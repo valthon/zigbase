@@ -17,6 +17,7 @@ pub const EngineError = error{ Validation, NotFound, Conflict } || db.DbError ||
 pub threadlocal var last_errors: ?[]const schema.ValidationError = null;
 
 pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Collection) EngineError!schema.Collection {
+    last_errors = null;
     // assign field ids where empty
     const fields = try alloc.alloc(schema.Field, def.fields.len);
     for (def.fields, 0..) |f, i| {
@@ -153,6 +154,88 @@ pub fn list(alloc: std.mem.Allocator, w: *db.Db) EngineError![]schema.Collection
     return out.toOwnedSlice(alloc);
 }
 
+pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []const u8, newdef: schema.Collection) EngineError!schema.Collection {
+    last_errors = null;
+    const old = (try get(alloc, w, id_or_name)) orelse return error.NotFound;
+
+    // assign ids to new fields lacking one; preserve existing ids
+    const fields = try alloc.alloc(schema.Field, newdef.fields.len);
+    for (newdef.fields, 0..) |f, i| {
+        fields[i] = f;
+        if (f.id.len == 0) {
+            var fid = id.fieldId(io);
+            fields[i].id = try alloc.dupe(u8, &fid);
+        }
+    }
+    var newc = newdef;
+    newc.fields = fields;
+    newc.id = old.id;
+    newc.name = old.name; // rename not supported in SP2
+
+    // validate
+    var errs: std.ArrayList(schema.ValidationError) = .empty;
+    try schema.validate(alloc, newc, &errs);
+    if (errs.items.len > 0) {
+        last_errors = errs.items;
+        return error.Validation;
+    }
+
+    // relation-resolved view for the rebuild's FK generation
+    const ddl_new = try resolveRelations(alloc, w, newc);
+
+    try w.exec("PRAGMA foreign_keys=OFF;");
+    errdefer w.exec("PRAGMA foreign_keys=ON;") catch {};
+    try w.begin();
+    errdefer w.rollback() catch {};
+    const plan = try ddl.rebuildPlan(alloc, old, ddl_new);
+    for (plan) |stmt| try w.exec(try alloc.dupeZ(u8, stmt));
+    try updateRow(alloc, w, old.id, newc);
+    try w.commit();
+    try w.exec("PRAGMA foreign_keys=ON;");
+
+    return newc;
+}
+
+fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schema.Collection) EngineError!void {
+    const schema_json = try schema.fieldsToJson(alloc, col.fields);
+    const indexes_json = try schema.indexesToJson(alloc, col.indexes);
+    var st = try w.prepare(
+        \\UPDATE "_collections" SET schema=?2, indexes=?3, listRule=?4, viewRule=?5,
+        \\ createRule=?6, updateRule=?7, deleteRule=?8, updated=datetime('now') WHERE id=?1;
+    );
+    defer st.finalize();
+    try st.bindText(1, col_id);
+    try st.bindText(2, schema_json);
+    try st.bindText(3, indexes_json);
+    try bindOptText(&st, 4, col.listRule);
+    try bindOptText(&st, 5, col.viewRule);
+    try bindOptText(&st, 6, col.createRule);
+    try bindOptText(&st, 7, col.updateRule);
+    try bindOptText(&st, 8, col.deleteRule);
+    _ = try st.step();
+}
+
+pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineError!void {
+    const target = (try get(alloc, w, id_or_name)) orelse return error.NotFound;
+    // refuse if another collection has a relation targeting this one
+    const all = try list(alloc, w);
+    for (all) |c| {
+        if (std.mem.eql(u8, c.id, target.id)) continue;
+        for (c.fields) |f| switch (f.options) {
+            .relation => |r| if (std.mem.eql(u8, r.targetCollectionId, target.id)) return error.Conflict,
+            else => {},
+        };
+    }
+    try w.begin();
+    errdefer w.rollback() catch {};
+    try w.exec(try std.fmt.allocPrintSentinel(alloc, "DROP TABLE \"{s}\";", .{target.name}, 0));
+    var st = try w.prepare("DELETE FROM \"_collections\" WHERE \"id\" = ?1;");
+    defer st.finalize();
+    try st.bindText(1, target.id);
+    _ = try st.step();
+    try w.commit();
+}
+
 test "create persists a collection and builds its physical table" {
     var d = try db.Db.openMemory();
     defer d.close();
@@ -185,4 +268,49 @@ test "create rejects an invalid collection" {
     defer arena.deinit();
     const def = schema.Collection{ .id = "", .name = "1bad", .fields = &.{} };
     try std.testing.expectError(error.Validation, create(arena.allocator(), std.testing.io, &d, def));
+}
+
+test "update rebuilds table and preserves data across a field rename" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const f0 = [_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
+    const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &f0 });
+    try d.exec("INSERT INTO posts (id, created, updated, title) VALUES ('r1','t','t','hello');");
+
+    const f1 = [_]schema.Field{
+        .{ .id = "f1", .name = "headline", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "views", .options = .{ .number = .{ .mode = .int } } },
+    };
+    var newdef = created;
+    newdef.fields = &f1;
+    _ = try update(a, std.testing.io, &d, created.id, newdef);
+
+    var st = try d.prepare("SELECT headline, views FROM posts WHERE id='r1';");
+    defer st.finalize();
+    try std.testing.expect((try st.step()));
+    try std.testing.expectEqualStrings("hello", st.columnText(0));
+    try std.testing.expect(st.isNull(1));
+}
+
+test "delete drops the table; delete refuses when referenced by a relation" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const users = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &.{} });
+    const pf = [_]schema.Field{.{ .id = "f1", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
+    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+
+    try std.testing.expectError(error.Conflict, delete(a, &d, "users"));
+    try delete(a, &d, "posts");
+    try delete(a, &d, "users");
+    try std.testing.expect((try get(a, &d, "posts")) == null);
 }
