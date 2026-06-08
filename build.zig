@@ -23,6 +23,9 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const zap = b.dependency("zap", .{ .target = target, .optimize = optimize });
+    exe_mod.addImport("zap", zap.module("zap"));
+
     const exe = b.addExecutable(.{ .name = "zigbase", .root_module = exe_mod });
     b.installArtifact(exe);
 
