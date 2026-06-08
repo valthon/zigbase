@@ -70,4 +70,5 @@ test {
     _ = @import("api/error.zig");
     _ = @import("api/health.zig");
     _ = @import("server.zig");
+    _ = @import("id.zig");
 }
