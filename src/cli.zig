@@ -49,8 +49,9 @@ test "no args -> help" {
     try std.testing.expect(std.meta.activeTag(try parse(&.{})) == .help);
 }
 
-test "serve with port and data-dir" {
-    const cmd = try parse(&.{ "serve", "--http-port", "9000", "--data-dir", "/tmp/zb" });
+test "serve with all three flags" {
+    const cmd = try parse(&.{ "serve", "--http-host", "127.0.0.1", "--http-port", "9000", "--data-dir", "/tmp/zb" });
+    try std.testing.expectEqualStrings("127.0.0.1", cmd.serve.http_host.?);
     try std.testing.expectEqual(@as(u16, 9000), cmd.serve.http_port.?);
     try std.testing.expectEqualStrings("/tmp/zb", cmd.serve.data_dir.?);
 }
@@ -59,6 +60,14 @@ test "unknown command errors" {
     try std.testing.expectError(ParseError.UnknownCommand, parse(&.{"frobnicate"}));
 }
 
+test "unknown flag errors" {
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "--nope" }));
+}
+
 test "missing flag value errors" {
     try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--http-port" }));
+}
+
+test "non-numeric port errors with BadValue" {
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--http-port", "abc" }));
 }
