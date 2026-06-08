@@ -11,7 +11,7 @@ test "sqlite library links and reports a 3.x version" {
     try std.testing.expect(std.mem.startsWith(u8, v, "3."));
 }
 
-pub const DbError = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed };
+pub const DbError = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed, WalNotEnabled };
 
 pub const Db = struct {
     handle: *c.sqlite3,
@@ -130,19 +130,21 @@ test "prepared insert with bound params, then read back" {
     defer db.close();
     try db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);");
 
-    var ins = try db.prepare("INSERT INTO t (id, name) VALUES (?1, ?2);");
-    try ins.bindInt(1, 42);
-    try ins.bindText(2, "ada");
-    try std.testing.expect((try ins.step()) == false); // INSERT yields no row
-    ins.finalize();
+    {
+        var ins = try db.prepare("INSERT INTO t (id, name) VALUES (?1, ?2);");
+        defer ins.finalize();
+        try ins.bindInt(1, 42);
+        try ins.bindText(2, "ada");
+        try std.testing.expect((try ins.step()) == false); // INSERT yields no row
+    }
 
     var sel = try db.prepare("SELECT id, name FROM t WHERE id = ?1;");
+    defer sel.finalize();
     try sel.bindInt(1, 42);
     try std.testing.expect((try sel.step()) == true);
     try std.testing.expectEqual(@as(i64, 42), sel.columnInt(0));
     try std.testing.expectEqualStrings("ada", sel.columnText(1));
     try std.testing.expect((try sel.step()) == false);
-    sel.finalize();
 }
 
 test "rollback discards uncommitted writes" {
@@ -180,6 +182,7 @@ pub const Pool = struct {
     path: [:0]const u8, // owned copy
     writer: Db,
     // std.Thread.Mutex was removed in Zig 0.16; use std.atomic.Mutex (spin) instead.
+    // TODO(perf): std.atomic.Mutex is a spinlock; replace with a futex/blocking mutex for write-latency workloads once one is available in this std.
     writer_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator, path: [:0]const u8) (DbError || std.mem.Allocator.Error)!Pool {
@@ -187,8 +190,15 @@ pub const Pool = struct {
         errdefer allocator.free(owned);
         var writer = try Db.open(owned);
         errdefer writer.close();
-        // WAL + sane durability defaults.
-        try writer.exec("PRAGMA journal_mode=WAL;");
+        // WAL + sane durability defaults. sqlite3_exec reports OK even when WAL
+        // was not actually applied, so read back the journal_mode and verify.
+        {
+            var stmt = try writer.prepare("PRAGMA journal_mode=WAL;");
+            defer stmt.finalize();
+            if ((try stmt.step()) == false) return DbError.WalNotEnabled;
+            const mode = stmt.columnText(0);
+            if (!std.ascii.eqlIgnoreCase(mode, "wal")) return DbError.WalNotEnabled;
+        }
         try writer.exec("PRAGMA synchronous=NORMAL;");
         try writer.exec("PRAGMA foreign_keys=ON;");
         try writer.exec("PRAGMA busy_timeout=5000;");
@@ -222,6 +232,7 @@ pub const Pool = struct {
             return DbError.OpenFailed;
         }
         var db = Db{ .handle = handle.? };
+        errdefer db.close();
         try db.exec("PRAGMA busy_timeout=5000;");
         return db;
     }
