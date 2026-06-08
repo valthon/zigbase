@@ -174,3 +174,82 @@ test "commit persists writes" {
     try std.testing.expect((try sel.step()) == true);
     try std.testing.expectEqual(@as(i64, 1), sel.columnInt(0));
 }
+
+pub const Pool = struct {
+    allocator: std.mem.Allocator,
+    path: [:0]const u8, // owned copy
+    writer: Db,
+    // std.Thread.Mutex was removed in Zig 0.16; use std.atomic.Mutex (spin) instead.
+    writer_mutex: std.atomic.Mutex = .unlocked,
+
+    pub fn init(allocator: std.mem.Allocator, path: [:0]const u8) (DbError || std.mem.Allocator.Error)!Pool {
+        const owned = try allocator.dupeZ(u8, path);
+        errdefer allocator.free(owned);
+        var writer = try Db.open(owned);
+        errdefer writer.close();
+        // WAL + sane durability defaults.
+        try writer.exec("PRAGMA journal_mode=WAL;");
+        try writer.exec("PRAGMA synchronous=NORMAL;");
+        try writer.exec("PRAGMA foreign_keys=ON;");
+        try writer.exec("PRAGMA busy_timeout=5000;");
+        return .{ .allocator = allocator, .path = owned, .writer = writer };
+    }
+
+    pub fn deinit(self: *Pool) void {
+        self.writer.close();
+        self.allocator.free(self.path);
+    }
+
+    /// Spin-locks the writer mutex and returns the writer connection.
+    /// Caller MUST call releaseWriter() when done.
+    pub fn acquireWriter(self: *Pool) *Db {
+        while (!self.writer_mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+        return &self.writer;
+    }
+
+    pub fn releaseWriter(self: *Pool) void {
+        self.writer_mutex.unlock();
+    }
+
+    /// Opens a fresh read-only connection. Caller owns it and must call close().
+    pub fn openReader(self: *Pool) DbError!Db {
+        var handle: ?*c.sqlite3 = null;
+        const flags = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX;
+        if (c.sqlite3_open_v2(self.path.ptr, &handle, flags, null) != c.SQLITE_OK) {
+            if (handle) |h| _ = c.sqlite3_close(h);
+            return DbError.OpenFailed;
+        }
+        var db = Db{ .handle = handle.? };
+        try db.exec("PRAGMA busy_timeout=5000;");
+        return db;
+    }
+};
+
+test "pool: a reader sees writes committed by the writer (WAL)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // realPathFileAlloc returns [:0]u8 (null-terminated) in Zig 0.16.
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir_path}, 0);
+    defer std.testing.allocator.free(db_path);
+
+    var pool = try Pool.init(std.testing.allocator, db_path);
+    defer pool.deinit();
+
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try w.exec("CREATE TABLE t (id INTEGER PRIMARY KEY);");
+        try w.exec("INSERT INTO t (id) VALUES (7);");
+    }
+
+    var reader = try pool.openReader();
+    defer reader.close();
+    var sel = try reader.prepare("SELECT id FROM t;");
+    defer sel.finalize();
+    try std.testing.expect((try sel.step()) == true);
+    try std.testing.expectEqual(@as(i64, 7), sel.columnInt(0));
+}
