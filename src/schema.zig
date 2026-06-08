@@ -112,6 +112,286 @@ pub fn validate(c: Collection, errors: *std.ArrayList(ValidationError)) void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// JSON (de)serialization
+//
+// Serialization builds a `std.json.Value` tree and calls
+// `std.json.Stringify.valueAlloc`. Parsing walks the dynamic `std.json.Value`
+// tree from `parseFromSlice`. Every string/array we retain is `dupe`d into the
+// caller's `alloc` (expected to be an arena), so the parsed tree may be freed
+// safely — we own all retained memory.
+// ---------------------------------------------------------------------------
+
+pub const ParseError = error{ InvalidSchema, UnknownFieldType, OutOfMemory };
+
+const Value = std.json.Value;
+const ObjectMap = std.json.ObjectMap;
+const Array = std.json.Array;
+
+fn jStr(s: []const u8) Value {
+    return .{ .string = s };
+}
+fn jBool(b: bool) Value {
+    return .{ .bool = b };
+}
+fn jInt(i: anytype) Value {
+    return .{ .integer = @intCast(i) };
+}
+
+fn putOpt(alloc: std.mem.Allocator, obj: *ObjectMap, key: []const u8, v: ?Value) !void {
+    if (v) |val| try obj.put(alloc, key, val);
+}
+
+fn fieldToValue(alloc: std.mem.Allocator, f: Field) !Value {
+    var obj: ObjectMap = .empty;
+    try obj.put(alloc, "id", jStr(f.id));
+    try obj.put(alloc, "name", jStr(f.name));
+    try obj.put(alloc, "required", jBool(f.required));
+    try obj.put(alloc, "unique", jBool(f.unique));
+    try obj.put(alloc, "type", jStr(@tagName(std.meta.activeTag(f.options))));
+
+    var opts: ObjectMap = .empty;
+    switch (f.options) {
+        .text => |o| {
+            try putOpt(alloc, &opts, "min", if (o.min) |x| jInt(x) else null);
+            try putOpt(alloc, &opts, "max", if (o.max) |x| jInt(x) else null);
+            try putOpt(alloc, &opts, "pattern", if (o.pattern) |x| jStr(x) else null);
+        },
+        .email, .url, .editor, .@"bool" => {},
+        .date => |o| {
+            try putOpt(alloc, &opts, "min", if (o.min) |x| jStr(x) else null);
+            try putOpt(alloc, &opts, "max", if (o.max) |x| jStr(x) else null);
+        },
+        .autodate => |o| {
+            try opts.put(alloc, "onCreate", jBool(o.onCreate));
+            try opts.put(alloc, "onUpdate", jBool(o.onUpdate));
+        },
+        .number => |o| {
+            try opts.put(alloc, "mode", jStr(@tagName(o.mode)));
+            try putOpt(alloc, &opts, "scale", if (o.scale) |x| jInt(x) else null);
+            try putOpt(alloc, &opts, "min", if (o.min) |x| Value{ .float = x } else null);
+            try putOpt(alloc, &opts, "max", if (o.max) |x| Value{ .float = x } else null);
+        },
+        .json => |o| {
+            try putOpt(alloc, &opts, "maxSize", if (o.maxSize) |x| jInt(x) else null);
+        },
+        .select => |o| {
+            var arr = Array.init(alloc);
+            for (o.values) |v| try arr.append(jStr(v));
+            try opts.put(alloc, "values", .{ .array = arr });
+            try opts.put(alloc, "maxSelect", jInt(o.maxSelect));
+        },
+        .relation => |o| {
+            try opts.put(alloc, "targetCollectionId", jStr(o.targetCollectionId));
+            try opts.put(alloc, "cascadeDelete", jBool(o.cascadeDelete));
+            try putOpt(alloc, &opts, "minSelect", if (o.minSelect) |x| jInt(x) else null);
+            try opts.put(alloc, "maxSelect", jInt(o.maxSelect));
+        },
+        .file => |o| {
+            try opts.put(alloc, "maxSelect", jInt(o.maxSelect));
+            try putOpt(alloc, &opts, "maxSize", if (o.maxSize) |x| jInt(x) else null);
+            if (o.mimeTypes) |mts| {
+                var arr = Array.init(alloc);
+                for (mts) |m| try arr.append(jStr(m));
+                try opts.put(alloc, "mimeTypes", .{ .array = arr });
+            }
+        },
+    }
+    try obj.put(alloc, "options", .{ .object = opts });
+    return .{ .object = obj };
+}
+
+pub fn fieldsToJson(alloc: std.mem.Allocator, fields: []const Field) ![]u8 {
+    var arr = Array.init(alloc);
+    for (fields) |f| try arr.append(try fieldToValue(alloc, f));
+    const root = Value{ .array = arr };
+    return std.json.Stringify.valueAlloc(alloc, root, .{});
+}
+
+pub fn indexesToJson(alloc: std.mem.Allocator, idx: []const Index) ![]u8 {
+    var arr = Array.init(alloc);
+    for (idx) |ix| {
+        var obj: ObjectMap = .empty;
+        try obj.put(alloc, "name", jStr(ix.name));
+        var farr = Array.init(alloc);
+        for (ix.fields) |fn_| try farr.append(jStr(fn_));
+        try obj.put(alloc, "fields", .{ .array = farr });
+        try obj.put(alloc, "unique", jBool(ix.unique));
+        try arr.append(.{ .object = obj });
+    }
+    return std.json.Stringify.valueAlloc(alloc, Value{ .array = arr }, .{});
+}
+
+// --- parsing helpers ---
+
+fn objGet(v: Value, key: []const u8) ?Value {
+    if (v != .object) return null;
+    return v.object.get(key);
+}
+
+fn getStr(alloc: std.mem.Allocator, v: Value, key: []const u8) !?[]const u8 {
+    const x = objGet(v, key) orelse return null;
+    if (x == .null) return null;
+    if (x != .string) return error.InvalidSchema;
+    return try alloc.dupe(u8, x.string);
+}
+
+fn getBool(v: Value, key: []const u8, default: bool) bool {
+    const x = objGet(v, key) orelse return default;
+    return switch (x) {
+        .bool => |b| b,
+        else => default,
+    };
+}
+
+fn asInt(x: Value) !i64 {
+    return switch (x) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        else => error.InvalidSchema,
+    };
+}
+
+fn getU32(v: Value, key: []const u8) !?u32 {
+    const x = objGet(v, key) orelse return null;
+    if (x == .null) return null;
+    return @intCast(try asInt(x));
+}
+
+fn getU32Default(v: Value, key: []const u8, default: u32) !u32 {
+    return (try getU32(v, key)) orelse default;
+}
+
+fn getU8(v: Value, key: []const u8) !?u8 {
+    const x = objGet(v, key) orelse return null;
+    if (x == .null) return null;
+    return @intCast(try asInt(x));
+}
+
+fn getU64(v: Value, key: []const u8) !?u64 {
+    const x = objGet(v, key) orelse return null;
+    if (x == .null) return null;
+    return @intCast(try asInt(x));
+}
+
+fn getF64(v: Value, key: []const u8) !?f64 {
+    const x = objGet(v, key) orelse return null;
+    return switch (x) {
+        .null => null,
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => error.InvalidSchema,
+    };
+}
+
+fn getStrArray(alloc: std.mem.Allocator, v: Value, key: []const u8) !?[]const []const u8 {
+    const x = objGet(v, key) orelse return null;
+    if (x == .null) return null;
+    if (x != .array) return error.InvalidSchema;
+    const items = x.array.items;
+    const out = try alloc.alloc([]const u8, items.len);
+    for (items, 0..) |it, i| {
+        if (it != .string) return error.InvalidSchema;
+        out[i] = try alloc.dupe(u8, it.string);
+    }
+    return out;
+}
+
+fn optionsFromValue(alloc: std.mem.Allocator, t: FieldType, opts: Value) !FieldOptions {
+    return switch (t) {
+        .text => .{ .text = .{
+            .min = try getU32(opts, "min"),
+            .max = try getU32(opts, "max"),
+            .pattern = try getStr(alloc, opts, "pattern"),
+        } },
+        .email => .{ .email = .{} },
+        .url => .{ .url = .{} },
+        .editor => .{ .editor = .{} },
+        .date => .{ .date = .{
+            .min = try getStr(alloc, opts, "min"),
+            .max = try getStr(alloc, opts, "max"),
+        } },
+        .autodate => .{ .autodate = .{
+            .onCreate = getBool(opts, "onCreate", true),
+            .onUpdate = getBool(opts, "onUpdate", false),
+        } },
+        .@"bool" => .{ .@"bool" = .{} },
+        .number => blk: {
+            var mode: NumberMode = .float;
+            if (objGet(opts, "mode")) |m| {
+                if (m == .string) mode = std.meta.stringToEnum(NumberMode, m.string) orelse return error.InvalidSchema;
+            }
+            break :blk .{ .number = .{
+                .mode = mode,
+                .scale = try getU8(opts, "scale"),
+                .min = try getF64(opts, "min"),
+                .max = try getF64(opts, "max"),
+            } };
+        },
+        .json => .{ .json = .{ .maxSize = try getU32(opts, "maxSize") } },
+        .select => .{ .select = .{
+            .values = (try getStrArray(alloc, opts, "values")) orelse &.{},
+            .maxSelect = try getU32Default(opts, "maxSelect", 1),
+        } },
+        .relation => .{ .relation = .{
+            .targetCollectionId = (try getStr(alloc, opts, "targetCollectionId")) orelse "",
+            .cascadeDelete = getBool(opts, "cascadeDelete", false),
+            .minSelect = try getU32(opts, "minSelect"),
+            .maxSelect = try getU32Default(opts, "maxSelect", 1),
+        } },
+        .file => .{ .file = .{
+            .maxSelect = try getU32Default(opts, "maxSelect", 1),
+            .maxSize = try getU64(opts, "maxSize"),
+            .mimeTypes = try getStrArray(alloc, opts, "mimeTypes"),
+        } },
+    };
+}
+
+fn fieldFromValue(alloc: std.mem.Allocator, v: Value) !Field {
+    if (v != .object) return error.InvalidSchema;
+    const id = (try getStr(alloc, v, "id")) orelse return error.InvalidSchema;
+    const name = (try getStr(alloc, v, "name")) orelse return error.InvalidSchema;
+    const type_v = objGet(v, "type") orelse return error.InvalidSchema;
+    if (type_v != .string) return error.InvalidSchema;
+    const t = std.meta.stringToEnum(FieldType, type_v.string) orelse return error.UnknownFieldType;
+    const opts = objGet(v, "options") orelse Value{ .object = .empty };
+    return .{
+        .id = id,
+        .name = name,
+        .required = getBool(v, "required", false),
+        .unique = getBool(v, "unique", false),
+        .options = try optionsFromValue(alloc, t, opts),
+    };
+}
+
+pub fn fieldsFromJson(alloc: std.mem.Allocator, s: []const u8) ![]Field {
+    var parsed = try std.json.parseFromSlice(Value, alloc, s, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .array) return error.InvalidSchema;
+    const items = root.array.items;
+    const out = try alloc.alloc(Field, items.len);
+    for (items, 0..) |it, i| out[i] = try fieldFromValue(alloc, it);
+    return out;
+}
+
+pub fn indexesFromJson(alloc: std.mem.Allocator, s: []const u8) ![]Index {
+    var parsed = try std.json.parseFromSlice(Value, alloc, s, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .array) return error.InvalidSchema;
+    const items = root.array.items;
+    const out = try alloc.alloc(Index, items.len);
+    for (items, 0..) |it, i| {
+        out[i] = .{
+            .name = (try getStr(alloc, it, "name")) orelse return error.InvalidSchema,
+            .fields = (try getStrArray(alloc, it, "fields")) orelse &.{},
+            .unique = getBool(it, "unique", false),
+        };
+    }
+    return out;
+}
+
 fn collectErrors(c: Collection) !std.ArrayList(ValidationError) {
     var list = try std.ArrayList(ValidationError).initCapacity(std.testing.allocator, 64);
     validate(c, &list);
@@ -149,4 +429,39 @@ test "sqlType mapping" {
     try std.testing.expectEqualStrings("REAL", nf.sqlType());
     try std.testing.expectEqualStrings("INTEGER", nif.sqlType());
     try std.testing.expectEqualStrings("INTEGER", bf.sqlType());
+}
+
+test "round-trip fields through json" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]Field{
+        .{ .id = "aaaaaaaa", .name = "title", .required = true, .options = .{ .text = .{ .max = 200 } } },
+        .{ .id = "bbbbbbbb", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
+        .{ .id = "cccccccc", .name = "tags", .options = .{ .select = .{ .values = &.{ "a", "b" }, .maxSelect = 3 } } },
+        .{ .id = "dddddddd", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users", .cascadeDelete = true } } },
+    };
+    const jsonStr = try fieldsToJson(a, &fields);
+    const back = try fieldsFromJson(a, jsonStr);
+    try std.testing.expectEqual(fields.len, back.len);
+    try std.testing.expectEqualStrings("title", back[0].name);
+    try std.testing.expect(back[0].required);
+    try std.testing.expectEqual(@as(?u32, 200), back[0].options.text.max);
+    try std.testing.expectEqual(NumberMode.fixed, back[1].options.number.mode);
+    try std.testing.expectEqual(@as(?u8, 2), back[1].options.number.scale);
+    try std.testing.expectEqual(@as(usize, 2), back[2].options.select.values.len);
+    try std.testing.expectEqualStrings("users", back[3].options.relation.targetCollectionId);
+    try std.testing.expect(back[3].options.relation.cascadeDelete);
+}
+
+test "indexes round-trip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const idx = [_]Index{.{ .name = "idx_title", .fields = &.{"title"}, .unique = true }};
+    const s = try indexesToJson(a, &idx);
+    const back = try indexesFromJson(a, s);
+    try std.testing.expectEqual(@as(usize, 1), back.len);
+    try std.testing.expectEqualStrings("idx_title", back[0].name);
+    try std.testing.expect(back[0].unique);
 }
