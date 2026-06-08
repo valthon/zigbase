@@ -71,4 +71,5 @@ test {
     _ = @import("api/health.zig");
     _ = @import("server.zig");
     _ = @import("id.zig");
+    _ = @import("schema.zig");
 }
