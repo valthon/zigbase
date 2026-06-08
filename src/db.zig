@@ -104,6 +104,26 @@ pub const Stmt = struct {
         return c.sqlite3_column_int64(self.handle, idx);
     }
 
+    pub fn columnDouble(self: *Stmt, idx: c_int) f64 {
+        return c.sqlite3_column_double(self.handle, idx);
+    }
+
+    pub const ColumnType = enum { Null, Integer, Float, Text, Blob };
+
+    pub fn columnType(self: *Stmt, idx: c_int) ColumnType {
+        return switch (c.sqlite3_column_type(self.handle, idx)) {
+            c.SQLITE_INTEGER => .Integer,
+            c.SQLITE_FLOAT => .Float,
+            c.SQLITE_TEXT => .Text,
+            c.SQLITE_BLOB => .Blob,
+            else => .Null,
+        };
+    }
+
+    pub fn isNull(self: *Stmt, idx: c_int) bool {
+        return c.sqlite3_column_type(self.handle, idx) == c.SQLITE_NULL;
+    }
+
     pub fn reset(self: *Stmt) void {
         _ = c.sqlite3_reset(self.handle);
     }
@@ -237,6 +257,19 @@ pub const Pool = struct {
         return db;
     }
 };
+
+test "column type, double, and null detection" {
+    var db = try Db.openMemory();
+    defer db.close();
+    try db.exec("CREATE TABLE t (a REAL, b TEXT);");
+    try db.exec("INSERT INTO t (a, b) VALUES (3.5, NULL);");
+    var sel = try db.prepare("SELECT a, b FROM t;");
+    defer sel.finalize();
+    try std.testing.expect((try sel.step()) == true);
+    try std.testing.expectEqual(Stmt.ColumnType.Float, sel.columnType(0));
+    try std.testing.expectApproxEqAbs(@as(f64, 3.5), sel.columnDouble(0), 0.0001);
+    try std.testing.expect(sel.isNull(1));
+}
 
 test "pool: a reader sees writes committed by the writer (WAL)" {
     var tmp = std.testing.tmpDir(.{});
