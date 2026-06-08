@@ -72,4 +72,5 @@ test {
     _ = @import("server.zig");
     _ = @import("id.zig");
     _ = @import("schema.zig");
+    _ = @import("ddl.zig");
 }
