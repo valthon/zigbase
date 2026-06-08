@@ -1,3 +1,14 @@
+//! Pure SQL string generation from schema types.
+//!
+//! All functions allocate into the supplied `alloc` and assume it is an
+//! arena: intermediate fragments (quoted idents, column defs, allocPrint
+//! results) are appended into the returned buffer but not individually freed.
+//! The engine creates one arena per operation, so this is leak-free in
+//! practice. Identifiers come from names already validated by
+//! `schema.isValidIdentifier` (letters/digits/underscore only), so inline
+//! `"{s}"` interpolation is injection-safe; `quoteIdent` is available for
+//! defensive quoting where escaping might matter.
+
 const std = @import("std");
 const schema = @import("schema.zig");
 
@@ -142,11 +153,13 @@ test "rebuildPlan copies retained columns by field id, adds new, drops removed" 
     const old = schema.Collection{ .id = "c1", .name = "posts", .fields = &old_fields };
     const new = schema.Collection{ .id = "c1", .name = "posts", .fields = &new_fields };
     const plan = try rebuildPlan(a, old, new);
-    try std.testing.expect(plan.len >= 4);
+    // No indexes in the fixture, so the plan is exactly: create, insert, drop, rename.
+    try std.testing.expectEqual(@as(usize, 4), plan.len);
     try std.testing.expect(std.mem.indexOf(u8, plan[0], "\"posts__new\"") != null);
     const insert = plan[1];
     try std.testing.expect(std.mem.indexOf(u8, insert, "INSERT INTO \"posts__new\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, insert, "\"headline\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, insert, "\"title\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, plan[plan.len - 1], "RENAME TO \"posts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan[2], "DROP TABLE \"posts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan[3], "RENAME TO \"posts\"") != null);
 }
