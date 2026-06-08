@@ -51,6 +51,16 @@ pub const Db = struct {
             return DbError.PrepareFailed;
         return .{ .handle = handle.? };
     }
+
+    pub fn begin(self: *Db) DbError!void {
+        try self.exec("BEGIN;");
+    }
+    pub fn commit(self: *Db) DbError!void {
+        try self.exec("COMMIT;");
+    }
+    pub fn rollback(self: *Db) DbError!void {
+        try self.exec("ROLLBACK;");
+    }
 };
 
 /// SQLITE_TRANSIENT tells SQLite to copy bound text/blobs immediately.
@@ -133,4 +143,34 @@ test "prepared insert with bound params, then read back" {
     try std.testing.expectEqualStrings("ada", sel.columnText(1));
     try std.testing.expect((try sel.step()) == false);
     sel.finalize();
+}
+
+test "rollback discards uncommitted writes" {
+    var db = try Db.openMemory();
+    defer db.close();
+    try db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY);");
+
+    try db.begin();
+    try db.exec("INSERT INTO t (id) VALUES (1);");
+    try db.rollback();
+
+    var sel = try db.prepare("SELECT COUNT(*) FROM t;");
+    defer sel.finalize();
+    try std.testing.expect((try sel.step()) == true);
+    try std.testing.expectEqual(@as(i64, 0), sel.columnInt(0));
+}
+
+test "commit persists writes" {
+    var db = try Db.openMemory();
+    defer db.close();
+    try db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY);");
+
+    try db.begin();
+    try db.exec("INSERT INTO t (id) VALUES (1);");
+    try db.commit();
+
+    var sel = try db.prepare("SELECT COUNT(*) FROM t;");
+    defer sel.finalize();
+    try std.testing.expect((try sel.step()) == true);
+    try std.testing.expectEqual(@as(i64, 1), sel.columnInt(0));
 }
