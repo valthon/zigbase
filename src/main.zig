@@ -13,4 +13,5 @@ test {
     _ = @import("config.zig");
     _ = @import("cli.zig");
     _ = @import("api/error.zig");
+    _ = @import("api/health.zig");
 }
