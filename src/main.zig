@@ -75,4 +75,6 @@ test {
     _ = @import("ddl.zig");
     _ = @import("migrations.zig");
     _ = @import("collections.zig");
+    _ = @import("app.zig");
+    _ = @import("http.zig");
 }
