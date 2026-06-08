@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     exe_mod.addIncludePath(b.path("vendor/sqlite"));
+    // Vendored SQLite amalgamation: 3.53.2 (sqlite-amalgamation-3530200).
     exe_mod.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
         .flags = &.{
@@ -18,6 +19,7 @@ pub fn build(b: *std.Build) void {
             "-DSQLITE_DQS=0",
             "-DSQLITE_ENABLE_FTS5",
             "-DSQLITE_DEFAULT_FOREIGN_KEYS=1",
+            "-DSQLITE_OMIT_LOAD_EXTENSION=1",
         },
     });
 
