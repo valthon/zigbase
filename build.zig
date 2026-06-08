@@ -8,6 +8,17 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
+    });
+    exe_mod.addIncludePath(b.path("vendor/sqlite"));
+    exe_mod.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        .flags = &.{
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_DQS=0",
+            "-DSQLITE_ENABLE_FTS5",
+            "-DSQLITE_DEFAULT_FOREIGN_KEYS=1",
+        },
     });
 
     const exe = b.addExecutable(.{ .name = "zigbase", .root_module = exe_mod });

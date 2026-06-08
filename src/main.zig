@@ -7,3 +7,7 @@ pub fn main() void {
 test "smoke" {
     try std.testing.expect(true);
 }
+
+test {
+    _ = @import("db.zig");
+}
