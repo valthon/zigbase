@@ -11,4 +11,5 @@ test "smoke" {
 test {
     _ = @import("db.zig");
     _ = @import("config.zig");
+    _ = @import("cli.zig");
 }
