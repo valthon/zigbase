@@ -83,30 +83,31 @@ pub fn isValidIdentifier(s: []const u8) bool {
     return true;
 }
 
-pub fn validate(c: Collection, errors: *std.ArrayList(ValidationError)) void {
+/// Appends any validation problems to `errors`. Self-sizing; messages/codes are static or borrowed from `c`.
+pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(ValidationError)) std.mem.Allocator.Error!void {
     if (!isValidIdentifier(c.name))
-        errors.appendAssumeCapacity(.{ .field = "name", .code = "validation_invalid_name", .message = "Name must start with a letter and contain only letters, digits, and underscores." });
+        try errors.append(alloc, .{ .field = "name", .code = "validation_invalid_name", .message = "Name must start with a letter and contain only letters, digits, and underscores." });
 
     for (c.fields, 0..) |f, i| {
         if (!isValidIdentifier(f.name)) {
-            errors.appendAssumeCapacity(.{ .field = f.name, .code = "validation_invalid_name", .message = "Invalid field name." });
+            try errors.append(alloc, .{ .field = f.name, .code = "validation_invalid_name", .message = "Invalid field name." });
             continue;
         }
         for (system_columns) |sys| {
             if (std.ascii.eqlIgnoreCase(f.name, sys))
-                errors.appendAssumeCapacity(.{ .field = f.name, .code = "validation_reserved_name", .message = "Field name collides with a system column." });
+                try errors.append(alloc, .{ .field = f.name, .code = "validation_reserved_name", .message = "Field name collides with a system column." });
         }
         for (c.fields[0..i]) |g| {
             if (std.ascii.eqlIgnoreCase(f.name, g.name))
-                errors.appendAssumeCapacity(.{ .field = f.name, .code = "validation_duplicate_name", .message = "Duplicate field name." });
+                try errors.append(alloc, .{ .field = f.name, .code = "validation_duplicate_name", .message = "Duplicate field name." });
         }
         switch (f.options) {
             .select => |o| if (o.values.len == 0)
-                errors.appendAssumeCapacity(.{ .field = f.name, .code = "validation_required", .message = "select requires at least one value." }),
+                try errors.append(alloc, .{ .field = f.name, .code = "validation_required", .message = "select requires at least one value." }),
             .number => |o| if (o.mode == .fixed and (o.scale == null or o.scale.? < 1 or o.scale.? > 8))
-                errors.appendAssumeCapacity(.{ .field = f.name, .code = "validation_invalid_scale", .message = "fixed number requires scale 1..8." }),
+                try errors.append(alloc, .{ .field = f.name, .code = "validation_invalid_scale", .message = "fixed number requires scale 1..8." }),
             .relation => |o| if (o.targetCollectionId.len == 0)
-                errors.appendAssumeCapacity(.{ .field = f.name, .code = "validation_required", .message = "relation requires targetCollectionId." }),
+                try errors.append(alloc, .{ .field = f.name, .code = "validation_required", .message = "relation requires targetCollectionId." }),
             else => {},
         }
     }
@@ -134,8 +135,8 @@ fn jStr(s: []const u8) Value {
 fn jBool(b: bool) Value {
     return .{ .bool = b };
 }
-fn jInt(i: anytype) Value {
-    return .{ .integer = @intCast(i) };
+fn jInt(i: anytype) !Value {
+    return .{ .integer = std.math.cast(i64, i) orelse return error.InvalidSchema };
 }
 
 fn putOpt(alloc: std.mem.Allocator, obj: *ObjectMap, key: []const u8, v: ?Value) !void {
@@ -153,8 +154,8 @@ fn fieldToValue(alloc: std.mem.Allocator, f: Field) !Value {
     var opts: ObjectMap = .empty;
     switch (f.options) {
         .text => |o| {
-            try putOpt(alloc, &opts, "min", if (o.min) |x| jInt(x) else null);
-            try putOpt(alloc, &opts, "max", if (o.max) |x| jInt(x) else null);
+            try putOpt(alloc, &opts, "min", if (o.min) |x| try jInt(x) else null);
+            try putOpt(alloc, &opts, "max", if (o.max) |x| try jInt(x) else null);
             try putOpt(alloc, &opts, "pattern", if (o.pattern) |x| jStr(x) else null);
         },
         .email, .url, .editor, .@"bool" => {},
@@ -168,28 +169,28 @@ fn fieldToValue(alloc: std.mem.Allocator, f: Field) !Value {
         },
         .number => |o| {
             try opts.put(alloc, "mode", jStr(@tagName(o.mode)));
-            try putOpt(alloc, &opts, "scale", if (o.scale) |x| jInt(x) else null);
+            try putOpt(alloc, &opts, "scale", if (o.scale) |x| try jInt(x) else null);
             try putOpt(alloc, &opts, "min", if (o.min) |x| Value{ .float = x } else null);
             try putOpt(alloc, &opts, "max", if (o.max) |x| Value{ .float = x } else null);
         },
         .json => |o| {
-            try putOpt(alloc, &opts, "maxSize", if (o.maxSize) |x| jInt(x) else null);
+            try putOpt(alloc, &opts, "maxSize", if (o.maxSize) |x| try jInt(x) else null);
         },
         .select => |o| {
             var arr = Array.init(alloc);
             for (o.values) |v| try arr.append(jStr(v));
             try opts.put(alloc, "values", .{ .array = arr });
-            try opts.put(alloc, "maxSelect", jInt(o.maxSelect));
+            try opts.put(alloc, "maxSelect", try jInt(o.maxSelect));
         },
         .relation => |o| {
             try opts.put(alloc, "targetCollectionId", jStr(o.targetCollectionId));
             try opts.put(alloc, "cascadeDelete", jBool(o.cascadeDelete));
-            try putOpt(alloc, &opts, "minSelect", if (o.minSelect) |x| jInt(x) else null);
-            try opts.put(alloc, "maxSelect", jInt(o.maxSelect));
+            try putOpt(alloc, &opts, "minSelect", if (o.minSelect) |x| try jInt(x) else null);
+            try opts.put(alloc, "maxSelect", try jInt(o.maxSelect));
         },
         .file => |o| {
-            try opts.put(alloc, "maxSelect", jInt(o.maxSelect));
-            try putOpt(alloc, &opts, "maxSize", if (o.maxSize) |x| jInt(x) else null);
+            try opts.put(alloc, "maxSelect", try jInt(o.maxSelect));
+            try putOpt(alloc, &opts, "maxSize", if (o.maxSize) |x| try jInt(x) else null);
             if (o.mimeTypes) |mts| {
                 var arr = Array.init(alloc);
                 for (mts) |m| try arr.append(jStr(m));
@@ -247,7 +248,10 @@ fn getBool(v: Value, key: []const u8, default: bool) bool {
 fn asInt(x: Value) !i64 {
     return switch (x) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| if (std.math.floor(f) == f and f >= -9.2233720368547758e18 and f < 9.2233720368547758e18)
+            @intFromFloat(f)
+        else
+            error.InvalidSchema,
         else => error.InvalidSchema,
     };
 }
@@ -255,7 +259,7 @@ fn asInt(x: Value) !i64 {
 fn getU32(v: Value, key: []const u8) !?u32 {
     const x = objGet(v, key) orelse return null;
     if (x == .null) return null;
-    return @intCast(try asInt(x));
+    return std.math.cast(u32, try asInt(x)) orelse return error.InvalidSchema;
 }
 
 fn getU32Default(v: Value, key: []const u8, default: u32) !u32 {
@@ -265,13 +269,13 @@ fn getU32Default(v: Value, key: []const u8, default: u32) !u32 {
 fn getU8(v: Value, key: []const u8) !?u8 {
     const x = objGet(v, key) orelse return null;
     if (x == .null) return null;
-    return @intCast(try asInt(x));
+    return std.math.cast(u8, try asInt(x)) orelse return error.InvalidSchema;
 }
 
 fn getU64(v: Value, key: []const u8) !?u64 {
     const x = objGet(v, key) orelse return null;
     if (x == .null) return null;
-    return @intCast(try asInt(x));
+    return std.math.cast(u64, try asInt(x)) orelse return error.InvalidSchema;
 }
 
 fn getF64(v: Value, key: []const u8) !?f64 {
@@ -393,8 +397,8 @@ pub fn indexesFromJson(alloc: std.mem.Allocator, s: []const u8) ![]Index {
 }
 
 fn collectErrors(c: Collection) !std.ArrayList(ValidationError) {
-    var list = try std.ArrayList(ValidationError).initCapacity(std.testing.allocator, 64);
-    validate(c, &list);
+    var list: std.ArrayList(ValidationError) = .empty;
+    try validate(std.testing.allocator, c, &list);
     return list;
 }
 
@@ -450,6 +454,8 @@ test "round-trip fields through json" {
     try std.testing.expectEqual(NumberMode.fixed, back[1].options.number.mode);
     try std.testing.expectEqual(@as(?u8, 2), back[1].options.number.scale);
     try std.testing.expectEqual(@as(usize, 2), back[2].options.select.values.len);
+    try std.testing.expectEqualStrings("a", back[2].options.select.values[0]);
+    try std.testing.expectEqualStrings("b", back[2].options.select.values[1]);
     try std.testing.expectEqualStrings("users", back[3].options.relation.targetCollectionId);
     try std.testing.expect(back[3].options.relation.cascadeDelete);
 }
