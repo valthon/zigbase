@@ -74,4 +74,5 @@ test {
     _ = @import("schema.zig");
     _ = @import("ddl.zig");
     _ = @import("migrations.zig");
+    _ = @import("collections.zig");
 }
