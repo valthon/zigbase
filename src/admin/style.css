@@ -1,0 +1,30 @@
+:root { --bg:#16161a; --panel:#1d1d23; --line:#2c2c34; --fg:#e6e6ea; --muted:#9a9aa6; --accent:#6d6dff; --danger:#ff5d5d; }
+* { box-sizing:border-box; }
+body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+input,select,button,textarea { font:inherit; color:var(--fg); }
+button { background:var(--accent); border:0; border-radius:6px; padding:7px 12px; color:#fff; cursor:pointer; }
+button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); }
+input,select,textarea { background:#101014; border:1px solid var(--line); border-radius:6px; padding:7px 9px; width:100%; }
+.row { display:flex; gap:8px; align-items:center; }
+.shell { display:flex; min-height:100vh; }
+.sidebar { width:230px; flex:0 0 230px; background:var(--panel); border-right:1px solid var(--line); padding:12px; transition:width .15s; display:flex; flex-direction:column; }
+.sidebar.collapsed { width:54px; flex-basis:54px; padding:12px 8px; }
+.sidebar.collapsed .hide-collapsed { display:none; }
+.brand { font-weight:700; margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; }
+.navitem { padding:6px 9px; border-radius:6px; cursor:pointer; color:var(--fg); text-decoration:none; display:block; }
+.navitem.active { background:rgba(109,109,255,.18); }
+.navitem .badge { font-size:11px; color:var(--muted); }
+.spacer { margin-top:auto; }
+.main { flex:1; padding:20px; overflow:auto; }
+.login-wrap { max-width:340px; margin:12vh auto; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:22px; }
+.field { margin-bottom:12px; }
+.field label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
+.error { color:var(--danger); font-size:13px; }
+table { width:100%; border-collapse:collapse; }
+th,td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line); font-size:13px; white-space:nowrap; max-width:280px; overflow:hidden; text-overflow:ellipsis; }
+th { color:var(--muted); font-weight:600; }
+tbody tr:hover { background:rgba(255,255,255,.03); cursor:pointer; }
+.toolbar { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
+.toolbar .grow { flex:1; }
+.muted { color:var(--muted); }
+.pager { margin-top:12px; display:flex; gap:8px; align-items:center; color:var(--muted); }
