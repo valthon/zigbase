@@ -103,4 +103,6 @@ test {
     _ = @import("query/params.zig");
     _ = @import("query/lexer.zig");
     _ = @import("query/parser.zig");
+    _ = @import("query/joiner.zig");
+    _ = @import("query/compiler.zig");
 }
