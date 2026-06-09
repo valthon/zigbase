@@ -1,4 +1,6 @@
 const std = @import("std");
+const db = @import("db.zig");
+const schema = @import("schema.zig");
 
 pub const ValueError = error{ TypeMismatch, TooPrecise, Overflow, BadNumber, BadSelect, NotObject } || std.mem.Allocator.Error;
 
@@ -63,6 +65,164 @@ pub fn scaledIntToDecimal(alloc: std.mem.Allocator, v: i64, scale: u8) ![]u8 {
     while (p < pad) : (p += 1) try out.append(alloc, '0');
     try out.appendSlice(alloc, fs);
     return out.toOwnedSlice(alloc);
+}
+
+/// Bind a `std.json.Value` into a prepared statement parameter according to the field's type.
+pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: schema.Field, v: std.json.Value) (ValueError || db.DbError)!void {
+    if (v == .null) return stmt.bindNull(idx);
+    switch (field.options) {
+        .text, .email, .url, .editor, .date, .autodate => {
+            if (v != .string) return error.TypeMismatch;
+            try stmt.bindText(idx, v.string);
+        },
+        .@"bool" => {
+            if (v != .bool) return error.TypeMismatch;
+            try stmt.bindInt(idx, if (v.bool) 1 else 0);
+        },
+        .number => |o| switch (o.mode) {
+            .float => {
+                const f: f64 = switch (v) {
+                    .float => v.float,
+                    .integer => @floatFromInt(v.integer),
+                    else => return error.TypeMismatch,
+                };
+                try stmt.bindDouble(idx, f);
+            },
+            .int => {
+                if (v != .string) return error.TypeMismatch;
+                try stmt.bindInt(idx, try decimalToScaledInt(v.string, 0));
+            },
+            .fixed => {
+                if (v != .string) return error.TypeMismatch;
+                try stmt.bindInt(idx, try decimalToScaledInt(v.string, o.scale orelse 0));
+            },
+        },
+        .json => {
+            const s = try std.json.Stringify.valueAlloc(alloc, v, .{});
+            try stmt.bindText(idx, s);
+        },
+        .select, .relation, .file => {
+            if (field.isMultiValue()) {
+                if (v != .array) return error.TypeMismatch;
+                const s = try std.json.Stringify.valueAlloc(alloc, v, .{});
+                try stmt.bindText(idx, s);
+            } else {
+                if (v != .string) return error.TypeMismatch;
+                try stmt.bindText(idx, v.string);
+            }
+        },
+    }
+}
+
+/// Read a column value from a stepped statement into a `std.json.Value` according to the field's type.
+/// Requires an arena allocator: the parse tree for json/multi-value fields is allocated into `alloc`
+/// and is never freed individually — it lives until the arena is released.
+pub fn readValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: schema.Field) !std.json.Value {
+    if (stmt.isNull(idx)) return .null;
+    switch (field.options) {
+        .text, .email, .url, .editor, .date, .autodate => {
+            return .{ .string = try alloc.dupe(u8, stmt.columnText(idx)) };
+        },
+        .@"bool" => return .{ .bool = stmt.columnInt(idx) != 0 },
+        .number => |o| switch (o.mode) {
+            .float => return .{ .float = stmt.columnDouble(idx) },
+            .int => return .{ .string = try scaledIntToDecimal(alloc, stmt.columnInt(idx), 0) },
+            .fixed => return .{ .string = try scaledIntToDecimal(alloc, stmt.columnInt(idx), o.scale orelse 0) },
+        },
+        .json => {
+            const txt = stmt.columnText(idx);
+            return (try std.json.parseFromSlice(std.json.Value, alloc, txt, .{})).value;
+        },
+        .select, .relation, .file => {
+            const txt = stmt.columnText(idx);
+            if (field.isMultiValue()) {
+                return (try std.json.parseFromSlice(std.json.Value, alloc, txt, .{})).value;
+            }
+            return .{ .string = try alloc.dupe(u8, txt) };
+        },
+    }
+}
+
+fn roundTrip(a: std.mem.Allocator, field: schema.Field, sql_type: []const u8, in: std.json.Value) !std.json.Value {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const create = try std.fmt.allocPrintSentinel(a, "CREATE TABLE t (v {s});", .{sql_type}, 0);
+    try d.exec(create);
+    var ins = try d.prepare("INSERT INTO t (v) VALUES (?1);");
+    try bindValue(a, &ins, 1, field, in);
+    _ = try ins.step();
+    ins.finalize();
+    var sel = try d.prepare("SELECT v FROM t;");
+    defer sel.finalize();
+    _ = try sel.step();
+    return readValue(a, &sel, 0, field);
+}
+
+test "text round-trips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = schema.Field{ .id = "f", .name = "title", .options = .{ .text = .{} } };
+    const out = try roundTrip(a, f, "TEXT", .{ .string = "hello" });
+    try std.testing.expectEqualStrings("hello", out.string);
+}
+
+test "bool round-trips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = schema.Field{ .id = "f", .name = "ok", .options = .{ .@"bool" = .{} } };
+    const out = try roundTrip(a, f, "INTEGER", .{ .bool = true });
+    try std.testing.expectEqual(true, out.bool);
+}
+
+test "fixed number round-trips as a precise string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = schema.Field{ .id = "f", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } };
+    const out = try roundTrip(a, f, "INTEGER", .{ .string = "10.50" });
+    try std.testing.expectEqualStrings("10.50", out.string);
+}
+
+test "float round-trips as a number" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = schema.Field{ .id = "f", .name = "ratio", .options = .{ .number = .{ .mode = .float } } };
+    const out = try roundTrip(a, f, "REAL", .{ .float = 1.5 });
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), out.float, 0.0001);
+}
+
+test "int number round-trips as a string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = schema.Field{ .id = "f", .name = "n", .options = .{ .number = .{ .mode = .int } } };
+    const out = try roundTrip(a, f, "INTEGER", .{ .string = "9007199254740993" });
+    try std.testing.expectEqualStrings("9007199254740993", out.string);
+}
+
+test "multi-select round-trips as an array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = schema.Field{ .id = "f", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 3 } } };
+    var arr = std.json.Array.init(a);
+    try arr.append(.{ .string = "x" });
+    try arr.append(.{ .string = "y" });
+    const out = try roundTrip(a, f, "TEXT", .{ .array = arr });
+    try std.testing.expectEqual(@as(usize, 2), out.array.items.len);
+    try std.testing.expectEqualStrings("x", out.array.items[0].string);
+}
+
+test "null round-trips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = schema.Field{ .id = "f", .name = "title", .options = .{ .text = .{} } };
+    const out = try roundTrip(a, f, "TEXT", .null);
+    try std.testing.expect(out == .null);
 }
 
 test "decimalToScaledInt: scale 2" {
