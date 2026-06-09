@@ -81,4 +81,5 @@ test {
     _ = @import("files/multipart.zig");
     _ = @import("data.zig");
     _ = @import("events.zig");
+    _ = @import("sentry.zig");
 }

@@ -98,6 +98,7 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
         .realtime_allowed_origins = cfg.realtime_allowed_origins,
         .max_upload_size = cfg.max_upload_size,
         .file_token_ttl_s = cfg.file_token_ttl_s,
+        .sentry_dsn = cfg.sentry_dsn,
         .storage = &storage_iface,
     };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);

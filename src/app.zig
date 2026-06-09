@@ -15,5 +15,6 @@ pub const App = struct {
     realtime_allowed_origins: []const u8 = "",
     max_upload_size: u64 = 50 << 20,
     file_token_ttl_s: i64 = 120,
+    sentry_dsn: []const u8 = "", // "" = log errors to stderr; set to enable Sentry reporting
     storage: ?*const @import("files/storage.zig").Storage = null,
 };

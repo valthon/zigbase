@@ -3,6 +3,7 @@ const std = @import("std");
 const App = @import("app.zig").App;
 const request = @import("request.zig");
 const Data = @import("data.zig").Data;
+const sentry = @import("sentry.zig");
 
 // NOTE: adding a variant requires updating phaseFieldName() and the consumer-facing camelCase field name.
 pub const RecordPhase = enum {
@@ -169,6 +170,47 @@ test "before hook error aborts (propagates) and unrelated collection is skipped"
 
     ev.collection = "posts";
     try std.testing.expectError(error.HookRejected, dispatch(&ev));
+}
+
+/// Route a framework-caught error: run the consumer onError handler (if any),
+/// then the built-in Sentry-or-log backstop. Never propagates.
+pub fn dispatchError(app: *App, dispatch: ?*const Dispatch, ev: *ErrorEvent) void {
+    if (dispatch) |d| {
+        if (d.on_error) |h| h(ev);
+    }
+    sentry.backstop(app, ev.message);
+}
+
+test "dispatchError runs consumer handler before the backstop" {
+    const H = struct {
+        // Records the order in which the consumer handler and the backstop ran.
+        var seq: std.ArrayListUnmanaged([]const u8) = .empty;
+        fn onErr(ev: *ErrorEvent) void {
+            _ = ev;
+            seq.append(std.testing.allocator, "handler") catch {};
+        }
+        fn sink(_: []const u8) void {
+            seq.append(std.testing.allocator, "backstop") catch {};
+        }
+    };
+    H.seq = .empty;
+    defer H.seq.deinit(std.testing.allocator);
+
+    var app: App = undefined;
+    app.allocator = std.testing.allocator;
+    app.sentry_dsn = ""; // DSN-less -> backstop takes the log path
+    // Route the log-mode backstop into our sink so it is observable and does not
+    // emit a real std.log.err (which Zig's test runner would count as a failure).
+    sentry.log_sink = H.sink;
+    defer sentry.log_sink = null;
+
+    var d = Dispatch{ .on_error = H.onErr };
+    var ev = ErrorEvent{ .app = &app, .ctx = null, .err = error.Boom, .phase = .after_hook, .message = "x" };
+    dispatchError(&app, &d, &ev);
+
+    try std.testing.expectEqual(@as(usize, 2), H.seq.items.len);
+    try std.testing.expectEqualStrings("handler", H.seq.items[0]);
+    try std.testing.expectEqualStrings("backstop", H.seq.items[1]);
 }
 
 test "only the matching phase's handler runs" {
