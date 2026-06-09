@@ -25,6 +25,7 @@ pub fn quoteIdent(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
 }
 
 pub fn columnDef(alloc: std.mem.Allocator, f: schema.Field) ![]u8 {
+    if (f.unique) return std.fmt.allocPrint(alloc, "\"{s}\" {s} UNIQUE", .{ f.name, f.sqlType() });
     return std.fmt.allocPrint(alloc, "\"{s}\" {s}", .{ f.name, f.sqlType() });
 }
 
@@ -57,10 +58,14 @@ pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.I
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, if (idx.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
-    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\" ON \"{s}\" (", .{ idx.name, table }));
+    try out.appendSlice(alloc, try quoteIdent(alloc, idx.name));
+    try out.appendSlice(alloc, " ON ");
+    try out.appendSlice(alloc, try quoteIdent(alloc, table));
+    try out.append(alloc, ' ');
+    try out.append(alloc, '(');
     for (idx.fields, 0..) |fname, i| {
         if (i > 0) try out.append(alloc, ',');
-        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\"", .{fname}));
+        try out.appendSlice(alloc, try quoteIdent(alloc, fname));
     }
     try out.appendSlice(alloc, ");");
     return out.toOwnedSlice(alloc);

@@ -40,6 +40,9 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
         return error.Validation;
     }
 
+    // reject duplicate collection name up front (→ 409 instead of a raw DbError → 500)
+    if ((try get(alloc, w, def.name)) != null) return error.Conflict;
+
     // build a DDL view where each single-relation's target collection id is resolved to its table name
     const ddl_col = try resolveRelations(alloc, w, col);
 
@@ -295,6 +298,46 @@ test "update rebuilds table and preserves data across a field rename" {
     try std.testing.expect((try st.step()));
     try std.testing.expectEqualStrings("hello", st.columnText(0));
     try std.testing.expect(st.isNull(1));
+}
+
+test "create rejects an index name containing SQL (injection guard)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const evil = [_]schema.Index{.{ .name = "x\" ON \"posts\" (\"id\"); DROP TABLE \"_collections\"; --", .fields = &.{"id"}, .unique = false }};
+    const def = schema.Collection{ .id = "", .name = "posts", .fields = &.{}, .indexes = &evil };
+    try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, def));
+    // _collections still exists
+    var st = try d.prepare("SELECT COUNT(*) FROM \"_collections\";");
+    defer st.finalize();
+    try std.testing.expect((try st.step()));
+}
+
+test "create rejects a duplicate collection name with Conflict" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &.{} });
+    try std.testing.expectError(error.Conflict, create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &.{} }));
+}
+
+test "unique field enforces uniqueness at the db level" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "slug", .unique = true, .options = .{ .text = .{} } }};
+    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
+    try d.exec("INSERT INTO posts (id, created, updated, slug) VALUES ('r1','t','t','x');");
+    try std.testing.expectError(db.DbError.ExecFailed, d.exec("INSERT INTO posts (id, created, updated, slug) VALUES ('r2','t','t','x');"));
 }
 
 test "delete drops the table; delete refuses when referenced by a relation" {

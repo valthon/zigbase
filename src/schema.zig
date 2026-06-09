@@ -111,6 +111,15 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
             else => {},
         }
     }
+
+    for (c.indexes) |idx| {
+        if (!isValidIdentifier(idx.name))
+            try errors.append(alloc, .{ .field = idx.name, .code = "validation_invalid_name", .message = "Invalid index name." });
+        for (idx.fields) |fname| {
+            if (!isValidIdentifier(fname))
+                try errors.append(alloc, .{ .field = fname, .code = "validation_invalid_name", .message = "Invalid index field name." });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
