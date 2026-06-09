@@ -5,6 +5,7 @@ const app_mod = @import("app.zig");
 const router = @import("router.zig");
 const health = @import("api/health.zig");
 const collections_api = @import("api/collections.zig");
+const records_api = @import("api/records.zig");
 const ApiError = @import("api/error.zig").ApiError;
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -18,6 +19,10 @@ const routes = [_]router.Route{
     .{ .method = .GET, .pattern = "/api/collections/:idOrName", .handler = collections_api.get },
     .{ .method = .PATCH, .pattern = "/api/collections/:idOrName", .handler = collections_api.update },
     .{ .method = .DELETE, .pattern = "/api/collections/:idOrName", .handler = collections_api.delete },
+    .{ .method = .GET, .pattern = "/api/collections/:col/records/:id", .handler = records_api.view },
+    .{ .method = .POST, .pattern = "/api/collections/:col/records", .handler = records_api.create },
+    .{ .method = .PATCH, .pattern = "/api/collections/:col/records/:id", .handler = records_api.update },
+    .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id", .handler = records_api.delete },
 };
 
 pub const Server = struct {
