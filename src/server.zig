@@ -7,6 +7,7 @@ const health = @import("api/health.zig");
 const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
 const auth_api = @import("api/auth.zig");
+const oauth_api = @import("api/oauth.zig");
 const ApiError = @import("api/error.zig").ApiError;
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -32,6 +33,9 @@ const routes = [_]router.Route{
     .{ .method = .POST, .pattern = "/api/collections/:col/confirm-verification", .handler = auth_api.confirmVerification },
     .{ .method = .POST, .pattern = "/api/collections/:col/request-password-reset", .handler = auth_api.requestPasswordReset },
     .{ .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .handler = auth_api.confirmPasswordReset },
+    .{ .method = .GET, .pattern = "/api/collections/:col/oauth2-providers", .handler = oauth_api.oauth2Providers },
+    .{ .method = .POST, .pattern = "/api/collections/:col/auth-with-oauth2", .handler = oauth_api.authWithOAuth2 },
+    .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
 };
 
 pub const Server = struct {
