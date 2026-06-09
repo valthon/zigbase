@@ -77,4 +77,5 @@ test {
     _ = @import("collections.zig");
     _ = @import("app.zig");
     _ = @import("http.zig");
+    _ = @import("router.zig");
 }
