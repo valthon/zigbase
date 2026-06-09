@@ -26,6 +26,7 @@ pub const Field = struct {
     name: []const u8,
     required: bool = false,
     unique: bool = false,
+    hidden: bool = false,
     options: FieldOptions,
 
     pub fn fieldType(self: Field) FieldType {
@@ -81,6 +82,54 @@ test "fieldByName finds and misses" {
     const c = Collection{ .id = "c", .name = "posts", .fields = &fields };
     try std.testing.expect(fieldByName(c, "title") != null);
     try std.testing.expect(fieldByName(c, "missing") == null);
+}
+
+/// Names reserved by the engine (base + auth system columns); user fields may not use them.
+pub fn isSystemFieldName(name: []const u8) bool {
+    const reserved = [_][]const u8{ "id", "created", "updated", "email", "username", "passwordHash", "tokenKey", "verified" };
+    for (reserved) |r| if (std.mem.eql(u8, name, r)) return true;
+    return false;
+}
+
+/// The implicit system fields of an auth collection (beyond id/created/updated).
+/// passwordHash/tokenKey are hidden (never serialized). Stable ids (leading '_').
+pub fn authSystemFields() []const Field {
+    const S = struct {
+        const fields = [_]Field{
+            .{ .id = "_email", .name = "email", .unique = true, .options = .{ .email = .{} } },
+            .{ .id = "_username", .name = "username", .options = .{ .text = .{} } },
+            .{ .id = "_pwhash", .name = "passwordHash", .hidden = true, .options = .{ .text = .{} } },
+            .{ .id = "_tokkey", .name = "tokenKey", .hidden = true, .options = .{ .text = .{} } },
+            .{ .id = "_verified", .name = "verified", .options = .{ .@"bool" = .{} } },
+        };
+    };
+    return &S.fields;
+}
+
+/// Returns `col` with auth system fields prepended to `fields` (for auth collections);
+/// base/view collections are returned unchanged. The slice is allocated from `alloc`.
+pub fn injectAuthFields(alloc: std.mem.Allocator, col: Collection) !Collection {
+    if (col.type != .auth) return col;
+    const sys = authSystemFields();
+    const out = try alloc.alloc(Field, sys.len + col.fields.len);
+    @memcpy(out[0..sys.len], sys);
+    @memcpy(out[sys.len..], col.fields);
+    var c = col;
+    c.fields = out;
+    return c;
+}
+
+test "injectAuthFields prepends the 5 auth fields for auth collections only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user = [_]Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
+    const auth_col = try injectAuthFields(a, .{ .id = "c", .name = "users", .type = .auth, .fields = &user });
+    try std.testing.expectEqual(@as(usize, 6), auth_col.fields.len);
+    try std.testing.expectEqualStrings("email", auth_col.fields[0].name);
+    try std.testing.expect(fieldByName(auth_col, "passwordHash").?.hidden);
+    const base_col = try injectAuthFields(a, .{ .id = "c", .name = "posts", .type = .base, .fields = &user });
+    try std.testing.expectEqual(@as(usize, 1), base_col.fields.len);
 }
 
 pub const Index = struct { name: []const u8, fields: []const []const u8, unique: bool = false };
