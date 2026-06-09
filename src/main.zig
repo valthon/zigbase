@@ -175,4 +175,5 @@ test {
     _ = @import("jwt.zig");
     _ = @import("auth.zig");
     _ = @import("oauth/secrets.zig");
+    _ = @import("oauth/providers.zig");
 }
