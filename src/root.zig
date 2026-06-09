@@ -6,6 +6,9 @@ pub const Config = @import("config.zig").Config;
 pub const Server = @import("server.zig").Server;
 pub const http = @import("http.zig");
 pub const Data = @import("data.zig").Data;
+pub const events = @import("events.zig");
+pub const RecordEvent = events.RecordEvent;
+pub const ErrorEvent = events.ErrorEvent;
 
 /// Internal modules the shipped binary's main() drives directly until a later
 /// task introduces the comptime App(cfg) builder. Not part of the stable API.
@@ -77,4 +80,5 @@ test {
     _ = @import("files/plan.zig");
     _ = @import("files/multipart.zig");
     _ = @import("data.zig");
+    _ = @import("events.zig");
 }
