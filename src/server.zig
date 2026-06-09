@@ -19,6 +19,7 @@ const routes = [_]router.Route{
     .{ .method = .GET, .pattern = "/api/collections/:idOrName", .handler = collections_api.get },
     .{ .method = .PATCH, .pattern = "/api/collections/:idOrName", .handler = collections_api.update },
     .{ .method = .DELETE, .pattern = "/api/collections/:idOrName", .handler = collections_api.delete },
+    .{ .method = .GET, .pattern = "/api/collections/:col/records", .handler = records_api.list },
     .{ .method = .GET, .pattern = "/api/collections/:col/records/:id", .handler = records_api.view },
     .{ .method = .POST, .pattern = "/api/collections/:col/records", .handler = records_api.create },
     .{ .method = .PATCH, .pattern = "/api/collections/:col/records/:id", .handler = records_api.update },
