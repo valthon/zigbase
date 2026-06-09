@@ -197,4 +197,5 @@ test {
     _ = @import("files/plan.zig");
     _ = @import("files/multipart.zig");
     _ = @import("api/files.zig");
+    _ = @import("admin.zig");
 }

@@ -11,6 +11,7 @@ const oauth_api = @import("api/oauth.zig");
 const files_api = @import("api/files.zig");
 const realtime_ws = @import("realtime/ws.zig");
 const files_multipart = @import("files/multipart.zig");
+const admin = @import("admin.zig");
 const ApiError = @import("api/error.zig").ApiError;
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -110,8 +111,11 @@ fn onRequest(r: zap.Request) !void {
             ctx.files = ex.files;
         } else |_| {}
     }
-    const resp = router.dispatch(&routes, &ctx) catch
-        ApiError.internal().toResponse(arena.allocator()) catch {
+    const resp = if (std.mem.startsWith(u8, ctx.path, "/_/") or std.mem.eql(u8, ctx.path, "/_"))
+        admin.serve(&ctx)
+    else
+        router.dispatch(&routes, &ctx) catch
+            ApiError.internal().toResponse(arena.allocator()) catch {
             setZapStatus(r, 500);
             r.setContentType(.JSON) catch {};
             r.sendBody("{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}") catch {};
@@ -143,6 +147,6 @@ fn onRequest(r: zap.Request) !void {
         };
         return;
     }
-    r.setContentType(.JSON) catch {};
+    r.setHeader("content-type", resp.content_type) catch {};
     r.sendBody(resp.body) catch {};
 }
