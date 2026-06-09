@@ -19,6 +19,10 @@ pub const RecordEvent = struct {
     app: *App,
     ctx: *const request.RequestContext,
     data: Data,
+    /// Request-scoped allocator that owns `record`'s JSON storage. Hooks MUST use
+    /// this (not `app.allocator`) for any allocation that becomes part of `record`,
+    /// so growth is consistent with the map's backing and is freed with the request.
+    arena: std.mem.Allocator,
     collection: []const u8,
     record: *std.json.Value, // mutable in before_*; the persisted record in after_*
     phase: RecordPhase,
@@ -144,7 +148,7 @@ test "record dispatcher fires wildcard then specific, in order, and mutations st
     defer obj.deinit(std.testing.allocator);
     try obj.put(std.testing.allocator, "touched", .{ .bool = false });
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .collection = "posts", .record = &rec, .phase = .before_create };
+    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
 
     try dispatch(&ev);
     try std.testing.expectEqual(@as(usize, 2), Trace.seq.items.len);
@@ -165,7 +169,7 @@ test "before hook error aborts (propagates) and unrelated collection is skipped"
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .collection = "comments", .record = &rec, .phase = .before_create };
+    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .arena = std.testing.allocator, .collection = "comments", .record = &rec, .phase = .before_create };
     try dispatch(&ev); // "comments" not registered -> no-op, no error
 
     ev.collection = "posts";
@@ -226,7 +230,7 @@ test "only the matching phase's handler runs" {
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .collection = "posts", .record = &rec, .phase = .before_create };
+    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
     try dispatch(&ev); // before_create fired, but only afterCreate is registered -> no call
     try std.testing.expectEqual(@as(usize, 0), H.after_calls);
     ev.phase = .after_create;

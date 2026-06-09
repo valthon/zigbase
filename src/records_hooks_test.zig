@@ -11,7 +11,9 @@ const records_api = @import("api/records.zig");
 
 const Hooks = struct {
     fn stampTitle(ev: *events.RecordEvent) anyerror!void {
-        try ev.record.object.put(std.testing.allocator, "title", .{ .string = "stamped" });
+        // Mutations that grow the record's map MUST allocate with the request-scoped
+        // arena (ev.arena) — the same allocator that owns ev.record — not app.allocator.
+        try ev.record.object.put(ev.arena, "title", .{ .string = "stamped" });
     }
     fn boom(ev: *events.RecordEvent) anyerror!void {
         _ = ev;
@@ -54,7 +56,9 @@ test "emitRecord before_create mutation is visible on the record" {
     var value: std.json.Value = .{ .object = obj };
     var rctx = request.RequestContext{ .method = "POST" };
 
-    try records_api.emitRecord(&app, &rctx, &conn, "posts", &value, .before_create);
+    // The record map is allocated with std.testing.allocator, so the arena argument
+    // is the same allocator — mirroring production where the request arena owns the record.
+    try records_api.emitRecord(&app, &rctx, std.testing.allocator, &conn, "posts", &value, .before_create);
     try std.testing.expectEqualStrings("stamped", value.object.get("title").?.string);
 }
 
@@ -75,7 +79,7 @@ test "emitRecord before_create hook error propagates" {
     var value: std.json.Value = .{ .object = obj };
     var rctx = request.RequestContext{ .method = "POST" };
 
-    try std.testing.expectError(error.HookRejected, records_api.emitRecord(&app, &rctx, &conn, "posts", &value, .before_create));
+    try std.testing.expectError(error.HookRejected, records_api.emitRecord(&app, &rctx, std.testing.allocator, &conn, "posts", &value, .before_create));
 }
 
 test "emitRecord after_create swallows hook errors" {
@@ -104,7 +108,7 @@ test "emitRecord after_create swallows hook errors" {
     var rctx = request.RequestContext{ .method = "POST" };
 
     // after_create routes the error to dispatchError + swallows; no error returned.
-    try records_api.emitRecord(&app, &rctx, &conn, "posts", &value, .after_create);
+    try records_api.emitRecord(&app, &rctx, std.testing.allocator, &conn, "posts", &value, .after_create);
 }
 
 test "emitRecord before_create skips a non-object body without firing the hook" {
@@ -125,6 +129,6 @@ test "emitRecord before_create skips a non-object body without firing the hook" 
     var value: std.json.Value = .{ .integer = 42 };
     var rctx = request.RequestContext{ .method = "POST" };
 
-    try records_api.emitRecord(&app, &rctx, &conn, "posts", &value, .before_create);
+    try records_api.emitRecord(&app, &rctx, std.testing.allocator, &conn, "posts", &value, .before_create);
     try std.testing.expectEqual(@as(usize, 0), Hooks.calls);
 }

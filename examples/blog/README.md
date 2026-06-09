@@ -10,6 +10,9 @@ This example exists primarily as a packaging proof: building it demonstrates
 that the SQLite C sources and zap dependency travel transitively through the
 published `zigbase` module into a downstream consumer package.
 
+> **Pre-1.0:** ZigBase is pre-1.0 — the hook-config shape and module API may
+> change between releases.
+
 ## The hook
 
 ```zig
@@ -23,9 +26,25 @@ fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
         .string => |s| s,
         else => return,
     } else return;
-    const buf = try ev.app.allocator.alloc(u8, title.len);
-    for (title, 0..) |ch, i| buf[i] = if (std.ascii.isAlphanumeric(ch)) std.ascii.toLower(ch) else '-';
-    try ev.record.object.put(ev.app.allocator, "slug", .{ .string = buf });
+
+    // Record mutations MUST allocate with `ev.arena` (the request-scoped
+    // allocator that owns `ev.record`), NOT `ev.app.allocator`.
+    const buf = try ev.arena.alloc(u8, title.len);
+    var len: usize = 0;
+    var in_run = false;
+    for (title) |ch| {
+        if (std.ascii.isAlphanumeric(ch)) {
+            buf[len] = std.ascii.toLower(ch);
+            len += 1;
+            in_run = true;
+        } else if (in_run) {
+            buf[len] = '-';
+            len += 1;
+            in_run = false;
+        }
+    }
+    if (len > 0 and buf[len - 1] == '-') len -= 1;
+    try ev.record.object.put(ev.arena, "slug", .{ .string = buf[0..len] }); // "Hello, World!" -> "hello-world"
 }
 
 pub fn main(init: std.process.Init) !void {

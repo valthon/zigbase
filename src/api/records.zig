@@ -22,6 +22,7 @@ const events = @import("../events.zig");
 pub fn emitRecord(
     app: *app_mod.App,
     rctx: *const request.RequestContext,
+    arena: std.mem.Allocator,
     conn: *db.Db,
     col_name: []const u8,
     value: *std.json.Value,
@@ -40,6 +41,7 @@ pub fn emitRecord(
         .app = app,
         .ctx = rctx,
         .data = .{ .app = app, .conn = conn, .io = app.io },
+        .arena = arena,
         .collection = col_name,
         .record = value,
         .phase = phase,
@@ -167,7 +169,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // local; downstream MUST read the `_mut` binding (here and for rec_mut/ur_mut/ex_mut
     // below), not the original const — the binding is the grow-capturing reference.
     var data_mut = data2;
-    emitRecord(app, &rctx, w, col.name, &data_mut, .before_create) catch return hookRejected(ctx);
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_create) catch return hookRejected(ctx);
     const rec = switch (rules.decide(col.createRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => records.create(ctx.allocator, app.io, w, col, data_mut),
@@ -184,7 +186,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.internal().toResponse(ctx.allocator);
     };
     var rec_mut = rec;
-    emitRecord(app, &rctx, w, col.name, &rec_mut, .after_create) catch {};
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &rec_mut, .after_create) catch {};
     realtime_ws.broadcast(app, col, .create, rid, rec_mut);
     return jsonResponse(ctx, 201, rec_mut);
 }
@@ -213,7 +215,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     };
     const rctx = buildContext(ctx, w, data);
     var data_mut = data2;
-    emitRecord(app, &rctx, w, col.name, &data_mut, .before_update) catch return hookRejected(ctx);
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_update) catch return hookRejected(ctx);
 
     // Write new file bytes BEFORE the DB update so a storage failure can't leave dangling refs.
     if (ctx.app.?.storage) |storage| {
@@ -243,7 +245,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     };
     if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch {};
     var ur_mut = ur;
-    emitRecord(app, &rctx, w, col.name, &ur_mut, .after_update) catch {};
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &ur_mut, .after_update) catch {};
     realtime_ws.broadcast(app, col, .update, ur_mut.object.get("id").?.string, ur_mut);
     return jsonResponse(ctx, 200, ur_mut);
 }
@@ -262,7 +264,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         .check => if (!try rules.matches(ctx.allocator, w, col, rid, col.deleteRule.?, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
     }
     var ex_mut = existing;
-    emitRecord(app, &rctx, w, col.name, &ex_mut, .before_delete) catch return hookRejected(ctx);
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .before_delete) catch return hookRejected(ctx);
     if (!try records.delete(ctx.allocator, w, col, rid)) return ApiError.notFound().toResponse(ctx.allocator);
     if (col.type == .auth) {
         var st = try w.prepare("DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
@@ -272,7 +274,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         _ = try st.step();
     }
     if (app.storage) |storage| storage.deleteRecord(app.io, col.name, rid) catch {};
-    emitRecord(app, &rctx, w, col.name, &ex_mut, .after_delete) catch {};
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .after_delete) catch {};
     realtime_ws.broadcast(app, col, .delete, rid, null);
     return .{ .status = 204, .body = "" };
 }
