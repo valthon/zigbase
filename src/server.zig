@@ -8,6 +8,7 @@ const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
 const auth_api = @import("api/auth.zig");
 const oauth_api = @import("api/oauth.zig");
+const files_api = @import("api/files.zig");
 const realtime_ws = @import("realtime/ws.zig");
 const files_multipart = @import("files/multipart.zig");
 const ApiError = @import("api/error.zig").ApiError;
@@ -38,6 +39,8 @@ const routes = [_]router.Route{
     .{ .method = .GET, .pattern = "/api/collections/:col/oauth2-providers", .handler = oauth_api.oauth2Providers },
     .{ .method = .POST, .pattern = "/api/collections/:col/auth-with-oauth2", .handler = oauth_api.authWithOAuth2 },
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
+    .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
+    .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
 };
 
 pub const Server = struct {

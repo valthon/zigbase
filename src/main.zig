@@ -7,6 +7,7 @@ const app_mod = @import("app.zig");
 const migrations = @import("migrations.zig");
 const crypto = @import("crypto.zig");
 const id_gen = @import("id.zig");
+const files_storage = @import("files/storage.zig");
 
 /// Zig 0.16 entry point: `main` receives a `std.process.Init` which carries the
 /// process gpa, an arena, and the command-line args. `std.process.argsAlloc`
@@ -80,6 +81,10 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
         defer pool.releaseWriter();
         try migrations.run(w);
     }
+    const storage_root = try std.fmt.allocPrint(allocator, "{s}/storage", .{cfg.data_dir});
+    defer allocator.free(storage_root);
+    var local_storage = files_storage.LocalStorage.init(storage_root);
+    const storage_iface = local_storage.storage();
     var app = app_mod.App{
         .allocator = allocator,
         .io = io,
@@ -92,6 +97,7 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
         .realtime_allowed_origins = cfg.realtime_allowed_origins,
         .max_upload_size = cfg.max_upload_size,
         .file_token_ttl_s = cfg.file_token_ttl_s,
+        .storage = &storage_iface,
     };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
@@ -190,4 +196,5 @@ test {
     _ = @import("files/storage.zig");
     _ = @import("files/plan.zig");
     _ = @import("files/multipart.zig");
+    _ = @import("api/files.zig");
 }
