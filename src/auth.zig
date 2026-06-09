@@ -169,6 +169,38 @@ pub const Authed = struct {
     is_superuser: bool,
 };
 
+pub const Verified = struct {
+    record: std.json.Value,
+    collection: []const u8,
+    is_superuser: bool,
+    exp: i64,
+};
+
+/// Resolve a JWT string to a verified identity (no HTTP ctx, no CSRF — the caller owns transport).
+/// peek claims → require type==.auth → load tokenKey → derive key → jwt.verify against SQLite now →
+/// load the record (hidden fields stripped). null on any failure.
+pub fn verifyToken(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, token: []const u8) ?Verified {
+    const claims = jwt.peekClaims(alloc, token) catch return null;
+    if (claims.type != .auth) return null;
+    const is_super = std.mem.eql(u8, claims.collection, "_superusers");
+    const table = if (is_super) "_superusers" else blk: {
+        const col = (collections.get(alloc, conn, claims.collection) catch return null) orelse return null;
+        break :blk col.name;
+    };
+    const tk = (tokenKeyFor(alloc, conn, table, claims.id) catch return null) orelse return null;
+    const key = crypto.deriveKey(app.jwt_secret, tk);
+    const now = nowUnix(conn) catch return null;
+    _ = jwt.verify(alloc, token, &key, now) catch return null;
+    const rec = if (is_super)
+        (superuserRecord(alloc, conn, claims.id) catch return null) orelse return null
+    else blk: {
+        const col = (collections.get(alloc, conn, claims.collection) catch return null) orelse return null;
+        const records = @import("records.zig");
+        break :blk (records.get(alloc, conn, col, claims.id) catch return null) orelse return null;
+    };
+    return .{ .record = rec, .collection = claims.collection, .is_superuser = is_super, .exp = claims.exp };
+}
+
 /// Current unix time from SQLite (keeps pure code clock-free).
 fn nowUnix(conn: *db.Db) db.DbError!i64 {
     var st = try conn.prepare("SELECT unixepoch('now');");
@@ -223,32 +255,12 @@ pub fn authenticate(io: std.Io, alloc: std.mem.Allocator, app: anytype, ctx: *co
 
     const claims = jwt.peekClaims(alloc, token) catch return null;
     if (claims.type != .auth) return null;
-
     if (from_cookie and isUnsafe(ctx.method)) {
         if (ctx.csrf_token.len == 0 or claims.csrf.len == 0) return null;
         if (!ctEqlSlices(claims.csrf, ctx.csrf_token)) return null;
     }
-
-    const is_super = std.mem.eql(u8, claims.collection, "_superusers");
-    const table = if (is_super) "_superusers" else blk: {
-        const col = (collections.get(alloc, conn, claims.collection) catch return null) orelse return null;
-        break :blk col.name;
-    };
-
-    const tk = (tokenKeyFor(alloc, conn, table, claims.id) catch return null) orelse return null;
-    const key = crypto.deriveKey(app.jwt_secret, tk);
-    const now = nowUnix(conn) catch return null;
-    _ = jwt.verify(alloc, token, &key, now) catch return null;
-
-    const rec = if (is_super)
-        (superuserRecord(alloc, conn, claims.id) catch return null) orelse return null
-    else blk: {
-        const col = (collections.get(alloc, conn, claims.collection) catch return null) orelse return null;
-        const records = @import("records.zig");
-        break :blk (records.get(alloc, conn, col, claims.id) catch return null) orelse return null;
-    };
-
-    return Authed{ .record = rec, .collection = claims.collection, .is_superuser = is_super };
+    const v = verifyToken(alloc, app, conn, token) orelse return null;
+    return Authed{ .record = v.record, .collection = v.collection, .is_superuser = v.is_superuser };
 }
 
 test "authenticate resolves a valid bearer token to its record" {
@@ -318,4 +330,29 @@ test "authenticate requires CSRF on the cookie + unsafe-method path" {
     try std.testing.expect((try authenticate(app.io, a, &app, &ok, &d)) != null);
     var get = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .cookie_header = cookie_hdr };
     try std.testing.expect((try authenticate(app.io, a, &app, &get, &d)) != null);
+}
+
+test "verifyToken resolves a valid token string to a record + exp" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try collections.create(a, std.testing.io, &d, .{
+        .id = "", .name = "users", .type = .auth,
+        .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
+    });
+    try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk-secret',1);");
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
+    const key = crypto.deriveKey(app.jwt_secret, "tk-secret");
+    const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    const v = verifyToken(a, &app, &d, token) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("users", v.collection);
+    try std.testing.expectEqual(false, v.is_superuser);
+    try std.testing.expectEqual(@as(i64, 9999999999), v.exp);
+    try std.testing.expectEqualStrings("rec1", v.record.object.get("id").?.string);
+    const wrong = crypto.deriveKey(app.jwt_secret, "other");
+    const bad = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &wrong);
+    try std.testing.expect(verifyToken(a, &app, &d, bad) == null);
 }
