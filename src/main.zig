@@ -178,4 +178,5 @@ test {
     _ = @import("oauth/providers.zig");
     _ = @import("oauth/client.zig");
     _ = @import("api/oauth.zig");
+    _ = @import("realtime/protocol.zig");
 }
