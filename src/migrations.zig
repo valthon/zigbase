@@ -87,10 +87,17 @@ test "0002 adds options column and seeds _superusers" {
     var d = try db.Db.openMemory();
     defer d.close();
     try run(&d);
-    var st = try d.prepare("SELECT type FROM \"_collections\" WHERE name='_superusers';");
+    var st = try d.prepare("SELECT type, system FROM \"_collections\" WHERE name='_superusers';");
     defer st.finalize();
     try std.testing.expect((try st.step()));
     try std.testing.expectEqualStrings("auth", st.columnText(0));
+    try std.testing.expectEqual(@as(i64, 1), st.columnInt(1)); // system=1
+    // re-running migrations does not duplicate the seed
+    try run(&d);
+    var dup = try d.prepare("SELECT COUNT(*) FROM \"_collections\" WHERE name='_superusers';");
+    defer dup.finalize();
+    _ = try dup.step();
+    try std.testing.expectEqual(@as(i64, 1), dup.columnInt(0));
     var c = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('_collections') WHERE name='options';");
     defer c.finalize();
     _ = try c.step();

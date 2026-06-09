@@ -594,7 +594,9 @@ pub fn collectionToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
     try root.put(alloc, "deleteRule", optStrValue(c.deleteRule));
     try root.put(alloc, "created", .{ .string = c.created });
     try root.put(alloc, "updated", .{ .string = c.updated });
-    try root.put(alloc, "options", (try std.json.parseFromSlice(std.json.Value, alloc, try optionsToJson(alloc, c), .{})).value);
+    const oparsed = try std.json.parseFromSlice(std.json.Value, alloc, try optionsToJson(alloc, c), .{});
+    defer oparsed.deinit();
+    try root.put(alloc, "options", oparsed.value);
     return std.json.Stringify.valueAlloc(alloc, Value{ .object = root }, .{});
 }
 

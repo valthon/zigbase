@@ -214,9 +214,10 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
 fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schema.Collection) EngineError!void {
     const schema_json = try schema.fieldsToJson(alloc, col.fields);
     const indexes_json = try schema.indexesToJson(alloc, col.indexes);
+    const options_json = try schema.optionsToJson(alloc, col);
     var st = try w.prepare(
         \\UPDATE "_collections" SET schema=?2, indexes=?3, listRule=?4, viewRule=?5,
-        \\ createRule=?6, updateRule=?7, deleteRule=?8, updated=datetime('now') WHERE id=?1;
+        \\ createRule=?6, updateRule=?7, deleteRule=?8, options=?9, updated=datetime('now') WHERE id=?1;
     );
     defer st.finalize();
     try st.bindText(1, col_id);
@@ -227,6 +228,7 @@ fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schem
     try bindOptText(&st, 6, col.createRule);
     try bindOptText(&st, 7, col.updateRule);
     try bindOptText(&st, 8, col.deleteRule);
+    try st.bindText(9, options_json);
     _ = try st.step();
 }
 
