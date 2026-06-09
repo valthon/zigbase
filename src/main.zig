@@ -98,4 +98,5 @@ test {
     _ = @import("http.zig");
     _ = @import("router.zig");
     _ = @import("values.zig");
+    _ = @import("records.zig");
 }
