@@ -1,7 +1,8 @@
 const std = @import("std");
 
 // ---- Public API (grows over this plan) -------------------------------------
-pub const App = @import("app.zig").App; // runtime app context (comptime builder added later)
+pub const App = @import("framework.zig").App; // comptime application builder
+pub const Runtime = @import("app.zig").App; // runtime app context struct
 pub const Config = @import("config.zig").Config;
 pub const Server = @import("server.zig").Server;
 pub const http = @import("http.zig");
@@ -9,20 +10,6 @@ pub const Data = @import("data.zig").Data;
 pub const events = @import("events.zig");
 pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
-
-/// Internal modules the shipped binary's main() drives directly until a later
-/// task introduces the comptime App(cfg) builder. Not part of the stable API.
-pub const @"internal" = struct {
-    pub const app = @import("app.zig");
-    pub const server = @import("server.zig");
-    pub const cli = @import("cli.zig");
-    pub const config = @import("config.zig");
-    pub const db = @import("db.zig");
-    pub const migrations = @import("migrations.zig");
-    pub const files_storage = @import("files/storage.zig");
-    pub const crypto = @import("crypto.zig");
-    pub const id = @import("id.zig");
-};
 
 // ---- Test discovery --------------------------------------------------------
 // The unit-test runner is rooted at THIS module. Reference every internal file
@@ -82,5 +69,6 @@ test {
     _ = @import("data.zig");
     _ = @import("events.zig");
     _ = @import("sentry.zig");
+    _ = @import("framework.zig");
     _ = @import("records_hooks_test.zig");
 }
