@@ -58,6 +58,39 @@ pub fn shouldDeliver(
     return rules.matches(alloc, reader, col, record_id, combined, &rctx);
 }
 
+pub const EventFrames = struct {
+    collection_channel: []const u8,
+    record_channel: []const u8,
+    frame_collection: []const u8,
+    frame_record: []const u8,
+};
+
+/// Build the two channels + two serialized frames for a record event. create/update carry `record`
+/// (full, hidden fields already stripped by the caller's records.get); delete carries only `{id}`.
+pub fn buildEventFrames(
+    alloc: std.mem.Allocator,
+    collection: []const u8,
+    action: protocol.Action,
+    record_id: []const u8,
+    record: ?std.json.Value,
+) !EventFrames {
+    const coll_channel = try alloc.dupe(u8, collection);
+    const rec_channel = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ collection, record_id });
+
+    const body: std.json.Value = if (action == .delete) blk: {
+        var o: std.json.ObjectMap = .empty;
+        try o.put(alloc, "id", .{ .string = record_id });
+        break :blk .{ .object = o };
+    } else record.?;
+
+    return .{
+        .collection_channel = coll_channel,
+        .record_channel = rec_channel,
+        .frame_collection = try protocol.serializeEvent(alloc, coll_channel, action, body),
+        .frame_record = try protocol.serializeEvent(alloc, rec_channel, action, body),
+    };
+}
+
 const TestDb = struct {
     d: db.Db,
     fn init() !TestDb {
@@ -175,4 +208,30 @@ test "expired identity is treated as anonymous" {
     c.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 100 });
     try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &c, 50, .update, rid, null));
     try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &c, 200, .update, rid, null));
+}
+
+test "buildEventFrames: create carries the full record on both channels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rec: std.json.ObjectMap = .empty;
+    try rec.put(a, "id", .{ .string = "REC1" });
+    try rec.put(a, "title", .{ .string = "hi" });
+    const ef = try buildEventFrames(a, "posts", .create, "REC1", .{ .object = rec });
+    try std.testing.expectEqualStrings("posts", ef.collection_channel);
+    try std.testing.expectEqualStrings("posts/REC1", ef.record_channel);
+    try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"topic\":\"posts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"title\":\"hi\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ef.frame_record, "\"topic\":\"posts/REC1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ef.frame_record, "\"title\":\"hi\"") != null);
+}
+
+test "buildEventFrames: delete is id-only (no body fields)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ef = try buildEventFrames(a, "posts", .delete, "REC1", null);
+    try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"action\":\"delete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"id\":\"REC1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"title\"") == null);
 }
