@@ -318,15 +318,15 @@ test "auth collection enforces identity uniqueness via partial unique index, all
     // two distinct emails ok
     try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('a','','','x@y.z');");
     try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('b','','','q@y.z');");
-    // duplicate non-empty email rejected
-    try std.testing.expectError(error.SqlError, d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('c','','','x@y.z');"));
+    // duplicate non-empty email rejected (exec maps the SQLite constraint error to ExecFailed)
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('c','','','x@y.z');"));
     // two empty emails allowed (partial index excludes them)
     try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('d','','','');");
     try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('e','','','');");
 }
 ```
 
-Note: confirm the exact error tag `db.exec` returns on a constraint violation (likely `error.SqlError` from `db.DbError`). If the build reports a different tag, update the `expectError` to match — do NOT widen it to `anyerror`.
+Note: `db.exec` returns `error.ExecFailed` (from `db.DbError`) on a constraint violation. If the build reports a different tag, update the `expectError` to match — do NOT widen it to `anyerror`.
 
 - [ ] **Step 2: Run to verify failure**
 
