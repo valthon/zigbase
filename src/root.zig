@@ -68,4 +68,5 @@ test {
     _ = @import("sentry.zig");
     _ = @import("framework.zig");
     _ = @import("records_hooks_test.zig");
+    _ = @import("schedule.zig");
 }
