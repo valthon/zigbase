@@ -226,24 +226,20 @@ fn createImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Colle
 
     const sql = try std.fmt.allocPrintSentinel(alloc, "INSERT INTO \"{s}\" ({s}) VALUES ({s}) RETURNING {s};", .{ col.name, cols.items, vals.items, rcols }, 0);
     var st = try w.prepare(sql);
+    defer st.finalize();
     try st.bindText(1, &gen_id);
     for (binds.items) |b| {
         values.bindValue(alloc, &st, b.idx, b.field, b.value) catch |e| {
-            st.finalize();
             try errs.append(alloc, .{ .field = b.field.name, .code = convCode(e), .message = "Invalid value." });
             last_errors = errs.items;
             return error.Validation;
         };
     }
-    if (!try st.step()) {
-        st.finalize();
-        return error.NotFound;
-    }
+    if (!try st.step()) return error.NotFound;
     const rec = try rowToObject(alloc, &st, col);
-    st.finalize();
+    while (try st.step()) {} // drain to DONE so the statement isn't active at commit time
     if (guard) |g| {
         if (!try guardPasses(alloc, w, col, &gen_id, g)) {
-            w.rollback() catch {};
             return error.Forbidden;
         }
         try w.commit();
@@ -374,25 +370,23 @@ fn updateImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
 
     const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ col.name, sets.items, rcols }, 0);
     var st = try w.prepare(sql);
+    defer st.finalize();
     try st.bindText(1, id);
     for (binds.items) |b| {
         values.bindValue(alloc, &st, b.idx, b.field, b.value) catch |e| {
-            st.finalize();
             try errs.append(alloc, .{ .field = b.field.name, .code = convCode(e), .message = "Invalid value." });
             last_errors = errs.items;
             return error.Validation;
         };
     }
     if (!try st.step()) {
-        st.finalize();
         if (guard != null) w.rollback() catch {};
         return null;
     }
     const rec = try rowToObject(alloc, &st, col);
-    st.finalize();
+    while (try st.step()) {} // drain to DONE so the statement isn't active at commit time
     if (guard) |g| {
         if (!try guardPasses(alloc, w, col, id, g)) {
-            w.rollback() catch {};
             return error.Forbidden;
         }
         try w.commit();
