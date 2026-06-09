@@ -1,13 +1,14 @@
 const std = @import("std");
-const cli = @import("cli.zig");
-const config = @import("config.zig");
-const db = @import("db.zig");
-const server = @import("server.zig");
-const app_mod = @import("app.zig");
-const migrations = @import("migrations.zig");
-const crypto = @import("crypto.zig");
-const id_gen = @import("id.zig");
-const files_storage = @import("files/storage.zig");
+const zigbase = @import("zigbase");
+const cli = zigbase.@"internal".cli;
+const config = zigbase.@"internal".config;
+const db = zigbase.@"internal".db;
+const server = zigbase.@"internal".server;
+const app_mod = zigbase.@"internal".app;
+const migrations = zigbase.@"internal".migrations;
+const crypto = zigbase.@"internal".crypto;
+const id_gen = zigbase.@"internal".id;
+const files_storage = zigbase.@"internal".files_storage;
 
 /// Zig 0.16 entry point: `main` receives a `std.process.Init` which carries the
 /// process gpa, an arena, and the command-line args. `std.process.argsAlloc`
@@ -145,57 +146,4 @@ fn runSuperuserCreate(allocator: std.mem.Allocator, io: std.Io, sa: cli.Superuse
         return;
     };
     std.log.info("superuser created: {s}", .{email});
-}
-
-test "smoke" {
-    try std.testing.expect(true);
-}
-
-test {
-    _ = @import("db.zig");
-    _ = @import("config.zig");
-    _ = @import("cli.zig");
-    _ = @import("api/error.zig");
-    _ = @import("api/health.zig");
-    _ = @import("api/collections.zig");
-    _ = @import("server.zig");
-    _ = @import("id.zig");
-    _ = @import("schema.zig");
-    _ = @import("ddl.zig");
-    _ = @import("migrations.zig");
-    _ = @import("collections.zig");
-    _ = @import("app.zig");
-    _ = @import("http.zig");
-    _ = @import("router.zig");
-    _ = @import("values.zig");
-    _ = @import("records.zig");
-    _ = @import("api/records.zig");
-    _ = @import("api/auth.zig");
-    _ = @import("query/params.zig");
-    _ = @import("query/lexer.zig");
-    _ = @import("query/parser.zig");
-    _ = @import("query/joiner.zig");
-    _ = @import("query/compiler.zig");
-    _ = @import("query/sort.zig");
-    _ = @import("query/expand.zig");
-    _ = @import("request.zig");
-    _ = @import("rules.zig");
-    _ = @import("crypto.zig");
-    _ = @import("jwt.zig");
-    _ = @import("auth.zig");
-    _ = @import("oauth/secrets.zig");
-    _ = @import("oauth/providers.zig");
-    _ = @import("oauth/client.zig");
-    _ = @import("api/oauth.zig");
-    _ = @import("realtime/protocol.zig");
-    _ = @import("realtime/connection.zig");
-    _ = @import("realtime/hub.zig");
-    _ = @import("realtime/ws.zig");
-    _ = @import("files/naming.zig");
-    _ = @import("files/mime.zig");
-    _ = @import("files/storage.zig");
-    _ = @import("files/plan.zig");
-    _ = @import("files/multipart.zig");
-    _ = @import("api/files.zig");
-    _ = @import("admin.zig");
 }
