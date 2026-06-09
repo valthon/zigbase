@@ -44,7 +44,7 @@ pub const Server = struct {
     host: [:0]const u8,
     port: u16,
 
-    var instance: ?*Server = null;
+    pub var instance: ?*Server = null;
 
     pub fn listen(self: *Server) !void {
         instance = self;
