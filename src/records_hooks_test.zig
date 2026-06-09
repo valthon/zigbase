@@ -17,6 +17,11 @@ const Hooks = struct {
         _ = ev;
         return error.HookRejected;
     }
+    var calls: usize = 0;
+    fn counter(ev: *events.RecordEvent) anyerror!void {
+        _ = ev;
+        calls += 1;
+    }
 };
 
 /// Open a memory DB with a `posts` collection (single text field `title`).
@@ -100,4 +105,26 @@ test "emitRecord after_create swallows hook errors" {
 
     // after_create routes the error to dispatchError + swallows; no error returned.
     try records_api.emitRecord(&app, &rctx, &conn, "posts", &value, .after_create);
+}
+
+test "emitRecord before_create skips a non-object body without firing the hook" {
+    var conn: db.Db = undefined;
+    var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup_arena.deinit();
+    try setupDb(&conn, &setup_arena);
+    defer conn.close();
+
+    const dispatch = events.Dispatch{
+        .record = events.buildRecordDispatcher(.{ .posts = .{ .beforeCreate = Hooks.counter } }),
+    };
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined, .dispatch = &dispatch };
+
+    Hooks.calls = 0;
+    // A non-object JSON body (here an integer) must short-circuit before the hook runs,
+    // so a hook's `ev.record.object` access can't panic on untrusted input.
+    var value: std.json.Value = .{ .integer = 42 };
+    var rctx = request.RequestContext{ .method = "POST" };
+
+    try records_api.emitRecord(&app, &rctx, &conn, "posts", &value, .before_create);
+    try std.testing.expectEqual(@as(usize, 0), Hooks.calls);
 }

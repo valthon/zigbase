@@ -29,6 +29,13 @@ pub fn emitRecord(
 ) !void {
     const d = app.dispatch orelse return;
     const handler = d.record orelse return;
+    const is_before = switch (phase) {
+        .before_create, .before_update, .before_delete => true,
+        else => false,
+    };
+    // before-hooks observe the raw request body; skip non-object bodies so a hook's
+    // `ev.record.object` access can't panic. records.* will reject non-objects with NotObject (400).
+    if (is_before and value.* != .object) return;
     var ev = events.RecordEvent{
         .app = app,
         .ctx = rctx,
@@ -36,10 +43,6 @@ pub fn emitRecord(
         .collection = col_name,
         .record = value,
         .phase = phase,
-    };
-    const is_before = switch (phase) {
-        .before_create, .before_update, .before_delete => true,
-        else => false,
     };
     if (is_before) {
         try handler(&ev);
@@ -160,6 +163,9 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         error.OutOfMemory => return e,
     };
     const rctx = buildContext(ctx, w, data);
+    // A before-hook may `put` NEW keys, which reallocs the map header captured in this
+    // local; downstream MUST read the `_mut` binding (here and for rec_mut/ur_mut/ex_mut
+    // below), not the original const — the binding is the grow-capturing reference.
     var data_mut = data2;
     emitRecord(app, &rctx, w, col.name, &data_mut, .before_create) catch return hookRejected(ctx);
     const rec = switch (rules.decide(col.createRule, &rctx)) {
