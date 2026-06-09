@@ -69,6 +69,7 @@ test {
     _ = @import("cli.zig");
     _ = @import("api/error.zig");
     _ = @import("api/health.zig");
+    _ = @import("api/collections.zig");
     _ = @import("server.zig");
     _ = @import("id.zig");
     _ = @import("schema.zig");
