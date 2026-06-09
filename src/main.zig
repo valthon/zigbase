@@ -111,4 +111,5 @@ test {
     _ = @import("rules.zig");
     _ = @import("crypto.zig");
     _ = @import("jwt.zig");
+    _ = @import("auth.zig");
 }
