@@ -39,6 +39,9 @@ pub fn decimalToScaledInt(s: []const u8, scale: u8) ValueError!i64 {
 
 pub fn scaledIntToDecimal(alloc: std.mem.Allocator, v: i64, scale: u8) ![]u8 {
     if (scale == 0) return std.fmt.allocPrint(alloc, "{d}", .{v});
+    // -minInt(i64) overflows; only reachable via direct DB tampering since
+    // decimalToScaledInt is overflow-checked. Reject rather than panic.
+    if (v == std.math.minInt(i64)) return error.Overflow;
     var pow: i64 = 1;
     var k: u8 = 0;
     while (k < scale) : (k += 1) pow *= 10;
@@ -49,10 +52,12 @@ pub fn scaledIntToDecimal(alloc: std.mem.Allocator, v: i64, scale: u8) ![]u8 {
     var fbuf: [24]u8 = undefined;
     const fs = try std.fmt.bufPrint(&fbuf, "{d}", .{frac_part});
     const pad = scale - @as(u8, @intCast(fs.len));
+    var ibuf: [24]u8 = undefined;
+    const is = try std.fmt.bufPrint(&ibuf, "{d}", .{int_part});
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     if (neg) try out.append(alloc, '-');
-    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d}", .{int_part}));
+    try out.appendSlice(alloc, is);
     try out.append(alloc, '.');
     var p: u8 = 0;
     while (p < pad) : (p += 1) try out.append(alloc, '0');
