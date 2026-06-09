@@ -87,6 +87,40 @@ pub fn fetchIdentity(
     return providers.extractIdentity(alloc, provider, resp.body);
 }
 
+const HttpCtx = struct { io: std.Io, alloc: std.mem.Allocator };
+
+fn httpCall(ctx: *anyopaque, alloc: std.mem.Allocator, method: Method, url: []const u8, headers: []const Header, body: ?[]const u8) TransportError!Response {
+    const hc: *HttpCtx = @ptrCast(@alignCast(ctx));
+    var client = std.http.Client{ .allocator = alloc, .io = hc.io };
+    defer client.deinit();
+
+    const extra = alloc.alloc(std.http.Header, headers.len) catch return error.TransportFailed;
+    for (headers, 0..) |h, i| extra[i] = .{ .name = h.name, .value = h.value };
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    const res = client.fetch(.{
+        .location = .{ .url = url },
+        .method = if (method == .POST) .POST else .GET,
+        .payload = body,
+        .extra_headers = extra,
+        .response_writer = &aw.writer,
+    }) catch return error.TransportFailed;
+
+    return .{ .status = @intFromEnum(res.status), .body = aw.written() };
+}
+
+/// A production transport backed by std.http.Client (TLS via std.crypto.tls). `hc` must outlive use.
+pub fn httpTransport(hc: *HttpCtx) Transport {
+    return .{ .ctx = hc, .call = httpCall };
+}
+
+/// Allocate an HttpCtx bound to (io, alloc) for httpTransport. Caller owns it (arena-friendly).
+pub fn httpContext(alloc: std.mem.Allocator, io: std.Io) !*HttpCtx {
+    const hc = try alloc.create(HttpCtx);
+    hc.* = .{ .io = io, .alloc = alloc };
+    return hc;
+}
+
 // A stub transport that returns canned responses keyed by URL substring.
 const StubTransport = struct {
     token_status: u16 = 200,
@@ -143,4 +177,13 @@ test "fetchIdentity fails on a non-2xx userinfo response" {
     const a = arena.allocator();
     var stub = StubTransport{ .userinfo_status = 401, .userinfo_body = "unauthorized" };
     try std.testing.expectError(error.ProviderError, fetchIdentity(stub.transport(), a, providers.lookup("google").?, "AT"));
+}
+
+test "httpTransport builds a Transport bound to its context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const hc = try httpContext(a, std.testing.io);
+    const t = httpTransport(hc);
+    try std.testing.expect(t.ctx == @as(*anyopaque, @ptrCast(hc)));
 }
