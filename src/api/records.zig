@@ -14,6 +14,7 @@ const rules = @import("../rules.zig");
 const request = @import("../request.zig");
 const auth = @import("../auth.zig");
 const realtime_ws = @import("../realtime/ws.zig");
+const file_plan = @import("../files/plan.zig");
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     const verrs = records.last_errors orelse &[_]schema.ValidationError{};
@@ -64,6 +65,23 @@ fn prepAuthData(ctx: *http.RequestCtx, col: schema.Collection, data: std.json.Va
     };
 }
 
+/// Write the planned uploads for `record_id` via Storage, then delete replaced/removed files.
+/// On a write failure, deletes the files written so far and returns error.StorageFailed (caller
+/// rolls back the record). No-op when no storage is configured (unit tests).
+fn writeUploads(ctx: *http.RequestCtx, col: schema.Collection, record_id: []const u8, writes: []const file_plan.FieldWrite, deletes: []const []const u8) !void {
+    const app = ctx.app.?;
+    const storage = app.storage orelse return;
+    var written: usize = 0;
+    for (writes) |wr| {
+        storage.put(app.io, col.name, record_id, wr.filename, wr.bytes) catch {
+            for (writes[0..written]) |dw| storage.delete(app.io, col.name, record_id, dw.filename) catch {};
+            return error.StorageFailed;
+        };
+        written += 1;
+    }
+    for (deletes) |d| storage.delete(app.io, col.name, record_id, d) catch {};
+}
+
 pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     var r = try app.pool.openReader();
@@ -84,11 +102,20 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
 
 pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    const data = (std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch
+    const raw = if (ctx.form_fields) |ff| ff else (std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch
         return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator)).value;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+
+    const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, raw, ctx.files, null) catch |e| switch (e) {
+        error.TooLarge => return (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator),
+        error.TooMany => return ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator),
+        error.BadMimeType => return ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator),
+        error.OutOfMemory => return e,
+    };
+    const data = all.data;
+
     const data2 = prepAuthData(ctx, col, data, true) catch |e| switch (e) {
         error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
         error.OutOfMemory => return e,
@@ -104,19 +131,33 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         error.Forbidden => return forbidden(ctx),
         else => return e,
     };
-    realtime_ws.broadcast(app, col, .create, rec.object.get("id").?.string, rec);
+    const rid = rec.object.get("id").?.string;
+    writeUploads(ctx, col, rid, all.writes, all.deletes) catch {
+        _ = records.delete(ctx.allocator, w, col, rid) catch {};
+        return ApiError.internal().toResponse(ctx.allocator);
+    };
+    realtime_ws.broadcast(app, col, .create, rid, rec);
     return jsonResponse(ctx, 201, rec);
 }
 
 pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    const data = (std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch
+    const raw = if (ctx.form_fields) |ff| ff else (std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch
         return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator)).value;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if ((try records.get(ctx.allocator, w, col, rid)) == null) return ApiError.notFound().toResponse(ctx.allocator);
+    const existing = (try records.get(ctx.allocator, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+
+    const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, raw, ctx.files, existing) catch |e| switch (e) {
+        error.TooLarge => return (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator),
+        error.TooMany => return ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator),
+        error.BadMimeType => return ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator),
+        error.OutOfMemory => return e,
+    };
+    const data = all.data;
+
     const data2 = prepAuthData(ctx, col, data, false) catch |e| switch (e) {
         error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
         error.OutOfMemory => return e,
@@ -133,6 +174,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         else => return e,
     };
     const ur = updated orelse return ApiError.notFound().toResponse(ctx.allocator);
+    writeUploads(ctx, col, ur.object.get("id").?.string, all.writes, all.deletes) catch {};
     realtime_ws.broadcast(app, col, .update, ur.object.get("id").?.string, ur);
     return jsonResponse(ctx, 200, ur);
 }
@@ -158,6 +200,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         try st.bindText(2, rid);
         _ = try st.step();
     }
+    if (app.storage) |storage| storage.deleteRecord(app.io, col.name, rid) catch {};
     realtime_ws.broadcast(app, col, .delete, rid, null);
     return .{ .status = 204, .body = "" };
 }
