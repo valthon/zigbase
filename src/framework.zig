@@ -19,13 +19,24 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate" };
             for (std.meta.fields(@TypeOf(cfg))) |f| {
-                if (!std.mem.eql(u8, f.name, "hooks") and !std.mem.eql(u8, f.name, "onError"))
-                    @compileError("unknown App cfg field '" ++ f.name ++ "'; expected 'hooks' and/or 'onError'");
+                var ok = false;
+                for (allowed) |name| {
+                    if (std.mem.eql(u8, f.name, name)) ok = true;
+                }
+                if (!ok) @compileError("unknown App cfg field '" ++ f.name ++ "'; expected one of hooks/onError/routes/onAuth/onFileServe/onFileUpload/onBootstrap/onBeforeServe/onBeforeTerminate");
             }
             var d = events.Dispatch{};
             if (@hasField(@TypeOf(cfg), "hooks")) d.record = events.buildRecordDispatcher(cfg.hooks);
             if (@hasField(@TypeOf(cfg), "onError")) d.on_error = cfg.onError;
+            if (@hasField(@TypeOf(cfg), "routes")) d.routes = events.buildRoutes(cfg.routes);
+            if (@hasField(@TypeOf(cfg), "onAuth")) d.on_auth = cfg.onAuth;
+            if (@hasField(@TypeOf(cfg), "onFileServe")) d.on_file_serve = cfg.onFileServe;
+            if (@hasField(@TypeOf(cfg), "onFileUpload")) d.on_file_upload = cfg.onFileUpload;
+            if (@hasField(@TypeOf(cfg), "onBootstrap")) d.on_bootstrap = cfg.onBootstrap;
+            if (@hasField(@TypeOf(cfg), "onBeforeServe")) d.on_before_serve = cfg.onBeforeServe;
+            if (@hasField(@TypeOf(cfg), "onBeforeTerminate")) d.on_before_terminate = cfg.onBeforeTerminate;
             break :blk d;
         };
 
@@ -134,6 +145,19 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
         .storage = &storage_iface,
         .dispatch = dispatch,
     };
+    if (dispatch.on_bootstrap) |h| {
+        var ev = events.LifecycleEvent{ .app = &app };
+        h(&ev);
+    }
+    if (dispatch.on_before_serve) |h| {
+        var ev = events.LifecycleEvent{ .app = &app };
+        h(&ev);
+    }
+    // before_terminate fires when listen() returns (graceful shutdown / error).
+    defer if (dispatch.on_before_terminate) |h| {
+        var ev = events.LifecycleEvent{ .app = &app };
+        h(&ev);
+    };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
     var srv = server.Server{ .app = &app, .host = host_z, .port = cfg.http_port };
@@ -193,4 +217,23 @@ test "App(cfg) builds a record dispatcher only when hooks are present" {
     };
     const WithHook = App(.{ .hooks = .{ .posts = .{ .afterCreate = H.f } } });
     try std.testing.expect(WithHook.dispatch.record != null);
+}
+
+test "App(cfg) assembles custom routes onto dispatch" {
+    const H = struct {
+        fn h(ev: *@import("events.zig").RouteEvent) anyerror!@import("http.zig").Response {
+            _ = ev;
+            return .{ .status = 200, .body = "ok" };
+        }
+    };
+    const A = App(.{ .routes = .{ .{ .method = .GET, .path = "/api/x", .handler = H.h, .auth = .public } } });
+    try std.testing.expectEqual(@as(usize, 1), A.dispatch.routes.len);
+    try std.testing.expectEqualStrings("/api/x", A.dispatch.routes[0].pattern);
+}
+
+test "App(.{}) has no routes and null lifecycle/auth/file handlers" {
+    const A = App(.{});
+    try std.testing.expectEqual(@as(usize, 0), A.dispatch.routes.len);
+    try std.testing.expect(A.dispatch.on_auth == null);
+    try std.testing.expect(A.dispatch.on_bootstrap == null);
 }
