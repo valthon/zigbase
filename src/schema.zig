@@ -70,21 +70,66 @@ pub const Collection = struct {
     updated: []const u8 = "",
 };
 
+pub const OAuth2Provider = struct {
+    name: []const u8,
+    clientId: []const u8 = "",
+    clientSecret: []const u8 = "", // persisted as a "v1:" AES-GCM blob; redacted in API output
+    enabled: bool = true,
+    redirectUrls: []const []const u8 = &.{},
+    // generic-provider overrides (ignored for presets):
+    authURL: ?[]const u8 = null,
+    tokenURL: ?[]const u8 = null,
+    userinfoURL: ?[]const u8 = null,
+    scopes: ?[]const []const u8 = null,
+};
+
+pub const OAuth2Options = struct {
+    enabled: bool = false,
+    providers: []const OAuth2Provider = &.{},
+};
+
 pub const AuthOptions = struct {
     identityFields: []const []const u8 = &.{"email"},
     minPasswordLength: u8 = 8,
+    oauth2: OAuth2Options = .{},
 };
 pub const CollectionOptions = struct {
     auth: AuthOptions = .{},
 };
 
-pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
+pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u8 {
     var root: ObjectMap = .empty;
     var auth: ObjectMap = .empty;
     var ids = std.json.Array.init(alloc);
     for (c.options.auth.identityFields) |f| try ids.append(.{ .string = f });
     try auth.put(alloc, "identityFields", .{ .array = ids });
     try auth.put(alloc, "minPasswordLength", .{ .integer = c.options.auth.minPasswordLength });
+
+    var oauth2: ObjectMap = .empty;
+    try oauth2.put(alloc, "enabled", .{ .bool = c.options.auth.oauth2.enabled });
+    var provs = std.json.Array.init(alloc);
+    for (c.options.auth.oauth2.providers) |p| {
+        var po: ObjectMap = .empty;
+        try po.put(alloc, "name", .{ .string = p.name });
+        try po.put(alloc, "clientId", .{ .string = p.clientId });
+        try po.put(alloc, "clientSecret", .{ .string = if (redact) "" else p.clientSecret });
+        try po.put(alloc, "enabled", .{ .bool = p.enabled });
+        var rus = std.json.Array.init(alloc);
+        for (p.redirectUrls) |u| try rus.append(.{ .string = u });
+        try po.put(alloc, "redirectUrls", .{ .array = rus });
+        if (p.authURL) |u| try po.put(alloc, "authURL", .{ .string = u });
+        if (p.tokenURL) |u| try po.put(alloc, "tokenURL", .{ .string = u });
+        if (p.userinfoURL) |u| try po.put(alloc, "userinfoURL", .{ .string = u });
+        if (p.scopes) |sc| {
+            var sa = std.json.Array.init(alloc);
+            for (sc) |s| try sa.append(.{ .string = s });
+            try po.put(alloc, "scopes", .{ .array = sa });
+        }
+        try provs.append(.{ .object = po });
+    }
+    try oauth2.put(alloc, "providers", .{ .array = provs });
+    try auth.put(alloc, "oauth2", .{ .object = oauth2 });
+
     try root.put(alloc, "auth", .{ .object = auth });
     return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
 }
@@ -104,6 +149,36 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
     };
     if (av.object.get("minPasswordLength")) |mv| if (mv == .integer) {
         opts.auth.minPasswordLength = std.math.cast(u8, mv.integer) orelse 8;
+    };
+    if (av.object.get("oauth2")) |ov| if (ov == .object) {
+        opts.auth.oauth2.enabled = if (ov.object.get("enabled")) |ev| (ev == .bool and ev.bool) else false;
+        if (ov.object.get("providers")) |pv| if (pv == .array) {
+            var list: std.ArrayList(OAuth2Provider) = .empty;
+            for (pv.array.items) |it| {
+                if (it != .object) continue;
+                const o = it.object;
+                var p = OAuth2Provider{ .name = "" };
+                if (o.get("name")) |x| if (x == .string) { p.name = try alloc.dupe(u8, x.string); };
+                if (o.get("clientId")) |x| if (x == .string) { p.clientId = try alloc.dupe(u8, x.string); };
+                if (o.get("clientSecret")) |x| if (x == .string) { p.clientSecret = try alloc.dupe(u8, x.string); };
+                if (o.get("enabled")) |x| if (x == .bool) { p.enabled = x.bool; };
+                if (o.get("redirectUrls")) |x| if (x == .array) {
+                    var rl: std.ArrayList([]const u8) = .empty;
+                    for (x.array.items) |ru| if (ru == .string) try rl.append(alloc, try alloc.dupe(u8, ru.string));
+                    p.redirectUrls = try rl.toOwnedSlice(alloc);
+                };
+                if (o.get("authURL")) |x| if (x == .string) { p.authURL = try alloc.dupe(u8, x.string); };
+                if (o.get("tokenURL")) |x| if (x == .string) { p.tokenURL = try alloc.dupe(u8, x.string); };
+                if (o.get("userinfoURL")) |x| if (x == .string) { p.userinfoURL = try alloc.dupe(u8, x.string); };
+                if (o.get("scopes")) |x| if (x == .array) {
+                    var sl: std.ArrayList([]const u8) = .empty;
+                    for (x.array.items) |sc| if (sc == .string) try sl.append(alloc, try alloc.dupe(u8, sc.string));
+                    p.scopes = try sl.toOwnedSlice(alloc);
+                };
+                try list.append(alloc, p);
+            }
+            opts.auth.oauth2.providers = try list.toOwnedSlice(alloc);
+        };
     };
     return opts;
 }
@@ -602,7 +677,7 @@ pub fn collectionToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
     try root.put(alloc, "deleteRule", optStrValue(c.deleteRule));
     try root.put(alloc, "created", .{ .string = c.created });
     try root.put(alloc, "updated", .{ .string = c.updated });
-    const oparsed = try std.json.parseFromSlice(std.json.Value, alloc, try optionsToJson(alloc, c), .{});
+    const oparsed = try std.json.parseFromSlice(std.json.Value, alloc, try optionsToJson(alloc, c, true), .{});
     defer oparsed.deinit();
     try root.put(alloc, "options", oparsed.value);
     return std.json.Stringify.valueAlloc(alloc, Value{ .object = root }, .{});
@@ -716,7 +791,7 @@ test "collection options round-trip identity fields" {
     defer arena.deinit();
     const a = arena.allocator();
     const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .identityFields = &.{ "email", "username" }, .minPasswordLength = 10 } } };
-    const s = try optionsToJson(a, c);
+    const s = try optionsToJson(a, c, false);
     const back = try optionsFromJson(a, s);
     try std.testing.expectEqual(@as(usize, 2), back.auth.identityFields.len);
     try std.testing.expectEqualStrings("username", back.auth.identityFields[1]);
@@ -751,4 +826,42 @@ test "validate accepts an auth collection with valid identity fields" {
     };
     try validate(a, c, &errs);
     for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_identity_field"));
+}
+
+test "oauth2 options round-trip through optionsToJson(false)/optionsFromJson" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const providers = [_]OAuth2Provider{.{ .name = "google", .clientId = "cid", .clientSecret = "v1:blob", .enabled = true, .redirectUrls = &.{"https://app/cb"} }};
+    const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &providers } } } };
+    const s = try optionsToJson(a, c, false);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"clientSecret\":\"v1:blob\"") != null);
+    const back = try optionsFromJson(a, s);
+    try std.testing.expectEqual(true, back.auth.oauth2.enabled);
+    try std.testing.expectEqual(@as(usize, 1), back.auth.oauth2.providers.len);
+    try std.testing.expectEqualStrings("cid", back.auth.oauth2.providers[0].clientId);
+    try std.testing.expectEqualStrings("v1:blob", back.auth.oauth2.providers[0].clientSecret);
+    try std.testing.expectEqualStrings("https://app/cb", back.auth.oauth2.providers[0].redirectUrls[0]);
+}
+
+test "optionsToJson(true) redacts clientSecret" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const providers = [_]OAuth2Provider{.{ .name = "google", .clientId = "cid", .clientSecret = "v1:blob", .redirectUrls = &.{} }};
+    const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &providers } } } };
+    const s = try optionsToJson(a, c, true);
+    try std.testing.expect(std.mem.indexOf(u8, s, "v1:blob") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"clientSecret\":\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"clientId\":\"cid\"") != null);
+}
+
+test "collectionToJson redacts oauth2 clientSecret" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const providers = [_]OAuth2Provider{.{ .name = "google", .clientId = "cid", .clientSecret = "v1:topsecret", .redirectUrls = &.{} }};
+    const c = Collection{ .id = "id1", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &providers } } } };
+    const out = try collectionToJson(a, c);
+    try std.testing.expect(std.mem.indexOf(u8, out, "topsecret") == null);
 }
