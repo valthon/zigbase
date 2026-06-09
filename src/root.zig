@@ -82,4 +82,5 @@ test {
     _ = @import("data.zig");
     _ = @import("events.zig");
     _ = @import("sentry.zig");
+    _ = @import("records_hooks_test.zig");
 }

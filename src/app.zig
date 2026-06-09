@@ -17,4 +17,6 @@ pub const App = struct {
     file_token_ttl_s: i64 = 120,
     sentry_dsn: []const u8 = "", // "" = log errors to stderr; set to enable Sentry reporting
     storage: ?*const @import("files/storage.zig").Storage = null,
+    /// Type-erased event dispatch built by the comptime App(cfg) builder; null = no subscribers.
+    dispatch: ?*const @import("events.zig").Dispatch = null,
 };
