@@ -110,4 +110,5 @@ test {
     _ = @import("request.zig");
     _ = @import("rules.zig");
     _ = @import("crypto.zig");
+    _ = @import("jwt.zig");
 }
