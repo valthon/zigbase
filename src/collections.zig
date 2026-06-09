@@ -53,6 +53,11 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     errdefer w.rollback() catch {};
     try w.exec(try alloc.dupeZ(u8, try ddl.createTableSql(alloc, ddl_col, null)));
     for (col.indexes) |idx| try w.exec(try alloc.dupeZ(u8, try ddl.createIndexSql(alloc, col.name, idx)));
+    if (col.type == .auth) {
+        for (col.options.auth.identityFields) |idf| {
+            try w.exec(try alloc.dupeZ(u8, try ddl.authIdentityIndexSql(alloc, col.name, idf)));
+        }
+    }
     try insertRow(alloc, w, col);
     try w.commit();
     return full;
@@ -204,6 +209,11 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     errdefer w.rollback() catch {};
     const plan = try ddl.rebuildPlan(alloc, old, ddl_new);
     for (plan) |stmt| try w.exec(try alloc.dupeZ(u8, stmt));
+    if (newc.type == .auth) {
+        for (newc.options.auth.identityFields) |idf| {
+            try w.exec(try alloc.dupeZ(u8, try ddl.authIdentityIndexSql(alloc, newc.name, idf)));
+        }
+    }
     try updateRow(alloc, w, old.id, newc); // persist user fields only
     try w.commit();
     try w.exec("PRAGMA foreign_keys=ON;");
@@ -427,4 +437,25 @@ test "delete drops the table; delete refuses when referenced by a relation" {
     try delete(a, &d, "posts");
     try delete(a, &d, "users");
     try std.testing.expect((try get(a, &d, "posts")) == null);
+}
+
+test "auth collection enforces identity uniqueness via partial unique index, allows multiple empty" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try @import("migrations.zig").run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try create(a, std.testing.io, &d, .{
+        .id = "", .name = "members", .type = .auth,
+        .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
+    });
+    // two distinct emails ok
+    try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('a','','','x@y.z');");
+    try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('b','','','q@y.z');");
+    // duplicate non-empty email rejected (exec maps the SQLite constraint error to ExecFailed)
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('c','','','x@y.z');"));
+    // two empty emails allowed (partial index excludes them)
+    try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('d','','','');");
+    try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('e','','','');");
 }

@@ -136,7 +136,7 @@ pub fn isSystemFieldName(name: []const u8) bool {
 pub fn authSystemFields() []const Field {
     const S = struct {
         const fields = [_]Field{
-            .{ .id = "_email", .name = "email", .unique = true, .options = .{ .email = .{} } },
+            .{ .id = "_email", .name = "email", .options = .{ .email = .{} } }, // uniqueness via partial unique index (see ddl.authIdentityIndexSql)
             .{ .id = "_username", .name = "username", .options = .{ .text = .{} } },
             .{ .id = "_pwhash", .name = "passwordHash", .hidden = true, .options = .{ .text = .{} } },
             .{ .id = "_tokkey", .name = "tokenKey", .hidden = true, .options = .{ .text = .{} } },

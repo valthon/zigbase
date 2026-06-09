@@ -71,6 +71,17 @@ pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.I
     return out.toOwnedSlice(alloc);
 }
 
+/// A partial UNIQUE index enforcing identity uniqueness only over non-empty values:
+///   CREATE UNIQUE INDEX IF NOT EXISTS "idx_auth_<table>_<field>" ON "<table>" ("<field>") WHERE "<field>" != '';
+/// `table` and `field` are validated schema identifiers (injection-safe), but we quote them anyway.
+pub fn authIdentityIndexSql(alloc: std.mem.Allocator, table: []const u8, field: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_auth_{s}_{s}\" ON \"{s}\" (\"{s}\") WHERE \"{s}\" != '';",
+        .{ table, field, table, field, field },
+    );
+}
+
 pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema.Collection) ![]const []u8 {
     var stmts: std.ArrayList([]u8) = .empty;
     errdefer stmts.deinit(alloc);
@@ -167,4 +178,15 @@ test "rebuildPlan copies retained columns by field id, adds new, drops removed" 
     try std.testing.expect(std.mem.indexOf(u8, insert, "\"title\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan[2], "DROP TABLE \"posts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan[3], "RENAME TO \"posts\"") != null);
+}
+
+test "authIdentityIndexSql builds a partial unique index over non-empty values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sql = try authIdentityIndexSql(a, "users", "email");
+    try std.testing.expectEqualStrings(
+        "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_auth_users_email\" ON \"users\" (\"email\") WHERE \"email\" != '';",
+        sql,
+    );
 }
