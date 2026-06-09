@@ -34,9 +34,22 @@ fn init_0002(w: *db.Db) db.DbError!void {
     );
 }
 
+fn init_0003(w: *db.Db) db.DbError!void {
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_externalAuths" (
+        \\  "id" TEXT PRIMARY KEY, "collectionRef" TEXT NOT NULL, "recordRef" TEXT NOT NULL,
+        \\  "provider" TEXT NOT NULL, "providerId" TEXT NOT NULL,
+        \\  "created" TEXT NOT NULL, "updated" TEXT NOT NULL
+        \\);
+    );
+    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_extauth_provider_pid\" ON \"_externalAuths\" (\"provider\",\"providerId\");");
+    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_extauth_rec_provider\" ON \"_externalAuths\" (\"collectionRef\",\"recordRef\",\"provider\");");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
+    .{ .name = "0003_external_auths", .up = init_0003 },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {
@@ -102,4 +115,18 @@ test "0002 adds options column and seeds _superusers" {
     defer c.finalize();
     _ = try c.step();
     try std.testing.expectEqual(@as(i64, 1), c.columnInt(0));
+}
+
+test "0003 creates _externalAuths with unique provider/providerId and per-record indexes" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try run(&d);
+    var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('_externalAuths');");
+    defer t.finalize();
+    _ = try t.step();
+    try std.testing.expect(t.columnInt(0) >= 7);
+    try d.exec("INSERT INTO \"_externalAuths\" (\"id\",\"collectionRef\",\"recordRef\",\"provider\",\"providerId\",\"created\",\"updated\") VALUES ('e1','users','r1','google','G1','','');");
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"_externalAuths\" (\"id\",\"collectionRef\",\"recordRef\",\"provider\",\"providerId\",\"created\",\"updated\") VALUES ('e2','users','r2','google','G1','','');"));
+    try d.exec("INSERT INTO \"_externalAuths\" (\"id\",\"collectionRef\",\"recordRef\",\"provider\",\"providerId\",\"created\",\"updated\") VALUES ('e3','users','r1','github','H1','','');");
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"_externalAuths\" (\"id\",\"collectionRef\",\"recordRef\",\"provider\",\"providerId\",\"created\",\"updated\") VALUES ('e4','users','r1','github','H2','','');"));
 }

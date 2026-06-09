@@ -174,4 +174,8 @@ test {
     _ = @import("crypto.zig");
     _ = @import("jwt.zig");
     _ = @import("auth.zig");
+    _ = @import("oauth/secrets.zig");
+    _ = @import("oauth/providers.zig");
+    _ = @import("oauth/client.zig");
+    _ = @import("api/oauth.zig");
 }

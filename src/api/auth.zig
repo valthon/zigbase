@@ -27,7 +27,7 @@ fn strField(obj: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
-fn nowUnix(conn: *db.Db) db.DbError!i64 {
+pub fn nowUnix(conn: *db.Db) db.DbError!i64 {
     var st = try conn.prepare("SELECT unixepoch('now');");
     defer st.finalize();
     _ = try st.step();
@@ -55,7 +55,7 @@ fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, ri
     return try alloc.dupe(u8, st.columnText(0));
 }
 
-fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
+pub fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\" FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
     var st = try conn.prepare(sql);
     defer st.finalize();
@@ -64,9 +64,9 @@ fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: [
     return try alloc.dupe(u8, st.columnText(0));
 }
 
-const Issued = struct { token: []const u8, cookies: [2]http.Cookie };
+pub const Issued = struct { token: []const u8, cookies: [2]http.Cookie };
 
-fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: []const u8, token_key: []const u8) !Issued {
+pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: []const u8, token_key: []const u8) !Issued {
     const app = ctx.app.?;
     const csrf = try crypto.genToken(app.io, ctx.allocator, 32);
     const now = try nowUnix(conn);
