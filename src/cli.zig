@@ -9,6 +9,7 @@ pub const ServeArgs = struct {
 pub const Command = union(enum) {
     help,
     serve: ServeArgs,
+    migrate: ServeArgs,
 };
 
 pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValue };
@@ -18,6 +19,19 @@ pub fn parse(args: []const []const u8) ParseError!Command {
     if (args.len == 0) return .help;
     if (std.mem.eql(u8, args[0], "help") or std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h"))
         return .help;
+    if (std.mem.eql(u8, args[0], "migrate")) {
+        var sa = ServeArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--data-dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                sa.data_dir = args[i];
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .migrate = sa };
+    }
     if (!std.mem.eql(u8, args[0], "serve")) return ParseError.UnknownCommand;
 
     var sa = ServeArgs{};
@@ -54,6 +68,11 @@ test "serve with all three flags" {
     try std.testing.expectEqualStrings("127.0.0.1", cmd.serve.http_host.?);
     try std.testing.expectEqual(@as(u16, 9000), cmd.serve.http_port.?);
     try std.testing.expectEqualStrings("/tmp/zb", cmd.serve.data_dir.?);
+}
+
+test "migrate command parses --data-dir" {
+    const cmd = try parse(&.{ "migrate", "--data-dir", "/tmp/zb" });
+    try std.testing.expectEqualStrings("/tmp/zb", cmd.migrate.data_dir.?);
 }
 
 test "unknown command errors" {
