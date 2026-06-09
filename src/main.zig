@@ -189,4 +189,5 @@ test {
     _ = @import("files/mime.zig");
     _ = @import("files/storage.zig");
     _ = @import("files/plan.zig");
+    _ = @import("files/multipart.zig");
 }

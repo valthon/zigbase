@@ -9,6 +9,7 @@ const records_api = @import("api/records.zig");
 const auth_api = @import("api/auth.zig");
 const oauth_api = @import("api/oauth.zig");
 const realtime_ws = @import("realtime/ws.zig");
+const files_multipart = @import("files/multipart.zig");
 const ApiError = @import("api/error.zig").ApiError;
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -99,6 +100,13 @@ fn onRequest(r: zap.Request) !void {
     ctx.authorization = r.getHeader("authorization") orelse "";
     ctx.cookie_header = r.getHeader("cookie") orelse "";
     ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
+    ctx.content_type = r.getHeader("content-type") orelse "";
+    if (std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) {
+        if (files_multipart.extract(r, arena.allocator())) |ex| {
+            ctx.form_fields = ex.form_fields;
+            ctx.files = ex.files;
+        } else |_| {}
+    }
     const resp = router.dispatch(&routes, &ctx) catch
         ApiError.internal().toResponse(arena.allocator()) catch {
             setZapStatus(r, 500);
@@ -122,6 +130,15 @@ fn onRequest(r: zap.Request) !void {
                 .none => .None,
             },
         }) catch {};
+    }
+    for (resp.extra_headers) |h| r.setHeader(h.name, h.value) catch {};
+    if (resp.file_path) |path| {
+        r.sendFile(path) catch {
+            setZapStatus(r, 404);
+            r.setContentType(.JSON) catch {};
+            r.sendBody("{\"code\":404,\"message\":\"Not found.\",\"data\":{}}") catch {};
+        };
+        return;
     }
     r.setContentType(.JSON) catch {};
     r.sendBody(resp.body) catch {};
