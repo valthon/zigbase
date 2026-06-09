@@ -154,16 +154,26 @@ The same map drives both the records drawer editor and (for the type options) th
 
 ## 7. Testing strategy
 
-No JS toolchain ships with ZigBase, so:
+Two layers — the Zig serving layer is unit-tested in-process, and the SPA is exercised by **automated
+headless-browser end-to-end tests**:
 - **The Zig serving layer is unit-tested** (`src/admin.zig` via the handler/`RequestCtx` test
   pattern): `GET /_/` returns the embedded `index.html` (Content-Type text/html); `/_/assets/app.js`
   returns the embedded bytes with `application/javascript` + `nosniff`; `/_/assets/style.css` →
   `text/css`; an unknown asset → 404; a non-asset `/_/x/y` falls back to `index.html`.
-- **The SPA itself is smoke/manual-validated** via a live browser session against a running server:
-  log in as a superuser; create a collection with varied field types + access rules; add/edit/delete
-  a record including a file upload and a relation; watch a live event land in the table; configure an
-  OAuth2 provider and confirm the secret is redacted on reload. (A scripted check can drive the API
-  the SPA uses, but the rendered UI is human-verified.)
+- **Automated headless-browser tests** drive a real Chromium against a running `zigbase` server,
+  asserting the rendered UI + behavior. Tooling: **Python + Playwright** (the prior sub-projects'
+  smokes already used Python; `pip install playwright` + `playwright install chromium`). This is a
+  **test-time dependency only** — it is NOT part of `zig build`, the runtime, or the single binary;
+  the build stays zero-Node. The tests live under `tests/admin/` (e.g. `test_admin.py`) and run as a
+  dedicated step (the SP9 "smoke" becomes this automated suite), seeding via the `superuser create`
+  CLI + the API. Coverage grows with the slices:
+  - *9a flows:* load `/_/`, log in as a superuser (assert redirect to `#/collections`), see the
+    collections in the sidebar, open a collection and see its records table paginate/filter; a bad
+    login shows an error; an unauthenticated deep-link bounces to `#/login`.
+  - *9b flows:* create a collection with several field types + access rules and see it appear;
+    open the record drawer, create/edit/delete a record including a **file upload** and a
+    **relation**; trigger a change via the API and assert the table updates **live**; configure an
+    OAuth2 provider and confirm the secret is **redacted** after reload.
 - **Holistic review** focuses on the serving layer + the client's auth/CSRF/token handling: no JWT in
   storage; CSRF header sent on writes; the realtime token held in memory only; `nosniff` on assets;
   the `/_/` routes don't leak server files (only embedded assets are served — no arbitrary path read);
@@ -178,14 +188,16 @@ No JS toolchain ships with ZigBase, so:
   API client + `#/login` + the collapsible sidebar + collections list + the records **table**
   (read-only, paginated/filter/sort)).
 - `src/admin.zig` (`@embedFile` + handlers) + `server.zig` routes + the **unit tests** for serving.
+- The **headless-browser test harness** (`tests/admin/`) + the 9a flows (login, sidebar, browse).
 - Result: you can load `/_/`, log in as a superuser, see collections and browse records.
 
 **9b — authoring + realtime (completes the admin):**
 - The schema editor (Fields / API Rules / Auth+OAuth2 tabs, with the OAuth2 provider config).
 - The record drawer editor (all field types, file upload, relations, validation-error surfacing).
 - The realtime live-view (auth-refresh token → WS → subscribe → apply events).
-- Live smoke (full browser walkthrough), holistic security review, then **merge SP9 → `main`**,
-  completing the 9-sub-project ZigBase roadmap.
+- The 9b headless-browser flows (create-collection, drawer edit, file upload, relation, live update,
+  OAuth config + redaction), holistic security review, then **merge SP9 → `main`**, completing the
+  9-sub-project ZigBase roadmap.
 
 ---
 
@@ -193,7 +205,9 @@ No JS toolchain ships with ZigBase, so:
 
 - Log / request viewer (needs a new backend log store + API).
 - General settings/config UI; superuser management UI (CLI exists).
-- Rich-text (WYSIWYG) editor for `editor` fields (plain textarea for now).
+- Rich-text (WYSIWYG) editor for `editor` fields — **confirmed wanted, deferred to a post-MVP
+  iteration**; the MVP renders `editor` fields as a plain textarea, and the type→control map is the
+  single place a WYSIWYG control later slots in.
 - View-collection (SQL view) editing UI; import/export; API-docs/preview screen.
 - A JS build pipeline / framework upgrade (intentionally avoided to keep the single-binary, no-node
   build).
