@@ -5,3 +5,7 @@ zig-pkg/
 *.db
 *.db-wal
 *.db-shm
+.superpowers/
+
+tests/admin/__pycache__/
+.pytest_cache/
