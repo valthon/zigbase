@@ -94,9 +94,9 @@ fn findLink(alloc: std.mem.Allocator, conn: *db.Db, provider: []const u8, provid
     return .{ .collectionRef = try alloc.dupe(u8, st.columnText(0)), .recordRef = try alloc.dupe(u8, st.columnText(1)) };
 }
 
-fn insertLink(io_unused: std.Io, alloc: std.mem.Allocator, conn: *db.Db, collection_ref: []const u8, record_ref: []const u8, provider: []const u8, provider_id: []const u8) !void {
+fn insertLink(io: std.Io, alloc: std.mem.Allocator, conn: *db.Db, collection_ref: []const u8, record_ref: []const u8, provider: []const u8, provider_id: []const u8) !void {
     _ = alloc;
-    var rid = id.collectionId(io_unused);
+    var rid = id.collectionId(io);
     var st = try conn.prepare(
         \\INSERT INTO "_externalAuths" ("id","collectionRef","recordRef","provider","providerId","created","updated")
         \\ VALUES (?1,?2,?3,?4,?5,datetime('now'),datetime('now'));
