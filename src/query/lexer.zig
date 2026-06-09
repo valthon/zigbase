@@ -40,6 +40,8 @@ pub fn lex(alloc: std.mem.Allocator, input: []const u8) LexError![]Token {
                 if (c == '-' or (c >= '0' and c <= '9')) {
                     const start = i;
                     i += 1;
+                    // a lone '-' is not a number
+                    if (c == '-' and (i >= input.len or input[i] < '0' or input[i] > '9')) return error.UnexpectedChar;
                     while (i < input.len and ((input[i] >= '0' and input[i] <= '9') or input[i] == '.')) : (i += 1) {}
                     try toks.append(alloc, .{ .kind = .number, .text = input[start..i] });
                 } else if (isIdentStart(c)) {
