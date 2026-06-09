@@ -378,7 +378,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     if (q.filter) |fstr| if (fstr.len > 0) {
         const toks = try lexer.lex(alloc, fstr);
         const ast = try parser.parse(alloc, toks);
-        const compiled = try compiler.compile(alloc, &j, ast);
+        const compiled = try compiler.compile(alloc, &j, ast, null);
         where_sql = compiled.where_sql;
         params = compiled.params;
     };
