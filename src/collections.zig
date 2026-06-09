@@ -87,10 +87,11 @@ fn bindOptText(st: *db.Stmt, idx: c_int, v: ?[]const u8) db.DbError!void {
 fn insertRow(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EngineError!void {
     const schema_json = try schema.fieldsToJson(alloc, col.fields);
     const indexes_json = try schema.indexesToJson(alloc, col.indexes);
+    const options_json = try schema.optionsToJson(alloc, col);
     var st = try w.prepare(
         \\INSERT INTO "_collections"
-        \\ (id,name,type,system,schema,indexes,listRule,viewRule,createRule,updateRule,deleteRule,created,updated)
-        \\ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11, datetime('now'), datetime('now'));
+        \\ (id,name,type,system,schema,indexes,listRule,viewRule,createRule,updateRule,deleteRule,options,created,updated)
+        \\ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12, datetime('now'), datetime('now'));
     );
     defer st.finalize();
     try st.bindText(1, col.id);
@@ -104,11 +105,12 @@ fn insertRow(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) Engine
     try bindOptText(&st, 9, col.createRule);
     try bindOptText(&st, 10, col.updateRule);
     try bindOptText(&st, 11, col.deleteRule);
+    try st.bindText(12, options_json);
     _ = try st.step();
 }
 
 const select_cols =
-    \\SELECT id,name,type,system,schema,indexes,listRule,viewRule,createRule,updateRule,deleteRule,created,updated FROM "_collections"
+    \\SELECT id,name,type,system,schema,indexes,listRule,viewRule,createRule,updateRule,deleteRule,created,updated,options FROM "_collections"
 ;
 
 fn dupOptText(alloc: std.mem.Allocator, st: *db.Stmt, idx: c_int) !?[]const u8 {
@@ -139,6 +141,7 @@ fn rowToCollection(alloc: std.mem.Allocator, st: *db.Stmt) EngineError!schema.Co
         .deleteRule = try dupOptText(alloc, st, 10),
         .created = try alloc.dupe(u8, st.columnText(11)),
         .updated = try alloc.dupe(u8, st.columnText(12)),
+        .options = try schema.optionsFromJson(alloc, st.columnText(13)),
     };
 }
 
@@ -269,7 +272,11 @@ test "create persists a collection and builds its physical table" {
     try std.testing.expectEqualStrings("posts", got.name);
     try std.testing.expectEqual(@as(usize, 2), got.fields.len);
     const all = try list(arena.allocator(), &d);
-    try std.testing.expectEqual(@as(usize, 1), all.len);
+    var user_count: usize = 0;
+    for (all) |c| if (!c.system) {
+        user_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), user_count);
 }
 
 test "create rejects an invalid collection" {

@@ -65,9 +65,48 @@ pub const Collection = struct {
     createRule: ?[]const u8 = null,
     updateRule: ?[]const u8 = null,
     deleteRule: ?[]const u8 = null,
+    options: CollectionOptions = .{},
     created: []const u8 = "",
     updated: []const u8 = "",
 };
+
+pub const AuthOptions = struct {
+    identityFields: []const []const u8 = &.{"email"},
+    minPasswordLength: u8 = 8,
+};
+pub const CollectionOptions = struct {
+    auth: AuthOptions = .{},
+};
+
+pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
+    var root: ObjectMap = .empty;
+    var auth: ObjectMap = .empty;
+    var ids = std.json.Array.init(alloc);
+    for (c.options.auth.identityFields) |f| try ids.append(.{ .string = f });
+    try auth.put(alloc, "identityFields", .{ .array = ids });
+    try auth.put(alloc, "minPasswordLength", .{ .integer = c.options.auth.minPasswordLength });
+    try root.put(alloc, "auth", .{ .object = auth });
+    return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
+}
+
+pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptions {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return .{};
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return .{};
+    const av = root.object.get("auth") orelse return .{};
+    if (av != .object) return .{};
+    var opts = CollectionOptions{};
+    if (av.object.get("identityFields")) |idv| if (idv == .array) {
+        var list: std.ArrayList([]const u8) = .empty;
+        for (idv.array.items) |it| if (it == .string) try list.append(alloc, try alloc.dupe(u8, it.string));
+        if (list.items.len > 0) opts.auth.identityFields = try list.toOwnedSlice(alloc);
+    };
+    if (av.object.get("minPasswordLength")) |mv| if (mv == .integer) {
+        opts.auth.minPasswordLength = std.math.cast(u8, mv.integer) orelse 8;
+    };
+    return opts;
+}
 
 /// Find a field by exact name (case-sensitive). Returns null if absent.
 pub fn fieldByName(c: Collection, name: []const u8) ?Field {
@@ -522,6 +561,10 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
         .createRule = try dupOptStr(alloc, objGetStr(obj, "createRule")),
         .updateRule = try dupOptStr(alloc, objGetStr(obj, "updateRule")),
         .deleteRule = try dupOptStr(alloc, objGetStr(obj, "deleteRule")),
+        .options = if (obj.object.get("options")) |ov|
+            try optionsFromJson(alloc, try std.json.Stringify.valueAlloc(alloc, ov, .{}))
+        else
+            .{},
     };
 }
 
@@ -551,6 +594,7 @@ pub fn collectionToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
     try root.put(alloc, "deleteRule", optStrValue(c.deleteRule));
     try root.put(alloc, "created", .{ .string = c.created });
     try root.put(alloc, "updated", .{ .string = c.updated });
+    try root.put(alloc, "options", (try std.json.parseFromSlice(std.json.Value, alloc, try optionsToJson(alloc, c), .{})).value);
     return std.json.Stringify.valueAlloc(alloc, Value{ .object = root }, .{});
 }
 
@@ -655,4 +699,16 @@ test "indexes round-trip" {
     try std.testing.expectEqual(@as(usize, 1), back.len);
     try std.testing.expectEqualStrings("idx_title", back[0].name);
     try std.testing.expect(back[0].unique);
+}
+
+test "collection options round-trip identity fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .identityFields = &.{ "email", "username" }, .minPasswordLength = 10 } } };
+    const s = try optionsToJson(a, c);
+    const back = try optionsFromJson(a, s);
+    try std.testing.expectEqual(@as(usize, 2), back.auth.identityFields.len);
+    try std.testing.expectEqualStrings("username", back.auth.identityFields[1]);
+    try std.testing.expectEqual(@as(u8, 10), back.auth.minPasswordLength);
 }
