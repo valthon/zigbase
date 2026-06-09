@@ -511,7 +511,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     return .{ .page = page, .perPage = per, .totalItems = total, .items = try items.toOwnedSlice(alloc) };
 }
 
-fn bindParams(st: *db.Stmt, params: []const compiler.Param, start: c_int) !c_int {
+pub fn bindParams(st: *db.Stmt, params: []const compiler.Param, start: c_int) !c_int {
     var idx = start;
     for (params) |p| {
         switch (p) {
