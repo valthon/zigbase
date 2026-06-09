@@ -177,4 +177,5 @@ test {
     _ = @import("oauth/secrets.zig");
     _ = @import("oauth/providers.zig");
     _ = @import("oauth/client.zig");
+    _ = @import("api/oauth.zig");
 }
