@@ -66,6 +66,13 @@ fn runMigrate(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void
 
 fn runServe(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
     const cfg = try loadCfg(sa);
+    if (std.mem.eql(u8, cfg.jwt_secret, "dev-insecure-secret-change-me")) {
+        if (cfg.cookie_secure) {
+            std.log.err("refusing to start: ZIGBASE_JWT_SECRET is unset/default while cookie_secure is enabled; set a strong secret", .{});
+            return error.InsecureJwtSecret;
+        }
+        std.log.warn("ZIGBASE_JWT_SECRET is using the insecure default; set it before production.", .{});
+    }
     var pool = try openPool(allocator, io, cfg);
     defer pool.deinit();
     {
