@@ -153,6 +153,118 @@ pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 // ----------------------------------------------------------------------------
+// Email verification & password reset
+// ----------------------------------------------------------------------------
+
+fn findByEmail(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, email: []const u8) !?[]const u8 {
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE \"email\" = ?1 AND \"email\" != '' LIMIT 1;", .{col.name}, 0);
+    var st = try conn.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, email);
+    if (try st.step()) return try alloc.dupe(u8, st.columnText(0));
+    return null;
+}
+
+fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid: []const u8, token_key: []const u8, tt: jwt.TokenType, ttl: i64) ![]const u8 {
+    const app = ctx.app.?;
+    const now = try nowUnix(conn);
+    const key = crypto.deriveKey(app.jwt_secret, token_key);
+    return jwt.sign(ctx.allocator, .{ .id = rid, .collection = col_name, .type = tt, .iat = now, .exp = now + ttl }, &key);
+}
+
+fn loadAuthCollection(ctx: *http.RequestCtx, conn: *db.Db) !?schema.Collection {
+    const col_name = ctx.param("col") orelse return null;
+    const col = (try collections.get(ctx.allocator, conn, col_name)) orelse return null;
+    if (col.type != .auth) return null;
+    return col;
+}
+
+/// Verify a typed token against the record's derived key. Returns claims on success.
+fn verifyTyped(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, token: []const u8, want: jwt.TokenType) !?jwt.Claims {
+    const app = ctx.app.?;
+    const claims = jwt.peekClaims(ctx.allocator, token) catch return null;
+    if (claims.type != want) return null;
+    if (!std.mem.eql(u8, claims.collection, col.name)) return null;
+    const tk = (try tokenKeyFor(ctx.allocator, conn, col.name, claims.id)) orelse return null;
+    const key = crypto.deriveKey(app.jwt_secret, tk);
+    const now = try nowUnix(conn);
+    const verified = jwt.verify(ctx.allocator, token, &key, now) catch return null;
+    return verified;
+}
+
+pub fn requestVerification(ctx: *http.RequestCtx) anyerror!http.Response {
+    const app = ctx.app.?;
+    const w = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
+    const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+    if (strField(body, "email")) |email| {
+        if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
+            if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
+                const token = try mintToken(ctx, w, col.name, rid, tk, .verification, app.verification_ttl_s);
+                std.log.info("verification token for {s}/{s}: {s}", .{ col.name, email, token });
+            }
+        }
+    }
+    return .{ .status = 204, .body = "" };
+}
+
+pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
+    const app = ctx.app.?;
+    const w = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
+    const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+    const token = strField(body, "token") orelse return ApiError.badRequest("token is required.").toResponse(ctx.allocator);
+    const claims = (try verifyTyped(ctx, w, col, token, .verification)) orelse
+        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
+    const sql = try std.fmt.allocPrintSentinel(ctx.allocator, "UPDATE \"{s}\" SET \"verified\" = 1 WHERE \"id\" = ?1;", .{col.name}, 0);
+    var st = try w.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, claims.id);
+    _ = try st.step();
+    return .{ .status = 200, .body = "{\"verified\":true}" };
+}
+
+pub fn requestPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
+    const app = ctx.app.?;
+    const w = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
+    const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+    if (strField(body, "email")) |email| {
+        if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
+            if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
+                const token = try mintToken(ctx, w, col.name, rid, tk, .password_reset, app.password_reset_ttl_s);
+                std.log.info("password-reset token for {s}/{s}: {s}", .{ col.name, email, token });
+            }
+        }
+    }
+    return .{ .status = 204, .body = "" };
+}
+
+pub fn confirmPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
+    const app = ctx.app.?;
+    const w = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
+    const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+    const token = strField(body, "token") orelse return ApiError.badRequest("token is required.").toResponse(ctx.allocator);
+    const password = strField(body, "password") orelse return ApiError.badRequest("password is required.").toResponse(ctx.allocator);
+    const claims = (try verifyTyped(ctx, w, col, token, .password_reset)) orelse
+        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
+    if (password.len < col.options.auth.minPasswordLength)
+        return ApiError.badRequest("Password too short.").toResponse(ctx.allocator);
+    var data: std.json.ObjectMap = .empty;
+    try data.put(ctx.allocator, "password", .{ .string = password });
+    const updated = auth.applyUpdate(app.io, ctx.allocator, .{ .object = data }, col.options.auth.minPasswordLength) catch
+        return ApiError.badRequest("Invalid password.").toResponse(ctx.allocator);
+    _ = records.update(ctx.allocator, w, col, claims.id, updated) catch
+        return ApiError.internal().toResponse(ctx.allocator);
+    return .{ .status = 200, .body = "{\"success\":true}" };
+}
+
+// ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
 
@@ -216,6 +328,31 @@ const TestEnv = struct {
 
     fn ctx(env: *TestEnv, a: std.mem.Allocator, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
         return .{ .method = m, .path = "/", .body = body, .allocator = a, .app = &env.app, .params = params };
+    }
+
+    /// Mint a typed token (verification/password_reset) for the record matching `email`.
+    fn mintTyped(self: *TestEnv, a: std.mem.Allocator, col_name: []const u8, email: []const u8, tt: jwt.TokenType) ![]const u8 {
+        const w = self.pool.acquireWriter();
+        defer self.pool.releaseWriter();
+        const col = (try collections.get(a, w, col_name)).?;
+        const rid = (try findByIdentity(a, w, col, email)).?;
+        const tk = (try tokenKeyFor(a, w, col.name, rid)).?;
+        const now = try nowUnix(w);
+        const key = crypto.deriveKey(self.app.jwt_secret, tk);
+        return jwt.sign(a, .{ .id = rid, .collection = col_name, .type = tt, .iat = now, .exp = now + 100000 }, &key);
+    }
+
+    fn recordVerified(self: *TestEnv, a: std.mem.Allocator, col_name: []const u8, email: []const u8) bool {
+        const w = self.pool.acquireWriter();
+        defer self.pool.releaseWriter();
+        const col = (collections.get(a, w, col_name) catch return false).?;
+        const rid = (findByIdentity(a, w, col, email) catch return false) orelse return false;
+        const sql = std.fmt.allocPrintSentinel(a, "SELECT \"verified\" FROM \"{s}\" WHERE \"id\" = ?1;", .{col.name}, 0) catch return false;
+        var st = w.prepare(sql) catch return false;
+        defer st.finalize();
+        st.bindText(1, rid) catch return false;
+        if (!(st.step() catch return false)) return false;
+        return st.columnInt(0) != 0;
     }
 };
 
@@ -284,4 +421,41 @@ test "auth-with-password then authenticate round-trips the issued token (bearer)
     var refresh = env.ctx(a, .POST, "", &p);
     refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
+}
+
+test "verification: request always 204; confirm sets verified=true" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "v@x.io", "longenough");
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+
+    var req = env.ctx(a, .POST, "{\"email\":\"v@x.io\"}", &p);
+    try std.testing.expectEqual(@as(u16, 204), (try requestVerification(&req)).status);
+    var req_missing = env.ctx(a, .POST, "{\"email\":\"nobody@x.io\"}", &p);
+    try std.testing.expectEqual(@as(u16, 204), (try requestVerification(&req_missing)).status);
+
+    const token = try env.mintTyped(a, "users", "v@x.io", .verification);
+    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
+    var conf = env.ctx(a, .POST, body, &p);
+    try std.testing.expectEqual(@as(u16, 200), (try confirmVerification(&conf)).status);
+    try std.testing.expect(env.recordVerified(a, "users", "v@x.io"));
+}
+
+test "password reset: confirm changes the password and rotates the token" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "r@x.io", "oldpassword");
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    const token = try env.mintTyped(a, "users", "r@x.io", .password_reset);
+    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
+    var conf = env.ctx(a, .POST, body, &p);
+    try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&conf)).status);
+    var conf2 = env.ctx(a, .POST, body, &p);
+    try std.testing.expectEqual(@as(u16, 400), (try confirmPasswordReset(&conf2)).status);
 }
