@@ -147,6 +147,13 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         .check => if (!try rules.matches(ctx.allocator, w, col, rid, col.deleteRule.?, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
     }
     if (!try records.delete(ctx.allocator, w, col, rid)) return ApiError.notFound().toResponse(ctx.allocator);
+    if (col.type == .auth) {
+        var st = try w.prepare("DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
+        defer st.finalize();
+        try st.bindText(1, col.name);
+        try st.bindText(2, rid);
+        _ = try st.step();
+    }
     return .{ .status = 204, .body = "" };
 }
 

@@ -212,6 +212,53 @@ pub fn authWithOAuth2(ctx: *http.RequestCtx) anyerror!http.Response {
     return authWithOAuth2Impl(ctx, oauth_client.httpTransport(hc));
 }
 
+fn linkCount(alloc: std.mem.Allocator, conn: *db.Db, collection_ref: []const u8, record_ref: []const u8) !i64 {
+    _ = alloc;
+    var st = try conn.prepare("SELECT COUNT(*) FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
+    defer st.finalize();
+    try st.bindText(1, collection_ref);
+    try st.bindText(2, record_ref);
+    _ = try st.step();
+    return st.columnInt(0);
+}
+
+fn passwordIsSet(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !bool {
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM \"{s}\" WHERE \"id\"=?1;", .{table}, 0);
+    var st = try conn.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, rid);
+    if (!try st.step()) return false;
+    return st.columnText(0).len > 0;
+}
+
+/// DELETE /api/collections/:col/records/:id/external-auths/:provider — self or superuser.
+pub fn unlinkProvider(ctx: *http.RequestCtx) anyerror!http.Response {
+    const app = ctx.app.?;
+    const w = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
+    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const provider = ctx.param("provider") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const col = (try collections.get(ctx.allocator, w, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
+
+    const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, w) catch null) orelse
+        return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+    const is_self = std.mem.eql(u8, authed.collection, col.name) and std.mem.eql(u8, authed.record.object.get("id").?.string, rid);
+    if (!authed.is_superuser and !is_self) return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+
+    if ((try linkCount(ctx.allocator, w, col.name, rid)) <= 1 and !(try passwordIsSet(ctx.allocator, w, col.name, rid)))
+        return (ApiError{ .status = 400, .message = "Cannot remove the last credential." }).toResponse(ctx.allocator);
+
+    var st = try w.prepare("DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2 AND \"provider\"=?3 RETURNING \"id\";");
+    defer st.finalize();
+    try st.bindText(1, col.name);
+    try st.bindText(2, rid);
+    try st.bindText(3, provider);
+    if (!try st.step()) return ApiError.notFound().toResponse(ctx.allocator);
+    return .{ .status = 204, .body = "" };
+}
+
 const app_mod = @import("../app.zig");
 const migrations = @import("../migrations.zig");
 
@@ -397,4 +444,83 @@ test "anonymous oauth create colliding email -> 409" {
     var stub = OAuthStub{ .pid = "P9", .email = "u@x.io" };
     var c = env.ctx(a, .POST, try oauthBody(a), &p);
     try std.testing.expectEqual(@as(u16, 409), (try authWithOAuth2Impl(&c, stub.transport())).status);
+}
+
+fn linkOne(env: *TestEnv, a: std.mem.Allocator, col: []const u8, rid: []const u8, provider: []const u8, pid: []const u8) !void {
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    try insertLink(std.testing.io, a, w, col, rid, provider, pid);
+}
+
+test "unlink refuses the last credential of a password-less account" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.seedOAuthCollection(a, "users");
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"passwordHash\",\"tokenKey\",\"verified\") VALUES ('r1','','','u@x.io','','tk',1);");
+    }
+    try linkOne(env, a, "users", "r1", "google", "P1");
+    const jwt = @import("../jwt.zig");
+    const crypto2 = @import("../crypto.zig");
+    const key = crypto2.deriveKey(env.app.jwt_secret, "tk");
+    const token = try jwt.sign(a, .{ .id = "r1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    const p = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "id", .value = "r1" }, .{ .key = "provider", .value = "google" } };
+    var c = env.ctx(a, .DELETE, "", &p);
+    c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    try std.testing.expectEqual(@as(u16, 400), (try unlinkProvider(&c)).status);
+}
+
+test "unlink succeeds when another credential remains (password set)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.seedOAuthCollection(a, "users");
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"passwordHash\",\"tokenKey\",\"verified\") VALUES ('r2','','','u2@x.io','$argon2id$x','tk2',1);");
+    }
+    try linkOne(env, a, "users", "r2", "google", "P2");
+    const jwt = @import("../jwt.zig");
+    const crypto2 = @import("../crypto.zig");
+    const key = crypto2.deriveKey(env.app.jwt_secret, "tk2");
+    const token = try jwt.sign(a, .{ .id = "r2", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    const p = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "id", .value = "r2" }, .{ .key = "provider", .value = "google" } };
+    var c = env.ctx(a, .DELETE, "", &p);
+    c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    try std.testing.expectEqual(@as(u16, 204), (try unlinkProvider(&c)).status);
+}
+
+test "deleting an auth record removes its external-auth links" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.seedOAuthCollection(a, "users");
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('r3','','','u3@x.io','tk3',1);");
+    }
+    try linkOne(env, a, "users", "r3", "google", "P3");
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const col = (try collections.get(a, w, "users")).?;
+        _ = try records.delete(a, w, col, "r3");
+        var st = try w.prepare("DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
+        defer st.finalize();
+        try st.bindText(1, "users");
+        try st.bindText(2, "r3");
+        _ = try st.step();
+        try std.testing.expectEqual(@as(i64, 0), try linkCount(a, w, "users", "r3"));
+    }
 }
