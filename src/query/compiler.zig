@@ -39,7 +39,16 @@ fn opSql(op: lexer.TokKind) []const u8 {
         .le => "<=",
         .like => "LIKE",
         .nlike => "NOT LIKE",
-        else => "=",
+        else => unreachable, // parser only produces comparison ops in a cmp node
+    };
+}
+
+/// LIKE only makes sense on text-stored columns; reject it on number/bool fields.
+fn likeAllowed(field: ?schema.Field) bool {
+    const f = field orelse return true; // system columns (id/created/updated) are text
+    return switch (f.options) {
+        .number, .@"bool" => false,
+        else => true,
     };
 }
 
@@ -59,6 +68,7 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
     const col = try j.resolve(col_operand.path);
 
     if (c.op == .like or c.op == .nlike) {
+        if (!likeAllowed(col.field)) return error.BadValue;
         const term = try literalToText(lit_operand);
         try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{term}) });
         return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op) });
@@ -208,4 +218,28 @@ test "compile rejects an unknown field" {
     const posts = try setup(&d, a);
     var j = joiner.Joiner.init(a, &d, posts);
     try std.testing.expectError(error.UnknownField, compileFilter(a, &d, posts, "nonsuch = 1", &j));
+}
+
+test "SQL injection: string literal with metacharacters stays in params, never in where_sql" {
+    // The dangerous literal contains SQL metacharacters that could break out of a
+    // parameter position if ever interpolated directly.  The correct behaviour is:
+    // where_sql must be exactly `"posts"."title" = ?` and the raw dangerous string
+    // must appear verbatim in params[0].text.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    // Use single-quotes in the filter so the double-quote inside the value is not
+    // the filter string delimiter, letting us embed " characters in the value.
+    const dangerous = "x\" OR \"1\"=\"1; DROP TABLE posts;--";
+    const filter = "title = 'x\" OR \"1\"=\"1; DROP TABLE posts;--'";
+    const c = try compileFilter(a, &d, posts, filter, &j);
+    // (a) where_sql must be exactly the parameterised form — no injected SQL
+    try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
+    // (b) the dangerous text must be bound as the first (and only) parameter
+    try std.testing.expectEqual(@as(usize, 1), c.params.len);
+    try std.testing.expectEqualStrings(dangerous, c.params[0].text);
 }

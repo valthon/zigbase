@@ -2,7 +2,6 @@ const std = @import("std");
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
-const ddl = @import("../ddl.zig");
 
 pub const JoinError = error{ UnknownField, NotARelation, MultiRelationTraversal } || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".return_type.?).error_union.error_set;
 
