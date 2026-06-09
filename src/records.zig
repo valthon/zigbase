@@ -147,15 +147,17 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Colle
     var next: usize = 2;
     for (col.fields) |f| {
         const provided = data.object.get(f.name);
-        if (f.required and (provided == null or isEmpty(provided.?))) {
-            try errs.append(alloc, .{ .field = f.name, .code = "validation_required", .message = "Missing required value." });
-            continue;
-        }
+        // autodate is server-set, so it must be handled before the required check
+        // (a required autodate field correctly receives no client value).
         if (f.fieldType() == .autodate) {
             try cols.append(alloc, ',');
             try cols.appendSlice(alloc, try ddl.quoteIdent(alloc, f.name));
             try vals.append(alloc, ',');
             try vals.appendSlice(alloc, if (f.options.autodate.onCreate) "strftime('%Y-%m-%dT%H:%M:%SZ','now')" else "NULL");
+            continue;
+        }
+        if (f.required and (provided == null or isEmpty(provided.?))) {
+            try errs.append(alloc, .{ .field = f.name, .code = "validation_required", .message = "Missing required value." });
             continue;
         }
         if (provided) |pv| {
