@@ -101,4 +101,5 @@ test {
     _ = @import("records.zig");
     _ = @import("api/records.zig");
     _ = @import("query/params.zig");
+    _ = @import("query/lexer.zig");
 }
