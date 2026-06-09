@@ -4,6 +4,7 @@ const App = @import("app.zig").App;
 const request = @import("request.zig");
 const Data = @import("data.zig").Data;
 const sentry = @import("sentry.zig");
+const http = @import("http.zig");
 
 // NOTE: adding a variant requires updating phaseFieldName() and the consumer-facing camelCase field name.
 pub const RecordPhase = enum {
@@ -41,12 +42,97 @@ pub const ErrorEvent = struct {
 pub const RecordHandler = *const fn (ev: *RecordEvent) anyerror!void;
 pub const ErrorHandler = *const fn (ev: *ErrorEvent) void;
 
+pub const AuthLevel = enum { public, authed, superuser };
+
+pub const RouteEvent = struct {
+    app: *App,
+    ctx: *http.RequestCtx,
+    /// Resolved request/auth context (auth identity, is_superuser, method). Built by
+    /// the framework before the handler runs; `.public` routes still get it (anonymous).
+    rctx: request.RequestContext,
+};
+pub const RouteHandler = *const fn (ev: *RouteEvent) anyerror!http.Response;
+
+/// A custom route after comptime assembly. The framework matches method+pattern
+/// (reusing router.matchPath), enforces `auth`, then calls `handler`.
+pub const RuntimeRoute = struct {
+    method: http.Method,
+    pattern: []const u8,
+    handler: RouteHandler,
+    auth: AuthLevel,
+};
+
+pub const AuthEvent = struct {
+    app: *App,
+    ctx: *const request.RequestContext,
+    collection: []const u8,
+    record: ?std.json.Value,
+    method: enum { password, oauth2 },
+};
+pub const AuthHandler = *const fn (ev: *AuthEvent) void;
+
+pub const FileEvent = struct {
+    app: *App,
+    ctx: *const request.RequestContext,
+    collection: []const u8,
+    record_id: []const u8,
+    filename: []const u8,
+};
+/// beforeServe may return error to deny (framework -> 404); afterUpload errors -> backstop.
+pub const FileServeHandler = *const fn (ev: *FileEvent) anyerror!void;
+pub const FileUploadHandler = *const fn (ev: *FileEvent) void;
+
+pub const LifecycleEvent = struct { app: *App };
+pub const LifecycleHandler = *const fn (ev: *LifecycleEvent) void;
+
+/// `@compileError` on any route spec missing a required field (`.method`/`.path`/
+/// `.handler`) or with a wrong-typed handler, mirroring `validateHooks`. `.auth` is
+/// optional (defaults to `.superuser`) so it is intentionally not required here.
+fn validateRouteSpecs(comptime specs: anytype) void {
+    inline for (std.meta.fields(@TypeOf(specs))) |f| {
+        const s = @field(specs, f.name);
+        if (!@hasField(@TypeOf(s), "method")) @compileError("route spec is missing '.method' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
+        if (!@hasField(@TypeOf(s), "path")) @compileError("route spec is missing '.path' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
+        if (!@hasField(@TypeOf(s), "handler")) @compileError("route spec is missing '.handler' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
+        // Assert the handler coerces to RouteHandler so a wrong-typed handler fails loudly too.
+        const _h: RouteHandler = s.handler;
+        _ = _h;
+    }
+}
+
+/// Assemble a comptime tuple of route specs into a runtime route table. Each spec is
+/// `.{ .method, .path, .handler, .auth = .public|.authed|.superuser }`; `.auth` defaults
+/// to `.superuser` (safe default) when omitted.
+pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
+    comptime validateRouteSpecs(specs);
+    const fields = std.meta.fields(@TypeOf(specs));
+    // A struct-namespace const has static lifetime, so &Holder.table is a valid []const returnable at runtime (a plain comptime local is not).
+    const Holder = struct {
+        const table: [fields.len]RuntimeRoute = blk: {
+            var t: [fields.len]RuntimeRoute = undefined;
+            for (fields, 0..) |f, i| {
+                const s = @field(specs, f.name);
+                const auth: AuthLevel = if (@hasField(@TypeOf(s), "auth")) s.auth else .superuser;
+                t[i] = .{ .method = s.method, .pattern = s.path, .handler = s.handler, .auth = auth };
+            }
+            break :blk t;
+        };
+    };
+    return &Holder.table;
+}
+
 /// Runtime, type-erased dispatch surface stored on `App`. The comptime App(cfg)
 /// builder (a later task) fills these with generated functions; null = no subscribers.
 pub const Dispatch = struct {
     record: ?RecordHandler = null,
     on_error: ?ErrorHandler = null,
-    // routes + cron added in a later plan (10b)
+    routes: []const RuntimeRoute = &.{},
+    on_auth: ?AuthHandler = null,
+    on_file_serve: ?FileServeHandler = null,
+    on_file_upload: ?FileUploadHandler = null,
+    on_bootstrap: ?LifecycleHandler = null,
+    on_before_serve: ?LifecycleHandler = null,
+    on_before_terminate: ?LifecycleHandler = null,
 };
 
 /// Map a comptime RecordPhase to its hook-config field name.
@@ -240,4 +326,40 @@ test "only the matching phase's handler runs" {
     ev.phase = .after_create;
     try dispatch(&ev);
     try std.testing.expectEqual(@as(usize, 1), H.after_calls);
+}
+
+test "buildRoutes assembles a runtime route table preserving order, method, pattern, auth" {
+    const H = struct {
+        fn a(ev: *RouteEvent) anyerror!http.Response {
+            _ = ev;
+            return .{ .status = 200, .body = "a" };
+        }
+        fn b(ev: *RouteEvent) anyerror!http.Response {
+            _ = ev;
+            return .{ .status = 200, .body = "b" };
+        }
+    };
+    const table = buildRoutes(.{
+        .{ .method = .GET, .path = "/api/x", .handler = H.a, .auth = .public },
+        .{ .method = .POST, .path = "/api/y", .handler = H.b, .auth = .superuser },
+    });
+    try std.testing.expectEqual(@as(usize, 2), table.len);
+    try std.testing.expect(table[0].method == .GET);
+    try std.testing.expectEqualStrings("/api/x", table[0].pattern);
+    try std.testing.expect(table[0].auth == .public);
+    try std.testing.expect(table[1].method == .POST);
+    try std.testing.expect(table[1].auth == .superuser);
+}
+
+test "buildRoutes defaults auth to .superuser when omitted" {
+    const H = struct {
+        fn a(ev: *RouteEvent) anyerror!http.Response {
+            _ = ev;
+            return .{ .status = 200, .body = "a" };
+        }
+    };
+    const table = buildRoutes(.{
+        .{ .method = .GET, .path = "/api/secret", .handler = H.a },
+    });
+    try std.testing.expect(table[0].auth == .superuser);
 }
