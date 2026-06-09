@@ -56,7 +56,7 @@ pub fn lex(alloc: std.mem.Allocator, input: []const u8) LexError![]Token {
     return toks.toOwnedSlice(alloc);
 }
 
-fn isIdentStart(c: u8) bool { return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'; }
+fn isIdentStart(c: u8) bool { return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '@'; }
 fn isIdentChar(c: u8) bool { return isIdentStart(c) or (c >= '0' and c <= '9') or c == '.'; }
 
 test "lex a relation-path comparison" {
@@ -70,4 +70,14 @@ test "lex a relation-path comparison" {
     try std.testing.expectEqualStrings("author.name", toks[0].text);
     try std.testing.expectEqualStrings("ab", toks[2].text);
     try std.testing.expectEqualStrings("10.5", toks[6].text);
+}
+
+test "lex an @request macro path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const toks = try lex(arena.allocator(), "owner = @request.auth.id");
+    try std.testing.expectEqual(TokKind.ident, toks[0].kind);
+    try std.testing.expectEqual(TokKind.eq, toks[1].kind);
+    try std.testing.expectEqual(TokKind.ident, toks[2].kind);
+    try std.testing.expectEqualStrings("@request.auth.id", toks[2].text);
 }

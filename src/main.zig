@@ -107,4 +107,6 @@ test {
     _ = @import("query/compiler.zig");
     _ = @import("query/sort.zig");
     _ = @import("query/expand.zig");
+    _ = @import("request.zig");
+    _ = @import("rules.zig");
 }

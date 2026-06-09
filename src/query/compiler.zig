@@ -5,27 +5,28 @@ const parser = @import("parser.zig");
 const lexer = @import("lexer.zig");
 const joiner = @import("joiner.zig");
 const values = @import("../values.zig");
+const request = @import("../request.zig");
 
 pub const Param = union(enum) { text: []const u8, int: i64, double: f64 };
 pub const CompileError = error{ BadFilter, BadValue } || joiner.JoinError || values.ValueError;
 
 pub const Compiled = struct { where_sql: []const u8, params: []const Param };
 
-pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node) CompileError!Compiled {
+pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, rctx: ?*const request.RequestContext) CompileError!Compiled {
     var params: std.ArrayList(Param) = .empty;
-    const sql = try emit(alloc, j, node, &params);
+    const sql = try emit(alloc, j, node, &params, rctx);
     return .{ .where_sql = sql, .params = try params.toOwnedSlice(alloc) };
 }
 
-fn emit(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, params: *std.ArrayList(Param)) CompileError![]u8 {
+fn emit(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext) CompileError![]u8 {
     switch (node.*) {
         .logic => |lg| {
-            const l = try emit(alloc, j, lg.l, params);
-            const r = try emit(alloc, j, lg.r, params);
+            const l = try emit(alloc, j, lg.l, params, rctx);
+            const r = try emit(alloc, j, lg.r, params, rctx);
             const conj = if (lg.op == .l_and) "AND" else "OR";
             return std.fmt.allocPrint(alloc, "({s} {s} {s})", .{ l, conj, r });
         },
-        .cmp => |c| return emitCmp(alloc, j, c, params),
+        .cmp => |c| return emitCmp(alloc, j, c, params, rctx),
     }
 }
 
@@ -54,29 +55,71 @@ fn likeAllowed(field: ?schema.Field) bool {
 
 const Cmp = @TypeOf(@as(parser.Node, undefined).cmp);
 
-fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param)) CompileError![]u8 {
-    const lhs_path = (c.lhs == .path);
-    const rhs_path = (c.rhs == .path);
-    if (lhs_path and rhs_path) {
+fn isColPath(op: parser.Operand) bool {
+    return op == .path and (op.path.len == 0 or op.path[0] != '@');
+}
+
+fn operandToText(op: parser.Operand, rctx: ?*const request.RequestContext) CompileError![]const u8 {
+    switch (op) {
+        .path => |p| {
+            if (p.len > 0 and p[0] == '@') {
+                const rc = rctx orelse return error.BadFilter;
+                return rc.resolveMacro(p) orelse return error.BadFilter;
+            }
+            return error.BadFilter;
+        },
+        else => return literalToText(op),
+    }
+}
+
+fn operandToParam(field: ?schema.Field, op: parser.Operand, rctx: ?*const request.RequestContext) CompileError!Param {
+    switch (op) {
+        .path => |p| {
+            if (p.len > 0 and p[0] == '@') {
+                const rc = rctx orelse return error.BadFilter;
+                return .{ .text = rc.resolveMacro(p) orelse return error.BadFilter };
+            }
+            return error.BadFilter;
+        },
+        else => return literalToParam(field, op),
+    }
+}
+
+fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext) CompileError![]u8 {
+    const l_col = isColPath(c.lhs);
+    const r_col = isColPath(c.rhs);
+
+    if (l_col and r_col) {
         const lc = try j.resolve(c.lhs.path);
         const rc = try j.resolve(c.rhs.path);
         return std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ lc.sql, opSql(c.op), rc.sql });
     }
-    const col_operand = if (lhs_path) c.lhs else c.rhs;
-    const lit_operand = if (lhs_path) c.rhs else c.lhs;
-    if (col_operand != .path) return error.BadFilter;
-    const col = try j.resolve(col_operand.path);
 
-    if (c.op == .like or c.op == .nlike) {
-        if (!likeAllowed(col.field)) return error.BadValue;
-        const term = try literalToText(lit_operand);
-        try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{term}) });
-        return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op) });
+    if (l_col or r_col) {
+        const col = if (l_col) try j.resolve(c.lhs.path) else try j.resolve(c.rhs.path);
+        const val_op = if (l_col) c.rhs else c.lhs;
+        if (c.op == .like or c.op == .nlike) {
+            if (!likeAllowed(col.field)) return error.BadValue;
+            const term = try operandToText(val_op, rctx);
+            try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{term}) });
+            return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op) });
+        }
+        try params.append(alloc, try operandToParam(col.field, val_op, rctx));
+        if (l_col) return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op) });
+        return std.fmt.allocPrint(alloc, "? {s} {s}", .{ opSql(c.op), col.sql });
     }
 
-    try params.append(alloc, try literalToParam(col.field, lit_operand));
-    if (lhs_path) return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op) });
-    return std.fmt.allocPrint(alloc, "? {s} {s}", .{ opSql(c.op), col.sql });
+    // neither side is a column: both are macros/literals -> bind both as text
+    if (c.op == .like or c.op == .nlike) {
+        const lt = try operandToText(c.lhs, rctx);
+        const rt = try operandToText(c.rhs, rctx);
+        try params.append(alloc, .{ .text = lt });
+        try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{rt}) });
+        return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op)});
+    }
+    try params.append(alloc, .{ .text = try operandToText(c.lhs, rctx) });
+    try params.append(alloc, .{ .text = try operandToText(c.rhs, rctx) });
+    return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op)});
 }
 
 fn literalToText(op: parser.Operand) CompileError![]const u8 {
@@ -126,7 +169,7 @@ fn compileFilter(a: std.mem.Allocator, d: *db.Db, posts: schema.Collection, filt
     _ = posts;
     const toks = try lexer.lex(a, filter);
     const ast = try parser.parse(a, toks);
-    return compile(a, j, ast);
+    return compile(a, j, ast, null);
 }
 
 test "compile text equality binds the literal" {
@@ -242,4 +285,52 @@ test "SQL injection: string literal with metacharacters stays in params, never i
     // (b) the dangerous text must be bound as the first (and only) parameter
     try std.testing.expectEqual(@as(usize, 1), c.params.len);
     try std.testing.expectEqualStrings(dangerous, c.params[0].text);
+}
+
+test "compile a macro rule binds the auth id as a param" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var auth: std.json.ObjectMap = .empty;
+    try auth.put(a, "id", .{ .string = "u1" });
+    const rctx = request.RequestContext{ .auth = .{ .object = auth } };
+    const toks = try lexer.lex(a, "title = @request.auth.id");
+    const ast = try parser.parse(a, toks);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compile(a, &j, ast, &rctx);
+    try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
+    try std.testing.expectEqualStrings("u1", c.params[0].text);
+}
+
+test "compile @ path without a context errors" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    const toks = try lexer.lex(a, "title = @request.auth.id");
+    const ast = try parser.parse(a, toks);
+    var j = joiner.Joiner.init(a, &d, posts);
+    try std.testing.expectError(error.BadFilter, compile(a, &j, ast, null));
+}
+
+test "compile a method-vs-literal rule binds both as text" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    const rctx = request.RequestContext{ .method = "GET" };
+    const toks = try lexer.lex(a, "@request.method = \"GET\"");
+    const ast = try parser.parse(a, toks);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compile(a, &j, ast, &rctx);
+    try std.testing.expectEqualStrings("? = ?", c.where_sql);
+    try std.testing.expectEqualStrings("GET", c.params[0].text);
+    try std.testing.expectEqualStrings("GET", c.params[1].text);
 }

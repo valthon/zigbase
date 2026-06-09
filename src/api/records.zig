@@ -10,8 +10,8 @@ const ApiError = @import("error.zig").ApiError;
 const FieldError = @import("error.zig").FieldError;
 const params_mod = @import("../query/params.zig");
 const expand_mod = @import("../query/expand.zig");
-
-// TODO(SP4): enforce the collection's list/view/create/update/delete rules.
+const rules = @import("../rules.zig");
+const request = @import("../request.zig");
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     const verrs = records.last_errors orelse &[_]schema.ValidationError{};
@@ -29,12 +29,27 @@ fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value) !http.Res
     return .{ .status = status, .body = try std.json.Stringify.valueAlloc(ctx.allocator, v, .{}) };
 }
 
+/// SP4: an empty request context (SP5 fills auth/superuser from the verified token).
+fn buildContext(ctx: *http.RequestCtx, data: ?std.json.Value) request.RequestContext {
+    return .{ .auth = null, .is_superuser = false, .data = data, .method = @tagName(ctx.method) };
+}
+
+fn forbidden(ctx: *http.RequestCtx) !http.Response {
+    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+}
+
 pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     var r = try app.pool.openReader();
     defer r.close();
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const rctx = buildContext(ctx, null);
+    switch (rules.decide(col.viewRule, &rctx)) {
+        .deny_locked => return ApiError.notFound().toResponse(ctx.allocator),
+        .allow => {},
+        .check => if (!try rules.matches(ctx.allocator, &r, col, rid, col.viewRule.?, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
+    }
     var rec = (try records.get(ctx.allocator, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const qp = try params_mod.parse(ctx.allocator, ctx.query);
     if (qp.get("expand")) |exp| if (exp.len > 0) try expand_mod.expand(ctx.allocator, &r, col, &rec, exp, 0);
@@ -48,9 +63,15 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rec = records.create(ctx.allocator, app.io, w, col, data) catch |e| switch (e) {
+    const rctx = buildContext(ctx, data);
+    const rec = switch (rules.decide(col.createRule, &rctx)) {
+        .deny_locked => return forbidden(ctx),
+        .allow => records.create(ctx.allocator, app.io, w, col, data),
+        .check => records.createGuarded(ctx.allocator, app.io, w, col, data, try rules.compileGuard(ctx.allocator, w, col, col.createRule.?, &rctx)),
+    } catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         error.NotObject => return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator),
+        error.Forbidden => return forbidden(ctx),
         else => return e,
     };
     return jsonResponse(ctx, 201, rec);
@@ -64,12 +85,19 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rec = (records.update(ctx.allocator, w, col, rid, data) catch |e| switch (e) {
+    if ((try records.get(ctx.allocator, w, col, rid)) == null) return ApiError.notFound().toResponse(ctx.allocator);
+    const rctx = buildContext(ctx, data);
+    const updated = switch (rules.decide(col.updateRule, &rctx)) {
+        .deny_locked => return forbidden(ctx),
+        .allow => records.update(ctx.allocator, w, col, rid, data),
+        .check => records.updateGuarded(ctx.allocator, w, col, rid, data, try rules.compileGuard(ctx.allocator, w, col, col.updateRule.?, &rctx)),
+    } catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         error.NotObject => return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator),
+        error.Forbidden => return ApiError.notFound().toResponse(ctx.allocator),
         else => return e,
-    }) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    return jsonResponse(ctx, 200, rec);
+    };
+    return jsonResponse(ctx, 200, updated orelse return ApiError.notFound().toResponse(ctx.allocator));
 }
 
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -78,6 +106,13 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    if ((try records.get(ctx.allocator, w, col, rid)) == null) return ApiError.notFound().toResponse(ctx.allocator);
+    const rctx = buildContext(ctx, null);
+    switch (rules.decide(col.deleteRule, &rctx)) {
+        .deny_locked => return forbidden(ctx),
+        .allow => {},
+        .check => if (!try rules.matches(ctx.allocator, w, col, rid, col.deleteRule.?, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
+    }
     if (!try records.delete(ctx.allocator, w, col, rid)) return ApiError.notFound().toResponse(ctx.allocator);
     return .{ .status = 204, .body = "" };
 }
@@ -87,7 +122,13 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     var r = try app.pool.openReader();
     defer r.close();
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-
+    const rctx = buildContext(ctx, null);
+    var rule_expr: ?[]const u8 = null;
+    switch (rules.decide(col.listRule, &rctx)) {
+        .deny_locked => return forbidden(ctx),
+        .allow => {},
+        .check => rule_expr = col.listRule,
+    }
     const qp = try params_mod.parse(ctx.allocator, ctx.query);
     const page = parseU32(qp.get("page"), 1);
     const perPage = parseU32(qp.get("perPage"), 30);
@@ -97,6 +138,8 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         .sort = qp.get("sort"),
         .page = page,
         .perPage = perPage,
+        .rule = rule_expr,
+        .rctx = &rctx,
     }) catch |e| switch (e) {
         error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString =>
             return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
@@ -144,8 +187,11 @@ const TestEnv = struct {
             var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer setup_arena.deinit();
             const sa = setup_arena.allocator();
-            const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
-            _ = try collections.create(sa, std.testing.io, w, .{ .id = "", .name = "posts", .fields = &fields });
+            _ = try collections.create(sa, std.testing.io, w, .{
+                .id = "", .name = "posts",
+                .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
+                .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            });
         }
         env.app = .{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = &env.pool };
         return env;
@@ -211,4 +257,45 @@ test "list handler returns the page envelope" {
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"totalItems\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"page\":1") != null);
+}
+
+fn seedRuled(env: *TestEnv, name: []const u8, listR: ?[]const u8, viewR: ?[]const u8, createR: ?[]const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    _ = try collections.create(a, std.testing.io, w, .{
+        .id = "", .name = name,
+        .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
+        .listRule = listR, .viewRule = viewR, .createRule = createR,
+    });
+}
+
+test "locked (null) collection: list 403, create 403" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedRuled(env, "locked", null, null, null);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = [_]http.Param{.{ .key = "col", .value = "locked" }};
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "", .allocator = a, .app = &env.app, .params = &p };
+    try std.testing.expectEqual(@as(u16, 403), (try list(&lctx)).status);
+    var cctx = ctxFor(env, a, .POST, "{\"title\":\"x\"}", &p);
+    try std.testing.expectEqual(@as(u16, 403), (try create(&cctx)).status);
+}
+
+test "createRule on request data: empty title -> 403, nonempty -> 201" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedRuled(env, "guarded", "", "", "@request.data.title != \"\"");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = [_]http.Param{.{ .key = "col", .value = "guarded" }};
+    var bad = ctxFor(env, a, .POST, "{\"title\":\"\"}", &p);
+    try std.testing.expectEqual(@as(u16, 403), (try create(&bad)).status);
+    var ok = ctxFor(env, a, .POST, "{\"title\":\"hello\"}", &p);
+    try std.testing.expectEqual(@as(u16, 201), (try create(&ok)).status);
 }

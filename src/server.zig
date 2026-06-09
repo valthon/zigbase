@@ -61,6 +61,7 @@ fn setZapStatus(r: zap.Request, status: u16) void {
         201 => .created,
         204 => .no_content,
         400 => .bad_request,
+        403 => .forbidden,
         404 => .not_found,
         409 => .conflict,
         422 => .unprocessable_content,
