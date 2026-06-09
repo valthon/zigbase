@@ -183,4 +183,5 @@ test {
     _ = @import("realtime/connection.zig");
     _ = @import("realtime/hub.zig");
     _ = @import("realtime/ws.zig");
+    _ = @import("files/naming.zig");
 }
