@@ -13,6 +13,7 @@ const expand_mod = @import("../query/expand.zig");
 const rules = @import("../rules.zig");
 const request = @import("../request.zig");
 const auth = @import("../auth.zig");
+const realtime_ws = @import("../realtime/ws.zig");
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     const verrs = records.last_errors orelse &[_]schema.ValidationError{};
@@ -103,6 +104,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         error.Forbidden => return forbidden(ctx),
         else => return e,
     };
+    realtime_ws.broadcast(app, col, .create, rec.object.get("id").?.string, rec);
     return jsonResponse(ctx, 201, rec);
 }
 
@@ -130,7 +132,9 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         error.Forbidden => return ApiError.notFound().toResponse(ctx.allocator),
         else => return e,
     };
-    return jsonResponse(ctx, 200, updated orelse return ApiError.notFound().toResponse(ctx.allocator));
+    const ur = updated orelse return ApiError.notFound().toResponse(ctx.allocator);
+    realtime_ws.broadcast(app, col, .update, ur.object.get("id").?.string, ur);
+    return jsonResponse(ctx, 200, ur);
 }
 
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -154,6 +158,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         try st.bindText(2, rid);
         _ = try st.step();
     }
+    realtime_ws.broadcast(app, col, .delete, rid, null);
     return .{ .status = 204, .body = "" };
 }
 

@@ -8,6 +8,7 @@ const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
 const auth_api = @import("api/auth.zig");
 const oauth_api = @import("api/oauth.zig");
+const realtime_ws = @import("realtime/ws.zig");
 const ApiError = @import("api/error.zig").ApiError;
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -43,13 +44,14 @@ pub const Server = struct {
     host: [:0]const u8,
     port: u16,
 
-    var instance: ?*Server = null;
+    pub var instance: ?*Server = null;
 
     pub fn listen(self: *Server) !void {
         instance = self;
-        var listener = zap.HttpListener.init(.{ .port = self.port, .on_request = onRequest, .log = false });
+        var listener = zap.HttpListener.init(.{ .port = self.port, .on_request = onRequest, .on_upgrade = realtime_ws.handleUpgrade, .log = false });
         try listener.listen();
         std.log.info("zigbase listening on http://{s}:{d}", .{ self.host, self.port });
+        realtime_ws.active = true; // reactor about to run; allow broadcast to publish
         zap.start(.{ .threads = 4, .workers = 1 });
     }
 };
