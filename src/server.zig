@@ -82,6 +82,9 @@ fn onRequest(r: zap.Request) !void {
         .allocator = arena.allocator(),
         .app = self.app,
     };
+    ctx.authorization = r.getHeader("authorization") orelse "";
+    ctx.cookie_header = r.getHeader("cookie") orelse "";
+    ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
     const resp = router.dispatch(&routes, &ctx) catch
         ApiError.internal().toResponse(arena.allocator()) catch {
             setZapStatus(r, 500);
@@ -90,6 +93,22 @@ fn onRequest(r: zap.Request) !void {
             return;
         };
     setZapStatus(r, resp.status);
+    for (resp.cookies) |c| {
+        r.setCookie(.{
+            .name = c.name,
+            .value = c.value,
+            .path = c.path,
+            .max_age_s = @intCast(c.max_age_s),
+            .secure = c.secure,
+            .http_only = c.http_only,
+            .same_site = switch (c.same_site) {
+                .default => .Default,
+                .lax => .Lax,
+                .strict => .Strict,
+                .none => .None,
+            },
+        }) catch {};
+    }
     r.setContentType(.JSON) catch {};
     r.sendBody(resp.body) catch {};
 }
