@@ -56,6 +56,16 @@ pub fn emitRecord(
     }
 }
 
+/// Fire file.afterUpload once per written file. After-style: never propagates.
+fn emitFileUploads(app: *app_mod.App, rctx: *const request.RequestContext, col_name: []const u8, record_id: []const u8, writes: []const file_plan.FieldWrite) void {
+    const d = app.dispatch orelse return;
+    const h = d.on_file_upload orelse return;
+    for (writes) |wr| {
+        var ev = events.FileEvent{ .app = app, .ctx = rctx, .collection = col_name, .record_id = record_id, .filename = wr.filename };
+        h(&ev);
+    }
+}
+
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     const verrs = records.last_errors orelse &[_]schema.ValidationError{};
     const fes = try ctx.allocator.alloc(FieldError, verrs.len);
@@ -191,6 +201,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         _ = records.delete(ctx.allocator, w, col, rid) catch {};
         return ApiError.internal().toResponse(ctx.allocator);
     };
+    emitFileUploads(app, &rctx, col.name, rid, all.writes);
     var rec_mut = rec;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &rec_mut, .after_create) catch {};
     realtime_ws.broadcast(app, col, .create, rid, rec_mut);
@@ -256,6 +267,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.notFound().toResponse(ctx.allocator);
     };
     if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch {};
+    emitFileUploads(app, &rctx, col.name, rid, all.writes);
     // Capture id BEFORE the after-hook so a hook that mutates/removes "id" can't panic the broadcast.
     const broadcast_id = ur.object.get("id").?.string;
     var ur_mut = ur;
