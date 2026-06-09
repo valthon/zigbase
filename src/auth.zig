@@ -25,7 +25,7 @@ pub fn applyCreate(io: std.Io, alloc: std.mem.Allocator, data: std.json.Value, m
     }
     try out.put(alloc, "passwordHash", .{ .string = phc });
     try out.put(alloc, "tokenKey", .{ .string = tk });
-    if (out.get("verified") == null) try out.put(alloc, "verified", .{ .bool = false });
+    try out.put(alloc, "verified", .{ .bool = false }); // never trust a client-supplied verified flag
     return .{ .object = out };
 }
 
@@ -88,4 +88,16 @@ test "applyUpdate rotates tokenKey when a new password is given, no-ops otherwis
     const same = try applyUpdate(std.testing.io, a, .{ .object = no_pw }, 8);
     try std.testing.expect(same.object.get("tokenKey") == null); // unchanged
     try std.testing.expectEqualStrings("hi", same.object.get("bio").?.string);
+}
+
+test "applyCreate forces verified=false even if the client sends verified=true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "email", .{ .string = "a@b.c" });
+    try data.put(a, "password", .{ .string = "longenough" });
+    try data.put(a, "verified", .{ .bool = true });
+    const out = try applyCreate(std.testing.io, a, .{ .object = data }, 8);
+    try std.testing.expectEqual(false, out.object.get("verified").?.bool);
 }

@@ -65,6 +65,19 @@ pub fn verify(alloc: std.mem.Allocator, token: []const u8, key: []const u8, now:
     return claims;
 }
 
+/// Decode the payload of a compact JWS WITHOUT verifying the signature or expiry.
+/// Used to locate the record (id/collection) before its signing key is known.
+/// The returned claims MUST then be confirmed with `verify` using the record's key.
+pub fn peekClaims(alloc: std.mem.Allocator, token: []const u8) JwtError!Claims {
+    var it = std.mem.splitScalar(u8, token, '.');
+    _ = it.next() orelse return error.Malformed; // header
+    const p = it.next() orelse return error.Malformed; // payload
+    _ = it.next() orelse return error.Malformed; // signature
+    const payload_json = b64dec(alloc, p) catch return error.Malformed;
+    const parsed = std.json.parseFromSlice(Claims, alloc, payload_json, .{}) catch return error.Malformed;
+    return parsed.value;
+}
+
 test "sign then verify round-trips claims" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -120,4 +133,20 @@ test "malformed token shapes are rejected" {
     const key = crypto.deriveKey("secret", "tk1");
     try std.testing.expectError(error.Malformed, verify(a, "not-a-jwt", &key, 0));
     try std.testing.expectError(error.Malformed, verify(a, "only.two", &key, 0));
+}
+
+test "peekClaims decodes the payload without checking the signature" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = crypto.deriveKey("secret", "tk1");
+    const claims = Claims{ .id = "u1", .collection = "users", .type = .auth, .iat = 1000, .exp = 2000 };
+    const token = try sign(a, claims, &key);
+    // Tamper the signature: peekClaims must still return the claims.
+    const buf = try a.dupe(u8, token);
+    buf[buf.len - 1] = if (buf[buf.len - 1] == 'A') 'B' else 'A';
+    const peeked = try peekClaims(a, buf);
+    try std.testing.expectEqualStrings("u1", peeked.id);
+    try std.testing.expectEqualStrings("users", peeked.collection);
+    try std.testing.expectError(error.Malformed, peekClaims(a, "nope"));
 }
