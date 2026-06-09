@@ -50,6 +50,9 @@ pub fn verify(alloc: std.mem.Allocator, token: []const u8, key: []const u8, now:
     const s = it.next() orelse return error.Malformed;
     if (it.next() != null) return error.Malformed;
 
+    // Reject any header other than the fixed HS256 header (defense-in-depth vs alg substitution).
+    if (!std.mem.eql(u8, h, header_b64)) return error.Malformed;
+
     const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ h, p });
     var expected: [32]u8 = undefined;
     HmacSha256.create(&expected, signing_input, key);
@@ -149,4 +152,18 @@ test "peekClaims decodes the payload without checking the signature" {
     try std.testing.expectEqualStrings("u1", peeked.id);
     try std.testing.expectEqualStrings("users", peeked.collection);
     try std.testing.expectError(error.Malformed, peekClaims(a, "nope"));
+}
+
+test "verify rejects a token with a foreign header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = crypto.deriveKey("secret", "tk1");
+    // craft header.payload.sig where header is some other base64url
+    const claims = Claims{ .id = "u1", .collection = "users", .type = .auth, .iat = 1000, .exp = 2000 };
+    const good = try sign(a, claims, &key);
+    // replace the header segment with a different (valid base64url) value
+    const dot = std.mem.indexOfScalar(u8, good, '.').?;
+    const tampered = try std.fmt.allocPrint(a, "ZXZpbA.{s}", .{good[dot + 1 ..]});
+    try std.testing.expectError(error.Malformed, verify(a, tampered, &key, 1500));
 }
