@@ -165,16 +165,22 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         error.OutOfMemory => return e,
     };
     const rctx = buildContext(ctx, w, data);
+    // Gate FIRST: before-hooks must run only on already-authorized ops (matching delete).
+    // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
+    const decision = rules.decide(col.createRule, &rctx);
+    if (decision == .deny_locked) return forbidden(ctx);
     // A before-hook may `put` NEW keys, which reallocs the map header captured in this
     // local; downstream MUST read the `_mut` binding (here and for rec_mut/ur_mut/ex_mut
     // below), not the original const — the binding is the grow-capturing reference.
     var data_mut = data2;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_create) catch return hookRejected(ctx);
-    const rec = switch (rules.decide(col.createRule, &rctx)) {
-        .deny_locked => return forbidden(ctx),
+    // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
+    // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
+    const rec = (switch (decision) {
+        .deny_locked => unreachable,
         .allow => records.create(ctx.allocator, app.io, w, col, data_mut),
         .check => records.createGuarded(ctx.allocator, app.io, w, col, data_mut, try rules.compileGuard(ctx.allocator, w, col, col.createRule.?, &rctx)),
-    } catch |e| switch (e) {
+    }) catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         error.NotObject => return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator),
         error.Forbidden => return forbidden(ctx),
@@ -214,6 +220,10 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         error.OutOfMemory => return e,
     };
     const rctx = buildContext(ctx, w, data);
+    // Gate FIRST: before-hooks must run only on already-authorized ops (matching delete).
+    // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
+    const decision = rules.decide(col.updateRule, &rctx);
+    if (decision == .deny_locked) return forbidden(ctx);
     var data_mut = data2;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_update) catch return hookRejected(ctx);
 
@@ -229,11 +239,13 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         }
     }
 
-    const updated = switch (rules.decide(col.updateRule, &rctx)) {
-        .deny_locked => return forbidden(ctx),
+    // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
+    // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
+    const updated = (switch (decision) {
+        .deny_locked => unreachable,
         .allow => records.update(ctx.allocator, w, col, rid, data_mut),
         .check => records.updateGuarded(ctx.allocator, w, col, rid, data_mut, try rules.compileGuard(ctx.allocator, w, col, col.updateRule.?, &rctx)),
-    } catch |e| switch (e) {
+    }) catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         error.NotObject => return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator),
         error.Forbidden => return ApiError.notFound().toResponse(ctx.allocator),
@@ -244,9 +256,11 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.notFound().toResponse(ctx.allocator);
     };
     if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch {};
+    // Capture id BEFORE the after-hook so a hook that mutates/removes "id" can't panic the broadcast.
+    const broadcast_id = ur.object.get("id").?.string;
     var ur_mut = ur;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &ur_mut, .after_update) catch {};
-    realtime_ws.broadcast(app, col, .update, ur_mut.object.get("id").?.string, ur_mut);
+    realtime_ws.broadcast(app, col, .update, broadcast_id, ur_mut);
     return jsonResponse(ctx, 200, ur_mut);
 }
 

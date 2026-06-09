@@ -76,6 +76,10 @@ fn isPhaseFieldName(comptime name: []const u8) bool {
 fn validateHooks(comptime hooks: anytype) void {
     inline for (std.meta.fields(@TypeOf(hooks))) |group| {
         const g = @field(hooks, group.name);
+        switch (@typeInfo(@TypeOf(g))) {
+            .@"struct" => {},
+            else => @compileError("record hook group '" ++ group.name ++ "' must be a struct like .{ .beforeCreate = fn }"),
+        }
         inline for (std.meta.fields(@TypeOf(g))) |f| {
             if (!isPhaseFieldName(f.name)) {
                 @compileError("unknown record hook '" ++ group.name ++ "." ++ f.name ++

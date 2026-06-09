@@ -15,10 +15,6 @@ pub const ErrorEvent = events.ErrorEvent;
 // The unit-test runner is rooted at THIS module. Reference every internal file
 // so its `test {}` blocks are analyzed and run (matches pre-restructure behavior
 // where main.zig's import graph reached them).
-test "smoke" {
-    try std.testing.expect(true);
-}
-
 test {
     _ = @import("app.zig");
     _ = @import("config.zig");

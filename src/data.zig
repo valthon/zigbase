@@ -7,9 +7,15 @@ const migrations = @import("migrations.zig");
 const App = @import("app.zig").App;
 
 /// Connection-bound, curated record operations. Hooks, custom routes, and jobs
-/// receive a `Data` rather than a raw connection. `conn` is the active connection:
-/// for `before*` record hooks it is the in-transaction writer (writes atomic with
-/// the triggering op); elsewhere a fresh acquired connection.
+/// receive a `Data` rather than a raw connection. Ops run on the passed `conn`
+/// using `app.allocator` (the gpa).
+///
+/// ATOMICITY (as shipped): NOT atomic for `before*` record hooks. The triggering
+/// write opens its transaction inside records.createGuarded/updateGuarded, which run
+/// AFTER the before-hook returns; so side-writes a hook issues via `ev.data` are
+/// committed independently of (and before) the triggering write, and their results
+/// are gpa-allocated rather than request-scoped. (A later plan will route these
+/// through a request arena / a true shared transaction.)
 ///
 /// Unknown-collection contract:
 ///   - `findById` returns `null` for BOTH an unknown collection and a missing
