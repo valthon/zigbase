@@ -221,6 +221,14 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
                 try errors.append(alloc, .{ .field = fname, .code = "validation_invalid_name", .message = "Invalid index field name." });
         }
     }
+
+    // Auth identity fields are interpolated into SQL/DDL, so they must be valid identifiers.
+    if (c.type == .auth) {
+        for (c.options.auth.identityFields) |idf| {
+            if (!isValidIdentifier(idf))
+                try errors.append(alloc, .{ .field = "identityFields", .code = "validation_invalid_identity_field", .message = "Identity field must be a valid identifier." });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -713,4 +721,34 @@ test "collection options round-trip identity fields" {
     try std.testing.expectEqual(@as(usize, 2), back.auth.identityFields.len);
     try std.testing.expectEqualStrings("username", back.auth.identityFields[1]);
     try std.testing.expectEqual(@as(u8, 10), back.auth.minPasswordLength);
+}
+
+test "validate rejects an auth collection with a non-identifier identity field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var errs: std.ArrayList(ValidationError) = .empty;
+    const c = Collection{
+        .id = "c", .name = "users", .type = .auth, .fields = &.{},
+        .options = .{ .auth = .{ .identityFields = &.{ "email", "x\") WHERE 1=1; --" } } },
+    };
+    try validate(a, c, &errs);
+    var found = false;
+    for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_identity_field")) {
+        found = true;
+    };
+    try std.testing.expect(found);
+}
+
+test "validate accepts an auth collection with valid identity fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var errs: std.ArrayList(ValidationError) = .empty;
+    const c = Collection{
+        .id = "c", .name = "users", .type = .auth, .fields = &.{},
+        .options = .{ .auth = .{ .identityFields = &.{ "email", "username" } } },
+    };
+    try validate(a, c, &errs);
+    for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_identity_field"));
 }
