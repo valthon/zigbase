@@ -11,6 +11,34 @@ const lexer = @import("query/lexer.zig");
 const parser = @import("query/parser.zig");
 const joiner = @import("query/joiner.zig");
 const sort = @import("query/sort.zig");
+const request = @import("request.zig");
+
+/// A compiled rule constraint enforced atomically on create/update.
+pub const Guard = struct {
+    where_sql: []const u8,
+    joins: []const []const u8 = &.{},
+    params: []const compiler.Param = &.{},
+};
+
+fn guardJoinsSql(alloc: std.mem.Allocator, joins: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (joins) |jn| {
+        try out.append(alloc, ' ');
+        try out.appendSlice(alloc, jn);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// SELECT 1 FROM col <joins> WHERE col.id=?1 AND (where) — bound id + guard params.
+fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8, g: Guard) !bool {
+    const js = try guardJoinsSql(alloc, g.joins);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, js, col.name, g.where_sql }, 0);
+    var st = try w.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, rid);
+    _ = try bindParams(&st, g.params, 2);
+    return try st.step();
+}
 
 /// readValue / rowToObject can surface std.json parse errors (for json and multi-value
 /// fields), and collections.get widens its own inferred error set. Capture those so
@@ -18,7 +46,7 @@ const sort = @import("query/sort.zig");
 const ReadError = @typeInfo(@typeInfo(@TypeOf(values.readValue)).@"fn".return_type.?).error_union.error_set;
 const CollectionsGetError = @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".return_type.?).error_union.error_set;
 
-pub const RecordError = error{ Validation, NotFound, NotObject } ||
+pub const RecordError = error{ Validation, NotFound, NotObject, Forbidden } ||
     db.DbError || values.ValueError || ReadError || CollectionsGetError;
 
 fn columnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
@@ -139,6 +167,14 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
 }
 
 pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value) RecordError!std.json.Value {
+    return createImpl(alloc, io, w, col, data, null);
+}
+
+pub fn createGuarded(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value, guard: Guard) RecordError!std.json.Value {
+    return createImpl(alloc, io, w, col, data, guard);
+}
+
+fn createImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value, guard: ?Guard) RecordError!std.json.Value {
     last_errors = null;
     if (data != .object) return error.NotObject;
     var errs: std.ArrayList(schema.ValidationError) = .empty;
@@ -181,20 +217,38 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Colle
     }
 
     const rcols = try columnList(alloc, col);
+    var gen_id = id_gen.collectionId(io);
+
+    if (guard != null) try w.begin();
+    errdefer if (guard != null) {
+        w.rollback() catch {};
+    };
+
     const sql = try std.fmt.allocPrintSentinel(alloc, "INSERT INTO \"{s}\" ({s}) VALUES ({s}) RETURNING {s};", .{ col.name, cols.items, vals.items, rcols }, 0);
     var st = try w.prepare(sql);
-    defer st.finalize();
-    var gen_id = id_gen.collectionId(io);
     try st.bindText(1, &gen_id);
     for (binds.items) |b| {
         values.bindValue(alloc, &st, b.idx, b.field, b.value) catch |e| {
+            st.finalize();
             try errs.append(alloc, .{ .field = b.field.name, .code = convCode(e), .message = "Invalid value." });
             last_errors = errs.items;
             return error.Validation;
         };
     }
-    if (!try st.step()) return error.NotFound;
-    return try rowToObject(alloc, &st, col);
+    if (!try st.step()) {
+        st.finalize();
+        return error.NotFound;
+    }
+    const rec = try rowToObject(alloc, &st, col);
+    st.finalize();
+    if (guard) |g| {
+        if (!try guardPasses(alloc, w, col, &gen_id, g)) {
+            w.rollback() catch {};
+            return error.Forbidden;
+        }
+        try w.commit();
+    }
+    return rec;
 }
 
 fn seedPosts(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
@@ -279,6 +333,14 @@ test "create rejects a value outside a select's allowed set" {
 }
 
 pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
+    return updateImpl(alloc, w, col, id, data, null);
+}
+
+pub fn updateGuarded(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value, guard: Guard) RecordError!?std.json.Value {
+    return updateImpl(alloc, w, col, id, data, guard);
+}
+
+fn updateImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value, guard: ?Guard) RecordError!?std.json.Value {
     last_errors = null;
     if (data != .object) return error.NotObject;
     var errs: std.ArrayList(schema.ValidationError) = .empty;
@@ -304,19 +366,38 @@ pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
     if (errs.items.len > 0) { last_errors = errs.items; return error.Validation; }
 
     const rcols = try columnList(alloc, col);
+
+    if (guard != null) try w.begin();
+    errdefer if (guard != null) {
+        w.rollback() catch {};
+    };
+
     const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ col.name, sets.items, rcols }, 0);
     var st = try w.prepare(sql);
-    defer st.finalize();
     try st.bindText(1, id);
     for (binds.items) |b| {
         values.bindValue(alloc, &st, b.idx, b.field, b.value) catch |e| {
+            st.finalize();
             try errs.append(alloc, .{ .field = b.field.name, .code = convCode(e), .message = "Invalid value." });
             last_errors = errs.items;
             return error.Validation;
         };
     }
-    if (!try st.step()) return null;
-    return try rowToObject(alloc, &st, col);
+    if (!try st.step()) {
+        st.finalize();
+        if (guard != null) w.rollback() catch {};
+        return null;
+    }
+    const rec = try rowToObject(alloc, &st, col);
+    st.finalize();
+    if (guard) |g| {
+        if (!try guardPasses(alloc, w, col, id, g)) {
+            w.rollback() catch {};
+            return error.Forbidden;
+        }
+        try w.commit();
+    }
+    return rec;
 }
 
 pub fn delete(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
@@ -358,7 +439,14 @@ test "delete removes the row; 404 on missing" {
     try std.testing.expect(!try delete(a, &d, col, "r1"));
 }
 
-pub const ListQuery = struct { filter: ?[]const u8 = null, sort: ?[]const u8 = null, page: u32 = 1, perPage: u32 = 30 };
+pub const ListQuery = struct {
+    filter: ?[]const u8 = null,
+    sort: ?[]const u8 = null,
+    page: u32 = 1,
+    perPage: u32 = 30,
+    rule: ?[]const u8 = null,
+    rctx: ?*const request.RequestContext = null,
+};
 pub const ListResult = struct { page: u32, perPage: u32, totalItems: i64, items: []std.json.Value };
 
 fn baseColumnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
@@ -381,6 +469,20 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         const compiled = try compiler.compile(alloc, &j, ast, null);
         where_sql = compiled.where_sql;
         params = compiled.params;
+    };
+    if (q.rule) |rstr| if (rstr.len > 0) {
+        const rtoks = try lexer.lex(alloc, rstr);
+        const rast = try parser.parse(alloc, rtoks);
+        const rc = try compiler.compile(alloc, &j, rast, q.rctx);
+        if (where_sql.len > 0) {
+            where_sql = try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, rc.where_sql });
+        } else {
+            where_sql = rc.where_sql;
+        }
+        var merged: std.ArrayList(compiler.Param) = .empty;
+        try merged.appendSlice(alloc, params);
+        try merged.appendSlice(alloc, rc.params);
+        params = try merged.toOwnedSlice(alloc);
     };
     var order_sql: []const u8 = try std.fmt.allocPrint(alloc, "\"{s}\".\"created\" DESC", .{col.name});
     if (q.sort) |sstr| if (sstr.len > 0) {
@@ -440,4 +542,48 @@ test "list filters, sorts, and paginates" {
     try std.testing.expectEqual(@as(i64, 2), res.totalItems);
     try std.testing.expectEqual(@as(usize, 1), res.items.len);
     try std.testing.expectEqualStrings("r3", res.items[0].object.get("id").?.string);
+}
+
+test "createGuarded rolls back when the guard fails" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "title", .{ .string = "hi" });
+    const guard = Guard{ .where_sql = "\"posts\".\"title\" = ?", .params = &.{.{ .text = "nope" }} };
+    try std.testing.expectError(error.Forbidden, createGuarded(a, std.testing.io, &d, col, .{ .object = data }, guard));
+    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "createGuarded commits when the guard passes" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "title", .{ .string = "hi" });
+    const guard = Guard{ .where_sql = "\"posts\".\"title\" = ?", .params = &.{.{ .text = "hi" }} };
+    const rec = try createGuarded(a, std.testing.io, &d, col, .{ .object = data }, guard);
+    try std.testing.expectEqualStrings("hi", rec.object.get("title").?.string);
+}
+
+test "list applies a rule clause AND-ed with the filter" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','keep',100),('r2','t','t','drop',100);");
+    const res = try list(a, &d, col, .{ .rule = "title = \"keep\"" });
+    try std.testing.expectEqual(@as(i64, 1), res.totalItems);
+    try std.testing.expectEqualStrings("r1", res.items[0].object.get("id").?.string);
 }
