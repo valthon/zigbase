@@ -73,7 +73,16 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
         defer pool.releaseWriter();
         try migrations.run(w);
     }
-    var app = app_mod.App{ .allocator = allocator, .io = io, .pool = &pool };
+    var app = app_mod.App{
+        .allocator = allocator,
+        .io = io,
+        .pool = &pool,
+        .jwt_secret = cfg.jwt_secret,
+        .cookie_secure = cfg.cookie_secure,
+        .auth_token_ttl_s = cfg.auth_token_ttl_s,
+        .verification_ttl_s = cfg.verification_ttl_s,
+        .password_reset_ttl_s = cfg.password_reset_ttl_s,
+    };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
     var srv = server.Server{ .app = &app, .host = host_z, .port = cfg.http_port };
