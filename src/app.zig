@@ -19,4 +19,8 @@ pub const App = struct {
     storage: ?*const @import("files/storage.zig").Storage = null,
     /// Type-erased event dispatch built by the comptime App(cfg) builder; null = no subscribers.
     dispatch: ?*const @import("events.zig").Dispatch = null,
+    /// Type-erased pointer to the running Scheduler (set by Scheduler.start); null = not running.
+    scheduler: ?*anyopaque = null,
+    /// Submit an ad-hoc job task for async execution; set by Scheduler.start. Task 5 wires App.submit().
+    submit_fn: ?*const fn (ctx: *anyopaque, name: []const u8, task: @import("events.zig").JobTask) anyerror!void = null,
 };

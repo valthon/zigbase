@@ -105,6 +105,148 @@ pub fn completeJob(s: *JobState, sched: schedule.Schedule, reactive_result: ?sch
     s.status = .idle;
 }
 
+const Thread = std.Thread;
+
+fn unixNow(io: std.Io) i64 {
+    const ts = std.Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+}
+
+/// Threaded scheduler runtime: a scheduler thread ticks the `JobState` table on a fixed
+/// cadence, enqueuing due jobs into a spinlock-guarded ring queue; a worker pool drains the
+/// queue and runs handlers. All `state`/`queue`/`q_*` mutation happens under `mutex`;
+/// `shutdown` is atomic. `start()` spawns threads; `stop()` joins them cleanly (no deadlock);
+/// `stop()` MUST be called before `deinit()` (deinit frees state/queue/workers).
+pub const Scheduler = struct {
+    allocator: std.mem.Allocator,
+    app: *App,
+    jobs: []const RuntimeJob,
+    pool_size: usize,
+    state: []JobState,
+    queue: []usize,
+    q_head: usize = 0,
+    q_len: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+    shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    sched_thread: ?Thread = null,
+    workers: []Thread = &.{},
+
+    pub fn init(allocator: std.mem.Allocator, app: *App, jobs: []const RuntimeJob, pool_size: usize) !Scheduler {
+        const state = try allocator.alloc(JobState, jobs.len);
+        errdefer allocator.free(state);
+        const now = unixNow(app.io);
+        for (state, 0..) |*s, i| {
+            s.* = .{ .status = .idle, .next_fire = schedule.nextFire(jobs[i].schedule, now) orelse now };
+        }
+        const queue = try allocator.alloc(usize, jobs.len);
+        return .{ .allocator = allocator, .app = app, .jobs = jobs, .pool_size = pool_size, .state = state, .queue = queue };
+    }
+
+    pub fn deinit(self: *Scheduler) void {
+        self.allocator.free(self.state);
+        self.allocator.free(self.queue);
+        if (self.workers.len > 0) self.allocator.free(self.workers);
+    }
+
+    fn lock(self: *Scheduler) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *Scheduler) void {
+        self.mutex.unlock();
+    }
+
+    fn enqueue(self: *Scheduler, idx: usize) void { // caller holds lock
+        if (self.q_len < self.queue.len) {
+            self.queue[(self.q_head + self.q_len) % self.queue.len] = idx;
+            self.q_len += 1;
+        }
+    }
+    fn dequeue(self: *Scheduler) ?usize { // caller holds lock
+        if (self.q_len == 0) return null;
+        const idx = self.queue[self.q_head];
+        self.q_head = (self.q_head + 1) % self.queue.len;
+        self.q_len -= 1;
+        return idx;
+    }
+
+    pub fn start(self: *Scheduler) !void {
+        self.app.scheduler = self;
+        self.app.submit_fn = &submitThunk;
+        self.workers = try self.allocator.alloc(Thread, self.pool_size);
+        var spawned: usize = 0;
+        errdefer {
+            self.shutdown.store(true, .release);
+            for (self.workers[0..spawned]) |t| t.join();
+        }
+        for (self.workers) |*t| {
+            t.* = try Thread.spawn(.{}, workerLoop, .{self});
+            spawned += 1;
+        }
+        self.sched_thread = try Thread.spawn(.{}, schedulerLoop, .{self});
+    }
+
+    pub fn stop(self: *Scheduler) void {
+        self.shutdown.store(true, .release);
+        if (self.sched_thread) |t| t.join();
+        self.sched_thread = null;
+        for (self.workers) |t| t.join();
+        self.app.scheduler = null;
+        self.app.submit_fn = null;
+    }
+
+    fn schedulerLoop(self: *Scheduler) void {
+        var fire_buf: [256]usize = undefined;
+        while (!self.shutdown.load(.acquire)) {
+            const now = unixNow(self.app.io);
+            self.lock();
+            const cap = @min(fire_buf.len, self.state.len);
+            const fired = tick(self.state, now, fire_buf[0..cap]);
+            for (fired) |idx| self.enqueue(idx);
+            self.unlock();
+            self.app.io.sleep(std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+        }
+    }
+
+    fn workerLoop(self: *Scheduler) void {
+        while (true) {
+            self.lock();
+            const maybe = self.dequeue();
+            self.unlock();
+            const idx = maybe orelse {
+                if (self.shutdown.load(.acquire)) return;
+                self.app.io.sleep(std.Io.Duration.fromMilliseconds(20), .awake) catch {};
+                continue;
+            };
+            const job = self.jobs[idx];
+            var ev = events.JobEvent{ .app = self.app, .name = job.name };
+            const result = job.run(&ev) catch |e| blk: {
+                var err_ev = events.ErrorEvent{ .app = self.app, .ctx = null, .err = e, .phase = .cron, .message = @errorName(e) };
+                events.dispatchError(self.app, self.app.dispatch, &err_ev);
+                break :blk null;
+            };
+            const now = unixNow(self.app.io);
+            self.lock();
+            completeJob(&self.state[idx], job.schedule, result, now);
+            self.unlock();
+        }
+    }
+
+    fn submitThunk(ctx: *anyopaque, name: []const u8, task: events.JobTask) anyerror!void {
+        const self: *Scheduler = @ptrCast(@alignCast(ctx));
+        const Holder = struct {
+            fn go(a: *App, n: []const u8, t: events.JobTask) void {
+                var ev = events.JobEvent{ .app = a, .name = n };
+                t(&ev) catch |e| {
+                    var err_ev = events.ErrorEvent{ .app = a, .ctx = null, .err = e, .phase = .job, .message = @errorName(e) };
+                    events.dispatchError(a, a.dispatch, &err_ev);
+                };
+            }
+        };
+        const th = try Thread.spawn(.{}, Holder.go, .{ self.app, name, task });
+        th.detach();
+    }
+};
+
 test "buildJobs assembles cron/interval/reactive into a uniform table" {
     const H = struct {
         fn cleanup(ev: *events.JobEvent) anyerror!void {
@@ -178,4 +320,37 @@ test "completeJob: interval reschedules; reactive uses returned delay; stop reti
     var s4 = JobState{ .status = .running, .next_fire = 0 };
     completeJob(&s4, .{ .cron = "0 0 30 2 *" }, null, 1609470000); // Feb 30 never occurs
     try std.testing.expect(s4.status == .stopped);
+}
+
+test "Scheduler runs a due reactive job then stops cleanly" {
+    const Counter = struct {
+        var n: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+        fn run(ev: *events.JobEvent) anyerror!schedule.Reactive {
+            _ = ev;
+            _ = n.fetchAdd(1, .monotonic);
+            return .stop; // run exactly once
+        }
+    };
+    Counter.n.store(0, .monotonic);
+    const jobs = buildJobs(.{
+        .{ .name = "once", .schedule = schedule.Schedule.reactive, .handler = Counter.run },
+    });
+    // Minimal App: only .io/.allocator are touched by the scheduler in this test (the job ignores the DB).
+    var app: App = undefined;
+    app.io = std.testing.io;
+    app.allocator = std.testing.allocator;
+    app.pool = undefined;
+    app.dispatch = null;
+    app.scheduler = null;
+    app.submit_fn = null;
+
+    var sched = try Scheduler.init(std.testing.allocator, &app, jobs, 2);
+    defer sched.deinit();
+    try sched.start();
+    var waited: usize = 0;
+    while (Counter.n.load(.monotonic) == 0 and waited < 300) : (waited += 1) {
+        app.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    sched.stop();
+    try std.testing.expectEqual(@as(u32, 1), Counter.n.load(.monotonic));
 }
