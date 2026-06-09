@@ -30,8 +30,13 @@ fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value) !http.Res
     return .{ .status = status, .body = try std.json.Stringify.valueAlloc(ctx.allocator, v, .{}) };
 }
 
-/// SP4: an empty request context (SP5 fills auth/superuser from the verified token).
-fn buildContext(ctx: *http.RequestCtx, data: ?std.json.Value) request.RequestContext {
+/// Fills auth/superuser from the verified bearer/cookie token (anonymous if absent/invalid).
+fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) request.RequestContext {
+    if (ctx.app) |app| {
+        if (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null) |a| {
+            return .{ .auth = a.record, .is_superuser = a.is_superuser, .data = data, .method = @tagName(ctx.method) };
+        }
+    }
     return .{ .auth = null, .is_superuser = false, .data = data, .method = @tagName(ctx.method) };
 }
 
@@ -64,7 +69,7 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     defer r.close();
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rctx = buildContext(ctx, null);
+    const rctx = buildContext(ctx, &r, null);
     switch (rules.decide(col.viewRule, &rctx)) {
         .deny_locked => return ApiError.notFound().toResponse(ctx.allocator),
         .allow => {},
@@ -87,7 +92,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
         error.OutOfMemory => return e,
     };
-    const rctx = buildContext(ctx, data);
+    const rctx = buildContext(ctx, w, data);
     const rec = switch (rules.decide(col.createRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => records.create(ctx.allocator, app.io, w, col, data2),
@@ -114,7 +119,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
         error.OutOfMemory => return e,
     };
-    const rctx = buildContext(ctx, data);
+    const rctx = buildContext(ctx, w, data);
     const updated = switch (rules.decide(col.updateRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => records.update(ctx.allocator, w, col, rid, data2),
@@ -135,7 +140,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     if ((try records.get(ctx.allocator, w, col, rid)) == null) return ApiError.notFound().toResponse(ctx.allocator);
-    const rctx = buildContext(ctx, null);
+    const rctx = buildContext(ctx, w, null);
     switch (rules.decide(col.deleteRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => {},
@@ -150,7 +155,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     var r = try app.pool.openReader();
     defer r.close();
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rctx = buildContext(ctx, null);
+    const rctx = buildContext(ctx, &r, null);
     var rule_expr: ?[]const u8 = null;
     switch (rules.decide(col.listRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
