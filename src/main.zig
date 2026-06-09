@@ -109,4 +109,5 @@ test {
     _ = @import("query/expand.zig");
     _ = @import("request.zig");
     _ = @import("rules.zig");
+    _ = @import("crypto.zig");
 }
