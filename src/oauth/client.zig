@@ -97,16 +97,24 @@ fn httpCall(ctx: *anyopaque, alloc: std.mem.Allocator, method: Method, url: []co
     const extra = alloc.alloc(std.http.Header, headers.len) catch return error.TransportFailed;
     for (headers, 0..) |h, i| extra[i] = .{ .name = h.name, .value = h.value };
 
-    var aw = std.Io.Writer.Allocating.init(alloc);
+    const MAX_RESP = 1 << 20; // 1 MiB
+    const resp_buf = alloc.alloc(u8, MAX_RESP) catch return error.TransportFailed;
+    var fw = std.Io.Writer.fixed(resp_buf);
     const res = client.fetch(.{
         .location = .{ .url = url },
         .method = if (method == .POST) .POST else .GET,
         .payload = body,
         .extra_headers = extra,
-        .response_writer = &aw.writer,
-    }) catch return error.TransportFailed;
+        .response_writer = &fw,
+    }) catch |e| {
+        // A body exceeding the fixed buffer surfaces as a write failure from fetch.
+        return switch (e) {
+            error.WriteFailed => error.ResponseTooLarge,
+            else => error.TransportFailed,
+        };
+    };
 
-    return .{ .status = @intFromEnum(res.status), .body = aw.written() };
+    return .{ .status = @intFromEnum(res.status), .body = fw.buffered() };
 }
 
 /// A production transport backed by std.http.Client (TLS via std.crypto.tls). `hc` must outlive use.
