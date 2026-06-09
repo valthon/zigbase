@@ -59,6 +59,52 @@ pub fn buildJobs(comptime specs: anytype) []const RuntimeJob {
     return &Holder.table;
 }
 
+pub const JobState = struct {
+    status: enum { idle, running, stopped },
+    next_fire: i64, // unix seconds; meaningful when status == .idle
+};
+
+/// Pure decision: append the indices of jobs that are `.idle` AND due (`next_fire <= now`)
+/// to `out`, marking each `.running` (single-flight). Returns the filled slice of `out`.
+/// Capping at out.len is a safety bound; callers pass out.len >= state.len.
+pub fn tick(state: []JobState, now: i64, out: []usize) []usize {
+    var n: usize = 0;
+    for (state, 0..) |*s, i| {
+        if (s.status == .idle and s.next_fire <= now) {
+            s.status = .running;
+            if (n < out.len) {
+                out[n] = i;
+                n += 1;
+            }
+        }
+    }
+    return out[0..n];
+}
+
+/// Apply a job's completion to its state. `reactive_result` is non-null ONLY for reactive
+/// jobs (the handler's return). For cron/interval, next_fire is recomputed from `sched`;
+/// if there is no future fire (e.g. an impossible cron), the job is retired (`.stopped`).
+pub fn completeJob(s: *JobState, sched: schedule.Schedule, reactive_result: ?schedule.Reactive, now: i64) void {
+    if (reactive_result) |rr| {
+        switch (rr) {
+            .stop => {
+                s.status = .stopped;
+                return;
+            },
+            .after => |iv| {
+                s.next_fire = now + schedule.periodSeconds(iv);
+                s.status = .idle;
+                return;
+            },
+        }
+    }
+    s.next_fire = schedule.nextFire(sched, now) orelse {
+        s.status = .stopped;
+        return;
+    };
+    s.status = .idle;
+}
+
 test "buildJobs assembles cron/interval/reactive into a uniform table" {
     const H = struct {
         fn cleanup(ev: *events.JobEvent) anyerror!void {
@@ -86,4 +132,50 @@ test "buildJobs assembles cron/interval/reactive into a uniform table" {
     try std.testing.expect(r2 != null and r2.?.after.minutes == 5);
     const r0 = try jobs[0].run(&ev);
     try std.testing.expect(r0 == null);
+}
+
+test "tick fires due idle jobs and marks them running (single-flight)" {
+    var st = [_]JobState{
+        .{ .status = .idle, .next_fire = 1000 },
+        .{ .status = .idle, .next_fire = 2000 },
+    };
+    var fire_buf: [8]usize = undefined;
+    const fired = tick(&st, 1000, &fire_buf);
+    try std.testing.expectEqual(@as(usize, 1), fired.len); // only job 0 is due (next_fire <= now)
+    try std.testing.expectEqual(@as(usize, 0), fired[0]);
+    try std.testing.expect(st[0].status == .running);
+    try std.testing.expect(st[1].status == .idle);
+}
+
+test "tick does not refire a job that is already running" {
+    var st = [_]JobState{.{ .status = .running, .next_fire = 1000 }};
+    var fire_buf: [8]usize = undefined;
+    const fired = tick(&st, 5000, &fire_buf);
+    try std.testing.expectEqual(@as(usize, 0), fired.len);
+}
+
+test "tick skips stopped jobs" {
+    var st = [_]JobState{.{ .status = .stopped, .next_fire = 0 }};
+    var fire_buf: [8]usize = undefined;
+    const fired = tick(&st, 9999, &fire_buf);
+    try std.testing.expectEqual(@as(usize, 0), fired.len);
+}
+
+test "completeJob: interval reschedules; reactive uses returned delay; stop retires; invalid cron retires" {
+    var s = JobState{ .status = .running, .next_fire = 1000 };
+    completeJob(&s, .{ .interval = .hourly }, null, 1000);
+    try std.testing.expect(s.status == .idle and s.next_fire == 1000 + 3600);
+
+    var s2 = JobState{ .status = .running, .next_fire = 0 };
+    completeJob(&s2, .reactive, .{ .after = .{ .minutes = 5 } }, 2000);
+    try std.testing.expect(s2.status == .idle and s2.next_fire == 2000 + 300);
+
+    var s3 = JobState{ .status = .running, .next_fire = 0 };
+    completeJob(&s3, .reactive, .stop, 2000);
+    try std.testing.expect(s3.status == .stopped);
+
+    // An impossible cron has no next fire -> retire the job rather than spin.
+    var s4 = JobState{ .status = .running, .next_fire = 0 };
+    completeJob(&s4, .{ .cron = "0 0 30 2 *" }, null, 1609470000); // Feb 30 never occurs
+    try std.testing.expect(s4.status == .stopped);
 }
