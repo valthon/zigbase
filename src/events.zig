@@ -4,6 +4,7 @@ const App = @import("app.zig").App;
 const request = @import("request.zig");
 const Data = @import("data.zig").Data;
 
+// NOTE: adding a variant requires updating phaseFieldName() and the consumer-facing camelCase field name.
 pub const RecordPhase = enum {
     before_create,
     after_create,
@@ -55,12 +56,40 @@ fn phaseFieldName(comptime p: RecordPhase) []const u8 {
     };
 }
 
+/// True iff `name` is one of the six canonical camelCase phase field names.
+/// Kept DRY with `phaseFieldName` by deriving the set from `RecordPhase`.
+fn isPhaseFieldName(comptime name: []const u8) bool {
+    inline for (std.meta.fields(RecordPhase)) |p| {
+        if (std.mem.eql(u8, name, phaseFieldName(@field(RecordPhase, p.name)))) return true;
+    }
+    return false;
+}
+
+/// `@compileError` on any hook-group field whose name is not a canonical phase
+/// name, so a typo (e.g. `.beforeCreat`) fails loudly instead of silently
+/// never firing. Runs over every group, including the `any` wildcard.
+fn validateHooks(comptime hooks: anytype) void {
+    inline for (std.meta.fields(@TypeOf(hooks))) |group| {
+        const g = @field(hooks, group.name);
+        inline for (std.meta.fields(@TypeOf(g))) |f| {
+            if (!isPhaseFieldName(f.name)) {
+                @compileError("unknown record hook '" ++ group.name ++ "." ++ f.name ++
+                    "'; expected one of beforeCreate/afterCreate/beforeUpdate/afterUpdate/beforeDelete/afterDelete");
+            }
+            // Assert the value coerces to RecordHandler so a wrong-typed hook fails loudly too.
+            const _coerce: RecordHandler = @field(g, f.name);
+            _ = _coerce;
+        }
+    }
+}
+
 /// Generate a record dispatcher from a comptime hook config of the shape:
 ///   .{ .any = .{ .beforeCreate = fn, ... }, .<collection> = .{ .afterUpdate = fn, ... } }
 /// `any` (wildcard) handlers fire first, then the collection-specific group whose
 /// field name equals ev.collection. Within a group, only the field matching ev.phase
 /// runs. Handlers run in declaration order; errors propagate.
 pub fn buildRecordDispatcher(comptime hooks: anytype) RecordHandler {
+    comptime validateHooks(hooks);
     const Gen = struct {
         fn dispatch(ev: *RecordEvent) anyerror!void {
             // Pass 1: wildcard ("any") groups. Pass 2: collection-specific groups.
