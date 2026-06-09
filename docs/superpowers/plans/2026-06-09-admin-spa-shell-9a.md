@@ -8,7 +8,7 @@
 
 **Tech Stack:** Zig 0.16.0 (`mise exec zig@0.16.0 -- zig <args>`; bare `zig` is 0.15.2). Preact+htm standalone (vendored ESM, no build). Python + Playwright for browser tests (test-time only — NOT part of `zig build`/runtime).
 
-**Build/test:** `mise exec zig@0.16.0 -- zig build test --summary all` (Zig) and `mise exec zig@0.16.0 -- zig build` (binary). Browser tests: `python3 -m pytest tests/admin/ -v` (after `pip install playwright pytest && python3 -m playwright install chromium`).
+**Build/test:** `mise exec zig@0.16.0 -- zig build test --summary all` (Zig) and `mise exec zig@0.16.0 -- zig build` (binary). Browser tests run through **mise-provided Python** (the repo routes tools through mise): `mise exec python@3.13 -- python -m pytest tests/admin/ -v` (after `mise use python@3.13` + `mise exec python@3.13 -- python -m pip install playwright pytest` + `mise exec python@3.13 -- python -m playwright install chromium`).
 
 **Branch:** Create and work on branch `admin-spa`. SP9 merges as a unit (9a+9b) after the holistic review at the end of 9b. Do NOT merge to `main` in this plan.
 
@@ -456,14 +456,22 @@ git commit -m "feat(admin): sidebar shell + collections nav + read-only records 
 
 **Files:** Create `tests/admin/conftest.py`, `tests/admin/test_shell.py`; Modify `.gitignore`.
 
-- [ ] **Step 1: Install Playwright (one-time, dev/test only — not part of the build)**
+- [ ] **Step 1: Install Playwright via mise-provided Python (one-time, dev/test only — not part of the build)**
+
+This repo routes tool installs through `mise` (the Zig toolchain already does). Provide Python via
+mise, then install the test packages into that Python:
 
 ```bash
-python3 -m pip install --quiet playwright pytest && python3 -m playwright install chromium
-python3 -c "import playwright; print('playwright ok')"
+mise use python@3.13
+mise exec python@3.13 -- python -m pip install --quiet playwright pytest
+mise exec python@3.13 -- python -m playwright install chromium
+mise exec python@3.13 -- python -c "import playwright; print('playwright ok')"
 ```
-If the install fails (offline/sandboxed), STOP and report BLOCKED noting the environment can't run
-browser tests; do not fake them.
+(`playwright install chromium` downloads the browser engine — that's a Playwright runtime asset, not
+a tool install, so it's fine.) If the mise Python install or the pip/playwright step fails
+(offline/sandboxed), STOP and report BLOCKED noting the environment can't run browser tests; do not
+fake them. The `conftest.py` invokes `python` (its own interpreter), so running the suite via
+`mise exec python@3.13 -- python -m pytest …` (Step 5) keeps everything on the mise Python.
 
 - [ ] **Step 2: Create `tests/admin/conftest.py`** — builds the binary, seeds a superuser, runs the server, and yields a Playwright page.
 
@@ -561,7 +569,7 @@ printf '\ntests/admin/__pycache__/\n.pytest_cache/\n' >> .gitignore
 
 - [ ] **Step 5: Run the browser tests**
 
-Run: `cd /home/valthon/nothlav/zigbase && python3 -m pytest tests/admin/ -v`
+Run: `cd /home/valthon/nothlav/zigbase && mise exec python@3.13 -- python -m pytest tests/admin/ -v`
 Expected: 4 passed. (The `binary` fixture builds the server once; each test gets a fresh seeded server + browser.) If a test fails, fix `app.js` (not the test) unless the test's assumption is wrong, then re-run.
 
 - [ ] **Step 6: Commit**
@@ -575,7 +583,7 @@ git commit -m "test(admin): headless-browser harness + 9a shell/login/browse flo
 
 ## Done criteria for 9a
 
-- `zig build` + `zig build test` green; `python3 -m pytest tests/admin/` green (login, bad-login error, deep-link bounce, browse-records).
+- `zig build` + `zig build test` green; `mise exec python@3.13 -- python -m pytest tests/admin/` green (login, bad-login error, deep-link bounce, browse-records).
 - Loading `/_/` serves the embedded SPA; a superuser can log in (cookie/CSRF), see collections in the collapsible sidebar, and browse a collection's records (paginated/filter/sort), all from the single binary. No schema/record editing yet (Plan 9b). No `main` merge.
 
 ---
