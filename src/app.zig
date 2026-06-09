@@ -12,4 +12,5 @@ pub const App = struct {
     auth_token_ttl_s: i64 = 14 * 24 * 3600,
     verification_ttl_s: i64 = 7 * 24 * 3600,
     password_reset_ttl_s: i64 = 3600,
+    realtime_allowed_origins: []const u8 = "",
 };

@@ -89,6 +89,7 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
         .auth_token_ttl_s = cfg.auth_token_ttl_s,
         .verification_ttl_s = cfg.verification_ttl_s,
         .password_reset_ttl_s = cfg.password_reset_ttl_s,
+        .realtime_allowed_origins = cfg.realtime_allowed_origins,
     };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);

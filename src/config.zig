@@ -9,6 +9,7 @@ pub const Config = struct {
     auth_token_ttl_s: i64 = 14 * 24 * 3600, // 14 days
     verification_ttl_s: i64 = 7 * 24 * 3600, // 7 days
     password_reset_ttl_s: i64 = 3600, // 1 hour
+    realtime_allowed_origins: []const u8 = "", // CSV of allowed WS Origins; "" = allow any (dev)
 
     /// Pure loader: applies overrides from a getter (env in prod, a stub in tests).
     pub fn load(getter: *const fn ([]const u8) ?[]const u8) !Config {
@@ -21,6 +22,7 @@ pub const Config = struct {
         if (getter("ZIGBASE_AUTH_TOKEN_TTL")) |v| cfg.auth_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_PASSWORD_RESET_TTL")) |v| cfg.password_reset_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter("ZIGBASE_REALTIME_ORIGINS")) |v| cfg.realtime_allowed_origins = v;
         return cfg;
     }
 };
@@ -80,4 +82,18 @@ test "auth defaults and overrides" {
     const c = try Config.load(&G1.get);
     try std.testing.expectEqual(true, c.cookie_secure);
     try std.testing.expectEqual(@as(i64, 3600), c.auth_token_ttl_s);
+}
+
+test "realtime origins default empty, overridable" {
+    const G0 = struct {
+        fn get(_: []const u8) ?[]const u8 { return null; }
+    };
+    try std.testing.expectEqualStrings("", (try Config.load(&G0.get)).realtime_allowed_origins);
+    const G1 = struct {
+        fn get(key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_REALTIME_ORIGINS")) return "https://app.example";
+            return null;
+        }
+    };
+    try std.testing.expectEqualStrings("https://app.example", (try Config.load(&G1.get)).realtime_allowed_origins);
 }
