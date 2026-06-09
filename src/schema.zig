@@ -419,6 +419,7 @@ fn dupOptStr(alloc: std.mem.Allocator, v: ?[]const u8) !?[]const u8 {
 /// Parse a request body into a Collection (id left empty; create/update assign it).
 pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection {
     const parsed = try std.json.parseFromSlice(Value, alloc, s, .{});
+    defer parsed.deinit(); // everything retained is duped into `alloc` before return
     const obj = parsed.value;
     if (obj != .object) return error.InvalidSchema;
 
@@ -458,10 +459,16 @@ pub fn collectionToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
     try root.put(alloc, "name", .{ .string = c.name });
     try root.put(alloc, "type", .{ .string = @tagName(c.type) });
     try root.put(alloc, "system", .{ .bool = c.system });
+    // Embed fields/indexes as arrays by reparsing their JSON. The parse trees stay alive
+    // until after Stringify reads them (defers run after the return expression evaluates).
     const fields_str = try fieldsToJson(alloc, c.fields);
-    try root.put(alloc, "schema", (try std.json.parseFromSlice(Value, alloc, fields_str, .{})).value);
+    const fparsed = try std.json.parseFromSlice(Value, alloc, fields_str, .{});
+    defer fparsed.deinit();
+    try root.put(alloc, "schema", fparsed.value);
     const idx_str = try indexesToJson(alloc, c.indexes);
-    try root.put(alloc, "indexes", (try std.json.parseFromSlice(Value, alloc, idx_str, .{})).value);
+    const iparsed = try std.json.parseFromSlice(Value, alloc, idx_str, .{});
+    defer iparsed.deinit();
+    try root.put(alloc, "indexes", iparsed.value);
     try root.put(alloc, "listRule", optStrValue(c.listRule));
     try root.put(alloc, "viewRule", optStrValue(c.viewRule));
     try root.put(alloc, "createRule", optStrValue(c.createRule));
