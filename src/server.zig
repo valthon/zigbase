@@ -6,6 +6,7 @@ const router = @import("router.zig");
 const health = @import("api/health.zig");
 const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
+const auth_api = @import("api/auth.zig");
 const ApiError = @import("api/error.zig").ApiError;
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -24,6 +25,13 @@ const routes = [_]router.Route{
     .{ .method = .POST, .pattern = "/api/collections/:col/records", .handler = records_api.create },
     .{ .method = .PATCH, .pattern = "/api/collections/:col/records/:id", .handler = records_api.update },
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id", .handler = records_api.delete },
+    .{ .method = .POST, .pattern = "/api/collections/:col/auth-with-password", .handler = auth_api.authWithPassword },
+    .{ .method = .POST, .pattern = "/api/collections/:col/auth-refresh", .handler = auth_api.authRefresh },
+    .{ .method = .POST, .pattern = "/api/collections/:col/auth-logout", .handler = auth_api.authLogout },
+    .{ .method = .POST, .pattern = "/api/collections/:col/request-verification", .handler = auth_api.requestVerification },
+    .{ .method = .POST, .pattern = "/api/collections/:col/confirm-verification", .handler = auth_api.confirmVerification },
+    .{ .method = .POST, .pattern = "/api/collections/:col/request-password-reset", .handler = auth_api.requestPasswordReset },
+    .{ .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .handler = auth_api.confirmPasswordReset },
 };
 
 pub const Server = struct {
@@ -82,6 +90,9 @@ fn onRequest(r: zap.Request) !void {
         .allocator = arena.allocator(),
         .app = self.app,
     };
+    ctx.authorization = r.getHeader("authorization") orelse "";
+    ctx.cookie_header = r.getHeader("cookie") orelse "";
+    ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
     const resp = router.dispatch(&routes, &ctx) catch
         ApiError.internal().toResponse(arena.allocator()) catch {
             setZapStatus(r, 500);
@@ -90,6 +101,22 @@ fn onRequest(r: zap.Request) !void {
             return;
         };
     setZapStatus(r, resp.status);
+    for (resp.cookies) |c| {
+        r.setCookie(.{
+            .name = c.name,
+            .value = c.value,
+            .path = c.path,
+            .max_age_s = @intCast(c.max_age_s),
+            .secure = c.secure,
+            .http_only = c.http_only,
+            .same_site = switch (c.same_site) {
+                .default => .Default,
+                .lax => .Lax,
+                .strict => .Strict,
+                .none => .None,
+            },
+        }) catch {};
+    }
     r.setContentType(.JSON) catch {};
     r.sendBody(resp.body) catch {};
 }

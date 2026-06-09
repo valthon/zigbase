@@ -5,6 +5,10 @@ pub const Config = struct {
     http_port: u16 = 8090,
     data_dir: []const u8 = "./zb_data",
     jwt_secret: []const u8 = "dev-insecure-secret-change-me",
+    cookie_secure: bool = false, // dev default; set true behind HTTPS
+    auth_token_ttl_s: i64 = 14 * 24 * 3600, // 14 days
+    verification_ttl_s: i64 = 7 * 24 * 3600, // 7 days
+    password_reset_ttl_s: i64 = 3600, // 1 hour
 
     /// Pure loader: applies overrides from a getter (env in prod, a stub in tests).
     pub fn load(getter: *const fn ([]const u8) ?[]const u8) !Config {
@@ -13,6 +17,10 @@ pub const Config = struct {
         if (getter("ZIGBASE_HTTP_PORT")) |v| cfg.http_port = try std.fmt.parseInt(u16, v, 10);
         if (getter("ZIGBASE_DATA_DIR")) |v| cfg.data_dir = v;
         if (getter("ZIGBASE_JWT_SECRET")) |v| cfg.jwt_secret = v;
+        if (getter("ZIGBASE_COOKIE_SECURE")) |v| cfg.cookie_secure = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        if (getter("ZIGBASE_AUTH_TOKEN_TTL")) |v| cfg.auth_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter("ZIGBASE_PASSWORD_RESET_TTL")) |v| cfg.password_reset_ttl_s = try std.fmt.parseInt(i64, v, 10);
         return cfg;
     }
 };
@@ -52,4 +60,24 @@ test "env overrides are applied and parsed" {
     const cfg = try Config.load(&G.get);
     try std.testing.expectEqual(@as(u16, 9123), cfg.http_port);
     try std.testing.expectEqualStrings("/var/zb", cfg.data_dir);
+}
+
+test "auth defaults and overrides" {
+    const G0 = struct {
+        fn get(_: []const u8) ?[]const u8 { return null; }
+    };
+    const d = try Config.load(&G0.get);
+    try std.testing.expectEqual(false, d.cookie_secure);
+    try std.testing.expectEqual(@as(i64, 14 * 24 * 3600), d.auth_token_ttl_s);
+
+    const G1 = struct {
+        fn get(key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_COOKIE_SECURE")) return "true";
+            if (std.mem.eql(u8, key, "ZIGBASE_AUTH_TOKEN_TTL")) return "3600";
+            return null;
+        }
+    };
+    const c = try Config.load(&G1.get);
+    try std.testing.expectEqual(true, c.cookie_secure);
+    try std.testing.expectEqual(@as(i64, 3600), c.auth_token_ttl_s);
 }

@@ -5,6 +5,8 @@ const db = @import("db.zig");
 const server = @import("server.zig");
 const app_mod = @import("app.zig");
 const migrations = @import("migrations.zig");
+const crypto = @import("crypto.zig");
+const id_gen = @import("id.zig");
 
 /// Zig 0.16 entry point: `main` receives a `std.process.Init` which carries the
 /// process gpa, an arena, and the command-line args. `std.process.argsAlloc`
@@ -29,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
         .help => printUsage(),
         .serve => |sa| try runServe(allocator, init.io, sa),
         .migrate => |sa| try runMigrate(allocator, init.io, sa),
+        .superuser_create => |sa| try runSuperuserCreate(allocator, init.io, sa),
     }
 }
 
@@ -63,6 +66,13 @@ fn runMigrate(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void
 
 fn runServe(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
     const cfg = try loadCfg(sa);
+    if (std.mem.eql(u8, cfg.jwt_secret, "dev-insecure-secret-change-me")) {
+        if (cfg.cookie_secure) {
+            std.log.err("refusing to start: ZIGBASE_JWT_SECRET is unset/default while cookie_secure is enabled; set a strong secret", .{});
+            return error.InsecureJwtSecret;
+        }
+        std.log.warn("ZIGBASE_JWT_SECRET is using the insecure default; set it before production.", .{});
+    }
     var pool = try openPool(allocator, io, cfg);
     defer pool.deinit();
     {
@@ -70,11 +80,62 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
         defer pool.releaseWriter();
         try migrations.run(w);
     }
-    var app = app_mod.App{ .allocator = allocator, .io = io, .pool = &pool };
+    var app = app_mod.App{
+        .allocator = allocator,
+        .io = io,
+        .pool = &pool,
+        .jwt_secret = cfg.jwt_secret,
+        .cookie_secure = cfg.cookie_secure,
+        .auth_token_ttl_s = cfg.auth_token_ttl_s,
+        .verification_ttl_s = cfg.verification_ttl_s,
+        .password_reset_ttl_s = cfg.password_reset_ttl_s,
+    };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
     var srv = server.Server{ .app = &app, .host = host_z, .port = cfg.http_port };
     try srv.listen();
+}
+
+fn runSuperuserCreate(allocator: std.mem.Allocator, io: std.Io, sa: cli.SuperuserArgs) !void {
+    const email = sa.email orelse {
+        std.log.err("--email is required", .{});
+        return;
+    };
+    const password = sa.password orelse {
+        std.log.err("--password is required", .{});
+        return;
+    };
+    if (password.len < 8) {
+        std.log.err("password must be at least 8 characters", .{});
+        return;
+    }
+    const cfg = try loadCfg(.{ .data_dir = sa.data_dir });
+    var pool = try openPool(allocator, io, cfg);
+    defer pool.deinit();
+    const w = pool.acquireWriter();
+    defer pool.releaseWriter();
+    try migrations.run(w);
+
+    const phc = try crypto.hashPassword(io, allocator, password);
+    defer allocator.free(phc);
+    const tk = try crypto.genToken(io, allocator, 32);
+    defer allocator.free(tk);
+    var rid = id_gen.collectionId(io);
+
+    var st = try w.prepare(
+        \\INSERT INTO "_superusers" ("id","created","updated","email","username","passwordHash","tokenKey","verified")
+        \\ VALUES (?1, datetime('now'), datetime('now'), ?2, '', ?3, ?4, 1);
+    );
+    defer st.finalize();
+    try st.bindText(1, &rid);
+    try st.bindText(2, email);
+    try st.bindText(3, phc);
+    try st.bindText(4, tk);
+    _ = st.step() catch {
+        std.log.err("could not create superuser (email already exists?)", .{});
+        return;
+    };
+    std.log.info("superuser created: {s}", .{email});
 }
 
 test "smoke" {
@@ -100,6 +161,7 @@ test {
     _ = @import("values.zig");
     _ = @import("records.zig");
     _ = @import("api/records.zig");
+    _ = @import("api/auth.zig");
     _ = @import("query/params.zig");
     _ = @import("query/lexer.zig");
     _ = @import("query/parser.zig");
@@ -109,4 +171,7 @@ test {
     _ = @import("query/expand.zig");
     _ = @import("request.zig");
     _ = @import("rules.zig");
+    _ = @import("crypto.zig");
+    _ = @import("jwt.zig");
+    _ = @import("auth.zig");
 }

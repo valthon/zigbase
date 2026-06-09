@@ -43,16 +43,24 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     // reject duplicate collection name up front (→ 409 instead of a raw DbError → 500)
     if ((try get(alloc, w, def.name)) != null) return error.Conflict;
 
+    // For auth collections, prepend the system columns so the physical table and the
+    // loaded collection carry them; only the user fields (`col`) are persisted in _collections.
+    const full = try schema.injectAuthFields(alloc, col);
     // build a DDL view where each single-relation's target collection id is resolved to its table name
-    const ddl_col = try resolveRelations(alloc, w, col);
+    const ddl_col = try resolveRelations(alloc, w, full);
 
     try w.begin();
     errdefer w.rollback() catch {};
     try w.exec(try alloc.dupeZ(u8, try ddl.createTableSql(alloc, ddl_col, null)));
     for (col.indexes) |idx| try w.exec(try alloc.dupeZ(u8, try ddl.createIndexSql(alloc, col.name, idx)));
+    if (col.type == .auth) {
+        for (col.options.auth.identityFields) |idf| {
+            try w.exec(try alloc.dupeZ(u8, try ddl.authIdentityIndexSql(alloc, col.name, idf)));
+        }
+    }
     try insertRow(alloc, w, col);
     try w.commit();
-    return col;
+    return full;
 }
 
 /// Returns a copy of `col` where each relation field's targetCollectionId is replaced by the
@@ -84,10 +92,11 @@ fn bindOptText(st: *db.Stmt, idx: c_int, v: ?[]const u8) db.DbError!void {
 fn insertRow(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EngineError!void {
     const schema_json = try schema.fieldsToJson(alloc, col.fields);
     const indexes_json = try schema.indexesToJson(alloc, col.indexes);
+    const options_json = try schema.optionsToJson(alloc, col);
     var st = try w.prepare(
         \\INSERT INTO "_collections"
-        \\ (id,name,type,system,schema,indexes,listRule,viewRule,createRule,updateRule,deleteRule,created,updated)
-        \\ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11, datetime('now'), datetime('now'));
+        \\ (id,name,type,system,schema,indexes,listRule,viewRule,createRule,updateRule,deleteRule,options,created,updated)
+        \\ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12, datetime('now'), datetime('now'));
     );
     defer st.finalize();
     try st.bindText(1, col.id);
@@ -101,11 +110,12 @@ fn insertRow(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) Engine
     try bindOptText(&st, 9, col.createRule);
     try bindOptText(&st, 10, col.updateRule);
     try bindOptText(&st, 11, col.deleteRule);
+    try st.bindText(12, options_json);
     _ = try st.step();
 }
 
 const select_cols =
-    \\SELECT id,name,type,system,schema,indexes,listRule,viewRule,createRule,updateRule,deleteRule,created,updated FROM "_collections"
+    \\SELECT id,name,type,system,schema,indexes,listRule,viewRule,createRule,updateRule,deleteRule,created,updated,options FROM "_collections"
 ;
 
 fn dupOptText(alloc: std.mem.Allocator, st: *db.Stmt, idx: c_int) !?[]const u8 {
@@ -136,6 +146,7 @@ fn rowToCollection(alloc: std.mem.Allocator, st: *db.Stmt) EngineError!schema.Co
         .deleteRule = try dupOptText(alloc, st, 10),
         .created = try alloc.dupe(u8, st.columnText(11)),
         .updated = try alloc.dupe(u8, st.columnText(12)),
+        .options = try schema.optionsFromJson(alloc, st.columnText(13)),
     };
 }
 
@@ -144,7 +155,7 @@ pub fn get(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineEr
     defer st.finalize();
     try st.bindText(1, id_or_name);
     if (!try st.step()) return null;
-    return try rowToCollection(alloc, &st);
+    return try schema.injectAuthFields(alloc, try rowToCollection(alloc, &st));
 }
 
 pub fn list(alloc: std.mem.Allocator, w: *db.Db) EngineError![]schema.Collection {
@@ -152,7 +163,7 @@ pub fn list(alloc: std.mem.Allocator, w: *db.Db) EngineError![]schema.Collection
     var st = try w.prepare(select_cols ++ " ORDER BY created;");
     defer st.finalize();
     while (try st.step()) {
-        try out.append(alloc, try rowToCollection(alloc, &st));
+        try out.append(alloc, try schema.injectAuthFields(alloc, try rowToCollection(alloc, &st)));
     }
     return out.toOwnedSlice(alloc);
 }
@@ -183,8 +194,14 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         return error.Validation;
     }
 
+    // Inject auth system fields (after validation, which only sees user fields) so the rebuild
+    // preserves the auth columns: `old` is auth-injected (from get), so both sides carry the
+    // auth field ids and rebuildPlan keeps them. Without this an auth-collection update would
+    // drop email/passwordHash/tokenKey/etc and destroy all credentials.
+    const newc_full = try schema.injectAuthFields(alloc, newc);
+
     // relation-resolved view for the rebuild's FK generation
-    const ddl_new = try resolveRelations(alloc, w, newc);
+    const ddl_new = try resolveRelations(alloc, w, newc_full);
 
     try w.exec("PRAGMA foreign_keys=OFF;");
     errdefer w.exec("PRAGMA foreign_keys=ON;") catch {};
@@ -192,19 +209,25 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     errdefer w.rollback() catch {};
     const plan = try ddl.rebuildPlan(alloc, old, ddl_new);
     for (plan) |stmt| try w.exec(try alloc.dupeZ(u8, stmt));
-    try updateRow(alloc, w, old.id, newc);
+    if (newc.type == .auth) {
+        for (newc.options.auth.identityFields) |idf| {
+            try w.exec(try alloc.dupeZ(u8, try ddl.authIdentityIndexSql(alloc, newc.name, idf)));
+        }
+    }
+    try updateRow(alloc, w, old.id, newc); // persist user fields only
     try w.commit();
     try w.exec("PRAGMA foreign_keys=ON;");
 
-    return newc;
+    return newc_full;
 }
 
 fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schema.Collection) EngineError!void {
     const schema_json = try schema.fieldsToJson(alloc, col.fields);
     const indexes_json = try schema.indexesToJson(alloc, col.indexes);
+    const options_json = try schema.optionsToJson(alloc, col);
     var st = try w.prepare(
         \\UPDATE "_collections" SET schema=?2, indexes=?3, listRule=?4, viewRule=?5,
-        \\ createRule=?6, updateRule=?7, deleteRule=?8, updated=datetime('now') WHERE id=?1;
+        \\ createRule=?6, updateRule=?7, deleteRule=?8, options=?9, updated=datetime('now') WHERE id=?1;
     );
     defer st.finalize();
     try st.bindText(1, col_id);
@@ -215,6 +238,7 @@ fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schem
     try bindOptText(&st, 6, col.createRule);
     try bindOptText(&st, 7, col.updateRule);
     try bindOptText(&st, 8, col.deleteRule);
+    try st.bindText(9, options_json);
     _ = try st.step();
 }
 
@@ -260,7 +284,11 @@ test "create persists a collection and builds its physical table" {
     try std.testing.expectEqualStrings("posts", got.name);
     try std.testing.expectEqual(@as(usize, 2), got.fields.len);
     const all = try list(arena.allocator(), &d);
-    try std.testing.expectEqual(@as(usize, 1), all.len);
+    var user_count: usize = 0;
+    for (all) |c| if (!c.system) {
+        user_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), user_count);
 }
 
 test "create rejects an invalid collection" {
@@ -340,6 +368,59 @@ test "unique field enforces uniqueness at the db level" {
     try std.testing.expectError(db.DbError.ExecFailed, d.exec("INSERT INTO posts (id, created, updated, slug) VALUES ('r2','t','t','x');"));
 }
 
+test "auth collection gets system columns; passwordHash hidden in metadata" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
+    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &fields });
+
+    var st = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name IN ('email','username','passwordHash','tokenKey','verified');");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 5), st.columnInt(0));
+
+    const got = (try get(a, &d, "users")).?;
+    try std.testing.expect(schema.fieldByName(got, "email") != null);
+    try std.testing.expect(schema.fieldByName(got, "bio") != null);
+    const json = try schema.collectionToJson(a, got);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"email\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "passwordHash") == null);
+}
+
+test "updating an auth collection preserves its auth columns (credentials not dropped)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const f0 = [_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
+    const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &f0 });
+    // seed a credential row directly
+    try d.exec("INSERT INTO users (id,created,updated,email,passwordHash,tokenKey,verified) VALUES ('u1','t','t','a@b.c','$argon2id$hash','tk',1);");
+
+    // update the user-field schema (add a field) — must NOT drop the auth columns
+    const f1 = [_]schema.Field{
+        .{ .id = "f1", .name = "bio", .options = .{ .text = .{} } },
+        .{ .id = "", .name = "nickname", .options = .{ .text = .{} } },
+    };
+    var newdef = created;
+    newdef.fields = &f1;
+    _ = try update(a, std.testing.io, &d, created.id, newdef);
+
+    // the credential survives the rebuild
+    var st = try d.prepare("SELECT email, passwordHash, tokenKey, verified, nickname FROM users WHERE id='u1';");
+    defer st.finalize();
+    try std.testing.expect((try st.step()));
+    try std.testing.expectEqualStrings("a@b.c", st.columnText(0));
+    try std.testing.expectEqualStrings("$argon2id$hash", st.columnText(1));
+    try std.testing.expectEqualStrings("tk", st.columnText(2));
+}
+
 test "delete drops the table; delete refuses when referenced by a relation" {
     var d = try db.Db.openMemory();
     defer d.close();
@@ -356,4 +437,25 @@ test "delete drops the table; delete refuses when referenced by a relation" {
     try delete(a, &d, "posts");
     try delete(a, &d, "users");
     try std.testing.expect((try get(a, &d, "posts")) == null);
+}
+
+test "auth collection enforces identity uniqueness via partial unique index, allows multiple empty" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try @import("migrations.zig").run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try create(a, std.testing.io, &d, .{
+        .id = "", .name = "members", .type = .auth,
+        .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
+    });
+    // two distinct emails ok
+    try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('a','','','x@y.z');");
+    try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('b','','','q@y.z');");
+    // duplicate non-empty email rejected (exec maps the SQLite constraint error to ExecFailed)
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('c','','','x@y.z');"));
+    // two empty emails allowed (partial index excludes them)
+    try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('d','','','');");
+    try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('e','','','');");
 }

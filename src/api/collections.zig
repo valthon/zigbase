@@ -5,10 +5,26 @@ const db = @import("../db.zig");
 const migrations = @import("../migrations.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
+const auth = @import("../auth.zig");
+const crypto = @import("../crypto.zig");
+const jwt = @import("../jwt.zig");
 const ApiError = @import("error.zig").ApiError;
 const FieldError = @import("error.zig").FieldError;
 
-// TODO(SP5): all handlers below must require a superuser once auth lands.
+/// True if the request carries a valid superuser token. Uses a short-lived reader connection.
+fn isSuperuser(ctx: *http.RequestCtx) bool {
+    const app = ctx.app orelse return false;
+    var r = app.pool.openReader() catch return false;
+    defer r.close();
+    const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, &r) catch null) orelse return false;
+    return authed.is_superuser;
+}
+
+fn requireSuperuser(ctx: *http.RequestCtx) ?http.Response {
+    if (isSuperuser(ctx)) return null;
+    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator) catch
+        ApiError.internal().toResponse(ctx.allocator) catch unreachable;
+}
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     const verrs = collections.last_errors orelse &[_]schema.ValidationError{};
@@ -18,6 +34,7 @@ fn validationResponse(ctx: *http.RequestCtx) !http.Response {
 }
 
 pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
+    if (requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
@@ -32,6 +49,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
+    if (requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
         return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
@@ -46,15 +64,17 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
+    if (requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const col = (try collections.get(ctx.allocator, w, key)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const col =(try collections.get(ctx.allocator, w, key)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     return .{ .status = 200, .body = try schema.collectionToJson(ctx.allocator, col) };
 }
 
 pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
+    if (requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
@@ -71,6 +91,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
+    if (requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
@@ -109,6 +130,14 @@ const TestEnv = struct {
         env.tmp.cleanup();
         std.testing.allocator.destroy(env);
     }
+
+    fn superuserToken(env: *TestEnv, a: std.mem.Allocator) ![]const u8 {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("INSERT INTO \"_superusers\" (\"id\",\"created\",\"updated\",\"email\",\"username\",\"passwordHash\",\"tokenKey\",\"verified\") VALUES ('su1','','','admin@x.io','','','sutk',1);");
+        const key = crypto.deriveKey(env.app.jwt_secret, "sutk");
+        return jwt.sign(a, .{ .id = "su1", .collection = "_superusers", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    }
 };
 
 fn ctxFor(env: *TestEnv, arena: std.mem.Allocator, method: http.Method, path: []const u8, body: []const u8, params: []const http.Param) http.RequestCtx {
@@ -122,19 +151,24 @@ test "create then get then list a collection over handlers" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+
     const body =
         \\{"name":"posts","fields":[{"id":"","name":"title","type":"text","options":{}}]}
     ;
     var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+    cctx.authorization = auth_hdr;
     const cres = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 201), cres.status);
     try std.testing.expect(std.mem.indexOf(u8, cres.body, "\"name\":\"posts\"") != null);
 
     var gctx = ctxFor(env, a, .GET, "/api/collections/posts", "", &.{.{ .key = "idOrName", .value = "posts" }});
+    gctx.authorization = auth_hdr;
     const gres = try get(&gctx);
     try std.testing.expectEqual(@as(u16, 200), gres.status);
 
     var lctx = ctxFor(env, a, .GET, "/api/collections", "", &.{});
+    lctx.authorization = auth_hdr;
     const lres = try list(&lctx);
     try std.testing.expectEqual(@as(u16, 200), lres.status);
     try std.testing.expect(std.mem.indexOf(u8, lres.body, "\"posts\"") != null);
@@ -145,8 +179,26 @@ test "create with invalid name returns 400 with field errors" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cctx = ctxFor(env, arena.allocator(), .POST, "/api/collections", "{\"name\":\"1bad\",\"fields\":[]}", &.{});
+    const a = arena.allocator();
+    var cctx = ctxFor(env, a, .POST, "/api/collections", "{\"name\":\"1bad\",\"fields\":[]}", &.{});
+    cctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_invalid_name") != null);
+}
+
+test "collection management requires a superuser" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var anon = ctxFor(env, a, .GET, "/api/collections", "", &.{});
+    try std.testing.expectEqual(@as(u16, 403), (try list(&anon)).status);
+
+    const token = try env.superuserToken(a);
+    var su = ctxFor(env, a, .GET, "/api/collections", "", &.{});
+    su.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    try std.testing.expectEqual(@as(u16, 200), (try list(&su)).status);
 }

@@ -6,10 +6,17 @@ pub const ServeArgs = struct {
     data_dir: ?[]const u8 = null,
 };
 
+pub const SuperuserArgs = struct {
+    data_dir: ?[]const u8 = null,
+    email: ?[]const u8 = null,
+    password: ?[]const u8 = null,
+};
+
 pub const Command = union(enum) {
     help,
     serve: ServeArgs,
     migrate: ServeArgs,
+    superuser_create: SuperuserArgs,
 };
 
 pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValue };
@@ -31,6 +38,28 @@ pub fn parse(args: []const []const u8) ParseError!Command {
             } else return ParseError.UnknownFlag;
         }
         return .{ .migrate = sa };
+    }
+    if (std.mem.eql(u8, args[0], "superuser")) {
+        if (args.len < 2 or !std.mem.eql(u8, args[1], "create")) return ParseError.UnknownCommand;
+        var sa = SuperuserArgs{};
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--email")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                sa.email = args[i];
+            } else if (std.mem.eql(u8, a, "--password")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                sa.password = args[i];
+            } else if (std.mem.eql(u8, a, "--data-dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                sa.data_dir = args[i];
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .superuser_create = sa };
     }
     if (!std.mem.eql(u8, args[0], "serve")) return ParseError.UnknownCommand;
 
@@ -89,4 +118,10 @@ test "missing flag value errors" {
 
 test "non-numeric port errors with BadValue" {
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--http-port", "abc" }));
+}
+
+test "superuser create parses email and password" {
+    const cmd = try parse(&.{ "superuser", "create", "--email", "a@b.c", "--password", "secret123" });
+    try std.testing.expectEqualStrings("a@b.c", cmd.superuser_create.email.?);
+    try std.testing.expectEqualStrings("secret123", cmd.superuser_create.password.?);
 }

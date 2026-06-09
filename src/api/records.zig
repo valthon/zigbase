@@ -12,6 +12,7 @@ const params_mod = @import("../query/params.zig");
 const expand_mod = @import("../query/expand.zig");
 const rules = @import("../rules.zig");
 const request = @import("../request.zig");
+const auth = @import("../auth.zig");
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     const verrs = records.last_errors orelse &[_]schema.ValidationError{};
@@ -29,13 +30,37 @@ fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value) !http.Res
     return .{ .status = status, .body = try std.json.Stringify.valueAlloc(ctx.allocator, v, .{}) };
 }
 
-/// SP4: an empty request context (SP5 fills auth/superuser from the verified token).
-fn buildContext(ctx: *http.RequestCtx, data: ?std.json.Value) request.RequestContext {
+/// Fills auth/superuser from the verified bearer/cookie token (anonymous if absent/invalid).
+fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) request.RequestContext {
+    if (ctx.app) |app| {
+        if (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null) |a| {
+            return .{ .auth = a.record, .is_superuser = a.is_superuser, .data = data, .method = @tagName(ctx.method) };
+        }
+    }
     return .{ .auth = null, .is_superuser = false, .data = data, .method = @tagName(ctx.method) };
 }
 
 fn forbidden(ctx: *http.RequestCtx) !http.Response {
     return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+}
+
+/// For auth collections, transform request data through auth.applyCreate/applyUpdate
+/// (hash password, gen/rotate tokenKey, strip plaintext, force verified=false on create).
+/// For non-auth collections, returns `data` unchanged. Maps a bad/short/missing password to BadPassword.
+const AuthPrepError = error{BadPassword} || std.mem.Allocator.Error;
+
+fn prepAuthData(ctx: *http.RequestCtx, col: schema.Collection, data: std.json.Value, comptime is_create: bool) AuthPrepError!std.json.Value {
+    if (col.type != .auth) return data;
+    const app = ctx.app.?;
+    const min_len = col.options.auth.minPasswordLength;
+    const out = if (is_create)
+        auth.applyCreate(app.io, ctx.allocator, data, min_len)
+    else
+        auth.applyUpdate(app.io, ctx.allocator, data, min_len);
+    return out catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.BadPassword, // PasswordTooShort and rare hashing/token failures -> bad request
+    };
 }
 
 pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -44,7 +69,7 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     defer r.close();
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rctx = buildContext(ctx, null);
+    const rctx = buildContext(ctx, &r, null);
     switch (rules.decide(col.viewRule, &rctx)) {
         .deny_locked => return ApiError.notFound().toResponse(ctx.allocator),
         .allow => {},
@@ -63,11 +88,15 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rctx = buildContext(ctx, data);
+    const data2 = prepAuthData(ctx, col, data, true) catch |e| switch (e) {
+        error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
+        error.OutOfMemory => return e,
+    };
+    const rctx = buildContext(ctx, w, data);
     const rec = switch (rules.decide(col.createRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
-        .allow => records.create(ctx.allocator, app.io, w, col, data),
-        .check => records.createGuarded(ctx.allocator, app.io, w, col, data, try rules.compileGuard(ctx.allocator, w, col, col.createRule.?, &rctx)),
+        .allow => records.create(ctx.allocator, app.io, w, col, data2),
+        .check => records.createGuarded(ctx.allocator, app.io, w, col, data2, try rules.compileGuard(ctx.allocator, w, col, col.createRule.?, &rctx)),
     } catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         error.NotObject => return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator),
@@ -86,11 +115,15 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     if ((try records.get(ctx.allocator, w, col, rid)) == null) return ApiError.notFound().toResponse(ctx.allocator);
-    const rctx = buildContext(ctx, data);
+    const data2 = prepAuthData(ctx, col, data, false) catch |e| switch (e) {
+        error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
+        error.OutOfMemory => return e,
+    };
+    const rctx = buildContext(ctx, w, data);
     const updated = switch (rules.decide(col.updateRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
-        .allow => records.update(ctx.allocator, w, col, rid, data),
-        .check => records.updateGuarded(ctx.allocator, w, col, rid, data, try rules.compileGuard(ctx.allocator, w, col, col.updateRule.?, &rctx)),
+        .allow => records.update(ctx.allocator, w, col, rid, data2),
+        .check => records.updateGuarded(ctx.allocator, w, col, rid, data2, try rules.compileGuard(ctx.allocator, w, col, col.updateRule.?, &rctx)),
     } catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         error.NotObject => return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator),
@@ -107,7 +140,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     if ((try records.get(ctx.allocator, w, col, rid)) == null) return ApiError.notFound().toResponse(ctx.allocator);
-    const rctx = buildContext(ctx, null);
+    const rctx = buildContext(ctx, w, null);
     switch (rules.decide(col.deleteRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => {},
@@ -122,7 +155,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     var r = try app.pool.openReader();
     defer r.close();
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rctx = buildContext(ctx, null);
+    const rctx = buildContext(ctx, &r, null);
     var rule_expr: ?[]const u8 = null;
     switch (rules.decide(col.listRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
@@ -298,4 +331,47 @@ test "createRule on request data: empty title -> 403, nonempty -> 201" {
     try std.testing.expectEqual(@as(u16, 403), (try create(&bad)).status);
     var ok = ctxFor(env, a, .POST, "{\"title\":\"hello\"}", &p);
     try std.testing.expectEqual(@as(u16, 201), (try create(&ok)).status);
+}
+
+fn seedAuth(env: *TestEnv, name: []const u8, createR: ?[]const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    _ = try collections.create(a, std.testing.io, w, .{
+        .id = "", .name = name, .type = .auth,
+        .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
+        .listRule = "", .viewRule = "", .createRule = createR, .updateRule = "", .deleteRule = "",
+    });
+}
+
+test "creating an auth record hashes the password, hides secrets, forces verified=false" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedAuth(env, "users", "");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    var cctx = ctxFor(env, a, .POST, "{\"email\":\"u@x.io\",\"password\":\"longenough\",\"verified\":true}", &p);
+    const res = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 201), res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "passwordHash") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "tokenKey") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "password") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"verified\":false") != null);
+}
+
+test "creating an auth record without a password is a 400" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedAuth(env, "users2", "");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = [_]http.Param{.{ .key = "col", .value = "users2" }};
+    var cctx = ctxFor(env, a, .POST, "{\"email\":\"u@x.io\"}", &p);
+    const res = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 400), res.status);
 }

@@ -26,6 +26,7 @@ pub const Field = struct {
     name: []const u8,
     required: bool = false,
     unique: bool = false,
+    hidden: bool = false,
     options: FieldOptions,
 
     pub fn fieldType(self: Field) FieldType {
@@ -64,9 +65,48 @@ pub const Collection = struct {
     createRule: ?[]const u8 = null,
     updateRule: ?[]const u8 = null,
     deleteRule: ?[]const u8 = null,
+    options: CollectionOptions = .{},
     created: []const u8 = "",
     updated: []const u8 = "",
 };
+
+pub const AuthOptions = struct {
+    identityFields: []const []const u8 = &.{"email"},
+    minPasswordLength: u8 = 8,
+};
+pub const CollectionOptions = struct {
+    auth: AuthOptions = .{},
+};
+
+pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
+    var root: ObjectMap = .empty;
+    var auth: ObjectMap = .empty;
+    var ids = std.json.Array.init(alloc);
+    for (c.options.auth.identityFields) |f| try ids.append(.{ .string = f });
+    try auth.put(alloc, "identityFields", .{ .array = ids });
+    try auth.put(alloc, "minPasswordLength", .{ .integer = c.options.auth.minPasswordLength });
+    try root.put(alloc, "auth", .{ .object = auth });
+    return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
+}
+
+pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptions {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return .{};
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return .{};
+    const av = root.object.get("auth") orelse return .{};
+    if (av != .object) return .{};
+    var opts = CollectionOptions{};
+    if (av.object.get("identityFields")) |idv| if (idv == .array) {
+        var list: std.ArrayList([]const u8) = .empty;
+        for (idv.array.items) |it| if (it == .string) try list.append(alloc, try alloc.dupe(u8, it.string));
+        if (list.items.len > 0) opts.auth.identityFields = try list.toOwnedSlice(alloc);
+    };
+    if (av.object.get("minPasswordLength")) |mv| if (mv == .integer) {
+        opts.auth.minPasswordLength = std.math.cast(u8, mv.integer) orelse 8;
+    };
+    return opts;
+}
 
 /// Find a field by exact name (case-sensitive). Returns null if absent.
 pub fn fieldByName(c: Collection, name: []const u8) ?Field {
@@ -83,11 +123,58 @@ test "fieldByName finds and misses" {
     try std.testing.expect(fieldByName(c, "missing") == null);
 }
 
+/// Names reserved by the engine (base + auth system columns); user fields may not use them.
+pub fn isSystemFieldName(name: []const u8) bool {
+    // case-insensitive: SQLite column names collide case-insensitively
+    const reserved = [_][]const u8{ "id", "created", "updated", "email", "username", "passwordHash", "tokenKey", "verified" };
+    for (reserved) |r| if (std.ascii.eqlIgnoreCase(name, r)) return true;
+    return false;
+}
+
+/// The implicit system fields of an auth collection (beyond id/created/updated).
+/// passwordHash/tokenKey are hidden (never serialized). Stable ids (leading '_').
+pub fn authSystemFields() []const Field {
+    const S = struct {
+        const fields = [_]Field{
+            .{ .id = "_email", .name = "email", .options = .{ .email = .{} } }, // uniqueness via partial unique index (see ddl.authIdentityIndexSql)
+            .{ .id = "_username", .name = "username", .options = .{ .text = .{} } },
+            .{ .id = "_pwhash", .name = "passwordHash", .hidden = true, .options = .{ .text = .{} } },
+            .{ .id = "_tokkey", .name = "tokenKey", .hidden = true, .options = .{ .text = .{} } },
+            .{ .id = "_verified", .name = "verified", .options = .{ .@"bool" = .{} } },
+        };
+    };
+    return &S.fields;
+}
+
+/// Returns `col` with auth system fields prepended to `fields` (for auth collections);
+/// base/view collections are returned unchanged. The slice is allocated from `alloc`.
+pub fn injectAuthFields(alloc: std.mem.Allocator, col: Collection) !Collection {
+    if (col.type != .auth) return col;
+    const sys = authSystemFields();
+    const out = try alloc.alloc(Field, sys.len + col.fields.len);
+    @memcpy(out[0..sys.len], sys);
+    @memcpy(out[sys.len..], col.fields);
+    var c = col;
+    c.fields = out;
+    return c;
+}
+
+test "injectAuthFields prepends the 5 auth fields for auth collections only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user = [_]Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
+    const auth_col = try injectAuthFields(a, .{ .id = "c", .name = "users", .type = .auth, .fields = &user });
+    try std.testing.expectEqual(@as(usize, 6), auth_col.fields.len);
+    try std.testing.expectEqualStrings("email", auth_col.fields[0].name);
+    try std.testing.expect(fieldByName(auth_col, "passwordHash").?.hidden);
+    const base_col = try injectAuthFields(a, .{ .id = "c", .name = "posts", .type = .base, .fields = &user });
+    try std.testing.expectEqual(@as(usize, 1), base_col.fields.len);
+}
+
 pub const Index = struct { name: []const u8, fields: []const []const u8, unique: bool = false };
 
 pub const ValidationError = struct { field: []const u8, code: []const u8, message: []const u8 };
-
-const system_columns = [_][]const u8{ "id", "created", "updated" };
 
 pub fn isValidIdentifier(s: []const u8) bool {
     if (s.len == 0) return false;
@@ -108,9 +195,8 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
             try errors.append(alloc, .{ .field = f.name, .code = "validation_invalid_name", .message = "Invalid field name." });
             continue;
         }
-        for (system_columns) |sys| {
-            if (std.ascii.eqlIgnoreCase(f.name, sys))
-                try errors.append(alloc, .{ .field = f.name, .code = "validation_reserved_name", .message = "Field name collides with a system column." });
+        if (isSystemFieldName(f.name)) {
+            try errors.append(alloc, .{ .field = f.name, .code = "validation_reserved_name", .message = "Field name is reserved." });
         }
         for (c.fields[0..i]) |g| {
             if (std.ascii.eqlIgnoreCase(f.name, g.name))
@@ -133,6 +219,14 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
         for (idx.fields) |fname| {
             if (!isValidIdentifier(fname))
                 try errors.append(alloc, .{ .field = fname, .code = "validation_invalid_name", .message = "Invalid index field name." });
+        }
+    }
+
+    // Auth identity fields are interpolated into SQL/DDL, so they must be valid identifiers.
+    if (c.type == .auth) {
+        for (c.options.auth.identityFields) |idf| {
+            if (!isValidIdentifier(idf))
+                try errors.append(alloc, .{ .field = "identityFields", .code = "validation_invalid_identity_field", .message = "Identity field must be a valid identifier." });
         }
     }
 }
@@ -450,11 +544,13 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
     const name = try alloc.dupe(u8, (objGetStr(obj, "name")) orelse return error.InvalidSchema);
     const ctype = std.meta.stringToEnum(CollectionType, objGetStr(obj, "type") orelse "base") orelse .base;
 
-    const empty_fields: []const Field = &.{};
-    const fields = if (obj.object.get("fields")) |fv| blk: {
+    const raw_fields = if (obj.object.get("fields")) |fv| blk: {
         const fs = try std.json.Stringify.valueAlloc(alloc, fv, .{});
         break :blk try fieldsFromJson(alloc, fs);
-    } else empty_fields;
+    } else &[_]Field{};
+    var kept: std.ArrayList(Field) = .empty;
+    for (raw_fields) |f| if (!isSystemFieldName(f.name)) try kept.append(alloc, f);
+    const fields = try kept.toOwnedSlice(alloc);
 
     const empty_indexes: []const Index = &.{};
     const indexes = if (obj.object.get("indexes")) |iv| blk: {
@@ -473,6 +569,10 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
         .createRule = try dupOptStr(alloc, objGetStr(obj, "createRule")),
         .updateRule = try dupOptStr(alloc, objGetStr(obj, "updateRule")),
         .deleteRule = try dupOptStr(alloc, objGetStr(obj, "deleteRule")),
+        .options = if (obj.object.get("options")) |ov|
+            try optionsFromJson(alloc, try std.json.Stringify.valueAlloc(alloc, ov, .{}))
+        else
+            .{},
     };
 }
 
@@ -485,7 +585,9 @@ pub fn collectionToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
     try root.put(alloc, "system", .{ .bool = c.system });
     // Embed fields/indexes as arrays by reparsing their JSON. The parse trees stay alive
     // until after Stringify reads them (defers run after the return expression evaluates).
-    const fields_str = try fieldsToJson(alloc, c.fields);
+    var visible: std.ArrayList(Field) = .empty;
+    for (c.fields) |f| if (!f.hidden) try visible.append(alloc, f);
+    const fields_str = try fieldsToJson(alloc, visible.items);
     const fparsed = try std.json.parseFromSlice(Value, alloc, fields_str, .{});
     defer fparsed.deinit();
     try root.put(alloc, "schema", fparsed.value);
@@ -500,6 +602,9 @@ pub fn collectionToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
     try root.put(alloc, "deleteRule", optStrValue(c.deleteRule));
     try root.put(alloc, "created", .{ .string = c.created });
     try root.put(alloc, "updated", .{ .string = c.updated });
+    const oparsed = try std.json.parseFromSlice(std.json.Value, alloc, try optionsToJson(alloc, c), .{});
+    defer oparsed.deinit();
+    try root.put(alloc, "options", oparsed.value);
     return std.json.Stringify.valueAlloc(alloc, Value{ .object = root }, .{});
 }
 
@@ -604,4 +709,46 @@ test "indexes round-trip" {
     try std.testing.expectEqual(@as(usize, 1), back.len);
     try std.testing.expectEqualStrings("idx_title", back[0].name);
     try std.testing.expect(back[0].unique);
+}
+
+test "collection options round-trip identity fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .identityFields = &.{ "email", "username" }, .minPasswordLength = 10 } } };
+    const s = try optionsToJson(a, c);
+    const back = try optionsFromJson(a, s);
+    try std.testing.expectEqual(@as(usize, 2), back.auth.identityFields.len);
+    try std.testing.expectEqualStrings("username", back.auth.identityFields[1]);
+    try std.testing.expectEqual(@as(u8, 10), back.auth.minPasswordLength);
+}
+
+test "validate rejects an auth collection with a non-identifier identity field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var errs: std.ArrayList(ValidationError) = .empty;
+    const c = Collection{
+        .id = "c", .name = "users", .type = .auth, .fields = &.{},
+        .options = .{ .auth = .{ .identityFields = &.{ "email", "x\") WHERE 1=1; --" } } },
+    };
+    try validate(a, c, &errs);
+    var found = false;
+    for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_identity_field")) {
+        found = true;
+    };
+    try std.testing.expect(found);
+}
+
+test "validate accepts an auth collection with valid identity fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var errs: std.ArrayList(ValidationError) = .empty;
+    const c = Collection{
+        .id = "c", .name = "users", .type = .auth, .fields = &.{},
+        .options = .{ .auth = .{ .identityFields = &.{ "email", "username" } } },
+    };
+    try validate(a, c, &errs);
+    for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_identity_field"));
 }

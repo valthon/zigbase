@@ -67,7 +67,7 @@ fn rowToObject(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection)
     try obj.put(alloc, "updated", .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
     for (col.fields, 0..) |f, i| {
         const v = try values.readValue(alloc, stmt, @intCast(3 + i), f);
-        try obj.put(alloc, f.name, v);
+        if (!f.hidden) try obj.put(alloc, f.name, v);
     }
     return .{ .object = obj };
 }
