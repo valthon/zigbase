@@ -22,6 +22,9 @@ const API = {
   logout: () => api('POST', '/collections/_superusers/auth-logout'),
   collections: () => api('GET', '/collections'),
   records: (col, q) => api('GET', `/collections/${encodeURIComponent(col)}/records?${q}`),
+  createCollection: (payload) => api('POST', '/collections', payload),
+  updateCollection: (name, payload) => api('PATCH', `/collections/${encodeURIComponent(name)}`, payload),
+  deleteCollection: (name) => api('DELETE', `/collections/${encodeURIComponent(name)}`),
 };
 
 // --- tiny hash router ---
@@ -103,8 +106,8 @@ function Shell({ route }) {
       </div>
       <div class="main">
         ${route.name === 'records' ? html`<${RecordsTable} col=${route.col}/>`
-          : route.name === 'schema' ? html`<div data-test="schema-stub"><h2>${route.col}</h2><p class="muted">Schema editor — Plan 9b.</p></div>`
-          : html`<div data-test="collections-home"><h2>Collections</h2><p class="muted">Pick a collection from the sidebar. Create/edit lands in Plan 9b.</p></div>`}
+          : route.name === 'schema' ? html`<${SchemaEditor} name=${route.col}/>`
+          : html`<div data-test="collections-home"><h2>Collections</h2><button data-test="new-collection" onClick=${() => go('#/collections/__new__')}>+ New collection</button></div>`}
       </div>
     </div>`;
 }
@@ -157,5 +160,110 @@ function fmt(v) {
   if (typeof v === 'object') return JSON.stringify(v);
   return String(v);
 }
+
+const FIELD_TYPES = ['text','email','url','editor','date','autodate','bool','number','json','select','relation','file'];
+const RULES = ['listRule','viewRule','createRule','updateRule','deleteRule'];
+
+function blankField() { return { id: '', name: '', type: 'text', required: false, unique: false, options: {} }; }
+
+function SchemaEditor({ name }) {
+  const isNew = name === '__new__';
+  const [tab, setTab] = useState('fields');
+  const [col, setCol] = useState(null);
+  const [allCols, setAllCols] = useState([]);
+  const [err, setErr] = useState('');
+  const [fieldErrs, setFieldErrs] = useState({});
+  useEffect(() => {
+    API.collections().then(cs => {
+      setAllCols(cs);
+      if (isNew) setCol({ name: '', type: 'base', schema: [], listRule: null, viewRule: null, createRule: null, updateRule: null, deleteRule: null, options: { auth: { identityFields: ['email'], minPasswordLength: 8, oauth2: { enabled: false, providers: [] } } } });
+      else setCol(cs.find(c => c.name === name) || null);
+    }).catch(x => setErr((x.data && x.data.message) || 'Load failed'));
+  }, [name]);
+  if (col == null) return html`<div class="muted">…</div>`;
+
+  function setF(i, patch) { const s = col.schema.slice(); s[i] = { ...s[i], ...patch }; setCol({ ...col, schema: s }); }
+  function setOpt(i, patch) { setF(i, { options: { ...col.schema[i].options, ...patch } }); }
+  function addField() { setCol({ ...col, schema: [...col.schema, blankField()] }); }
+  function delField(i) { const s = col.schema.slice(); s.splice(i, 1); setCol({ ...col, schema: s }); }
+  function setRule(r, v) { setCol({ ...col, [r]: v }); }
+
+  async function save() {
+    setErr(''); setFieldErrs({});
+    const payload = { name: col.name, type: col.type, fields: col.schema, options: col.options };
+    for (const r of RULES) payload[r] = col[r];
+    try {
+      const saved = isNew ? await API.createCollection(payload) : await API.updateCollection(name, payload);
+      // Do a full page load of the saved collection's records view so the sidebar list refreshes.
+      // location.assign() to a URL with a *new path query* forces a document reload (not just a
+      // hashchange), avoiding the race between setting the hash and a separate location.reload().
+      location.assign('/_/?saved=' + Date.now() + '#/collections/' + encodeURIComponent(saved.name) + '/records');
+    } catch (x) {
+      setErr((x.data && x.data.message) || 'Save failed');
+      if (x.data && x.data.data) setFieldErrs(x.data.data);
+    }
+  }
+  async function del() {
+    if (!confirm('Delete collection ' + col.name + '?')) return;
+    try { await API.deleteCollection(name); location.assign('/_/?deleted=' + Date.now() + '#/collections'); }
+    catch (x) { setErr((x.data && x.data.message) || 'Delete failed'); }
+  }
+
+  const isAuth = col.type === 'auth';
+  return html`
+    <div data-test="schema-editor">
+      <div class="toolbar">
+        <h2 style="margin:0">${isNew ? 'New collection' : 'Edit ' + col.name}</h2>
+        <div class="grow"></div>
+        ${!isNew && !col.system && html`<button class="ghost" data-test="delete-collection" onClick=${del}>Delete</button>`}
+        <button data-test="save-collection" onClick=${save}>Save</button>
+      </div>
+      ${err && html`<div class="error" data-test="schema-error">${err}</div>`}
+      <div class="row" style="border-bottom:1px solid var(--line); margin-bottom:12px">
+        ${['fields','rules', ...(isAuth ? ['auth'] : [])].map(t => html`<button key=${t} class=${'ghost' + (tab===t?' active':'')} data-test=${'tab-'+t} onClick=${() => setTab(t)} style=${tab===t?'border-color:var(--accent)':''}>${t==='fields'?'Fields':t==='rules'?'API Rules':'Auth / OAuth2'}</button>`)}
+      </div>
+
+      ${tab === 'fields' && html`<div data-test="tab-fields-body">
+        <div class="field"><label>Name</label><input data-test="col-name" value=${col.name} onInput=${e => setCol({ ...col, name: e.target.value })} disabled=${!isNew && col.system}/></div>
+        ${isNew && html`<div class="field"><label>Type</label><select data-test="col-type" value=${col.type} onChange=${e => setCol({ ...col, type: e.target.value })}>${['base','auth'].map(t => html`<option key=${t} value=${t}>${t}</option>`)}</select></div>`}
+        <label class="muted">Fields</label>
+        ${col.schema.map((f, i) => html`<div class="row" data-test="field-row" style="margin:6px 0; align-items:flex-start; flex-wrap:wrap" key=${i}>
+          <input style="width:150px" data-test="field-name" placeholder="name" value=${f.name} onInput=${e => setF(i, { name: e.target.value })} disabled=${isSystemField(f.name)}/>
+          <select style="width:120px" data-test="field-type" value=${f.type} onChange=${e => setF(i, { type: e.target.value, options: {} })} disabled=${isSystemField(f.name)}>${FIELD_TYPES.map(t => html`<option key=${t} value=${t}>${t}</option>`)}</select>
+          <label class="muted"><input type="checkbox" style="width:auto" checked=${f.required} onChange=${e => setF(i, { required: e.target.checked })}/> req</label>
+          <label class="muted"><input type="checkbox" style="width:auto" checked=${f.unique} onChange=${e => setF(i, { unique: e.target.checked })}/> uniq</label>
+          ${fieldOptions(f, i, setOpt, allCols)}
+          ${!isSystemField(f.name) && html`<button class="ghost" data-test="del-field" onClick=${() => delField(i)}>✕</button>`}
+          ${fieldErrs[f.name] && html`<div class="error" style="flex-basis:100%">${fieldErrs[f.name].message}</div>`}
+        </div>`)}
+        <button class="ghost" data-test="add-field" onClick=${addField}>+ Add field</button>
+      </div>`}
+
+      ${tab === 'rules' && html`<div data-test="tab-rules-body">
+        ${RULES.map(r => html`<div class="field" key=${r}>
+          <label>${r}</label>
+          <div class="row">
+            <input style="flex:1" data-test=${'rule-'+r} placeholder='empty = public' value=${col[r] == null ? '' : col[r]} disabled=${col[r] == null} onInput=${e => setRule(r, e.target.value)}/>
+            <label class="muted"><input type="checkbox" style="width:auto" data-test=${'lock-'+r} checked=${col[r] == null} onChange=${e => setRule(r, e.target.checked ? null : '')}/> lock</label>
+          </div>
+        </div>`)}
+      </div>`}
+
+      ${tab === 'auth' && html`<${AuthTab} col=${col} setCol=${setCol}/>`}
+    </div>`;
+}
+
+function isSystemField(n) { return ['id','created','updated','email','username','passwordHash','tokenKey','verified'].includes(n); }
+
+function fieldOptions(f, i, setOpt, allCols) {
+  const o = f.options || {};
+  if (f.type === 'select') return html`<input style="width:200px" data-test="opt-values" placeholder="values: a,b,c" value=${(o.values||[]).join(',')} onInput=${e => setOpt(i, { values: e.target.value.split(',').map(s=>s.trim()).filter(Boolean), maxSelect: o.maxSelect||1 })}/>`;
+  if (f.type === 'relation') return html`<select style="width:160px" data-test="opt-target" value=${o.targetCollectionId||''} onChange=${e => setOpt(i, { targetCollectionId: e.target.value, maxSelect: o.maxSelect||1 })}><option value="">target…</option>${allCols.map(c => html`<option key=${c.id} value=${c.name}>${c.name}</option>`)}</select>`;
+  if (f.type === 'number') return html`<select style="width:110px" data-test="opt-mode" value=${o.mode||'float'} onChange=${e => setOpt(i, { mode: e.target.value })}>${['float','int','fixed'].map(m => html`<option key=${m} value=${m}>${m}</option>`)}</select>`;
+  if (f.type === 'file') return html`<input style="width:90px" type="number" data-test="opt-maxselect" placeholder="maxSel" value=${o.maxSelect||1} onInput=${e => setOpt(i, { maxSelect: +e.target.value || 1 })}/>`;
+  return '';
+}
+
+function AuthTab({ col, setCol }) { return html`<div data-test="tab-auth-body" class="muted">Auth/OAuth2 — Task 4.</div>`; }
 
 render(html`<${App}/>`, document.getElementById('app'));

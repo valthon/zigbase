@@ -44,3 +44,16 @@ def login(page):
     page.fill('[data-test=password]', 'adminpassword')
     page.click('[data-test=login-submit]')
     page.wait_for_selector('[data-test=nav-collections]', timeout=5000)
+
+def csrf(page):
+    for c in page.context.cookies():
+        if c["name"] == "zb_csrf":
+            return c["value"]
+    return ""
+
+def api_request(page, method, path, body=None):
+    headers = {"X-CSRF-Token": csrf(page)}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    r = page.request.fetch(path, method=method, headers=headers, data=(__import__("json").dumps(body) if body is not None else None))
+    return r
