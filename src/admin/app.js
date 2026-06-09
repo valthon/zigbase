@@ -297,7 +297,32 @@ function fieldOptions(f, i, setOpt, allCols) {
   return '';
 }
 
-function AuthTab({ col, setCol }) { return html`<div data-test="tab-auth-body" class="muted">Auth/OAuth2 — Task 4.</div>`; }
+const OAUTH_PRESETS = ['google','github','microsoft','discord','generic'];
+
+function AuthTab({ col, setCol }) {
+  const auth = col.options.auth || { identityFields: ['email'], minPasswordLength: 8, oauth2: { enabled: false, providers: [] } };
+  const oauth2 = auth.oauth2 || { enabled: false, providers: [] };
+  function setAuth(patch) { setCol({ ...col, options: { ...col.options, auth: { ...auth, ...patch } } }); }
+  function setOauth(patch) { setAuth({ oauth2: { ...oauth2, ...patch } }); }
+  function setProv(i, patch) { const ps = oauth2.providers.slice(); ps[i] = { ...ps[i], ...patch }; setOauth({ providers: ps }); }
+  function addProv() { setOauth({ enabled: true, providers: [...oauth2.providers, { name: 'google', clientId: '', clientSecret: '', enabled: true, redirectUrls: [] }] }); }
+  function delProv(i) { const ps = oauth2.providers.slice(); ps.splice(i, 1); setOauth({ providers: ps }); }
+
+  return html`<div data-test="tab-auth-body">
+    <div class="field"><label>identityFields (comma)</label><input data-test="identity-fields" value=${(auth.identityFields||[]).join(',')} onInput=${e => setAuth({ identityFields: e.target.value.split(',').map(s=>s.trim()).filter(Boolean) })}/></div>
+    <div class="field"><label>minPasswordLength</label><input type="number" data-test="min-pw" value=${auth.minPasswordLength||8} onInput=${e => setAuth({ minPasswordLength: +e.target.value || 8 })}/></div>
+    <label class="muted"><input type="checkbox" style="width:auto" data-test="oauth-enabled" checked=${oauth2.enabled} onChange=${e => setOauth({ enabled: e.target.checked })}/> OAuth2 enabled</label>
+    ${oauth2.providers.map((p, i) => html`<div class="row" data-test="oauth-provider" style="flex-wrap:wrap; border:1px solid var(--line); border-radius:8px; padding:8px; margin:8px 0" key=${i}>
+      <select style="width:120px" data-test="oauth-name" value=${p.name} onChange=${e => setProv(i, { name: e.target.value })}>${OAUTH_PRESETS.map(n => html`<option key=${n} value=${n}>${n}</option>`)}</select>
+      <input style="width:160px" data-test="oauth-clientid" placeholder="clientId" value=${p.clientId||''} onInput=${e => setProv(i, { clientId: e.target.value })}/>
+      <input style="width:160px" type="password" data-test="oauth-secret" placeholder=${p.clientSecret ? '•••• (set; leave blank to keep)' : 'clientSecret'} value=${p.clientSecret||''} onInput=${e => setProv(i, { clientSecret: e.target.value })}/>
+      <input style="width:200px" data-test="oauth-redirects" placeholder="redirectUrls (comma)" value=${(p.redirectUrls||[]).join(',')} onInput=${e => setProv(i, { redirectUrls: e.target.value.split(',').map(s=>s.trim()).filter(Boolean) })}/>
+      <label class="muted"><input type="checkbox" style="width:auto" checked=${p.enabled} onChange=${e => setProv(i, { enabled: e.target.checked })}/> on</label>
+      <button class="ghost" data-test="del-provider" onClick=${() => delProv(i)}>✕</button>
+    </div>`)}
+    <button class="ghost" data-test="add-provider" onClick=${addProv}>+ Add provider</button>
+  </div>`;
+}
 
 function RecordDrawer({ col, record, schema, onClose, onSaved }) {
   const isNew = !record;
