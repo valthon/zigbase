@@ -86,6 +86,9 @@ pub const FileUploadHandler = *const fn (ev: *FileEvent) void;
 pub const LifecycleEvent = struct { app: *App };
 pub const LifecycleHandler = *const fn (ev: *LifecycleEvent) void;
 
+pub const JobEvent = struct { app: *App, name: []const u8 };
+pub const JobTask = *const fn (ev: *JobEvent) anyerror!void;
+
 /// `@compileError` on any route spec missing a required field (`.method`/`.path`/
 /// `.handler`) or with a wrong-typed handler, mirroring `validateHooks`. `.auth` is
 /// optional (defaults to `.superuser`) so it is intentionally not required here.
