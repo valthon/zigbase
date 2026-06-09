@@ -201,6 +201,10 @@ pub fn verifyToken(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, token: 
     return .{ .record = rec, .collection = claims.collection, .is_superuser = is_super, .exp = claims.exp };
 }
 
+pub fn nowUnixPub(conn: *db.Db) db.DbError!i64 {
+    return nowUnix(conn);
+}
+
 /// Current unix time from SQLite (keeps pure code clock-free).
 fn nowUnix(conn: *db.Db) db.DbError!i64 {
     var st = try conn.prepare("SELECT unixepoch('now');");

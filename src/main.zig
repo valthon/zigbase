@@ -182,4 +182,5 @@ test {
     _ = @import("realtime/protocol.zig");
     _ = @import("realtime/connection.zig");
     _ = @import("realtime/hub.zig");
+    _ = @import("realtime/ws.zig");
 }
