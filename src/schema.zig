@@ -86,8 +86,9 @@ test "fieldByName finds and misses" {
 
 /// Names reserved by the engine (base + auth system columns); user fields may not use them.
 pub fn isSystemFieldName(name: []const u8) bool {
+    // case-insensitive: SQLite column names collide case-insensitively
     const reserved = [_][]const u8{ "id", "created", "updated", "email", "username", "passwordHash", "tokenKey", "verified" };
-    for (reserved) |r| if (std.mem.eql(u8, name, r)) return true;
+    for (reserved) |r| if (std.ascii.eqlIgnoreCase(name, r)) return true;
     return false;
 }
 

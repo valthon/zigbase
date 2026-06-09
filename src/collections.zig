@@ -186,8 +186,14 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         return error.Validation;
     }
 
+    // Inject auth system fields (after validation, which only sees user fields) so the rebuild
+    // preserves the auth columns: `old` is auth-injected (from get), so both sides carry the
+    // auth field ids and rebuildPlan keeps them. Without this an auth-collection update would
+    // drop email/passwordHash/tokenKey/etc and destroy all credentials.
+    const newc_full = try schema.injectAuthFields(alloc, newc);
+
     // relation-resolved view for the rebuild's FK generation
-    const ddl_new = try resolveRelations(alloc, w, newc);
+    const ddl_new = try resolveRelations(alloc, w, newc_full);
 
     try w.exec("PRAGMA foreign_keys=OFF;");
     errdefer w.exec("PRAGMA foreign_keys=ON;") catch {};
@@ -195,11 +201,11 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     errdefer w.rollback() catch {};
     const plan = try ddl.rebuildPlan(alloc, old, ddl_new);
     for (plan) |stmt| try w.exec(try alloc.dupeZ(u8, stmt));
-    try updateRow(alloc, w, old.id, newc);
+    try updateRow(alloc, w, old.id, newc); // persist user fields only
     try w.commit();
     try w.exec("PRAGMA foreign_keys=ON;");
 
-    return newc;
+    return newc_full;
 }
 
 fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schema.Collection) EngineError!void {
@@ -364,6 +370,36 @@ test "auth collection gets system columns; passwordHash hidden in metadata" {
     const json = try schema.collectionToJson(a, got);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"email\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "passwordHash") == null);
+}
+
+test "updating an auth collection preserves its auth columns (credentials not dropped)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const f0 = [_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
+    const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &f0 });
+    // seed a credential row directly
+    try d.exec("INSERT INTO users (id,created,updated,email,passwordHash,tokenKey,verified) VALUES ('u1','t','t','a@b.c','$argon2id$hash','tk',1);");
+
+    // update the user-field schema (add a field) — must NOT drop the auth columns
+    const f1 = [_]schema.Field{
+        .{ .id = "f1", .name = "bio", .options = .{ .text = .{} } },
+        .{ .id = "", .name = "nickname", .options = .{ .text = .{} } },
+    };
+    var newdef = created;
+    newdef.fields = &f1;
+    _ = try update(a, std.testing.io, &d, created.id, newdef);
+
+    // the credential survives the rebuild
+    var st = try d.prepare("SELECT email, passwordHash, tokenKey, verified, nickname FROM users WHERE id='u1';");
+    defer st.finalize();
+    try std.testing.expect((try st.step()));
+    try std.testing.expectEqualStrings("a@b.c", st.columnText(0));
+    try std.testing.expectEqualStrings("$argon2id$hash", st.columnText(1));
+    try std.testing.expectEqualStrings("tk", st.columnText(2));
 }
 
 test "delete drops the table; delete refuses when referenced by a relation" {
