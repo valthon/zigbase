@@ -33,6 +33,7 @@ fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: 
                     }
                 }
             }
+            if (np.clientSecret.len == 0 and np.enabled) return error.BadOAuthConfig;
         } else if (!secrets.isEncrypted(np.clientSecret)) {
             np.clientSecret = try secrets.encryptSecret(app.io, ctx.allocator, app.jwt_secret, np.clientSecret);
         }
@@ -222,6 +223,24 @@ test "create with invalid name returns 400 with field errors" {
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_invalid_name") != null);
+}
+
+test "enabled oauth2 provider with no client secret is rejected at save" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const token = try env.superuserToken(a);
+    const body =
+        \\{"name":"m3","type":"auth","fields":[],
+        \\ "options":{"auth":{"oauth2":{"enabled":true,"providers":[
+        \\   {"name":"google","clientId":"cid","clientSecret":"","enabled":true,"redirectUrls":["https://app/cb"]}
+        \\ ]}}}}
+    ;
+    var c = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+    c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    try std.testing.expectEqual(@as(u16, 400), (try create(&c)).status);
 }
 
 test "collection management requires a superuser" {
