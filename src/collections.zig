@@ -43,8 +43,11 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     // reject duplicate collection name up front (→ 409 instead of a raw DbError → 500)
     if ((try get(alloc, w, def.name)) != null) return error.Conflict;
 
+    // For auth collections, prepend the system columns so the physical table and the
+    // loaded collection carry them; only the user fields (`col`) are persisted in _collections.
+    const full = try schema.injectAuthFields(alloc, col);
     // build a DDL view where each single-relation's target collection id is resolved to its table name
-    const ddl_col = try resolveRelations(alloc, w, col);
+    const ddl_col = try resolveRelations(alloc, w, full);
 
     try w.begin();
     errdefer w.rollback() catch {};
@@ -52,7 +55,7 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     for (col.indexes) |idx| try w.exec(try alloc.dupeZ(u8, try ddl.createIndexSql(alloc, col.name, idx)));
     try insertRow(alloc, w, col);
     try w.commit();
-    return col;
+    return full;
 }
 
 /// Returns a copy of `col` where each relation field's targetCollectionId is replaced by the
@@ -144,7 +147,7 @@ pub fn get(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineEr
     defer st.finalize();
     try st.bindText(1, id_or_name);
     if (!try st.step()) return null;
-    return try rowToCollection(alloc, &st);
+    return try schema.injectAuthFields(alloc, try rowToCollection(alloc, &st));
 }
 
 pub fn list(alloc: std.mem.Allocator, w: *db.Db) EngineError![]schema.Collection {
@@ -152,7 +155,7 @@ pub fn list(alloc: std.mem.Allocator, w: *db.Db) EngineError![]schema.Collection
     var st = try w.prepare(select_cols ++ " ORDER BY created;");
     defer st.finalize();
     while (try st.step()) {
-        try out.append(alloc, try rowToCollection(alloc, &st));
+        try out.append(alloc, try schema.injectAuthFields(alloc, try rowToCollection(alloc, &st)));
     }
     return out.toOwnedSlice(alloc);
 }
@@ -338,6 +341,29 @@ test "unique field enforces uniqueness at the db level" {
     _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
     try d.exec("INSERT INTO posts (id, created, updated, slug) VALUES ('r1','t','t','x');");
     try std.testing.expectError(db.DbError.ExecFailed, d.exec("INSERT INTO posts (id, created, updated, slug) VALUES ('r2','t','t','x');"));
+}
+
+test "auth collection gets system columns; passwordHash hidden in metadata" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
+    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &fields });
+
+    var st = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name IN ('email','username','passwordHash','tokenKey','verified');");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 5), st.columnInt(0));
+
+    const got = (try get(a, &d, "users")).?;
+    try std.testing.expect(schema.fieldByName(got, "email") != null);
+    try std.testing.expect(schema.fieldByName(got, "bio") != null);
+    const json = try schema.collectionToJson(a, got);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"email\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "passwordHash") == null);
 }
 
 test "delete drops the table; delete refuses when referenced by a relation" {

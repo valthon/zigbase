@@ -136,8 +136,6 @@ pub const Index = struct { name: []const u8, fields: []const []const u8, unique:
 
 pub const ValidationError = struct { field: []const u8, code: []const u8, message: []const u8 };
 
-const system_columns = [_][]const u8{ "id", "created", "updated" };
-
 pub fn isValidIdentifier(s: []const u8) bool {
     if (s.len == 0) return false;
     if (!std.ascii.isAlphabetic(s[0])) return false;
@@ -157,9 +155,8 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
             try errors.append(alloc, .{ .field = f.name, .code = "validation_invalid_name", .message = "Invalid field name." });
             continue;
         }
-        for (system_columns) |sys| {
-            if (std.ascii.eqlIgnoreCase(f.name, sys))
-                try errors.append(alloc, .{ .field = f.name, .code = "validation_reserved_name", .message = "Field name collides with a system column." });
+        if (isSystemFieldName(f.name)) {
+            try errors.append(alloc, .{ .field = f.name, .code = "validation_reserved_name", .message = "Field name is reserved." });
         }
         for (c.fields[0..i]) |g| {
             if (std.ascii.eqlIgnoreCase(f.name, g.name))
@@ -499,11 +496,13 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
     const name = try alloc.dupe(u8, (objGetStr(obj, "name")) orelse return error.InvalidSchema);
     const ctype = std.meta.stringToEnum(CollectionType, objGetStr(obj, "type") orelse "base") orelse .base;
 
-    const empty_fields: []const Field = &.{};
-    const fields = if (obj.object.get("fields")) |fv| blk: {
+    const raw_fields = if (obj.object.get("fields")) |fv| blk: {
         const fs = try std.json.Stringify.valueAlloc(alloc, fv, .{});
         break :blk try fieldsFromJson(alloc, fs);
-    } else empty_fields;
+    } else &[_]Field{};
+    var kept: std.ArrayList(Field) = .empty;
+    for (raw_fields) |f| if (!isSystemFieldName(f.name)) try kept.append(alloc, f);
+    const fields = try kept.toOwnedSlice(alloc);
 
     const empty_indexes: []const Index = &.{};
     const indexes = if (obj.object.get("indexes")) |iv| blk: {
@@ -534,7 +533,9 @@ pub fn collectionToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
     try root.put(alloc, "system", .{ .bool = c.system });
     // Embed fields/indexes as arrays by reparsing their JSON. The parse trees stay alive
     // until after Stringify reads them (defers run after the return expression evaluates).
-    const fields_str = try fieldsToJson(alloc, c.fields);
+    var visible: std.ArrayList(Field) = .empty;
+    for (c.fields) |f| if (!f.hidden) try visible.append(alloc, f);
+    const fields_str = try fieldsToJson(alloc, visible.items);
     const fparsed = try std.json.parseFromSlice(Value, alloc, fields_str, .{});
     defer fparsed.deinit();
     try root.put(alloc, "schema", fparsed.value);
