@@ -51,6 +51,7 @@ pub const Server = struct {
         var listener = zap.HttpListener.init(.{ .port = self.port, .on_request = onRequest, .on_upgrade = realtime_ws.handleUpgrade, .log = false });
         try listener.listen();
         std.log.info("zigbase listening on http://{s}:{d}", .{ self.host, self.port });
+        realtime_ws.active = true; // reactor about to run; allow broadcast to publish
         zap.start(.{ .threads = 4, .workers = 1 });
     }
 };
