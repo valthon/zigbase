@@ -25,6 +25,7 @@ const API = {
   createCollection: (payload) => api('POST', '/collections', payload),
   updateCollection: (name, payload) => api('PATCH', `/collections/${encodeURIComponent(name)}`, payload),
   deleteCollection: (name) => api('DELETE', `/collections/${encodeURIComponent(name)}`),
+  refresh: () => api('POST', '/collections/_superusers/auth-refresh'),
 };
 
 // --- tiny hash router ---
@@ -112,6 +113,21 @@ function Shell({ route }) {
     </div>`;
 }
 
+function useLiveCollection(col, apply) {
+  useEffect(() => {
+    let ws, closed = false;
+    (async () => {
+      let token;
+      try { token = (await API.refresh()).token; } catch (_) { return; } // degrade: no live updates
+      if (closed) return;
+      ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/realtime');
+      ws.onopen = () => { ws.send(JSON.stringify({ action: 'auth', token })); ws.send(JSON.stringify({ action: 'subscribe', topic: col })); };
+      ws.onmessage = (e) => { let m; try { m = JSON.parse(e.data); } catch (_) { return; } if (m.type === 'event') apply(m); };
+    })();
+    return () => { closed = true; if (ws) try { ws.close(); } catch (_) {} };
+  }, [col]);
+}
+
 function RecordsTable({ col }) {
   const [data, setData] = useState(null);
   const [err, setErr] = useState('');
@@ -131,6 +147,18 @@ function RecordsTable({ col }) {
   }
   useEffect(() => { setPage(1); }, [col]);
   useEffect(load, [col, page, sort]);
+  useLiveCollection(col, (m) => {
+    setData(prev => {
+      if (!prev) return prev;
+      const items = prev.items.slice();
+      const id = m.record && m.record.id;
+      const idx = items.findIndex(r => r.id === id);
+      if (m.action === 'delete') { if (idx >= 0) items.splice(idx, 1); }
+      else if (m.action === 'update') { if (idx >= 0) items[idx] = m.record; }
+      else if (m.action === 'create') { if (idx < 0) items.unshift(m.record); }
+      return { ...prev, items };
+    });
+  });
   const items = data ? data.items : [];
   const columns = items.length ? Object.keys(items[0]).filter(k => k !== 'collectionId' && k !== 'collectionName') : ['id', 'created', 'updated'];
   return html`
