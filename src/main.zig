@@ -100,4 +100,5 @@ test {
     _ = @import("values.zig");
     _ = @import("records.zig");
     _ = @import("api/records.zig");
+    _ = @import("query/params.zig");
 }
