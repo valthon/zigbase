@@ -20,12 +20,17 @@ pub fn App(comptime cfg: anytype) type {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
             const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate" };
+            const allowed_list = blk2: {
+                var s: []const u8 = "";
+                for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
+                break :blk2 s;
+            };
             for (std.meta.fields(@TypeOf(cfg))) |f| {
                 var ok = false;
                 for (allowed) |name| {
                     if (std.mem.eql(u8, f.name, name)) ok = true;
                 }
-                if (!ok) @compileError("unknown App cfg field '" ++ f.name ++ "'; expected one of hooks/onError/routes/onAuth/onFileServe/onFileUpload/onBootstrap/onBeforeServe/onBeforeTerminate");
+                if (!ok) @compileError("unknown App cfg field '" ++ f.name ++ "'; expected one of " ++ allowed_list);
             }
             var d = events.Dispatch{};
             if (@hasField(@TypeOf(cfg), "hooks")) d.record = events.buildRecordDispatcher(cfg.hooks);

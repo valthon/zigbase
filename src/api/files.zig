@@ -81,8 +81,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     // file.beforeServe runs only on files the requester may already access; a handler
     // returning an error denies the download as 404 (hides existence, like viewRule).
     if (app.dispatch) |d| if (d.on_file_serve) |h| {
-        var fctx = request.RequestContext{ .method = "GET" };
-        var fev = events.FileEvent{ .app = app, .ctx = &fctx, .collection = col_name, .record_id = rid, .filename = name };
+        var fev = events.FileEvent{ .app = app, .ctx = &rctx, .collection = col_name, .record_id = rid, .filename = name };
         h(&fev) catch return ApiError.notFound().toResponse(ctx.allocator);
     };
 
