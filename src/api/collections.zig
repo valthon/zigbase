@@ -10,6 +10,36 @@ const crypto = @import("../crypto.zig");
 const jwt = @import("../jwt.zig");
 const ApiError = @import("error.zig").ApiError;
 const FieldError = @import("error.zig").FieldError;
+const secrets = @import("../oauth/secrets.zig");
+const oauth_api = @import("oauth.zig");
+
+/// Encrypt any plaintext clientSecret, validate provider endpoints (resolvable + https), and
+/// (on update) preserve a stored secret when the incoming one is empty. Mutates `def.options`.
+fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: ?schema.Collection) !void {
+    const app = ctx.app.?;
+    if (def.type != .auth) return;
+    const provs = def.options.auth.oauth2.providers;
+    if (provs.len == 0) return;
+    const out = try ctx.allocator.alloc(schema.OAuth2Provider, provs.len);
+    for (provs, 0..) |p, i| {
+        var np = p;
+        if (oauth_api.resolveProvider(np) == null) return error.BadOAuthConfig;
+        if (np.clientSecret.len == 0) {
+            if (existing) |ex| {
+                for (ex.options.auth.oauth2.providers) |xp| {
+                    if (std.mem.eql(u8, xp.name, np.name)) {
+                        np.clientSecret = xp.clientSecret;
+                        break;
+                    }
+                }
+            }
+        } else if (!secrets.isEncrypted(np.clientSecret)) {
+            np.clientSecret = try secrets.encryptSecret(app.io, ctx.allocator, app.jwt_secret, np.clientSecret);
+        }
+        out[i] = np;
+    }
+    def.options.auth.oauth2.providers = out;
+}
 
 /// True if the request carries a valid superuser token. Uses a short-lived reader connection.
 fn isSuperuser(ctx: *http.RequestCtx) bool {
@@ -55,7 +85,10 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const created = collections.create(ctx.allocator, app.io, w, def) catch |e| switch (e) {
+    var def_mut = def;
+    prepareOAuthConfig(ctx, &def_mut, null) catch
+        return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator);
+    const created = collections.create(ctx.allocator, app.io, w, def_mut) catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         error.Conflict => return ApiError.conflict("Collection already exists.").toResponse(ctx.allocator),
         else => return e,
@@ -81,7 +114,11 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const updated = collections.update(ctx.allocator, app.io, w, key, def) catch |e| switch (e) {
+    const existing = collections.get(ctx.allocator, w, key) catch null;
+    var def_mut = def;
+    prepareOAuthConfig(ctx, &def_mut, existing) catch
+        return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator);
+    const updated = collections.update(ctx.allocator, app.io, w, key, def_mut) catch |e| switch (e) {
         error.NotFound => return ApiError.notFound().toResponse(ctx.allocator),
         error.Validation => return validationResponse(ctx),
         error.Conflict => return ApiError.conflict("Conflict.").toResponse(ctx.allocator),
@@ -201,4 +238,49 @@ test "collection management requires a superuser" {
     var su = ctxFor(env, a, .GET, "/api/collections", "", &.{});
     su.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 200), (try list(&su)).status);
+}
+
+test "creating an oauth2 collection encrypts the clientSecret and redacts it in output" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const token = try env.superuserToken(a);
+    const body =
+        \\{"name":"members","type":"auth","fields":[],
+        \\ "options":{"auth":{"oauth2":{"enabled":true,"providers":[
+        \\   {"name":"google","clientId":"cid","clientSecret":"PLAINTEXT","enabled":true,"redirectUrls":["https://app/cb"]}
+        \\ ]}}}}
+    ;
+    var c = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+    c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    const res = try create(&c);
+    try std.testing.expectEqual(@as(u16, 201), res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "PLAINTEXT") == null);
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const col = (try collections.get(a, w, "members")).?;
+    const stored = col.options.auth.oauth2.providers[0].clientSecret;
+    try std.testing.expect(std.mem.startsWith(u8, stored, "v1:"));
+    try std.testing.expect(std.mem.indexOf(u8, stored, "PLAINTEXT") == null);
+}
+
+test "non-https generic provider endpoint is rejected at save" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const token = try env.superuserToken(a);
+    const body =
+        \\{"name":"m2","type":"auth","fields":[],
+        \\ "options":{"auth":{"oauth2":{"enabled":true,"providers":[
+        \\   {"name":"acme","clientId":"c","clientSecret":"s","redirectUrls":[],
+        \\    "authURL":"http://a/auth","tokenURL":"http://a/tok","userinfoURL":"http://a/ui"}
+        \\ ]}}}}
+    ;
+    var c = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+    c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    try std.testing.expectEqual(@as(u16, 400), (try create(&c)).status);
 }
