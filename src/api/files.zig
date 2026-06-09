@@ -13,6 +13,17 @@ const auth_api = @import("auth.zig");
 const params_mod = @import("../query/params.zig");
 const ApiError = @import("error.zig").ApiError;
 
+/// Extensions safe to render inline in a browser (no script execution). Everything else downloads.
+fn isInlineSafeExt(ext: []const u8) bool {
+    const safe = [_][]const u8{ "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico", "pdf" };
+    var buf: [16]u8 = undefined;
+    if (ext.len == 0 or ext.len > buf.len) return false;
+    for (ext, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const lower = buf[0..ext.len];
+    for (safe) |s| if (std.mem.eql(u8, s, lower)) return true;
+    return false;
+}
+
 fn recordReferencesFile(col: schema.Collection, rec: std.json.Value, name: []const u8) bool {
     if (rec != .object) return false;
     for (col.fields) |f| {
@@ -48,6 +59,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("rec") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const name = ctx.param("name") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    if (name.len == 0) return ApiError.notFound().toResponse(ctx.allocator);
 
     const col = (try collections.get(ctx.allocator, &r, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rec = (try records.get(ctx.allocator, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
@@ -69,11 +81,22 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     const path = (try storage.localPath(ctx.allocator, col.name, rid, name)) orelse return ApiError.internal().toResponse(ctx.allocator);
 
     const qp = params_mod.parse(ctx.allocator, ctx.query) catch null;
-    const is_download = if (qp) |p| (p.get("download") != null) else false;
-    const disposition = try std.fmt.allocPrint(ctx.allocator, "{s}; filename=\"{s}\"", .{ if (is_download) "attachment" else "inline", name });
+    const force_download = if (qp) |p| (p.get("download") != null) else false;
+
+    // Only render inline for known-safe types; everything else downloads (neutralizes HTML/SVG/JS XSS).
+    const ext = blk: {
+        const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse break :blk "";
+        break :blk name[dot + 1 ..];
+    };
+    const inline_safe = isInlineSafeExt(ext);
+    const disp_kind: []const u8 = if (force_download or !inline_safe) "attachment" else "inline";
+    const disposition = try std.fmt.allocPrint(ctx.allocator, "{s}; filename=\"{s}\"", .{ disp_kind, name });
+
     const cache: []const u8 = if (col.viewRule != null and col.viewRule.?.len == 0) "public, max-age=3600" else "private";
     const headers = try ctx.allocator.dupe(http.Header, &.{
         .{ .name = "Referrer-Policy", .value = "no-referrer" },
+        .{ .name = "X-Content-Type-Options", .value = "nosniff" },
+        .{ .name = "Content-Security-Policy", .value = "default-src 'none'; sandbox" },
         .{ .name = "Cache-Control", .value = cache },
         .{ .name = "Content-Disposition", .value = disposition },
     });

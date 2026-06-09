@@ -163,6 +163,19 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         error.OutOfMemory => return e,
     };
     const rctx = buildContext(ctx, w, data);
+
+    // Write new file bytes BEFORE the DB update so a storage failure can't leave dangling refs.
+    if (ctx.app.?.storage) |storage| {
+        var written: usize = 0;
+        for (all.writes) |wr| {
+            storage.put(app.io, col.name, rid, wr.filename, wr.bytes) catch {
+                for (all.writes[0..written]) |dw| storage.delete(app.io, col.name, rid, dw.filename) catch {};
+                return ApiError.internal().toResponse(ctx.allocator);
+            };
+            written += 1;
+        }
+    }
+
     const updated = switch (rules.decide(col.updateRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => records.update(ctx.allocator, w, col, rid, data2),
@@ -173,8 +186,11 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         error.Forbidden => return ApiError.notFound().toResponse(ctx.allocator),
         else => return e,
     };
-    const ur = updated orelse return ApiError.notFound().toResponse(ctx.allocator);
-    writeUploads(ctx, col, ur.object.get("id").?.string, all.writes, all.deletes) catch {};
+    const ur = updated orelse {
+        if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
+        return ApiError.notFound().toResponse(ctx.allocator);
+    };
+    if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch {};
     realtime_ws.broadcast(app, col, .update, ur.object.get("id").?.string, ur);
     return jsonResponse(ctx, 200, ur);
 }
