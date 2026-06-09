@@ -79,6 +79,11 @@ pub const Stmt = struct {
             return DbError.BindFailed;
     }
 
+    pub fn bindDouble(self: *Stmt, idx: c_int, val: f64) DbError!void {
+        if (c.sqlite3_bind_double(self.handle, idx, val) != c.SQLITE_OK)
+            return DbError.BindFailed;
+    }
+
     pub fn bindNull(self: *Stmt, idx: c_int) DbError!void {
         if (c.sqlite3_bind_null(self.handle, idx) != c.SQLITE_OK)
             return DbError.BindFailed;
@@ -257,6 +262,20 @@ pub const Pool = struct {
         return db;
     }
 };
+
+test "bindDouble round-trips a REAL" {
+    var db = try Db.openMemory();
+    defer db.close();
+    try db.exec("CREATE TABLE t (x REAL);");
+    var ins = try db.prepare("INSERT INTO t (x) VALUES (?1);");
+    try ins.bindDouble(1, 2.5);
+    try std.testing.expect((try ins.step()) == false);
+    ins.finalize();
+    var sel = try db.prepare("SELECT x FROM t;");
+    defer sel.finalize();
+    try std.testing.expect((try sel.step()));
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), sel.columnDouble(0), 0.0001);
+}
 
 test "column type, double, and null detection" {
     var db = try Db.openMemory();

@@ -97,4 +97,14 @@ test {
     _ = @import("app.zig");
     _ = @import("http.zig");
     _ = @import("router.zig");
+    _ = @import("values.zig");
+    _ = @import("records.zig");
+    _ = @import("api/records.zig");
+    _ = @import("query/params.zig");
+    _ = @import("query/lexer.zig");
+    _ = @import("query/parser.zig");
+    _ = @import("query/joiner.zig");
+    _ = @import("query/compiler.zig");
+    _ = @import("query/sort.zig");
+    _ = @import("query/expand.zig");
 }

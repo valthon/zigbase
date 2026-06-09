@@ -68,6 +68,21 @@ pub const Collection = struct {
     updated: []const u8 = "",
 };
 
+/// Find a field by exact name (case-sensitive). Returns null if absent.
+pub fn fieldByName(c: Collection, name: []const u8) ?Field {
+    for (c.fields) |f| {
+        if (std.mem.eql(u8, f.name, name)) return f;
+    }
+    return null;
+}
+
+test "fieldByName finds and misses" {
+    const fields = [_]Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
+    const c = Collection{ .id = "c", .name = "posts", .fields = &fields };
+    try std.testing.expect(fieldByName(c, "title") != null);
+    try std.testing.expect(fieldByName(c, "missing") == null);
+}
+
 pub const Index = struct { name: []const u8, fields: []const []const u8, unique: bool = false };
 
 pub const ValidationError = struct { field: []const u8, code: []const u8, message: []const u8 };
