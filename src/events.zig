@@ -62,12 +62,13 @@ pub const RuntimeRoute = struct {
     auth: AuthLevel,
 };
 
+pub const AuthMethod = enum { password, oauth2 };
 pub const AuthEvent = struct {
     app: *App,
     ctx: *const request.RequestContext,
     collection: []const u8,
     record: ?std.json.Value,
-    method: enum { password, oauth2 },
+    method: AuthMethod,
 };
 pub const AuthHandler = *const fn (ev: *AuthEvent) void;
 

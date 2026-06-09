@@ -7,6 +7,8 @@ const schema = @import("../schema.zig");
 const crypto = @import("../crypto.zig");
 const jwt = @import("../jwt.zig");
 const auth = @import("../auth.zig");
+const events = @import("../events.zig");
+const request = @import("../request.zig");
 const ApiError = @import("error.zig").ApiError;
 
 fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value, cookies: []const http.Cookie) !http.Response {
@@ -90,6 +92,16 @@ pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: [
     };
 }
 
+/// Fire auth.afterAuthSuccess. After-style: never propagates (auth already succeeded).
+pub fn emitAuth(ctx: *http.RequestCtx, collection: []const u8, record: ?std.json.Value, method: events.AuthMethod) void {
+    const app = ctx.app orelse return;
+    const d = app.dispatch orelse return;
+    const h = d.on_auth orelse return;
+    var rctx = request.RequestContext{ .method = @tagName(ctx.method) };
+    var ev = events.AuthEvent{ .app = app, .ctx = &rctx, .collection = collection, .record = record, .method = method };
+    h(&ev);
+}
+
 pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
@@ -115,6 +127,8 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     const rec = (try records.get(ctx.allocator, w, col, rid)) orelse
         return ApiError.notFound().toResponse(ctx.allocator);
 
+    emitAuth(ctx, col.name, rec, .password);
+
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator, "token", .{ .string = issued.token });
     try root.put(ctx.allocator, "record", rec);
@@ -136,6 +150,7 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
     const tk = (try tokenKeyFor(ctx.allocator, w, col_name, rid)) orelse
         return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
     const issued = try issue(ctx, w, col_name, rid, tk);
+    emitAuth(ctx, col_name, authed.record, .password);
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator, "token", .{ .string = issued.token });
     try root.put(ctx.allocator, "record", authed.record);
