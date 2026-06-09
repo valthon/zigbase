@@ -319,9 +319,8 @@ pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
     return try rowToObject(alloc, &st, col);
 }
 
-pub fn delete(w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
-    var buf: [256]u8 = undefined;
-    const sql = std.fmt.bufPrintZ(&buf, "DELETE FROM \"{s}\" WHERE \"id\"=?1 RETURNING \"id\";", .{col.name}) catch return error.ExecFailed;
+pub fn delete(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
+    const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"id\"=?1 RETURNING \"id\";", .{col.name}, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
     try st.bindText(1, id);
@@ -355,8 +354,8 @@ test "delete removes the row; 404 on missing" {
     const a = arena.allocator();
     const col = try seedPosts(&d, a);
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','x',1);");
-    try std.testing.expect(try delete(&d, col, "r1"));
-    try std.testing.expect(!try delete(&d, col, "r1"));
+    try std.testing.expect(try delete(a, &d, col, "r1"));
+    try std.testing.expect(!try delete(a, &d, col, "r1"));
 }
 
 pub const ListQuery = struct { filter: ?[]const u8 = null, sort: ?[]const u8 = null, page: u32 = 1, perPage: u32 = 30 };

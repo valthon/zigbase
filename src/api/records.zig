@@ -35,7 +35,9 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     defer r.close();
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rec = (try records.get(ctx.allocator, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    var rec = (try records.get(ctx.allocator, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const qp = try params_mod.parse(ctx.allocator, ctx.query);
+    if (qp.get("expand")) |exp| if (exp.len > 0) try expand_mod.expand(ctx.allocator, &r, col, &rec, exp, 0);
     return jsonResponse(ctx, 200, rec);
 }
 
@@ -76,7 +78,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if (!try records.delete(w, col, rid)) return ApiError.notFound().toResponse(ctx.allocator);
+    if (!try records.delete(ctx.allocator, w, col, rid)) return ApiError.notFound().toResponse(ctx.allocator);
     return .{ .status = 204, .body = "" };
 }
 
