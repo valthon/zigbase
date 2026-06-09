@@ -38,8 +38,17 @@ fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
     try ev.record.object.put(ev.arena, "slug", .{ .string = buf[0..len] });
 }
 
+/// GET /api/blog/ping — a public custom route returning a small JSON body.
+fn ping(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    _ = ev;
+    return .{ .status = 200, .body = "{\"pong\":true}" };
+}
+
 pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{
         .hooks = .{ .posts = .{ .beforeCreate = slugify } },
+        .routes = .{
+            .{ .method = .GET, .path = "/api/blog/ping", .handler = ping, .auth = .public },
+        },
     }).runCli(init);
 }

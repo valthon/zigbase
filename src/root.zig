@@ -10,6 +10,7 @@ pub const Data = @import("data.zig").Data;
 pub const events = @import("events.zig");
 pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
+pub const RouteEvent = events.RouteEvent;
 
 // ---- Test discovery --------------------------------------------------------
 // The unit-test runner is rooted at THIS module. Reference every internal file
