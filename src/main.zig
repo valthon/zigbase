@@ -154,6 +154,7 @@ test {
     _ = @import("values.zig");
     _ = @import("records.zig");
     _ = @import("api/records.zig");
+    _ = @import("api/auth.zig");
     _ = @import("query/params.zig");
     _ = @import("query/lexer.zig");
     _ = @import("query/parser.zig");
