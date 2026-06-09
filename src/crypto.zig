@@ -49,8 +49,10 @@ test "deriveKey is deterministic and changes with the token key" {
     const k1 = deriveKey("app-secret", "tokkey-1");
     const k1b = deriveKey("app-secret", "tokkey-1");
     const k2 = deriveKey("app-secret", "tokkey-2");
+    const k3 = deriveKey("other-secret", "tokkey-1");
     try std.testing.expectEqualSlices(u8, &k1, &k1b);
-    try std.testing.expect(!std.mem.eql(u8, &k1, &k2));
+    try std.testing.expect(!std.mem.eql(u8, &k1, &k2)); // token_key changes the key
+    try std.testing.expect(!std.mem.eql(u8, &k1, &k3)); // app_secret changes the key
 }
 
 test "genToken produces a string of the requested length" {
