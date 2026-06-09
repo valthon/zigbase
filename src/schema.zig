@@ -396,6 +396,109 @@ pub fn indexesFromJson(alloc: std.mem.Allocator, s: []const u8) ![]Index {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Collection request parse / response serialize
+// ---------------------------------------------------------------------------
+
+/// Non-allocating: returns the `.string` payload of `v.object.get(key)` if present.
+fn objGetStr(v: Value, key: []const u8) ?[]const u8 {
+    const x = objGet(v, key) orelse return null;
+    return switch (x) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn optStrValue(v: ?[]const u8) Value {
+    return if (v) |s| .{ .string = s } else .null;
+}
+fn dupOptStr(alloc: std.mem.Allocator, v: ?[]const u8) !?[]const u8 {
+    return if (v) |s| try alloc.dupe(u8, s) else null;
+}
+
+/// Parse a request body into a Collection (id left empty; create/update assign it).
+pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection {
+    const parsed = try std.json.parseFromSlice(Value, alloc, s, .{});
+    const obj = parsed.value;
+    if (obj != .object) return error.InvalidSchema;
+
+    const name = try alloc.dupe(u8, (objGetStr(obj, "name")) orelse return error.InvalidSchema);
+    const ctype = std.meta.stringToEnum(CollectionType, objGetStr(obj, "type") orelse "base") orelse .base;
+
+    const empty_fields: []const Field = &.{};
+    const fields = if (obj.object.get("fields")) |fv| blk: {
+        const fs = try std.json.Stringify.valueAlloc(alloc, fv, .{});
+        break :blk try fieldsFromJson(alloc, fs);
+    } else empty_fields;
+
+    const empty_indexes: []const Index = &.{};
+    const indexes = if (obj.object.get("indexes")) |iv| blk: {
+        const is = try std.json.Stringify.valueAlloc(alloc, iv, .{});
+        break :blk try indexesFromJson(alloc, is);
+    } else empty_indexes;
+
+    return .{
+        .id = "",
+        .name = name,
+        .type = ctype,
+        .fields = fields,
+        .indexes = indexes,
+        .listRule = try dupOptStr(alloc, objGetStr(obj, "listRule")),
+        .viewRule = try dupOptStr(alloc, objGetStr(obj, "viewRule")),
+        .createRule = try dupOptStr(alloc, objGetStr(obj, "createRule")),
+        .updateRule = try dupOptStr(alloc, objGetStr(obj, "updateRule")),
+        .deleteRule = try dupOptStr(alloc, objGetStr(obj, "deleteRule")),
+    };
+}
+
+/// Serialize a Collection to its API JSON shape.
+pub fn collectionToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
+    var root: ObjectMap = .empty;
+    try root.put(alloc, "id", .{ .string = c.id });
+    try root.put(alloc, "name", .{ .string = c.name });
+    try root.put(alloc, "type", .{ .string = @tagName(c.type) });
+    try root.put(alloc, "system", .{ .bool = c.system });
+    const fields_str = try fieldsToJson(alloc, c.fields);
+    try root.put(alloc, "schema", (try std.json.parseFromSlice(Value, alloc, fields_str, .{})).value);
+    const idx_str = try indexesToJson(alloc, c.indexes);
+    try root.put(alloc, "indexes", (try std.json.parseFromSlice(Value, alloc, idx_str, .{})).value);
+    try root.put(alloc, "listRule", optStrValue(c.listRule));
+    try root.put(alloc, "viewRule", optStrValue(c.viewRule));
+    try root.put(alloc, "createRule", optStrValue(c.createRule));
+    try root.put(alloc, "updateRule", optStrValue(c.updateRule));
+    try root.put(alloc, "deleteRule", optStrValue(c.deleteRule));
+    try root.put(alloc, "created", .{ .string = c.created });
+    try root.put(alloc, "updated", .{ .string = c.updated });
+    return std.json.Stringify.valueAlloc(alloc, Value{ .object = root }, .{});
+}
+
+test "parseCollectionInput then collectionToJson round-trips the essentials" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input =
+        \\{"name":"posts","fields":[
+        \\  {"id":"f1","name":"title","required":true,"type":"text","options":{}},
+        \\  {"id":"f2","name":"price","type":"number","options":{"mode":"fixed","scale":2}}
+        \\]}
+    ;
+    const col = try parseCollectionInput(a, input);
+    try std.testing.expectEqualStrings("posts", col.name);
+    try std.testing.expectEqual(CollectionType.base, col.type);
+    try std.testing.expectEqual(@as(usize, 2), col.fields.len);
+    try std.testing.expectEqualStrings("", col.id);
+
+    var full = col;
+    full.id = "abc123def456ghi";
+    full.created = "2026-01-01 00:00:00";
+    full.updated = "2026-01-01 00:00:00";
+    const out = try collectionToJson(a, full);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"abc123def456ghi\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"posts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"schema\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"title\"") != null);
+}
+
 fn collectErrors(c: Collection) !std.ArrayList(ValidationError) {
     var list: std.ArrayList(ValidationError) = .empty;
     try validate(std.testing.allocator, c, &list);
