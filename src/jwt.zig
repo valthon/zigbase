@@ -4,7 +4,7 @@ const crypto = @import("crypto.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const b64 = std.base64.url_safe_no_pad;
 
-pub const TokenType = enum { auth, verification, password_reset };
+pub const TokenType = enum { auth, verification, password_reset, file };
 
 pub const Claims = struct {
     id: []const u8,

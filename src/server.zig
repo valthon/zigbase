@@ -8,7 +8,9 @@ const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
 const auth_api = @import("api/auth.zig");
 const oauth_api = @import("api/oauth.zig");
+const files_api = @import("api/files.zig");
 const realtime_ws = @import("realtime/ws.zig");
+const files_multipart = @import("files/multipart.zig");
 const ApiError = @import("api/error.zig").ApiError;
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -37,6 +39,8 @@ const routes = [_]router.Route{
     .{ .method = .GET, .pattern = "/api/collections/:col/oauth2-providers", .handler = oauth_api.oauth2Providers },
     .{ .method = .POST, .pattern = "/api/collections/:col/auth-with-oauth2", .handler = oauth_api.authWithOAuth2 },
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
+    .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
+    .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
 };
 
 pub const Server = struct {
@@ -48,7 +52,7 @@ pub const Server = struct {
 
     pub fn listen(self: *Server) !void {
         instance = self;
-        var listener = zap.HttpListener.init(.{ .port = self.port, .on_request = onRequest, .on_upgrade = realtime_ws.handleUpgrade, .log = false });
+        var listener = zap.HttpListener.init(.{ .port = self.port, .on_request = onRequest, .on_upgrade = realtime_ws.handleUpgrade, .log = false, .max_body_size = @intCast(self.app.max_upload_size) });
         try listener.listen();
         std.log.info("zigbase listening on http://{s}:{d}", .{ self.host, self.port });
         realtime_ws.active = true; // reactor about to run; allow broadcast to publish
@@ -99,6 +103,13 @@ fn onRequest(r: zap.Request) !void {
     ctx.authorization = r.getHeader("authorization") orelse "";
     ctx.cookie_header = r.getHeader("cookie") orelse "";
     ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
+    ctx.content_type = r.getHeader("content-type") orelse "";
+    if (std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) {
+        if (files_multipart.extract(r, arena.allocator())) |ex| {
+            ctx.form_fields = ex.form_fields;
+            ctx.files = ex.files;
+        } else |_| {}
+    }
     const resp = router.dispatch(&routes, &ctx) catch
         ApiError.internal().toResponse(arena.allocator()) catch {
             setZapStatus(r, 500);
@@ -122,6 +133,15 @@ fn onRequest(r: zap.Request) !void {
                 .none => .None,
             },
         }) catch {};
+    }
+    for (resp.extra_headers) |h| r.setHeader(h.name, h.value) catch {};
+    if (resp.file_path) |path| {
+        r.sendFile(path) catch {
+            setZapStatus(r, 404);
+            r.setContentType(.JSON) catch {};
+            r.sendBody("{\"code\":404,\"message\":\"Not found.\",\"data\":{}}") catch {};
+        };
+        return;
     }
     r.setContentType(.JSON) catch {};
     r.sendBody(resp.body) catch {};

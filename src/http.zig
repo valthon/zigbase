@@ -19,6 +19,10 @@ pub const RequestCtx = struct {
     authorization: []const u8 = "",
     cookie_header: []const u8 = "",
     csrf_token: []const u8 = "", // X-CSRF-Token header value
+    /// Request content-type (filled by server.zig). Multipart bodies populate form_fields/files.
+    content_type: []const u8 = "",
+    form_fields: ?std.json.Value = null,
+    files: []const UploadedFile = &.{},
 
     pub fn param(self: *const RequestCtx, name: []const u8) ?[]const u8 {
         for (self.params) |p| {
@@ -60,11 +64,24 @@ pub const Cookie = struct {
     path: []const u8 = "/",
 };
 
+pub const Header = struct { name: []const u8, value: []const u8 };
+
+/// A file part from a multipart/form-data upload. `bytes` lives in the request arena.
+pub const UploadedFile = struct {
+    field: []const u8,
+    filename: []const u8, // client-supplied original (untrusted)
+    mimetype: []const u8, // client-supplied (untrusted; advisory)
+    bytes: []const u8,
+};
+
 pub const Response = struct {
     status: u16,
     content_type: []const u8 = "application/json",
     body: []const u8, // allocated in the request arena
     cookies: []const Cookie = &.{},
+    /// When set, server.zig streams this filesystem path via sendFile instead of `body`.
+    file_path: ?[]const u8 = null,
+    extra_headers: []const Header = &.{},
 };
 
 pub const Handler = *const fn (ctx: *RequestCtx) anyerror!Response;
@@ -92,4 +109,13 @@ test "cookie parses a named value out of the Cookie header" {
     try std.testing.expect(ctx.cookie("missing") == null);
     var empty = RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .cookie_header = "" };
     try std.testing.expect(empty.cookie("zb_auth") == null);
+}
+
+test "Response file_path and UploadedFile default/usage" {
+    const r = Response{ .status = 200, .body = "", .file_path = "/x/y.png" };
+    try std.testing.expectEqualStrings("/x/y.png", r.file_path.?);
+    const u = UploadedFile{ .field = "cover", .filename = "a.png", .mimetype = "image/png", .bytes = "x" };
+    try std.testing.expectEqualStrings("cover", u.field);
+    const ctx = RequestCtx{ .method = .POST, .path = "/", .allocator = std.testing.allocator };
+    try std.testing.expect(ctx.files.len == 0 and ctx.form_fields == null);
 }

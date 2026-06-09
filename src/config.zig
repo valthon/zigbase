@@ -10,6 +10,8 @@ pub const Config = struct {
     verification_ttl_s: i64 = 7 * 24 * 3600, // 7 days
     password_reset_ttl_s: i64 = 3600, // 1 hour
     realtime_allowed_origins: []const u8 = "", // CSV of allowed WS Origins; "" = allow any (dev)
+    max_upload_size: u64 = 50 << 20, // 50 MiB per request body
+    file_token_ttl_s: i64 = 120, // short-lived file-access token
 
     /// Pure loader: applies overrides from a getter (env in prod, a stub in tests).
     pub fn load(getter: *const fn ([]const u8) ?[]const u8) !Config {
@@ -23,6 +25,8 @@ pub const Config = struct {
         if (getter("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_PASSWORD_RESET_TTL")) |v| cfg.password_reset_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_REALTIME_ORIGINS")) |v| cfg.realtime_allowed_origins = v;
+        if (getter("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
+        if (getter("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
         return cfg;
     }
 };

@@ -180,8 +180,19 @@ pub const Verified = struct {
 /// peek claims → require type==.auth → load tokenKey → derive key → jwt.verify against SQLite now →
 /// load the record (hidden fields stripped). null on any failure.
 pub fn verifyToken(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, token: []const u8) ?Verified {
+    return verifyTokenOfTypes(alloc, app, conn, token, &.{.auth});
+}
+
+/// Like verifyToken but accepts any of `types` for the claim's `type`. The file endpoint uses
+/// {.auth, .file}; the main API uses verifyToken (.auth only).
+pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, token: []const u8, types: []const jwt.TokenType) ?Verified {
     const claims = jwt.peekClaims(alloc, token) catch return null;
-    if (claims.type != .auth) return null;
+    var ok = false;
+    for (types) |t| if (claims.type == t) {
+        ok = true;
+        break;
+    };
+    if (!ok) return null;
     const is_super = std.mem.eql(u8, claims.collection, "_superusers");
     const table = if (is_super) "_superusers" else blk: {
         const col = (collections.get(alloc, conn, claims.collection) catch return null) orelse return null;
@@ -359,4 +370,23 @@ test "verifyToken resolves a valid token string to a record + exp" {
     const wrong = crypto.deriveKey(app.jwt_secret, "other");
     const bad = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &wrong);
     try std.testing.expect(verifyToken(a, &app, &d, bad) == null);
+}
+
+test "verifyTokenOfTypes accepts a file token only when allowed" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+    try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk',1);");
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
+    const key = crypto.deriveKey(app.jwt_secret, "tk");
+    const file_tok = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .file, .iat = 0, .exp = 9999999999 }, &key);
+    try std.testing.expect(verifyToken(a, &app, &d, file_tok) == null);
+    try std.testing.expect(verifyTokenOfTypes(a, &app, &d, file_tok, &.{ .auth, .file }) != null);
+    const wrong = crypto.deriveKey(app.jwt_secret, "other");
+    const bad = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .file, .iat = 0, .exp = 9999999999 }, &wrong);
+    try std.testing.expect(verifyTokenOfTypes(a, &app, &d, bad, &.{ .auth, .file }) == null);
 }
