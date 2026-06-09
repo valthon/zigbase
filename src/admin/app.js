@@ -118,6 +118,9 @@ function RecordsTable({ col }) {
   const [page, setPage] = useState(1);
   const [filter, setFilter] = useState('');
   const [sort, setSort] = useState('');
+  const [editing, setEditing] = useState(undefined); // undefined=closed, null=new, record=edit
+  const [schema, setSchema] = useState([]);
+  useEffect(() => { API.collections().then(cs => { const c = cs.find(x => x.name === col); setSchema(c ? c.schema : []); }); }, [col]);
   const perPage = 30;
   function load() {
     setErr('');
@@ -137,12 +140,13 @@ function RecordsTable({ col }) {
         <div class="grow"></div>
         <input class="grow" data-test="filter" placeholder="filter e.g. status='published'" value=${filter} onInput=${e => setFilter(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter') { setPage(1); load(); } }}/>
         <button class="ghost" data-test="apply-filter" onClick=${() => { setPage(1); load(); }}>Apply</button>
+        <button data-test="new-record" onClick=${() => setEditing(null)}>+ New record</button>
       </div>
       ${err && html`<div class="error" data-test="records-error">${err}</div>`}
       <table>
         <thead><tr>${columns.map(c => html`<th key=${c} onClick=${() => setSort(sort === c ? '-' + c : c)} style="cursor:pointer">${c}${sort === c ? ' ▲' : sort === '-' + c ? ' ▼' : ''}</th>`)}</tr></thead>
         <tbody data-test="rows">
-          ${items.map(r => html`<tr key=${r.id} data-test="row">${columns.map(c => html`<td key=${c}>${fmt(r[c])}</td>`)}</tr>`)}
+          ${items.map(r => html`<tr key=${r.id} data-test="row" style="cursor:pointer" onClick=${() => setEditing(r)}>${columns.map(c => html`<td key=${c}>${fmt(r[c])}</td>`)}</tr>`)}
         </tbody>
       </table>
       ${data && data.totalItems === 0 && html`<p class="muted" data-test="empty">No records.</p>`}
@@ -151,6 +155,7 @@ function RecordsTable({ col }) {
         <span data-test="pageinfo">Page ${data ? data.page : page} / ${data ? data.totalPages || 1 : 1}</span>
         <button class="ghost" disabled=${data && page >= (data.totalPages || 1)} onClick=${() => setPage(page + 1)}>Next ›</button>
       </div>
+      ${editing !== undefined && html`<${RecordDrawer} col=${col} record=${editing} schema=${schema} onClose=${() => setEditing(undefined)} onSaved=${() => { setEditing(undefined); load(); }}/>`}
     </div>`;
 }
 
@@ -265,5 +270,88 @@ function fieldOptions(f, i, setOpt, allCols) {
 }
 
 function AuthTab({ col, setCol }) { return html`<div data-test="tab-auth-body" class="muted">Auth/OAuth2 — Task 4.</div>`; }
+
+function RecordDrawer({ col, record, schema, onClose, onSaved }) {
+  const isNew = !record;
+  const [vals, setVals] = useState(() => ({ ...(record || {}) }));
+  const [files, setFiles] = useState({}); // field -> FileList
+  const [removals, setRemovals] = useState({}); // field -> [filenames]
+  const [err, setErr] = useState('');
+  const [fieldErrs, setFieldErrs] = useState({});
+  const editable = schema.filter(f => !['id','created','updated','passwordHash','tokenKey'].includes(f.name) && f.type !== 'autodate');
+
+  function set(name, v) { setVals({ ...vals, [name]: v }); }
+  async function save() {
+    setErr(''); setFieldErrs({});
+    const hasFiles = Object.values(files).some(fl => fl && fl.length);
+    let body, isForm = false;
+    if (hasFiles || Object.keys(removals).length) {
+      const fd = new FormData(); isForm = true;
+      for (const f of editable) {
+        if (f.type === 'file') continue;
+        const v = vals[f.name];
+        if (v != null) fd.append(f.name, typeof v === 'object' ? JSON.stringify(v) : String(v));
+      }
+      for (const [name, fl] of Object.entries(files)) for (const file of fl) fd.append(name, file);
+      for (const [name, names] of Object.entries(removals)) if (names.length) fd.append(name + '-', JSON.stringify(names));
+      body = fd;
+    } else {
+      body = {};
+      for (const f of editable) if (vals[f.name] !== undefined) body[f.name] = vals[f.name];
+    }
+    try {
+      const saved = isNew
+        ? await api('POST', `/collections/${encodeURIComponent(col)}/records`, body, isForm)
+        : await api('PATCH', `/collections/${encodeURIComponent(col)}/records/${encodeURIComponent(record.id)}`, body, isForm);
+      onSaved(saved);
+    } catch (x) { setErr((x.data && x.data.message) || 'Save failed'); if (x.data && x.data.data) setFieldErrs(x.data.data); }
+  }
+  async function del() {
+    if (!confirm('Delete record?')) return;
+    try { await api('DELETE', `/collections/${encodeURIComponent(col)}/records/${encodeURIComponent(record.id)}`); onSaved(null); }
+    catch (x) { setErr((x.data && x.data.message) || 'Delete failed'); }
+  }
+
+  return html`
+    <div class="drawer" data-test="record-drawer" style="position:fixed; top:0; right:0; bottom:0; width:380px; background:var(--panel); border-left:1px solid var(--line); padding:16px; overflow:auto; box-shadow:-8px 0 30px rgba(0,0,0,.4)">
+      <div class="row"><b style="flex:1">${isNew ? 'New record' : 'Edit record'}</b><button class="ghost" data-test="drawer-close" onClick=${onClose}>✕</button></div>
+      ${err && html`<div class="error" data-test="record-error">${err}</div>`}
+      ${editable.map(f => html`<div class="field" key=${f.name}>
+        <label>${f.name} <span class="muted">(${f.type})</span></label>
+        ${control(f, vals[f.name], v => set(f.name, v), files, setFiles, removals, setRemovals)}
+        ${fieldErrs[f.name] && html`<div class="error" data-test=${'err-'+f.name}>${fieldErrs[f.name].message}</div>`}
+      </div>`)}
+      <div class="row" style="margin-top:14px">
+        <button data-test="record-save" onClick=${save}>Save</button>
+        ${!isNew && html`<button class="ghost" data-test="record-delete" onClick=${del}>Delete</button>`}
+      </div>
+    </div>`;
+}
+
+function control(f, value, set, files, setFiles, removals, setRemovals) {
+  const t = f.type, o = f.options || {};
+  if (t === 'bool') return html`<input type="checkbox" style="width:auto" data-test=${'in-'+f.name} checked=${!!value} onChange=${e => set(e.target.checked)}/>`;
+  if (t === 'number') return html`<input type="text" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
+  if (t === 'editor' || t === 'json') return html`<textarea rows="4" data-test=${'in-'+f.name} value=${typeof value === 'object' ? JSON.stringify(value, null, 2) : (value ?? '')} onInput=${e => set(t === 'json' ? safeJson(e.target.value) : e.target.value)}></textarea>`;
+  if (t === 'date') return html`<input type="text" placeholder="YYYY-MM-DD" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
+  if (t === 'select') return html`<select data-test=${'in-'+f.name} value=${value ?? ''} onChange=${e => set(e.target.value)}><option value="">—</option>${(o.values||[]).map(v => html`<option key=${v} value=${v}>${v}</option>`)}</select>`;
+  if (t === 'relation') return html`<${RelationPicker} target=${o.targetCollectionId} value=${value} onChange=${set} name=${f.name}/>`;
+  if (t === 'file') {
+    const existing = value == null ? [] : (Array.isArray(value) ? value : [value]).filter(Boolean);
+    return html`<div>
+      ${existing.map(fn => html`<label class="muted" key=${fn} style="display:block"><input type="checkbox" style="width:auto" data-test=${'rm-'+f.name} onChange=${e => setRemovals({ ...removals, [f.name]: e.target.checked ? [...(removals[f.name]||[]), fn] : (removals[f.name]||[]).filter(x=>x!==fn) })}/> ${fn} (remove)</label>`)}
+      <input type="file" multiple=${(o.maxSelect||1) > 1} data-test=${'in-'+f.name} onChange=${e => setFiles({ ...files, [f.name]: e.target.files })}/>
+    </div>`;
+  }
+  return html`<input type="text" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
+}
+function safeJson(s) { try { return JSON.parse(s); } catch (_) { return s; } }
+
+function RelationPicker({ target, value, onChange, name }) {
+  const [opts, setOpts] = useState([]);
+  useEffect(() => { if (target) API.records(target, 'perPage=50').then(d => setOpts(d.items)).catch(() => {}); }, [target]);
+  return html`<select data-test=${'in-'+name} value=${value ?? ''} onChange=${e => onChange(e.target.value || null)}>
+    <option value="">—</option>${opts.map(r => html`<option key=${r.id} value=${r.id}>${r.id}</option>`)}</select>`;
+}
 
 render(html`<${App}/>`, document.getElementById('app'));
