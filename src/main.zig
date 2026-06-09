@@ -5,6 +5,8 @@ const db = @import("db.zig");
 const server = @import("server.zig");
 const app_mod = @import("app.zig");
 const migrations = @import("migrations.zig");
+const crypto = @import("crypto.zig");
+const id_gen = @import("id.zig");
 
 /// Zig 0.16 entry point: `main` receives a `std.process.Init` which carries the
 /// process gpa, an arena, and the command-line args. `std.process.argsAlloc`
@@ -29,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
         .help => printUsage(),
         .serve => |sa| try runServe(allocator, init.io, sa),
         .migrate => |sa| try runMigrate(allocator, init.io, sa),
+        .superuser_create => |sa| try runSuperuserCreate(allocator, init.io, sa),
     }
 }
 
@@ -75,6 +78,48 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
     defer allocator.free(host_z);
     var srv = server.Server{ .app = &app, .host = host_z, .port = cfg.http_port };
     try srv.listen();
+}
+
+fn runSuperuserCreate(allocator: std.mem.Allocator, io: std.Io, sa: cli.SuperuserArgs) !void {
+    const email = sa.email orelse {
+        std.log.err("--email is required", .{});
+        return;
+    };
+    const password = sa.password orelse {
+        std.log.err("--password is required", .{});
+        return;
+    };
+    if (password.len < 8) {
+        std.log.err("password must be at least 8 characters", .{});
+        return;
+    }
+    const cfg = try loadCfg(.{ .data_dir = sa.data_dir });
+    var pool = try openPool(allocator, io, cfg);
+    defer pool.deinit();
+    const w = pool.acquireWriter();
+    defer pool.releaseWriter();
+    try migrations.run(w);
+
+    const phc = try crypto.hashPassword(io, allocator, password);
+    defer allocator.free(phc);
+    const tk = try crypto.genToken(io, allocator, 32);
+    defer allocator.free(tk);
+    var rid = id_gen.collectionId(io);
+
+    var st = try w.prepare(
+        \\INSERT INTO "_superusers" ("id","created","updated","email","username","passwordHash","tokenKey","verified")
+        \\ VALUES (?1, datetime('now'), datetime('now'), ?2, '', ?3, ?4, 1);
+    );
+    defer st.finalize();
+    try st.bindText(1, &rid);
+    try st.bindText(2, email);
+    try st.bindText(3, phc);
+    try st.bindText(4, tk);
+    _ = st.step() catch {
+        std.log.err("could not create superuser (email already exists?)", .{});
+        return;
+    };
+    std.log.info("superuser created: {s}", .{email});
 }
 
 test "smoke" {
