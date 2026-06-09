@@ -13,6 +13,14 @@ const GenTokenError = @typeInfo(@typeInfo(@TypeOf(crypto.genToken)).@"fn".return
 
 pub const AuthError = error{ PasswordTooShort, IdentityTaken } || db.DbError || std.mem.Allocator.Error || HashPasswordError || GenTokenError;
 
+/// Fields the server fully controls; they must NEVER be copied from client-supplied data.
+/// `password` is hashed server-side; `passwordHash`/`tokenKey` are set by the server; `verified`
+/// changes only via the confirm-verification endpoint.
+fn isServerManagedField(name: []const u8) bool {
+    return std.mem.eql(u8, name, "password") or std.mem.eql(u8, name, "passwordHash") or
+        std.mem.eql(u8, name, "tokenKey") or std.mem.eql(u8, name, "verified");
+}
+
 /// Given the request data for an auth-collection record, return a copy with `passwordHash`,
 /// `tokenKey`, and `verified` populated (plaintext `password` removed). Hashes the `password`.
 /// `min_len` is the collection's minPasswordLength.
@@ -25,7 +33,7 @@ pub fn applyCreate(io: std.Io, alloc: std.mem.Allocator, data: std.json.Value, m
     var out: std.json.ObjectMap = .empty;
     var it = data.object.iterator();
     while (it.next()) |e| {
-        if (std.mem.eql(u8, e.key_ptr.*, "password")) continue; // never store the plaintext
+        if (isServerManagedField(e.key_ptr.*)) continue; // never copy server-managed credential fields
         try out.put(alloc, try alloc.dupe(u8, e.key_ptr.*), e.value_ptr.*);
     }
     try out.put(alloc, "passwordHash", .{ .string = phc });
@@ -39,18 +47,21 @@ pub fn applyCreate(io: std.Io, alloc: std.mem.Allocator, data: std.json.Value, m
 /// present, returns `data` unchanged.
 pub fn applyUpdate(io: std.Io, alloc: std.mem.Allocator, data: std.json.Value, min_len: u8) AuthError!std.json.Value {
     if (data != .object) return data;
-    const pw = data.object.get("password") orelse return data;
-    if (pw != .string or pw.string.len < min_len) return error.PasswordTooShort;
-    const phc = try crypto.hashPassword(io, alloc, pw.string);
-    const tk = try crypto.genToken(io, alloc, 32);
+    // Always return a stripped copy: client-supplied server-managed fields are never written.
     var out: std.json.ObjectMap = .empty;
     var it = data.object.iterator();
     while (it.next()) |e| {
-        if (std.mem.eql(u8, e.key_ptr.*, "password")) continue;
+        if (isServerManagedField(e.key_ptr.*)) continue;
         try out.put(alloc, try alloc.dupe(u8, e.key_ptr.*), e.value_ptr.*);
     }
-    try out.put(alloc, "passwordHash", .{ .string = phc });
-    try out.put(alloc, "tokenKey", .{ .string = tk });
+    if (data.object.get("password")) |pw| {
+        if (pw != .string or pw.string.len < min_len) return error.PasswordTooShort;
+        const phc = try crypto.hashPassword(io, alloc, pw.string);
+        const tk = try crypto.genToken(io, alloc, 32);
+        try out.put(alloc, "passwordHash", .{ .string = phc });
+        try out.put(alloc, "tokenKey", .{ .string = tk }); // rotate, invalidating existing tokens
+    }
+    // `verified` is never written here; it changes only via confirm-verification.
     return .{ .object = out };
 }
 
@@ -104,6 +115,51 @@ test "applyCreate forces verified=false even if the client sends verified=true" 
     try data.put(a, "password", .{ .string = "longenough" });
     try data.put(a, "verified", .{ .bool = true });
     const out = try applyCreate(std.testing.io, a, .{ .object = data }, 8);
+    try std.testing.expectEqual(false, out.object.get("verified").?.bool);
+}
+
+test "applyUpdate strips client-supplied passwordHash/tokenKey/verified (no password)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "email", .{ .string = "e@x.io" });
+    try data.put(a, "verified", .{ .bool = true });
+    try data.put(a, "passwordHash", .{ .string = "$argon2id$evil" });
+    try data.put(a, "tokenKey", .{ .string = "evil" });
+    const out = try applyUpdate(std.testing.io, a, .{ .object = data }, 8);
+    try std.testing.expect(out.object.get("verified") == null);
+    try std.testing.expect(out.object.get("passwordHash") == null);
+    try std.testing.expect(out.object.get("tokenKey") == null);
+    try std.testing.expectEqualStrings("e@x.io", out.object.get("email").?.string); // legit field kept
+}
+
+test "applyUpdate with password sets server passwordHash/tokenKey and ignores client ones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "password", .{ .string = "longenough" });
+    try data.put(a, "tokenKey", .{ .string = "evil" });
+    try data.put(a, "verified", .{ .bool = true });
+    const out = try applyUpdate(std.testing.io, a, .{ .object = data }, 8);
+    try std.testing.expect(std.mem.startsWith(u8, out.object.get("passwordHash").?.string, "$argon2id$"));
+    try std.testing.expect(!std.mem.eql(u8, out.object.get("tokenKey").?.string, "evil")); // server-generated
+    try std.testing.expect(out.object.get("verified") == null); // never client-set on update
+}
+
+test "applyCreate strips client passwordHash/tokenKey (forces server values)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "email", .{ .string = "e@x.io" });
+    try data.put(a, "password", .{ .string = "longenough" });
+    try data.put(a, "passwordHash", .{ .string = "$argon2id$evil" });
+    try data.put(a, "tokenKey", .{ .string = "evil" });
+    const out = try applyCreate(std.testing.io, a, .{ .object = data }, 8);
+    try std.testing.expect(!std.mem.eql(u8, out.object.get("passwordHash").?.string, "$argon2id$evil"));
+    try std.testing.expect(!std.mem.eql(u8, out.object.get("tokenKey").?.string, "evil"));
     try std.testing.expectEqual(false, out.object.get("verified").?.bool);
 }
 
