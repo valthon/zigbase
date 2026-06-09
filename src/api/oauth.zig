@@ -159,24 +159,32 @@ pub fn authWithOAuth2Impl(ctx: *http.RequestCtx, transport: oauth_client.Transpo
     const code = strField(body, "code") orelse return ApiError.badRequest("code is required.").toResponse(ctx.allocator);
     const verifier = strField(body, "codeVerifier") orelse return ApiError.badRequest("codeVerifier is required.").toResponse(ctx.allocator);
     const redirect_url = strField(body, "redirectUrl") orelse return ApiError.badRequest("redirectUrl is required.").toResponse(ctx.allocator);
-
-    const w = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
     const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const col = (try collections.get(ctx.allocator, w, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
 
+    // Phase 1: load collection + provider config under a short-lived reader (no lock held during HTTP).
+    var col: schema.Collection = undefined;
+    {
+        var r = app.pool.openReader() catch return ApiError.internal().toResponse(ctx.allocator);
+        defer r.close();
+        col = (collections.get(ctx.allocator, &r, col_name) catch return ApiError.internal().toResponse(ctx.allocator)) orelse
+            return ApiError.notFound().toResponse(ctx.allocator);
+    }
+    if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
     const cfg = findProviderConfig(col, provider_name) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const provider = resolveProvider(cfg) orelse return ApiError.badRequest("Provider misconfigured.").toResponse(ctx.allocator);
     if (!redirectAllowed(cfg, redirect_url)) return ApiError.badRequest("redirectUrl not allowed.").toResponse(ctx.allocator);
-
     const secret = secrets.decryptSecret(ctx.allocator, app.jwt_secret, cfg.clientSecret) catch
         return ApiError.internal().toResponse(ctx.allocator);
 
+    // Phase 2: provider HTTP calls — NO database lock held.
     const access_token = oauth_client.exchangeCode(transport, ctx.allocator, provider, cfg.clientId, secret, code, verifier, redirect_url) catch
         return ApiError.badRequest("OAuth exchange failed.").toResponse(ctx.allocator);
     const identity = oauth_client.fetchIdentity(transport, ctx.allocator, provider, access_token) catch
         return ApiError.badRequest("OAuth identity fetch failed.").toResponse(ctx.allocator);
+
+    // Phase 3: DB decision tree under the writer.
+    const w = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
 
     const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, w) catch null);
     const authed_rid: ?[]const u8 = if (authed) |x|
