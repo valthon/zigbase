@@ -13,4 +13,6 @@ pub const App = struct {
     verification_ttl_s: i64 = 7 * 24 * 3600,
     password_reset_ttl_s: i64 = 3600,
     realtime_allowed_origins: []const u8 = "",
+    max_upload_size: u64 = 50 << 20,
+    file_token_ttl_s: i64 = 120,
 };
