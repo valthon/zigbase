@@ -92,6 +92,82 @@ pub fn planFileField(
     };
 }
 
+pub const FieldWrite = struct { filename: []const u8, bytes: []const u8 };
+
+pub const AllPlan = struct {
+    data: std.json.Value,
+    writes: []const FieldWrite,
+    deletes: []const []const u8,
+};
+
+fn parseRemovals(alloc: std.mem.Allocator, v: ?std.json.Value) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    const val = v orelse return out.toOwnedSlice(alloc);
+    switch (val) {
+        .string => |s| {
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch {
+                if (s.len > 0) try out.append(alloc, s);
+                return out.toOwnedSlice(alloc);
+            };
+            if (parsed.value == .array) {
+                for (parsed.value.array.items) |it| if (it == .string) try out.append(alloc, it.string);
+            } else if (s.len > 0) try out.append(alloc, s);
+        },
+        .array => |arr| for (arr.items) |it| if (it == .string) try out.append(alloc, it.string),
+        else => {},
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Build the record data + files to write/delete from form `data` + uploaded `files`. `existing` is
+/// the current record (update) or null (create). Reuses planFileField per file field; drops the
+/// `<field>` raw value and the `<field>-` control key from the data.
+pub fn planAllFileFields(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    col: schema.Collection,
+    data: std.json.Value,
+    files: []const http.UploadedFile,
+    existing: ?std.json.Value,
+) PlanError!AllPlan {
+    if (data != .object) return .{ .data = data, .writes = &.{}, .deletes = &.{} };
+
+    var out: std.json.ObjectMap = .empty;
+    var it = data.object.iterator();
+    while (it.next()) |e| try out.put(alloc, e.key_ptr.*, e.value_ptr.*);
+
+    var writes: std.ArrayList(FieldWrite) = .empty;
+    var deletes: std.ArrayList([]const u8) = .empty;
+
+    for (col.fields) |field| {
+        if (field.options != .file) continue;
+        var ups: std.ArrayList(http.UploadedFile) = .empty;
+        for (files) |f| if (std.mem.eql(u8, f.field, field.name)) try ups.append(alloc, f);
+        const minus_key = try std.fmt.allocPrint(alloc, "{s}-", .{field.name});
+        const removals = try parseRemovals(alloc, data.object.get(minus_key));
+        _ = out.swapRemove(minus_key);
+
+        const present = ups.items.len > 0 or data.object.get(minus_key) != null or data.object.get(field.name) != null;
+        const ex_val: ?std.json.Value = if (existing) |x| (if (x == .object) x.object.get(field.name) else null) else null;
+
+        const plan = try planFileField(io, alloc, field, ex_val, ups.items, removals, present);
+        if (plan) |p| {
+            try out.put(alloc, field.name, p.value);
+            for (p.writes) |wr| try writes.append(alloc, .{ .filename = wr.filename, .bytes = wr.bytes });
+            for (p.deletes) |d| try deletes.append(alloc, d);
+        } else {
+            if (ups.items.len == 0 and data.object.get(field.name) != null and existing == null)
+                _ = out.swapRemove(field.name);
+        }
+    }
+
+    return .{
+        .data = .{ .object = out },
+        .writes = try writes.toOwnedSlice(alloc),
+        .deletes = try deletes.toOwnedSlice(alloc),
+    };
+}
+
 fn fileField(name: []const u8, max_select: u32, max_size: ?u64, mimes: ?[]const []const u8) schema.Field {
     return .{ .id = "f", .name = name, .options = .{ .file = .{ .maxSelect = max_select, .maxSize = max_size, .mimeTypes = mimes } } };
 }
@@ -188,4 +264,62 @@ test "validation: maxSize, maxSelect, mimeTypes" {
     const mimes = [_][]const u8{"image/png"};
     const f3 = fileField("cover", 1, null, &mimes);
     try std.testing.expectError(error.BadMimeType, planFileField(std.testing.io, a, f3, null, &[_]http.UploadedFile{upload("cover", "x.txt", "hello")}, &.{}, true));
+}
+
+fn collWithFile(name: []const u8, max_select: u32) schema.Collection {
+    const S = struct {
+        var fields: [1]schema.Field = undefined;
+    };
+    S.fields[0] = fileField(name, max_select, null, null);
+    return .{ .id = "c", .name = "posts", .fields = &S.fields };
+}
+
+test "planAllFileFields create: sets file fields, collects writes, drops control keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "title", .{ .string = "hi" });
+    const col = collWithFile("cover", 1);
+    const ups = [_]http.UploadedFile{upload("cover", "p.png", &[_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A })};
+    const all = try planAllFileFields(std.testing.io, a, col, .{ .object = data }, &ups, null);
+    try std.testing.expectEqualStrings("hi", all.data.object.get("title").?.string);
+    try std.testing.expect(std.mem.endsWith(u8, all.data.object.get("cover").?.string, ".png"));
+    try std.testing.expectEqual(@as(usize, 1), all.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), all.deletes.len);
+}
+
+test "planAllFileFields update multi: <field>- JSON array removes, uploads add" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = collWithFile("docs", 5);
+    var existing: std.json.ObjectMap = .empty;
+    var ex = std.json.Array.init(a);
+    try ex.append(.{ .string = "k1.txt" });
+    try ex.append(.{ .string = "drop.txt" });
+    try existing.put(a, "docs", .{ .array = ex });
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "docs-", .{ .string = "[\"drop.txt\"]" });
+    const ups = [_]http.UploadedFile{upload("docs", "n.txt", "N")};
+    const all = try planAllFileFields(std.testing.io, a, col, .{ .object = data }, &ups, .{ .object = existing });
+    const arr = all.data.object.get("docs").?.array;
+    try std.testing.expectEqual(@as(usize, 2), arr.items.len);
+    try std.testing.expectEqualStrings("k1.txt", arr.items[0].string);
+    try std.testing.expect(all.data.object.get("docs-") == null);
+    try std.testing.expectEqual(@as(usize, 1), all.deletes.len);
+    try std.testing.expectEqualStrings("drop.txt", all.deletes[0]);
+}
+
+test "planAllFileFields: non-file fields and absent file field are untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = collWithFile("cover", 1);
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "title", .{ .string = "x" });
+    const all = try planAllFileFields(std.testing.io, a, col, .{ .object = data }, &.{}, null);
+    try std.testing.expectEqualStrings("x", all.data.object.get("title").?.string);
+    try std.testing.expect(all.data.object.get("cover") == null);
+    try std.testing.expectEqual(@as(usize, 0), all.writes.len);
 }
