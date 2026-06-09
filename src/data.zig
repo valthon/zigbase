@@ -10,6 +10,13 @@ const App = @import("app.zig").App;
 /// receive a `Data` rather than a raw connection. `conn` is the active connection:
 /// for `before*` record hooks it is the in-transaction writer (writes atomic with
 /// the triggering op); elsewhere a fresh acquired connection.
+///
+/// Unknown-collection contract:
+///   - `findById` returns `null` for BOTH an unknown collection and a missing
+///     record — an intentional collapse that mirrors the HTTP layer returning 404
+///     for either case.
+///   - `create`, `update`, `delete`, and `list` return `error.UnknownCollection`
+///     when the collection name does not resolve.
 pub const Data = struct {
     app: *App,
     conn: *db.Db,
@@ -63,4 +70,26 @@ test "Data.create then findById round-trips a record" {
 
     const found = (try d.findById("posts", id)).?;
     try std.testing.expectEqualStrings("hello", found.object.get("title").?.string);
+}
+
+test "Data.create on an unknown collection errors; findById collapses to null" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("PRAGMA foreign_keys=ON;");
+    try migrations.run(&conn);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    var app = App{ .allocator = a, .io = io, .pool = undefined };
+    const d = Data{ .app = &app, .conn = &conn, .io = io };
+
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "title", .{ .string = "hello" });
+    try std.testing.expectError(error.UnknownCollection, d.create("nope", .{ .object = obj }));
+
+    // findById intentionally collapses unknown-collection and missing-record to null.
+    try std.testing.expect((try d.findById("nope", "x")) == null);
 }
