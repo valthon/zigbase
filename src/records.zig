@@ -272,3 +272,84 @@ test "create rejects a value outside a select's allowed set" {
     try data.put(a, "status", .{ .string = "banana" });
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
 }
+
+pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
+    last_errors = null;
+    if (data != .object) return error.NotObject;
+    var errs: std.ArrayList(schema.ValidationError) = .empty;
+
+    var sets: std.ArrayList(u8) = .empty;
+    try sets.appendSlice(alloc, "\"updated\"=strftime('%Y-%m-%dT%H:%M:%SZ','now')");
+    var binds: std.ArrayList(BindItem) = .empty;
+    var next: usize = 2; // ?1 is the id in WHERE
+
+    for (col.fields) |f| {
+        if (f.fieldType() == .autodate) {
+            if (f.options.autodate.onUpdate) {
+                try sets.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"{s}\"=strftime('%Y-%m-%dT%H:%M:%SZ','now')", .{f.name}));
+            }
+            continue;
+        }
+        const provided = data.object.get(f.name) orelse continue; // partial: only provided fields
+        try validateFieldValue(alloc, w, f, provided, &errs);
+        try sets.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"{s}\"=?{d}", .{ f.name, next }));
+        try binds.append(alloc, .{ .idx = @intCast(next), .field = f, .value = provided });
+        next += 1;
+    }
+    if (errs.items.len > 0) { last_errors = errs.items; return error.Validation; }
+
+    const rcols = try columnList(alloc, col);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ col.name, sets.items, rcols }, 0);
+    var st = try w.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, id);
+    for (binds.items) |b| {
+        values.bindValue(alloc, &st, b.idx, b.field, b.value) catch |e| {
+            try errs.append(alloc, .{ .field = b.field.name, .code = convCode(e), .message = "Invalid value." });
+            last_errors = errs.items;
+            return error.Validation;
+        };
+    }
+    if (!try st.step()) return null;
+    return try rowToObject(alloc, &st, col);
+}
+
+pub fn delete(w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
+    var buf: [256]u8 = undefined;
+    const sql = std.fmt.bufPrintZ(&buf, "DELETE FROM \"{s}\" WHERE \"id\"=?1 RETURNING \"id\";", .{col.name}) catch return error.ExecFailed;
+    var st = try w.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, id);
+    return try st.step();
+}
+
+test "update merges provided fields, bumps updated, 404 on missing" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','old',100);");
+
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "title", .{ .string = "new" }); // price omitted -> unchanged
+    const rec = (try update(a, &d, col, "r1", .{ .object = data })).?;
+    try std.testing.expectEqualStrings("new", rec.object.get("title").?.string);
+    try std.testing.expectEqualStrings("1.00", rec.object.get("price").?.string);
+
+    const empty: std.json.ObjectMap = .empty;
+    try std.testing.expect((try update(a, &d, col, "missing", .{ .object = empty })) == null);
+}
+
+test "delete removes the row; 404 on missing" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','x',1);");
+    try std.testing.expect(try delete(&d, col, "r1"));
+    try std.testing.expect(!try delete(&d, col, "r1"));
+}
