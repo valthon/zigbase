@@ -6,6 +6,11 @@ const migrations = @import("migrations.zig");
 const values = @import("values.zig");
 const ddl = @import("ddl.zig");
 const id_gen = @import("id.zig");
+const compiler = @import("query/compiler.zig");
+const lexer = @import("query/lexer.zig");
+const parser = @import("query/parser.zig");
+const joiner = @import("query/joiner.zig");
+const sort = @import("query/sort.zig");
 
 /// readValue / rowToObject can surface std.json parse errors (for json and multi-value
 /// fields), and collections.get widens its own inferred error set. Capture those so
@@ -352,4 +357,88 @@ test "delete removes the row; 404 on missing" {
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','x',1);");
     try std.testing.expect(try delete(&d, col, "r1"));
     try std.testing.expect(!try delete(&d, col, "r1"));
+}
+
+pub const ListQuery = struct { filter: ?[]const u8 = null, sort: ?[]const u8 = null, page: u32 = 1, perPage: u32 = 30 };
+pub const ListResult = struct { page: u32, perPage: u32, totalItems: i64, items: []std.json.Value };
+
+fn baseColumnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\".\"id\",\"{s}\".\"created\",\"{s}\".\"updated\"", .{ col.name, col.name, col.name }));
+    for (col.fields) |f| {
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"{s}\".{s}", .{ col.name, try ddl.quoteIdent(alloc, f.name) }));
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: ListQuery) !ListResult {
+    var j = joiner.Joiner.init(alloc, conn, col);
+    var where_sql: []const u8 = "";
+    var params: []const compiler.Param = &.{};
+    if (q.filter) |fstr| if (fstr.len > 0) {
+        const toks = try lexer.lex(alloc, fstr);
+        const ast = try parser.parse(alloc, toks);
+        const compiled = try compiler.compile(alloc, &j, ast);
+        where_sql = compiled.where_sql;
+        params = compiled.params;
+    };
+    var order_sql: []const u8 = try std.fmt.allocPrint(alloc, "\"{s}\".\"created\" DESC", .{col.name});
+    if (q.sort) |sstr| if (sstr.len > 0) {
+        const ob = try sort.compile(alloc, &j, sstr);
+        if (ob.len > 0) order_sql = ob;
+    };
+    var joins_sql: std.ArrayList(u8) = .empty;
+    for (j.joins.items) |jn| { try joins_sql.append(alloc, ' '); try joins_sql.appendSlice(alloc, jn); }
+
+    const where_clause = if (where_sql.len > 0) try std.fmt.allocPrint(alloc, " WHERE {s}", .{where_sql}) else "";
+
+    const count_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COUNT(*) FROM \"{s}\"{s}{s};", .{ col.name, joins_sql.items, where_clause }, 0);
+    var cst = try conn.prepare(count_sql);
+    defer cst.finalize();
+    _ = try bindParams(&cst, params, 1);
+    _ = try cst.step();
+    const total = cst.columnInt(0);
+
+    const per: u32 = if (q.perPage == 0) 30 else @min(q.perPage, 500);
+    const page: u32 = if (q.page == 0) 1 else q.page;
+    const offset: i64 = @as(i64, (page - 1)) * @as(i64, per);
+    const bcols = try baseColumnList(alloc, col);
+    const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, order_sql }, 0);
+    var pst = try conn.prepare(page_sql);
+    defer pst.finalize();
+    const after = try bindParams(&pst, params, 1);
+    try pst.bindInt(after, @intCast(per));
+    try pst.bindInt(after + 1, offset);
+
+    var items: std.ArrayList(std.json.Value) = .empty;
+    while (try pst.step()) try items.append(alloc, try rowToObject(alloc, &pst, col));
+    return .{ .page = page, .perPage = per, .totalItems = total, .items = try items.toOwnedSlice(alloc) };
+}
+
+fn bindParams(st: *db.Stmt, params: []const compiler.Param, start: c_int) !c_int {
+    var idx = start;
+    for (params) |p| {
+        switch (p) {
+            .text => |t| try st.bindText(idx, t),
+            .int => |n| try st.bindInt(idx, n),
+            .double => |dv| try st.bindDouble(idx, dv),
+        }
+        idx += 1;
+    }
+    return idx;
+}
+
+test "list filters, sorts, and paginates" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a); // posts(title text, price fixed/2)
+    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','2026-01-01T00:00:00Z','t','aaa',100),('r2','2026-01-02T00:00:00Z','t','bbb',200),('r3','2026-01-03T00:00:00Z','t','ccc',300);");
+    const res = try list(a, &d, col, .{ .filter = "price >= 2.00", .sort = "-created", .page = 1, .perPage = 1 });
+    try std.testing.expectEqual(@as(i64, 2), res.totalItems);
+    try std.testing.expectEqual(@as(usize, 1), res.items.len);
+    try std.testing.expectEqualStrings("r3", res.items[0].object.get("id").?.string);
 }
