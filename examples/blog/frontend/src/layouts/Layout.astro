@@ -1,0 +1,22 @@
+---
+import '../styles/global.css';
+const { title = 'ZigBase Blog' } = Astro.props;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+  </head>
+  <body>
+    <header class="site">
+      <nav>
+        <a class="brand" href="/">ZigBase Blog</a>
+        <a href="/write">Write</a>
+        <a href="/_/" data-astro-reload>Admin</a>
+      </nav>
+    </header>
+    <main><slot /></main>
+  </body>
+</html>

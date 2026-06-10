@@ -1,0 +1,13 @@
+---
+import Layout from '../layouts/Layout.astro';
+import PostList from '../components/PostList.tsx';
+---
+<Layout title="ZigBase Blog">
+  <h1>Latest posts</h1>
+  <p class="muted">
+    Served by the <code>blog</code> binary itself: the Astro build output is
+    handed to <code>--serve-static frontend/dist</code> — ZigBase's default
+    runtime static-files mode.
+  </p>
+  <PostList client:load />
+</Layout>

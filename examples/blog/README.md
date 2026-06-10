@@ -83,3 +83,22 @@ mise exec zig@0.16.0 -- zig build           # produces ./zig-out/bin/blog
 
 Then create a `posts` record without a `slug` and the hook fills it in from the
 `title`.
+
+## Frontend (Astro + React islands)
+
+`frontend/` is an Astro site with React islands: a public post list/detail and a
+login + "write a post" island that exercises the `slugify` hook. The example's
+comptime `.collections` schema (users + posts) provisions itself on startup, so
+the whole thing works from a fresh data dir.
+
+```sh
+cd frontend && npm install && npm run build && cd ..
+zig build
+ZIGBASE_JWT_SECRET=... ./zig-out/bin/blog serve --serve-static frontend/dist
+# open http://127.0.0.1:8090/
+```
+
+This demonstrates ZigBase's **default static-files mode**: the binary serves
+`frontend/dist` at the root path because you passed `--serve-static`. The other
+modes (comptime-hardcoded dir, fully embedded) are shown by the golfsim and
+plugins examples.
