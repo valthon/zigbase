@@ -117,14 +117,54 @@ fn convCode(e: anyerror) []const u8 {
     };
 }
 
-/// Validate select membership/count, relation existence/count, and number string parsing.
-/// Appends field errors to `errs`. `conn` is used for relation existence lookups.
+fn appendMinMax(alloc: std.mem.Allocator, errs: *std.ArrayList(schema.ValidationError), field: []const u8, x: f64, min: ?f64, max: ?f64) !void {
+    if (min) |mn| if (x < mn)
+        try errs.append(alloc, .{ .field = field, .code = "validation_min", .message = "Value is below the minimum." });
+    if (max) |mx| if (x > mx)
+        try errs.append(alloc, .{ .field = field, .code = "validation_max", .message = "Value is above the maximum." });
+}
+
+/// Validate text/number/date min/max constraints, select membership/count, relation
+/// existence/count, and number string parsing. Appends field errors to `errs`.
+/// `conn` is used for relation existence lookups. Null and empty values skip the
+/// min/max constraint checks (required-ness is enforced separately by the caller,
+/// and an optional field must stay clearable).
 fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v: std.json.Value, errs: *std.ArrayList(schema.ValidationError)) !void {
     switch (f.options) {
-        .number => |o| if (v == .string and o.mode != .float) {
+        .text => |o| if (v == .string and v.string.len > 0) {
+            // min/max are documented as length in unicode codepoints (docs/fields.md).
+            const n = std.unicode.utf8CountCodepoints(v.string) catch v.string.len;
+            if (o.min) |mn| if (n < mn)
+                try errs.append(alloc, .{ .field = f.name, .code = "validation_min", .message = "Value is too short." });
+            if (o.max) |mx| if (n > mx)
+                try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Value is too long." });
+        },
+        .date => |o| if (v == .string and v.string.len > 0) {
+            // Normalized ISO-8601 strings order lexically.
+            if (o.min) |mn| if (std.mem.order(u8, v.string, mn) == .lt)
+                try errs.append(alloc, .{ .field = f.name, .code = "validation_min", .message = "Value is before the minimum date." });
+            if (o.max) |mx| if (std.mem.order(u8, v.string, mx) == .gt)
+                try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Value is after the maximum date." });
+        },
+        .number => |o| if (o.mode == .float) {
+            const x: f64 = switch (v) {
+                .float => |fl| fl,
+                .integer => |i| @floatFromInt(i),
+                else => return,
+            };
+            try appendMinMax(alloc, errs, f.name, x, o.min, o.max);
+        } else if (v == .string) {
             const scale: u8 = if (o.mode == .fixed) (o.scale orelse 0) else 0;
-            _ = values.decimalToScaledInt(v.string, scale) catch |e|
+            const sv = values.decimalToScaledInt(v.string, scale) catch |e| {
                 try errs.append(alloc, .{ .field = f.name, .code = convCode(e), .message = "Invalid number." });
+                return;
+            };
+            // Compare the decimal value as f64. min/max are stored as f64, so values
+            // beyond 2^53 cannot be bounded exactly anyway (see the documented-edge test).
+            var pow: f64 = 1;
+            var k: u8 = 0;
+            while (k < scale) : (k += 1) pow *= 10;
+            try appendMinMax(alloc, errs, f.name, @as(f64, @floatFromInt(sv)) / pow, o.min, o.max);
         },
         .select => |o| {
             if (countValues(v) > o.maxSelect)
@@ -518,6 +558,164 @@ test "create rejects a value outside a select's allowed set" {
     var data: std.json.ObjectMap = .empty;
     try data.put(a, "status", .{ .string = "banana" });
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
+}
+
+// ---------------------------------------------------------------------------
+// Field-constraint enforcement tests (TDD; Bug 3). The schema stores
+// text min/max, number min/max, and date min/max, but validateFieldValue
+// never enforced them.
+// ---------------------------------------------------------------------------
+
+fn seedConstrained(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
+    try migrations.run(d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{ .min = 2, .max = 5 } } },
+        .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2, .min = 0, .max = 100 } } },
+        .{ .id = "f3", .name = "seats", .options = .{ .number = .{ .mode = .int, .min = 1, .max = 8 } } },
+        .{ .id = "f4", .name = "ratio", .options = .{ .number = .{ .mode = .float, .min = 0, .max = 1 } } },
+        .{ .id = "f5", .name = "when", .options = .{ .date = .{ .min = "2026-01-01 00:00:00", .max = "2026-12-31 23:59:59" } } },
+    };
+    return collections.create(a, std.testing.io, d, .{ .id = "", .name = "limits", .fields = &fields });
+}
+
+fn expectFieldCode(field: []const u8, code: []const u8) !void {
+    const errs = last_errors orelse return error.TestExpectedEqual;
+    for (errs) |e| {
+        if (std.mem.eql(u8, e.field, field) and std.mem.eql(u8, e.code, code)) return;
+    }
+    return error.TestExpectedEqual;
+}
+
+fn createOne(a: std.mem.Allocator, d: *db.Db, col: schema.Collection, key: []const u8, v: std.json.Value) RecordError!std.json.Value {
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, key, v);
+    return create(a, std.testing.io, d, col, .{ .object = data });
+}
+
+test "text min/max enforce unicode codepoint counts" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "title", .{ .string = "a" }));
+    try expectFieldCode("title", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "title", .{ .string = "abcdef" }));
+    try expectFieldCode("title", "validation_max");
+    // "héllo" is 5 codepoints but 6 bytes: max=5 must count codepoints, not bytes
+    _ = try createOne(a, &d, col, "title", .{ .string = "héllo" });
+    _ = try createOne(a, &d, col, "title", .{ .string = "ab" });
+}
+
+test "text min does not reject an explicitly empty optional value (clearing stays possible)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    _ = try createOne(a, &d, col, "title", .{ .string = "" });
+    _ = try createOne(a, &d, col, "title", .null);
+}
+
+test "fixed-mode number min/max compare the decimal value" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "price", .{ .string = "-1" }));
+    try expectFieldCode("price", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "price", .{ .string = "-0.01" }));
+    try expectFieldCode("price", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "price", .{ .string = "100.01" }));
+    try expectFieldCode("price", "validation_max");
+    _ = try createOne(a, &d, col, "price", .{ .string = "0" });
+    _ = try createOne(a, &d, col, "price", .{ .string = "100.00" });
+    _ = try createOne(a, &d, col, "price", .{ .string = "45.00" });
+}
+
+test "int-mode number min/max" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "seats", .{ .string = "0" }));
+    try expectFieldCode("seats", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "seats", .{ .string = "9" }));
+    try expectFieldCode("seats", "validation_max");
+    _ = try createOne(a, &d, col, "seats", .{ .string = "1" });
+    _ = try createOne(a, &d, col, "seats", .{ .string = "8" });
+}
+
+test "int-mode bounds compare as f64: values beyond 2^53 lose precision (documented edge)" {
+    // The schema stores min/max as f64, so bounds themselves cannot represent
+    // integers above 2^53 exactly. 9007199254740993 (2^53+1) rounds to 2^53 when
+    // compared, so a max of 9007199254740992 does NOT reject it. This is the
+    // accepted behavior; exact enforcement would need decimal bounds in the schema.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "big", .options = .{ .number = .{ .mode = .int, .max = 9007199254740992.0 } } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "bigints", .fields = &fields });
+    _ = try createOne(a, &d, col, "big", .{ .string = "9007199254740993" });
+}
+
+test "float-mode number min/max (float and integer JSON values)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "ratio", .{ .float = -0.5 }));
+    try expectFieldCode("ratio", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "ratio", .{ .float = 1.5 }));
+    try expectFieldCode("ratio", "validation_max");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "ratio", .{ .integer = 2 }));
+    try expectFieldCode("ratio", "validation_max");
+    _ = try createOne(a, &d, col, "ratio", .{ .float = 0.5 });
+    _ = try createOne(a, &d, col, "ratio", .{ .integer = 1 });
+}
+
+test "date min/max compare normalized ISO-8601 strings lexically" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }));
+    try expectFieldCode("when", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2027-01-01 00:00:00" }));
+    try expectFieldCode("when", "validation_max");
+    _ = try createOne(a, &d, col, "when", .{ .string = "2026-06-15 12:00:00" });
+    _ = try createOne(a, &d, col, "when", .{ .string = "2026-01-01 00:00:00" }); // inclusive bounds
+    _ = try createOne(a, &d, col, "when", .{ .string = "2026-12-31 23:59:59" });
+}
+
+test "update enforces the same constraints" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    const rec = try createOne(a, &d, col, "price", .{ .string = "1.00" });
+    const rid = rec.object.get("id").?.string;
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "price", .{ .string = "-1" });
+    try std.testing.expectError(error.Validation, update(a, &d, col, rid, .{ .object = data }));
+    try expectFieldCode("price", "validation_min");
 }
 
 pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
