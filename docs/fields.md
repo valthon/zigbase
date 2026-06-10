@@ -121,13 +121,12 @@ A date/time string column.
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `min` | string | unset | earliest allowed value, inclusive (a date string) |
-| `max` | string | unset | latest allowed value, inclusive (a date string) |
+| `min` | string | unset | earliest allowed value (a date string) — **accepted but not yet enforced** |
+| `max` | string | unset | latest allowed value (a date string) — **accepted but not yet enforced** |
 
-`min`/`max` compare **lexically** against the submitted string (normalized
-ISO-8601 date strings order correctly that way), so use the same format for the
-bounds as your record values. Violations are a `400` with `validation_min` /
-`validation_max`.
+`min`/`max` are stored and round-tripped, but record validation does not apply
+them yet: enforcement needs date parsing/normalization, which the write path
+doesn't have (see KNOWN_LIMITATIONS.md).
 
 ```json
 { "name": "starts_at", "type": "date", "options": { "min": "2026-01-01 00:00:00" } }

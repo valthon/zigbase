@@ -124,7 +124,7 @@ fn appendMinMax(alloc: std.mem.Allocator, errs: *std.ArrayList(schema.Validation
         try errs.append(alloc, .{ .field = field, .code = "validation_max", .message = "Value is above the maximum." });
 }
 
-/// Validate text/number/date min/max constraints, select membership/count, relation
+/// Validate text/number min/max constraints, select membership/count, relation
 /// existence/count, and number string parsing. Appends field errors to `errs`.
 /// `conn` is used for relation existence lookups. Null and empty values skip the
 /// min/max constraint checks (required-ness is enforced separately by the caller,
@@ -139,13 +139,9 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             if (o.max) |mx| if (n > mx)
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Value is too long." });
         },
-        .date => |o| if (v == .string and v.string.len > 0) {
-            // Normalized ISO-8601 strings order lexically.
-            if (o.min) |mn| if (std.mem.order(u8, v.string, mn) == .lt)
-                try errs.append(alloc, .{ .field = f.name, .code = "validation_min", .message = "Value is before the minimum date." });
-            if (o.max) |mx| if (std.mem.order(u8, v.string, mx) == .gt)
-                try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Value is after the maximum date." });
-        },
+        // date min/max are deliberately NOT enforced: a lexical compare is unsound
+        // without date normalization (mixed "T"/"Z" vs space formats false-reject,
+        // garbage like "25:99:99" false-accepts). See KNOWN_LIMITATIONS.md.
         .number => |o| if (o.mode == .float) {
             const x: f64 = switch (v) {
                 .float => |fl| fl,
@@ -734,20 +730,20 @@ test "float-mode number min/max (float and integer JSON values)" {
     _ = try createOne(a, &d, col, "ratio", .{ .integer = 1 });
 }
 
-test "date min/max compare normalized ISO-8601 strings lexically" {
+test "date min/max are accepted but NOT enforced (no date normalization in the write path)" {
+    // A lexical compare is unsound without normalization: clients legitimately mix
+    // "2026-06-10 08:00:00" and "2026-06-10T08:00:00Z", which order incorrectly as
+    // bytes, and garbage like "2026-06-10 25:99:99" would still pass. Enforcement
+    // is deferred until dates are parsed/normalized (see KNOWN_LIMITATIONS.md).
     var d = try db.Db.openMemory();
     defer d.close();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const col = try seedConstrained(&d, a);
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }));
-    try expectFieldCode("when", "validation_min");
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2027-01-01 00:00:00" }));
-    try expectFieldCode("when", "validation_max");
-    _ = try createOne(a, &d, col, "when", .{ .string = "2026-06-15 12:00:00" });
-    _ = try createOne(a, &d, col, "when", .{ .string = "2026-01-01 00:00:00" }); // inclusive bounds
-    _ = try createOne(a, &d, col, "when", .{ .string = "2026-12-31 23:59:59" });
+    const col = try seedConstrained(&d, a); // "when": min 2026-01-01, max 2026-12-31
+    _ = try createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }); // below min: accepted
+    _ = try createOne(a, &d, col, "when", .{ .string = "2027-01-01 00:00:00" }); // above max: accepted
+    _ = try createOne(a, &d, col, "when", .{ .string = "2026-06-10T08:00:00Z" }); // mixed format: accepted
 }
 
 test "update enforces the same constraints" {
