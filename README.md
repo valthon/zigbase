@@ -75,7 +75,10 @@ commands as the stock server. Beyond hooks, `App(.{...})` also accepts a comptim
 **schema** (`.collections` + `.migrations`, provisioned at startup with additive
 auto-migration), **pluggable backends** (`.storage` / `.mailer`), and **footprint
 levers** (`.pools`). See [docs/framework.md](docs/framework.md) and the worked
-example in [examples/blog/](examples/blog/).
+examples: [examples/blog/](examples/blog/) (basic packaging),
+[examples/golfsim/](examples/golfsim/) (a real app), and
+[examples/plugins/](examples/plugins/) (advanced framework features — custom
+plugins, comptime schema, typed migrations, pool levers).
 
 ## CLI
 
@@ -153,7 +156,9 @@ src/
   files/                   local storage + multipart
   admin/                   embedded admin SPA (served at /_/)
 examples/
-  blog/                    worked framework example (hook, custom route, cron job)
+  blog/                    basic packaging proof (hook, custom route, cron job)
+  golfsim/                 a realistic app built on ZigBase (hooks, routes, cron)
+  plugins/                 advanced framework features (custom plugins, comptime schema, typed migrations, pools)
 ```
 
 ## Documentation

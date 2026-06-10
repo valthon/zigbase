@@ -408,24 +408,28 @@ For the changes auto-migration won't do, use the `.migrations` escape hatch.
 
 ### Explicit migrations (`.migrations`)
 
-`.migrations` is a slice of migration records, each run **once** (recorded in
-`_migrations` under a `prov:` prefix) **before** provisioning:
+`.migrations` is a **typed slice** of `zigbase.Migration` records, each run
+**once** (recorded in `_migrations` under a `prov:` prefix) **before**
+provisioning. The field is `[]const zigbase.Migration`, so it must be a typed
+slice (`&[_]zigbase.Migration{ ... }`) — a bare anonymous tuple does **not**
+coerce:
 
 ```zig
-.migrations = &.{
+.migrations = &[_]zigbase.Migration{
     .{ .id = "0001_rename_title", .up = renameTitle },
 },
-// .up signature: fn (alloc: std.mem.Allocator, io: std.Io, w: *Db) anyerror!void
-//   (Db is the writer connection; it exposes exec/prepare/begin/commit/rollback.)
-fn renameTitle(alloc: std.mem.Allocator, io: std.Io, w: anytype) anyerror!void {
+// .up signature: fn (alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void
+//   (zigbase.Db is the writer connection; it exposes exec/prepare/begin/commit/rollback.)
+fn renameTitle(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void {
     _ = alloc; _ = io;
     try w.exec("ALTER TABLE \"posts\" RENAME COLUMN \"headline\" TO \"title\";");
 }
 ```
 
 Each migration has an `.id` (used for the once-only record) and an `.up` function
-`fn (alloc, io, w: *Db) anyerror!void` run inside a transaction (rolled back on
-error). Use migrations for renames, drops, type changes, and data backfills.
+`fn (alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void` run
+inside a transaction (rolled back on error). Use migrations for renames, drops,
+type changes, and data backfills.
 
 ## 9. Pluggable storage & mailer backends (`.storage` / `.mailer`)
 
@@ -444,33 +448,50 @@ A plugin is a type with this uniform contract (built from the runtime
 
 ```zig
 pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !Self;
-pub fn interface(self: *Self) Storage; // or Mailer — the type-erased vtable view
-pub fn deinit(self: *Self) void;       // release owned resources
+pub fn interface(self: *Self) zigbase.Storage; // or zigbase.Mailer — the type-erased vtable view
+pub fn deinit(self: *Self) void;               // release owned resources
 ```
 
 `create` builds the backend from config; `interface` returns the type-erased
 vtable handle stored on the app; `deinit` tears it down (the instance outlives the
-server). Supply your own to back storage or mail with a different system (e.g. an
-S3 storage backend — the slot exists, though only local-disk ships):
+server). Supply your own to back storage or mail with a different system. A custom
+mailer hands back a `zigbase.Mailer` view built from a static `VTable` whose
+`send` receives a `zigbase.Email`:
 
 ```zig
-const MyS3Storage = struct {
-    backend: S3Backend,
-    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !@This() {
-        return .{ .backend = try S3Backend.init(gpa, cfg) };
+const AuditMailer = struct {
+    sent: usize = 0,
+
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !AuditMailer {
+        _ = gpa; _ = io; _ = cfg;
+        return .{};
     }
-    pub fn interface(self: *@This()) Storage { return self.backend.storage(); }
-    pub fn deinit(self: *@This()) void { self.backend.deinit(); }
+    pub fn interface(self: *AuditMailer) zigbase.Mailer {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    pub fn deinit(self: *AuditMailer) void { _ = self; }
+
+    const vtable = zigbase.Mailer.VTable{ .send = send };
+
+    fn send(ptr: *anyopaque, io: std.Io, alloc: std.mem.Allocator, email: zigbase.Email) anyerror!void {
+        _ = io; _ = alloc;
+        const self: *AuditMailer = @ptrCast(@alignCast(ptr));
+        self.sent += 1;
+        std.log.info("to={s} subject={s}", .{ email.to, email.subject });
+    }
 };
 
-zigbase.App(.{ .storage = MyS3Storage }).runCli(init);
+zigbase.App(.{ .mailer = AuditMailer }).runCli(init);
 ```
 
-The `Storage` vtable is defined in `src/files/storage.zig` (the default plugin
-wraps `LocalStorage`); the `Mailer` vtable — a single
-`send(io, alloc, Email)` — is in `src/mail/mailer.zig`. A custom mailer implements
-`send` and returns a `Mailer` view from `interface()`. (The default plugin types,
-`DefaultStoragePlugin` / `DefaultMailerPlugin`, live in `src/framework.zig`.)
+A custom storage plugin follows the same shape, returning a `zigbase.Storage`
+view from `interface()`. The `zigbase.Storage` vtable backs file storage (the
+default `zigbase.DefaultStoragePlugin` wraps `zigbase.LocalStorage`); the
+`zigbase.Mailer` vtable — a single `send(io, alloc, zigbase.Email)` — backs mail
+(the default `zigbase.DefaultMailerPlugin` selects `zigbase.LogMailer` or
+`zigbase.SmtpMailer` from config). See
+[`examples/plugins/`](../examples/plugins/) for the full, compiling custom-mailer
+plugin.
 
 ## 10. Footprint levers (`.pools`)
 
@@ -507,8 +528,16 @@ When the framework catches an error, your `onError` handler (if any) runs
 
 ## 12. The worked example
 
-See [`examples/blog/`](../examples/blog/) for a complete, buildable app. Its
-`App(.{...})` block is the canonical reference (hooks + route + job):
+Three buildable examples form a ladder:
+[`examples/blog/`](../examples/blog/) is the basic packaging proof,
+[`examples/golfsim/`](../examples/golfsim/) is a realistic app (hooks, routes,
+cron), and [`examples/plugins/`](../examples/plugins/) is the advanced
+framework-feature reference (custom mailer plugin + `.collections` schema +
+typed `.migrations` + `.pools` levers — all against the published `zigbase`
+module).
+
+The blog `App(.{...})` block is the canonical basics reference (hooks + route +
+job):
 
 ```zig
 pub fn main(init: std.process.Init) !void {
@@ -541,6 +570,12 @@ The public surface (from `src/root.zig`):
   `schedule.Reactive`.
 - `zigbase.RecordEvent`, `zigbase.ErrorEvent`, `zigbase.RouteEvent` —
   re-exported directly for convenience.
+- `zigbase.Migration` — the `.migrations` slice element type; `zigbase.Db` — the
+  writer connection passed to a migration's `.up`.
+- `zigbase.Storage` / `zigbase.Mailer` / `zigbase.Email` — the storage & mailer
+  plugin vtable types; `zigbase.DefaultStoragePlugin` / `zigbase.DefaultMailerPlugin`
+  — the built-in defaults; `zigbase.LocalStorage`, `zigbase.LogMailer`,
+  `zigbase.SmtpMailer`, `zigbase.SmtpTls` — the concrete backends.
 
 ---
 
