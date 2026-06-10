@@ -1,17 +1,17 @@
+//! ZigBase blog example — demonstrates the DEFAULT static-files mode.
+//!
+//! Comptime schema (provisioned at startup via additive auto-migration):
+//!   - users  (auth collection, open signup, self-only update/delete)
+//!   - posts  (title + server-derived slug + body + status; public list/view
+//!             only when published; authenticated create/update/delete)
+//!
+//! The `slugify` beforeCreate hook derives a URL slug from the post title.
+//! The Astro + React frontend in `frontend/` is served via:
+//!   --serve-static frontend/dist
+
 const std = @import("std");
 const zigbase = @import("zigbase");
 
-/// ZigBase blog example — demonstrates the DEFAULT static-files mode.
-///
-/// Comptime schema (provisioned at startup via additive auto-migration):
-///   - users  (auth collection, open signup, self-only update/delete)
-///   - posts  (title + server-derived slug + body + status; public list/view
-///             only when published; authenticated create/update/delete)
-///
-/// The `slugify` beforeCreate hook derives a URL slug from the post title.
-/// The Astro + React frontend in `frontend/` is served via:
-///   --serve-static frontend/dist
-///
 /// before_create on "posts": derive a URL slug from the title if one isn't set.
 /// NOTE: record mutations MUST allocate with `ev.arena` (the request-scoped
 /// allocator that owns `ev.record`), NOT `ev.app.allocator` (the long-lived gpa) —
@@ -87,6 +87,9 @@ pub fn main(init: std.process.Init) !void {
                     .{ .name = "body", .type = .text, .max = 20000 },
                     .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
                 },
+                // NOTE: any authed user can edit/delete any post — deliberately simple for a demo.
+                // For per-author restriction, add an author relation field and use
+                // "@request.auth.id = author" in the update/delete rules.
                 .rules = .{
                     .list = "status = \"published\"",
                     .view = "status = \"published\"",

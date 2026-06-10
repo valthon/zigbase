@@ -93,8 +93,8 @@ the whole thing works from a fresh data dir.
 
 ```sh
 cd frontend && npm install && npm run build && cd ..
-zig build
-ZIGBASE_JWT_SECRET=... ./zig-out/bin/blog serve --serve-static frontend/dist
+mise exec zig@0.16.0 -- zig build
+ZIGBASE_JWT_SECRET=... ./zig-out/bin/blog serve --data-dir ./data --serve-static frontend/dist
 # open http://127.0.0.1:8090/
 ```
 

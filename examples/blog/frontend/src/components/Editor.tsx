@@ -13,7 +13,7 @@ export default function Editor() {
 
   async function run(fn: () => Promise<void>) {
     setBusy(true); setError(null);
-    try { await fn(); } catch (e: any) { setError(e.message); } finally { setBusy(false); }
+    try { await fn(); } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); }
   }
 
   if (!authed) {
