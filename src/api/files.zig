@@ -111,6 +111,60 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     return .{ .status = 200, .body = "", .file_path = path, .extra_headers = headers };
 }
 
+test "isInlineSafeExt allows only known-safe types" {
+    // Safe image/pdf types render inline.
+    for ([_][]const u8{ "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico", "pdf" }) |s| {
+        try std.testing.expect(isInlineSafeExt(s));
+    }
+    // Case-insensitive.
+    try std.testing.expect(isInlineSafeExt("PNG"));
+    try std.testing.expect(isInlineSafeExt("Jpeg"));
+    // Script-capable / unknown types must NOT render inline (XSS neutralization).
+    for ([_][]const u8{ "html", "htm", "svg", "js", "xml" }) |s| {
+        try std.testing.expect(!isInlineSafeExt(s));
+    }
+    // Empty extension -> not safe.
+    try std.testing.expect(!isInlineSafeExt(""));
+    // Anything longer than the 16-byte buffer -> not safe (length boundary).
+    try std.testing.expect(!isInlineSafeExt("a" ** 17));
+}
+
+test "recordReferencesFile matches single + array file fields, ignores non-file fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "avatar", .options = .{ .file = .{ .maxSelect = 1 } } },
+        .{ .id = "f2", .name = "gallery", .options = .{ .file = .{ .maxSelect = 9 } } },
+        .{ .id = "f3", .name = "caption", .options = .{ .text = .{} } },
+    };
+    const col = schema.Collection{ .id = "c1", .name = "media", .fields = &fields };
+
+    var rec: std.json.ObjectMap = .empty;
+    try rec.put(a, "avatar", .{ .string = "pic.png" });
+    var gallery = std.json.Array.init(a);
+    try gallery.append(.{ .string = "g1.png" });
+    try gallery.append(.{ .string = "g2.png" });
+    try rec.put(a, "gallery", .{ .array = gallery });
+    // A NON-file (text) field whose value collides with a filename: must NOT grant access.
+    try rec.put(a, "caption", .{ .string = "evil.html" });
+    const rval = std.json.Value{ .object = rec };
+
+    // Single-file field match.
+    try std.testing.expect(recordReferencesFile(col, rval, "pic.png"));
+    // Array-element match.
+    try std.testing.expect(recordReferencesFile(col, rval, "g1.png"));
+    try std.testing.expect(recordReferencesFile(col, rval, "g2.png"));
+    // Name not referenced anywhere.
+    try std.testing.expect(!recordReferencesFile(col, rval, "missing.png"));
+    // Collides only with a non-file text field's value -> NOT a reference (prevents
+    // serving arbitrary files via a text-field collision).
+    try std.testing.expect(!recordReferencesFile(col, rval, "evil.html"));
+    // A non-object record is never a reference.
+    try std.testing.expect(!recordReferencesFile(col, .{ .string = "x" }, "pic.png"));
+}
+
 /// POST /api/files/token — authenticated; mints a short-lived file-access token.
 pub fn token(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;

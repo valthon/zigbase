@@ -425,6 +425,72 @@ test "update merges provided fields, bumps updated, 404 on missing" {
     try std.testing.expect((try update(a, &d, col, "missing", .{ .object = empty })) == null);
 }
 
+test "update rejects an over-precise fixed value and leaves the row unchanged" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','keep',100);");
+
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "price", .{ .string = "1.999" }); // scale=2 -> too precise
+    try std.testing.expectError(error.Validation, update(a, &d, col, "r1", .{ .object = data }));
+    try std.testing.expect(last_errors != null and last_errors.?.len >= 1);
+
+    // The row must be untouched (price still "1.00", title still "keep").
+    const rec = (try get(a, &d, col, "r1")).?;
+    try std.testing.expectEqualStrings("keep", rec.object.get("title").?.string);
+    try std.testing.expectEqualStrings("1.00", rec.object.get("price").?.string);
+}
+
+test "updateGuarded rolls back when the guard fails, preserving the original value" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','old',100);");
+
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "title", .{ .string = "new" });
+    // Guard never matches -> the UPDATE inside the txn is rolled back.
+    const guard = Guard{ .where_sql = "\"posts\".\"title\" = ?", .params = &.{.{ .text = "nope" }} };
+    try std.testing.expectError(error.Forbidden, updateGuarded(a, &d, col, "r1", .{ .object = data }, guard));
+
+    // Rollback worked: the original "old" title persists.
+    const rec = (try get(a, &d, col, "r1")).?;
+    try std.testing.expectEqualStrings("old", rec.object.get("title").?.string);
+}
+
+test "list clamps pagination bounds" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','a',1),('r2','t','t','b',2);");
+
+    // perPage=0 -> default 30.
+    {
+        const res = try list(a, &d, col, .{ .perPage = 0 });
+        try std.testing.expectEqual(@as(u32, 30), res.perPage);
+    }
+    // perPage above the cap is clamped to 500.
+    {
+        const res = try list(a, &d, col, .{ .perPage = 1000 });
+        try std.testing.expectEqual(@as(u32, 500), res.perPage);
+    }
+    // page=0 -> normalized to 1.
+    {
+        const res = try list(a, &d, col, .{ .page = 0 });
+        try std.testing.expectEqual(@as(u32, 1), res.page);
+    }
+}
+
 test "delete removes the row; 404 on missing" {
     var d = try db.Db.openMemory();
     defer d.close();

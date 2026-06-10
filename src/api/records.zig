@@ -496,6 +496,75 @@ test "createRule on request data: empty title -> 403, nonempty -> 201" {
     try std.testing.expectEqual(@as(u16, 201), (try create(&ok)).status);
 }
 
+fn seedUpDelRuled(env: *TestEnv, name: []const u8, updateR: ?[]const u8, deleteR: ?[]const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    _ = try collections.create(a, std.testing.io, w, .{
+        .id = "", .name = name,
+        .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
+        // create/view permissive so a row can be seeded over the handler.
+        .listRule = "", .viewRule = "", .createRule = "", .updateRule = updateR, .deleteRule = deleteR,
+    });
+}
+
+test "update handler: rule denial -> 403, missing id -> 404" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    // null update rule -> locked (deny) for non-superusers.
+    try seedUpDelRuled(env, "ud_upd", null, "");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "ud_upd" }};
+
+    // Seed a row via the create handler.
+    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    const cres = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 201), cres.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, cres.body, .{});
+    const rid = parsed.value.object.get("id").?.string;
+
+    // Existing row, but the locked updateRule denies -> 403.
+    const p_exist = [_]http.Param{ .{ .key = "col", .value = "ud_upd" }, .{ .key = "id", .value = rid } };
+    var uctx = ctxFor(env, a, .PATCH, "{\"title\":\"new\"}", &p_exist);
+    try std.testing.expectEqual(@as(u16, 403), (try update(&uctx)).status);
+
+    // Nonexistent id -> 404 (the not-found check precedes the rule gate).
+    const p_missing = [_]http.Param{ .{ .key = "col", .value = "ud_upd" }, .{ .key = "id", .value = "nope" } };
+    var mctx = ctxFor(env, a, .PATCH, "{\"title\":\"new\"}", &p_missing);
+    try std.testing.expectEqual(@as(u16, 404), (try update(&mctx)).status);
+}
+
+test "delete handler: rule denial -> 403, missing id -> 404" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    // null delete rule -> locked (deny) for non-superusers.
+    try seedUpDelRuled(env, "ud_del", "", null);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "ud_del" }};
+
+    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    const cres = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 201), cres.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, cres.body, .{});
+    const rid = parsed.value.object.get("id").?.string;
+
+    // Existing row, but the locked deleteRule denies -> 403.
+    const p_exist = [_]http.Param{ .{ .key = "col", .value = "ud_del" }, .{ .key = "id", .value = rid } };
+    var dctx = ctxFor(env, a, .DELETE, "", &p_exist);
+    try std.testing.expectEqual(@as(u16, 403), (try delete(&dctx)).status);
+
+    // Nonexistent id -> 404.
+    const p_missing = [_]http.Param{ .{ .key = "col", .value = "ud_del" }, .{ .key = "id", .value = "nope" } };
+    var mctx = ctxFor(env, a, .DELETE, "", &p_missing);
+    try std.testing.expectEqual(@as(u16, 404), (try delete(&mctx)).status);
+}
+
 fn seedAuth(env: *TestEnv, name: []const u8, createR: ?[]const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

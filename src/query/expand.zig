@@ -156,6 +156,54 @@ test "H1: expand enforces the target collection's viewRule" {
     }
 }
 
+test "expand of a dangling relation id yields null" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }}, .viewRule = "" });
+    const pf = [_]schema.Field{.{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf, .viewRule = "" });
+    // The author id points at a row that does not exist (FK off to simulate a
+    // target row that was removed out-of-band / a stale reference).
+    try d.exec("PRAGMA foreign_keys=OFF;");
+    try d.exec("INSERT INTO posts (id,created,updated,author) VALUES ('p_1','t','t','u_missing');");
+    try d.exec("PRAGMA foreign_keys=ON;");
+
+    var rec = (try records.get(a, &d, posts, "p_1")).?;
+    const su = request.RequestContext{ .is_superuser = true };
+    try expand(a, &d, posts, &rec, "author", 0, &su);
+    // The relation key is present under expand but the target is missing -> null.
+    const author = rec.object.get("expand").?.object.get("author").?;
+    try std.testing.expect(author == .null);
+}
+
+test "expand silently skips a non-relation or unknown head" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }}, .viewRule = "" });
+    try d.exec("INSERT INTO posts (id,created,updated,title) VALUES ('p_1','t','t','hi');");
+    const su = request.RequestContext{ .is_superuser = true };
+
+    // "title" is a non-relation field -> skipped; "ghost" is unknown -> skipped.
+    {
+        var rec = (try records.get(a, &d, posts, "p_1")).?;
+        try expand(a, &d, posts, &rec, "title", 0, &su);
+        try std.testing.expect(rec.object.get("expand") == null);
+    }
+    {
+        var rec = (try records.get(a, &d, posts, "p_1")).?;
+        try expand(a, &d, posts, &rec, "ghost", 0, &su);
+        try std.testing.expect(rec.object.get("expand") == null);
+    }
+}
+
 test "H1: a public (empty-rule) target is expanded for anyone" {
     var d = try db.Db.openMemory();
     defer d.close();

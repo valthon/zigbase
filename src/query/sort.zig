@@ -43,3 +43,26 @@ test "sort compiles direction and relation paths" {
     const ob = try compile(a, &j, "-created,author.name");
     try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, j1.\"name\" ASC", ob);
 }
+
+test "sort error paths: bare sign, unknown column, empty" {
+    const db = @import("../db.zig");
+    const schema = @import("../schema.zig");
+    const migrations = @import("../migrations.zig");
+    const collections = @import("../collections.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }} });
+
+    var j = joiner.Joiner.init(a, &d, posts);
+    // A bare sign with no column is a bad sort spec.
+    try std.testing.expectError(error.BadSort, compile(a, &j, "-"));
+    // Sorting on a nonexistent column propagates from the joiner.
+    try std.testing.expectError(error.UnknownField, compile(a, &j, "nope"));
+    // Empty / whitespace-only spec yields an empty ORDER BY fragment.
+    try std.testing.expectEqualStrings("", try compile(a, &j, ""));
+    try std.testing.expectEqualStrings("", try compile(a, &j, "   "));
+}

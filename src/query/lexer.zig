@@ -72,6 +72,22 @@ test "lex a relation-path comparison" {
     try std.testing.expectEqualStrings("10.5", toks[6].text);
 }
 
+test "lex rejects malformed input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Unterminated string literal.
+    try std.testing.expectError(error.UnterminatedString, lex(a, "title = \"abc"));
+    // A lone '&' (not '&&') is invalid.
+    try std.testing.expectError(error.UnexpectedChar, lex(a, "a & b"));
+    // A lone '|' (not '||') is invalid.
+    try std.testing.expectError(error.UnexpectedChar, lex(a, "a | b"));
+    // A lone '-' with no following digit is not a number.
+    try std.testing.expectError(error.UnexpectedChar, lex(a, "x = -"));
+    // A stray character outside the grammar.
+    try std.testing.expectError(error.UnexpectedChar, lex(a, "a = %"));
+}
+
 test "lex an @request macro path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

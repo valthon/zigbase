@@ -70,3 +70,25 @@ pub const Joiner = struct {
 fn isSystemCol(s: []const u8) bool {
     return std.mem.eql(u8, s, "id") or std.mem.eql(u8, s, "created") or std.mem.eql(u8, s, "updated");
 }
+
+test "joiner rejects traversal through non-relation and multi-relation fields" {
+    const migrations = @import("../migrations.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }} });
+    const pf = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "tags", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 9 } } },
+    };
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+
+    var j = Joiner.init(a, &d, posts);
+    // Traversing THROUGH a text field (title is not a relation).
+    try std.testing.expectError(error.NotARelation, j.resolve("title.x"));
+    // Traversing THROUGH a multi-value relation is unsupported.
+    try std.testing.expectError(error.MultiRelationTraversal, j.resolve("tags.name"));
+}
