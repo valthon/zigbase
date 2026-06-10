@@ -1,0 +1,30 @@
+name: CI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  zig:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Build
+        run: mise exec zig@0.16.0 -- zig build
+      - name: Unit tests
+        run: mise exec zig@0.16.0 -- zig build test --summary all
+      - name: Build example consumer (dependency-graph proof)
+        run: cd examples/blog && mise exec zig@0.16.0 -- zig build
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install Playwright + Chromium
+        run: |
+          mise exec python@3.13 -- python -m pip install --quiet pytest playwright
+          mise exec python@3.13 -- python -m playwright install --with-deps chromium
+      - name: Headless browser tests
+        run: mise exec python@3.13 -- python -m pytest tests/admin -q
