@@ -4,7 +4,7 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-06-10
 
 ### Fixed
 - **Provisioning no longer leaks at shutdown:** `applySpecs` and `runMigrations`
@@ -60,4 +60,5 @@ backend-as-a-service in Zig 0.16, plus an embeddable Zig framework.
 ### Known limitations
 See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — notably: SMTP must be configured for email delivery in production (tokens are logged otherwise); rate limiting trusts proxy-supplied client IPs; auto-migration is additive-only; and the scheduler is single-process.
 
+[0.2.0]: https://github.com/valthon/zigbase/releases/tag/v0.2.0
 [0.1.0]: https://github.com/valthon/zigbase/releases/tag/v0.1.0
