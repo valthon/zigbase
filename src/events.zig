@@ -3,8 +3,89 @@ const std = @import("std");
 const App = @import("app.zig").App;
 const request = @import("request.zig");
 const Data = @import("data.zig").Data;
+const db = @import("db.zig");
 const sentry = @import("sentry.zig");
 const http = @import("http.zig");
+const migrations = @import("migrations.zig");
+const collections = @import("collections.zig");
+const schema = @import("schema.zig");
+
+// ---------------------------------------------------------------------------
+// RAII DB-access handles for the events that carry only `app` (RouteEvent,
+// JobEvent, LifecycleEvent). Unlike RecordEvent — whose `.data` is already bound
+// to the in-transaction writer for the triggering write — these events have no
+// ambient connection, so a handler that wants DB access must check one out of
+// the pool and (crucially) hand it back. These handles make that lifetime
+// explicit and leak-safe:
+//
+//   var w = ev.writer();         // acquires the shared pool writer (mutex-guarded)
+//   defer w.deinit();            // releases it back to the pool — no leak
+//   _ = try w.data().create(...);
+//
+//   var r = try ev.reader();     // checks out a pooled read-only connection
+//   defer r.deinit();            // returns it to the warm pool — no leak
+//   const rec = try r.data().findById(...);
+//
+// Asymmetry by design (mirrors db.Pool): the WRITER is a single shared,
+// mutex-guarded connection, so deinit *unlocks* it (does not close). The READER
+// is checked out of the pool's warm reader set, so deinit *returns* it to the
+// pool (releaseReader) rather than closing.
+// ---------------------------------------------------------------------------
+
+/// RAII handle around the pool's shared writer connection. `data()` yields a
+/// `Data` bound to it; `deinit()` releases the writer mutex. Hold it no longer
+/// than necessary — only one writer exists pool-wide.
+pub const WriterData = struct {
+    app: *App,
+    pool: *db.Pool,
+    conn: *db.Db,
+
+    /// A `Data` bound to the acquired writer connection. Valid until `deinit()`.
+    pub fn data(self: *WriterData) Data {
+        return .{ .app = self.app, .conn = self.conn, .io = self.app.io };
+    }
+
+    /// Release the writer back to the pool. Call exactly once (use `defer`).
+    pub fn deinit(self: *WriterData) void {
+        self.pool.releaseWriter();
+    }
+};
+
+/// RAII handle around a pooled, read-only connection checked out via
+/// `acquireReader()`. `data()` yields a `Data` bound to it; `deinit()` returns
+/// the connection to the pool's warm reader set.
+pub const ReaderData = struct {
+    app: *App,
+    pool: *db.Pool,
+    conn: db.Db,
+
+    /// A `Data` bound to this reader connection. Takes `*ReaderData` so the
+    /// returned `Data.conn` points at this handle's own (stable) `conn` field
+    /// rather than a dangling stack copy; the handle must outlive the `Data`.
+    pub fn data(self: *ReaderData) Data {
+        return .{ .app = self.app, .conn = &self.conn, .io = self.app.io };
+    }
+
+    /// Return the connection to the pool's warm reader set. Call exactly once
+    /// (use `defer`). Passes `&self.conn` to match `Pool.releaseReader`.
+    pub fn deinit(self: *ReaderData) void {
+        self.pool.releaseReader(&self.conn);
+    }
+};
+
+/// Acquire the pool's writer for create/update/delete. Caller MUST `deinit()`
+/// the returned handle (use `defer`) to release the writer.
+fn acquireWriter(app: *App) WriterData {
+    const conn = app.pool.acquireWriter();
+    return .{ .app = app, .pool = app.pool, .conn = conn };
+}
+
+/// Check out a pooled read-only connection for reads. Caller MUST `deinit()` the
+/// returned handle (use `defer`) to return it to the pool.
+fn acquireReader(app: *App) db.DbError!ReaderData {
+    const conn = try app.pool.acquireReader();
+    return .{ .app = app, .pool = app.pool, .conn = conn };
+}
 
 // NOTE: adding a variant requires updating phaseFieldName() and the consumer-facing camelCase field name.
 pub const RecordPhase = enum {
@@ -50,6 +131,17 @@ pub const RouteEvent = struct {
     /// Resolved request/auth context (auth identity, is_superuser, method). Built by
     /// the framework before the handler runs; `.public` routes still get it (anonymous).
     rctx: request.RequestContext,
+
+    /// Acquire the pool writer for create/update/delete:
+    /// `var w = ev.writer(); defer w.deinit(); _ = try w.data().create(...);`.
+    pub fn writer(ev: *RouteEvent) WriterData {
+        return acquireWriter(ev.app);
+    }
+    /// Check out a pooled read-only connection for reads:
+    /// `var r = try ev.reader(); defer r.deinit(); _ = try r.data().findById(...);`.
+    pub fn reader(ev: *RouteEvent) db.DbError!ReaderData {
+        return acquireReader(ev.app);
+    }
 };
 pub const RouteHandler = *const fn (ev: *RouteEvent) anyerror!http.Response;
 
@@ -83,10 +175,37 @@ pub const FileEvent = struct {
 pub const FileServeHandler = *const fn (ev: *FileEvent) anyerror!void;
 pub const FileUploadHandler = *const fn (ev: *FileEvent) void;
 
-pub const LifecycleEvent = struct { app: *App };
+pub const LifecycleEvent = struct {
+    app: *App,
+
+    /// Acquire the pool writer for create/update/delete:
+    /// `var w = ev.writer(); defer w.deinit(); _ = try w.data().create(...);`.
+    pub fn writer(ev: *LifecycleEvent) WriterData {
+        return acquireWriter(ev.app);
+    }
+    /// Check out a pooled read-only connection for reads:
+    /// `var r = try ev.reader(); defer r.deinit(); _ = try r.data().findById(...);`.
+    pub fn reader(ev: *LifecycleEvent) db.DbError!ReaderData {
+        return acquireReader(ev.app);
+    }
+};
 pub const LifecycleHandler = *const fn (ev: *LifecycleEvent) void;
 
-pub const JobEvent = struct { app: *App, name: []const u8 };
+pub const JobEvent = struct {
+    app: *App,
+    name: []const u8,
+
+    /// Acquire the pool writer for create/update/delete:
+    /// `var w = ev.writer(); defer w.deinit(); _ = try w.data().create(...);`.
+    pub fn writer(ev: *JobEvent) WriterData {
+        return acquireWriter(ev.app);
+    }
+    /// Check out a pooled read-only connection for reads:
+    /// `var r = try ev.reader(); defer r.deinit(); _ = try r.data().findById(...);`.
+    pub fn reader(ev: *JobEvent) db.DbError!ReaderData {
+        return acquireReader(ev.app);
+    }
+};
 pub const JobTask = *const fn (ev: *JobEvent) anyerror!void;
 
 /// `@compileError` on any route spec missing a required field (`.method`/`.path`/
@@ -366,4 +485,141 @@ test "buildRoutes defaults auth to .superuser when omitted" {
         .{ .method = .GET, .path = "/api/secret", .handler = H.a },
     });
     try std.testing.expect(table[0].auth == .superuser);
+}
+
+// ---------------------------------------------------------------------------
+// writer()/reader() data-accessor tests.
+//
+// A file-backed Pool (WAL) so a reader can see the writer's committed rows,
+// mirroring the db.zig pool tests and the data.zig Data round-trip test. The
+// no-leak assertions re-acquire the writer/reader *directly* off the pool after
+// the handle's deinit: if deinit failed to release, acquireWriter would deadlock
+// (spinlock) and acquireReader would not see the warm connection back in the
+// pool.
+// ---------------------------------------------------------------------------
+
+const TestEnv = struct {
+    tmp: std.testing.TmpDir,
+    db_path: [:0]u8,
+    pool: db.Pool,
+    arena: std.heap.ArenaAllocator,
+    app: App,
+
+    fn init() !*TestEnv {
+        const ga = std.testing.allocator;
+        const env = try ga.create(TestEnv);
+        errdefer ga.destroy(env);
+
+        env.tmp = std.testing.tmpDir(.{});
+        errdefer env.tmp.cleanup();
+
+        const dir_path = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+        defer ga.free(dir_path);
+        env.db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        errdefer ga.free(env.db_path);
+
+        env.pool = try db.Pool.init(ga, env.db_path);
+        errdefer env.pool.deinit();
+
+        env.arena = std.heap.ArenaAllocator.init(ga);
+        errdefer env.arena.deinit();
+        const a = env.arena.allocator();
+        const io = std.testing.io;
+
+        // Migrate + create a collection on the writer so create/findById work.
+        {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            try w.exec("PRAGMA foreign_keys=ON;");
+            try migrations.run(w);
+            const fields = [_]schema.Field{
+                .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
+            };
+            _ = try collections.create(a, io, w, .{ .id = "", .name = "posts", .fields = &fields });
+        }
+
+        env.app = App{ .allocator = a, .io = io, .pool = &env.pool };
+        return env;
+    }
+
+    fn deinit(env: *TestEnv) void {
+        const ga = std.testing.allocator;
+        env.arena.deinit();
+        env.pool.deinit();
+        ga.free(env.db_path);
+        env.tmp.cleanup();
+        ga.destroy(env);
+    }
+};
+
+test "RouteEvent.writer() create round-trips and releases the writer (no leak)" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    var ev = RouteEvent{ .app = &env.app, .ctx = undefined, .rctx = .{} };
+
+    var id_buf: [64]u8 = undefined;
+    var id_len: usize = 0;
+    {
+        var w = ev.writer();
+        defer w.deinit();
+        var obj: std.json.ObjectMap = .empty;
+        try obj.put(a, "title", .{ .string = "hello" });
+        const created = try w.data().create("posts", .{ .object = obj });
+        const id = created.object.get("id").?.string;
+        @memcpy(id_buf[0..id.len], id);
+        id_len = id.len;
+
+        const found = (try w.data().findById("posts", id)).?;
+        try std.testing.expectEqualStrings("hello", found.object.get("title").?.string);
+    }
+
+    // Prove deinit released the writer: re-acquiring it directly must not
+    // deadlock (the spinlock would hang forever if still held).
+    {
+        const w2 = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        _ = w2;
+    }
+}
+
+test "JobEvent.reader() sees a committed write and returns the conn to the pool (no leak)" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    var job = JobEvent{ .app = &env.app, .name = "nightly" };
+
+    // Write a record via the writer handle first.
+    var id_buf: [64]u8 = undefined;
+    var id_len: usize = 0;
+    {
+        var w = job.writer();
+        defer w.deinit();
+        var obj: std.json.ObjectMap = .empty;
+        try obj.put(a, "title", .{ .string = "world" });
+        const created = try w.data().create("posts", .{ .object = obj });
+        const id = created.object.get("id").?.string;
+        @memcpy(id_buf[0..id.len], id);
+        id_len = id.len;
+    }
+    const id = id_buf[0..id_len];
+
+    // The warm pool starts cold; after a reader handle deinit it must hold the
+    // returned connection.
+    try std.testing.expectEqual(@as(usize, 0), env.pool.reader_count);
+    {
+        var r = try job.reader();
+        defer r.deinit();
+        const found = (try r.data().findById("posts", id)).?;
+        try std.testing.expectEqualStrings("world", found.object.get("title").?.string);
+    }
+    // Prove deinit returned the connection to the warm pool (no leak/close).
+    try std.testing.expectEqual(@as(usize, 1), env.pool.reader_count);
+
+    // And re-acquiring reuses that exact warm connection.
+    var r2 = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r2);
+    try std.testing.expectEqual(@as(usize, 0), env.pool.reader_count);
 }
