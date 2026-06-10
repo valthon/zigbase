@@ -258,6 +258,12 @@ fn stableFieldId(comptime col: []const u8, comptime name: []const u8) []const u8
 /// An explicit migration for changes additive auto-provisioning won't do
 /// (renames, retypes, data backfills). Recorded in `_migrations` under
 /// `id` (prefixed), so it runs exactly once and is idempotent across restarts.
+///
+/// Note: the `alloc` passed to `up` is a short-lived arena scoped to the
+/// `runMigrations` call — anything allocated from it is freed before
+/// `runMigrations` returns. Do not store pointers derived from `alloc` in
+/// state that outlives the call; use a separate long-lived allocator for
+/// persistent data.
 pub const Migration = struct {
     id: []const u8,
     up: *const fn (alloc: std.mem.Allocator, io: std.Io, w: *db.Db) anyerror!void,
@@ -356,6 +362,8 @@ pub fn ensureCollection(
 
     // Diff user fields. `live.fields` from get() includes injected auth system
     // fields for auth collections; compare only against non-system field names.
+    // (additions/merged below skip .deinit(): this fn runs under applySpecs'
+    // arena, which reclaims them wholesale.)
     var additions: std.ArrayList(schema.Field) = .empty;
     var changed = false;
     for (spec.fields) |sf| {
@@ -505,6 +513,8 @@ fn specFieldByName(c: schema.Collection, name: []const u8) ?schema.Field {
 fn topoOrder(alloc: std.mem.Allocator, specs: []const schema.Collection) std.mem.Allocator.Error![]usize {
     const n = specs.len;
     const visited = try alloc.alloc(u8, n); // 0=unseen 1=on-stack 2=done
+    // No-op under applySpecs' arena; effective for direct callers with a raw
+    // allocator (e.g. the std.testing.allocator leak test).
     defer alloc.free(visited);
     @memset(visited, 0);
     var out: std.ArrayList(usize) = .empty;
