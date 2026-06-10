@@ -64,6 +64,7 @@ test {
     _ = @import("auth.zig");
     _ = @import("id.zig");
     _ = @import("admin.zig");
+    _ = @import("static_files.zig");
     _ = @import("api/error.zig");
     _ = @import("api/health.zig");
     _ = @import("api/collections.zig");
