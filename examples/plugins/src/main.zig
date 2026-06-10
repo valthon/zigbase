@@ -14,6 +14,9 @@
 //!   3. An EXPLICIT MIGRATION via `.migrations` — a `zigbase.Migration` whose
 //!      `up = fn(alloc, io, w: *zigbase.Db) anyerror!void` runs a `w.exec(...)`.
 //!   4. POOL LEVERS via `.pools` — reader/job pool sizes + page-cache budget.
+//!   5. FULLY EMBEDDED STATIC FRONTEND via `embedStaticDir` — the Astro build
+//!      output in `frontend/dist` is compiled into the binary at build time;
+//!      there is no runtime dependency on the frontend directory.
 //!
 //! The whole point: this package compiles against the PUBLISHED `zigbase`
 //! module, proving the documented plugin/schema/migration features are usable
@@ -100,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
                 .type = .base,
                 .fields = .{
                     .{ .name = "name", .type = .text, .required = true },
-                    .{ .name = "email", .type = .email },
+                    .{ .name = "contact_email", .type = .email },
                 },
                 .rules = .{ .list = "", .view = "" },
             },
@@ -121,5 +124,8 @@ pub fn main(init: std.process.Init) !void {
 
         // 4. footprint tuning levers
         .pools = .{ .readers = 4, .jobs = 1, .cache_kib = 512 },
+
+        // 5. fully embedded static frontend (see build.zig embedStaticDir)
+        .static_files = .{ .embedded = &@import("static_assets").files },
     }).runCli(init);
 }

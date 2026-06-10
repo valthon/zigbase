@@ -1,4 +1,5 @@
 const std = @import("std");
+const zigbase_build = @import("zigbase");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -12,6 +13,11 @@ pub fn build(b: *std.Build) void {
     });
     const zigbase = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
     exe_mod.addImport("zigbase", zigbase.module("zigbase"));
+
+    // Embed the built Astro frontend into the binary (fails with a clear message
+    // if frontend/dist is missing — run `npm run build` in frontend/ first).
+    const assets = zigbase_build.embedStaticDir(b, "frontend/dist");
+    exe_mod.addImport("static_assets", assets);
 
     const exe = b.addExecutable(.{ .name = "plugins", .root_module = exe_mod });
     b.installArtifact(exe);

@@ -102,3 +102,37 @@ def test_serve_static_missing_dir_is_fatal():
             env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default"},
         )
         assert proc.wait(timeout=20) != 0
+
+
+import shutil
+
+
+def test_embedded_static_in_plugins_example():
+    if shutil.which("npm") is None:
+        import pytest
+        pytest.skip("npm not available; cannot build the plugins frontend")
+    plugins = REPO / "examples" / "plugins"
+    fe = plugins / "frontend"
+    if not (fe / "dist" / "index.html").exists():
+        subprocess.run(["npm", "install", "--no-audit", "--no-fund"], cwd=fe, check=True)
+        subprocess.run(["npm", "run", "build"], cwd=fe, check=True)
+    subprocess.run(ZIG + ["build"], cwd=plugins, check=True)
+    binary = plugins / "zig-out" / "bin" / "plugins"
+    with tempfile.TemporaryDirectory() as data:
+        port = _free_port()
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--http-port", str(port), "--data-dir", data],
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default"},
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            _wait_up(f"{base}/api/health")
+            st, hdr, body = _get(f"{base}/")
+            assert st == 200 and b"one binary" in body.lower()
+            assert "text/html" in _hdr(hdr, "Content-Type")
+            etag = _hdr(hdr, "ETag")
+            assert etag and etag.startswith('"')
+            st, _, _ = _get(f"{base}/", {"If-None-Match": etag})
+            assert st == 304
+        finally:
+            proc.terminate(); proc.wait(timeout=10)

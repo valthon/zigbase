@@ -34,14 +34,28 @@ code:
    the warm-reader pool, scheduler worker count, and per-connection SQLite
    page-cache budget — i.e. the runtime footprint.
 
+5. **Fully embedded static frontend** via `embedStaticDir`. The Astro + React
+   build output in `frontend/dist` is compiled into the binary at build time via
+   `.static_files = .{ .embedded = &@import("static_assets").files }` — there is
+   no runtime dependency on the `frontend/dist` directory.
+
 ## Build & run
 
 ```sh
 cd examples/plugins
+cd frontend && npm install && npm run build && cd ..
 mise exec zig@0.16.0 -- zig build
 ./zig-out/bin/plugins help
 ./zig-out/bin/plugins serve     # provisions authors/posts + runs the migration
+# open http://127.0.0.1:8090/
 ```
+
+This demonstrates the **embedded** static-files mode: the Astro frontend is
+compiled into the binary by `embedStaticDir` in `build.zig`. Delete
+`frontend/dist` after building — the site still serves from the binary.
+`--serve-static` is rejected as an unknown flag because the mode is
+comptime-hardcoded. The other modes are shown by the blog (runtime flag) and
+golfsim (hardcoded dir) examples.
 
 The fact that this package **compiles against the published `zigbase` module**
 is the proof that the documented plugin / schema / migration / pool features are
