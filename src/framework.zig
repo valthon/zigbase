@@ -9,6 +9,7 @@ const files_storage = @import("files/storage.zig");
 const db = @import("db.zig");
 const crypto = @import("crypto.zig");
 const id_gen = @import("id.zig");
+const scheduler = @import("scheduler.zig");
 
 /// Comptime application builder. `cfg` is an anonymous struct VALUE with optional
 /// `.hooks` (record hook groups) and optional `.onError` (an ErrorHandler).
@@ -19,7 +20,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -45,21 +46,26 @@ pub fn App(comptime cfg: anytype) type {
             break :blk d;
         };
 
+        /// The comptime-assembled cron/interval/reactive job table (empty when no `.cron`).
+        pub const jobs: []const scheduler.RuntimeJob = if (@hasField(@TypeOf(cfg), "cron")) scheduler.buildJobs(cfg.cron) else &.{};
+        /// Worker pool size for the scheduler (defaults to 2 when `.jobs.pool_size` is unset).
+        pub const job_pool_size: usize = if (@hasField(@TypeOf(cfg), "jobs") and @hasField(@TypeOf(cfg.jobs), "pool_size")) cfg.jobs.pool_size else 2;
+
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
         /// wiring this app's `dispatch` into the runtime context for `serve`.
         pub fn runCli(init: std.process.Init) !void {
-            return runCliImpl(init, &dispatch);
+            return runCliImpl(init, &dispatch, jobs, job_pool_size);
         }
 
         /// Start the HTTP server directly with an explicit config (no CLI parsing).
         pub fn run(init: std.process.Init, cfg_runtime: config.Config) !void {
-            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch);
+            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size);
         }
     };
 }
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
-fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch) !void {
+fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize) !void {
     const allocator = init.gpa;
     const arena = init.arena.allocator();
 
@@ -79,7 +85,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch) !void {
         .help => printUsage(),
         .serve => |sa| {
             const cfg = try loadCfg(sa);
-            try serveImpl(allocator, init.io, cfg, dispatch);
+            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size);
         },
         .migrate => |sa| try migrateImpl(allocator, init.io, sa),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, sa),
@@ -115,7 +121,7 @@ fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !voi
     std.log.info("migrations applied", .{});
 }
 
-fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispatch: *const events.Dispatch) !void {
+fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize) !void {
     if (std.mem.eql(u8, cfg.jwt_secret, "dev-insecure-secret-change-me")) {
         if (cfg.cookie_secure) {
             std.log.err("refusing to start: ZIGBASE_JWT_SECRET is unset/default while cookie_secure is enabled; set a strong secret", .{});
@@ -166,6 +172,15 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
     var srv = server.Server{ .app = &app, .host = host_z, .port = cfg.http_port };
+    // Start the scheduler only when jobs are configured. Registered LAST among the teardown
+    // defers, so (LIFO) its stop()+deinit() runs FIRST on return — joining worker threads
+    // before pool.deinit()/local_storage go out of scope, since workers touch app.pool/storage.
+    var sched: ?scheduler.Scheduler = if (jobs.len > 0) try scheduler.Scheduler.init(allocator, &app, jobs, pool_size) else null;
+    if (sched) |*s| try s.start();
+    defer if (sched) |*s| {
+        s.stop();
+        s.deinit();
+    };
     try srv.listen();
 }
 
@@ -241,4 +256,21 @@ test "App(.{}) has no routes and null lifecycle/auth/file handlers" {
     try std.testing.expectEqual(@as(usize, 0), A.dispatch.routes.len);
     try std.testing.expect(A.dispatch.on_auth == null);
     try std.testing.expect(A.dispatch.on_bootstrap == null);
+}
+
+test "App(cfg) exposes the comptime job table and pool size" {
+    const H = struct {
+        fn j(ev: *@import("events.zig").JobEvent) anyerror!void {
+            _ = ev;
+        }
+    };
+    const A = App(.{
+        .jobs = .{ .pool_size = 3 },
+        .cron = .{.{ .name = "n", .schedule = @import("schedule.zig").Schedule{ .interval = .hourly }, .handler = H.j }},
+    });
+    try std.testing.expectEqual(@as(usize, 1), A.jobs.len);
+    try std.testing.expectEqual(@as(usize, 3), A.job_pool_size);
+    const B = App(.{});
+    try std.testing.expectEqual(@as(usize, 0), B.jobs.len);
+    try std.testing.expectEqual(@as(usize, 2), B.job_pool_size); // default pool size
 }

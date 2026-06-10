@@ -23,4 +23,16 @@ pub const App = struct {
     scheduler: ?*anyopaque = null,
     /// Submit an ad-hoc job task for async execution; set by Scheduler.start. Task 5 wires App.submit().
     submit_fn: ?*const fn (ctx: *anyopaque, name: []const u8, task: @import("events.zig").JobTask) anyerror!void = null,
+
+    /// Offload an ad-hoc background task onto the scheduler (runs off the request thread).
+    /// Returns error.SchedulerUnavailable if no scheduler is running (CLI/tests/no jobs configured).
+    ///
+    /// LIMITATION (v0.1): ad-hoc submitted tasks currently run on a DETACHED thread that is
+    /// NOT joined at shutdown. A task submitted near shutdown may outlive the Scheduler's
+    /// stop()/deinit() and must not assume `app` (or its pool/storage) outlives it
+    /// indefinitely. Cron/interval jobs, by contrast, use the bounded, cleanly-joined worker pool.
+    pub fn submit(self: *App, name: []const u8, task: @import("events.zig").JobTask) !void {
+        const f = self.submit_fn orelse return error.SchedulerUnavailable;
+        return f(self.scheduler.?, name, task);
+    }
 };
