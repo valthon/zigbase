@@ -67,12 +67,14 @@ pub const DefaultMailerPlugin = struct {
         _ = gpa;
         _ = io;
         if (cfg.smtp_host.len == 0) return .{};
-        return .{ .smtp_backend = mail.SmtpMailer.init(
+        return .{ .smtp_backend = mail.SmtpMailer.initTls(
             cfg.smtp_host,
             cfg.smtp_port,
             cfg.smtp_username,
             cfg.smtp_password,
             cfg.smtp_from,
+            cfg.smtp_tls,
+            cfg.smtp_insecure_skip_verify,
         ) };
     }
 
