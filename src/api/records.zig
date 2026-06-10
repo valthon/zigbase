@@ -166,7 +166,10 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         var r = try app.pool.acquireReader();
         defer app.pool.releaseReader(&r);
         const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-        const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, raw, ctx.files, null) catch |e| switch (e) {
+        // Multipart values are verbatim strings; make them behave like a JSON client.
+        // JSON bodies (form_fields == null) are never coerced.
+        const coerced = if (ctx.form_fields != null) try records.coerceFormFields(ctx.allocator, col, raw) else raw;
+        const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, coerced, ctx.files, null) catch |e| switch (e) {
             error.TooLarge => return (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator),
             error.TooMany => return ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator),
             error.BadMimeType => return ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator),
@@ -226,7 +229,10 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const existing = (try records.get(ctx.allocator, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
 
-    const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, raw, ctx.files, existing) catch |e| switch (e) {
+    // Multipart values are verbatim strings; make them behave like a JSON client.
+    // JSON bodies (form_fields == null) are never coerced.
+    const coerced = if (ctx.form_fields != null) try records.coerceFormFields(ctx.allocator, col, raw) else raw;
+    const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, coerced, ctx.files, existing) catch |e| switch (e) {
         error.TooLarge => return (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator),
         error.TooMany => return ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator),
         error.BadMimeType => return ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator),
@@ -593,6 +599,189 @@ test "creating an auth record hashes the password, hides secrets, forces verifie
     try std.testing.expect(std.mem.indexOf(u8, res.body, "tokenKey") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "password") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"verified\":false") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Multipart-input handler tests (TDD). ctx.form_fields non-null == multipart;
+// the handlers must coerce those string values by schema BEFORE validation,
+// and must NEVER coerce JSON bodies.
+// ---------------------------------------------------------------------------
+
+fn seedTyped(env: *TestEnv, name: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    _ = try collections.create(a, std.testing.io, w, .{
+        .id = "", .name = name,
+        .fields = &[_]schema.Field{
+            .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+            .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
+            .{ .id = "f3", .name = "ratio", .options = .{ .number = .{ .mode = .float } } },
+            .{ .id = "f4", .name = "flag", .options = .{ .@"bool" = .{} } },
+            .{ .id = "f5", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 3 } } },
+            .{ .id = "f6", .name = "photos", .options = .{ .file = .{ .maxSelect = 3 } } },
+        },
+        .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+    });
+}
+
+fn formCtx(env: *TestEnv, a: std.mem.Allocator, m: http.Method, fields: std.json.ObjectMap, files: []const http.UploadedFile, params: []const http.Param) http.RequestCtx {
+    return .{
+        .method = m, .path = "/", .body = "", .allocator = a, .app = &env.app, .params = params,
+        .content_type = "multipart/form-data; boundary=x",
+        .form_fields = .{ .object = fields },
+        .files = files,
+    };
+}
+
+test "multipart create: schema coercion (bool/float/multi-select) + verbatim text/fixed" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedTyped(env, "mp_things");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = [_]http.Param{.{ .key = "col", .value = "mp_things" }};
+    var ff: std.json.ObjectMap = .empty;
+    try ff.put(a, "title", .{ .string = "true" }); // scalar-looking text stays text
+    try ff.put(a, "price", .{ .string = "45.00" });
+    try ff.put(a, "ratio", .{ .string = "2.50" });
+    try ff.put(a, "flag", .{ .string = "true" });
+    try ff.put(a, "tags", .{ .string = "[\"x\",\"y\"]" });
+    var ctx = formCtx(env, a, .POST, ff, &.{}, &p);
+    const res = try create(&ctx);
+    try std.testing.expectEqual(@as(u16, 201), res.status);
+    const rec = (try std.json.parseFromSlice(std.json.Value, a, res.body, .{})).value.object;
+    try std.testing.expectEqualStrings("true", rec.get("title").?.string);
+    try std.testing.expectEqualStrings("45.00", rec.get("price").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), rec.get("ratio").?.float, 0.0001);
+    try std.testing.expectEqual(true, rec.get("flag").?.bool);
+    try std.testing.expectEqual(@as(usize, 2), rec.get("tags").?.array.items.len);
+}
+
+test "multipart create: file part + fixed-mode decimal in the same request (original repro)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedTyped(env, "mp_files");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = [_]http.Param{.{ .key = "col", .value = "mp_files" }};
+    var ff: std.json.ObjectMap = .empty;
+    try ff.put(a, "title", .{ .string = "b" });
+    try ff.put(a, "price", .{ .string = "45.00" });
+    const ups = [_]http.UploadedFile{.{ .field = "photos", .filename = "x.jpg", .mimetype = "image/jpeg", .bytes = "\xff\xd8\xff\xe0data" }};
+    var ctx = formCtx(env, a, .POST, ff, &ups, &p);
+    const res = try create(&ctx);
+    try std.testing.expectEqual(@as(u16, 201), res.status);
+    const rec = (try std.json.parseFromSlice(std.json.Value, a, res.body, .{})).value.object;
+    try std.testing.expectEqualStrings("b", rec.get("title").?.string);
+    try std.testing.expectEqualStrings("45.00", rec.get("price").?.string);
+    const photos = rec.get("photos").?.array;
+    try std.testing.expectEqual(@as(usize, 1), photos.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, photos.items[0].string, ".jpg"));
+}
+
+test "multipart update: coercion + removal-key passthrough removes the file" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedTyped(env, "mp_upd");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = [_]http.Param{.{ .key = "col", .value = "mp_upd" }};
+
+    var cff: std.json.ObjectMap = .empty;
+    try cff.put(a, "flag", .{ .string = "true" });
+    const ups = [_]http.UploadedFile{.{ .field = "photos", .filename = "x.jpg", .mimetype = "image/jpeg", .bytes = "\xff\xd8\xff\xe0data" }};
+    var cctx = formCtx(env, a, .POST, cff, &ups, &p);
+    const cres = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 201), cres.status);
+    const crec = (try std.json.parseFromSlice(std.json.Value, a, cres.body, .{})).value.object;
+    const rid = crec.get("id").?.string;
+    const stored = crec.get("photos").?.array.items[0].string;
+
+    var uff: std.json.ObjectMap = .empty;
+    try uff.put(a, "flag", .{ .string = "false" });
+    const minus = try std.fmt.allocPrint(a, "[\"{s}\"]", .{stored});
+    try uff.put(a, "photos-", .{ .string = minus });
+    const up = [_]http.Param{ .{ .key = "col", .value = "mp_upd" }, .{ .key = "id", .value = rid } };
+    var uctx = formCtx(env, a, .PATCH, uff, &.{}, &up);
+    const ures = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 200), ures.status);
+    const urec = (try std.json.parseFromSlice(std.json.Value, a, ures.body, .{})).value.object;
+    try std.testing.expectEqual(false, urec.get("flag").?.bool);
+    try std.testing.expectEqual(@as(usize, 0), urec.get("photos").?.array.items.len);
+}
+
+test "JSON bodies are NEVER coerced: a string for a bool/float field stays a 400" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedTyped(env, "mp_json");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = [_]http.Param{.{ .key = "col", .value = "mp_json" }};
+    var c1 = ctxFor(env, a, .POST, "{\"flag\":\"true\"}", &p);
+    const r1 = try create(&c1);
+    try std.testing.expectEqual(@as(u16, 400), r1.status);
+    try std.testing.expect(std.mem.indexOf(u8, r1.body, "\"flag\"") != null);
+    var c2 = ctxFor(env, a, .POST, "{\"ratio\":\"2.50\"}", &p);
+    try std.testing.expectEqual(@as(u16, 400), (try create(&c2)).status);
+}
+
+test "multipart auth signup still works (password keys pass through untouched)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedAuth(env, "mp_users", "");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = [_]http.Param{.{ .key = "col", .value = "mp_users" }};
+    var ff: std.json.ObjectMap = .empty;
+    try ff.put(a, "email", .{ .string = "mp@x.io" });
+    try ff.put(a, "password", .{ .string = "longenough" });
+    try ff.put(a, "passwordConfirm", .{ .string = "longenough" });
+    var ctx = formCtx(env, a, .POST, ff, &.{}, &p);
+    const res = try create(&ctx);
+    try std.testing.expectEqual(@as(u16, 201), res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "mp@x.io") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "password") == null);
+}
+
+test "validation error is attributed to the offending field, not the first (Bug 2)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedTyped(env, "mp_attr");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = [_]http.Param{.{ .key = "col", .value = "mp_attr" }};
+
+    // multipart: title/ratio/flag valid, price invalid -> the error must name "price"
+    var ff: std.json.ObjectMap = .empty;
+    try ff.put(a, "title", .{ .string = "ok" });
+    try ff.put(a, "ratio", .{ .string = "1.5" });
+    try ff.put(a, "flag", .{ .string = "true" });
+    try ff.put(a, "price", .{ .string = "abc" });
+    var mctx = formCtx(env, a, .POST, ff, &.{}, &p);
+    const mres = try create(&mctx);
+    try std.testing.expectEqual(@as(u16, 400), mres.status);
+    const mdata = (try std.json.parseFromSlice(std.json.Value, a, mres.body, .{})).value.object.get("data").?.object;
+    try std.testing.expect(mdata.get("price") != null);
+    try std.testing.expect(mdata.get("title") == null);
+    try std.testing.expect(mdata.get("ratio") == null);
+    try std.testing.expect(mdata.get("flag") == null);
+
+    // JSON: same shape, same attribution
+    var jctx = ctxFor(env, a, .POST, "{\"title\":\"ok\",\"ratio\":1.5,\"flag\":true,\"price\":\"abc\"}", &p);
+    const jres = try create(&jctx);
+    try std.testing.expectEqual(@as(u16, 400), jres.status);
+    const jdata = (try std.json.parseFromSlice(std.json.Value, a, jres.body, .{})).value.object.get("data").?.object;
+    try std.testing.expect(jdata.get("price") != null);
+    try std.testing.expect(jdata.get("title") == null);
 }
 
 test "creating an auth record without a password is a 400" {

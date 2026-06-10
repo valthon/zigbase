@@ -170,6 +170,194 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
     }
 }
 
+/// Schema-aware coercion of multipart form fields, applied ONLY to multipart
+/// input (never JSON bodies), BEFORE validation. Multipart values arrive as
+/// verbatim strings (see src/files/multipart.zig); this makes them look like a
+/// well-formed JSON client per the collection schema:
+///   bool          "true"/"false" -> JSON bool (else left for normal validation)
+///   number float  parseable, finite -> JSON float (else left as a string)
+///   number int/fixed                   kept as a string (the accepted form)
+///   select/relation (multi)  JSON-array string -> array (the admin UI sends
+///                            JSON.stringify(array)); else left as-is
+///   json          any parseable JSON -> the parsed value; else the raw string
+///   everything else (text/email/url/editor/date/single select/relation/file)
+///                 kept verbatim
+/// Keys that match no schema field ("<field>-" removal keys, auth
+/// password/passwordConfirm) and non-string values pass through untouched.
+/// Allocates into `alloc` (the request arena).
+pub fn coerceFormFields(alloc: std.mem.Allocator, col: schema.Collection, data: std.json.Value) std.mem.Allocator.Error!std.json.Value {
+    if (data != .object) return data;
+    var out: std.json.ObjectMap = .empty;
+    var it = data.object.iterator();
+    while (it.next()) |e| {
+        try out.put(alloc, e.key_ptr.*, coerceFieldValue(alloc, col, e.key_ptr.*, e.value_ptr.*));
+    }
+    return .{ .object = out };
+}
+
+fn coerceFieldValue(alloc: std.mem.Allocator, col: schema.Collection, key: []const u8, v: std.json.Value) std.json.Value {
+    const f = schema.fieldByName(col, key) orelse return v;
+    if (v != .string) return v;
+    const s = v.string;
+    switch (f.options) {
+        .@"bool" => {
+            if (std.mem.eql(u8, s, "true")) return .{ .bool = true };
+            if (std.mem.eql(u8, s, "false")) return .{ .bool = false };
+            return v;
+        },
+        .number => |o| {
+            if (o.mode != .float) return v; // int/fixed: strings are the accepted JSON form
+            const x = std.fmt.parseFloat(f64, s) catch return v;
+            if (!std.math.isFinite(x)) return v; // JSON can't carry nan/inf; let validation reject
+            return .{ .float = x };
+        },
+        .json => {
+            // Leaked into the arena deliberately (the codebase-wide pattern for parse trees).
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return v;
+            return parsed.value;
+        },
+        .select, .relation => {
+            if (!f.isMultiValue()) return v;
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return v;
+            return if (parsed.value == .array) parsed.value else v;
+        },
+        else => return v,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multipart coercion tests (TDD: written before coerceFormFields exists).
+// Multipart values are all strings; coercion makes them look like a
+// well-formed JSON client per the collection schema, BEFORE validation.
+// ---------------------------------------------------------------------------
+
+fn coerceCol() schema.Collection {
+    const S = struct {
+        const fields = [_]schema.Field{
+            .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+            .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
+            .{ .id = "f3", .name = "ratio", .options = .{ .number = .{ .mode = .float } } },
+            .{ .id = "f4", .name = "qty", .options = .{ .number = .{ .mode = .int } } },
+            .{ .id = "f5", .name = "flag", .options = .{ .@"bool" = .{} } },
+            .{ .id = "f6", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 3 } } },
+            .{ .id = "f7", .name = "status", .options = .{ .select = .{ .values = &.{ "a", "b" }, .maxSelect = 1 } } },
+            .{ .id = "f8", .name = "meta", .options = .{ .json = .{} } },
+            .{ .id = "f9", .name = "photos", .options = .{ .file = .{ .maxSelect = 3 } } },
+        };
+    };
+    return .{ .id = "c", .name = "things", .fields = &S.fields };
+}
+
+fn coerceOneField(a: std.mem.Allocator, key: []const u8, s: []const u8) !std.json.Value {
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, key, .{ .string = s });
+    const out = try coerceFormFields(a, coerceCol(), .{ .object = data });
+    return out.object.get(key).?;
+}
+
+test "coerce: text keeps scalar-looking strings verbatim" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "123", "true", "false", "b", "007", "+15551234" }) |s| {
+        const v = try coerceOneField(a, "title", s);
+        try std.testing.expect(v == .string);
+        try std.testing.expectEqualStrings(s, v.string);
+    }
+}
+
+test "coerce: bool 'true'/'false' become JSON bools; anything else is left alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(true, (try coerceOneField(a, "flag", "true")).bool);
+    try std.testing.expectEqual(false, (try coerceOneField(a, "flag", "false")).bool);
+    const odd = try coerceOneField(a, "flag", "yes");
+    try std.testing.expect(odd == .string);
+}
+
+test "coerce: float mode parses to a JSON float; unparseable/non-finite stays string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try coerceOneField(a, "ratio", "45.00");
+    try std.testing.expectApproxEqAbs(@as(f64, 45.0), v.float, 0.0001);
+    try std.testing.expect((try coerceOneField(a, "ratio", "abc")) == .string);
+    try std.testing.expect((try coerceOneField(a, "ratio", "nan")) == .string);
+    try std.testing.expect((try coerceOneField(a, "ratio", "inf")) == .string);
+}
+
+test "coerce: int/fixed number modes keep the decimal string (the accepted JSON form)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try coerceOneField(a, "price", "45.00");
+    try std.testing.expectEqualStrings("45.00", p.string);
+    const q = try coerceOneField(a, "qty", "42");
+    try std.testing.expectEqualStrings("42", q.string);
+}
+
+test "coerce: multi-select JSON-array string becomes an array; single select stays a string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try coerceOneField(a, "tags", "[\"x\",\"y\"]");
+    try std.testing.expect(v == .array);
+    try std.testing.expectEqual(@as(usize, 2), v.array.items.len);
+    try std.testing.expectEqualStrings("x", v.array.items[0].string);
+    // non-array JSON ("true") and plain strings are left alone for multi-select
+    try std.testing.expect((try coerceOneField(a, "tags", "true")) == .string);
+    try std.testing.expect((try coerceOneField(a, "tags", "x")) == .string);
+    // single-valued select: a JSON-looking string is the literal value
+    const sv = try coerceOneField(a, "status", "[\"a\"]");
+    try std.testing.expect(sv == .string);
+}
+
+test "coerce: json field parses any valid JSON; invalid stays string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const obj = try coerceOneField(a, "meta", "{\"a\":1}");
+    try std.testing.expect(obj == .object);
+    try std.testing.expectEqual(@as(i64, 1), obj.object.get("a").?.integer);
+    try std.testing.expectEqual(true, (try coerceOneField(a, "meta", "true")).bool);
+    try std.testing.expect((try coerceOneField(a, "meta", "not json")) == .string);
+}
+
+test "coerce: non-schema keys (removal/auth) and non-string values pass through untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "photos-", .{ .string = "[\"old.jpg\"]" });
+    try data.put(a, "password", .{ .string = "true" });
+    try data.put(a, "passwordConfirm", .{ .string = "true" });
+    var arr = std.json.Array.init(a);
+    try arr.append(.{ .string = "x" });
+    try data.put(a, "tags", .{ .array = arr });
+    const out = try coerceFormFields(a, coerceCol(), .{ .object = data });
+    try std.testing.expectEqualStrings("[\"old.jpg\"]", out.object.get("photos-").?.string);
+    try std.testing.expectEqualStrings("true", out.object.get("password").?.string);
+    try std.testing.expectEqualStrings("true", out.object.get("passwordConfirm").?.string);
+    try std.testing.expect(out.object.get("tags").? == .array);
+}
+
+test "coerce: file field values are untouched (the file plan owns them)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try coerceOneField(a, "photos", "[\"a.jpg\"]");
+    try std.testing.expect(v == .string);
+}
+
+test "coerce: non-object data is returned as-is" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const out = try coerceFormFields(a, coerceCol(), .{ .string = "nope" });
+    try std.testing.expect(out == .string);
+}
+
 pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value) RecordError!std.json.Value {
     return createImpl(alloc, io, w, col, data, null);
 }
