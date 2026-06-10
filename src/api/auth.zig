@@ -29,6 +29,29 @@ fn strField(obj: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
+/// Wall-clock seconds (no DB connection needed) for the rate limiter, mirroring
+/// scheduler.unixNow — used at the top of the gated endpoints before any conn exists.
+fn wallNowUnix(io: std.Io) i64 {
+    const ts = std.Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+}
+
+/// Rate-limit gate for a sensitive auth endpoint. Returns a 429 Response when the
+/// limiter denies the request, else null (proceed). `scope` is the endpoint tag
+/// ("login"/"reset"/"verify"). The key is the client IP when known, else falls back
+/// to the submitted identity/email so the limiter still functions without a proxy IP.
+/// No-op (null) when no limiter is wired (rate_limit_max == 0 / tests).
+fn rateLimited(ctx: *http.RequestCtx, scope: []const u8, ident: []const u8) !?http.Response {
+    const app = ctx.app.?;
+    const limiter = app.rate_limiter orelse return null;
+    const key = if (ctx.remote_ip.len > 0)
+        try std.fmt.allocPrint(ctx.allocator, "{s}:ip:{s}", .{ scope, ctx.remote_ip })
+    else
+        try std.fmt.allocPrint(ctx.allocator, "{s}:ident:{s}", .{ scope, ident });
+    if (limiter.allow(key, wallNowUnix(app.io))) return null;
+    return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator);
+}
+
 pub fn nowUnix(conn: *db.Db) db.DbError!i64 {
     var st = try conn.prepare("SELECT unixepoch('now');");
     defer st.finalize();
@@ -107,6 +130,9 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
     const identity = strField(body, "identity") orelse return ApiError.badRequest("identity is required.").toResponse(ctx.allocator);
     const password = strField(body, "password") orelse return ApiError.badRequest("password is required.").toResponse(ctx.allocator);
+
+    // Rate-limit gate (brute-force defense): per client IP, falling back to identity.
+    if (try rateLimited(ctx, "login", identity)) |resp| return resp;
 
     // Login is read-only (identity lookup, password hash, tokenKey, unixepoch; issue() only
     // reads + signs). Use a READER so the expensive argon2 verify below does NOT run while
@@ -231,6 +257,10 @@ fn verifyTyped(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, toke
 
 pub fn requestVerification(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
+    // Rate-limit gate (email-bombing defense): per client IP, falling back to the
+    // submitted email. Gated BEFORE the writer lock so a limited request never holds it.
+    const rl_email = if (parseBody(ctx)) |b| (strField(b, "email") orelse "") else "";
+    if (try rateLimited(ctx, "verify", rl_email)) |resp| return resp;
     // Strings are arena-allocated (ctx.allocator), so they outlive the scoped
     // writer block below and remain valid for the post-lock SMTP send.
     var pending: ?struct { email: []const u8, mail_body: []const u8 } = null;
@@ -275,6 +305,10 @@ pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
 
 pub fn requestPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
+    // Rate-limit gate (email-bombing defense): per client IP, falling back to the
+    // submitted email. Gated BEFORE the writer lock so a limited request never holds it.
+    const rl_email = if (parseBody(ctx)) |b| (strField(b, "email") orelse "") else "";
+    if (try rateLimited(ctx, "reset", rl_email)) |resp| return resp;
     // Strings are arena-allocated (ctx.allocator), so they outlive the scoped
     // writer block below and remain valid for the post-lock SMTP send.
     var pending: ?struct { email: []const u8, mail_body: []const u8 } = null;

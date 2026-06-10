@@ -77,6 +77,24 @@ fn methodFromZap(r: zap.Request) http.Method {
     };
 }
 
+/// Best-effort client IP from reverse-proxy headers, for rate-limit keying.
+/// Prefers the first hop of `X-Forwarded-For` (the original client), then
+/// `X-Real-IP`. Returns "" when neither header is present (direct connection /
+/// no proxy); the limiter then falls back to keying on the submitted identity.
+fn clientIp(r: zap.Request) []const u8 {
+    if (r.getHeader("x-forwarded-for")) |xff| {
+        // "client, proxy1, proxy2" — take the first, trimmed.
+        const first = if (std.mem.indexOfScalar(u8, xff, ',')) |c| xff[0..c] else xff;
+        const trimmed = std.mem.trim(u8, first, " \t");
+        if (trimmed.len > 0) return trimmed;
+    }
+    if (r.getHeader("x-real-ip")) |xri| {
+        const trimmed = std.mem.trim(u8, xri, " \t");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return "";
+}
+
 fn setZapStatus(r: zap.Request, status: u16) void {
     const code: zap.http.StatusCode = switch (status) {
         200 => .ok,
@@ -87,6 +105,7 @@ fn setZapStatus(r: zap.Request, status: u16) void {
         404 => .not_found,
         409 => .conflict,
         422 => .unprocessable_content,
+        429 => .too_many_requests,
         else => .internal_server_error,
     };
     r.setStatus(code);
@@ -156,6 +175,10 @@ fn onRequest(r: zap.Request) !void {
     ctx.cookie_header = r.getHeader("cookie") orelse "";
     ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
     ctx.content_type = r.getHeader("content-type") orelse "";
+    // Best-effort client IP for rate limiting. zap (0.10.6) exposes no peer-address
+    // accessor on Request, so we trust the reverse-proxy hop headers: the FIRST hop in
+    // X-Forwarded-For (the original client), else X-Real-IP. "" when neither is present.
+    ctx.remote_ip = clientIp(r);
     if (std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) {
         if (files_multipart.extract(r, arena.allocator())) |ex| {
             ctx.form_fields = ex.form_fields;

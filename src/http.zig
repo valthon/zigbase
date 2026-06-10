@@ -19,6 +19,10 @@ pub const RequestCtx = struct {
     authorization: []const u8 = "",
     cookie_header: []const u8 = "",
     csrf_token: []const u8 = "", // X-CSRF-Token header value
+    /// Best-effort client IP for rate limiting (filled by server.zig from
+    /// X-Forwarded-For / X-Real-IP). "" when unknown (no proxy header); the
+    /// limiter then falls back to keying on the submitted identity.
+    remote_ip: []const u8 = "",
     /// Request content-type (filled by server.zig). Multipart bodies populate form_fields/files.
     content_type: []const u8 = "",
     form_fields: ?std.json.Value = null,

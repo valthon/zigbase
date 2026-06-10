@@ -1,5 +1,6 @@
 const std = @import("std");
 const db = @import("db.zig");
+const ratelimit = @import("ratelimit.zig");
 
 /// Shared request-handling state. `io` supplies entropy for id generation;
 /// `pool` is the SQLite connection pool. Config/auth are added in later sub-projects.
@@ -23,6 +24,9 @@ pub const App = struct {
     mailer: ?*const @import("mail/mailer.zig").Mailer = null,
     /// Type-erased event dispatch built by the comptime App(cfg) builder; null = no subscribers.
     dispatch: ?*const @import("events.zig").Dispatch = null,
+    /// In-memory rate limiter for sensitive auth endpoints; null = disabled
+    /// (rate_limit_max == 0, or tests/CLI that don't wire it). Set in serveImpl.
+    rate_limiter: ?*ratelimit.RateLimiter = null,
     /// Type-erased pointer to the running Scheduler (set by Scheduler.start); null = not running.
     scheduler: ?*anyopaque = null,
     /// Submit an ad-hoc job task for async execution; set by Scheduler.start. Task 5 wires App.submit().

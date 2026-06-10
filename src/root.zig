@@ -20,6 +20,7 @@ pub const RouteEvent = events.RouteEvent;
 test {
     _ = @import("app.zig");
     _ = @import("config.zig");
+    _ = @import("ratelimit.zig");
     _ = @import("cli.zig");
     _ = @import("db.zig");
     _ = @import("http.zig");

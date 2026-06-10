@@ -23,6 +23,13 @@ pub const Config = struct {
     file_token_ttl_s: i64 = 120, // short-lived file-access token
     sentry_dsn: []const u8 = "", // "" = log errors to stderr; set to enable Sentry reporting
 
+    // In-memory rate limiting for sensitive auth endpoints (login / password-reset /
+    // email-verification). Fixed window: at most `rate_limit_max` requests per client
+    // key per `rate_limit_window_s` seconds. `rate_limit_max = 0` disables it entirely.
+    // Default 10/60s is well above a single interactive login (Playwright suite stays green).
+    rate_limit_max: u32 = 10, // attempts per window per key; 0 = disabled
+    rate_limit_window_s: i64 = 60, // window length in seconds
+
     // SMTP / mailer. When smtp_host is empty (default), the default mailer plugin
     // resolves to LogMailer (logs verify/reset emails — pre-mailer dev/CI behavior).
     // Set smtp_host to upgrade to a real SMTP client with NO code change.
@@ -61,6 +68,8 @@ pub const Config = struct {
         if (getter("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
         if (getter("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
+        if (getter("ZIGBASE_RATE_LIMIT_MAX")) |v| cfg.rate_limit_max = try std.fmt.parseInt(u32, v, 10);
+        if (getter("ZIGBASE_RATE_LIMIT_WINDOW")) |v| cfg.rate_limit_window_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_SMTP_HOST")) |v| cfg.smtp_host = v;
         if (getter("ZIGBASE_SMTP_PORT")) |v| cfg.smtp_port = try std.fmt.parseInt(u16, v, 10);
         if (getter("ZIGBASE_SMTP_USERNAME")) |v| cfg.smtp_username = v;
@@ -167,6 +176,26 @@ test "smtp tls env overrides" {
     const d = try Config.load(&G0.get);
     try std.testing.expectEqual(SmtpTls.auto, d.smtp_tls);
     try std.testing.expectEqual(false, d.smtp_insecure_skip_verify);
+}
+
+test "rate limit defaults and overrides" {
+    const G0 = struct {
+        fn get(_: []const u8) ?[]const u8 { return null; }
+    };
+    const d = try Config.load(&G0.get);
+    try std.testing.expectEqual(@as(u32, 10), d.rate_limit_max);
+    try std.testing.expectEqual(@as(i64, 60), d.rate_limit_window_s);
+
+    const G1 = struct {
+        fn get(key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_RATE_LIMIT_MAX")) return "0";
+            if (std.mem.eql(u8, key, "ZIGBASE_RATE_LIMIT_WINDOW")) return "120";
+            return null;
+        }
+    };
+    const c = try Config.load(&G1.get);
+    try std.testing.expectEqual(@as(u32, 0), c.rate_limit_max);
+    try std.testing.expectEqual(@as(i64, 120), c.rate_limit_window_s);
 }
 
 test "realtime origins default empty, overridable" {

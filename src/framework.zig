@@ -13,6 +13,7 @@ const scheduler = @import("scheduler.zig");
 const mail = @import("mail/mailer.zig");
 const provision = @import("provision.zig");
 const schema = @import("schema.zig");
+const ratelimit = @import("ratelimit.zig");
 
 // ============================================================================
 // Comptime plugins (storage + mailer)
@@ -428,6 +429,11 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
     defer mailer_inst.deinit();
     const mailer_iface = mailer_inst.interface();
 
+    // In-memory rate limiter for sensitive auth endpoints. A serveImpl stack var that
+    // outlives the server (like storage/mailer); skipped entirely when disabled.
+    var rate_limiter = ratelimit.RateLimiter.init(allocator, cfg.rate_limit_max, cfg.rate_limit_window_s);
+    defer rate_limiter.deinit();
+
     var app = app_mod.App{
         .allocator = allocator,
         .io = io,
@@ -444,6 +450,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
         .storage = &storage_iface,
         .mailer = &mailer_iface,
         .dispatch = dispatch,
+        .rate_limiter = if (cfg.rate_limit_max == 0) null else &rate_limiter,
     };
     if (dispatch.on_bootstrap) |h| {
         var ev = events.LifecycleEvent{ .app = &app };
