@@ -392,6 +392,9 @@ name** — provisioning resolves it to the target's id (no need to capture ids a
 you would over the REST API). Mistakes are caught at compile time: an unknown
 field type, a `select` without `.values`, a `fixed` number without a valid
 `.scale = 1..8`, or a relation without `.target` is a **compile error**.
+Field names reserved by the engine (`id`, `created`, `updated`, `email`,
+`username`, `passwordHash`, `tokenKey`, `verified`) are also rejected at compile
+time with a clear error message.
 
 ### Startup provisioning + additive auto-migration
 

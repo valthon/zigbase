@@ -6,6 +6,19 @@ All notable changes to ZigBase are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- **Provisioning no longer leaks at shutdown:** `applySpecs` and `runMigrations`
+  now wrap all internal allocations in a short-lived arena (backed by the
+  caller's allocator), so intermediate allocations from `topoOrder`,
+  `collections.create` / `ddl.quoteIdent`, `schema.indexesToJson`, and the
+  `prov:` migration-name string are all freed before the call returns. The
+  long-lived gpa accumulates nothing during startup provisioning.
+- **Reserved field names in comptime `.collections` are rejected at compile
+  time:** declaring a field whose name is reserved by the engine (`id`,
+  `created`, `updated`, `email`, `username`, `passwordHash`, `tokenKey`,
+  `verified`) now produces a clear `@compileError` at build time rather than an
+  opaque validation failure at startup.
+
 ### Added
 - **Static file serving:** root-path fallback with four comptime modes — runtime
   `--serve-static <dir>` flag (default), `.disabled`, comptime-hardcoded `.dir`, or
