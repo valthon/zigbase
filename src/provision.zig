@@ -1,0 +1,715 @@
+//! Comptime collection definitions + startup provisioning.
+//!
+//! Developers describe their schema IN ZIG at comptime via `Schema(.{ ... })`,
+//! and ZigBase provisions it at startup: creating not-yet-existing collections,
+//! resolving relation targets BY NAME, and applying safe ADDITIVE auto-migration
+//! (new columns). Destructive changes (type change / column drop) are detected,
+//! logged, and SKIPPED — never silently applied. An explicit-migration escape
+//! hatch (`.migrations`) covers the rest.
+//!
+//! The comptime `.collections` literal is lowered to a `[]const schema.Collection`
+//! by `buildCollections`, validated where possible at comptime via `@compileError`
+//! (unknown field type, bad option, missing relation target name). The runtime
+//! provisioner (`applySchema`) then diffs each spec against the live `_collections`
+//! and applies the minimal safe change set. Running it twice is a clean no-op.
+
+const std = @import("std");
+const schema = @import("schema.zig");
+const collections = @import("collections.zig");
+const db = @import("db.zig");
+
+// ---------------------------------------------------------------------------
+// Comptime builder: a `.collections` literal -> []const schema.Collection
+// ---------------------------------------------------------------------------
+
+/// A comptime relation field stores its target collection BY NAME in
+/// `targetCollectionId`. `applySchema` resolves the name -> the target
+/// collection's id at provisioning time (after the target exists).
+///
+/// `buildCollections` accepts a comptime struct literal of the shape:
+///
+///     .{
+///         .users = .{ .type = .auth, .fields = .{
+///             .{ .name = "display_name", .type = .text },
+///         }, .rules = .{ .list = "", .view = "" } },
+///         .listings = .{ .fields = .{
+///             .{ .name = "title", .type = .text, .required = true },
+///             .{ .name = "price", .type = .number, .mode = .fixed, .scale = 2 },
+///             .{ .name = "owner", .type = .relation, .target = "users" },
+///             .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
+///         }, .rules = .{ .list = "status = \"published\"" } },
+///     }
+///
+/// Each top-level field name is a collection name; its value carries
+/// `.type` (default `.base`), `.fields` (a tuple of field literals), and an
+/// optional `.rules = .{ .list, .view, .create, .update, .delete }`.
+pub fn buildCollections(comptime cfg: anytype) []const schema.Collection {
+    comptime {
+        const Cfg = @TypeOf(cfg);
+        const info = @typeInfo(Cfg);
+        if (info != .@"struct") @compileError("collections config must be a struct literal");
+        const cols_fields = info.@"struct".fields;
+        var out: [cols_fields.len]schema.Collection = undefined;
+        for (cols_fields, 0..) |cf, ci| {
+            out[ci] = buildCollection(cf.name, @field(cfg, cf.name));
+        }
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Collection {
+    comptime {
+        if (!schema.isValidIdentifier(name))
+            @compileError("collection name '" ++ name ++ "' must be a valid identifier (letter, then letters/digits/underscore)");
+        const S = @TypeOf(spec);
+        const sinfo = @typeInfo(S);
+        if (sinfo != .@"struct") @compileError("collection '" ++ name ++ "' must be a struct literal");
+
+        // collection type (default .base)
+        const ctype: schema.CollectionType = if (@hasField(S, "type")) spec.type else .base;
+
+        // fields
+        const ftuple = if (@hasField(S, "fields")) spec.fields else .{};
+        const FT = @TypeOf(ftuple);
+        const ftinfo = @typeInfo(FT);
+        if (ftinfo != .@"struct") @compileError("collection '" ++ name ++ "' .fields must be a tuple of field literals");
+        const ff = ftinfo.@"struct".fields;
+        var fields: [ff.len]schema.Field = undefined;
+        for (ff, 0..) |f, i| {
+            fields[i] = buildField(name, @field(ftuple, f.name));
+        }
+        const frozen_fields = fields;
+
+        // rules
+        var col = schema.Collection{
+            .id = "",
+            .name = name,
+            .type = ctype,
+            .fields = &frozen_fields,
+        };
+        if (@hasField(S, "rules")) {
+            const R = @TypeOf(spec.rules);
+            if (@hasField(R, "list")) col.listRule = spec.rules.list;
+            if (@hasField(R, "view")) col.viewRule = spec.rules.view;
+            if (@hasField(R, "create")) col.createRule = spec.rules.create;
+            if (@hasField(R, "update")) col.updateRule = spec.rules.update;
+            if (@hasField(R, "delete")) col.deleteRule = spec.rules.delete;
+        }
+        return col;
+    }
+}
+
+fn buildField(comptime col_name: []const u8, comptime f: anytype) schema.Field {
+    comptime {
+        const F = @TypeOf(f);
+        if (!@hasField(F, "name")) @compileError("a field in collection '" ++ col_name ++ "' is missing .name");
+        const fname: []const u8 = f.name;
+        if (!@hasField(F, "type")) @compileError("field '" ++ fname ++ "' in collection '" ++ col_name ++ "' is missing .type");
+        const ftype: schema.FieldType = f.type;
+
+        // A stable field id derived from collection+field name keeps provisioning
+        // idempotent (the rebuild path matches columns by field id across runs).
+        const fid = stableFieldId(col_name, fname);
+
+        var field = schema.Field{
+            .id = fid,
+            .name = fname,
+            .options = undefined,
+        };
+        if (@hasField(F, "required")) field.required = f.required;
+        if (@hasField(F, "unique")) field.unique = f.unique;
+        if (@hasField(F, "hidden")) field.hidden = f.hidden;
+
+        field.options = buildOptions(col_name, fname, ftype, f);
+        return field;
+    }
+}
+
+fn buildOptions(comptime col: []const u8, comptime fname: []const u8, comptime ftype: schema.FieldType, comptime f: anytype) schema.FieldOptions {
+    comptime {
+        const F = @TypeOf(f);
+        const where = "field '" ++ fname ++ "' in collection '" ++ col ++ "'";
+        return switch (ftype) {
+            .text => .{ .text = .{
+                .min = optU32(f, "min"),
+                .max = optU32(f, "max"),
+                .pattern = optStr(f, "pattern"),
+            } },
+            .email => .{ .email = .{} },
+            .url => .{ .url = .{} },
+            .editor => .{ .editor = .{} },
+            .date => .{ .date = .{
+                .min = optStr(f, "min"),
+                .max = optStr(f, "max"),
+            } },
+            .autodate => .{ .autodate = .{
+                .onCreate = if (@hasField(F, "onCreate")) f.onCreate else true,
+                .onUpdate = if (@hasField(F, "onUpdate")) f.onUpdate else false,
+            } },
+            .@"bool" => .{ .@"bool" = .{} },
+            .number => blk: {
+                const mode: schema.NumberMode = if (@hasField(F, "mode")) f.mode else .float;
+                const scale = optU8(f, "scale");
+                if (mode == .fixed and (scale == null or scale.? < 1 or scale.? > 8))
+                    @compileError(where ++ ": fixed number requires .scale = 1..8");
+                break :blk .{ .number = .{
+                    .mode = mode,
+                    .scale = scale,
+                    .min = optF64(f, "min"),
+                    .max = optF64(f, "max"),
+                } };
+            },
+            .json => .{ .json = .{ .maxSize = optU32(f, "maxSize") } },
+            .select => blk: {
+                if (!@hasField(F, "values")) @compileError(where ++ ": select requires .values = .{ ... }");
+                const vals = strTupleToSlice(f.values);
+                if (vals.len == 0) @compileError(where ++ ": select requires at least one value");
+                break :blk .{ .select = .{
+                    .values = vals,
+                    .maxSelect = if (@hasField(F, "maxSelect")) f.maxSelect else 1,
+                } };
+            },
+            .relation => blk: {
+                if (!@hasField(F, "target")) @compileError(where ++ ": relation requires .target = \"<collection name>\"");
+                const target: []const u8 = f.target;
+                if (target.len == 0) @compileError(where ++ ": relation .target must be a non-empty collection name");
+                // NOTE: at comptime we store the TARGET NAME in targetCollectionId;
+                // applySchema resolves it to the target collection's id at provisioning.
+                break :blk .{ .relation = .{
+                    .targetCollectionId = target,
+                    .cascadeDelete = if (@hasField(F, "cascadeDelete")) f.cascadeDelete else false,
+                    .minSelect = optU32(f, "minSelect"),
+                    .maxSelect = if (@hasField(F, "maxSelect")) f.maxSelect else 1,
+                } };
+            },
+            .file => .{ .file = .{
+                .maxSelect = if (@hasField(F, "maxSelect")) f.maxSelect else 1,
+                .maxSize = optU64(f, "maxSize"),
+                .mimeTypes = if (@hasField(F, "mimeTypes")) strTupleToSlice(f.mimeTypes) else null,
+            } },
+        };
+    }
+}
+
+// --- comptime option extractors ---
+
+fn optStr(comptime f: anytype, comptime key: []const u8) ?[]const u8 {
+    return if (@hasField(@TypeOf(f), key)) @field(f, key) else null;
+}
+fn optU32(comptime f: anytype, comptime key: []const u8) ?u32 {
+    return if (@hasField(@TypeOf(f), key)) @field(f, key) else null;
+}
+fn optU8(comptime f: anytype, comptime key: []const u8) ?u8 {
+    return if (@hasField(@TypeOf(f), key)) @field(f, key) else null;
+}
+fn optU64(comptime f: anytype, comptime key: []const u8) ?u64 {
+    return if (@hasField(@TypeOf(f), key)) @field(f, key) else null;
+}
+fn optF64(comptime f: anytype, comptime key: []const u8) ?f64 {
+    return if (@hasField(@TypeOf(f), key)) @field(f, key) else null;
+}
+
+/// Lower a comptime tuple of string literals (e.g. `.{ "a", "b" }`) into a
+/// `[]const []const u8` usable in a runtime schema spec.
+fn strTupleToSlice(comptime t: anytype) []const []const u8 {
+    comptime {
+        const info = @typeInfo(@TypeOf(t));
+        if (info != .@"struct") @compileError("expected a tuple of string literals");
+        const tf = info.@"struct".fields;
+        var out: [tf.len][]const u8 = undefined;
+        for (tf, 0..) |tff, i| {
+            const v: []const u8 = @field(t, tff.name);
+            out[i] = v;
+        }
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+/// Deterministic 8-char lowercase-hex id derived from collection+field name.
+/// Stable across runs so additive provisioning matches columns by id.
+fn stableFieldId(comptime col: []const u8, comptime name: []const u8) []const u8 {
+    comptime {
+        var h = std.hash.Fnv1a_64.init();
+        h.update(col);
+        h.update("\x00");
+        h.update(name);
+        const v = h.final();
+        const hex = "0123456789abcdef";
+        var buf: [8]u8 = undefined;
+        var x = v;
+        var i: usize = 8;
+        while (i > 0) {
+            i -= 1;
+            buf[i] = hex[@intCast(x & 0xf)];
+            x >>= 4;
+        }
+        const frozen = buf;
+        return &frozen;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Explicit-migration escape hatch
+// ---------------------------------------------------------------------------
+
+/// An explicit migration for changes additive auto-provisioning won't do
+/// (renames, retypes, data backfills). Recorded in `_migrations` under
+/// `id` (prefixed), so it runs exactly once and is idempotent across restarts.
+pub const Migration = struct {
+    id: []const u8,
+    up: *const fn (alloc: std.mem.Allocator, io: std.Io, w: *db.Db) anyerror!void,
+};
+
+// ---------------------------------------------------------------------------
+// Runtime provisioner
+// ---------------------------------------------------------------------------
+
+pub const ProvisionError = error{ UnknownRelationTarget, RelationTargetMissing } ||
+    collections.EngineError;
+
+/// Apply the comptime-defined schema to the live database. Safe to call on
+/// every startup: it is idempotent. Two-pass so name-based relations resolve
+/// after all targets exist.
+///   pass 1: ensure every collection exists (create missing; additive field-add
+///           for existing). Relation fields are created with their target NAME
+///           still in targetCollectionId — collections.create resolves the FK by
+///           name, but the persisted metadata must carry the target *id*, so...
+///   pass 2: resolve every relation field's target name -> id and reconcile.
+pub fn applySchema(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    w: *db.Db,
+    comptime cfg: anytype,
+) ProvisionError!void {
+    const specs = comptime buildCollections(cfg);
+    try applySpecs(alloc, io, w, specs);
+}
+
+/// Like `applySchema` but takes already-lowered specs (used by tests and by
+/// `applySchema`). Relation targetCollectionId carries the target NAME on input.
+pub fn applySpecs(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    w: *db.Db,
+    specs: []const schema.Collection,
+) ProvisionError!void {
+    // Validate all relation targets reference a known comptime collection name up
+    // front, so an unknown target is a clear startup error (not a broken relation).
+    for (specs) |spec| {
+        for (spec.fields) |f| switch (f.options) {
+            .relation => |r| {
+                if (!nameInSpecs(specs, r.targetCollectionId)) {
+                    // Allow targeting a pre-existing live collection too (e.g. _superusers).
+                    if ((try collections.get(alloc, w, r.targetCollectionId)) == null) {
+                        std.log.warn(
+                            "provision: collection '{s}' field '{s}' relates to unknown target '{s}' — refusing to provision",
+                            .{ spec.name, f.name, r.targetCollectionId },
+                        );
+                        return error.UnknownRelationTarget;
+                    }
+                }
+            },
+            else => {},
+        };
+    }
+
+    // Topologically order so relation targets are created first; on cycle, fall
+    // back to declaration order (collections.create resolves by name and will
+    // error clearly if a target is genuinely missing).
+    const order = try topoOrder(alloc, specs);
+
+    for (order) |idx| {
+        try ensureCollection(alloc, io, w, specs[idx]);
+    }
+}
+
+/// Idempotent ensure: create the collection if absent, else additively add any
+/// comptime field missing from the live schema. Destructive diffs are logged
+/// and skipped. Relation fields' targetCollectionId (a NAME on input) is resolved
+/// to the live target id before persisting.
+pub fn ensureCollection(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    w: *db.Db,
+    spec_in: schema.Collection,
+) ProvisionError!void {
+    const spec = try resolveTargets(alloc, w, spec_in);
+
+    const existing = try collections.get(alloc, w, spec.name);
+    if (existing == null) {
+        _ = try collections.create(alloc, io, w, spec);
+        std.log.info("provision: created collection '{s}'", .{spec.name});
+        return;
+    }
+    const live = existing.?;
+
+    // Diff user fields. `live.fields` from get() includes injected auth system
+    // fields for auth collections; compare only against non-system field names.
+    var additions: std.ArrayList(schema.Field) = .empty;
+    var changed = false;
+    for (spec.fields) |sf| {
+        const lf = schema.fieldByName(live, sf.name);
+        if (lf == null) {
+            try additions.append(alloc, sf);
+            changed = true;
+            continue;
+        }
+        // present in both: detect a non-additive change (type or sql storage class)
+        if (lf.?.fieldType() != sf.fieldType() or !std.mem.eql(u8, lf.?.sqlType(), sf.sqlType())) {
+            std.log.warn(
+                "provision: collection '{s}' field '{s}' type changed ({s} -> {s}); SKIPPED — write an explicit migration (auto-migration is additive-only)",
+                .{ spec.name, sf.name, @tagName(lf.?.fieldType()), @tagName(sf.fieldType()) },
+            );
+        }
+    }
+
+    // Detect drops: a live user field absent from the comptime spec. We do NOT
+    // drop it (data loss); just warn so the developer knows the schemas diverge.
+    for (live.fields) |lf| {
+        if (lf.id.len > 0 and lf.id[0] == '_') continue; // injected auth system field
+        if (schema.isSystemFieldName(lf.name)) continue;
+        if (specFieldByName(spec, lf.name) == null) {
+            std.log.warn(
+                "provision: collection '{s}' has live field '{s}' not in the comptime schema; left in place (auto-migration never drops columns)",
+                .{ spec.name, lf.name },
+            );
+        }
+    }
+
+    if (!changed) return; // idempotent no-op
+
+    // Additive auto-migration: rebuild the table with the union of live + new
+    // fields, matching existing columns by id (rebuildPlan preserves their data),
+    // and persist the merged user-field schema.
+    var merged: std.ArrayList(schema.Field) = .empty;
+    // keep the live user fields (preserves their ids/order), then append additions
+    for (live.fields) |lf| {
+        if (lf.id.len > 0 and lf.id[0] == '_') continue; // skip injected auth fields
+        if (schema.isSystemFieldName(lf.name)) continue;
+        try merged.append(alloc, lf);
+    }
+    for (additions.items) |sf| try merged.append(alloc, sf);
+
+    var newdef = live;
+    newdef.fields = merged.items;
+    newdef.indexes = spec.indexes;
+    newdef.listRule = spec.listRule orelse live.listRule;
+    newdef.viewRule = spec.viewRule orelse live.viewRule;
+    newdef.createRule = spec.createRule orelse live.createRule;
+    newdef.updateRule = spec.updateRule orelse live.updateRule;
+    newdef.deleteRule = spec.deleteRule orelse live.deleteRule;
+    _ = try collections.update(alloc, io, w, live.id, newdef);
+    std.log.info("provision: collection '{s}' added {d} field(s)", .{ spec.name, additions.items.len });
+}
+
+/// Return a copy of `col` where each single-relation field's targetCollectionId
+/// (a target NAME on input) is replaced by the live target collection's id, so the
+/// persisted metadata matches what the runtime API produces. Errors clearly if the
+/// target is missing.
+fn resolveTargets(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) ProvisionError!schema.Collection {
+    var any = false;
+    for (col.fields) |f| if (f.options == .relation) {
+        any = true;
+    };
+    if (!any) return col;
+
+    const fields = try alloc.alloc(schema.Field, col.fields.len);
+    for (col.fields, 0..) |f, i| {
+        fields[i] = f;
+        switch (f.options) {
+            .relation => |r| {
+                const target = (try collections.get(alloc, w, r.targetCollectionId)) orelse {
+                    std.log.warn("provision: relation target '{s}' not found while provisioning '{s}' — refusing to provision", .{ r.targetCollectionId, col.name });
+                    return error.RelationTargetMissing;
+                };
+                var nr = r;
+                nr.targetCollectionId = target.id;
+                fields[i].options = .{ .relation = nr };
+            },
+            else => {},
+        }
+    }
+    var out = col;
+    out.fields = fields;
+    return out;
+}
+
+/// Run explicit migrations in order, each recorded once in `_migrations` under a
+/// `prov:` prefix (so they never collide with the built-in system migrations).
+pub fn runMigrations(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    w: *db.Db,
+    migs: []const Migration,
+) !void {
+    for (migs) |m| {
+        const name = try std.fmt.allocPrint(alloc, "prov:{s}", .{m.id});
+        if (try migrationApplied(w, name)) continue;
+        try w.begin();
+        errdefer w.rollback() catch {};
+        try m.up(alloc, io, w);
+        try recordMigration(w, name);
+        try w.commit();
+        std.log.info("provision: applied migration '{s}'", .{m.id});
+    }
+}
+
+fn migrationApplied(w: *db.Db, name: []const u8) db.DbError!bool {
+    var st = try w.prepare("SELECT 1 FROM \"_migrations\" WHERE \"name\" = ?1;");
+    defer st.finalize();
+    try st.bindText(1, name);
+    return try st.step();
+}
+
+fn recordMigration(w: *db.Db, name: []const u8) db.DbError!void {
+    var st = try w.prepare("INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, datetime('now'));");
+    defer st.finalize();
+    try st.bindText(1, name);
+    _ = try st.step();
+}
+
+// --- helpers ---
+
+fn nameInSpecs(specs: []const schema.Collection, name: []const u8) bool {
+    for (specs) |s| if (std.mem.eql(u8, s.name, name)) return true;
+    return false;
+}
+
+fn specFieldByName(c: schema.Collection, name: []const u8) ?schema.Field {
+    for (c.fields) |f| if (std.mem.eql(u8, f.name, name)) return f;
+    return null;
+}
+
+/// Order spec indices so every relation target (within the spec set) is created
+/// before the collection that references it. Falls back to declaration order for
+/// targets outside the spec set or on cycle.
+fn topoOrder(alloc: std.mem.Allocator, specs: []const schema.Collection) std.mem.Allocator.Error![]usize {
+    const n = specs.len;
+    const visited = try alloc.alloc(u8, n); // 0=unseen 1=on-stack 2=done
+    @memset(visited, 0);
+    var out: std.ArrayList(usize) = .empty;
+
+    const Walker = struct {
+        fn visit(s: []const schema.Collection, vis: []u8, o: *std.ArrayList(usize), a: std.mem.Allocator, i: usize) std.mem.Allocator.Error!void {
+            if (vis[i] != 0) return; // done or on-stack (cycle): skip to break the loop
+            vis[i] = 1;
+            for (s[i].fields) |f| switch (f.options) {
+                .relation => |r| {
+                    for (s, 0..) |t, ti| {
+                        if (ti != i and std.mem.eql(u8, t.name, r.targetCollectionId)) {
+                            try visit(s, vis, o, a, ti);
+                        }
+                    }
+                },
+                else => {},
+            };
+            vis[i] = 2;
+            try o.append(a, i);
+        }
+    };
+    for (0..n) |i| try Walker.visit(specs, visited, &out, alloc, i);
+    return out.toOwnedSlice(alloc);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const migrations = @import("migrations.zig");
+
+test "buildCollections lowers a literal into collection/field specs" {
+    const specs = comptime buildCollections(.{
+        .users = .{ .type = .auth, .fields = .{
+            .{ .name = "display_name", .type = .text },
+        }, .rules = .{ .list = "", .view = "" } },
+        .listings = .{ .fields = .{
+            .{ .name = "title", .type = .text, .required = true },
+            .{ .name = "price", .type = .number, .mode = .fixed, .scale = 2 },
+            .{ .name = "owner", .type = .relation, .target = "users" },
+            .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
+        }, .rules = .{ .list = "status = \"published\"", .update = "@request.auth.id = owner" } },
+    });
+    try std.testing.expectEqual(@as(usize, 2), specs.len);
+
+    const users = specs[0];
+    try std.testing.expectEqualStrings("users", users.name);
+    try std.testing.expectEqual(schema.CollectionType.auth, users.type);
+    try std.testing.expectEqual(@as(usize, 1), users.fields.len);
+    try std.testing.expectEqualStrings("display_name", users.fields[0].name);
+
+    const listings = specs[1];
+    try std.testing.expectEqualStrings("listings", listings.name);
+    try std.testing.expectEqual(@as(usize, 4), listings.fields.len);
+    try std.testing.expect(listings.fields[0].required);
+    try std.testing.expectEqual(schema.NumberMode.fixed, listings.fields[1].options.number.mode);
+    try std.testing.expectEqual(@as(?u8, 2), listings.fields[1].options.number.scale);
+    // relation stores the TARGET NAME at comptime
+    try std.testing.expectEqualStrings("users", listings.fields[2].options.relation.targetCollectionId);
+    try std.testing.expectEqual(@as(usize, 2), listings.fields[3].options.select.values.len);
+    try std.testing.expectEqualStrings("status = \"published\"", listings.listRule.?);
+    try std.testing.expectEqualStrings("@request.auth.id = owner", listings.updateRule.?);
+
+    // field ids are stable + 8 chars
+    try std.testing.expectEqual(@as(usize, 8), listings.fields[0].id.len);
+}
+
+test "stable field ids are deterministic and collision-distinct" {
+    const a = comptime stableFieldId("posts", "title");
+    const b = comptime stableFieldId("posts", "title");
+    const c = comptime stableFieldId("posts", "body");
+    try std.testing.expectEqualStrings(a, b);
+    try std.testing.expect(!std.mem.eql(u8, a, c));
+}
+
+test "topoOrder places relation targets before dependents" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lf = [_]schema.Field{.{ .id = "r", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } }};
+    const specs = [_]schema.Collection{
+        .{ .id = "", .name = "listings", .fields = &lf },
+        .{ .id = "", .name = "users", .fields = &.{} },
+    };
+    const order = try topoOrder(a, &specs);
+    // users (idx 1) must come before listings (idx 0)
+    try std.testing.expectEqual(@as(usize, 2), order.len);
+    var pos_users: usize = 0;
+    var pos_listings: usize = 0;
+    for (order, 0..) |idx, p| {
+        if (idx == 1) pos_users = p;
+        if (idx == 0) pos_listings = p;
+    }
+    try std.testing.expect(pos_users < pos_listings);
+}
+
+test "applySpecs provisions collections + name-based relation resolves to target id; idempotent" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const lf = [_]schema.Field{
+        .{ .id = "f_owner", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } },
+    };
+    const uf = [_]schema.Field{.{ .id = "f_dn", .name = "display_name", .options = .{ .text = .{} } }};
+    const specs = [_]schema.Collection{
+        .{ .id = "", .name = "listings", .fields = &lf },
+        .{ .id = "", .name = "users", .type = .auth, .fields = &uf },
+    };
+
+    try applySpecs(a, std.testing.io, &d, &specs);
+
+    const users = (try collections.get(a, &d, "users")).?;
+    const listings = (try collections.get(a, &d, "listings")).?;
+    try std.testing.expectEqual(schema.CollectionType.auth, users.type);
+    // the relation's stored targetCollectionId equals the users collection's id
+    const owner = schema.fieldByName(listings, "owner").?;
+    try std.testing.expectEqualStrings(users.id, owner.options.relation.targetCollectionId);
+
+    // physical FK works: insert a user, then a listing referencing it
+    try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\") VALUES ('u1','','');");
+    try d.exec("INSERT INTO \"listings\" (\"id\",\"created\",\"updated\",\"owner\") VALUES ('l1','','','u1');");
+
+    // re-provision: clean no-op (no error, no duplicate collection)
+    try applySpecs(a, std.testing.io, &d, &specs);
+    const all = try collections.list(a, &d);
+    var listings_count: usize = 0;
+    for (all) |c| if (std.mem.eql(u8, c.name, "listings")) {
+        listings_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), listings_count);
+}
+
+test "applySpecs additively adds a new field (auto-migration), preserving data" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const v1 = [_]schema.Field{.{ .id = "f_title", .name = "title", .options = .{ .text = .{} } }};
+    const s1 = [_]schema.Collection{.{ .id = "", .name = "posts", .fields = &v1 }};
+    try applySpecs(a, std.testing.io, &d, &s1);
+    try d.exec("INSERT INTO \"posts\" (\"id\",\"created\",\"updated\",\"title\") VALUES ('p1','','','hello');");
+
+    // v2 adds a `views` field
+    const v2 = [_]schema.Field{
+        .{ .id = "f_title", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f_views", .name = "views", .options = .{ .number = .{ .mode = .int } } },
+    };
+    const s2 = [_]schema.Collection{.{ .id = "", .name = "posts", .fields = &v2 }};
+    try applySpecs(a, std.testing.io, &d, &s2);
+
+    var st = try d.prepare("SELECT title, views FROM \"posts\" WHERE id='p1';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("hello", st.columnText(0)); // data preserved
+    try std.testing.expect(st.isNull(1)); // new column, null for old row
+}
+
+test "applySpecs logs+skips a destructive type change (does not destroy data)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const v1 = [_]schema.Field{.{ .id = "f_n", .name = "n", .options = .{ .text = .{} } }};
+    const s1 = [_]schema.Collection{.{ .id = "", .name = "items", .fields = &v1 }};
+    try applySpecs(a, std.testing.io, &d, &s1);
+    try d.exec("INSERT INTO \"items\" (\"id\",\"created\",\"updated\",\"n\") VALUES ('i1','','','keepme');");
+
+    // v2 changes `n` text -> number (REAL): a destructive retype, must be skipped
+    const v2 = [_]schema.Field{.{ .id = "f_n", .name = "n", .options = .{ .number = .{ .mode = .float } } }};
+    const s2 = [_]schema.Collection{.{ .id = "", .name = "items", .fields = &v2 }};
+    try applySpecs(a, std.testing.io, &d, &s2);
+
+    // the column was NOT retyped/rebuilt: original text value survives
+    var st = try d.prepare("SELECT n FROM \"items\" WHERE id='i1';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("keepme", st.columnText(0));
+    // and the live schema still reports text (skip preserved it)
+    const live = (try collections.get(a, &d, "items")).?;
+    try std.testing.expectEqual(schema.FieldType.text, schema.fieldByName(live, "n").?.fieldType());
+}
+
+test "applySpecs rejects an unknown relation target" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lf = [_]schema.Field{.{ .id = "f_o", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "ghosts", .maxSelect = 1 } } }};
+    const specs = [_]schema.Collection{.{ .id = "", .name = "listings", .fields = &lf }};
+    try std.testing.expectError(error.UnknownRelationTarget, applySpecs(a, std.testing.io, &d, &specs));
+}
+
+test "runMigrations runs each explicit migration once (idempotent)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        var calls: usize = 0;
+        fn up(_: std.mem.Allocator, _: std.Io, w: *db.Db) anyerror!void {
+            calls += 1;
+            try w.exec("CREATE TABLE IF NOT EXISTS \"prov_demo\" (\"x\" TEXT);");
+        }
+    };
+    M.calls = 0;
+    const migs = [_]Migration{.{ .id = "0001_demo", .up = M.up }};
+    try runMigrations(a, std.testing.io, &d, &migs);
+    try runMigrations(a, std.testing.io, &d, &migs);
+    try std.testing.expectEqual(@as(usize, 1), M.calls);
+}

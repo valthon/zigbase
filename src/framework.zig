@@ -11,6 +11,8 @@ const crypto = @import("crypto.zig");
 const id_gen = @import("id.zig");
 const scheduler = @import("scheduler.zig");
 const mail = @import("mail/mailer.zig");
+const provision = @import("provision.zig");
+const schema = @import("schema.zig");
 
 // ============================================================================
 // Comptime plugins (storage + mailer)
@@ -93,7 +95,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -138,6 +140,22 @@ pub fn App(comptime cfg: anytype) type {
         /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
         pub const MailerPlugin: type = if (@hasField(@TypeOf(cfg), "mailer")) cfg.mailer else DefaultMailerPlugin;
 
+        /// Comptime-lowered collection specs from `.collections` (empty when absent).
+        /// Relation fields carry their target collection BY NAME in `targetCollectionId`;
+        /// `provision.applySpecs` resolves names -> ids at startup. When empty, no
+        /// provisioning runs and the binary behaves byte-for-byte as before.
+        pub const collections: []const schema.Collection = if (@hasField(@TypeOf(cfg), "collections"))
+            provision.buildCollections(cfg.collections)
+        else
+            &.{};
+
+        /// Explicit migrations (the escape hatch for non-additive changes), run in
+        /// order before provisioning and recorded once in `_migrations`. Empty by default.
+        pub const provision_migrations: []const provision.Migration = if (@hasField(@TypeOf(cfg), "migrations"))
+            cfg.migrations
+        else
+            &.{};
+
         /// Bundle of comptime-resolved knobs threaded into the serve path: the
         /// selected storage/mailer plugin TYPES and the reader-pool cap.
         const Opts = ServeOpts{
@@ -149,12 +167,12 @@ pub fn App(comptime cfg: anytype) type {
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
         /// wiring this app's `dispatch` into the runtime context for `serve`.
         pub fn runCli(init: std.process.Init) !void {
-            return runCliImpl(init, &dispatch, jobs, job_pool_size, Opts);
+            return runCliImpl(init, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts);
         }
 
         /// Start the HTTP server directly with an explicit config (no CLI parsing).
         pub fn run(init: std.process.Init, cfg_runtime: config.Config) !void {
-            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, Opts);
+            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts);
         }
     };
 }
@@ -168,7 +186,7 @@ pub const ServeOpts = struct {
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
-fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, comptime opts: ServeOpts) !void {
+fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts) !void {
     const allocator = init.gpa;
     const arena = init.arena.allocator();
 
@@ -193,7 +211,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         },
         .serve => |sa| {
             const cfg = try loadCfg(sa);
-            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, opts);
+            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts);
         },
         .migrate => |sa| try migrateImpl(allocator, init.io, sa),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, sa),
@@ -353,7 +371,7 @@ fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !voi
     std.log.info("migrations applied", .{});
 }
 
-fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, comptime opts: ServeOpts) !void {
+fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts) !void {
     if (std.mem.eql(u8, cfg.jwt_secret, "dev-insecure-secret-change-me")) {
         if (cfg.cookie_secure) {
             std.log.err("refusing to start: ZIGBASE_JWT_SECRET is unset/default while cookie_secure is enabled; set a strong secret", .{});
@@ -367,6 +385,18 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
         const w = pool.acquireWriter();
         defer pool.releaseWriter();
         try migrations.run(w);
+        // Comptime-schema provisioning. When `.collections`/`.migrations` are absent
+        // both slices are empty, so this whole block is a no-op and the binary behaves
+        // exactly as before the feature. Otherwise: run the explicit escape-hatch
+        // migrations (once each, recorded in _migrations), then idempotently provision
+        // the comptime collections (create-missing + additive field-add + name->id
+        // relation resolution; destructive diffs are logged and skipped).
+        if (schema_migrations.len > 0) {
+            try provision.runMigrations(allocator, io, w, schema_migrations);
+        }
+        if (schema_collections.len > 0) {
+            try provision.applySpecs(allocator, io, w, schema_collections);
+        }
     }
     // Instantiate the comptime-selected storage + mailer plugins. The instances are
     // serveImpl stack vars that outlive the server (srv.listen() runs to shutdown),
@@ -551,4 +581,33 @@ test "App(cfg) accepts a custom storage + mailer plugin type override" {
     const A = App(.{ .storage = MyStorage, .mailer = DefaultMailerPlugin });
     try std.testing.expectEqual(MyStorage, A.StoragePlugin);
     try std.testing.expectEqual(DefaultMailerPlugin, A.MailerPlugin);
+}
+
+test "App(cfg) lowers .collections into comptime specs; name-based relation kept by name" {
+    const A = App(.{ .collections = .{
+        .users = .{ .type = .auth, .fields = .{
+            .{ .name = "display_name", .type = .text },
+        } },
+        .posts = .{ .fields = .{
+            .{ .name = "title", .type = .text, .required = true },
+            .{ .name = "author", .type = .relation, .target = "users" },
+            .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
+        }, .rules = .{ .list = "status = \"published\"" } },
+    } });
+    try std.testing.expectEqual(@as(usize, 2), A.collections.len);
+    try std.testing.expectEqualStrings("users", A.collections[0].name);
+    try std.testing.expectEqual(schema.CollectionType.auth, A.collections[0].type);
+    try std.testing.expectEqualStrings("posts", A.collections[1].name);
+    try std.testing.expect(A.collections[1].fields[0].required);
+    // relation target stored BY NAME at comptime (resolved to id at provisioning)
+    try std.testing.expectEqualStrings("users", A.collections[1].fields[1].options.relation.targetCollectionId);
+    try std.testing.expectEqualStrings("status = \"published\"", A.collections[1].listRule.?);
+    // stable, 8-char field ids
+    try std.testing.expectEqual(@as(usize, 8), A.collections[1].fields[0].id.len);
+}
+
+test "App(.{}) has no comptime collections and no provision migrations" {
+    const A = App(.{});
+    try std.testing.expectEqual(@as(usize, 0), A.collections.len);
+    try std.testing.expectEqual(@as(usize, 0), A.provision_migrations.len);
 }
