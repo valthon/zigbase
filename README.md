@@ -41,7 +41,7 @@ The default bind is `0.0.0.0:8090`. Your `zig` must be 0.16.0 — either activat
 Fetch ZigBase as a dependency:
 
 ```sh
-zig fetch --save git+https://github.com/<owner>/zigbase
+zig fetch --save git+https://github.com/valthon/zigbase
 ```
 
 Wire the module into your `build.zig` (ZigBase links libc):

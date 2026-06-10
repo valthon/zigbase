@@ -59,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
 Add the dependency:
 
 ```sh
-zig fetch --save git+https://github.com/<owner>/zigbase
+zig fetch --save git+https://github.com/valthon/zigbase
 ```
 
 Wire the module into your `build.zig`:

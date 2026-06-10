@@ -37,7 +37,7 @@ explicit `zigbase.Config`, skipping CLI parsing.)
 ## 2. Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/<owner>/zigbase
+zig fetch --save git+https://github.com/valthon/zigbase
 ```
 
 In your `build.zig`:

@@ -94,7 +94,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
 
 fn printUsage() void {
     std.log.info(
-        \\zigbase — a single-binary backend (https://github.com/<owner>/zigbase)
+        \\zigbase — a single-binary backend (https://github.com/valthon/zigbase)
         \\
         \\usage:
         \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
