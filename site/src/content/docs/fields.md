@@ -1,20 +1,24 @@
-# Field types & options reference
+---
+title: Fields
+description: The complete catalog of ZigBase field types and their options — text, email, url, editor, date, autodate, bool, number, json, select, relation, and file.
+order: 2
+group: reference
+---
 
-> 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/fields> — the site is the canonical reading experience.
+# Field types & options
 
-This is the complete catalog of ZigBase field types and their `options` shapes. It
-is the companion reference to the [API docs](api.md) (which describe the request/
-response envelopes) and the [recipes](recipes.md) (which show provisioning in
-practice). Every type name, option key, default, and validation rule below matches
-`src/schema.zig`.
+This is the complete catalog of ZigBase field types and their `options` shapes. It is the
+companion reference to the [API docs](./api) (which describe the request/response
+envelopes) and the [recipes](./recipes) (which show provisioning in practice). Every type
+name, option key, default, and validation rule below matches `src/schema.zig`.
 
 ## How fields appear in requests vs. responses
 
-When you **create or update** a collection (`POST`/`PATCH /api/collections`), you
-supply the field list under the key **`fields`**. When the server **returns** a
-collection, the same list is exposed under the key **`schema`** (see
-[api.md → Input vs. output shape](api.md#input-vs-output-shape)). The per-field
-object is identical in both directions:
+When you **create or update** a collection (`POST`/`PATCH /api/collections`), you supply the
+field list under the key **`fields`**. When the server **returns** a collection, the same
+list is exposed under the key **`schema`** (see
+[API → Input vs. output shape](./api#input-vs-output-shape)). The per-field object is
+identical in both directions:
 
 ```jsonc
 {
@@ -27,29 +31,26 @@ object is identical in both directions:
 }
 ```
 
-`required` and `unique` are common to every type and both default to `false`.
-The `options` object is type-specific; unknown/omitted option keys fall back to the
-defaults listed for each type. A field whose `options` you don't care about can pass
-`"options": {}` (all defaults).
+`required` and `unique` are common to every type and both default to `false`. The `options`
+object is type-specific; unknown/omitted option keys fall back to the defaults listed for
+each type. A field whose `options` you don't care about can pass `"options": {}` (all
+defaults).
 
 ### Field-name rules (apply to every type)
 
 A field `name` must:
 
-- be a **valid identifier** — start with a letter, then letters/digits/underscores
-  only (`^[A-Za-z][A-Za-z0-9_]*$`);
+- be a **valid identifier** — start with a letter, then letters/digits/underscores only
+  (`^[A-Za-z][A-Za-z0-9_]*$`);
 - not collide (case-insensitively) with another field in the same collection;
-- not be a **reserved system name**. The reserved set is: `id`, `created`,
-  `updated`, `email`, `username`, `passwordHash`, `tokenKey`, `verified`. These are
-  injected/managed by the engine. (On an `auth` collection, `email`, `username`,
-  `passwordHash`, `tokenKey`, and `verified` are added for you automatically — see
+- not be a **reserved system name**. The reserved set is: `id`, `created`, `updated`,
+  `email`, `username`, `passwordHash`, `tokenKey`, `verified`. These are injected/managed by
+  the engine. (On an `auth` collection, `email`, `username`, `passwordHash`, `tokenKey`, and
+  `verified` are added for you automatically — see
   [auth collections](#auth-collections-and-system-fields).)
 
-A field that violates any of these produces a `400` with a `validation_*` field
-error (`validation_invalid_name`, `validation_duplicate_name`,
-`validation_reserved_name`).
-
----
+A field that violates any of these produces a `400` with a `validation_*` field error
+(`validation_invalid_name`, `validation_duplicate_name`, `validation_reserved_name`).
 
 ## The 12 field types
 
@@ -70,9 +71,7 @@ error (`validation_invalid_name`, `validation_duplicate_name`,
 
 > Note the type tag is spelled **`bool`** in JSON (the Zig enum is `@"bool"`).
 
----
-
-### `text`
+### text
 
 A string column.
 
@@ -86,7 +85,7 @@ A string column.
 { "name": "title", "type": "text", "required": true, "options": { "min": 1, "max": 200 } }
 ```
 
-### `email`
+### email
 
 A string column intended to hold an email address. **No options.**
 
@@ -94,7 +93,7 @@ A string column intended to hold an email address. **No options.**
 { "name": "contact", "type": "email", "options": {} }
 ```
 
-### `url`
+### url
 
 A string column intended to hold a URL. **No options.**
 
@@ -102,16 +101,16 @@ A string column intended to hold a URL. **No options.**
 { "name": "homepage", "type": "url", "options": {} }
 ```
 
-### `editor`
+### editor
 
-A rich-text / HTML string column. **No options.** (Stored as TEXT; the type is a
-hint to clients/admin UI.)
+A rich-text / HTML string column. **No options.** (Stored as TEXT; the type is a hint to
+clients/admin UI.)
 
 ```json
 { "name": "body", "type": "editor", "options": {} }
 ```
 
-### `date`
+### date
 
 A date/time string column.
 
@@ -124,10 +123,10 @@ A date/time string column.
 { "name": "starts_at", "type": "date", "options": { "min": "2026-01-01 00:00:00" } }
 ```
 
-### `autodate`
+### autodate
 
-A server-managed timestamp column, written automatically by the engine on create
-and/or update.
+A server-managed timestamp column, written automatically by the engine on create and/or
+update.
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -138,10 +137,10 @@ and/or update.
 { "name": "published_at", "type": "autodate", "options": { "onCreate": true, "onUpdate": false } }
 ```
 
-> The base `created` and `updated` columns already exist on every record; use
-> `autodate` for *additional* managed timestamps.
+> The base `created` and `updated` columns already exist on every record; use `autodate` for
+> *additional* managed timestamps.
 
-### `bool`
+### bool
 
 A boolean column (stored as INTEGER 0/1). **No options.** Spell the type `"bool"`.
 
@@ -149,7 +148,7 @@ A boolean column (stored as INTEGER 0/1). **No options.** Spell the type `"bool"
 { "name": "is_active", "type": "bool", "options": {} }
 ```
 
-### `number`
+### number
 
 A numeric column. **The `mode` decides storage and precision.**
 
@@ -162,24 +161,25 @@ A numeric column. **The `mode` decides storage and precision.**
 
 - **`float`** — stored as SQLite `REAL` (IEEE-754 double). The default.
 - **`int`** — stored as `INTEGER` (whole numbers).
-- **`fixed`** — fixed-point decimal stored as `INTEGER` (scaled by `10^scale`).
-  **`scale` is mandatory and must be 1..8.** Use this for money and other values
-  where binary-float rounding is unacceptable.
+- **`fixed`** — fixed-point decimal stored as `INTEGER` (scaled by `10^scale`). **`scale` is
+  mandatory and must be 1..8.** Use this for money and other values where binary-float
+  rounding is unacceptable.
 
-> **Validation gotcha:** `mode: "fixed"` **without** a valid `scale` (1..8) is a
-> `400` (`validation_invalid_scale`: "fixed number requires scale 1..8."). A `float`
-> or `int` field never needs `scale`.
+> **Validation gotcha:** `mode: "fixed"` **without** a valid `scale` (1..8) is a `400`
+> (`validation_invalid_scale`: "fixed number requires scale 1..8."). A `float` or `int`
+> field never needs `scale`.
 
 ```json
 // money: two decimal places, fixed-point
 { "name": "price_per_hour", "type": "number", "options": { "mode": "fixed", "scale": 2, "min": 0 } }
 ```
+
 ```json
 // a plain integer count
 { "name": "seats", "type": "number", "options": { "mode": "int", "min": 1, "max": 8 } }
 ```
 
-### `json`
+### json
 
 An arbitrary JSON value, stored as TEXT.
 
@@ -191,7 +191,7 @@ An arbitrary JSON value, stored as TEXT.
 { "name": "metadata", "type": "json", "options": { "maxSize": 4096 } }
 ```
 
-### `select`
+### select
 
 A single- or multi-value enumerated column.
 
@@ -203,14 +203,14 @@ A single- or multi-value enumerated column.
 - `maxSelect: 1` → single-valued (the record stores one of `values`).
 - `maxSelect > 1` → multi-valued (the field becomes a multi-value column).
 
-> **Validation gotcha:** an empty `values` array is a `400` (`validation_required`:
-> "select requires at least one value.").
+> **Validation gotcha:** an empty `values` array is a `400` (`validation_required`: "select
+> requires at least one value.").
 
 ```json
 { "name": "status", "type": "select", "options": { "values": ["pending", "confirmed", "cancelled"], "maxSelect": 1 } }
 ```
 
-### `relation`
+### relation
 
 A foreign-key reference to records in another collection.
 
@@ -224,12 +224,11 @@ A foreign-key reference to records in another collection.
 - `maxSelect: 1` → a single relation (one referenced id).
 - `maxSelect > 1` → a multi-relation.
 
-> ### CRITICAL: `targetCollectionId` is an **id**, not a name
+> **CRITICAL: `targetCollectionId` is an id, not a name.**
 >
-> `targetCollectionId` must be the **id** that the target collection's create
-> response returned — **not** the collection's `name`. ZigBase assigns the id when
-> you create the collection; it is in the `"id"` field of the
-> `POST /api/collections` response:
+> `targetCollectionId` must be the **id** that the target collection's create response
+> returned — **not** the collection's `name`. ZigBase assigns the id when you create the
+> collection; it is in the `"id"` field of the `POST /api/collections` response:
 >
 > ```jsonc
 > // response from creating the "simulators" collection
@@ -237,11 +236,10 @@ A foreign-key reference to records in another collection.
 > //        ^^^^^^^^^^^^^^^ THIS is what a relation's targetCollectionId must hold
 > ```
 >
-> So provisioning is **order-dependent**: create the target collection first,
-> **capture its `id` from the response**, then create the referencing collection
-> with `targetCollectionId` set to that captured id. The
-> [provisioning recipe](recipes.md#recipe-provisioning-your-schema) shows the exact
-> create-then-capture-id `curl` sequence. A relation with an empty
+> So provisioning is **order-dependent**: create the target collection first, **capture its
+> `id` from the response**, then create the referencing collection with `targetCollectionId`
+> set to that captured id. The [provisioning recipe](./recipes#recipe-provisioning-your-schema)
+> shows the exact create-then-capture-id `curl` sequence. A relation with an empty
 > `targetCollectionId` is a `400` (`validation_required`: "relation requires
 > targetCollectionId.").
 
@@ -251,11 +249,11 @@ A foreign-key reference to records in another collection.
   "options": { "targetCollectionId": "a1b2c3d4e5f6g7h", "cascadeDelete": true, "maxSelect": 1 } }
 ```
 
-### `file`
+### file
 
-An uploaded-file reference. Files themselves are uploaded as `multipart/form-data`
-on record create/update and served from `GET /api/files/:col/:rec/:name` (see
-[api.md → Files](api.md#files)).
+An uploaded-file reference. Files themselves are uploaded as `multipart/form-data` on record
+create/update and served from `GET /api/files/:col/:rec/:name` (see
+[API → Files](./api#files)).
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -264,20 +262,18 @@ on record create/update and served from `GET /api/files/:col/:rec/:name` (see
 | `mimeTypes` | array of strings | unset | allowed MIME types; others are rejected |
 
 - `maxSelect: 1` → single file; `maxSelect > 1` → multiple files.
-- An upload exceeding `maxSize` → `413`; a disallowed `mimeTypes` value → `400`
-  ("File type not allowed."); too many files for `maxSelect` → `400`.
+- An upload exceeding `maxSize` → `413`; a disallowed `mimeTypes` value → `400` ("File type
+  not allowed."); too many files for `maxSelect` → `400`.
 
 ```json
 { "name": "photos", "type": "file",
   "options": { "maxSelect": 6, "maxSize": 5242880, "mimeTypes": ["image/png", "image/jpeg", "image/webp"] } }
 ```
 
----
-
 ## Auth collections and system fields
 
-A collection created with `"type": "auth"` automatically gains these system fields
-(you do **not** declare them, and you may **not** reuse their names):
+A collection created with `"type": "auth"` automatically gains these system fields (you do
+**not** declare them, and you may **not** reuse their names):
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -299,19 +295,17 @@ Auth collections also carry an `options.auth` block:
 }
 ```
 
-`identityFields` defaults to `["email"]`; each entry must be a valid identifier
-(it is interpolated into SQL). `minPasswordLength` defaults to `8`. See the
-[signup recipe](recipes.md#recipe-user-registration-signup) for how record-create
-acts as the signup path on an auth collection.
-
----
+`identityFields` defaults to `["email"]`; each entry must be a valid identifier (it is
+interpolated into SQL). `minPasswordLength` defaults to `8`. See the
+[signup recipe](./recipes#recipe-user-registration-signup) for how record-create acts as the
+signup path on an auth collection.
 
 ## A complete multi-field `POST /api/collections` body
 
-A `listings` base collection that exercises `text`, fixed-point `number`,
-`select`, `relation`, and `file`. (`owner` references a `users` auth collection and
-`simulator` references a `simulators` collection — substitute the **ids** those
-collections' create responses returned for the two `targetCollectionId` values.)
+A `listings` base collection that exercises `text`, fixed-point `number`, `select`,
+`relation`, and `file`. (`owner` references a `users` auth collection and `simulator`
+references a `simulators` collection — substitute the **ids** those collections' create
+responses returned for the two `targetCollectionId` values.)
 
 ```jsonc
 {
@@ -347,14 +341,10 @@ collections' create responses returned for the two `targetCollectionId` values.)
 }
 ```
 
-The five rule keys (`listRule`/`viewRule`/`createRule`/`updateRule`/`deleteRule`)
-are described in [api.md → Access rules](api.md#access-rules); owner-scoped and
-relation-traversal rule patterns are in
-[recipes.md → Owner-scoped access rules](recipes.md#recipe-owner-scoped-access-rules).
+The five rule keys (`listRule`/`viewRule`/`createRule`/`updateRule`/`deleteRule`) are
+described in [API → Access rules](./api#access-rules); owner-scoped and relation-traversal
+rule patterns are in [Recipes → Owner-scoped access rules](./recipes#recipe-owner-scoped-access-rules).
 
----
+## See also
 
-See also: [recipes.md](recipes.md) · [tutorial.md](tutorial.md) ·
-[api.md](api.md) · [framework.md](framework.md)
-</content>
-</invoke>
+[Recipes](./recipes) · [Tutorial](./tutorial) · [API](./api) · [Framework](./framework)

@@ -16,3 +16,7 @@ examples/*/zig-out/
 examples/*/.zig-cache/
 examples/*/data/
 dist/
+
+site/node_modules
+site/dist
+site/.astro

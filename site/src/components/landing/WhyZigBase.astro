@@ -1,0 +1,76 @@
+---
+const points = [
+  {
+    title: 'One static binary',
+    body: 'A single statically-linked executable with no runtime dependencies — copy it to a server and run it.',
+  },
+  {
+    title: 'SQLite-backed',
+    body: 'All data lives in one SQLite file with WAL enabled. Easy to back up, easy to reason about.',
+  },
+  {
+    title: 'Comptime framework',
+    body: 'Extend the server in typed Zig with hooks, routes, and jobs — zero-cost abstractions, checked at compile time.',
+  },
+  {
+    title: 'Tiny footprint',
+    body: 'Comptime pool levers let you tune memory use down for small deployments — no GC, no VM.',
+  },
+];
+---
+
+<section class="why container">
+  <header class="why__head">
+    <h2>Why ZigBase</h2>
+    <p>An architecture built for simple operation and deep extensibility.</p>
+  </header>
+
+  <div class="why__grid">
+    {
+      points.map((p) => (
+        <div class="why__point">
+          <h3 class="why__title">{p.title}</h3>
+          <p class="why__body">{p.body}</p>
+        </div>
+      ))
+    }
+  </div>
+</section>
+
+<style>
+  .why {
+    padding-block: var(--space-8);
+  }
+
+  .why__head {
+    text-align: center;
+    margin-bottom: var(--space-6);
+  }
+
+  .why__head p {
+    color: var(--color-muted);
+    margin-top: var(--space-3);
+  }
+
+  .why__grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: var(--space-5);
+  }
+
+  .why__point {
+    border-left: 3px solid var(--color-accent);
+    padding-left: var(--space-4);
+  }
+
+  .why__title {
+    font-size: var(--text-lg);
+    margin-bottom: var(--space-2);
+  }
+
+  .why__body {
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+    line-height: var(--leading-normal);
+  }
+</style>

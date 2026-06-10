@@ -1,27 +1,28 @@
-# Tutorial: build an app on ZigBase, end to end
-
-> 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/tutorial> — the site is the canonical reading experience.
-
-This walkthrough takes you from an empty database to a working backend for
-**"Airbnb for golf simulators"** — hosts list simulators, guests book slots. It ties
-together every moving part: provisioning collections, setting access rules,
-registering and logging in a user, creating a record with a file upload, a custom
-business route, and a scheduled job.
-
-It is meant to be read top to bottom and run as you go. Each step links to the
-reference docs for depth:
-
-- field types & option shapes → [fields.md](fields.md)
-- the full curl recipes this tutorial condenses → [recipes.md](recipes.md)
-- endpoint envelopes, rule semantics, realtime, files → [api.md](api.md)
-- hooks, custom routes, jobs (the Zig framework) → [framework.md](framework.md)
-
 ---
+title: Tutorial
+description: Build a backend on ZigBase end to end — provision collections, set access rules, register a user, upload a file, add a custom route and a cron job.
+order: 3
+group: getting-started
+---
+
+# Tutorial: build an app on ZigBase
+
+This walkthrough takes you from an empty database to a working backend for **"Airbnb for
+golf simulators"** — hosts list simulators, guests book slots. It ties together every
+moving part: provisioning collections, setting access rules, registering and logging in a
+user, creating a record with a file upload, a custom business route, and a scheduled job.
+
+Read it top to bottom and run it as you go. Each step links onward to the reference docs:
+
+- field types & option shapes → [Fields](./fields)
+- the full curl recipes this tutorial condenses → [Recipes](./recipes)
+- endpoint envelopes, rule semantics, realtime, files → [API](./api)
+- hooks, custom routes, jobs (the Zig framework) → [Framework](./framework)
 
 ## 0. Run the server
 
-Build the binary and create a superuser (collection management is superuser-only),
-then start serving:
+Build the binary and create a superuser (collection management is superuser-only), then
+start serving:
 
 ```sh
 mise install                                     # Zig 0.16.0, pinned in mise.toml
@@ -38,15 +39,13 @@ curl http://127.0.0.1:8090/api/health   # {"status":"ok"}
 
 Throughout, `BASE=http://127.0.0.1:8090`.
 
----
-
 ## 1. Provision collections (in dependency order)
 
-There is no schema-file import — you create collections by calling
-`POST /api/collections` as the superuser. Relation fields point at their target by
-**collection id** (the `id` from the create response, **not** the name — see
-[fields.md → the relation gotcha](fields.md#critical-targetcollectionid-is-an-id-not-a-name)),
-so you must create targets first and **capture each returned id**.
+There is no schema-file import — you create collections by calling `POST /api/collections`
+as the superuser. Relation fields point at their target by **collection id** (the `id`
+from the create response, **not** the name — see
+[the relation gotcha](./fields#relation)), so you must create targets first and **capture
+each returned id**.
 
 First, log in as the superuser. Superusers live in the built-in `_superusers` auth
 collection, so they use the normal auth endpoint:
@@ -73,10 +72,10 @@ USERS_ID=$(curl -s -X POST "$BASE/api/collections" \
   }' | jq -r .id)
 ```
 
-Then `simulators` (references `users` by id), then `listings` (references
-`simulators`). The full four-collection script — including `bookings` — is in
-[recipes.md → Provisioning your schema](recipes.md#recipe-provisioning-your-schema).
-Here is `listings`, which also carries a `file` field for photos:
+Then `simulators` (references `users` by id), then `listings` (references `simulators`).
+The full four-collection script — including `bookings` — is in
+[Recipes → Provisioning your schema](./recipes#recipe-provisioning-your-schema). Here is
+`listings`, which also carries a `file` field for photos:
 
 ```sh
 SIMS_ID=$(curl -s -X POST "$BASE/api/collections" \
@@ -117,30 +116,25 @@ LISTINGS_ID=$(curl -s -X POST "$BASE/api/collections" \
   }" | jq -r .id)
 ```
 
-The field shapes used here are catalogued in [fields.md](fields.md).
-
----
+The field shapes used here are catalogued in [Fields](./fields).
 
 ## 2. Understand the access rules you just set
 
 Each collection's five rules (`listRule`/`viewRule`/`createRule`/`updateRule`/
-`deleteRule`) are filter expressions; `""` means public, `null` means
-superuser-only, anything else is checked per request. Highlights from above:
+`deleteRule`) are filter expressions; `""` means public, `null` means superuser-only,
+anything else is checked per request. Highlights from above:
 
-- `users`: `createRule: ""` → **open signup** (anyone may create a user). Update/
-  delete are self-only (`@request.auth.id = id`).
-- `simulators`/`listings`: writes are **owner-scoped**
-  (`@request.auth.id = simulator.owner`), which uses **relation traversal** —
-  following the single-value `simulator` relation to read the owner.
-- `listings` are publicly listable only when `status = "published"`; the owner can
-  also view their drafts.
+- `users`: `createRule: ""` → **open signup** (anyone may create a user). Update/delete
+  are self-only (`@request.auth.id = id`).
+- `simulators`/`listings`: writes are **owner-scoped** (`@request.auth.id =
+  simulator.owner`), which uses **relation traversal** — following the single-value
+  `simulator` relation to read the owner.
+- `listings` are publicly listable only when `status = "published"`; the owner can also
+  view their drafts.
 
-Rule grammar and denial status codes are in
-[api.md → Access rules](api.md#access-rules); owner-scoped and relation-traversal
-patterns (and how the `owner` field gets set safely) are in
-[recipes.md → Owner-scoped access rules](recipes.md#recipe-owner-scoped-access-rules).
-
----
+Rule grammar and denial status codes are in [API → Access rules](./api#access-rules);
+owner-scoped and relation-traversal patterns (and how the `owner` field gets set safely)
+are in [Recipes → Owner-scoped access rules](./recipes#recipe-owner-scoped-access-rules).
 
 ## 3. Register a user and log in
 
@@ -154,8 +148,8 @@ curl -s -X POST "$BASE/api/collections/users/records" \
   -d '{"email":"host@example.com","password":"hostpassword","name":"Demo Host"}'
 ```
 
-`password` must be at least `minPasswordLength` (default 8). Now log in to get a
-token and the user's id:
+`password` must be at least `minPasswordLength` (default 8). Now log in to get a token and
+the user's id:
 
 ```sh
 LOGIN=$(curl -s -X POST "$BASE/api/collections/users/auth-with-password" \
@@ -165,10 +159,8 @@ HOST_TOKEN=$(echo "$LOGIN" | jq -r .token)
 HOST_ID=$(echo "$LOGIN"   | jq -r .record.id)
 ```
 
-Details: [recipes.md → User registration](recipes.md#recipe-user-registration-signup)
-and [api.md → Auth](api.md#auth).
-
----
+Details: [Recipes → User registration](./recipes#recipe-user-registration-signup) and
+[API → Auth](./api#auth).
 
 ## 4. Create records, including a file upload
 
@@ -195,19 +187,16 @@ curl -s -X POST "$BASE/api/collections/listings/records" \
 ```
 
 The uploaded file is stored locally and served from
-`GET /api/files/listings/:recordId/:filename`. Because `listings` has a public
-`viewRule` for published rows, the photo serves directly; protected collections need
-a bearer token, the auth cookie, or a short-lived **file token**. See
-[api.md → Files](api.md#files).
-
----
+`GET /api/files/listings/:recordId/:filename`. Because `listings` has a public `viewRule`
+for published rows, the photo serves directly; protected collections need a bearer token,
+the auth cookie, or a short-lived **file token**. See [API → Files](./api#files).
 
 ## 5. Add a custom business route (the Zig framework)
 
 REST CRUD covers most needs, but "confirm a booking" is business logic. ZigBase is an
-**embeddable Zig framework**: import it, register a custom route, and your binary
-*is* the server. A `POST /api/bookings/:id/confirm` handler reads the `:id` path
-param, loads the record, and flips its status:
+**embeddable Zig framework**: import it, register a custom route, and your binary *is* the
+server. A `POST /api/bookings/:id/confirm` handler reads the `:id` path param, loads the
+record, and flips its status:
 
 ```zig
 const std = @import("std");
@@ -232,16 +221,14 @@ fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
 ```
 
 `RouteEvent` gives you `app`, `ctx` (path params via `ctx.param`), and `rctx` (auth
-identity for finer authorization). It does **not** carry a `Data` facade, so you build
-one from the pool. The full version (with owner authorization) is in
-[recipes.md → custom business route](recipes.md#recipe-a-custom-business-route-with-a-path-param--db-write).
-
----
+identity for finer authorization). It does **not** carry a `Data` facade, so you build one
+from the pool. The full version (with owner authorization) is in
+[Recipes → a custom business route](./recipes#recipe-a-custom-business-route-with-a-path-param--db-write).
 
 ## 6. Add a scheduled job
 
-A nightly job cancels stale pending bookings. A `JobEvent` carries only `app` and
-`name`, so — like the route above — you acquire a connection and build `Data`:
+A nightly job cancels stale pending bookings. A `JobEvent` carries only `app` and `name`,
+so — like the route above — you acquire a connection and build `Data`:
 
 ```zig
 fn expireStaleBookings(ev: *zigbase.events.JobEvent) anyerror!void {
@@ -260,12 +247,10 @@ fn expireStaleBookings(ev: *zigbase.events.JobEvent) anyerror!void {
 }
 ```
 
----
-
 ## 7. Wire it all into your `App(.{...})`
 
-The hook, route, and job come together in one comptime config. This is the whole
-extended server:
+The hook, route, and job come together in one comptime config. This is the whole extended
+server:
 
 ```zig
 const std = @import("std");
@@ -292,24 +277,17 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 `runCli` gives your binary the same `serve` / `migrate` / `superuser create` / `help`
-commands as the stock server. A misconfigured extension (unknown config key, typo'd
-hook phase, wrong-typed handler) is a **compile error**, so it never reaches runtime.
+commands as the stock server. A misconfigured extension (unknown config key, typo'd hook
+phase, wrong-typed handler) is a **compile error**, so it never reaches runtime.
 
-Build and run your binary exactly as in step 0 (it replaces `zig-out/bin/zigbase`).
-The `validateBooking` before-hook is shown in full in
-[recipes.md → computed-field / validation hook](recipes.md#recipe-a-computed-field--validation-beforecreate-hook).
-
----
+Build and run your binary exactly as in step 0 (it replaces `zig-out/bin/zigbase`). The
+`validateBooking` before-hook is shown in full in
+[Recipes → computed-field / validation hook](./recipes#recipe-a-computed-field--validation-beforecreate-hook).
 
 ## Where to go next
 
-- **Field reference:** every type and option → [fields.md](fields.md)
-- **More recipes:** provisioning, owner rules, hooks, routes, jobs →
-  [recipes.md](recipes.md)
-- **API reference:** records query (`filter`/`sort`/`expand`), realtime, files →
-  [api.md](api.md)
-- **Framework reference:** the full hook/route/job/event surface →
-  [framework.md](framework.md)
-- **The worked, buildable example:** [`examples/blog/`](../examples/blog/)
-- **Caveats:** [KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md)
-</content>
+- **Field reference:** every type and option → [Fields](./fields)
+- **More recipes:** provisioning, owner rules, hooks, routes, jobs → [Recipes](./recipes)
+- **API reference:** records query (`filter`/`sort`/`expand`), realtime, files → [API](./api)
+- **Framework reference:** the full hook/route/job/event surface → [Framework](./framework)
+- **Caveats:** [Known limitations](./known-limitations)

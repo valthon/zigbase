@@ -1,0 +1,111 @@
+---
+/**
+ * A small "Copy" button that copies the text of an associated <pre>/code block.
+ *
+ * Resolution order for the source text:
+ *   1. `target` prop — a CSS selector (queried within the surrounding document).
+ *   2. The previous-element sibling of the button (so it can sit right after a <pre>).
+ *   3. A <pre> inside the button's own parent (so it can wrap a <pre>).
+ */
+interface Props {
+  target?: string;
+  label?: string;
+  class?: string;
+}
+
+const { target, label = 'Copy', class: className } = Astro.props;
+---
+
+<button
+  type="button"
+  class:list={['copy-btn', className]}
+  data-copy-button
+  data-target={target}
+  aria-label={label}
+>
+  <span class="copy-btn__label" data-copy-label>{label}</span>
+</button>
+
+<style>
+  .copy-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    font-size: var(--text-xs);
+    font-family: var(--font-sans);
+    padding: var(--space-1) var(--space-2);
+    color: var(--color-muted);
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+
+  .copy-btn:hover {
+    color: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+
+  .copy-btn[data-copied='true'] {
+    color: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+</style>
+
+<script>
+  function resolveSource(btn: HTMLElement): HTMLElement | null {
+    const sel = btn.dataset.target;
+    if (sel) {
+      const el = document.querySelector<HTMLElement>(sel);
+      if (el) return el;
+    }
+    const prev = btn.previousElementSibling;
+    if (prev && prev.matches('pre, code')) return prev as HTMLElement;
+    const parent = btn.parentElement;
+    const within = parent?.querySelector<HTMLElement>('pre, code');
+    return within ?? null;
+  }
+
+  function initCopyButtons() {
+    const buttons =
+      document.querySelectorAll<HTMLButtonElement>('[data-copy-button]');
+    buttons.forEach((btn) => {
+      if (btn.dataset.bound === 'true') return;
+      btn.dataset.bound = 'true';
+      const labelEl = btn.querySelector<HTMLElement>('[data-copy-label]');
+      const original = labelEl?.textContent ?? 'Copy';
+
+      btn.addEventListener('click', async () => {
+        const src = resolveSource(btn);
+        const text = src?.textContent ?? '';
+        try {
+          await navigator.clipboard.writeText(text.trim());
+        } catch {
+          // Fallback for non-secure contexts.
+          const ta = document.createElement('textarea');
+          ta.value = text.trim();
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          try {
+            document.execCommand('copy');
+          } catch {
+            /* give up silently */
+          }
+          ta.remove();
+        }
+        btn.dataset.copied = 'true';
+        if (labelEl) labelEl.textContent = 'Copied!';
+        window.setTimeout(() => {
+          btn.dataset.copied = 'false';
+          if (labelEl) labelEl.textContent = original;
+        }, 1500);
+      });
+    });
+  }
+
+  initCopyButtons();
+  document.addEventListener('astro:page-load', initCopyButtons);
+</script>

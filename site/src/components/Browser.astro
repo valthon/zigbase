@@ -1,0 +1,88 @@
+---
+interface Props {
+  url?: string;
+  class?: string;
+}
+
+const { url = 'http://127.0.0.1:8090/_/', class: className } = Astro.props;
+---
+
+<div class:list={['browser', className]}>
+  <div class="browser__chrome">
+    <span class="browser__dots" aria-hidden="true">
+      <span class="browser__dot browser__dot--red"></span>
+      <span class="browser__dot browser__dot--yellow"></span>
+      <span class="browser__dot browser__dot--green"></span>
+    </span>
+    <div class="browser__address" aria-hidden="true">{url}</div>
+  </div>
+  <div class="browser__viewport">
+    <slot />
+  </div>
+</div>
+
+<style>
+  .browser {
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    background-color: var(--color-surface);
+    box-shadow: 0 16px 40px -20px rgba(0, 0, 0, 0.35);
+  }
+
+  .browser__chrome {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    background-color: var(--color-surface);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .browser__dots {
+    display: inline-flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .browser__dot {
+    width: 11px;
+    height: 11px;
+    border-radius: var(--radius-full);
+    display: inline-block;
+  }
+  .browser__dot--red {
+    background-color: #ff5f57;
+  }
+  .browser__dot--yellow {
+    background-color: #febc2e;
+  }
+  .browser__dot--green {
+    background-color: #28c840;
+  }
+
+  .browser__address {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--color-muted);
+    background-color: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-full);
+    padding: var(--space-1) var(--space-3);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .browser__viewport {
+    background-color: var(--color-bg);
+    line-height: 0;
+  }
+
+  .browser__viewport :global(img) {
+    width: 100%;
+    height: auto;
+  }
+</style>

@@ -1,0 +1,6 @@
+---
+// Redirect /docs to the overview page (base-aware via BASE_URL).
+return Astro.redirect(
+  `${import.meta.env.BASE_URL.replace(/\/?$/, '/')}docs/overview`,
+);
+---

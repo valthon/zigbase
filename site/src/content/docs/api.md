@@ -1,20 +1,25 @@
-# ZigBase REST + WebSocket API
+---
+title: API
+description: The ZigBase HTTP REST and realtime WebSocket reference — collections, records, query grammar, access rules, auth, OAuth2, files, and realtime.
+order: 1
+group: reference
+---
 
-> 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/api> — the site is the canonical reading experience.
+# REST + WebSocket API
 
-ZigBase is a single-binary backend. This document is the user-facing reference for
-its HTTP REST API and its realtime WebSocket interface. It describes only what the
-server actually implements.
+ZigBase is a single-binary backend. This page is the user-facing reference for its HTTP
+REST API and its realtime WebSocket interface. It describes only what the server actually
+implements.
 
-> **New to ZigBase?** Start with the [tutorial](tutorial.md) (build an app end to
-> end), then reach for the [field-type catalog](fields.md) and the
-> [task recipes](recipes.md). This page is the endpoint reference.
+> **New to ZigBase?** Start with the [Tutorial](./tutorial) (build an app end to end), then
+> reach for the [field-type catalog](./fields) and the [task recipes](./recipes). This page
+> is the endpoint reference.
 
 ## Conventions
 
 - **Base path:** all REST endpoints live under `/api`.
-- **Encoding:** requests and responses are JSON (`Content-Type: application/json`),
-  except file uploads (`multipart/form-data`, see [Files](#files)) and file downloads.
+- **Encoding:** requests and responses are JSON (`Content-Type: application/json`), except
+  file uploads (`multipart/form-data`, see [Files](#files)) and file downloads.
 - **Error envelope:** every error response is a JSON object of the shape:
 
   ```json
@@ -37,16 +42,14 @@ server actually implements.
 A request is authenticated by either of:
 
 1. **Bearer token** — `Authorization: Bearer <jwt>`.
-2. **Cookie** — the httpOnly `zb_auth` cookie. When authenticating via the cookie,
-   unsafe methods (POST, PATCH, DELETE) additionally require a double-submit CSRF
-   check: send the value of the readable `zb_csrf` cookie back in the
-   `X-CSRF-Token` header. The server compares it against the CSRF claim embedded in
-   the token; a missing or mismatched header fails authentication on unsafe methods.
+2. **Cookie** — the httpOnly `zb_auth` cookie. When authenticating via the cookie, unsafe
+   methods (POST, PATCH, DELETE) additionally require a double-submit CSRF check: send the
+   value of the readable `zb_csrf` cookie back in the `X-CSRF-Token` header. The server
+   compares it against the CSRF claim embedded in the token; a missing or mismatched header
+   fails authentication on unsafe methods.
 
-The `zb_auth` cookie is httpOnly, `SameSite=Strict`; `zb_csrf` is readable (not
-httpOnly), `SameSite=Strict`. Both are set by the auth endpoints (see [Auth](#auth)).
-
----
+The `zb_auth` cookie is httpOnly, `SameSite=Strict`; `zb_csrf` is readable (not httpOnly),
+`SameSite=Strict`. Both are set by the auth endpoints (see [Auth](#auth)).
 
 ## Collections
 
@@ -62,9 +65,8 @@ Collection management endpoints are **superuser-only**.
 
 ### Input vs. output shape
 
-On **input** (POST/PATCH), the field list is supplied under the key `fields`.
-On **output**, the serialized collection exposes the field list under the key
-`schema`:
+On **input** (POST/PATCH), the field list is supplied under the key `fields`. On
+**output**, the serialized collection exposes the field list under the key `schema`:
 
 ```jsonc
 // request body (create)
@@ -91,12 +93,10 @@ On **output**, the serialized collection exposes the field list under the key
 
 ### Fields
 
-A field has a `name`, a `type` (e.g. `text`, `relation`, `file`, …), and a
-type-specific `options` object. Common options include `required` and `unique`;
-`relation` fields reference another collection. Auth collections (`"type":"auth"`)
-have system fields such as `email` injected automatically.
-
----
+A field has a `name`, a `type` (e.g. `text`, `relation`, `file`, …), and a type-specific
+`options` object. Common options include `required` and `unique`; `relation` fields
+reference another collection. Auth collections (`"type":"auth"`) have system fields such as
+`email` injected automatically. The complete field-type catalog is in [Fields](./fields).
 
 ## Records
 
@@ -110,8 +110,7 @@ Record endpoints operate on a collection by name (`:col`).
 | PATCH | `/api/collections/:col/records/:id` | Update a record. |
 | DELETE | `/api/collections/:col/records/:id` | Delete a record. |
 
-Access to each operation is governed by the collection's
-[access rules](#access-rules).
+Access to each operation is governed by the collection's [access rules](#access-rules).
 
 ### List: query parameters
 
@@ -137,8 +136,8 @@ The list response envelope:
 
 ### Filter grammar
 
-The `filter` parameter (and rule expressions, and realtime subscription filters)
-share one grammar.
+The `filter` parameter (and rule expressions, and realtime subscription filters) share one
+grammar.
 
 **Comparison operators:**
 
@@ -155,9 +154,9 @@ share one grammar.
 
 **Boolean combination:** `&&` (and), `||` (or), with parentheses `( )` for grouping.
 
-**Operands:** field paths (identifiers, may contain `.` for relation traversal,
-e.g. `author.name`), single- or double-quoted strings, numbers, booleans
-(`true`/`false`), and `null`.
+**Operands:** field paths (identifiers, may contain `.` for relation traversal, e.g.
+`author.name`), single- or double-quoted strings, numbers, booleans (`true`/`false`), and
+`null`.
 
 **Request macros** resolve against the current request:
 
@@ -195,12 +194,10 @@ expand=author,comments.user
 
 Expansion runs on both the list endpoint and the single-record `view` endpoint.
 
----
-
 ## Access rules
 
-Each collection defines five rules: **list**, **view**, **create**, **update**,
-**delete**. A rule is one of:
+Each collection defines five rules: **list**, **view**, **create**, **update**, **delete**.
+A rule is one of:
 
 | Rule value | Meaning |
 | --- | --- |
@@ -212,13 +209,11 @@ Superusers bypass all rules.
 
 **Denial status codes:**
 
-- **view / update / delete** on a record that does not exist *or* does not satisfy
-  the rule return **404** — this hides record existence.
+- **view / update / delete** on a record that does not exist *or* does not satisfy the rule
+  return **404** — this hides record existence.
 - **create** denial returns **403**.
-- A **locked** (`null`) list/view rule denies non-superusers (list returns 403; view
-  returns 404).
-
----
+- A **locked** (`null`) list/view rule denies non-superusers (list returns 403; view returns
+  404).
 
 ## Auth
 
@@ -246,64 +241,62 @@ Auth endpoints target an auth-type collection (`:col`).
 { "token": "<jwt>", "record": { "id": "...", "email": "..." } }
 ```
 
-`identity` is matched against the collection's configured identity fields.
-`auth-refresh` returns the same `{ token, record }` shape and re-sets the cookies.
-`auth-logout` clears `zb_auth` and `zb_csrf`.
+`identity` is matched against the collection's configured identity fields. `auth-refresh`
+returns the same `{ token, record }` shape and re-sets the cookies. `auth-logout` clears
+`zb_auth` and `zb_csrf`.
 
 ### Registration / signup
 
-There is **no dedicated register endpoint**. Signing up a user is a normal
-**record create on the auth collection**:
+There is **no dedicated register endpoint**. Signing up a user is a normal **record create
+on the auth collection**:
 
 ```sh
 POST /api/collections/users/records
 { "email": "user@example.com", "password": "a-good-password" }
 ```
 
-On this create the server hashes the password (argon2id), strips the plaintext,
-mints a `tokenKey`, and **forces `verified` to `false`** (a client-supplied
-`verified` is ignored); `passwordHash`/`tokenKey` are hidden in the response. The
-auth collection needs a **public create rule** (`""`) for open signup, and the
-password must be at least `minPasswordLength` (default 8) — otherwise the create is
-a `400`. After signup, obtain a token via `auth-with-password` above. Full walkthrough:
-[recipes.md → User registration](recipes.md#recipe-user-registration-signup).
+On this create the server hashes the password (argon2id), strips the plaintext, mints a
+`tokenKey`, and **forces `verified` to `false`** (a client-supplied `verified` is ignored);
+`passwordHash`/`tokenKey` are hidden in the response. The auth collection needs a **public
+create rule** (`""`) for open signup, and the password must be at least `minPasswordLength`
+(default 8) — otherwise the create is a `400`. After signup, obtain a token via
+`auth-with-password` above. Full walkthrough:
+[Recipes → User registration](./recipes#recipe-user-registration-signup).
 
 ### Verification & password reset — email delivery
 
-The `request-verification` and `request-password-reset` endpoints mint a token and
-deliver it via the configured mailer, then return `204` (they never reveal whether
-the email exists). The matching `confirm-*` endpoint takes that `token` in its body.
+The `request-verification` and `request-password-reset` endpoints mint a token and deliver
+it via the configured mailer, then return `204` (they never reveal whether the email
+exists). The matching `confirm-*` endpoint takes that `token` in its body.
 
 - **With SMTP configured** (`ZIGBASE_SMTP_HOST` + friends — see the
-  [README config table](../README.md#configuration)), the token is **emailed** over
-  the configured transport (`none` / `starttls` / `implicit` / `auto`).
-- **Without SMTP** (the default), the token is **logged to the server** instead — a
-  dev/CI convenience. To complete a flow locally, read the token from the log and POST
-  it to the matching `confirm-*` endpoint.
+  [Configuration table](./configuration#environment-variables)), the token is **emailed**
+  over the configured transport (`none` / `starttls` / `implicit` / `auto`).
+- **Without SMTP** (the default), the token is **logged to the server** instead — a dev/CI
+  convenience. To complete a flow locally, read the token from the log and POST it to the
+  matching `confirm-*` endpoint.
 
-Configure SMTP for production; see
-[KNOWN_LIMITATIONS.md → Auth & email](../KNOWN_LIMITATIONS.md).
+Configure SMTP for production; see [Known limitations](./known-limitations).
 
 ### Rate limiting
 
-The sensitive auth endpoints — `auth-with-password` (login), `request-verification`,
-and `request-password-reset` — are rate limited. Over the limit, the endpoint returns
-**`429 Too Many Requests`** (`{ "message": "Too many requests. Try again later." }`).
+The sensitive auth endpoints — `auth-with-password` (login), `request-verification`, and
+`request-password-reset` — are rate limited. Over the limit, the endpoint returns **`429
+Too Many Requests`** (`{ "message": "Too many requests. Try again later." }`).
 
 - **Config:** `ZIGBASE_RATE_LIMIT_MAX` attempts (default `10`) per
-  `ZIGBASE_RATE_LIMIT_WINDOW` seconds (default `60`), per client key, per endpoint.
-  Set `ZIGBASE_RATE_LIMIT_MAX=0` to disable rate limiting entirely.
-- **Keying:** the client key is the IP from `X-Forwarded-For` (first hop) or
-  `X-Real-IP`. **Deploy behind a reverse proxy that sets one of these headers** —
-  otherwise (direct exposure) the limiter falls back to keying on the submitted
-  identity/email, which is still spoofable. See
-  [KNOWN_LIMITATIONS.md → Auth & email](../KNOWN_LIMITATIONS.md).
+  `ZIGBASE_RATE_LIMIT_WINDOW` seconds (default `60`), per client key, per endpoint. Set
+  `ZIGBASE_RATE_LIMIT_MAX=0` to disable rate limiting entirely.
+- **Keying:** the client key is the IP from `X-Forwarded-For` (first hop) or `X-Real-IP`.
+  **Deploy behind a reverse proxy that sets one of these headers** — otherwise (direct
+  exposure) the limiter falls back to keying on the submitted identity/email, which is still
+  spoofable. See [Known limitations](./known-limitations).
 
 ### OAuth2
 
-ZigBase uses **client-driven PKCE**: the client generates and holds the PKCE state
-and code verifier, runs the authorization redirect itself, then submits the
-authorization `code` to the server.
+ZigBase uses **client-driven PKCE**: the client generates and holds the PKCE state and code
+verifier, runs the authorization redirect itself, then submits the authorization `code` to
+the server.
 
 | Method | Path | Description |
 | --- | --- | --- |
@@ -328,15 +321,12 @@ authorization `code` to the server.
 
 `redirectUrl` must be in the provider's configured allowlist.
 
----
-
 ## Files
 
 File-type fields hold uploaded files.
 
-- **Upload:** files are submitted via `multipart/form-data` on record create
-  (`POST .../records`) or update (`PATCH .../records/:id`), alongside the other
-  field values.
+- **Upload:** files are submitted via `multipart/form-data` on record create (`POST
+  .../records`) or update (`PATCH .../records/:id`), alongside the other field values.
 - **Serve:** `GET /api/files/:col/:rec/:name`.
 
 ### Access
@@ -344,30 +334,28 @@ File-type fields hold uploaded files.
 File access reuses the collection's **view** rule:
 
 - Files in a **public** collection (empty view rule) serve directly.
-- Files in a **protected** collection require an authenticated identity. Supply it
-  via a bearer token, the auth cookie, or a short-lived **file token**:
-  `POST /api/files/token` returns `{ "token": "<jwt>" }` (the caller must already be
-  authenticated). Pass that token to the serve endpoint as the `token` query
-  parameter: `GET /api/files/:col/:rec/:name?token=...`.
+- Files in a **protected** collection require an authenticated identity. Supply it via a
+  bearer token, the auth cookie, or a short-lived **file token**: `POST /api/files/token`
+  returns `{ "token": "<jwt>" }` (the caller must already be authenticated). Pass that token
+  to the serve endpoint as the `token` query parameter: `GET
+  /api/files/:col/:rec/:name?token=...`.
 
 ### Content handling
 
-Only known-safe types are rendered inline (images such as png/jpg/gif/webp/avif/
-bmp/ico, plus pdf). Everything else is served as a download:
-`Content-Disposition: attachment` with `X-Content-Type-Options: nosniff` (this
-neutralizes HTML/SVG/JS XSS). Appending `?download` forces a download for any type.
-
----
+Only known-safe types are rendered inline (images such as png/jpg/gif/webp/avif/bmp/ico,
+plus pdf). Everything else is served as a download: `Content-Disposition: attachment` with
+`X-Content-Type-Options: nosniff` (this neutralizes HTML/SVG/JS XSS). Appending `?download`
+forces a download for any type.
 
 ## Realtime (WebSocket)
 
-Connect to `ws://<host>/api/realtime` (the upgrade is gated to that exact path and
-the connection Origin is validated against the server's allowlist).
+Connect to `ws://<host>/api/realtime` (the upgrade is gated to that exact path and the
+connection Origin is validated against the server's allowlist).
 
 ### Authenticating
 
-Send the JWT explicitly as a frame — the auth **cookie is intentionally NOT used**
-over WebSocket (defense against cross-site WebSocket hijacking):
+Send the JWT explicitly as a frame — the auth **cookie is intentionally NOT used** over
+WebSocket (defense against cross-site WebSocket hijacking):
 
 ```json
 { "action": "auth", "token": "<jwt>" }
@@ -383,11 +371,10 @@ The server replies `{ "type": "auth", "status": "ok" | "error" }`.
 ```
 
 A topic is either a whole collection (`<collection>`) or a single record
-(`<collection>/<id>`). `filter` is optional and uses the
-[filter grammar](#filter-grammar). Unsubscribe with
-`{ "action": "unsubscribe", "topic": "..." }`. The server acknowledges subscribe/
-unsubscribe with `{ "type": "ack", "action": "...", "topic": "..." }`. On connect it
-sends `{ "type": "connect", "clientId": "..." }`.
+(`<collection>/<id>`). `filter` is optional and uses the [filter grammar](#filter-grammar).
+Unsubscribe with `{ "action": "unsubscribe", "topic": "..." }`. The server acknowledges
+subscribe/unsubscribe with `{ "type": "ack", "action": "...", "topic": "..." }`. On connect
+it sends `{ "type": "connect", "clientId": "..." }`.
 
 ### Event frames
 
@@ -404,14 +391,11 @@ When a subscribed record changes, the server pushes:
 
 `action` is one of `create`, `update`, `delete`. For `delete`, `record` is id-only.
 
-Malformed or unknown client frames produce
-`{ "type": "error", "message": "..." }`.
-
----
+Malformed or unknown client frames produce `{ "type": "error", "message": "..." }`.
 
 ## See also
 
-- [tutorial.md](tutorial.md) — build an app on ZigBase, end to end.
-- [fields.md](fields.md) — the complete field-type & options catalog.
-- [recipes.md](recipes.md) — provisioning, access rules, hooks, custom routes, jobs.
-- [framework.md](framework.md) — embedding ZigBase as a Zig library.
+- [Tutorial](./tutorial) — build an app on ZigBase, end to end.
+- [Fields](./fields) — the complete field-type & options catalog.
+- [Recipes](./recipes) — provisioning, access rules, hooks, custom routes, jobs.
+- [Framework](./framework) — embedding ZigBase as a Zig library.

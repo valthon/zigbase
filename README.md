@@ -10,6 +10,8 @@ with comptime record hooks, custom HTTP routes, and scheduled jobs.
 
 `v0.1.0 — early release` · `License: Apache-2.0` · see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
 
+**Website & docs:** <https://valthon.github.io/zigbase>
+
 ## Quickstart (run the binary)
 
 ```sh

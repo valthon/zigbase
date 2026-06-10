@@ -1,5 +1,7 @@
 # Building a Zig app on ZigBase
 
+> 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/framework> — the site is the canonical reading experience.
+
 ZigBase is not only a standalone backend binary — it is an **embeddable Zig
 framework**. You `zig fetch --save` it, `@import("zigbase")`, and configure
 `zigbase.App(.{...})` with comptime hooks, custom routes, scheduled jobs, and

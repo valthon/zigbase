@@ -1,0 +1,60 @@
+---
+import { Image } from 'astro:assets';
+import Browser from '../Browser.astro';
+import adminDashboard from '../../assets/screenshots/admin-dashboard.png';
+---
+
+<section class="admin">
+  <div class="container">
+    <header class="admin__head">
+      <h2>An admin dashboard, built in</h2>
+      <p>
+        Manage collections, records, and users from the embedded single-page
+        admin UI served at <code>/_/</code> — nothing extra to deploy.
+      </p>
+    </header>
+
+    <Browser url="127.0.0.1:8090/_/" class="admin__frame">
+      <Image
+        src={adminDashboard}
+        width={adminDashboard.width}
+        height={adminDashboard.height}
+        alt="ZigBase admin dashboard showing a sidebar of collections and a table of post records"
+        class="admin__shot"
+        loading="lazy"
+        decoding="async"
+        sizes="(max-width: 960px) 100vw, 920px"
+      />
+    </Browser>
+  </div>
+</section>
+
+<style>
+  .admin {
+    padding-block: var(--space-8);
+    background-color: var(--color-surface);
+    border-block: 1px solid var(--color-border);
+  }
+
+  .admin__head {
+    text-align: center;
+    max-width: 54ch;
+    margin: 0 auto var(--space-6);
+  }
+
+  .admin__head p {
+    color: var(--color-muted);
+    margin-top: var(--space-3);
+  }
+
+  .admin__frame {
+    max-width: 920px;
+    margin-inline: auto;
+  }
+
+  .admin__shot {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+</style>

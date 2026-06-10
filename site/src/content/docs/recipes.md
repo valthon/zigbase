@@ -1,43 +1,45 @@
-# Recipes: building a real app on ZigBase
+---
+title: Recipes
+description: Copy-pasteable recipes — provisioning a schema, signup, owner-scoped access rules, validation hooks, custom routes, and DB access in cron jobs.
+order: 1
+group: guides
+---
 
-> 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/recipes> — the site is the canonical reading experience.
+# Recipes
 
 Task-oriented, copy-pasteable recipes for going from an empty database to a working
 backend. The running example is **"Airbnb for golf simulators"**: hosts list golf
 simulators, guests book time slots.
 
-These recipes assume a ZigBase server running on `http://127.0.0.1:8090` and a
-superuser already created:
+These recipes assume a ZigBase server running on `http://127.0.0.1:8090` and a superuser
+already created:
 
 ```sh
 ./zig-out/bin/zigbase superuser create --email admin@example.com --password "a-strong-password" --data-dir ./zb_data
 ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" ./zig-out/bin/zigbase serve --data-dir ./zb_data
 ```
 
-Reference companions: field shapes are in [fields.md](fields.md); endpoint envelopes
-and rule semantics are in [api.md](api.md); the framework hook/route/job APIs are in
-[framework.md](framework.md).
-
----
+Reference companions: field shapes are in [Fields](./fields); endpoint envelopes and rule
+semantics are in [API](./api); the framework hook/route/job APIs are in
+[Framework](./framework).
 
 ## Recipe: provisioning your schema
 
-There is no "import a schema file" endpoint — over the REST API you **provision by
-calling `POST /api/collections`** for each collection, as a superuser. Because
-relation fields reference their target by **id** (not name — see
-[fields.md → relation gotcha](fields.md#critical-targetcollectionid-is-an-id-not-a-name)),
-you must create collections **in dependency order** and **capture each `id`** from
-the response to feed the next collection's `targetCollectionId`.
+There is no "import a schema file" endpoint — over the REST API you **provision by calling
+`POST /api/collections`** for each collection, as a superuser. Because relation fields
+reference their target by **id** (not name — see
+[Fields → relation gotcha](./fields#relation)), you must create collections **in
+dependency order** and **capture each `id`** from the response to feed the next
+collection's `targetCollectionId`.
 
-> **Embedding ZigBase?** You can skip the REST dance entirely and **declare your
-> schema in Zig at comptime** via `App(.{ .collections = .{ ... } })`, provisioned
-> at startup with additive auto-migration — relations reference their target **by
-> name** (no id-capturing). See
-> [framework.md → Define your schema in code](framework.md#8-define-your-schema-in-code-collections--migrations).
+> **Embedding ZigBase?** You can skip the REST dance entirely and **declare your schema in
+> Zig at comptime** via `App(.{ .collections = .{ ... } })`, provisioned at startup with
+> additive auto-migration — relations reference their target **by name** (no id-capturing).
+> See [Framework → Define your schema in code](./framework#8-define-your-schema-in-code-collections--migrations).
 
-The script below logs in as the superuser, then creates `users` (auth) →
-`simulators` → `listings` → `bookings`, wiring relations by captured id, and seeds a
-demo simulator. It uses `curl` + `jq`.
+The script below logs in as the superuser, then creates `users` (auth) → `simulators` →
+`listings` → `bookings`, wiring relations by captured id, and seeds a demo simulator. It
+uses `curl` + `jq`.
 
 ```bash
 #!/usr/bin/env bash
@@ -156,19 +158,17 @@ echo "Provisioning complete."
 
 Notes:
 
-- **Order matters.** `users` and `simulators` must exist (and their ids captured)
-  before `listings`; `listings` and `users` before `bookings`.
-- **Capture the id, not the name.** Every relation's `targetCollectionId` above is a
-  shell variable holding the **id** returned by the prior create call.
+- **Order matters.** `users` and `simulators` must exist (and their ids captured) before
+  `listings`; `listings` and `users` before `bookings`.
+- **Capture the id, not the name.** Every relation's `targetCollectionId` above is a shell
+  variable holding the **id** returned by the prior create call.
 - Collection management is **superuser-only**; record create/seed calls run as the
   relevant user (or anonymously where the create rule is public).
 
----
-
 ## Recipe: user registration (signup)
 
-ZigBase has no separate "register" endpoint. **Signup is a normal record create on
-an auth collection:**
+ZigBase has no separate "register" endpoint. **Signup is a normal record create on an auth
+collection:**
 
 ```sh
 curl -s -X POST "$BASE/api/collections/users/records" \
@@ -186,13 +186,12 @@ What the server does on this create (auth collections only):
 
 Requirements:
 
-- The `users` collection needs a **public create rule** (`"createRule": ""`) for
-  open signup. With any other rule, anonymous signup is denied (a non-public,
-  non-empty rule yields `403`; a `null`/locked rule yields `403`).
+- The `users` collection needs a **public create rule** (`"createRule": ""`) for open
+  signup. With any other rule, anonymous signup is denied (a non-public, non-empty rule
+  yields `403`; a `null`/locked rule yields `403`).
 - `password` must be at least **`minPasswordLength`** characters (default **8**;
   configurable in the collection's `options.auth.minPasswordLength`). A missing or
-  too-short password is a **`400`** ("A password of the required length is
-  required.").
+  too-short password is a **`400`** ("A password of the required length is required.").
 
 Then **log in** to obtain a token (and the `zb_auth`/`zb_csrf` cookies):
 
@@ -203,25 +202,23 @@ curl -s -X POST "$BASE/api/collections/users/auth-with-password" \
 # -> { "token": "<jwt>", "record": { "id": "...", "email": "guest@example.com", ... } }
 ```
 
-`identity` is matched against the collection's `identityFields` (default `["email"]`).
-See [api.md → auth-with-password](api.md#auth-with-password). Email **verification**
-is optional; the token is emailed when SMTP is configured, or logged in dev otherwise —
-see [api.md → Verification & password reset](api.md#verification--password-reset--email-delivery).
-
----
+`identity` is matched against the collection's `identityFields` (default `["email"]`). See
+[API → auth-with-password](./api#auth-with-password). Email **verification** is optional;
+the token is emailed when SMTP is configured, or logged in dev otherwise — see
+[API → Verification & password reset](./api#verification--password-reset--email-delivery).
 
 ## Recipe: owner-scoped access rules
 
 Access rules are filter expressions evaluated per request (full grammar in
-[api.md → Filter grammar](api.md#filter-grammar)). Relevant pieces:
+[API → Filter grammar](./api#filter-grammar)). Relevant pieces:
 
 - `@request.auth.id` — the authenticated user's record id (`""` when anonymous).
 - A bare field name (e.g. `owner`) refers to the record being checked.
 - **Relation traversal with `.` is supported in rules** (not just flat fields):
-  `simulator.owner` follows the single-value `simulator` relation to the simulators
-  row and reads its `owner`. You can chain: `listing.simulator.owner`. (Traversal
-  works through **single-value** relations; traversing a multi-value relation —
-  `maxSelect > 1` — is not supported and the query is rejected.)
+  `simulator.owner` follows the single-value `simulator` relation to the simulators row
+  and reads its `owner`. You can chain: `listing.simulator.owner`. (Traversal works
+  through **single-value** relations; traversing a multi-value relation — `maxSelect > 1`
+  — is not supported and the query is rejected.)
 
 ### Edit only your own records
 
@@ -232,8 +229,7 @@ Access rules are filter expressions evaluated per request (full grammar in
 
 ### Public read OR owner read
 
-Anyone may read published rows; the owner may additionally read their own
-(e.g. drafts):
+Anyone may read published rows; the owner may additionally read their own (e.g. drafts):
 
 ```jsonc
 "listRule": "status = \"published\"",
@@ -249,17 +245,17 @@ booked listing's simulator:
 "viewRule": "@request.auth.id = guest || @request.auth.id = listing.simulator.owner"
 ```
 
-Here `listing.simulator.owner` traverses `bookings.listing` →
-`listings.simulator` → `simulators.owner`.
+Here `listing.simulator.owner` traverses `bookings.listing` → `listings.simulator` →
+`simulators.owner`.
 
 ### How does the `owner` field get set on create?
 
-A rule like `updateRule: "@request.auth.id = owner"` only protects *existing* rows.
-You still must ensure the `owner` field is correctly populated **at create time**.
-Two patterns:
+A rule like `updateRule: "@request.auth.id = owner"` only protects *existing* rows. You
+still must ensure the `owner` field is correctly populated **at create time**. Two
+patterns:
 
-1. **Server sets it (recommended).** A `beforeCreate` hook overwrites `owner` from
-   the authenticated identity, so the client can't spoof it:
+1. **Server sets it (recommended).** A `beforeCreate` hook overwrites `owner` from the
+   authenticated identity, so the client can't spoof it:
 
    ```zig
    fn setOwner(ev: *zigbase.RecordEvent) anyerror!void {
@@ -269,29 +265,29 @@ Two patterns:
        try ev.record.object.put(ev.arena, "owner", .{ .string = uid }); // ev.arena, not app.allocator
    }
    ```
-   Register it as `.hooks = .{ .simulators = .{ .beforeCreate = setOwner } }`. See
-   [framework.md → Record hooks](framework.md#4-record-hooks-hooks).
 
-2. **Client sends it, the create rule enforces it.** Require the submitted `owner`
-   to equal the caller, via a `@request.data.*` create rule:
+   Register it as `.hooks = .{ .simulators = .{ .beforeCreate = setOwner } }`. See
+   [Framework → Record hooks](./framework#4-record-hooks-hooks).
+
+2. **Client sends it, the create rule enforces it.** Require the submitted `owner` to
+   equal the caller, via a `@request.data.*` create rule:
 
    ```jsonc
    "createRule": "@request.data.owner = @request.auth.id"
    ```
-   The client must include `"owner": "<their id>"` in the body; a mismatched or
-   missing value fails the rule with `403`.
+
+   The client must include `"owner": "<their id>"` in the body; a mismatched or missing
+   value fails the rule with `403`.
 
 Pattern 1 is sturdier (the client cannot get it wrong); pattern 2 needs no Zig code.
 
----
-
 ## Recipe: a computed-field / validation `beforeCreate` hook
 
-A `beforeCreate` hook runs **after** access rules pass and **before** the write. It
-may mutate `ev.record` and may **return an error to reject** the write (the request
-fails with `400`). This example, on `bookings`, (a) rejects a booking that overlaps
-an existing confirmed booking for the same listing, and (b) computes a derived
-`duration_minutes` field.
+A `beforeCreate` hook runs **after** access rules pass and **before** the write. It may
+mutate `ev.record` and may **return an error to reject** the write (the request fails with
+`400`). This example, on `bookings`, (a) rejects a booking that overlaps an existing
+confirmed booking for the same listing, and (b) computes a derived `duration_minutes`
+field.
 
 ```zig
 const std = @import("std");
@@ -339,31 +335,28 @@ Register it:
 
 Key points:
 
-- **Use `ev.arena`** for anything stored into `ev.record` (the request-scoped
-  allocator that owns the record's JSON), never `ev.app.allocator`. See
-  [framework.md → CRITICAL: use ev.arena](framework.md#critical-use-evarena-not-evappallocator).
+- **Use `ev.arena`** for anything stored into `ev.record` (the request-scoped allocator
+  that owns the record's JSON), never `ev.app.allocator`. See
+  [Framework → CRITICAL: use ev.arena](./framework#critical-use-evarena-not-evappallocator).
 - **`ev.data.list(collection, query)`** returns a `ListResult` with `totalItems` and
-  `items`; the `query` is a `records.ListQuery` (`.filter`, `.sort`, `.page`,
-  `.perPage`). `ev.data` also offers `findById`, `create`, `update`, `delete`.
-- **Returning any error rejects** the create with `400` ("Request rejected by a
-  hook.").
-- **Atomicity caveat:** a `before*` hook's own `ev.data` writes are **not** atomic
-  with the triggering write (the triggering write's transaction opens after the hook
-  returns). For a pure read-and-validate hook like this, that's fine; avoid relying
-  on a hook-issued side-write rolling back if the main write fails. See
-  [framework.md → Atomicity caveat](framework.md#the-evdata-facade).
-
----
+  `items`; the `query` is a `records.ListQuery` (`.filter`, `.sort`, `.page`, `.perPage`).
+  `ev.data` also offers `findById`, `create`, `update`, `delete`.
+- **Returning any error rejects** the create with `400` ("Request rejected by a hook.").
+- **Atomicity caveat:** a `before*` hook's own `ev.data` writes are **not** atomic with the
+  triggering write (the triggering write's transaction opens after the hook returns). For a
+  pure read-and-validate hook like this, that's fine; avoid relying on a hook-issued
+  side-write rolling back if the main write fails. See
+  [Framework → The ev.data facade](./framework#the-evdata-facade).
 
 ## Recipe: a custom business route with a path param + DB write
 
-A `POST /api/bookings/:id/confirm` route that a host calls to confirm a pending
-booking. It reads the `:id` path param, loads the record, mutates it, and returns the
-standard JSON envelope (or `404`/`403`).
+A `POST /api/bookings/:id/confirm` route that a host calls to confirm a pending booking. It
+reads the `:id` path param, loads the record, mutates it, and returns the standard JSON
+envelope (or `404`/`403`).
 
-`RouteEvent` carries `app`, `ctx` (the `http.RequestCtx`), and `rctx` (the resolved
-auth identity). It does **not** carry a `Data` facade — build one from the pool the
-same way a cron job does.
+`RouteEvent` carries `app`, `ctx` (the `http.RequestCtx`), and `rctx` (the resolved auth
+identity). It does **not** carry a `Data` facade — build one from the pool the same way a
+cron job does.
 
 ```zig
 const std = @import("std");
@@ -402,8 +395,8 @@ fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
 }
 ```
 
-Register it (note `.auth = .authed` so only logged-in users reach the handler; the
-default if omitted is `.superuser`):
+Register it (note `.auth = .authed` so only logged-in users reach the handler; the default
+if omitted is `.superuser`):
 
 ```zig
 .routes = .{
@@ -414,30 +407,28 @@ default if omitted is `.superuser`):
 Key points:
 
 - **Path params:** `ev.ctx.param("id")` returns the captured `:id` (or `null`).
-- **The auth level is enforced by the framework before your handler runs**; inside,
-  use `ev.rctx` for finer authorization (e.g. owner checks).
+- **The auth level is enforced by the framework before your handler runs**; inside, use
+  `ev.rctx` for finer authorization (e.g. owner checks).
 - **Built-in routes win** over custom routes matching the same method+path, so namespace
   your routes (`/api/bookings/:id/confirm`, not a path that shadows a built-in).
 - Return any `zigbase.http.Response`; the body is a JSON string you allocate from
   `ev.ctx.allocator`.
 
----
-
 ## Recipe: DB access inside a cron / lifecycle job
 
-A `JobEvent` carries `app` and `name` — but no ambient connection. Use the RAII
-DB accessors it exposes to check a connection out of the pool and hand it back:
+A `JobEvent` carries `app` and `name` — but no ambient connection. Use the RAII DB
+accessors it exposes to check a connection out of the pool and hand it back:
 
 - For **writes**: `var w = ev.writer(); defer w.deinit();` then `w.data()`.
 - For **reads**: `var r = try ev.reader(); defer r.deinit();` then `r.data()`.
 
-`w.data()` / `r.data()` each yield a `zigbase.Data` bound to that connection
-(`findById` / `create` / `update` / `delete` / `list`). The same accessors exist on
-`RouteEvent` and `LifecycleEvent`. (See
-[framework.md → DB access from a route](framework.md#db-access-from-a-route-evwriter--evreader).)
+`w.data()` / `r.data()` each yield a `zigbase.Data` bound to that connection (`findById` /
+`create` / `update` / `delete` / `list`). The same accessors exist on `RouteEvent` and
+`LifecycleEvent`. (See
+[Framework → DB access from a route](./framework#db-access-from-a-route-evwriter--evreader).)
 
-This nightly job cancels stale `pending` bookings (older than now) by listing them
-and updating each:
+This nightly job cancels stale `pending` bookings (older than now) by listing them and
+updating each:
 
 ```zig
 const std = @import("std");
@@ -468,8 +459,8 @@ fn expireStaleBookings(ev: *zigbase.events.JobEvent) anyerror!void {
 }
 ```
 
-Register it on a schedule (cron/interval handlers have the
-`fn (*JobEvent) anyerror!void` signature):
+Register it on a schedule (cron/interval handlers have the `fn (*JobEvent) anyerror!void`
+signature):
 
 ```zig
 .jobs = .{ .pool_size = 2 },
@@ -482,17 +473,14 @@ Register it on a schedule (cron/interval handlers have the
 
 Key points:
 
-- **Always `defer <handle>.deinit()`** on the writer/reader handle — it releases
-  the writer (or returns the reader connection) to the pool. The writer is a single
-  shared, mutex-guarded connection — holding it blocks all other writes.
-- Job allocations can use `ev.app.allocator` (the long-lived gpa) since there is no
-  request arena here; free anything large yourself if the job runs often.
-- Scheduling is **single-process, UTC, minute-granularity**; cron is numeric-only.
-  See [framework.md → Scheduled jobs](framework.md#7-scheduled-jobs-cron--jobs) and
-  its caveats.
+- **Always `defer <handle>.deinit()`** on the writer/reader handle — it releases the writer
+  (or returns the reader connection) to the pool. The writer is a single shared,
+  mutex-guarded connection — holding it blocks all other writes.
+- Job allocations can use `ev.app.allocator` (the long-lived gpa) since there is no request
+  arena here; free anything large yourself if the job runs often.
+- Scheduling is **single-process, UTC, minute-granularity**; cron is numeric-only. See
+  [Framework → Scheduled jobs](./framework#7-scheduled-jobs-cron--jobs) and its caveats.
 
----
+## See also
 
-See also: [fields.md](fields.md) · [tutorial.md](tutorial.md) ·
-[api.md](api.md) · [framework.md](framework.md)
-</content>
+[Fields](./fields) · [Tutorial](./tutorial) · [API](./api) · [Framework](./framework)

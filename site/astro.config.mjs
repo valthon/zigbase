@@ -1,0 +1,46 @@
+// @ts-check
+import { defineConfig } from 'astro/config';
+import { rehypeHeadingIds } from '@astrojs/markdown-remark';
+import rehypeAutolinkHeadings from 'rehype-autolink-headings';
+
+// https://astro.build/config
+export default defineConfig({
+  site: 'https://valthon.github.io',
+  base: '/zigbase',
+  trailingSlash: 'never',
+  build: {
+    // Emit `docs/tutorial.html` (served at `/zigbase/docs/tutorial`, no trailing
+    // slash) rather than `docs/tutorial/index.html` (served at `.../tutorial/`).
+    // This is what makes the authored relative cross-links in the markdown content
+    // (e.g. `./api`, `../download`) resolve correctly on GitHub Pages — a sibling
+    // `./api` from `/zigbase/docs/tutorial` points at `/zigbase/docs/api`.
+    format: 'file',
+  },
+  markdown: {
+    // Append a small '#' anchor link to each heading so the prose CSS can render
+    // hover anchors and the TOC can target them.
+    //
+    // rehypeHeadingIds is REQUIRED here, not redundant: rehype-autolink-headings
+    // needs heading `id`s to already exist when it runs, and a user-supplied
+    // rehypePlugins array runs before Astro injects its own id pass — so without
+    // this explicit plugin the autolink step finds no ids and emits zero anchors
+    // (verified: removing it drops 24 anchors → 0 on the framework page).
+    rehypePlugins: [
+      rehypeHeadingIds,
+      [
+        rehypeAutolinkHeadings,
+        {
+          behavior: 'append',
+          properties: { class: 'heading-anchor', ariaHidden: 'true', tabIndex: -1 },
+          content: [],
+        },
+      ],
+    ],
+    shikiConfig: {
+      themes: {
+        light: 'github-light',
+        dark: 'github-dark',
+      },
+    },
+  },
+});
