@@ -8,6 +8,7 @@ pub const Server = @import("server.zig").Server;
 pub const http = @import("http.zig");
 pub const Data = @import("data.zig").Data;
 pub const events = @import("events.zig");
+pub const schedule = @import("schedule.zig");
 pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
 pub const RouteEvent = events.RouteEvent;

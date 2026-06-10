@@ -44,11 +44,20 @@ fn ping(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
     return .{ .status = 200, .body = "{\"pong\":true}" };
 }
 
+/// An interval job: logs a heartbeat (demonstrates background scheduling).
+fn heartbeat(ev: *zigbase.events.JobEvent) anyerror!void {
+    std.log.info("blog heartbeat job '{s}' ran", .{ev.name});
+}
+
 pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{
         .hooks = .{ .posts = .{ .beforeCreate = slugify } },
         .routes = .{
             .{ .method = .GET, .path = "/api/blog/ping", .handler = ping, .auth = .public },
+        },
+        .jobs = .{ .pool_size = 2 },
+        .cron = .{
+            .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
         },
     }).runCli(init);
 }
