@@ -1,0 +1,194 @@
+---
+import { getCollection } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+import Nav from '../../components/Nav.astro';
+import Footer from '../../components/Footer.astro';
+
+// BASE_URL is '/zigbase' (no trailing slash) — normalise to trailing slash.
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
+const examples = (await getCollection('examples')).sort(
+  (a, b) => a.data.order - b.data.order,
+);
+---
+
+<Base
+  title="Examples — ZigBase"
+  description="Three buildable examples that form a ladder: a packaging proof, a realistic app, and the advanced framework surface."
+>
+  <Nav />
+
+  <main class="container ex">
+    <header class="ex__head">
+      <p class="ex__eyebrow">Examples</p>
+      <h1 class="ex__title">Three examples, one ladder</h1>
+      <p class="ex__lede">
+        ZigBase ships three buildable example projects that climb from the
+        simplest possible use to the full framework surface: a
+        <strong>packaging proof</strong>, then a
+        <strong>realistic app</strong>, then the
+        <strong>advanced framework</strong> a library integrator configures in
+        code. Each builds against the published <code>zigbase</code> module.
+      </p>
+    </header>
+
+    <ol class="ex__grid">
+      {
+        examples.map((ex, i) => (
+          <li class="ex__card">
+            <a class="ex__card-link" href={`${base}examples/${ex.id}`}>
+              <span class="ex__rung">
+                <span class="ex__step">{i + 1}</span>
+                {ex.data.rung}
+              </span>
+              <h2 class="ex__card-title">{ex.data.title}</h2>
+              <p class="ex__card-summary">{ex.data.summary}</p>
+              <span class="ex__cta">
+                Read the walkthrough
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                  <path d="M5 12h14M13 6l6 6-6 6" />
+                </svg>
+              </span>
+            </a>
+            <a
+              class="ex__source"
+              href={`https://github.com/valthon/zigbase/tree/main/${ex.data.repoPath}`}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              View source on GitHub
+            </a>
+          </li>
+        ))
+      }
+    </ol>
+  </main>
+
+  <Footer />
+</Base>
+
+<style>
+  .ex {
+    padding-block: var(--space-7) var(--space-8);
+  }
+
+  .ex__head {
+    max-width: 60ch;
+    margin-bottom: var(--space-7);
+  }
+  .ex__eyebrow {
+    font-size: var(--text-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-accent);
+    margin-bottom: var(--space-2);
+  }
+  .ex__title {
+    font-size: var(--text-4xl);
+    margin: 0 0 var(--space-3);
+  }
+  .ex__lede {
+    color: var(--color-muted);
+    font-size: var(--text-lg);
+    line-height: var(--leading-normal);
+  }
+  .ex__lede code {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+  }
+
+  .ex__grid {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: var(--space-5);
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  }
+
+  .ex__card {
+    display: flex;
+    flex-direction: column;
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    transition: transform 0.15s ease, border-color 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+  .ex__card:hover {
+    transform: translateY(-3px);
+    border-color: var(--color-accent);
+    box-shadow: 0 8px 24px -12px rgba(0, 0, 0, 0.25);
+  }
+
+  .ex__card-link {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-5);
+    color: inherit;
+    text-decoration: none;
+    flex: 1;
+  }
+  .ex__card-link:hover {
+    text-decoration: none;
+  }
+
+  .ex__rung {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-muted);
+  }
+  .ex__step {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: var(--radius-full);
+    background-color: var(--color-accent);
+    color: #1a1a1a;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+
+  .ex__card-title {
+    font-size: var(--text-2xl);
+    margin: 0;
+  }
+  .ex__card-summary {
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+    line-height: var(--leading-normal);
+    margin: 0;
+    flex: 1;
+  }
+
+  .ex__cta {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+    color: var(--color-accent);
+    font-weight: 600;
+    font-size: var(--text-sm);
+  }
+
+  .ex__source {
+    display: block;
+    padding: var(--space-3) var(--space-5);
+    border-top: 1px solid var(--color-border);
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+  }
+  .ex__source:hover {
+    color: var(--color-accent);
+    text-decoration: none;
+  }
+</style>

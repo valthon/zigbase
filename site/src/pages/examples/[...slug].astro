@@ -1,0 +1,25 @@
+---
+import { getCollection, render } from 'astro:content';
+import type { GetStaticPaths } from 'astro';
+import ExampleLayout from '../../layouts/ExampleLayout.astro';
+
+export const getStaticPaths = (async () => {
+  const entries = await getCollection('examples');
+  return entries.map((entry) => ({
+    params: { slug: entry.id },
+    props: { entry },
+  }));
+}) satisfies GetStaticPaths;
+
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+---
+
+<ExampleLayout
+  title={entry.data.title}
+  description={entry.data.summary}
+  rung={entry.data.rung}
+  repoPath={entry.data.repoPath}
+>
+  <Content />
+</ExampleLayout>
