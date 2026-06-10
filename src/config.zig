@@ -1,5 +1,14 @@
 const std = @import("std");
 
+/// SMTP transport security mode (config-driven).
+///   none     — plaintext SMTP (MailHog / local relays; current behavior).
+///   starttls — connect plaintext, EHLO, issue STARTTLS, upgrade the same
+///              connection to TLS, re-EHLO; AUTH/MAIL/RCPT/DATA run over TLS.
+///   implicit — SMTPS: wrap the TCP connection in TLS immediately on connect
+///              (before any SMTP bytes); the whole exchange runs over TLS.
+///   auto     — infer from port: 465 → implicit, 587 → starttls, else → none.
+pub const SmtpTls = enum { none, starttls, implicit, auto };
+
 pub const Config = struct {
     http_host: []const u8 = "0.0.0.0",
     http_port: u16 = 8090,
@@ -22,6 +31,20 @@ pub const Config = struct {
     smtp_username: []const u8 = "", // non-empty enables AUTH LOGIN
     smtp_password: []const u8 = "",
     smtp_from: []const u8 = "noreply@zigbase.dev", // envelope + From: header address
+    smtp_tls: SmtpTls = .auto, // transport security: none/starttls/implicit/auto
+    smtp_insecure_skip_verify: bool = false, // true = skip cert verification (self-signed relays)
+
+    /// Resolve `auto` to a concrete TLS mode from the port:
+    ///   465 → implicit (SMTPS), 587 → starttls, anything else → none.
+    /// `none`/`starttls`/`implicit` are returned unchanged.
+    pub fn resolveSmtpTls(mode: SmtpTls, port: u16) SmtpTls {
+        if (mode != .auto) return mode;
+        return switch (port) {
+            465 => .implicit,
+            587 => .starttls,
+            else => .none,
+        };
+    }
 
     /// Pure loader: applies overrides from a getter (env in prod, a stub in tests).
     pub fn load(getter: *const fn ([]const u8) ?[]const u8) !Config {
@@ -43,6 +66,15 @@ pub const Config = struct {
         if (getter("ZIGBASE_SMTP_USERNAME")) |v| cfg.smtp_username = v;
         if (getter("ZIGBASE_SMTP_PASSWORD")) |v| cfg.smtp_password = v;
         if (getter("ZIGBASE_SMTP_FROM")) |v| cfg.smtp_from = v;
+        if (getter("ZIGBASE_SMTP_TLS")) |v| {
+            if (std.mem.eql(u8, v, "none")) cfg.smtp_tls = .none
+            else if (std.mem.eql(u8, v, "starttls")) cfg.smtp_tls = .starttls
+            else if (std.mem.eql(u8, v, "implicit")) cfg.smtp_tls = .implicit
+            else if (std.mem.eql(u8, v, "auto")) cfg.smtp_tls = .auto
+            else return error.InvalidSmtpTls;
+        }
+        if (getter("ZIGBASE_SMTP_INSECURE")) |v|
+            cfg.smtp_insecure_skip_verify = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
         return cfg;
     }
 };
@@ -102,6 +134,39 @@ test "auth defaults and overrides" {
     const c = try Config.load(&G1.get);
     try std.testing.expectEqual(true, c.cookie_secure);
     try std.testing.expectEqual(@as(i64, 3600), c.auth_token_ttl_s);
+}
+
+test "smtp_tls auto inference from port" {
+    // auto resolves per-port.
+    try std.testing.expectEqual(SmtpTls.implicit, Config.resolveSmtpTls(.auto, 465));
+    try std.testing.expectEqual(SmtpTls.starttls, Config.resolveSmtpTls(.auto, 587));
+    try std.testing.expectEqual(SmtpTls.none, Config.resolveSmtpTls(.auto, 25));
+    try std.testing.expectEqual(SmtpTls.none, Config.resolveSmtpTls(.auto, 2525));
+    // explicit modes pass through unchanged regardless of port.
+    try std.testing.expectEqual(SmtpTls.none, Config.resolveSmtpTls(.none, 465));
+    try std.testing.expectEqual(SmtpTls.starttls, Config.resolveSmtpTls(.starttls, 25));
+    try std.testing.expectEqual(SmtpTls.implicit, Config.resolveSmtpTls(.implicit, 587));
+}
+
+test "smtp tls env overrides" {
+    const G = struct {
+        fn get(key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_SMTP_TLS")) return "starttls";
+            if (std.mem.eql(u8, key, "ZIGBASE_SMTP_INSECURE")) return "true";
+            return null;
+        }
+    };
+    const cfg = try Config.load(&G.get);
+    try std.testing.expectEqual(SmtpTls.starttls, cfg.smtp_tls);
+    try std.testing.expectEqual(true, cfg.smtp_insecure_skip_verify);
+
+    // Default: auto + verify on.
+    const G0 = struct {
+        fn get(_: []const u8) ?[]const u8 { return null; }
+    };
+    const d = try Config.load(&G0.get);
+    try std.testing.expectEqual(SmtpTls.auto, d.smtp_tls);
+    try std.testing.expectEqual(false, d.smtp_insecure_skip_verify);
 }
 
 test "realtime origins default empty, overridable" {

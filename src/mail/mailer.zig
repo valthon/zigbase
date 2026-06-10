@@ -1,4 +1,6 @@
 const std = @import("std");
+const config = @import("../config.zig");
+const SmtpTls = config.SmtpTls;
 
 /// A single outbound email. v0.1 is text-only (no html_body) to keep the
 /// message builder simple; add an optional `html_body` later for multipart.
@@ -52,21 +54,51 @@ pub const LogMailer = struct {
     }
 };
 
-/// Minimal SMTP backend. v0.1 supports PLAINTEXT SMTP with optional AUTH LOGIN
-/// (base64 user/pass). TLS / STARTTLS is intentionally NOT implemented here to
-/// avoid shipping a broken crypto path; this works against plaintext relays and
-/// dev sinks like maildev/MailHog. TLS / submission-port (465/587) support is a
-/// documented follow-up. Connect -> EHLO -> [AUTH LOGIN] -> MAIL FROM -> RCPT TO
-/// -> DATA (RFC5322 message) -> QUIT.
+/// Minimal SMTP backend with optional TLS. Supports three transport modes,
+/// driven by `tls` (see `config.SmtpTls`):
+///   .none     — plaintext SMTP (MailHog / local relays).
+///   .implicit — SMTPS: TLS handshake immediately after connect, then the whole
+///               exchange runs over TLS (typically port 465).
+///   .starttls — connect plaintext, EHLO, STARTTLS, upgrade the SAME socket to
+///               TLS, re-EHLO, continue over TLS (typically port 587/25).
+///   .auto     — inferred from port (465→implicit, 587→starttls, else→none).
+/// AUTH LOGIN credentials (base64) are only ever sent AFTER the TLS handshake
+/// when a TLS mode is active, so they never leak in plaintext.
+///
+/// Connect -> [TLS] -> EHLO -> [STARTTLS -> TLS -> EHLO] -> [AUTH LOGIN] ->
+/// MAIL FROM -> RCPT TO -> DATA (RFC5322 message) -> QUIT.
 pub const SmtpMailer = struct {
     host: []const u8,
     port: u16,
     username: []const u8,
     password: []const u8,
     from: []const u8,
+    tls: SmtpTls = .auto,
+    insecure_skip_verify: bool = false,
 
     pub fn init(host: []const u8, port: u16, username: []const u8, password: []const u8, from: []const u8) SmtpMailer {
         return .{ .host = host, .port = port, .username = username, .password = password, .from = from };
+    }
+
+    /// Full constructor with explicit TLS mode + cert-verification policy.
+    pub fn initTls(
+        host: []const u8,
+        port: u16,
+        username: []const u8,
+        password: []const u8,
+        from: []const u8,
+        tls_mode: SmtpTls,
+        insecure_skip_verify: bool,
+    ) SmtpMailer {
+        return .{
+            .host = host,
+            .port = port,
+            .username = username,
+            .password = password,
+            .from = from,
+            .tls = tls_mode,
+            .insecure_skip_verify = insecure_skip_verify,
+        };
     }
 
     pub fn mailer(self: *SmtpMailer) Mailer {
@@ -75,79 +107,143 @@ pub const SmtpMailer = struct {
 
     const vtable = Mailer.VTable{ .send = send };
 
+    /// Active SMTP byte stream. `r`/`w` are the plaintext SMTP reader/writer;
+    /// over plaintext these point at the raw socket interfaces, over TLS they
+    /// point at the TLS client's decrypted reader / plaintext writer. When TLS
+    /// is active, `socket_w` is the underlying socket writer that must ALSO be
+    /// flushed after the TLS writer (the TLS writer encrypts into the socket
+    /// writer's buffer, which then has to be pushed to the wire) — mirrors
+    /// std/http/Client.zig Connection.flush (flush tls.client.writer then the
+    /// stream writer).
+    const Conn = struct {
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        socket_w: ?*std.Io.Writer = null,
+    };
+
     fn send(ptr: *anyopaque, io: std.Io, alloc: std.mem.Allocator, email: Email) anyerror!void {
         const self: *SmtpMailer = @ptrCast(@alignCast(ptr));
+
+        const mode = config.Config.resolveSmtpTls(self.tls, self.port);
 
         const addr = try std.Io.net.IpAddress.resolve(io, self.host, self.port);
         const stream = try addr.connect(io, .{ .mode = .stream });
         defer stream.close(io);
 
-        var read_buf: [4096]u8 = undefined;
-        var write_buf: [4096]u8 = undefined;
-        var sr = stream.reader(io, &read_buf);
-        var sw = stream.writer(io, &write_buf);
-        const r = &sr.interface;
-        const w = &sw.interface;
+        // Underlying socket reader/writer. For TLS these carry ciphertext; for
+        // plaintext they ARE the SMTP stream. TLS frames can be up to ~16 KiB,
+        // so size the socket buffers to the TLS minimum when TLS may be used.
+        const tls_min = std.crypto.tls.Client.min_buffer_len;
+        var sock_read: [tls_min]u8 = undefined;
+        var sock_write: [tls_min]u8 = undefined;
+        var sr = stream.reader(io, &sock_read);
+        var sw = stream.writer(io, &sock_write);
+        const sock_r = &sr.interface;
+        const sock_w = &sw.interface;
 
-        // Greeting.
-        try expectCode(r, 220);
+        switch (mode) {
+            .none => {
+                var conn = Conn{ .r = sock_r, .w = sock_w };
+                try self.runExchange(io, alloc, email, &conn, false);
+            },
+            .implicit => {
+                // Handshake immediately; the entire exchange runs over TLS.
+                var tls_state = try TlsState.init(self, alloc, io, sock_r, sock_w);
+                defer tls_state.deinit();
+                var conn = Conn{ .r = &tls_state.client.reader, .w = &tls_state.client.writer, .socket_w = sock_w };
+                try self.runExchange(io, alloc, email, &conn, false);
+            },
+            .starttls => {
+                // Plaintext greeting + EHLO, issue STARTTLS, then upgrade.
+                var plain = Conn{ .r = sock_r, .w = sock_w };
+                try expectCode(plain.r, 220);
+                try ehlo(&plain);
+                try writeLine(&plain, "STARTTLS\r\n");
+                try expectCode(plain.r, 220);
 
-        // EHLO.
-        try writeLine(w, "EHLO localhost\r\n");
-        try expectCode(r, 250);
+                var tls_state = try TlsState.init(self, alloc, io, sock_r, sock_w);
+                defer tls_state.deinit();
+                var conn = Conn{ .r = &tls_state.client.reader, .w = &tls_state.client.writer, .socket_w = sock_w };
+                // Banner already consumed on the plaintext leg; re-EHLO over TLS.
+                try self.runExchange(io, alloc, email, &conn, true);
+            },
+            .auto => unreachable, // resolveSmtpTls never returns .auto
+        }
+    }
 
-        // Optional AUTH LOGIN (base64 username then password).
+    /// Run the SMTP exchange over `conn`. When `skip_greeting` is false we first
+    /// wait for the 220 banner and EHLO; for STARTTLS the banner was already
+    /// consumed on the plaintext leg and we only re-EHLO over TLS.
+    fn runExchange(self: *SmtpMailer, io: std.Io, alloc: std.mem.Allocator, email: Email, conn: *Conn, comptime starttls_resumed: bool) anyerror!void {
+        if (!starttls_resumed) {
+            // Greeting (implicit TLS and plaintext both see the banner here).
+            try expectCode(conn.r, 220);
+        }
+        // EHLO (initial for none/implicit; the post-STARTTLS re-EHLO otherwise).
+        try ehlo(conn);
+
+        // Optional AUTH LOGIN (base64 username then password). Over TLS this runs
+        // encrypted; credentials never traverse a plaintext leg.
         if (self.username.len > 0) {
-            try writeLine(w, "AUTH LOGIN\r\n");
-            try expectCode(r, 334);
-            try sendB64Line(w, alloc, self.username);
-            try expectCode(r, 334);
-            try sendB64Line(w, alloc, self.password);
-            try expectCode(r, 235);
+            try writeLine(conn, "AUTH LOGIN\r\n");
+            try expectCode(conn.r, 334);
+            try sendB64Line(conn, alloc, self.username);
+            try expectCode(conn.r, 334);
+            try sendB64Line(conn, alloc, self.password);
+            try expectCode(conn.r, 235);
         }
 
         // MAIL FROM.
         const mail_from = try std.fmt.allocPrint(alloc, "MAIL FROM:<{s}>\r\n", .{self.from});
         defer alloc.free(mail_from);
-        try writeLine(w, mail_from);
-        try expectCode(r, 250);
+        try writeLine(conn, mail_from);
+        try expectCode(conn.r, 250);
 
         // RCPT TO.
         const rcpt = try std.fmt.allocPrint(alloc, "RCPT TO:<{s}>\r\n", .{email.to});
         defer alloc.free(rcpt);
-        try writeLine(w, rcpt);
-        try expectCode(r, 250);
+        try writeLine(conn, rcpt);
+        try expectCode(conn.r, 250);
 
         // DATA.
-        try writeLine(w, "DATA\r\n");
-        try expectCode(r, 354);
+        try writeLine(conn, "DATA\r\n");
+        try expectCode(conn.r, 354);
 
         const now_s = std.Io.Clock.real.now(io).toSeconds();
         const msg = try buildMessage(alloc, self.from, email, now_s);
         defer alloc.free(msg);
-        try writeLine(w, msg);
-        try writeLine(w, "\r\n.\r\n");
-        try expectCode(r, 250);
+        try writeLine(conn, msg);
+        try writeLine(conn, "\r\n.\r\n");
+        try expectCode(conn.r, 250);
 
         // QUIT.
-        try writeLine(w, "QUIT\r\n");
+        try writeLine(conn, "QUIT\r\n");
         // Server replies 221; ignore failures here (message already accepted).
-        _ = readReply(r) catch {};
+        _ = readReply(conn.r) catch {};
     }
 
-    fn writeLine(w: *std.Io.Writer, line: []const u8) anyerror!void {
-        try w.writeAll(line);
-        try w.flush();
+    fn ehlo(conn: *Conn) anyerror!void {
+        try writeLine(conn, "EHLO localhost\r\n");
+        try expectCode(conn.r, 250);
     }
 
-    fn sendB64Line(w: *std.Io.Writer, alloc: std.mem.Allocator, raw: []const u8) anyerror!void {
+    /// Write a line over the connection and flush. For TLS this flushes the
+    /// plaintext TLS writer (encrypting into the socket buffer) AND the socket
+    /// writer (pushing the ciphertext to the wire); see Conn doc comment.
+    fn writeLine(conn: *Conn, line: []const u8) anyerror!void {
+        try conn.w.writeAll(line);
+        try conn.w.flush();
+        if (conn.socket_w) |swr| try swr.flush();
+    }
+
+    fn sendB64Line(conn: *Conn, alloc: std.mem.Allocator, raw: []const u8) anyerror!void {
         const enc = std.base64.standard.Encoder;
         const out = try alloc.alloc(u8, enc.calcSize(raw.len));
         defer alloc.free(out);
         _ = enc.encode(out, raw);
         const line = try std.fmt.allocPrint(alloc, "{s}\r\n", .{out});
         defer alloc.free(line);
-        try writeLine(w, line);
+        try writeLine(conn, line);
     }
 
     /// Read one SMTP reply (consuming continuation lines "NNN-...") and return
@@ -166,6 +262,86 @@ pub const SmtpMailer = struct {
     fn expectCode(r: *std.Io.Reader, want: u16) anyerror!void {
         const got = try readReply(r);
         if (got != want) return error.SmtpUnexpectedReply;
+    }
+};
+
+/// Owns the TLS client + the buffers it borrows and (optionally) the CA bundle.
+/// `std.crypto.tls.Client` keeps pointers into `read_buffer`/`write_buffer`, so
+/// they must outlive the client — hence heap-allocated and freed in `deinit`.
+const TlsState = struct {
+    client: std.crypto.tls.Client,
+    alloc: std.mem.Allocator,
+    read_buffer: []u8,
+    write_buffer: []u8,
+    bundle: std.crypto.Certificate.Bundle,
+    bundle_lock: std.Io.RwLock,
+    have_bundle: bool,
+
+    /// Handshake TLS over an already-connected socket (`sock_r`/`sock_w` carry
+    /// ciphertext). Loads the system CA bundle via `Certificate.Bundle.rescan`
+    /// and verifies the chain against `self.host` (SNI + hostname check) unless
+    /// `insecure_skip_verify` is set. Mirrors std/http/Client.zig's TLS setup.
+    fn init(self: *SmtpMailer, alloc: std.mem.Allocator, io: std.Io, sock_r: *std.Io.Reader, sock_w: *std.Io.Writer) anyerror!TlsState {
+        const tls_min = std.crypto.tls.Client.min_buffer_len;
+        const read_buffer = try alloc.alloc(u8, tls_min);
+        errdefer alloc.free(read_buffer);
+        const write_buffer = try alloc.alloc(u8, tls_min);
+        errdefer alloc.free(write_buffer);
+
+        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        io.random(&entropy);
+
+        const now = std.Io.Clock.real.now(io);
+
+        var state = TlsState{
+            .client = undefined,
+            .alloc = alloc,
+            .read_buffer = read_buffer,
+            .write_buffer = write_buffer,
+            .bundle = .empty,
+            .bundle_lock = .init,
+            .have_bundle = false,
+        };
+
+        const host_opt: @TypeOf(@as(std.crypto.tls.Client.Options, undefined).host) =
+            if (self.insecure_skip_verify) .no_verification else .{ .explicit = self.host };
+
+        var ca_opt: @TypeOf(@as(std.crypto.tls.Client.Options, undefined).ca) = undefined;
+        if (self.insecure_skip_verify) {
+            ca_opt = .no_verification;
+        } else {
+            // Load the system trust store. Captured by pointer below, so the
+            // bundle must live as long as the client (it's a field of state,
+            // but the handshake reads it during init only).
+            try state.bundle.rescan(alloc, io, now);
+            state.have_bundle = true;
+            ca_opt = .{ .bundle = .{
+                .gpa = alloc,
+                .io = io,
+                .lock = &state.bundle_lock,
+                .bundle = &state.bundle,
+            } };
+        }
+
+        state.client = std.crypto.tls.Client.init(sock_r, sock_w, .{
+            .host = host_opt,
+            .ca = ca_opt,
+            .read_buffer = read_buffer,
+            .write_buffer = write_buffer,
+            .entropy = &entropy,
+            .realtime_now = now,
+        }) catch |err| {
+            if (state.have_bundle) state.bundle.deinit(alloc);
+            return err;
+        };
+        return state;
+    }
+
+    fn deinit(state: *TlsState) void {
+        const a = state.alloc;
+        if (state.have_bundle) state.bundle.deinit(a);
+        a.free(state.read_buffer);
+        a.free(state.write_buffer);
     }
 };
 
@@ -245,6 +421,20 @@ test "rfc5322Date formats a known epoch" {
     // 1704067200 == Mon, 01 Jan 2024 00:00:00 +0000
     const d2 = rfc5322Date(1704067200);
     try std.testing.expectEqualStrings("Mon, 01 Jan 2024 00:00:00 +0000", &d2);
+}
+
+test "SmtpMailer.init defaults to auto TLS with verification on" {
+    const m = SmtpMailer.init("smtp.example.com", 587, "u", "p", "from@example.com");
+    try std.testing.expectEqual(SmtpTls.auto, m.tls);
+    try std.testing.expectEqual(false, m.insecure_skip_verify);
+    // auto@587 resolves to starttls.
+    try std.testing.expectEqual(SmtpTls.starttls, config.Config.resolveSmtpTls(m.tls, m.port));
+}
+
+test "SmtpMailer.initTls records explicit mode + insecure flag" {
+    const m = SmtpMailer.initTls("smtp.example.com", 465, "u", "p", "from@example.com", .implicit, true);
+    try std.testing.expectEqual(SmtpTls.implicit, m.tls);
+    try std.testing.expectEqual(true, m.insecure_skip_verify);
 }
 
 test "base64 AUTH LOGIN encoding matches expected" {
