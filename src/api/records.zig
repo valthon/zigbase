@@ -154,11 +154,31 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     return jsonResponse(ctx, 200, rec);
 }
 
-pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
+/// The one body-ingestion path for record create/update: parse the body
+/// (multipart form fields or JSON), apply the multipart schema coercion, and
+/// plan file fields. Centralized so no entry point can skip the coercion.
+/// Returns `.resp` with the mapped 400/413 client error when the body or file
+/// plan is invalid; OutOfMemory propagates.
+const Prepared = union(enum) { plan: file_plan.AllPlan, resp: http.Response };
+
+fn prepareRecordData(ctx: *http.RequestCtx, col: schema.Collection, existing: ?std.json.Value) anyerror!Prepared {
     const app = ctx.app.?;
     const raw = if (ctx.form_fields) |ff| ff else (std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch
-        return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator)).value;
+        return .{ .resp = try ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator) }).value;
+    // Multipart values are verbatim strings; make them behave like a JSON client.
+    // JSON bodies (form_fields == null) are never coerced.
+    const coerced = if (ctx.form_fields != null) try records.coerceFormFields(ctx.allocator, col, raw) else raw;
+    const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, coerced, ctx.files, existing) catch |e| switch (e) {
+        error.TooLarge => return .{ .resp = try (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator) },
+        error.TooMany => return .{ .resp = try ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator) },
+        error.BadMimeType => return .{ .resp = try ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator) },
+        error.OutOfMemory => return e,
+    };
+    return .{ .plan = all };
+}
 
+pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
+    const app = ctx.app.?;
     // Resolve, plan files, and (for auth collections) hash the password BEFORE acquiring the
     // writer, so the expensive argon2 hash in prepAuthData does NOT run under the global writer
     // lock. The reader is closed before the writer is taken. M2 fix.
@@ -166,14 +186,9 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         var r = try app.pool.acquireReader();
         defer app.pool.releaseReader(&r);
         const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-        // Multipart values are verbatim strings; make them behave like a JSON client.
-        // JSON bodies (form_fields == null) are never coerced.
-        const coerced = if (ctx.form_fields != null) try records.coerceFormFields(ctx.allocator, col, raw) else raw;
-        const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, coerced, ctx.files, null) catch |e| switch (e) {
-            error.TooLarge => return (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator),
-            error.TooMany => return ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator),
-            error.BadMimeType => return ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator),
-            error.OutOfMemory => return e,
+        const all = switch (try prepareRecordData(ctx, col, null)) {
+            .plan => |p| p,
+            .resp => |resp| return resp,
         };
         const data2 = prepAuthData(ctx, col, all.data, true) catch |e| switch (e) {
             error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
@@ -221,22 +236,15 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
 
 pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    const raw = if (ctx.form_fields) |ff| ff else (std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch
-        return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator)).value;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const existing = (try records.get(ctx.allocator, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
 
-    // Multipart values are verbatim strings; make them behave like a JSON client.
-    // JSON bodies (form_fields == null) are never coerced.
-    const coerced = if (ctx.form_fields != null) try records.coerceFormFields(ctx.allocator, col, raw) else raw;
-    const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, coerced, ctx.files, existing) catch |e| switch (e) {
-        error.TooLarge => return (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator),
-        error.TooMany => return ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator),
-        error.BadMimeType => return ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator),
-        error.OutOfMemory => return e,
+    const all = switch (try prepareRecordData(ctx, col, existing)) {
+        .plan => |p| p,
+        .resp => |resp| return resp,
     };
     const data = all.data;
 

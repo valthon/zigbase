@@ -155,11 +155,13 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 try errs.append(alloc, .{ .field = f.name, .code = convCode(e), .message = "Invalid number." });
                 return;
             };
-            // Compare the decimal value as f64. min/max are stored as f64, so values
-            // beyond 2^53 cannot be bounded exactly anyway (see the documented-edge test).
-            var pow: f64 = 1;
-            var k: u8 = 0;
-            while (k < scale) : (k += 1) pow *= 10;
+            // Compare the decimal value as f64 (value/10^scale vs the f64 bound).
+            // Dividing — not multiplying the bound out — is deliberate: the division
+            // correctly rounds to the same f64 a decimal-equal bound parsed to, so
+            // "0.10" passes min=0.1, whereas f64(0.1)*100 = 10.000000000000002 would
+            // false-reject sv=10. Bounds are f64, so values beyond 2^53 cannot be
+            // bounded exactly anyway (see the documented-edge test).
+            const pow: f64 = @floatFromInt(values.pow10(scale) catch return); // unreachable: decimalToScaledInt already validated scale
             try appendMinMax(alloc, errs, f.name, @as(f64, @floatFromInt(sv)) / pow, o.min, o.max);
         },
         .select => |o| {
@@ -693,6 +695,25 @@ test "int-mode number min/max" {
     try expectFieldCode("seats", "validation_max");
     _ = try createOne(a, &d, col, "seats", .{ .string = "1" });
     _ = try createOne(a, &d, col, "seats", .{ .string = "8" });
+}
+
+test "fixed-mode bound equality: a value textually equal to the f64 bound passes (divide semantics)" {
+    // Pins the divide-based compare: "0.10" with min=0.1 must pass. Multiplying the
+    // bound out instead (f64(0.1)*100 = 10.000000000000002 > sv=10) would false-reject.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "amt", .options = .{ .number = .{ .mode = .fixed, .scale = 2, .min = 0.1, .max = 0.3 } } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tenths", .fields = &fields });
+    _ = try createOne(a, &d, col, "amt", .{ .string = "0.10" }); // == min
+    _ = try createOne(a, &d, col, "amt", .{ .string = "0.30" }); // == max
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "amt", .{ .string = "0.09" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "amt", .{ .string = "0.31" }));
 }
 
 test "int-mode bounds compare as f64: values beyond 2^53 lose precision (documented edge)" {
