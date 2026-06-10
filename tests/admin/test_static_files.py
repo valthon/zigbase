@@ -65,8 +65,8 @@ def test_serve_static_runtime_mode():
             # dir mode delegates caching to facil.io's sendFile: one (unquoted,
             # base64) etag header, If-None-Match/304 answered by the transport
             etag_values = hdr.get_all("etag") or []
-            etag = etag_values[0] if etag_values else None
-            assert etag, f"no etag header found; got: {etag_values}"
+            assert len(etag_values) == 1, f"expected exactly one etag header, got: {etag_values}"
+            etag = etag_values[0]
             st, _, _ = _get(f"{base}/assets/app.js", {"If-None-Match": etag})
             assert st == 304
 
