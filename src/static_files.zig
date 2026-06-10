@@ -40,6 +40,7 @@ const nosniff = http.Header{ .name = "X-Content-Type-Options", .value = "nosniff
 /// Returns null for unsafe paths (no leading '/', NUL, backslash, "..").
 /// "" means "the root" (callers resolve it to index.html). Caller owns the slice.
 pub fn sanitize(alloc: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    // `path` is already percent-decoded by the HTTP layer (facil.io), so "%2e%2e" cannot sneak past the ".." check.
     if (path.len == 0 or path[0] != '/') return null;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
     if (std.mem.indexOfScalar(u8, path, '\\') != null) return null;
@@ -66,8 +67,10 @@ fn headersWithEtag(alloc: std.mem.Allocator, etag: []const u8) ![]http.Header {
     return hs;
 }
 
-fn notModified(headers: []const http.Header) http.Response {
-    return .{ .status = 304, .body = "", .content_type = "text/plain", .extra_headers = headers };
+/// RFC 7232: a 304 carries the headers the 200 would have sent, so it reports
+/// the file's real content type rather than a placeholder.
+fn notModified(content_type: []const u8, headers: []const http.Header) http.Response {
+    return .{ .status = 304, .body = "", .content_type = content_type, .extra_headers = headers };
 }
 
 /// True when the request's If-None-Match matches this entity tag ("*" or exact).
@@ -95,12 +98,13 @@ fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const 
         const idx = try std.fmt.allocPrint(ctx.allocator, "{s}/index.html", .{rel});
         break :blk findEmbedded(files, idx);
     } orelse return null;
+    const content_type = mime.fromExtension(hit.path);
     const headers = try headersWithEtag(ctx.allocator, hit.etag);
-    if (etagMatches(ctx.if_none_match, hit.etag)) return notModified(headers);
+    if (etagMatches(ctx.if_none_match, hit.etag)) return notModified(content_type, headers);
     return .{
         .status = 200,
         .body = hit.bytes,
-        .content_type = mime.fromExtension(hit.path),
+        .content_type = content_type,
         .extra_headers = headers,
     };
 }
@@ -114,13 +118,17 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
         st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
     }
     if (st.kind != .file) return null;
+    // mtime granularity is filesystem-dependent (some report whole seconds), so an
+    // in-place rewrite within one tick can leave a stale cache hit — a freshness
+    // caveat, not a security issue.
     const etag = try std.fmt.allocPrint(ctx.allocator, "\"{x}-{x}\"", .{ st.mtime.nanoseconds, st.size });
+    const content_type = mime.fromExtension(full);
     const headers = try headersWithEtag(ctx.allocator, etag);
-    if (etagMatches(ctx.if_none_match, etag)) return notModified(headers);
+    if (etagMatches(ctx.if_none_match, etag)) return notModified(content_type, headers);
     return .{
         .status = 200,
         .body = "",
-        .content_type = mime.fromExtension(full),
+        .content_type = content_type,
         .file_path = full,
         .extra_headers = headers,
     };
@@ -128,6 +136,8 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
 
 /// Serve `ctx.path` from `source`. Returns null when no file matches (the caller
 /// emits its 404), including for non-GET/HEAD methods and `.none` sources.
+/// HEAD gets the same response as GET (status + headers + body/file_path);
+/// stripping the body for HEAD is the transport layer's (zap/facil.io) job.
 pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source) !?http.Response {
     if (ctx.method != .GET and ctx.method != .HEAD) return null;
     if (std.meta.activeTag(source) == .none) return null;
@@ -198,6 +208,14 @@ test "embedded: exact file, root index, directory index, miss" {
 
     var miss = http.RequestCtx{ .method = .GET, .path = "/nope.png", .allocator = arena.allocator() };
     try std.testing.expect((try serve(std.testing.io, &miss, src)) == null);
+
+    // HEAD is served like GET (the transport strips the body).
+    var head = http.RequestCtx{ .method = .HEAD, .path = "/assets/app.js", .allocator = arena.allocator() };
+    const hr = (try serve(std.testing.io, &head, src)).?;
+    try std.testing.expectEqual(@as(u16, 200), hr.status);
+    try std.testing.expectEqualStrings("application/javascript", hr.content_type);
+    try std.testing.expectEqual(@as(usize, 2), hr.extra_headers.len);
+    try std.testing.expectEqualStrings("\"22222222\"", hr.extra_headers[0].value);
 }
 
 test "embedded: If-None-Match yields 304; non-GET/HEAD and .none yield null" {
