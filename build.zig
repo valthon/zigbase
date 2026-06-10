@@ -75,7 +75,12 @@ pub fn embedStaticDir(b: *std.Build, dir_rel: []const u8) *std.Build.Module {
     defer walker.deinit();
     while (walker.next(io) catch |e| std.debug.panic("embedStaticDir: walk failed: {s}", .{@errorName(e)})) |entry| {
         if (entry.kind != .file) continue;
-        names.append(alloc, alloc.dupe(u8, entry.path) catch @panic("OOM")) catch @panic("OOM");
+        const path = alloc.dupe(u8, entry.path) catch @panic("OOM");
+        // walk() joins with the native separator; manifest paths must be
+        // '/'-separated to match HTTP request paths (matters on Windows; a
+        // no-op on POSIX given the no-backslash filename assumption below).
+        std.mem.replaceScalar(u8, path, '\\', '/');
+        names.append(alloc, path) catch @panic("OOM");
     }
     std.mem.sort([]const u8, names.items, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
