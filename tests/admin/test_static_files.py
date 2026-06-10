@@ -62,10 +62,11 @@ def test_serve_static_runtime_mode():
             # asset with content type + ETag, then 304
             st, hdr, body = _get(f"{base}/assets/app.js")
             assert st == 200 and b"console.log" in body
-            # server may emit two ETag-style headers; find the quoted one (our handler's)
+            # dir mode delegates caching to facil.io's sendFile: one (unquoted,
+            # base64) etag header, If-None-Match/304 answered by the transport
             etag_values = hdr.get_all("etag") or []
-            etag = next((v for v in etag_values if v.startswith('"')), None)
-            assert etag is not None, f"no quoted ETag found; got: {etag_values}"
+            etag = etag_values[0] if etag_values else None
+            assert etag, f"no etag header found; got: {etag_values}"
             st, _, _ = _get(f"{base}/assets/app.js", {"If-None-Match": etag})
             assert st == 304
 
@@ -91,6 +92,7 @@ def test_serve_static_runtime_mode():
 
 
 def test_serve_static_missing_dir_is_fatal():
+    subprocess.run(ZIG + ["build"], cwd=REPO, check=True)
     binary = REPO / "zig-out" / "bin" / "zigbase"
     with tempfile.TemporaryDirectory() as data:
         port = _free_port()

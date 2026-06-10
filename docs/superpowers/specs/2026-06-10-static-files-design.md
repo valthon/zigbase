@@ -102,9 +102,10 @@ In disabled/dir/embedded modes the CLI parser receives a comptime flag telling i
 4. **Content types:** extension table — html, css, js, mjs, json, svg, png, jpg/jpeg, gif,
    webp, avif, ico, woff, woff2, ttf, wasm, txt, xml, map, pdf, mp4, webm; unknown →
    `application/octet-stream`. Always `X-Content-Type-Options: nosniff`.
-5. **Caching:** `ETag` on every response — dir mode derives `"<mtime>-<size>"`, embedded mode a
-   comptime content hash. `If-None-Match` match → `304` with empty body. No `Cache-Control`
-   beyond ETag in v1.
+5. **Caching:** embedded mode emits a comptime CRC32 content `ETag` and answers `If-None-Match`
+   with `304` itself (plain body responses get no transport etag). Dir mode delegates entirely to
+   facil.io's sendFile, which adds its own `etag`, `Last-Modified`, `Cache-Control: max-age=3600`,
+   and handles `If-None-Match`/`304` — zigbase adds no caching headers of its own there.
 6. **Transport:** dir mode sets `Response.file_path` (zap `sendFile` streaming); embedded mode
    sets `Response.body` to the comptime slice (no copy).
 7. **Miss:** return null → server responds plain-text 404 (`text/plain`), distinct from the

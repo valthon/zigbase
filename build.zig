@@ -93,10 +93,12 @@ pub fn embedStaticDir(b: *std.Build, dir_rel: []const u8) *std.Build.Module {
     ) catch @panic("OOM");
     for (names.items) |rel| {
         _ = wf.addCopyFile(b.path(b.fmt("{s}/{s}", .{ dir_rel, rel })), rel);
+        // no size limit: runs at build time on the developer's machine, not in the server
         const data = dir.readFileAlloc(io, rel, alloc, .unlimited) catch |e|
             std.debug.panic("embedStaticDir: cannot read '{s}/{s}': {s}", .{ dir_rel, rel, @errorName(e) });
         defer alloc.free(data);
         const crc = std.hash.Crc32.hash(data);
+        // Assumes asset filenames are ASCII without '"' or '\' — true for Vite/Astro hashed output.
         src.appendSlice(alloc, b.fmt(
             "    .{{ .path = \"{s}\", .bytes = @embedFile(\"{s}\"), .etag = \"\\\"{x:0>8}\\\"\" }},\n",
             .{ rel, rel, crc },

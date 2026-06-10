@@ -118,19 +118,19 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
         st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
     }
     if (st.kind != .file) return null;
-    // mtime granularity is filesystem-dependent (some report whole seconds), so an
-    // in-place rewrite within one tick can leave a stale cache hit — a freshness
-    // caveat, not a security issue.
-    const etag = try std.fmt.allocPrint(ctx.allocator, "\"{x}-{x}\"", .{ st.mtime.nanoseconds, st.size });
-    const content_type = mime.fromExtension(full);
-    const headers = try headersWithEtag(ctx.allocator, etag);
-    if (etagMatches(ctx.if_none_match, etag)) return notModified(content_type, headers);
+    // Dir mode delegates ETag/Last-Modified/Cache-Control(max-age=3600)/If-None-Match/304
+    // handling to facil.io's sendFile (http_sendfile2), which always emits its own etag
+    // and answers conditional requests itself — adding ours would put two ETag headers
+    // on the wire. Embedded mode keeps zigbase's CRC32 ETag because plain body responses
+    // get no transport etag.
+    const hs = try ctx.allocator.alloc(http.Header, 1);
+    hs[0] = nosniff;
     return .{
         .status = 200,
         .body = "",
-        .content_type = content_type,
+        .content_type = mime.fromExtension(full),
         .file_path = full,
-        .extra_headers = headers,
+        .extra_headers = hs,
     };
 }
 
@@ -234,7 +234,7 @@ test "embedded: If-None-Match yields 304; non-GET/HEAD and .none yield null" {
     try std.testing.expect((try serve(std.testing.io, &none, Source.none)) == null);
 }
 
-test "dir: serves files via file_path with ETag; index resolution; miss; traversal" {
+test "dir: serves files via file_path; index resolution; miss; traversal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
@@ -251,13 +251,9 @@ test "dir: serves files via file_path with ETag; index resolution; miss; travers
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expect(r.file_path != null);
     try std.testing.expect(std.mem.endsWith(u8, r.file_path.?, "assets/app.js"));
-    try std.testing.expectEqual(@as(usize, 2), r.extra_headers.len);
-    try std.testing.expectEqualStrings("ETag", r.extra_headers[0].name);
-    const etag = r.extra_headers[0].value;
-    try std.testing.expect(etag.len > 2 and etag[0] == '"' and etag[etag.len - 1] == '"');
-
-    var again = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = arena.allocator(), .if_none_match = etag };
-    try std.testing.expectEqual(@as(u16, 304), (try serve(std.testing.io, &again, src)).?.status);
+    // Dir mode emits ONLY nosniff; ETag/304 are facil.io sendFile's job.
+    try std.testing.expectEqual(@as(usize, 1), r.extra_headers.len);
+    try std.testing.expectEqualStrings("X-Content-Type-Options", r.extra_headers[0].name);
 
     var root_req = http.RequestCtx{ .method = .GET, .path = "/", .allocator = arena.allocator() };
     const ri = (try serve(std.testing.io, &root_req, src)).?;
