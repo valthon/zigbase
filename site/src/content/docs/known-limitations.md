@@ -39,13 +39,16 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
 
 ## Fields
 
-- **Fixed-mode number fields can't be set in a multipart (file-upload) create/update.**
-  The HTTP layer type-coerces multipart form values to numbers (`45.00` → float), while
-  `fixed` mode requires **string** input — so a multipart request that carries a
-  fixed-mode value fails with a 400 validation error. **Workaround:** create/update the
-  record via JSON first, then attach files in a separate multipart `PATCH` that only
-  carries the file field. Also note `fixed` mode requires a `scale` option (1..8) and is
-  currently **not configurable from the admin UI** (use the API).
+- **The text field's `pattern` option is accepted but not yet enforced.** It is stored
+  and round-tripped through the schema API, but record validation does not apply it
+  (Zig's std has no regex engine and we won't hand-roll one). `min`/`max` for text and
+  number fields *are* enforced (`validation_min` / `validation_max`).
+- **The date field's `min`/`max` options are accepted but not yet enforced.** Enforcement
+  is pending date parsing/normalization in the write path — a raw lexical compare is
+  unsound when clients mix formats (`2026-06-10 08:00:00` vs `2026-06-10T08:00:00Z`).
+- **Fixed-mode numbers aren't configurable from the admin UI yet.** `fixed` mode requires
+  a `scale` option (1..8) that the schema editor doesn't expose — create fixed-mode
+  fields via the API (the admin UI edits records on them just fine).
 
 ## Scheduler
 

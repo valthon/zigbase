@@ -12,9 +12,6 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
 ## Schema / migrations
 - **Comptime auto-migration is additive-only.** Startup provisioning of a comptime `.collections` schema creates missing collections and adds new fields, preserving data. **Non-additive changes (rename, drop, or type-change a field) are detected, logged, and skipped** — they require an explicit `.migrations` entry.
 
-## Fields
-- **Fixed-mode number fields can't be set in a multipart (file-upload) create/update.** The HTTP layer type-coerces multipart form values to numbers (`45.00` → float), while `fixed` mode requires **string** input — so a multipart request that carries a fixed-mode value fails with a 400 validation error. **Workaround:** create/update the record via JSON first, then attach files in a separate multipart `PATCH` that only carries the file field. Also note `fixed` mode requires a `scale` option (1..8) and is currently **not configurable from the admin UI** (use the API).
-
 ## Scheduler
 - **Single-process only** — jobs run in the serving process; there is no distributed coordination.
 - **Cron is UTC, numeric-only** (no `JAN`/`MON` names), **minute-granularity**, and **ANDs day-of-month with day-of-week** (unlike Vixie cron, which ORs them when one is `*`).

@@ -165,7 +165,7 @@ LISTINGS_ID=$(curl -s -X POST "$BASE/api/collections" \
     \"fields\": [
       { \"id\": \"f_title\", \"name\": \"title\", \"type\": \"text\", \"required\": true, \"options\": { \"min\": 1, \"max\": 140 } },
       { \"id\": \"f_price\", \"name\": \"price_per_hour\", \"type\": \"number\", \"required\": true,
-        \"options\": { \"mode\": \"float\" } },
+        \"options\": { \"mode\": \"float\", \"min\": 0 } },
       { \"id\": \"f_status\", \"name\": \"status\", \"type\": \"select\", \"required\": true,
         \"options\": { \"values\": [\"draft\", \"published\", \"archived\"], \"maxSelect\": 1 } },
       { \"id\": \"f_sim\", \"name\": \"simulator\", \"type\": \"relation\", \"required\": true,
@@ -186,11 +186,12 @@ The field shapes used here are catalogued in [Fields](./fields).
   </Fragment>
 </PathTabs>
 
-> **Money fields:** `price_per_hour` uses the default **float** number mode here. A
-> fixed-point **fixed** mode (exact decimal strings like `"45.00"`, no float drift) exists
-> for money — see [Fields → number](./fields#number) — but it is currently API-only (it
-> requires a `scale` option the admin UI doesn't expose yet) and has a known limitation
-> with multipart file-upload requests. See [Known limitations](./known-limitations).
+> **Money fields:** `price_per_hour` uses the default **float** number mode here so both
+> paths build the same schema. A fixed-point **fixed** mode (exact decimal strings like
+> `"45.00"`, no float drift) exists for money — see [Fields → number](./fields#number) —
+> but it requires a `scale` option the admin UI doesn't expose yet, so creating
+> fixed-mode fields is API-only for now. The `min: 0` in the terminal path keeps prices
+> non-negative (`validation_min` on violation).
 
 ## 2. Understand the access rules you just set
 
