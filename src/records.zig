@@ -214,52 +214,66 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
 /// input (never JSON bodies), BEFORE validation. Multipart values arrive as
 /// verbatim strings (see src/files/multipart.zig); this makes them look like a
 /// well-formed JSON client per the collection schema:
-///   bool          "true"/"false" -> JSON bool (else left for normal validation)
-///   number float  parseable, finite -> JSON float (else left as a string)
-///   number int/fixed                   kept as a string (the accepted form)
-///   select/relation (multi)  JSON-array string -> array (the admin UI sends
-///                            JSON.stringify(array)); else left as-is
-///   json          any parseable JSON -> the parsed value; else the raw string
+///   bool          "" -> null; "true"/"false" -> JSON bool (else left as-is)
+///   number (all)  "" -> null; float mode: parseable, finite -> JSON float
+///                 (else left as a string); int/fixed: kept as a string
+///                 (the accepted form)
+///   select/relation (multi)  "" -> null; JSON-array string -> array (the admin
+///                 UI sends JSON.stringify(array)); any other string wraps as a
+///                 one-element array of the ORIGINAL string ("123" -> ["123"])
+///   json          "" -> null; any parseable JSON -> the parsed value; else the
+///                 raw string
 ///   everything else (text/email/url/editor/date/single select/relation/file)
-///                 kept verbatim
-/// Keys that match no schema field ("<field>-" removal keys, auth
-/// password/passwordConfirm) and non-string values pass through untouched.
-/// Allocates into `alloc` (the request arena).
+///                 kept verbatim — including "", which is their JSON clear form
+/// So an empty multipart value clears every field type: text-likes store "",
+/// bool/number/json/multi-value fields store null. Keys that match no schema
+/// field ("<field>-" removal keys, auth password/passwordConfirm) and
+/// non-string values pass through untouched. Allocates into `alloc` (arena).
 pub fn coerceFormFields(alloc: std.mem.Allocator, col: schema.Collection, data: std.json.Value) std.mem.Allocator.Error!std.json.Value {
     if (data != .object) return data;
     var out: std.json.ObjectMap = .empty;
     var it = data.object.iterator();
     while (it.next()) |e| {
-        try out.put(alloc, e.key_ptr.*, coerceFieldValue(alloc, col, e.key_ptr.*, e.value_ptr.*));
+        try out.put(alloc, e.key_ptr.*, try coerceFieldValue(alloc, col, e.key_ptr.*, e.value_ptr.*));
     }
     return .{ .object = out };
 }
 
-fn coerceFieldValue(alloc: std.mem.Allocator, col: schema.Collection, key: []const u8, v: std.json.Value) std.json.Value {
+fn coerceFieldValue(alloc: std.mem.Allocator, col: schema.Collection, key: []const u8, v: std.json.Value) std.mem.Allocator.Error!std.json.Value {
     const f = schema.fieldByName(col, key) orelse return v;
     if (v != .string) return v;
     const s = v.string;
     switch (f.options) {
         .@"bool" => {
+            if (s.len == 0) return .null; // multipart "" = clear
             if (std.mem.eql(u8, s, "true")) return .{ .bool = true };
             if (std.mem.eql(u8, s, "false")) return .{ .bool = false };
             return v;
         },
         .number => |o| {
+            if (s.len == 0) return .null; // multipart "" = clear (all modes)
             if (o.mode != .float) return v; // int/fixed: strings are the accepted JSON form
             const x = std.fmt.parseFloat(f64, s) catch return v;
             if (!std.math.isFinite(x)) return v; // JSON can't carry nan/inf; let validation reject
             return .{ .float = x };
         },
         .json => {
+            if (s.len == 0) return .null; // multipart "" = clear
             // Leaked into the arena deliberately (the codebase-wide pattern for parse trees).
             const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return v;
             return parsed.value;
         },
         .select, .relation => {
             if (!f.isMultiValue()) return v;
-            const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return v;
-            return if (parsed.value == .array) parsed.value else v;
+            if (s.len == 0) return .null; // multipart "" = clear
+            if (std.json.parseFromSlice(std.json.Value, alloc, s, .{})) |parsed| {
+                if (parsed.value == .array) return parsed.value;
+            } else |_| {}
+            // A single occurrence (-F tags=x) wraps as a one-element array of the
+            // ORIGINAL string, mirroring how repeated keys arrive as string arrays.
+            var arr = std.json.Array.init(alloc);
+            try arr.append(v);
+            return .{ .array = arr };
         },
         else => return v,
     }
@@ -345,12 +359,45 @@ test "coerce: multi-select JSON-array string becomes an array; single select sta
     try std.testing.expect(v == .array);
     try std.testing.expectEqual(@as(usize, 2), v.array.items.len);
     try std.testing.expectEqualStrings("x", v.array.items[0].string);
-    // non-array JSON ("true") and plain strings are left alone for multi-select
-    try std.testing.expect((try coerceOneField(a, "tags", "true")) == .string);
-    try std.testing.expect((try coerceOneField(a, "tags", "x")) == .string);
     // single-valued select: a JSON-looking string is the literal value
     const sv = try coerceOneField(a, "status", "[\"a\"]");
     try std.testing.expect(sv == .string);
+}
+
+test "coerce: a single plain value for a multi-value field wraps as a one-element array of the ORIGINAL string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // -F tags=x (one occurrence) must behave like ["x"], matching -F tags=x -F tags=y
+    const v = try coerceOneField(a, "tags", "x");
+    try std.testing.expect(v == .array);
+    try std.testing.expectEqual(@as(usize, 1), v.array.items.len);
+    try std.testing.expectEqualStrings("x", v.array.items[0].string);
+    // valid-JSON-but-not-array strings wrap the ORIGINAL string, never the parsed value
+    const n = try coerceOneField(a, "tags", "123");
+    try std.testing.expect(n == .array);
+    try std.testing.expectEqualStrings("123", n.array.items[0].string);
+    const b = try coerceOneField(a, "tags", "true");
+    try std.testing.expect(b == .array);
+    try std.testing.expectEqualStrings("true", b.array.items[0].string);
+}
+
+test "coerce: an empty multipart value clears optional non-text fields to null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // bool, number (all modes), json, and multi-value fields: "" -> null
+    try std.testing.expect((try coerceOneField(a, "flag", "")) == .null);
+    try std.testing.expect((try coerceOneField(a, "price", "")) == .null);
+    try std.testing.expect((try coerceOneField(a, "qty", "")) == .null);
+    try std.testing.expect((try coerceOneField(a, "ratio", "")) == .null);
+    try std.testing.expect((try coerceOneField(a, "meta", "")) == .null);
+    try std.testing.expect((try coerceOneField(a, "tags", "")) == .null);
+    // text-like and single select keep "" (their JSON form accepts it)
+    const tv = try coerceOneField(a, "title", "");
+    try std.testing.expect(tv == .string and tv.string.len == 0);
+    const sv = try coerceOneField(a, "status", "");
+    try std.testing.expect(sv == .string and sv.string.len == 0);
 }
 
 test "coerce: json field parses any valid JSON; invalid stays string" {
