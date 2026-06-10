@@ -4,6 +4,7 @@ pub const ServeArgs = struct {
     http_host: ?[]const u8 = null,
     http_port: ?u16 = null,
     data_dir: ?[]const u8 = null,
+    serve_static: ?[]const u8 = null,
 };
 
 pub const SuperuserArgs = struct {
@@ -30,8 +31,14 @@ fn isHelpFlag(a: []const u8) bool {
 
 pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValue };
 
+/// Comptime-derived parser switches. `serve_static` is true only in the default
+/// static-files mode — in .disabled/.dir/.embedded the flag is rejected as unknown.
+pub const ParseOpts = struct {
+    serve_static: bool = true,
+};
+
 /// Parse argv (excluding the program name).
-pub fn parse(args: []const []const u8) ParseError!Command {
+pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
     if (args.len == 0) return .{ .help = .top };
     if (std.mem.eql(u8, args[0], "help") or isHelpFlag(args[0]))
         return .{ .help = .top };
@@ -96,6 +103,10 @@ pub fn parse(args: []const []const u8) ParseError!Command {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
             sa.data_dir = args[i];
+        } else if (popts.serve_static and std.mem.eql(u8, a, "--serve-static")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            sa.serve_static = args[i];
         } else {
             return ParseError.UnknownFlag;
         }
@@ -106,55 +117,68 @@ pub fn parse(args: []const []const u8) ParseError!Command {
 test "no args -> top-level help" {
     // Use std.meta.activeTag for union-tag comparison; direct `== .help` on a
     // tagged union value does not compile in Zig 0.16.0.
-    const cmd = try parse(&.{});
+    const cmd = try parse(&.{}, .{});
     try std.testing.expect(std.meta.activeTag(cmd) == .help);
     try std.testing.expectEqual(HelpTopic.top, cmd.help);
 }
 
 test "--help and -h and help -> top-level help" {
-    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{"--help"})).help);
-    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{"-h"})).help);
-    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{"help"})).help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{"--help"}, .{})).help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{"-h"}, .{})).help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{"help"}, .{})).help);
 }
 
 test "per-command --help routes to that command's help topic" {
-    try std.testing.expectEqual(HelpTopic.serve, (try parse(&.{ "serve", "--help" })).help);
-    try std.testing.expectEqual(HelpTopic.serve, (try parse(&.{ "serve", "-h" })).help);
-    try std.testing.expectEqual(HelpTopic.migrate, (try parse(&.{ "migrate", "--help" })).help);
-    try std.testing.expectEqual(HelpTopic.superuser_create, (try parse(&.{ "superuser", "create", "--help" })).help);
-    try std.testing.expectEqual(HelpTopic.superuser_create, (try parse(&.{ "superuser", "--help" })).help);
+    try std.testing.expectEqual(HelpTopic.serve, (try parse(&.{ "serve", "--help" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.serve, (try parse(&.{ "serve", "-h" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.migrate, (try parse(&.{ "migrate", "--help" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.superuser_create, (try parse(&.{ "superuser", "create", "--help" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.superuser_create, (try parse(&.{ "superuser", "--help" }, .{})).help);
 }
 
 test "serve with all three flags" {
-    const cmd = try parse(&.{ "serve", "--http-host", "127.0.0.1", "--http-port", "9000", "--data-dir", "/tmp/zb" });
+    const cmd = try parse(&.{ "serve", "--http-host", "127.0.0.1", "--http-port", "9000", "--data-dir", "/tmp/zb" }, .{});
     try std.testing.expectEqualStrings("127.0.0.1", cmd.serve.http_host.?);
     try std.testing.expectEqual(@as(u16, 9000), cmd.serve.http_port.?);
     try std.testing.expectEqualStrings("/tmp/zb", cmd.serve.data_dir.?);
 }
 
 test "migrate command parses --data-dir" {
-    const cmd = try parse(&.{ "migrate", "--data-dir", "/tmp/zb" });
+    const cmd = try parse(&.{ "migrate", "--data-dir", "/tmp/zb" }, .{});
     try std.testing.expectEqualStrings("/tmp/zb", cmd.migrate.data_dir.?);
 }
 
 test "unknown command errors" {
-    try std.testing.expectError(ParseError.UnknownCommand, parse(&.{"frobnicate"}));
+    try std.testing.expectError(ParseError.UnknownCommand, parse(&.{"frobnicate"}, .{}));
 }
 
 test "unknown flag errors" {
-    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "--nope" }));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "--nope" }, .{}));
 }
 
 test "missing flag value errors" {
-    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--http-port" }));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--http-port" }, .{}));
 }
 
 test "non-numeric port errors with BadValue" {
-    try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--http-port", "abc" }));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--http-port", "abc" }, .{}));
 }
 
 test "superuser create parses email and password" {
-    const cmd = try parse(&.{ "superuser", "create", "--email", "a@b.c", "--password", "secret123" });
+    const cmd = try parse(&.{ "superuser", "create", "--email", "a@b.c", "--password", "secret123" }, .{});
     try std.testing.expectEqualStrings("a@b.c", cmd.superuser_create.email.?);
     try std.testing.expectEqualStrings("secret123", cmd.superuser_create.password.?);
+}
+
+test "serve parses --serve-static when enabled" {
+    const cmd = try parse(&.{ "serve", "--serve-static", "public" }, .{});
+    try std.testing.expectEqualStrings("public", cmd.serve.serve_static.?);
+}
+
+test "--serve-static is an unknown flag when disabled at comptime" {
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "--serve-static", "public" }, .{ .serve_static = false }));
+}
+
+test "--serve-static without a value errors" {
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--serve-static" }, .{}));
 }

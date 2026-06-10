@@ -12,6 +12,7 @@ const files_api = @import("api/files.zig");
 const realtime_ws = @import("realtime/ws.zig");
 const files_multipart = @import("files/multipart.zig");
 const admin = @import("admin.zig");
+const static_files = @import("static_files.zig");
 const ApiError = @import("api/error.zig").ApiError;
 const auth = @import("auth.zig");
 const events = @import("events.zig");
@@ -100,6 +101,7 @@ fn setZapStatus(r: zap.Request, status: u16) void {
         200 => .ok,
         201 => .created,
         204 => .no_content,
+        304 => .not_modified,
         400 => .bad_request,
         403 => .forbidden,
         404 => .not_found,
@@ -175,6 +177,7 @@ fn onRequest(r: zap.Request) !void {
     ctx.cookie_header = r.getHeader("cookie") orelse "";
     ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
     ctx.content_type = r.getHeader("content-type") orelse "";
+    ctx.if_none_match = r.getHeader("if-none-match") orelse "";
     // Best-effort client IP for rate limiting. zap (0.10.6) exposes no peer-address
     // accessor on Request, so we trust the reverse-proxy hop headers: the FIRST hop in
     // X-Forwarded-For (the original client), else X-Real-IP. "" when neither is present.
@@ -197,6 +200,17 @@ fn onRequest(r: zap.Request) !void {
         };
         if (builtin) |hit| break :blk hit;
         if (dispatchCustom(&ctx) catch null) |hit| break :blk hit;
+        // The whole /api namespace stays JSON — including the bare "/api" path
+        // (mirrors the exact-"/_" handling in the admin guard above).
+        if (std.meta.activeTag(self.app.static_source) != .none and
+            (ctx.method == .GET or ctx.method == .HEAD) and
+            !std.mem.startsWith(u8, ctx.path, "/api/") and
+            !std.mem.eql(u8, ctx.path, "/api"))
+        {
+            if (static_files.serve(self.app.io, &ctx, self.app.static_source) catch null) |hit| break :blk hit;
+            // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.
+            break :blk http.Response{ .status = 404, .body = "not found", .content_type = "text/plain; charset=utf-8" };
+        }
         break :blk ApiError.notFound().toResponse(arena.allocator()) catch {
             sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
             return;

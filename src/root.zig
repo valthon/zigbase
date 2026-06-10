@@ -38,6 +38,10 @@ pub const DefaultMailerPlugin = @import("framework.zig").DefaultMailerPlugin;
 pub const Db = @import("db.zig").Db;
 pub const Migration = @import("provision.zig").Migration;
 
+// Static files: the entry type of a build-generated embedded manifest (see
+// build.zig embedStaticDir) and of `.static_files = .{ .embedded = ... }`.
+pub const StaticFile = @import("static_files.zig").StaticFile;
+
 // ---- Test discovery --------------------------------------------------------
 // The unit-test runner is rooted at THIS module. Reference every internal file
 // so its `test {}` blocks are analyzed and run (matches pre-restructure behavior
@@ -64,6 +68,7 @@ test {
     _ = @import("auth.zig");
     _ = @import("id.zig");
     _ = @import("admin.zig");
+    _ = @import("static_files.zig");
     _ = @import("api/error.zig");
     _ = @import("api/health.zig");
     _ = @import("api/collections.zig");

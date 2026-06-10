@@ -1,6 +1,6 @@
 ---
 title: Plugins & comptime config
-summary: The comptime-config surface a framework integrator uses — custom mailer, comptime schema, explicit migration, pool levers.
+summary: The comptime-config surface a framework integrator uses — custom mailer, comptime schema, explicit migration, pool levers, and a fully embedded Astro/React frontend.
 rung: Advanced framework surface
 order: 3
 repoPath: examples/plugins
@@ -36,6 +36,11 @@ features a consumer configures in code.
    the warm-reader pool, scheduler worker count, and per-connection SQLite
    page-cache budget — i.e. the runtime footprint.
 
+5. **Fully embedded static frontend** via `embedStaticDir`. The Astro + React
+   build output in `frontend/dist` is compiled into the binary at build time via
+   `.static_files = .{ .embedded = &@import("static_assets").files }` — there is
+   no runtime dependency on the `frontend/dist` directory.
+
 The fact that this package **compiles against the published `zigbase` module**
 is the proof that the documented plugin / schema / migration / pool features are
 usable by an external consumer.
@@ -53,15 +58,30 @@ The three examples form a ladder:
 | `examples/golfsim` | a realistic app built on ZigBase (hooks, routes, cron) |
 | **`examples/plugins`** | the comptime-config surface a framework integrator uses |
 
+## Frontend (Astro + React islands)
+
+`frontend/` is a single-page Astro site with React islands that browse the `authors` and
+published `posts` collections. The HTML, JS, and CSS are **compiled into the executable**
+via `embedStaticDir` + `.static_files = .{ .embedded = ... }`. There is no runtime
+dependency on the `frontend/dist` directory — delete it after building and the site still
+serves.
+
+This demonstrates the **embedded** static-files mode: the Astro frontend is compiled into
+the binary by `embedStaticDir` in `build.zig`. `--serve-static` is rejected as an unknown
+flag because the mode is comptime-hardcoded. The other modes are shown by the blog (runtime
+flag) and golfsim (hardcoded dir) examples.
+
 ## Building and running
 
 This example needs **Zig 0.16**, which you can get via [mise](https://mise.jdx.dev)
 (`mise exec zig@0.16.0 -- zig ...`). From `examples/plugins/`:
 
 ```sh
-cd examples/plugins && zig build
+cd frontend && npm install && npm run build && cd ..
+zig build       # embeds frontend/dist into the binary
 ./zig-out/bin/plugins help
 ./zig-out/bin/plugins serve     # provisions authors/posts + runs the migration
+# open http://127.0.0.1:8090/
 ```
 
 ---

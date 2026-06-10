@@ -22,6 +22,20 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
 - **No Windows build** — Linux and macOS only (the embedded HTTP server depends on facil.io/zap).
 - **Admin UI:** no logs or settings screens, and the record editor uses a plain textarea (no WYSIWYG rich-text editor) — both deferred.
 
+## Static file serving
+
+- Static files are served without authentication — collection access rules do not
+  apply to the static root; use file storage for access-controlled delivery.
+- No `Range`/partial-content requests (no video seeking on large files served from
+  the static root).
+- No directory listings; directories resolve to `index.html` or 404.
+- Path safety is lexical (`..`, backslashes, and NUL bytes are rejected); symlinks
+  inside the static root are followed — do not point them outside the root.
+- No on-the-fly compression; pre-compress at the CDN or reverse proxy if needed.
+- In **dir** mode (`--serve-static` or comptime `.dir`), caching is controlled by
+  facil.io's `sendFile` (fixed `Cache-Control: max-age=3600`) — this value is not
+  configurable yet.
+
 ## Other deferred work
 - Image thumbnails / transforms; an S3 (or other remote) storage backend — a pluggable `.storage` slot exists, but only the local-disk backend ships; `fields=` response projection; resumable/chunked uploads; realtime backfill/replay and per-event-guard load-tuning.
 

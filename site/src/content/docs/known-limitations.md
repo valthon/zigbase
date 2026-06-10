@@ -49,6 +49,20 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
   task submitted right before shutdown may be cut off. (Cron jobs use the bounded, cleanly
   joined pool.)
 
+## Static file serving
+
+- Static files are served without authentication — collection access rules do not apply
+  to the static root; use file storage for access-controlled delivery.
+- No `Range`/partial-content requests (no video seeking on large files served from the
+  static root).
+- No directory listings; directories resolve to `index.html` or 404.
+- Path safety is lexical (`..`, backslashes, and NUL bytes are rejected); symlinks inside
+  the static root are followed — do not point them outside the root.
+- No on-the-fly compression; pre-compress at the CDN or reverse proxy if needed.
+- In **dir** mode (`--serve-static` or comptime `.dir`), caching is controlled by
+  facil.io's `sendFile` (fixed `Cache-Control: max-age=3600`) — this value is not
+  configurable yet.
+
 ## Platform & UI
 
 - **No Windows build** — Linux and macOS only (the embedded HTTP server depends on

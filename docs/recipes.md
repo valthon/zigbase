@@ -20,6 +20,61 @@ and rule semantics are in [api.md](api.md); the framework hook/route/job APIs ar
 
 ---
 
+## Recipe: ship your frontend inside the binary
+
+Build any static site (Astro, Vite, plain HTML) into a `dist/` folder, then embed
+it at compile time using the `embedStaticDir` helper exported from zigbase's
+`build.zig`. The built binary serves the frontend from memory — no directory needed
+at runtime.
+
+```zig
+// build.zig
+const std = @import("std");
+const zigbase_build = @import("zigbase");
+
+pub fn build(b: *std.Build) void {
+    // ... standard setup ...
+
+    // Generate a manifest module: one @embedFile per asset, with precomputed CRC32 ETags.
+    // build fails with a clear error if frontend/dist is missing — run `npm run build` first.
+    const assets = zigbase_build.embedStaticDir(b, "frontend/dist");
+    exe_mod.addImport("static_assets", assets);
+}
+```
+
+```zig
+// main.zig
+const static_assets = @import("static_assets");
+
+pub fn main(init: std.process.Init) !void {
+    return zigbase.App(.{
+        .static_files = .{ .embedded = &static_assets.files },
+        // ... other config ...
+    }).runCli(init);
+}
+```
+
+GET and HEAD requests that miss `/_/`, the built-in API, and custom routes are
+served from the embedded manifest. `/` and directory paths resolve to `index.html`.
+Each asset's response carries a precomputed CRC32 `ETag`; a matching
+`If-None-Match` gets `304 Not Modified`. Static misses return a plain-text 404;
+`/api/*` misses keep the JSON envelope.
+
+The three static-files modes — and their trade-offs:
+
+| Mode | When to use | `--serve-static` flag |
+|---|---|---|
+| *(field absent — default)* | Flexible deploy: pass `--serve-static <dir>` at runtime. | enabled |
+| `.static_files = .disabled` | No static serving, flag rejected. | rejected |
+| `.static_files = .{ .dir = "frontend/dist" }` | Dir is always at that relative path (dev servers, Docker images with a known layout). | rejected |
+| `.static_files = .{ .embedded = &@import("static_assets").files }` | True single-binary deploy — assets inside the executable. | rejected |
+
+See [examples/blog/](../examples/blog/) (runtime flag), [examples/golfsim/](../examples/golfsim/)
+(hardcoded dir), and [examples/plugins/](../examples/plugins/) (embedded) for working
+Astro + React frontends, one per mode.
+
+---
+
 ## Recipe: provisioning your schema
 
 There is no "import a schema file" endpoint — over the REST API you **provision by
@@ -28,6 +83,11 @@ relation fields reference their target by **id** (not name — see
 [fields.md → relation gotcha](fields.md#critical-targetcollectionid-is-an-id-not-a-name)),
 you must create collections **in dependency order** and **capture each `id`** from
 the response to feed the next collection's `targetCollectionId`.
+
+> **Note:** the golfsim example now self-provisions its schema at startup via
+> `App(.{ .collections = .{ ... } })` — the script below is the REST-API
+> alternative, useful when you are running the stock binary or want fine-grained
+> control over ids and ordering.
 
 > **Embedding ZigBase?** You can skip the REST dance entirely and **declare your
 > schema in Zig at comptime** via `App(.{ .collections = .{ ... } })`, provisioned

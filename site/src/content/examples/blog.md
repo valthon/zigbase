@@ -1,6 +1,6 @@
 ---
 title: Blog
-summary: A minimal app on ZigBase-as-a-library — one before_create hook that derives a URL slug.
+summary: A minimal app on ZigBase-as-a-library — slugify hook + an Astro/React frontend served with --serve-static.
 rung: Packaging proof
 order: 1
 repoPath: examples/blog
@@ -82,19 +82,37 @@ exe_mod.addImport("zigbase", zigbase.module("zigbase"));
 
 Your executable module must `.link_libc = true` (SQLite needs libc).
 
+## Frontend (Astro + React islands)
+
+`frontend/` is an Astro site with React islands: a public post list/detail and a login +
+"write a post" island that exercises the `slugify` hook. The example's comptime
+`.collections` schema (users + posts) provisions itself on startup, so the whole thing works
+from a fresh data directory.
+
+```sh
+cd frontend && npm install && npm run build && cd ..
+zig build
+ZIGBASE_JWT_SECRET=... ./zig-out/bin/blog serve --data-dir ./data --serve-static frontend/dist
+# open http://127.0.0.1:8090/
+```
+
+This demonstrates ZigBase's **default static-files mode**: the binary serves `frontend/dist`
+at the root path because you passed `--serve-static`. The other modes (comptime-hardcoded
+dir, fully embedded) are shown by the golfsim and plugins examples.
+
 ## Building and running
 
 This example needs **Zig 0.16**, which you can get via [mise](https://mise.jdx.dev)
 (`mise exec zig@0.16.0 -- zig ...`). From `examples/blog/`:
 
 ```sh
-cd examples/blog && zig build       # produces ./zig-out/bin/blog
+cd frontend && npm install && npm run build && cd ..
+zig build       # produces ./zig-out/bin/blog
 ./zig-out/bin/blog superuser create --email you@example.com --password <pw> --data-dir ./data
-./zig-out/bin/blog serve --data-dir ./data
+ZIGBASE_JWT_SECRET=... ./zig-out/bin/blog serve --data-dir ./data --serve-static frontend/dist
 ```
 
-Then create a `posts` record without a `slug` and the hook fills it in from the
-`title`.
+Then create a `posts` record without a `slug` and the hook fills it in from the `title`.
 
 ---
 

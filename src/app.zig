@@ -17,6 +17,8 @@ pub const App = struct {
     max_upload_size: u64 = 50 << 20,
     file_token_ttl_s: i64 = 120,
     sentry_dsn: []const u8 = "", // "" = log errors to stderr; set to enable Sentry reporting
+    /// Static-file source resolved by framework.serveImpl (.none = no static serving).
+    static_source: @import("static_files.zig").Source = .none,
     storage: ?*const @import("files/storage.zig").Storage = null,
     /// Pluggable mailer (resolved from the comptime mailer plugin in serveImpl).
     /// Default = LogMailer (logs); set SMTP config to upgrade to SmtpMailer. null in

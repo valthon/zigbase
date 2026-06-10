@@ -4,6 +4,36 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Provisioning no longer leaks at shutdown:** `applySpecs` and `runMigrations`
+  now wrap all internal allocations in a short-lived arena (backed by the
+  caller's allocator), so intermediate allocations from `topoOrder`,
+  `collections.create` / `ddl.quoteIdent`, `schema.indexesToJson`, and the
+  `prov:` migration-name string are all freed before the call returns. The
+  long-lived gpa accumulates nothing during startup provisioning.
+- **Reserved field names in comptime `.collections` are rejected at compile
+  time:** declaring a field whose name is reserved by the engine (`id`,
+  `created`, `updated`, `email`, `username`, `passwordHash`, `tokenKey`,
+  `verified`) now produces a clear `@compileError` at build time rather than an
+  opaque validation failure at startup.
+
+### Added
+- **Static file serving:** root-path fallback with four comptime modes — runtime
+  `--serve-static <dir>` flag (default), `.disabled`, comptime-hardcoded `.dir`, or
+  assets fully `.embedded` in the binary via the new `embedStaticDir` build helper
+  in `build.zig`. Embedded mode computes a CRC32 content `ETag` at build time and
+  handles `If-None-Match`/304 itself. Dir mode (`--serve-static` or comptime `.dir`)
+  delegates caching to facil.io's `sendFile` (`ETag`, `Last-Modified`,
+  `Cache-Control: max-age=3600`, 304). All modes add `X-Content-Type-Options: nosniff`
+  and lexical traversal protection (`..`, backslash, NUL). Static misses return
+  plain-text 404; `/api/*` misses keep the JSON envelope.
+- **Example frontends:** all three examples now ship an Astro + React-islands
+  frontend (one per static mode: blog = runtime flag, golfsim = hardcoded dir,
+  plugins = embedded). Blog and golfsim also gain comptime `.collections` schemas so
+  the examples provision themselves at startup.
+
 ## [0.1.0] - 2026-06-10
 
 First public release: a single-binary, PocketBase-inspired (not API-compatible)

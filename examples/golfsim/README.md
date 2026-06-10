@@ -106,28 +106,36 @@ pooled writer, wrap it in a `Data`, and release on exit.
 `Data` from the pool: `zigbase.Data{ .app = ev.app, .conn = ev.app.pool.acquireWriter(), .io = ev.app.io }`
 (with `defer ev.app.pool.releaseWriter();`).
 
+## Frontend (Astro + React islands)
+
+`frontend/` is an Astro site whose React islands drive the whole booking flow:
+sign in, browse published listings, hold a slot (the `beforeCreate` hook
+validates the listing, computes `price_total`, stamps the guest, and forces
+`status=pending`), then confirm it through the custom
+`POST /api/bookings/:id/confirm` route.
+
+```sh
+cd frontend && npm install && npm run build && cd ..
+mise exec zig@0.16.0 -- zig build
+ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
+  ./zig-out/bin/golfsim serve --data-dir ./data
+# open http://127.0.0.1:8090/  — no --serve-static needed
+```
+
+This demonstrates the **comptime-hardcoded** static mode:
+`.static_files = .{ .dir = "frontend/dist" }` bakes the directory into the
+binary's config, and `--serve-static` is rejected as an unknown flag. The
+collections (users / simulators / listings / bookings) are provisioned at
+startup from the comptime `.collections` schema.
+
 ## Provisioning the collections
 
-The hook, route and cron reference the collections **by name** (`users` /
-`simulators` / `listings` / `bookings`); until those collections exist they are
-harmless no-ops, which is fine for a compiling example. Provision them at runtime by
-calling `POST /api/collections` as a superuser, **in dependency order**, capturing
-each new collection's `id` to wire the relation fields.
-
-The canonical, copy-pasteable provisioning script lives in
-[`docs/recipes.md` → "provisioning your schema"](../../docs/recipes.md). It creates
-`users` (auth) → `simulators` → `listings` → `bookings`, wiring relations by id and
-seeding a demo host. The shapes this example assumes:
-
-- `listings`: `title` (text), `price_per_hour` (number), `status`
-  (select: `draft`/`published`/`archived`), `simulator` (relation), and
-  **`photos` (file** — listing photos, `image/png`/`jpeg`/`webp`).
-- `bookings`: `listing` (relation), `guest` (relation), `starts_at`/`ends_at`
-  (date), `status` (select: `pending`/`confirmed`/`cancelled`).
-
-> The **`photos` file field** on `listings` is provisioned via the API (see the
-> recipe) — file storage itself is provided by the framework; this example does not
-> need any extra code to support uploads.
+The collections are provisioned automatically at startup via the comptime
+`.collections = .{ ... }` schema in `src/main.zig` — no manual API calls
+needed. On first run the framework creates all four collections and their
+fields. The canonical runtime-provisioning recipe in
+[`docs/recipes.md`](../../docs/recipes.md) remains as an alternative reference
+for using the REST API to set up schemas manually.
 
 A quick smoke once the server is up:
 
@@ -154,13 +162,15 @@ Your executable module must `.link_libc = true` (SQLite needs libc).
 From `examples/golfsim/`:
 
 ```sh
+cd frontend && npm install && npm run build && cd ..
 mise exec zig@0.16.0 -- zig build           # produces ./zig-out/bin/golfsim
 ./zig-out/bin/golfsim superuser create --email you@example.com --password "<pw>" --data-dir ./data
 ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
   ./zig-out/bin/golfsim serve --data-dir ./data
+# open http://127.0.0.1:8090/  — frontend served automatically, no --serve-static flag
 ```
 
-Then provision the collections (recipe above), register a guest, create a
+The collections provision themselves at startup. Register a guest, create a
 `published` listing, and `POST /api/collections/bookings/records` — the hook fills in
 `guest`, `status` and `price_total`; `POST /api/bookings/:id/confirm` flips it to
 `confirmed`; and the `expire-holds` cron sweeps stale pending holds.

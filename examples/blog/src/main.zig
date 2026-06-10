@@ -1,3 +1,14 @@
+//! ZigBase blog example — demonstrates the DEFAULT static-files mode.
+//!
+//! Comptime schema (provisioned at startup via additive auto-migration):
+//!   - users  (auth collection, open signup, self-only update/delete)
+//!   - posts  (title + server-derived slug + body + status; public list/view
+//!             only when published; authenticated create/update/delete)
+//!
+//! The `slugify` beforeCreate hook derives a URL slug from the post title.
+//! The Astro + React frontend in `frontend/` is served via:
+//!   --serve-static frontend/dist
+
 const std = @import("std");
 const zigbase = @import("zigbase");
 
@@ -58,6 +69,35 @@ pub fn main(init: std.process.Init) !void {
         .jobs = .{ .pool_size = 2 },
         .cron = .{
             .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
+        },
+        // Provisioned at startup (additive auto-migration): an auth collection with
+        // open signup, and public posts readable only when published.
+        .collections = .{
+            .users = .{
+                .type = .auth,
+                .fields = .{
+                    .{ .name = "name", .type = .text, .max = 100 },
+                },
+                .rules = .{ .list = "", .view = "", .create = "", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
+            },
+            .posts = .{
+                .fields = .{
+                    .{ .name = "title", .type = .text, .required = true, .max = 200 },
+                    .{ .name = "slug", .type = .text, .max = 220 },
+                    .{ .name = "body", .type = .text, .max = 20000 },
+                    .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
+                },
+                // NOTE: any authed user can edit/delete any post — deliberately simple for a demo.
+                // For per-author restriction, add an author relation field and use
+                // "@request.auth.id = author" in the update/delete rules.
+                .rules = .{
+                    .list = "status = \"published\"",
+                    .view = "status = \"published\"",
+                    .create = "@request.auth.id != \"\"",
+                    .update = "@request.auth.id != \"\"",
+                    .delete = "@request.auth.id != \"\"",
+                },
+            },
         },
     }).runCli(init);
 }

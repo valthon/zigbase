@@ -25,6 +25,8 @@ pub const RequestCtx = struct {
     remote_ip: []const u8 = "",
     /// Request content-type (filled by server.zig). Multipart bodies populate form_fields/files.
     content_type: []const u8 = "",
+    /// If-None-Match request header value (filled by server.zig; "" when absent).
+    if_none_match: []const u8 = "",
     form_fields: ?std.json.Value = null,
     files: []const UploadedFile = &.{},
 

@@ -105,6 +105,7 @@ fn buildField(comptime col_name: []const u8, comptime f: anytype) schema.Field {
         const F = @TypeOf(f);
         if (!@hasField(F, "name")) @compileError("a field in collection '" ++ col_name ++ "' is missing .name");
         const fname: []const u8 = f.name;
+        if (schema.isSystemFieldName(fname)) @compileError("collection '" ++ col_name ++ "': field name '" ++ fname ++ "' is reserved by the engine (id/created/updated/email/username/passwordHash/tokenKey/verified); pick another name");
         if (!@hasField(F, "type")) @compileError("field '" ++ fname ++ "' in collection '" ++ col_name ++ "' is missing .type");
         const ftype: schema.FieldType = f.type;
 
@@ -257,6 +258,12 @@ fn stableFieldId(comptime col: []const u8, comptime name: []const u8) []const u8
 /// An explicit migration for changes additive auto-provisioning won't do
 /// (renames, retypes, data backfills). Recorded in `_migrations` under
 /// `id` (prefixed), so it runs exactly once and is idempotent across restarts.
+///
+/// Note: the `alloc` passed to `up` is a short-lived arena scoped to the
+/// `runMigrations` call — anything allocated from it is freed before
+/// `runMigrations` returns. Do not store pointers derived from `alloc` in
+/// state that outlives the call; use a separate long-lived allocator for
+/// persistent data.
 pub const Migration = struct {
     id: []const u8,
     up: *const fn (alloc: std.mem.Allocator, io: std.Io, w: *db.Db) anyerror!void,
@@ -289,12 +296,20 @@ pub fn applySchema(
 
 /// Like `applySchema` but takes already-lowered specs (used by tests and by
 /// `applySchema`). Relation targetCollectionId carries the target NAME on input.
+///
+/// `alloc` is used only as the backing allocator for an internal arena; nothing
+/// allocated inside this function escapes the call (all results are written to
+/// the DB). Callers may safely pass their long-lived gpa.
 pub fn applySpecs(
     alloc: std.mem.Allocator,
     io: std.Io,
     w: *db.Db,
     specs: []const schema.Collection,
 ) ProvisionError!void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
     // Validate all relation targets reference a known comptime collection name up
     // front, so an unknown target is a clear startup error (not a broken relation).
     for (specs) |spec| {
@@ -302,7 +317,7 @@ pub fn applySpecs(
             .relation => |r| {
                 if (!nameInSpecs(specs, r.targetCollectionId)) {
                     // Allow targeting a pre-existing live collection too (e.g. _superusers).
-                    if ((try collections.get(alloc, w, r.targetCollectionId)) == null) {
+                    if ((try collections.get(a, w, r.targetCollectionId)) == null) {
                         std.log.warn(
                             "provision: collection '{s}' field '{s}' relates to unknown target '{s}' — refusing to provision",
                             .{ spec.name, f.name, r.targetCollectionId },
@@ -318,10 +333,10 @@ pub fn applySpecs(
     // Topologically order so relation targets are created first; on cycle, fall
     // back to declaration order (collections.create resolves by name and will
     // error clearly if a target is genuinely missing).
-    const order = try topoOrder(alloc, specs);
+    const order = try topoOrder(a, specs);
 
     for (order) |idx| {
-        try ensureCollection(alloc, io, w, specs[idx]);
+        try ensureCollection(a, io, w, specs[idx]);
     }
 }
 
@@ -347,6 +362,8 @@ pub fn ensureCollection(
 
     // Diff user fields. `live.fields` from get() includes injected auth system
     // fields for auth collections; compare only against non-system field names.
+    // (additions/merged below skip .deinit(): this fn runs under applySpecs'
+    // arena, which reclaims them wholesale.)
     var additions: std.ArrayList(schema.Field) = .empty;
     var changed = false;
     for (spec.fields) |sf| {
@@ -438,18 +455,26 @@ fn resolveTargets(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) P
 
 /// Run explicit migrations in order, each recorded once in `_migrations` under a
 /// `prov:` prefix (so they never collide with the built-in system migrations).
+///
+/// `alloc` is used only as the backing allocator for an internal arena; nothing
+/// allocated inside this function escapes the call. Callers may safely pass their
+/// long-lived gpa.
 pub fn runMigrations(
     alloc: std.mem.Allocator,
     io: std.Io,
     w: *db.Db,
     migs: []const Migration,
 ) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
     for (migs) |m| {
-        const name = try std.fmt.allocPrint(alloc, "prov:{s}", .{m.id});
+        const name = try std.fmt.allocPrint(a, "prov:{s}", .{m.id});
         if (try migrationApplied(w, name)) continue;
         try w.begin();
         errdefer w.rollback() catch {};
-        try m.up(alloc, io, w);
+        try m.up(a, io, w);
         try recordMigration(w, name);
         try w.commit();
         std.log.info("provision: applied migration '{s}'", .{m.id});
@@ -488,6 +513,9 @@ fn specFieldByName(c: schema.Collection, name: []const u8) ?schema.Field {
 fn topoOrder(alloc: std.mem.Allocator, specs: []const schema.Collection) std.mem.Allocator.Error![]usize {
     const n = specs.len;
     const visited = try alloc.alloc(u8, n); // 0=unseen 1=on-stack 2=done
+    // No-op under applySpecs' arena; effective for direct callers with a raw
+    // allocator (e.g. the std.testing.allocator leak test).
+    defer alloc.free(visited);
     @memset(visited, 0);
     var out: std.ArrayList(usize) = .empty;
 
@@ -582,6 +610,19 @@ test "topoOrder places relation targets before dependents" {
         if (idx == 0) pos_listings = p;
     }
     try std.testing.expect(pos_users < pos_listings);
+}
+
+test "topoOrder is leak-free (std.testing.allocator)" {
+    // std.testing.allocator is a leak-detecting allocator; this test would fail
+    // before the defer alloc.free(visited) fix was applied.
+    const lf = [_]schema.Field{.{ .id = "r", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } }};
+    const specs = [_]schema.Collection{
+        .{ .id = "", .name = "listings", .fields = &lf },
+        .{ .id = "", .name = "users", .fields = &.{} },
+    };
+    const order = try topoOrder(std.testing.allocator, &specs);
+    defer std.testing.allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 2), order.len);
 }
 
 test "applySpecs provisions collections + name-based relation resolves to target id; idempotent" {

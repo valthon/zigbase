@@ -18,6 +18,11 @@ jobs:
         run: cd examples/blog && mise exec zig@0.16.0 -- zig build
       - name: Build golfsim example consumer (realistic app)
         run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build plugins example frontend (embedded assets)
+        run: cd examples/plugins/frontend && npm ci --no-audit --no-fund && npm run build
       - name: Build plugins example consumer (advanced framework surface)
         run: cd examples/plugins && mise exec zig@0.16.0 -- zig build
 
@@ -26,6 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build plugins example frontend (embedded assets, used by static-files tests)
+        run: cd examples/plugins/frontend && npm ci --no-audit --no-fund && npm run build
       - name: Install Playwright + Chromium + aiosmtpd
         run: |
           mise exec python@3.13 -- python -m pip install --quiet pytest playwright aiosmtpd

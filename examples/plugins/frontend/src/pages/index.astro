@@ -1,0 +1,30 @@
+---
+import '../styles/global.css';
+import Browser from '../components/Browser.tsx';
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZigBase plugins example</title>
+  </head>
+  <body>
+    <header class="site">
+      <nav>
+        <span class="brand">ZigBase plugins example</span>
+        <a href="/_/" data-astro-reload>Admin</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Everything in one binary</h1>
+      <p class="muted">
+        This page &mdash; HTML, JS, CSS &mdash; is <strong>compiled into the executable</strong>
+        via <code>embedStaticDir</code> + <code is:raw>.static_files = .{ .embedded = … }</code>.
+        There is no frontend directory at runtime; delete <code>frontend/dist</code>
+        after building and the site still serves.
+      </p>
+      <Browser client:load />
+    </main>
+  </body>
+</html>
