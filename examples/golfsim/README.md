@@ -117,7 +117,8 @@ validates the listing, computes `price_total`, stamps the guest, and forces
 ```sh
 cd frontend && npm install && npm run build && cd ..
 mise exec zig@0.16.0 -- zig build
-ZIGBASE_JWT_SECRET=... ./zig-out/bin/golfsim serve --data-dir ./data
+ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
+  ./zig-out/bin/golfsim serve --data-dir ./data
 # open http://127.0.0.1:8090/  — no --serve-static needed
 ```
 

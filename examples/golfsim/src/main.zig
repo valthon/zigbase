@@ -89,6 +89,11 @@ fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
 //    NOTE: RouteEvent does NOT carry a `Data` (only RecordEvent does), so a
 //    route that touches the DB builds its own `Data` from the pool — the same
 //    construction the cron job uses below.
+//
+//    NOTE: this demo route does NOT verify the caller is the listing's owner — any
+//    authed user can confirm any booking, and the frontend lets the GUEST confirm
+//    their own hold. For the production owner-check pattern (compare
+//    @request.auth.id to listing.simulator.owner), see docs/recipes.md.
 // ---------------------------------------------------------------------------
 fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
     const not_found: zigbase.http.Response = .{ .status = 404, .body = "{\"message\":\"Booking not found.\"}" };
@@ -255,6 +260,8 @@ pub fn main(init: std.process.Init) !void {
                     .{ .name = "label", .type = .text, .required = true, .max = 120 },
                     .{ .name = "owner", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
                 },
+                // NOTE: any authed user can create a simulator (become a host) — deliberately
+                // simple for a demo; restrict with a role/claim check in a real app.
                 .rules = .{ .list = "", .view = "", .create = "@request.auth.id != \"\"", .update = "@request.auth.id = owner", .delete = "@request.auth.id = owner" },
             },
             .listings = .{

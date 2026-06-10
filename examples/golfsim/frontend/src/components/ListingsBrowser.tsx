@@ -12,7 +12,9 @@ function BookForm({ listing }: { listing: Listing }) {
   async function book() {
     setBusy(true); setError(null);
     try {
-      // datetime-local gives "YYYY-MM-DDTHH:MM"; the API wants RFC3339 seconds.
+      // datetime-local gives "YYYY-MM-DDTHH:MM" in the user's LOCAL time; appending
+      // ":00Z" treats it as UTC — fine for a demo, wrong across timezones. Use a
+      // timezone-aware conversion in a real app.
       const b = await createBooking(listing.id, `${start}:00Z`, `${end}:00Z`);
       setBooked(b.price_total);
     } catch (e: unknown) {

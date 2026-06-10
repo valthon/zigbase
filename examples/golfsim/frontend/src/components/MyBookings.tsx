@@ -25,9 +25,12 @@ export default function MyBookings() {
           <h2>{b.expand?.listing?.title ?? b.listing}</h2>
           <p className="muted">
             {new Date(b.starts_at).toLocaleString()} → {new Date(b.ends_at).toLocaleString()} ·
-            ${b.price_total?.toFixed?.(2) ?? b.price_total} · <strong>{b.status}</strong>
+            ${b.price_total.toFixed(2)} · <strong>{b.status}</strong>
           </p>
           {b.status === 'pending' && (
+            /* Demo simplification: the /confirm route accepts any authed caller, so the
+               guest confirms their own hold here. A real app would restrict confirmation
+               to the simulator owner — see main.zig's NOTE. */
             <button onClick={() => confirmBooking(b.id).then(reload).catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))}>
               Confirm (custom route)
             </button>
