@@ -100,20 +100,27 @@ pub const AllPlan = struct {
     deletes: []const []const u8,
 };
 
+/// Append the removal names carried by one string value: a JSON-array string
+/// (the admin UI / curl convention) contributes its string elements; anything
+/// else is a single verbatim filename.
+fn appendRemovalString(alloc: std.mem.Allocator, out: *std.ArrayList([]const u8), s: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch {
+        if (s.len > 0) try out.append(alloc, s);
+        return;
+    };
+    if (parsed.value == .array) {
+        for (parsed.value.array.items) |it| if (it == .string) try out.append(alloc, it.string);
+    } else if (s.len > 0) try out.append(alloc, s);
+}
+
 fn parseRemovals(alloc: std.mem.Allocator, v: ?std.json.Value) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     const val = v orelse return out.toOwnedSlice(alloc);
     switch (val) {
-        .string => |s| {
-            const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch {
-                if (s.len > 0) try out.append(alloc, s);
-                return out.toOwnedSlice(alloc);
-            };
-            if (parsed.value == .array) {
-                for (parsed.value.array.items) |it| if (it == .string) try out.append(alloc, it.string);
-            } else if (s.len > 0) try out.append(alloc, s);
-        },
-        .array => |arr| for (arr.items) |it| if (it == .string) try out.append(alloc, it.string),
+        .string => |s| try appendRemovalString(alloc, &out, s),
+        // Repeated '<field>-' multipart keys arrive as an array of verbatim
+        // JSON-text strings; each element gets the same parse-or-verbatim rule.
+        .array => |arr| for (arr.items) |it| if (it == .string) try appendRemovalString(alloc, &out, it.string),
         else => {},
     }
     return out.toOwnedSlice(alloc);
@@ -309,6 +316,35 @@ test "planAllFileFields update multi: <field>- JSON array removes, uploads add" 
     try std.testing.expect(all.data.object.get("docs-") == null);
     try std.testing.expectEqual(@as(usize, 1), all.deletes.len);
     try std.testing.expectEqualStrings("drop.txt", all.deletes[0]);
+}
+
+test "planAllFileFields: repeated '<field>-' removal keys (array of JSON-text strings) all apply" {
+    // The multipart parser promotes repeated keys to an array of verbatim strings,
+    // so `-F 'photos-=["a.jpg"]' -F 'photos-=["b.jpg"]'` arrives as
+    // ["[\"a.jpg\"]", "[\"b.jpg\"]"]: each element must be JSON-parsed.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = collWithFile("docs", 5);
+    var existing: std.json.ObjectMap = .empty;
+    var ex = std.json.Array.init(a);
+    try ex.append(.{ .string = "a.txt" });
+    try ex.append(.{ .string = "b.txt" });
+    try ex.append(.{ .string = "keep.txt" });
+    try existing.put(a, "docs", .{ .array = ex });
+    var data: std.json.ObjectMap = .empty;
+    var minus = std.json.Array.init(a);
+    try minus.append(.{ .string = "[\"a.txt\"]" });
+    try minus.append(.{ .string = "[\"b.txt\"]" });
+    try minus.append(.{ .string = "plain.txt" }); // a non-JSON element stays verbatim
+    try data.put(a, "docs-", .{ .array = minus });
+    const all = try planAllFileFields(std.testing.io, a, col, .{ .object = data }, &.{}, .{ .object = existing });
+    try std.testing.expectEqual(@as(usize, 2), all.deletes.len);
+    try std.testing.expectEqualStrings("a.txt", all.deletes[0]);
+    try std.testing.expectEqualStrings("b.txt", all.deletes[1]);
+    const arr = all.data.object.get("docs").?.array;
+    try std.testing.expectEqual(@as(usize, 1), arr.items.len);
+    try std.testing.expectEqualStrings("keep.txt", arr.items[0].string);
 }
 
 test "planAllFileFields: non-file fields and absent file field are untouched" {
