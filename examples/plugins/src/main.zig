@@ -103,6 +103,8 @@ pub fn main(init: std.process.Init) !void {
                 .type = .base,
                 .fields = .{
                     .{ .name = "name", .type = .text, .required = true },
+                    // "email" is a reserved system field name (auth collections own it);
+                    // base collections must pick another name.
                     .{ .name = "contact_email", .type = .email },
                 },
                 .rules = .{ .list = "", .view = "" },

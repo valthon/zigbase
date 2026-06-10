@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("zigbase", zigbase.module("zigbase"));
 
     // Embed the built Astro frontend into the binary (fails with a clear message
-    // if frontend/dist is missing — run `npm run build` in frontend/ first).
+    // if frontend/dist is missing — run `npm install && npm run build` in frontend/ first).
     const assets = zigbase_build.embedStaticDir(b, "frontend/dist");
     exe_mod.addImport("static_assets", assets);
 

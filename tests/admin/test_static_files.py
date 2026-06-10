@@ -1,4 +1,6 @@
-import socket, subprocess, tempfile, time, os, pathlib, urllib.request, urllib.error
+import socket, subprocess, tempfile, time, os, pathlib, shutil, urllib.request, urllib.error
+
+import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
@@ -104,12 +106,8 @@ def test_serve_static_missing_dir_is_fatal():
         assert proc.wait(timeout=20) != 0
 
 
-import shutil
-
-
 def test_embedded_static_in_plugins_example():
     if shutil.which("npm") is None:
-        import pytest
         pytest.skip("npm not available; cannot build the plugins frontend")
     plugins = REPO / "examples" / "plugins"
     fe = plugins / "frontend"
