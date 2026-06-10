@@ -132,6 +132,11 @@ pub fn embedStaticDir(b: *std.Build, opts: struct {
 }) *std.Build.Module
 ```
 
+> **Amended during implementation:** the shipped signature is
+> `embedStaticDir(b: *std.Build, dir_rel: []const u8)` — a positional
+> build-root-relative path, no opts struct (the module name is chosen by the
+> consumer via `addImport`). The live docs and examples reflect this.
+
 Implementation: walk `dir` at build (configure) time with `std.fs`, emit a generated `.zig`
 source into a `WriteFiles` step alongside copies of the asset files, where the generated file
 declares `pub const files = [_]StaticFile{ .{ .path = "...", .bytes = @embedFile("...") , .etag = "..." }, ... }`.

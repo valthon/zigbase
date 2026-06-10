@@ -368,6 +368,10 @@ are served from the static root. Requests under `/api/` are never served
 statically — an unmatched `/api/*` path keeps the JSON 404 envelope, while a
 static miss returns a plain-text 404 (`text/plain`).
 
+Static files are served **without authentication** — collection access rules do
+not apply to the static root, so never place secrets there. For access-controlled
+file delivery, use [file storage](#files) instead.
+
 - `/` and directory paths resolve to that directory's `index.html`.
 - **Caching:** in **embedded** mode, each asset has a precomputed CRC32 content
   `ETag`; a request with a matching `If-None-Match` gets `304 Not Modified` from
