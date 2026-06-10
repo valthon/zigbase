@@ -486,15 +486,18 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
         .embedded => |files| .{ .embedded = files },
         .default => if (cfg.static_dir.len > 0) static_files.Source{ .dir = cfg.static_dir } else .none,
     };
-    if (std.meta.activeTag(static_source) == .dir) {
-        const probe = std.Io.Dir.cwd().openDir(io, static_source.dir, .{}) catch {
-            std.log.err("static dir '{s}' is missing or unreadable (from {s})", .{
-                static_source.dir,
-                if (std.meta.activeTag(opts.static_mode) == .dir) "comptime .static_files" else "--serve-static",
-            });
-            return error.StaticDirUnavailable;
-        };
-        probe.close(io);
+    switch (static_source) {
+        .dir => |dir_path| {
+            const probe = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch {
+                std.log.err("static dir '{s}' is missing or unreadable (from {s})", .{
+                    dir_path,
+                    if (std.meta.activeTag(opts.static_mode) == .dir) "comptime .static_files" else "--serve-static",
+                });
+                return error.StaticDirUnavailable;
+            };
+            probe.close(io);
+        },
+        else => {},
     }
 
     var app = app_mod.App{
