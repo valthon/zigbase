@@ -4,6 +4,10 @@ ZigBase is a single-binary backend. This document is the user-facing reference f
 its HTTP REST API and its realtime WebSocket interface. It describes only what the
 server actually implements.
 
+> **New to ZigBase?** Start with the [tutorial](tutorial.md) (build an app end to
+> end), then reach for the [field-type catalog](fields.md) and the
+> [task recipes](recipes.md). This page is the endpoint reference.
+
 ## Conventions
 
 - **Base path:** all REST endpoints live under `/api`.
@@ -244,6 +248,24 @@ Auth endpoints target an auth-type collection (`:col`).
 `auth-refresh` returns the same `{ token, record }` shape and re-sets the cookies.
 `auth-logout` clears `zb_auth` and `zb_csrf`.
 
+### Registration / signup
+
+There is **no dedicated register endpoint**. Signing up a user is a normal
+**record create on the auth collection**:
+
+```sh
+POST /api/collections/users/records
+{ "email": "user@example.com", "password": "a-good-password" }
+```
+
+On this create the server hashes the password (argon2id), strips the plaintext,
+mints a `tokenKey`, and **forces `verified` to `false`** (a client-supplied
+`verified` is ignored); `passwordHash`/`tokenKey` are hidden in the response. The
+auth collection needs a **public create rule** (`""`) for open signup, and the
+password must be at least `minPasswordLength` (default 8) — otherwise the create is
+a `400`. After signup, obtain a token via `auth-with-password` above. Full walkthrough:
+[recipes.md → User registration](recipes.md#recipe-user-registration-signup).
+
 ### Verification & password reset — mailer limitation
 
 > **Important:** ZigBase currently has **no mailer**. The verification and
@@ -359,3 +381,12 @@ When a subscribed record changes, the server pushes:
 
 Malformed or unknown client frames produce
 `{ "type": "error", "message": "..." }`.
+
+---
+
+## See also
+
+- [tutorial.md](tutorial.md) — build an app on ZigBase, end to end.
+- [fields.md](fields.md) — the complete field-type & options catalog.
+- [recipes.md](recipes.md) — provisioning, access rules, hooks, custom routes, jobs.
+- [framework.md](framework.md) — embedding ZigBase as a Zig library.

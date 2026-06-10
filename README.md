@@ -139,6 +139,9 @@ examples/
 
 ## Documentation
 
+- [docs/tutorial.md](docs/tutorial.md) — **start here**: build an app on ZigBase, end to end (provision → rules → signup → records + file upload → custom route → cron)
+- [docs/fields.md](docs/fields.md) — field-type & options catalog (all 12 types, defaults, validation rules)
+- [docs/recipes.md](docs/recipes.md) — task recipes: schema provisioning (curl), signup, owner/relation access rules, hooks, custom routes, DB access in cron
 - [docs/api.md](docs/api.md) — HTTP API reference (collections, records, query, rules, auth, oauth2, realtime, files, admin)
 - [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs
 - [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — current caveats

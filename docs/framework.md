@@ -6,6 +6,10 @@ framework**. You `zig fetch --save` it, `@import("zigbase")`, and configure
 lifecycle/auth/file event handlers. Your app *is* the ZigBase server, plus your
 extensions.
 
+> For runnable, end-to-end usage of these APIs (hooks, a custom route with a path
+> param, and a DB-touching cron job), see the [tutorial](tutorial.md) and the
+> [recipes](recipes.md). This page is the framework reference.
+
 ## 1. Overview
 
 The shipped binary is, in its entirety:
@@ -350,3 +354,13 @@ The public surface (from `src/root.zig`):
   `schedule.Reactive`.
 - `zigbase.RecordEvent`, `zigbase.ErrorEvent`, `zigbase.RouteEvent` —
   re-exported directly for convenience.
+
+---
+
+## See also
+
+- [tutorial.md](tutorial.md) — build an app on ZigBase, end to end.
+- [recipes.md](recipes.md) — copy-pasteable hook / route / job patterns (computed
+  fields, owner rules, path-param routes, DB access in cron).
+- [fields.md](fields.md) — the field-type & options catalog.
+- [api.md](api.md) — the HTTP REST + WebSocket reference.
