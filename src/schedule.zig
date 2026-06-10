@@ -1,6 +1,9 @@
 const std = @import("std");
 
 pub const Interval = union(enum) { weekly, daily, hourly, minutes: u64 };
+/// A job's firing schedule. For `interval` schedules the next fire is measured from the
+/// previous run's COMPLETION (via completeJob -> after + period), not a fixed wall-clock
+/// cadence, so long-running jobs drift; runs never overlap (single-flight).
 pub const Schedule = union(enum) { cron: []const u8, interval: Interval, reactive };
 pub const Reactive = union(enum) { after: Interval, stop };
 
@@ -14,7 +17,10 @@ pub fn periodSeconds(iv: Interval) i64 {
 }
 
 /// Does a single cron field match `value`? Supports `*`, `a`, `a,b,c`, `a-b`, `*/n`.
-/// Numeric only (no JAN/MON names). `min`/`max` are accepted for signature symmetry.
+/// Numeric only (no JAN/MON names); evaluated in UTC. `min`/`max` are accepted for
+/// signature symmetry. Parsing is best-effort: a malformed numeric sub-part is silently
+/// skipped (catch continue) rather than rejecting the whole field, so a typo'd field may
+/// match unexpectedly.
 pub fn cronFieldMatches(field: []const u8, value: u32, min: u32, max: u32) bool {
     _ = min;
     _ = max;
@@ -58,6 +64,8 @@ fn civilFromUnix(t: i64) Civil {
     return .{ .minute = minute, .hour = hour, .dom = @intCast(d), .month = @intCast(m), .dow = dow };
 }
 
+/// Matches a 5-field cron expression against UTC time `t`. Day-of-month and day-of-week
+/// are ANDed (both must match); this differs from Vixie cron, which ORs them when one is `*`.
 fn cronMatchesAt(expr: []const u8, t: i64) bool {
     var it = std.mem.splitScalar(u8, expr, ' ');
     const f_min = it.next() orelse return false;
@@ -78,6 +86,10 @@ fn cronMatchesAt(expr: []const u8, t: i64) bool {
 /// - interval: after + periodSeconds
 /// - reactive: null (handler return drives the next fire)
 /// - cron: next whole UTC minute matching the expression (searched up to ~370 days); null if none/invalid.
+///
+/// Cron expressions are numeric-only (no JAN/MON names) and evaluated in UTC. Day-of-month
+/// and day-of-week are ANDed (both must match); this differs from Vixie cron, which ORs them
+/// when one is `*`.
 pub fn nextFire(sched: Schedule, after_unix: i64) ?i64 {
     switch (sched) {
         .interval => |iv| return after_unix + periodSeconds(iv),
