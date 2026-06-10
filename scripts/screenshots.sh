@@ -603,9 +603,13 @@ api_json "$GOLF_PORT" "" POST /api/collections/users/records \
 GUEST_TOKEN="$(api_json "$GOLF_PORT" "" POST /api/collections/users/auth-with-password \
   "{\"identity\":\"$GUEST_EMAIL\",\"password\":\"$GUEST_PW\"}" | jget token)"
 
-# Future slot so the expire-holds cron never sweeps it.
-STARTS_AT="$(date -u -d 'tomorrow 18:00' +%Y-%m-%dT%H:%M:%SZ)"
-ENDS_AT="$(date -u -d 'tomorrow 20:00' +%Y-%m-%dT%H:%M:%SZ)"
+# Future slot so the expire-holds cron never sweeps it. (Python, not `date -d`:
+# BSD/macOS date has no -d.)
+tomorrow_utc() {
+  PY -c "from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) + timedelta(days=1)).replace(hour=$1, minute=0, second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ'))"
+}
+STARTS_AT="$(tomorrow_utc 18)"
+ENDS_AT="$(tomorrow_utc 20)"
 api_json "$GOLF_PORT" "$GUEST_TOKEN" POST /api/collections/bookings/records \
   "{\"listing\":\"$LISTING_ID\",\"starts_at\":\"$STARTS_AT\",\"ends_at\":\"$ENDS_AT\"}" >/dev/null
 
