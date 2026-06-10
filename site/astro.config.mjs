@@ -1,11 +1,15 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
+import mdx from '@astrojs/mdx';
 import { rehypeHeadingIds } from '@astrojs/markdown-remark';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 
 // https://astro.build/config
 export default defineConfig({
   site: 'https://valthon.github.io',
+  // @astrojs/mdx inherits the `markdown` config below (rehype heading ids +
+  // autolink anchors, Shiki dual themes) by default — keep it integration-first.
+  integrations: [mdx()],
   base: '/zigbase',
   trailingSlash: 'never',
   build: {
