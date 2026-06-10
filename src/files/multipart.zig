@@ -21,34 +21,67 @@ fn boundaryFromContentType(ct_header: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Extract a parameter value (`name` / `filename`) from a Content-Disposition
-/// header value such as `form-data; name="title"; filename="a.jpg"`.
-/// Handles quoted values (with backslash escapes) and bare tokens.
-fn dispositionParam(alloc: std.mem.Allocator, header: []const u8, key: []const u8) std.mem.Allocator.Error!?[]const u8 {
+const Disposition = struct { name: ?[]const u8 = null, filename: ?[]const u8 = null };
+
+/// Parse a Content-Disposition header value such as
+/// `form-data; name="title"; filename="a.jpg"` in ONE pass, extracting only
+/// `name` and `filename`. Quoted values support backslash escapes; values are
+/// borrowed from `header` unless unescaping forces a copy. A `;`-separated
+/// segment without '=' is a valueless flag param and is skipped. Params we
+/// don't care about are scanned past without allocating.
+fn parseDisposition(alloc: std.mem.Allocator, header: []const u8) std.mem.Allocator.Error!Disposition {
+    var out = Disposition{};
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, header, i, ';')) |semi| {
         var j = semi + 1;
         while (j < header.len and (header[j] == ' ' or header[j] == '\t')) j += 1;
-        const eq = std.mem.indexOfScalarPos(u8, header, j, '=') orelse return null;
-        const pname = std.mem.trim(u8, header[j..eq], " \t");
-        const matched = std.ascii.eqlIgnoreCase(pname, key);
-        var k = eq + 1;
+        // Param name ends at '=' — bounded by the current segment: a ';' first
+        // means this segment is a valueless flag param (e.g. "form-data; x; ...").
+        var k = j;
+        while (k < header.len and header[k] != '=' and header[k] != ';') k += 1;
+        if (k >= header.len or header[k] == ';') {
+            i = k;
+            continue;
+        }
+        const pname = std.mem.trim(u8, header[j..k], " \t");
+        const slot: ?*?[]const u8 = if (std.ascii.eqlIgnoreCase(pname, "name"))
+            &out.name
+        else if (std.ascii.eqlIgnoreCase(pname, "filename"))
+            &out.filename
+        else
+            null;
+        k += 1; // past '='
         if (k < header.len and header[k] == '"') {
             k += 1;
-            var out: std.ArrayList(u8) = .empty;
+            const vstart = k;
+            var escaped = false;
             while (k < header.len and header[k] != '"') : (k += 1) {
-                if (header[k] == '\\' and k + 1 < header.len) k += 1;
-                try out.append(alloc, header[k]);
+                if (header[k] == '\\' and k + 1 < header.len) {
+                    k += 1;
+                    escaped = true;
+                }
             }
-            if (matched) return try out.toOwnedSlice(alloc);
-            i = k; // resume the ';' scan after the closing quote
+            if (slot) |s| {
+                if (!escaped) {
+                    s.* = header[vstart..k]; // borrow; no allocation
+                } else {
+                    var buf: std.ArrayList(u8) = .empty;
+                    var m = vstart;
+                    while (m < k) : (m += 1) {
+                        if (header[m] == '\\' and m + 1 < k) m += 1;
+                        try buf.append(alloc, header[m]);
+                    }
+                    s.* = try buf.toOwnedSlice(alloc);
+                }
+            }
+            i = if (k < header.len) k + 1 else k; // past the closing quote
         } else {
             const end = std.mem.indexOfScalarPos(u8, header, k, ';') orelse header.len;
-            if (matched) return try alloc.dupe(u8, std.mem.trim(u8, header[k..end], " \t"));
+            if (slot) |s| s.* = std.mem.trim(u8, header[k..end], " \t");
             i = end;
         }
     }
-    return null;
+    return out;
 }
 
 /// Record one parsed part. A part with a `filename` disposition parameter is a file
@@ -76,10 +109,16 @@ fn handlePart(
         }
     }
     const d = disposition orelse return; // a part without a disposition carries no name; skip
-    const name = (try dispositionParam(alloc, d, "name")) orelse return;
-    if (try dispositionParam(alloc, d, "filename")) |fname| {
-        // `filename=""` with no bytes is the browser's "no file chosen" sentinel.
-        if (fname.len == 0 and content.len == 0) return;
+    const disp = try parseDisposition(alloc, d);
+    const raw_name = disp.name orelse return;
+    // PHP/jQuery convention (matched by the old facil.io path, which stripped it):
+    // "photos[]" keys the same field as "photos".
+    const name = if (std.mem.endsWith(u8, raw_name, "[]")) raw_name[0 .. raw_name.len - 2] else raw_name;
+    if (disp.filename) |fname| {
+        // Zero-byte file parts are dropped: browsers send filename="" with no bytes
+        // for an empty file input, and the old fio path skipped all null-data
+        // binfiles — a 0-byte part must never replace a stored file.
+        if (content.len == 0) return;
         try files.append(alloc, .{
             .field = name,
             .filename = if (fname.len == 0) "file" else fname,
@@ -113,6 +152,33 @@ fn handlePart(
 /// exact bytes the client sent. Schema-aware coercion happens later, in the records
 /// layer, where the collection schema is known.
 ///
+const Delim = struct { start: usize, after: usize, kind: enum { open, close } };
+
+/// Validate the bytes following "--<boundary>" at `end` per RFC 2046: "--" closes
+/// the multipart; otherwise only optional SP/HT transport padding may precede the
+/// CRLF that ends the delimiter line. Anything else means the match was content.
+fn checkDelimTail(body: []const u8, start: usize, end: usize) ?Delim {
+    if (end + 2 <= body.len and body[end] == '-' and body[end + 1] == '-')
+        return .{ .start = start, .after = end + 2, .kind = .close };
+    var k = end;
+    while (k < body.len and (body[k] == ' ' or body[k] == '\t')) k += 1;
+    if (k + 2 <= body.len and body[k] == '\r' and body[k + 1] == '\n')
+        return .{ .start = start, .after = k + 2, .kind = .open };
+    return null;
+}
+
+/// Find the next true delimiter ("\r\n--<boundary>" with a valid tail) at or after
+/// `from`. A bare prefix match (e.g. "\r\n--XBOUNDZ" for boundary XBOUND) is body
+/// content: keep searching from the next byte.
+fn nextDelimiter(body: []const u8, delim: []const u8, from: usize) ?Delim {
+    var i = from;
+    while (std.mem.indexOfPos(u8, body, i, delim)) |cand| {
+        if (checkDelimTail(body, cand, cand + delim.len)) |d| return d;
+        i = cand + 1;
+    }
+    return null;
+}
+
 /// Field values and file bytes borrow from `body`; names are duped into `alloc`.
 pub fn parse(alloc: std.mem.Allocator, content_type: []const u8, body: []const u8) ParseError!Extracted {
     var fields: std.json.ObjectMap = .empty;
@@ -122,17 +188,24 @@ pub fn parse(alloc: std.mem.Allocator, content_type: []const u8, body: []const u
     const dash_boundary = try std.fmt.allocPrint(alloc, "--{s}", .{boundary});
     const delim = try std.fmt.allocPrint(alloc, "\r\n--{s}", .{boundary});
 
-    // First delimiter: at the very start of the body (or after a preamble).
-    var pos = (std.mem.indexOf(u8, body, dash_boundary) orelse return error.BadMultipart) + dash_boundary.len;
-    while (true) {
-        if (pos + 2 <= body.len and std.mem.eql(u8, body[pos .. pos + 2], "--")) break; // closing "--boundary--"
-        // Skip optional transport padding up to the CRLF that ends the delimiter line.
-        const hdr_start = (std.mem.indexOfPos(u8, body, pos, "\r\n") orelse return error.BadMultipart) + 2;
+    // First delimiter: "--<boundary>" at the very start of the body, else a full
+    // "\r\n--<boundary>" after a preamble — both with a valid RFC 2046 tail.
+    var cur: Delim = blk: {
+        if (std.mem.startsWith(u8, body, dash_boundary)) {
+            if (checkDelimTail(body, 0, dash_boundary.len)) |d| break :blk d;
+        }
+        break :blk nextDelimiter(body, delim, 0) orelse return error.BadMultipart;
+    };
+    while (cur.kind == .open) {
+        const hdr_start = cur.after;
         const hdr_end = std.mem.indexOfPos(u8, body, hdr_start, "\r\n\r\n") orelse return error.BadMultipart;
         const content_start = hdr_end + 4;
-        const next = std.mem.indexOfPos(u8, body, content_start, delim) orelse return error.BadMultipart;
-        try handlePart(alloc, &fields, &files, body[hdr_start..hdr_end], body[content_start..next]);
-        pos = next + delim.len;
+        // An empty part shares its CRLF with the header terminator, so the next
+        // delimiter may begin at hdr_end + 2.
+        const next = nextDelimiter(body, delim, hdr_end + 2) orelse return error.BadMultipart;
+        const content = if (next.start < content_start) "" else body[content_start..next.start];
+        try handlePart(alloc, &fields, &files, body[hdr_start..hdr_end], content);
+        cur = next;
     }
     return .{ .form_fields = .{ .object = fields }, .files = try files.toOwnedSlice(alloc) };
 }
@@ -299,6 +372,102 @@ test "parse: missing boundary or malformed body errors" {
     try t.expectError(error.BadMultipart, parseBody(a, "no delimiter here"));
     // part started but never terminated
     try t.expectError(error.BadMultipart, parseBody(a, "--XBOUND\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv"));
+}
+
+test "parse: a boundary-prefixed decoy inside content is content, not a delimiter" {
+    // RFC 2046: a delimiter is "\r\n--<boundary>" followed by "--" or by optional
+    // SP/HT padding and CRLF. "\r\n--XBOUNDZ..." (boundary XBOUND) is body bytes.
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const smuggled = "AA\r\n--XBOUNDZ\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nBB";
+    const body = "--XBOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"a\"\r\n\r\n" ++ smuggled ++ "\r\n" ++
+        "--XBOUND--\r\n";
+    const ex = try parseBody(a, body);
+    try t.expectEqualStrings(smuggled, ex.form_fields.object.get("a").?.string);
+    try t.expect(ex.form_fields.object.get("b") == null); // nothing smuggled in
+    try t.expectEqual(@as(usize, 1), ex.form_fields.object.count());
+}
+
+test "parse: only SP/HT transport padding is allowed before the delimiter CRLF" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // legit padding after the boundary line is accepted
+    const padded = "--XBOUND  \t\r\n" ++
+        "Content-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n" ++
+        "--XBOUND--\r\n";
+    const ex = try parseBody(a, padded);
+    try t.expectEqualStrings("v", ex.form_fields.object.get("a").?.string);
+    // a non-padding byte after "--XBOUND" inside content means it is NOT a delimiter
+    const decoy_pad = "--XBOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"a\"\r\n\r\nx\r\n--XBOUND junk\r\nmore\r\n" ++
+        "--XBOUND--\r\n";
+    const ex2 = try parseBody(a, decoy_pad);
+    try t.expectEqualStrings("x\r\n--XBOUND junk\r\nmore", ex2.form_fields.object.get("a").?.string);
+}
+
+test "parse: empty part content yields an empty string" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "--XBOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"a\"\r\n\r\n\r\n" ++
+        "--XBOUND--\r\n";
+    const ex = try parseBody(a, body);
+    try t.expectEqualStrings("", ex.form_fields.object.get("a").?.string);
+}
+
+test "parse: a valueless flag param in the disposition does not eat the name" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "--XBOUND\r\n" ++
+        "Content-Disposition: form-data; x; name=\"title\"\r\n\r\nv1\r\n" ++
+        "--XBOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"other\"; flag\r\n\r\nv2\r\n" ++
+        "--XBOUND\r\n" ++
+        "Content-Disposition: form-data; decoy=\"a\\\"long;decoy\"; name=\"third\"\r\n\r\nv3\r\n" ++
+        "--XBOUND--\r\n";
+    const ex = try parseBody(a, body);
+    try t.expectEqualStrings("v1", ex.form_fields.object.get("title").?.string);
+    try t.expectEqualStrings("v2", ex.form_fields.object.get("other").?.string);
+    try t.expectEqualStrings("v3", ex.form_fields.object.get("third").?.string);
+}
+
+test "parse: a zero-byte file part with a real filename is skipped (matches old fio behavior)" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "--XBOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"photos\"; filename=\"photo.jpg\"\r\n" ++
+        "Content-Type: image/jpeg\r\n\r\n\r\n" ++
+        "--XBOUND--\r\n";
+    const ex = try parseBody(a, body);
+    try t.expectEqual(@as(usize, 0), ex.files.len);
+    try t.expect(ex.form_fields.object.get("photos") == null);
+}
+
+test "parse: trailing '[]' (PHP/jQuery convention) is stripped from part names" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "--XBOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"photos[]\"; filename=\"a.jpg\"\r\n" ++
+        "Content-Type: image/jpeg\r\n\r\nAA\r\n" ++
+        "--XBOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"photos[]\"; filename=\"b.jpg\"\r\n" ++
+        "Content-Type: image/jpeg\r\n\r\nBB\r\n" ++
+        "--XBOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"tags[]\"\r\n\r\nx\r\n" ++
+        "--XBOUND--\r\n";
+    const ex = try parseBody(a, body);
+    try t.expectEqual(@as(usize, 2), ex.files.len);
+    try t.expectEqualStrings("photos", ex.files[0].field);
+    try t.expectEqualStrings("photos", ex.files[1].field);
+    try t.expectEqualStrings("x", ex.form_fields.object.get("tags").?.string);
+    try t.expect(ex.form_fields.object.get("tags[]") == null);
 }
 
 test "parse: final terminator without trailing CRLF is accepted" {
