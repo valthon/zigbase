@@ -1,6 +1,7 @@
 ---
 import Logo from '../assets/logo.svg';
 import ThemeToggle from './ThemeToggle.astro';
+import { ZIGBASE_VERSION_TAG, REPO_URL } from '../config/site';
 
 // BASE_URL is '/zigbase' (no trailing slash under trailingSlash:'ignore'),
 // so normalise to a trailing slash before joining paths — matches Base.astro.
@@ -12,7 +13,8 @@ const links = [
   { href: base + 'download', label: 'Download' },
 ];
 
-const repo = 'https://github.com/valthon/zigbase';
+const repo = REPO_URL;
+const version = ZIGBASE_VERSION_TAG;
 ---
 
 <header class="nav">
@@ -56,7 +58,7 @@ const repo = 'https://github.com/valthon/zigbase';
       </ul>
 
       <div class="nav__actions">
-        <span class="nav__badge">v0.1.0</span>
+        <span class="nav__badge">{version}</span>
         <a
           class="nav__icon-link"
           href={repo}

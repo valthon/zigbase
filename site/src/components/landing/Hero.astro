@@ -1,10 +1,12 @@
 ---
 import Button from '../Button.astro';
 import CopyButton from '../CopyButton.astro';
+import { ZIGBASE_VERSION_TAG, REPO_URL } from '../../config/site';
 
 // BASE_URL is '/zigbase' (no trailing slash) — normalise to trailing slash.
 const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
-const repo = 'https://github.com/valthon/zigbase';
+const repo = REPO_URL;
+const version = ZIGBASE_VERSION_TAG;
 
 const installCmd = 'zig fetch --save git+https://github.com/valthon/zigbase';
 ---
@@ -13,7 +15,7 @@ const installCmd = 'zig fetch --save git+https://github.com/valthon/zigbase';
   <div class="container hero__inner">
     <span class="hero__badge">
       <span class="hero__spark" aria-hidden="true">⚡</span>
-      v0.1.0 · Apache-2.0
+      {version} · Apache-2.0
     </span>
 
     <h1 class="hero__title">

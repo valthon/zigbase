@@ -17,8 +17,14 @@ export default defineConfig({
     format: 'file',
   },
   markdown: {
-    // Astro auto-adds heading ids; append a small '#' anchor link to each
-    // h2–h4 so the prose CSS can render hover anchors and the TOC can target them.
+    // Append a small '#' anchor link to each heading so the prose CSS can render
+    // hover anchors and the TOC can target them.
+    //
+    // rehypeHeadingIds is REQUIRED here, not redundant: rehype-autolink-headings
+    // needs heading `id`s to already exist when it runs, and a user-supplied
+    // rehypePlugins array runs before Astro injects its own id pass — so without
+    // this explicit plugin the autolink step finds no ids and emits zero anchors
+    // (verified: removing it drops 24 anchors → 0 on the framework page).
     rehypePlugins: [
       rehypeHeadingIds,
       [
