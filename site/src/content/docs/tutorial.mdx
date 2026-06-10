@@ -1,9 +1,11 @@
 ---
 title: Tutorial
-description: Build a backend on ZigBase end to end — provision collections, set access rules, register a user, upload a file, add a custom route and a cron job.
+description: Build a backend on ZigBase end to end, your way — every server step shown both from the embedded admin UI and from the terminal — provision collections, set access rules, register a user, upload a file, configure OAuth2, add a custom route and a cron job.
 order: 3
 group: getting-started
 ---
+
+import PathTabs from '../../components/PathTabs.astro';
 
 # Tutorial: build an app on ZigBase
 
@@ -11,6 +13,10 @@ This walkthrough takes you from an empty database to a working backend for **"Ai
 golf simulators"** — hosts list simulators, guests book slots. It ties together every
 moving part: provisioning collections, setting access rules, registering and logging in a
 user, creating a record with a file upload, a custom business route, and a scheduled job.
+
+Every step that talks to the server can be done two ways — from the **embedded admin UI**
+at `/_/` or from the **terminal** with `curl` — and the tab switcher on any step flips the
+whole page at once, so pick your path and the tutorial follows you.
 
 Read it top to bottom and run it as you go. Each step links onward to the reference docs:
 
@@ -39,7 +45,66 @@ curl http://127.0.0.1:8090/api/health   # {"status":"ok"}
 
 Throughout, `BASE=http://127.0.0.1:8090`.
 
+### Open the admin UI
+
+The same binary embeds an admin SPA at **http://127.0.0.1:8090/_/**. Open it and sign in
+with the superuser you just created — every admin-UI step below starts from here.
+
+![The admin login screen at /_/#/login](../../assets/screenshots/admin-login.png)
+
 ## 1. Provision collections (in dependency order)
+
+The schema is three collections — `users` (auth), `simulators`, and `listings` — created
+in that order, because relation fields point at collections that must already exist.
+
+<PathTabs>
+  <Fragment slot="ui">
+
+In the admin UI's left sidebar, click **⚙ Collections**, then **+ New collection** to open
+the schema editor. Create the three collections in order:
+
+1. **`users`** — set the name to `users` and the type to **auth**. Click **+ Add field**
+   and add one extra field: `name`, type **text**. (Auth collections get `email`,
+   `verified`, and the password machinery for free.)
+
+   ![The schema editor creating the users auth collection with a name text field](../../assets/screenshots/admin-new-collection-users.png)
+
+   Before saving, switch to the **API Rules** tab. A new collection starts with every rule
+   **locked** — the `lock` checkbox means *superuser-only* (`null`). Unchecking it enables
+   the text input: leave it **empty** for *public* (`""`), or type a filter expression.
+   For `users`: uncheck the lock on **listRule**, **viewRule**, and **createRule** and
+   leave all three empty (public — an empty `createRule` is what makes signup open), and
+   uncheck **updateRule** and **deleteRule** and type `@request.auth.id = id` into both
+   (users may only edit or delete themselves). Save.
+
+2. **`simulators`** — type **base**, two fields: `label` (**text**, check *req*) and
+   `owner` (**relation**, check *req*) — pick `users` from the relation's target dropdown.
+   Note the convenience here: the UI picks relation targets **by name** and the server
+   resolves the id for you; on the terminal path you have to capture and substitute
+   collection ids yourself. Rules: unlock **listRule** and **viewRule** as empty (public),
+   set **createRule** to `@request.auth.id != ""`, and set **updateRule** and
+   **deleteRule** to `@request.auth.id = owner`. Save.
+
+3. **`listings`** — type **base**, five fields: `title` (**text**, *req*),
+   `price_per_hour` (**number**, *req* — leave the mode dropdown on **float**), `status`
+   (**select**, *req* — type `draft,published,archived` into the values input), `simulator`
+   (**relation**, *req* — target `simulators`), and `photos` (**file** — set *maxSel* to
+   `6`).
+
+   ![The schema editor with the five listings fields configured](../../assets/screenshots/admin-fields-listings.png)
+
+   Rules: unlock all five; **listRule** `status = "published"`, **viewRule**
+   `status = "published" || @request.auth.id = simulator.owner`, **createRule**
+   `@request.auth.id != ""`, and **updateRule** / **deleteRule**
+   `@request.auth.id = simulator.owner`. Save.
+
+> **What the UI can't set (yet):** advanced field options are API-only today —
+> `cascadeDelete` / `minSelect` on relations, `min` / `max` / `pattern` on text,
+> `min` / `max` / `scale` on number, and `maxSize` / `mimeTypes` on file. The schema the
+> UI saves is the same shape as the terminal path's payloads, minus those constraints.
+
+  </Fragment>
+  <Fragment slot="cli">
 
 There is no schema-file import — you create collections by calling `POST /api/collections`
 as the superuser. Relation fields point at their target by **collection id** (the `id`
@@ -100,7 +165,7 @@ LISTINGS_ID=$(curl -s -X POST "$BASE/api/collections" \
     \"fields\": [
       { \"id\": \"f_title\", \"name\": \"title\", \"type\": \"text\", \"required\": true, \"options\": { \"min\": 1, \"max\": 140 } },
       { \"id\": \"f_price\", \"name\": \"price_per_hour\", \"type\": \"number\", \"required\": true,
-        \"options\": { \"mode\": \"fixed\", \"scale\": 2, \"min\": 0 } },
+        \"options\": { \"mode\": \"float\" } },
       { \"id\": \"f_status\", \"name\": \"status\", \"type\": \"select\", \"required\": true,
         \"options\": { \"values\": [\"draft\", \"published\", \"archived\"], \"maxSelect\": 1 } },
       { \"id\": \"f_sim\", \"name\": \"simulator\", \"type\": \"relation\", \"required\": true,
@@ -118,6 +183,15 @@ LISTINGS_ID=$(curl -s -X POST "$BASE/api/collections" \
 
 The field shapes used here are catalogued in [Fields](./fields).
 
+  </Fragment>
+</PathTabs>
+
+> **Money fields:** `price_per_hour` uses the default **float** number mode here. A
+> fixed-point **fixed** mode (exact decimal strings like `"45.00"`, no float drift) exists
+> for money — see [Fields → number](./fields#number) — but it is currently API-only (it
+> requires a `scale` option the admin UI doesn't expose yet) and has a known limitation
+> with multipart file-upload requests. See [Known limitations](./known-limitations).
+
 ## 2. Understand the access rules you just set
 
 Each collection's five rules (`listRule`/`viewRule`/`createRule`/`updateRule`/
@@ -132,6 +206,25 @@ anything else is checked per request. Highlights from above:
 - `listings` are publicly listable only when `status = "published"`; the owner can also
   view their drafts.
 
+<PathTabs>
+  <Fragment slot="ui">
+
+This is the **API Rules** tab of `listings` as you left it — the `lock` checkbox is the
+`null` (superuser-only) state, an unlocked empty input is public, and anything you type is
+evaluated per request:
+
+![The listings API Rules tab with the five owner-scoped rules filled in](../../assets/screenshots/admin-rules-listings.png)
+
+  </Fragment>
+  <Fragment slot="cli">
+
+On the terminal path there is nothing left to do here: the rules were the
+`listRule` … `deleteRule` keys you already sent in step 1's `POST /api/collections`
+payloads, and they took effect the moment each collection was created.
+
+  </Fragment>
+</PathTabs>
+
 Rule grammar and denial status codes are in [API → Access rules](./api#access-rules);
 owner-scoped and relation-traversal patterns (and how the `owner` field gets set safely)
 are in [Recipes → Owner-scoped access rules](./recipes#recipe-owner-scoped-access-rules).
@@ -140,7 +233,43 @@ are in [Recipes → Owner-scoped access rules](./recipes#recipe-owner-scoped-acc
 
 Signup is a **record create on the `users` auth collection** (there is no separate
 register endpoint). The server hashes the password, strips the plaintext, sets
-`verified=false`, and mints a token key:
+`verified=false`, and mints a token key.
+
+<PathTabs>
+  <Fragment slot="ui">
+
+Signup is deliberately an **end-user action**, even on the admin-UI path: the admin record
+drawer has no password field, because users register themselves through your app (or, here,
+through two curls):
+
+```sh
+curl -s -X POST "$BASE/api/collections/users/records" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"host@example.com","password":"hostpassword","name":"Demo Host"}'
+```
+
+`password` must be at least `minPasswordLength` (default 8). Log in to get the token and
+id the terminal path uses for step 4 (the admin-UI path won't need them):
+
+```sh
+LOGIN=$(curl -s -X POST "$BASE/api/collections/users/auth-with-password" \
+  -H 'Content-Type: application/json' \
+  -d '{"identity":"host@example.com","password":"hostpassword"}')
+HOST_TOKEN=$(echo "$LOGIN" | jq -r .token)
+HOST_ID=$(echo "$LOGIN"   | jq -r .record.id)
+```
+
+Now click **users** in the admin sidebar — the new record is there:
+
+![The users records table showing the Demo Host row](../../assets/screenshots/admin-records-users.png)
+
+And if you already had the table open when the curl ran, the row appeared **without a
+refresh**: the records table is a live realtime subscriber over WebSocket, so you're
+literally watching the realtime API at work. Click the row to open the record drawer —
+you can edit the user from here (for example, tick `verified`).
+
+  </Fragment>
+  <Fragment slot="cli">
 
 ```sh
 curl -s -X POST "$BASE/api/collections/users/records" \
@@ -159,10 +288,39 @@ HOST_TOKEN=$(echo "$LOGIN" | jq -r .token)
 HOST_ID=$(echo "$LOGIN"   | jq -r .record.id)
 ```
 
+  </Fragment>
+</PathTabs>
+
 Details: [Recipes → User registration](./recipes#recipe-user-registration-signup) and
 [API → Auth](./api#auth).
 
 ## 4. Create records, including a file upload
+
+Time for data: a simulator the host owns, then a listing with a photo.
+
+<PathTabs>
+  <Fragment slot="ui">
+
+Click **simulators** in the sidebar, then **+ New record**. The drawer renders one control
+per field: type `Bay 1 — TrackMan` into `label`, and pick the host's record from the
+`owner` relation dropdown (it lists `users` records by id). Save.
+
+Then open **listings** → **+ New record**: `title` `Sunset Tee Times`, `price_per_hour`
+`45.00`, `status` `published` from the select dropdown, the simulator you just created
+from the `simulator` relation dropdown, and choose a photo (say, `bay1.jpg`) in the
+`photos` file input — it accepts multiple files since `maxSelect` is 6.
+
+![The new-listing record drawer with all fields filled and a photo chosen](../../assets/screenshots/admin-new-record-listing.png)
+
+Save. The drawer sends plain JSON normally, and switches to a `multipart/form-data` upload
+automatically when files are chosen — the same two request shapes the terminal path makes
+by hand. The listings table now shows the record, uploaded filename included (and on
+edit, existing files get "(remove)" checkboxes):
+
+![The listings records table with the saved Sunset Tee Times row and its photo filename](../../assets/screenshots/admin-records-listings.png)
+
+  </Fragment>
+  <Fragment slot="cli">
 
 Create a simulator the host owns:
 
@@ -186,12 +344,30 @@ curl -s -X POST "$BASE/api/collections/listings/records" \
   -F "photos=@./bay1.jpg;type=image/jpeg"
 ```
 
+  </Fragment>
+</PathTabs>
+
 The uploaded file is stored locally and served from
 `GET /api/files/listings/:recordId/:filename`. Because `listings` has a public `viewRule`
 for published rows, the photo serves directly; protected collections need a bearer token,
 the auth cookie, or a short-lived **file token**. See [API → Files](./api#files).
 
-## 5. Add a custom business route (the Zig framework)
+## 5. Configure OAuth2 sign-in (optional)
+
+Password signup works, but "Sign in with Google" is a form away: open the **users**
+collection in the schema editor and switch to its **Auth / OAuth2** tab. It holds the
+auth-collection knobs (`identityFields`, `minPasswordLength`) plus an **OAuth2 enabled**
+checkbox and a **+ Add provider** picker (google, github, microsoft, discord, or generic).
+Add a provider, paste the client id and the write-only client secret from the provider's
+console, and list the redirect URL(s) your app uses — what would otherwise be an afternoon
+of OAuth plumbing is a form:
+
+![The users collection's Auth / OAuth2 tab with a configured google provider](../../assets/screenshots/admin-oauth.png)
+
+Your frontend then lists enabled providers and exchanges the authorization code via two
+endpoints — see [API → OAuth2](./api#oauth2) for the flow.
+
+## 6. Add a custom business route (the Zig framework)
 
 REST CRUD covers most needs, but "confirm a booking" is business logic. ZigBase is an
 **embeddable Zig framework**: import it, register a custom route, and your binary *is* the
@@ -225,7 +401,7 @@ identity for finer authorization). It does **not** carry a `Data` facade, so you
 from the pool. The full version (with owner authorization) is in
 [Recipes → a custom business route](./recipes#recipe-a-custom-business-route-with-a-path-param--db-write).
 
-## 6. Add a scheduled job
+## 7. Add a scheduled job
 
 A nightly job cancels stale pending bookings. A `JobEvent` carries only `app` and `name`,
 so — like the route above — you acquire a connection and build `Data`:
@@ -247,7 +423,7 @@ fn expireStaleBookings(ev: *zigbase.events.JobEvent) anyerror!void {
 }
 ```
 
-## 7. Wire it all into your `App(.{...})`
+## 8. Wire it all into your `App(.{...})`
 
 The hook, route, and job come together in one comptime config. This is the whole extended
 server:
@@ -291,3 +467,14 @@ Build and run your binary exactly as in step 0 (it replaces `zig-out/bin/zigbase
 - **API reference:** records query (`filter`/`sort`/`expand`), realtime, files → [API](./api)
 - **Framework reference:** the full hook/route/job/event surface → [Framework](./framework)
 - **Caveats:** [Known limitations](./known-limitations)
+
+## The finished app
+
+This exact backend — same collections, same rules, plus the booking hook, route, and cron
+job — ships as a runnable example with a web frontend baked into the binary:
+
+![The golfsim example's listings page: published listings with prices and a booking form](../../assets/screenshots/example-golfsim-listings.png)
+
+Browse the walkthrough at [Examples → Golf simulator booking](../examples/golfsim), or see
+the other rungs of the ladder (a minimal blog, a plugin marketplace) on the
+[Examples](../examples) index.

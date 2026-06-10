@@ -1,6 +1,6 @@
 ---
 title: Known limitations
-description: Current caveats in ZigBase v0.1.0 — auth/email, framework hooks, schema migrations, the scheduler, platform/UI gaps, and deferred work.
+description: Current caveats in ZigBase v0.1.0 — auth/email, framework hooks, schema migrations, fields, the scheduler, platform/UI gaps, and deferred work.
 order: 3
 group: reference
 ---
@@ -36,6 +36,16 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
   `.collections` schema creates missing collections and adds new fields, preserving data.
   **Non-additive changes (rename, drop, or type-change a field) are detected, logged, and
   skipped** — they require an explicit `.migrations` entry.
+
+## Fields
+
+- **Fixed-mode number fields can't be set in a multipart (file-upload) create/update.**
+  The HTTP layer type-coerces multipart form values to numbers (`45.00` → float), while
+  `fixed` mode requires **string** input — so a multipart request that carries a
+  fixed-mode value fails with a 400 validation error. **Workaround:** create/update the
+  record via JSON first, then attach files in a separate multipart `PATCH` that only
+  carries the file field. Also note `fixed` mode requires a `scale` option (1..8) and is
+  currently **not configurable from the admin UI** (use the API).
 
 ## Scheduler
 
