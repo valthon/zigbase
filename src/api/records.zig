@@ -150,7 +150,7 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     }
     var rec = (try records.get(ctx.allocator, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const qp = try params_mod.parse(ctx.allocator, ctx.query);
-    if (qp.get("expand")) |exp| if (exp.len > 0) try expand_mod.expand(ctx.allocator, &r, col, &rec, exp, 0);
+    if (qp.get("expand")) |exp| if (exp.len > 0) try expand_mod.expand(ctx.allocator, &r, col, &rec, exp, 0, &rctx);
     return jsonResponse(ctx, 200, rec);
 }
 
@@ -158,22 +158,30 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const raw = if (ctx.form_fields) |ff| ff else (std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch
         return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator)).value;
-    const w = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
-    const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
 
-    const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, raw, ctx.files, null) catch |e| switch (e) {
-        error.TooLarge => return (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator),
-        error.TooMany => return ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator),
-        error.BadMimeType => return ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator),
-        error.OutOfMemory => return e,
+    // Resolve, plan files, and (for auth collections) hash the password BEFORE acquiring the
+    // writer, so the expensive argon2 hash in prepAuthData does NOT run under the global writer
+    // lock. The reader is closed before the writer is taken. M2 fix.
+    const col, const all, const data2 = blk: {
+        var r = try app.pool.openReader();
+        defer r.close();
+        const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+        const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, raw, ctx.files, null) catch |e| switch (e) {
+            error.TooLarge => return (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator),
+            error.TooMany => return ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator),
+            error.BadMimeType => return ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator),
+            error.OutOfMemory => return e,
+        };
+        const data2 = prepAuthData(ctx, col, all.data, true) catch |e| switch (e) {
+            error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
+            error.OutOfMemory => return e,
+        };
+        break :blk .{ col, all, data2 };
     };
     const data = all.data;
 
-    const data2 = prepAuthData(ctx, col, data, true) catch |e| switch (e) {
-        error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
-        error.OutOfMemory => return e,
-    };
+    const w = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
     const rctx = buildContext(ctx, w, data);
     // Gate FIRST: before-hooks must run only on already-authorized ops (matching delete).
     // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
@@ -329,13 +337,13 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         .rule = rule_expr,
         .rctx = &rctx,
     }) catch |e| switch (e) {
-        error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString =>
+        error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep =>
             return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
         else => return e,
     };
 
     if (qp.get("expand")) |exp| if (exp.len > 0) {
-        for (result.items) |*item| try expand_mod.expand(ctx.allocator, &r, col, item, exp, 0);
+        for (result.items) |*item| try expand_mod.expand(ctx.allocator, &r, col, item, exp, 0, &rctx);
     };
 
     const total_pages: i64 = if (result.perPage == 0) 0 else @divTrunc(result.totalItems + @as(i64, result.perPage) - 1, @as(i64, result.perPage));

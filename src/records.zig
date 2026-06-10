@@ -49,6 +49,10 @@ const CollectionsGetError = @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".
 pub const RecordError = error{ Validation, NotFound, NotObject, Forbidden } ||
     db.DbError || values.ValueError || ReadError || CollectionsGetError;
 
+/// Hard cap on the length of an attacker-supplied `?filter=`/`?sort=` string. Rejected
+/// before lexing so a giant or deeply-nested expression can't exhaust CPU/stack.
+pub const max_filter_len = 4096;
+
 fn columnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -454,6 +458,8 @@ fn baseColumnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
 }
 
 pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: ListQuery) !ListResult {
+    if (q.filter) |fstr| if (fstr.len > max_filter_len) return error.BadFilter;
+    if (q.sort) |sstr| if (sstr.len > max_filter_len) return error.BadSort;
     var j = joiner.Joiner.init(alloc, conn, col);
     var where_sql: []const u8 = "";
     var params: []const compiler.Param = &.{};
@@ -536,6 +542,18 @@ test "list filters, sorts, and paginates" {
     try std.testing.expectEqual(@as(i64, 2), res.totalItems);
     try std.testing.expectEqual(@as(usize, 1), res.items.len);
     try std.testing.expectEqualStrings("r3", res.items[0].object.get("id").?.string);
+}
+
+test "list rejects an over-long filter (DoS cap) before lexing" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    const big = try a.alloc(u8, max_filter_len + 1);
+    @memset(big, '(');
+    try std.testing.expectError(error.BadFilter, list(a, &d, col, .{ .filter = big }));
 }
 
 test "createGuarded rolls back when the guard fails" {

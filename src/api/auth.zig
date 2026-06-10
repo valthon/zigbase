@@ -108,23 +108,32 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     const identity = strField(body, "identity") orelse return ApiError.badRequest("identity is required.").toResponse(ctx.allocator);
     const password = strField(body, "password") orelse return ApiError.badRequest("password is required.").toResponse(ctx.allocator);
 
-    const w = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
+    // Login is read-only (identity lookup, password hash, tokenKey, unixepoch; issue() only
+    // reads + signs). Use a READER so the expensive argon2 verify below does NOT run while
+    // holding the single global writer lock — otherwise every login serializes all writes.
+    var r = try app.pool.openReader();
+    defer r.close();
     const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const col = (try collections.get(ctx.allocator, w, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const col = (try collections.get(ctx.allocator, &r, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
 
-    const rid = (try findByIdentity(ctx.allocator, w, col, identity)) orelse
+    const rid = (try findByIdentity(ctx.allocator, &r, col, identity)) orelse {
+        // Unknown identity: run identity-independent argon2 work so the response time matches
+        // the known-identity path (defeats account enumeration via timing). L1 fix.
+        crypto.dummyVerify(app.io, ctx.allocator);
         return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
-    const phc = (try passwordHashFor(ctx.allocator, w, col.name, rid)) orelse
+    };
+    const phc = (try passwordHashFor(ctx.allocator, &r, col.name, rid)) orelse {
+        crypto.dummyVerify(app.io, ctx.allocator);
         return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
+    };
     if (!crypto.verifyPassword(app.io, ctx.allocator, phc, password))
         return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
 
-    const tk = (try tokenKeyFor(ctx.allocator, w, col.name, rid)) orelse
+    const tk = (try tokenKeyFor(ctx.allocator, &r, col.name, rid)) orelse
         return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
-    const issued = try issue(ctx, w, col.name, rid, tk);
-    const rec = (try records.get(ctx.allocator, w, col, rid)) orelse
+    const issued = try issue(ctx, &r, col.name, rid, tk);
+    const rec = (try records.get(ctx.allocator, &r, col, rid)) orelse
         return ApiError.notFound().toResponse(ctx.allocator);
 
     emitAuth(ctx, col.name, rec, .password);

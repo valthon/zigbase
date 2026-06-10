@@ -14,12 +14,17 @@ pub const Node = union(enum) {
     logic: struct { op: lexer.TokKind, l: *Node, r: *Node }, // op is .l_and or .l_or
 };
 
-pub const ParseError = error{ UnexpectedToken, BadOperand, Empty } || std.mem.Allocator.Error;
+pub const ParseError = error{ UnexpectedToken, BadOperand, Empty, TooDeep } || std.mem.Allocator.Error;
+
+/// Cap on paren-nesting recursion. `?filter=` is attacker-controlled on public-list
+/// collections; without a bound a few thousand `(` overflows the stack and crashes the worker.
+const max_depth = 32;
 
 const Parser = struct {
     alloc: std.mem.Allocator,
     toks: []const lexer.Token,
     pos: usize = 0,
+    depth: usize = 0,
 
     fn peek(self: *Parser) lexer.TokKind { return self.toks[self.pos].kind; }
     fn next(self: *Parser) lexer.Token { const t = self.toks[self.pos]; self.pos += 1; return t; }
@@ -44,6 +49,9 @@ const Parser = struct {
     }
     fn parsePrimary(self: *Parser) ParseError!*Node {
         if (self.peek() == .lparen) {
+            if (self.depth >= max_depth) return error.TooDeep;
+            self.depth += 1;
+            defer self.depth -= 1;
             _ = self.next();
             const inner = try self.parseOr();
             if (self.peek() != .rparen) return error.UnexpectedToken;
@@ -110,4 +118,25 @@ test "parse rejects a trailing token" {
     const a = arena.allocator();
     const toks = try lexer.lex(a, "a = 1 b = 2");
     try std.testing.expectError(error.UnexpectedToken, parse(a, toks));
+}
+
+test "parse rejects pathologically deep nesting (no stack overflow)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: std.ArrayList(u8) = .empty;
+    for (0..100) |_| try buf.append(a, '(');
+    try buf.appendSlice(a, "a = 1");
+    for (0..100) |_| try buf.append(a, ')');
+    const toks = try lexer.lex(a, buf.items);
+    try std.testing.expectError(error.TooDeep, parse(a, toks));
+}
+
+test "parse still accepts moderate nesting (depth 5)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const toks = try lexer.lex(a, "(((((a = 1)))))");
+    const root = try parse(a, toks);
+    try std.testing.expectEqualStrings("a", root.cmp.lhs.path);
 }

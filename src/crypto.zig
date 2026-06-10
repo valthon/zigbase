@@ -20,6 +20,18 @@ pub fn verifyPassword(io: std.Io, alloc: std.mem.Allocator, phc: []const u8, pas
     return true;
 }
 
+/// A fixed, valid argon2id PHC hash with the same params (`interactive_2id`) used by
+/// `hashPassword`. Used to perform identity-independent argon2 work on a login miss so the
+/// response time of an unknown identity matches that of a known one (defeats account
+/// enumeration via a timing oracle). The plaintext it hashes is irrelevant — it never matches.
+pub const dummy_password_hash = "$argon2id$v=19$m=65536,t=2,p=1$X6nNL1XIBemv6GtMawOzIiupjeI6RhVcq4OM6oHc2Ds$7q5akLEU/XJR2q91NLbc9ARqZfPFtOSdtSIQZBP4I2o";
+
+/// Run an argon2 verify against the fixed dummy hash, discarding the result. Call this on a
+/// login miss (unknown identity / missing hash) to keep the work identity-independent.
+pub fn dummyVerify(io: std.Io, alloc: std.mem.Allocator) void {
+    _ = verifyPassword(io, alloc, dummy_password_hash, "zigbase-login-timing-dummy-mismatch");
+}
+
 /// Per-record JWT signing key = HMAC-SHA256(app_secret, token_key). Rotating token_key
 /// (on password change) changes the key, invalidating all prior tokens for that record.
 pub fn deriveKey(app_secret: []const u8, token_key: []const u8) [32]u8 {
@@ -60,4 +72,15 @@ test "genToken produces a string of the requested length" {
     defer arena.deinit();
     const t = try genToken(std.testing.io, arena.allocator(), 32);
     try std.testing.expectEqual(@as(usize, 32), t.len);
+}
+
+test "dummy login-timing hash is a well-formed argon2id PHC string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(std.mem.startsWith(u8, dummy_password_hash, "$argon2id$"));
+    // It verifies its own plaintext (proves the constant parses + is real work) ...
+    try std.testing.expect(verifyPassword(std.testing.io, a, dummy_password_hash, "zigbase-login-timing-dummy"));
+    // ... and dummyVerify (which uses a deliberately-mismatched plaintext) just runs the work.
+    dummyVerify(std.testing.io, a);
 }

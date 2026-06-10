@@ -4,12 +4,14 @@ const records = @import("../records.zig");
 const schema = @import("../schema.zig");
 const db = @import("../db.zig");
 const migrations = @import("../migrations.zig");
+const rules = @import("../rules.zig");
+const request = @import("../request.zig");
 
 const max_depth = 6;
 
 /// Explicit error set so the mutual recursion between `expand` and `expandField`
 /// does not produce an inferred-error-set dependency loop.
-pub const ExpandError = records.RecordError || collections.EngineError;
+pub const ExpandError = records.RecordError || collections.EngineError || rules.RuleError;
 
 /// Expand the given comma-separated, dot-nested expand-spec ("author,tags.owner") into
 /// `rec.object`'s "expand" key. `rec` must be a `.object`. Single relations nest an object;
@@ -17,7 +19,7 @@ pub const ExpandError = records.RecordError || collections.EngineError;
 ///
 /// LIMITATION: when multiple expand paths share a head (e.g. "author.org,author.name"),
 /// `head` is expanded once per comma-segment and the later segment overwrites the earlier.
-pub fn expand(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, rec: *std.json.Value, spec: []const u8, depth: usize) ExpandError!void {
+pub fn expand(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, rec: *std.json.Value, spec: []const u8, depth: usize, rctx: *const request.RequestContext) ExpandError!void {
     if (depth >= max_depth or rec.* != .object) return;
     var it = std.mem.splitScalar(u8, spec, ',');
     var expand_obj: std.json.ObjectMap = .empty;
@@ -32,25 +34,39 @@ pub fn expand(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, re
         if (field.fieldType() != .relation) continue;
         const target = (try collections.get(alloc, conn, field.options.relation.targetCollectionId)) orelse continue;
         const id_val = rec.object.get(head) orelse continue;
-        const nested = try expandField(alloc, conn, target, id_val, rest, depth);
+        const nested = try expandField(alloc, conn, target, id_val, rest, depth, rctx);
         try expand_obj.put(alloc, head, nested);
         any = true;
     }
     if (any) try rec.object.put(alloc, "expand", .{ .object = expand_obj });
 }
 
-fn expandField(alloc: std.mem.Allocator, conn: *db.Db, target: schema.Collection, id_val: std.json.Value, rest: []const u8, depth: usize) ExpandError!std.json.Value {
+/// Whether `rctx` is permitted to view record `id` of `target` under `target.viewRule`.
+/// Mirrors the view handler in src/api/records.zig: superuser/empty-rule => allow,
+/// null rule => deny, otherwise the row must satisfy the rule. This is what closes the
+/// access-control bypass where a public collection's relation leaked a locked target.
+fn canView(alloc: std.mem.Allocator, conn: *db.Db, target: schema.Collection, id: []const u8, rctx: *const request.RequestContext) ExpandError!bool {
+    return switch (rules.decide(target.viewRule, rctx)) {
+        .deny_locked => false,
+        .allow => true,
+        .check => try rules.matches(alloc, conn, target, id, target.viewRule.?, rctx),
+    };
+}
+
+fn expandField(alloc: std.mem.Allocator, conn: *db.Db, target: schema.Collection, id_val: std.json.Value, rest: []const u8, depth: usize, rctx: *const request.RequestContext) ExpandError!std.json.Value {
     switch (id_val) {
         .string => |id| {
+            if (!try canView(alloc, conn, target, id, rctx)) return .null;
             var sub = (try records.get(alloc, conn, target, id)) orelse return .null;
-            if (rest.len > 0) try expand(alloc, conn, target, &sub, rest, depth + 1);
+            if (rest.len > 0) try expand(alloc, conn, target, &sub, rest, depth + 1, rctx);
             return sub;
         },
         .array => |arr| {
             var out = std.json.Array.init(alloc);
             for (arr.items) |item| if (item == .string) {
+                if (!try canView(alloc, conn, target, item.string, rctx)) continue;
                 var sub = (try records.get(alloc, conn, target, item.string)) orelse continue;
-                if (rest.len > 0) try expand(alloc, conn, target, &sub, rest, depth + 1);
+                if (rest.len > 0) try expand(alloc, conn, target, &sub, rest, depth + 1, rctx);
                 try out.append(sub);
             };
             return .{ .array = out };
@@ -73,7 +89,8 @@ test "expand nests a single relation under record.expand" {
     try d.exec("INSERT INTO posts (id,created,updated,author) VALUES ('p_1','t','t','u_1');");
 
     var rec = (try records.get(a, &d, posts, "p_1")).?;
-    try expand(a, &d, posts, &rec, "author", 0);
+    const su = request.RequestContext{ .is_superuser = true };
+    try expand(a, &d, posts, &rec, "author", 0, &su);
     const exp = rec.object.get("expand").?.object;
     try std.testing.expectEqualStrings("Ada", exp.get("author").?.object.get("name").?.string);
 }
@@ -98,8 +115,88 @@ test "expand nests two hops (author.org)" {
     try d.exec("INSERT INTO posts (id,created,updated,author) VALUES ('p_1','t','t','u_1');");
 
     var rec = (try records.get(a, &d, posts, "p_1")).?;
-    try expand(a, &d, posts, &rec, "author.org", 0);
+    const su = request.RequestContext{ .is_superuser = true };
+    try expand(a, &d, posts, &rec, "author.org", 0, &su);
     const author = rec.object.get("expand").?.object.get("author").?.object;
     const org = author.get("expand").?.object.get("org").?.object;
     try std.testing.expectEqualStrings("Acme", org.get("label").?.string);
+}
+
+test "H1: expand enforces the target collection's viewRule" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    // secrets has a NULL viewRule -> superuser-only (locked). posts is public and
+    // relates to secrets; without the fix anyone expanding `owner` would read it.
+    const secrets = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "secrets", .fields = &[_]schema.Field{.{ .id = "s1", .name = "ssn", .options = .{ .text = .{} } }}, .viewRule = null });
+    const pf = [_]schema.Field{.{ .id = "f3", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = secrets.id, .maxSelect = 1 } } }};
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf, .viewRule = "" });
+    try d.exec("INSERT INTO secrets (id,created,updated,ssn) VALUES ('s_1','t','t','111-22-3333');");
+    try d.exec("INSERT INTO posts (id,created,updated,owner) VALUES ('p_1','t','t','s_1');");
+
+    const anon = request.RequestContext{};
+    const su = request.RequestContext{ .is_superuser = true };
+
+    // Anonymous: the locked related record is OMITTED (expanded value is null).
+    {
+        var rec = (try records.get(a, &d, posts, "p_1")).?;
+        try expand(a, &d, posts, &rec, "owner", 0, &anon);
+        const owner = rec.object.get("expand").?.object.get("owner").?;
+        try std.testing.expect(owner == .null);
+    }
+    // Superuser: the related record IS included.
+    {
+        var rec = (try records.get(a, &d, posts, "p_1")).?;
+        try expand(a, &d, posts, &rec, "owner", 0, &su);
+        const owner = rec.object.get("expand").?.object.get("owner").?;
+        try std.testing.expectEqualStrings("111-22-3333", owner.object.get("ssn").?.string);
+    }
+}
+
+test "H1: a public (empty-rule) target is expanded for anyone" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const pub_users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "pubusers", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }}, .viewRule = "" });
+    const pf = [_]schema.Field{.{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = pub_users.id, .maxSelect = 1 } } }};
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf, .viewRule = "" });
+    try d.exec("INSERT INTO pubusers (id,created,updated,name) VALUES ('u_1','t','t','Ada');");
+    try d.exec("INSERT INTO posts (id,created,updated,author) VALUES ('p_1','t','t','u_1');");
+
+    const anon = request.RequestContext{};
+    var rec = (try records.get(a, &d, posts, "p_1")).?;
+    try expand(a, &d, posts, &rec, "author", 0, &anon);
+    const author = rec.object.get("expand").?.object.get("author").?;
+    try std.testing.expectEqualStrings("Ada", author.object.get("name").?.string);
+}
+
+test "H1: a multi-relation array filters out the records the rctx may not view" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    // owner-scoped target: only the matching @request.auth.id row is viewable.
+    const items = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "items", .fields = &[_]schema.Field{.{ .id = "i1", .name = "owner", .options = .{ .text = .{} } }}, .viewRule = "owner = @request.auth.id" });
+    const pf = [_]schema.Field{.{ .id = "f3", .name = "things", .options = .{ .relation = .{ .targetCollectionId = items.id, .maxSelect = 9 } } }};
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf, .viewRule = "" });
+    try d.exec("INSERT INTO items (id,created,updated,owner) VALUES ('i_1','t','t','u_me'),('i_2','t','t','u_other');");
+    try d.exec("INSERT INTO posts (id,created,updated,things) VALUES ('p_1','t','t','[\"i_1\",\"i_2\"]');");
+
+    var auth_obj: std.json.ObjectMap = .empty;
+    try auth_obj.put(a, "id", .{ .string = "u_me" });
+    const me = request.RequestContext{ .auth = .{ .object = auth_obj } };
+
+    var rec = (try records.get(a, &d, posts, "p_1")).?;
+    try expand(a, &d, posts, &rec, "things", 0, &me);
+    const arr = rec.object.get("expand").?.object.get("things").?.array;
+    try std.testing.expectEqual(@as(usize, 1), arr.items.len);
+    try std.testing.expectEqualStrings("i_1", arr.items[0].object.get("id").?.string);
 }
