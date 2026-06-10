@@ -63,14 +63,24 @@ pub const Db = struct {
     }
 };
 
-/// SQLITE_TRANSIENT tells SQLite to copy bound text/blobs immediately.
-const SQLITE_TRANSIENT: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+/// SQLITE_TRANSIENT tells SQLite to copy bound text/blobs immediately. It is the value
+/// `(void(*)(void*))-1`. A function-pointer-typed -1 fails Zig's comptime alignment check
+/// on targets with aligned code pointers (e.g. aarch64, where fn pointers are 4-byte
+/// aligned), so we type it — and bind the destructor argument (below) — as an opaque
+/// pointer. The C ABI is identical (a pointer is a pointer), with no fn-ptr alignment
+/// constraint, which lets the binary cross-compile to aarch64.
+const SQLITE_TRANSIENT: ?*const anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+
+/// `sqlite3_bind_text` re-declared with an opaque-pointer destructor (vs translate-c's
+/// function-pointer type) so `SQLITE_TRANSIENT` passes without a fn-ptr alignment cast.
+/// Links to the same C symbol; ABI-identical.
+extern fn sqlite3_bind_text(stmt: ?*c.sqlite3_stmt, idx: c_int, text: [*c]const u8, n: c_int, destructor: ?*const anyopaque) callconv(.c) c_int;
 
 pub const Stmt = struct {
     handle: *c.sqlite3_stmt,
 
     pub fn bindText(self: *Stmt, idx: c_int, val: []const u8) DbError!void {
-        if (c.sqlite3_bind_text(self.handle, idx, val.ptr, @intCast(val.len), SQLITE_TRANSIENT) != c.SQLITE_OK)
+        if (sqlite3_bind_text(self.handle, idx, val.ptr, @intCast(val.len), SQLITE_TRANSIENT) != c.SQLITE_OK)
             return DbError.BindFailed;
     }
 
