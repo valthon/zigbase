@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="ZigBase logo" fill="none">
+  <!-- Stylized "Z": top bar, diagonal, bottom bar. Drawn in currentColor so it
+       adapts to light/dark themes. -->
+  <path
+    d="M11 11 H37 L17 37 H37"
+    stroke="currentColor"
+    stroke-width="4.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <!-- Lightning bolt crossing the Z, in amber. -->
+  <path
+    d="M28 4 L18 23 L25 23 L20 44 L34 20 L26 20 L33 4 Z"
+    fill="#f7a41d"
+    stroke="var(--color-bg, #ffffff)"
+    stroke-width="1.5"
+    stroke-linejoin="round"
+  />
+</svg>

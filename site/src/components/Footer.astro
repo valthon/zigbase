@@ -1,0 +1,106 @@
+---
+// BASE_URL is '/zigbase' (no trailing slash) — normalise to trailing slash.
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
+const repo = 'https://github.com/valthon/zigbase';
+
+const docsLinks = [
+  { href: base + 'docs/overview', label: 'Overview' },
+  { href: base + 'docs/quick-start', label: 'Quick start' },
+  { href: base + 'docs/tutorial', label: 'Tutorial' },
+  { href: base + 'docs/api', label: 'API' },
+  { href: base + 'docs/framework', label: 'Framework' },
+];
+
+const projectLinks = [
+  { href: repo, label: 'GitHub', external: true },
+  { href: repo + '/releases', label: 'Releases', external: true },
+  { href: base + 'docs/changelog', label: 'Changelog', external: false },
+  { href: 'https://www.apache.org/licenses/LICENSE-2.0', label: 'License: Apache-2.0', external: true },
+];
+---
+
+<footer class="footer">
+  <div class="footer__inner container">
+    <div class="footer__cols">
+      <nav class="footer__col" aria-label="Documentation">
+        <h2 class="footer__heading">Docs</h2>
+        <ul>
+          {docsLinks.map((l) => (
+            <li><a href={l.href}>{l.label}</a></li>
+          ))}
+        </ul>
+      </nav>
+
+      <nav class="footer__col" aria-label="Project">
+        <h2 class="footer__heading">Project</h2>
+        <ul>
+          {projectLinks.map((l) => (
+            <li>
+              <a
+                href={l.href}
+                {...l.external
+                  ? { target: '_blank', rel: 'noopener noreferrer' }
+                  : {}}
+              >
+                {l.label}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </nav>
+    </div>
+
+    <p class="footer__fineprint">
+      Built with Astro · ZigBase is not affiliated with the Zig project.
+    </p>
+  </div>
+</footer>
+
+<style>
+  .footer {
+    margin-top: var(--space-9);
+    border-top: 1px solid var(--color-border);
+    background-color: var(--color-surface);
+    padding-block: var(--space-7);
+  }
+
+  .footer__cols {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-8);
+  }
+
+  .footer__heading {
+    font-size: var(--text-sm);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--color-muted);
+    margin-bottom: var(--space-3);
+  }
+
+  .footer__col ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .footer__col a {
+    color: var(--color-text);
+    font-size: var(--text-sm);
+  }
+  .footer__col a:hover {
+    color: var(--color-accent);
+    text-decoration: none;
+  }
+
+  .footer__fineprint {
+    margin-top: var(--space-6);
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+  }
+</style>

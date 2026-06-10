@@ -1,0 +1,129 @@
+---
+/**
+ * Toggles document.documentElement.dataset.theme between 'light' and 'dark',
+ * persists to localStorage.theme, and reflects state via aria-pressed + icon.
+ *
+ * Stays in sync with the no-flash <script> in Base.astro, which reads
+ * localStorage.theme before first paint and sets data-theme only when an
+ * explicit choice exists. On load this button resolves the *effective* theme
+ * (explicit choice, else the OS preference) so its icon matches what's shown.
+ */
+---
+
+<button
+  type="button"
+  class="theme-toggle"
+  data-theme-toggle
+  aria-pressed="false"
+  aria-label="Toggle dark mode"
+  title="Toggle dark mode"
+>
+  <svg
+    class="theme-toggle__icon theme-toggle__icon--sun"
+    viewBox="0 0 24 24"
+    width="20"
+    height="20"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <circle cx="12" cy="12" r="4"></circle>
+    <path
+      d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"
+    ></path>
+  </svg>
+  <svg
+    class="theme-toggle__icon theme-toggle__icon--moon"
+    viewBox="0 0 24 24"
+    width="20"
+    height="20"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+  </svg>
+</button>
+
+<style>
+  .theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    color: var(--color-text);
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+
+  .theme-toggle:hover {
+    color: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+
+  /* Show sun in light mode, moon in dark mode. Default (light): sun. */
+  .theme-toggle__icon--moon {
+    display: none;
+  }
+  .theme-toggle[aria-pressed='true'] .theme-toggle__icon--sun {
+    display: none;
+  }
+  .theme-toggle[aria-pressed='true'] .theme-toggle__icon--moon {
+    display: block;
+  }
+</style>
+
+<script>
+  function effectiveTheme(): 'light' | 'dark' {
+    const explicit = document.documentElement.dataset.theme;
+    if (explicit === 'light' || explicit === 'dark') return explicit;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches
+      ? 'dark'
+      : 'light';
+  }
+
+  function syncButton(btn: HTMLButtonElement) {
+    btn.setAttribute(
+      'aria-pressed',
+      effectiveTheme() === 'dark' ? 'true' : 'false'
+    );
+  }
+
+  function initThemeToggles() {
+    const toggles =
+      document.querySelectorAll<HTMLButtonElement>('[data-theme-toggle]');
+    toggles.forEach((btn) => {
+      syncButton(btn);
+      if (btn.dataset.bound === 'true') return;
+      btn.dataset.bound = 'true';
+
+      btn.addEventListener('click', () => {
+        const next = effectiveTheme() === 'dark' ? 'light' : 'dark';
+        document.documentElement.dataset.theme = next;
+        try {
+          localStorage.setItem('theme', next);
+        } catch {
+          /* ignore storage failures */
+        }
+        // Keep every toggle on the page in sync.
+        document
+          .querySelectorAll<HTMLButtonElement>('[data-theme-toggle]')
+          .forEach(syncButton);
+      });
+    });
+  }
+
+  initThemeToggles();
+  document.addEventListener('astro:page-load', initThemeToggles);
+</script>

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="ZigBase">
+  <rect width="48" height="48" rx="10" fill="#1a1a1a" />
+  <!-- Stylized "Z" in light strokes for contrast on the dark rounded square. -->
+  <path
+    d="M13 13 H35 L17 35 H35"
+    fill="none"
+    stroke="#f9f9f9"
+    stroke-width="4"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <!-- Amber lightning bolt. -->
+  <path
+    d="M29 6 L19 24 L25 24 L21 42 L33 22 L27 22 L33 6 Z"
+    fill="#f7a41d"
+    stroke="#1a1a1a"
+    stroke-width="1.25"
+    stroke-linejoin="round"
+  />
+</svg>
