@@ -231,18 +231,27 @@ fn verifyTyped(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, toke
 
 pub fn requestVerification(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    const w = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
-    const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-    if (strField(body, "email")) |email| {
-        if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
-            if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
-                const token = try mintToken(ctx, w, col.name, rid, tk, .verification, app.verification_ttl_s);
-                const mail_body = try std.fmt.allocPrint(ctx.allocator, "Verify your email ({s}). Your verification token:\n\n{s}\n", .{ col.name, token });
-                try deliverToken(app, ctx.allocator, email, "Verify your email", mail_body);
+    // Strings are arena-allocated (ctx.allocator), so they outlive the scoped
+    // writer block below and remain valid for the post-lock SMTP send.
+    var pending: ?struct { email: []const u8, mail_body: []const u8 } = null;
+    {
+        const w = app.pool.acquireWriter();
+        defer app.pool.releaseWriter();
+        const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+        const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+        if (strField(body, "email")) |email| {
+            if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
+                if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
+                    const token = try mintToken(ctx, w, col.name, rid, tk, .verification, app.verification_ttl_s);
+                    const mail_body = try std.fmt.allocPrint(ctx.allocator, "Verify your email ({s}). Your verification token:\n\n{s}\n", .{ col.name, token });
+                    pending = .{ .email = email, .mail_body = mail_body };
+                }
             }
         }
+    }
+    // Writer lock released: do the blocking SMTP send outside the global lock.
+    if (pending) |p| {
+        try deliverToken(app, ctx.allocator, p.email, "Verify your email", p.mail_body);
     }
     return .{ .status = 204, .body = "" };
 }
@@ -266,18 +275,27 @@ pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
 
 pub fn requestPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    const w = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
-    const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-    if (strField(body, "email")) |email| {
-        if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
-            if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
-                const token = try mintToken(ctx, w, col.name, rid, tk, .password_reset, app.password_reset_ttl_s);
-                const mail_body = try std.fmt.allocPrint(ctx.allocator, "Reset your password ({s}). Your password-reset token:\n\n{s}\n", .{ col.name, token });
-                try deliverToken(app, ctx.allocator, email, "Reset your password", mail_body);
+    // Strings are arena-allocated (ctx.allocator), so they outlive the scoped
+    // writer block below and remain valid for the post-lock SMTP send.
+    var pending: ?struct { email: []const u8, mail_body: []const u8 } = null;
+    {
+        const w = app.pool.acquireWriter();
+        defer app.pool.releaseWriter();
+        const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+        const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+        if (strField(body, "email")) |email| {
+            if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
+                if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
+                    const token = try mintToken(ctx, w, col.name, rid, tk, .password_reset, app.password_reset_ttl_s);
+                    const mail_body = try std.fmt.allocPrint(ctx.allocator, "Reset your password ({s}). Your password-reset token:\n\n{s}\n", .{ col.name, token });
+                    pending = .{ .email = email, .mail_body = mail_body };
+                }
             }
         }
+    }
+    // Writer lock released: do the blocking SMTP send outside the global lock.
+    if (pending) |p| {
+        try deliverToken(app, ctx.allocator, p.email, "Reset your password", p.mail_body);
     }
     return .{ .status = 204, .body = "" };
 }
