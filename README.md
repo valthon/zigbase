@@ -35,6 +35,7 @@ The default bind is `0.0.0.0:8090`. Your `zig` must be 0.16.0 — either activat
 - **OAuth2** — Authorization-Code + PKCE provider login and account linking. → [docs/api.md](docs/api.md)
 - **Realtime** — subscribe to record changes over WebSocket. → [docs/api.md](docs/api.md)
 - **Files** — local file storage with serving and short-lived file-access tokens. → [docs/api.md](docs/api.md)
+- **Static files** — serve a frontend from the same binary: `--serve-static <dir>` at runtime, or pin/embed it at comptime. → [docs/framework.md](docs/framework.md)
 - **Admin UI** — embedded single-page app served at `/_/`. → [docs/api.md](docs/api.md)
 - **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema (with additive auto-migration), and pluggable storage/mailer backends. → [docs/framework.md](docs/framework.md)
 - **Email** — pluggable SMTP mailer (STARTTLS / implicit TLS / plaintext) delivering verification and password-reset email; logs the tokens in dev when SMTP is unset. → [docs/api.md](docs/api.md)
@@ -77,15 +78,17 @@ commands as the stock server. Beyond hooks, `App(.{...})` also accepts a comptim
 **schema** (`.collections` + `.migrations`, provisioned at startup with additive
 auto-migration), **pluggable backends** (`.storage` / `.mailer`), and **footprint
 levers** (`.pools`). See [docs/framework.md](docs/framework.md) and the worked
-examples: [examples/blog/](examples/blog/) (basic packaging),
-[examples/golfsim/](examples/golfsim/) (a real app), and
-[examples/plugins/](examples/plugins/) (advanced framework features — custom
-plugins, comptime schema, typed migrations, pool levers).
+examples: [examples/blog/](examples/blog/) (basic packaging — default
+`--serve-static` mode), [examples/golfsim/](examples/golfsim/) (a real app —
+comptime-hardcoded `.dir` static mode), and [examples/plugins/](examples/plugins/)
+(advanced framework features — custom plugins, comptime schema, typed migrations,
+pool levers — fully embedded static assets via `embedStaticDir`). Each example ships
+an Astro + React frontend demonstrating a different static-files mode.
 
 ## CLI
 
 ```
-zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
+zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
 zigbase migrate [--data-dir PATH]
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase help
@@ -158,18 +161,18 @@ src/
   files/                   local storage + multipart
   admin/                   embedded admin SPA (served at /_/)
 examples/
-  blog/                    basic packaging proof (hook, custom route, cron job)
-  golfsim/                 a realistic app built on ZigBase (hooks, routes, cron)
-  plugins/                 advanced framework features (custom plugins, comptime schema, typed migrations, pools)
+  blog/                    basic packaging proof (hook, custom route, cron job, --serve-static Astro frontend)
+  golfsim/                 a realistic app built on ZigBase (hooks, routes, cron, comptime .dir static frontend)
+  plugins/                 advanced framework features (custom plugins, comptime schema, typed migrations, pools, embedded static frontend)
 ```
 
 ## Documentation
 
 - [docs/tutorial.md](docs/tutorial.md) — **start here**: build an app on ZigBase, end to end (provision → rules → signup → records + file upload → custom route → cron)
 - [docs/fields.md](docs/fields.md) — field-type & options catalog (all 12 types, defaults, validation rules)
-- [docs/recipes.md](docs/recipes.md) — task recipes: schema provisioning (curl), signup, owner/relation access rules, hooks, custom routes, DB access in cron
-- [docs/api.md](docs/api.md) — HTTP API reference (collections, records, query, rules, auth, oauth2, realtime, files, admin)
-- [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs
+- [docs/recipes.md](docs/recipes.md) — task recipes: ship a frontend in the binary, schema provisioning (curl), signup, owner/relation access rules, hooks, custom routes, DB access in cron
+- [docs/api.md](docs/api.md) — HTTP API reference (collections, records, query, rules, auth, oauth2, realtime, files, static files, admin)
+- [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs, static-file modes
 - [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — current caveats
 - [CHANGELOG.md](CHANGELOG.md) — release history
 
