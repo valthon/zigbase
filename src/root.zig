@@ -1,0 +1,74 @@
+const std = @import("std");
+
+// ---- Public API (grows over this plan) -------------------------------------
+pub const App = @import("framework.zig").App; // comptime application builder
+pub const Runtime = @import("app.zig").App; // runtime app context struct
+pub const Config = @import("config.zig").Config;
+pub const Server = @import("server.zig").Server;
+pub const http = @import("http.zig");
+pub const Data = @import("data.zig").Data;
+pub const events = @import("events.zig");
+pub const schedule = @import("schedule.zig");
+pub const RecordEvent = events.RecordEvent;
+pub const ErrorEvent = events.ErrorEvent;
+pub const RouteEvent = events.RouteEvent;
+
+// ---- Test discovery --------------------------------------------------------
+// The unit-test runner is rooted at THIS module. Reference every internal file
+// so its `test {}` blocks are analyzed and run (matches pre-restructure behavior
+// where main.zig's import graph reached them).
+test {
+    _ = @import("app.zig");
+    _ = @import("config.zig");
+    _ = @import("cli.zig");
+    _ = @import("db.zig");
+    _ = @import("http.zig");
+    _ = @import("router.zig");
+    _ = @import("request.zig");
+    _ = @import("server.zig");
+    _ = @import("schema.zig");
+    _ = @import("collections.zig");
+    _ = @import("records.zig");
+    _ = @import("values.zig");
+    _ = @import("ddl.zig");
+    _ = @import("migrations.zig");
+    _ = @import("rules.zig");
+    _ = @import("crypto.zig");
+    _ = @import("jwt.zig");
+    _ = @import("auth.zig");
+    _ = @import("id.zig");
+    _ = @import("admin.zig");
+    _ = @import("api/error.zig");
+    _ = @import("api/health.zig");
+    _ = @import("api/collections.zig");
+    _ = @import("api/records.zig");
+    _ = @import("api/auth.zig");
+    _ = @import("api/oauth.zig");
+    _ = @import("api/files.zig");
+    _ = @import("oauth/secrets.zig");
+    _ = @import("oauth/providers.zig");
+    _ = @import("oauth/client.zig");
+    _ = @import("query/params.zig");
+    _ = @import("query/lexer.zig");
+    _ = @import("query/parser.zig");
+    _ = @import("query/joiner.zig");
+    _ = @import("query/compiler.zig");
+    _ = @import("query/sort.zig");
+    _ = @import("query/expand.zig");
+    _ = @import("realtime/protocol.zig");
+    _ = @import("realtime/connection.zig");
+    _ = @import("realtime/hub.zig");
+    _ = @import("realtime/ws.zig");
+    _ = @import("files/naming.zig");
+    _ = @import("files/mime.zig");
+    _ = @import("files/storage.zig");
+    _ = @import("files/plan.zig");
+    _ = @import("files/multipart.zig");
+    _ = @import("data.zig");
+    _ = @import("events.zig");
+    _ = @import("sentry.zig");
+    _ = @import("framework.zig");
+    _ = @import("records_hooks_test.zig");
+    _ = @import("schedule.zig");
+    _ = @import("scheduler.zig");
+}

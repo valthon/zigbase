@@ -15,6 +15,56 @@ const request = @import("../request.zig");
 const auth = @import("../auth.zig");
 const realtime_ws = @import("../realtime/ws.zig");
 const file_plan = @import("../files/plan.zig");
+const events = @import("../events.zig");
+
+/// Fire a record lifecycle event. `before_*` errors propagate (caller rolls back via the
+/// normal records path); `after_*` errors route to the error backstop and are swallowed.
+pub fn emitRecord(
+    app: *app_mod.App,
+    rctx: *const request.RequestContext,
+    arena: std.mem.Allocator,
+    conn: *db.Db,
+    col_name: []const u8,
+    value: *std.json.Value,
+    phase: events.RecordPhase,
+) !void {
+    const d = app.dispatch orelse return;
+    const handler = d.record orelse return;
+    const is_before = switch (phase) {
+        .before_create, .before_update, .before_delete => true,
+        else => false,
+    };
+    // before-hooks observe the raw request body; skip non-object bodies so a hook's
+    // `ev.record.object` access can't panic. records.* will reject non-objects with NotObject (400).
+    if (is_before and value.* != .object) return;
+    var ev = events.RecordEvent{
+        .app = app,
+        .ctx = rctx,
+        .data = .{ .app = app, .conn = conn, .io = app.io },
+        .arena = arena,
+        .collection = col_name,
+        .record = value,
+        .phase = phase,
+    };
+    if (is_before) {
+        try handler(&ev);
+    } else {
+        handler(&ev) catch |e| {
+            var err_ev = events.ErrorEvent{ .app = app, .ctx = rctx, .err = e, .phase = .after_hook, .message = @errorName(e) };
+            events.dispatchError(app, app.dispatch, &err_ev);
+        };
+    }
+}
+
+/// Fire file.afterUpload once per written file. After-style: never propagates.
+fn emitFileUploads(app: *app_mod.App, rctx: *const request.RequestContext, col_name: []const u8, record_id: []const u8, writes: []const file_plan.FieldWrite) void {
+    const d = app.dispatch orelse return;
+    const h = d.on_file_upload orelse return;
+    for (writes) |wr| {
+        var ev = events.FileEvent{ .app = app, .ctx = rctx, .collection = col_name, .record_id = record_id, .filename = wr.filename };
+        h(&ev);
+    }
+}
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     const verrs = records.last_errors orelse &[_]schema.ValidationError{};
@@ -44,6 +94,10 @@ fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) requ
 
 fn forbidden(ctx: *http.RequestCtx) !http.Response {
     return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+}
+
+fn hookRejected(ctx: *http.RequestCtx) anyerror!http.Response {
+    return ApiError.badRequest("Request rejected by a hook.").toResponse(ctx.allocator);
 }
 
 /// For auth collections, transform request data through auth.applyCreate/applyUpdate
@@ -121,11 +175,22 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         error.OutOfMemory => return e,
     };
     const rctx = buildContext(ctx, w, data);
-    const rec = switch (rules.decide(col.createRule, &rctx)) {
-        .deny_locked => return forbidden(ctx),
-        .allow => records.create(ctx.allocator, app.io, w, col, data2),
-        .check => records.createGuarded(ctx.allocator, app.io, w, col, data2, try rules.compileGuard(ctx.allocator, w, col, col.createRule.?, &rctx)),
-    } catch |e| switch (e) {
+    // Gate FIRST: before-hooks must run only on already-authorized ops (matching delete).
+    // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
+    const decision = rules.decide(col.createRule, &rctx);
+    if (decision == .deny_locked) return forbidden(ctx);
+    // A before-hook may `put` NEW keys, which reallocs the map header captured in this
+    // local; downstream MUST read the `_mut` binding (here and for rec_mut/ur_mut/ex_mut
+    // below), not the original const — the binding is the grow-capturing reference.
+    var data_mut = data2;
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_create) catch return hookRejected(ctx);
+    // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
+    // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
+    const rec = (switch (decision) {
+        .deny_locked => unreachable,
+        .allow => records.create(ctx.allocator, app.io, w, col, data_mut),
+        .check => records.createGuarded(ctx.allocator, app.io, w, col, data_mut, try rules.compileGuard(ctx.allocator, w, col, col.createRule.?, &rctx)),
+    }) catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         error.NotObject => return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator),
         error.Forbidden => return forbidden(ctx),
@@ -136,8 +201,11 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         _ = records.delete(ctx.allocator, w, col, rid) catch {};
         return ApiError.internal().toResponse(ctx.allocator);
     };
-    realtime_ws.broadcast(app, col, .create, rid, rec);
-    return jsonResponse(ctx, 201, rec);
+    emitFileUploads(app, &rctx, col.name, rid, all.writes);
+    var rec_mut = rec;
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &rec_mut, .after_create) catch {};
+    realtime_ws.broadcast(app, col, .create, rid, rec_mut);
+    return jsonResponse(ctx, 201, rec_mut);
 }
 
 pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -163,6 +231,12 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         error.OutOfMemory => return e,
     };
     const rctx = buildContext(ctx, w, data);
+    // Gate FIRST: before-hooks must run only on already-authorized ops (matching delete).
+    // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
+    const decision = rules.decide(col.updateRule, &rctx);
+    if (decision == .deny_locked) return forbidden(ctx);
+    var data_mut = data2;
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_update) catch return hookRejected(ctx);
 
     // Write new file bytes BEFORE the DB update so a storage failure can't leave dangling refs.
     if (ctx.app.?.storage) |storage| {
@@ -176,11 +250,13 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         }
     }
 
-    const updated = switch (rules.decide(col.updateRule, &rctx)) {
-        .deny_locked => return forbidden(ctx),
-        .allow => records.update(ctx.allocator, w, col, rid, data2),
-        .check => records.updateGuarded(ctx.allocator, w, col, rid, data2, try rules.compileGuard(ctx.allocator, w, col, col.updateRule.?, &rctx)),
-    } catch |e| switch (e) {
+    // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
+    // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
+    const updated = (switch (decision) {
+        .deny_locked => unreachable,
+        .allow => records.update(ctx.allocator, w, col, rid, data_mut),
+        .check => records.updateGuarded(ctx.allocator, w, col, rid, data_mut, try rules.compileGuard(ctx.allocator, w, col, col.updateRule.?, &rctx)),
+    }) catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         error.NotObject => return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator),
         error.Forbidden => return ApiError.notFound().toResponse(ctx.allocator),
@@ -191,8 +267,13 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.notFound().toResponse(ctx.allocator);
     };
     if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch {};
-    realtime_ws.broadcast(app, col, .update, ur.object.get("id").?.string, ur);
-    return jsonResponse(ctx, 200, ur);
+    emitFileUploads(app, &rctx, col.name, rid, all.writes);
+    // Capture id BEFORE the after-hook so a hook that mutates/removes "id" can't panic the broadcast.
+    const broadcast_id = ur.object.get("id").?.string;
+    var ur_mut = ur;
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &ur_mut, .after_update) catch {};
+    realtime_ws.broadcast(app, col, .update, broadcast_id, ur_mut);
+    return jsonResponse(ctx, 200, ur_mut);
 }
 
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -201,13 +282,15 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if ((try records.get(ctx.allocator, w, col, rid)) == null) return ApiError.notFound().toResponse(ctx.allocator);
+    const existing = (try records.get(ctx.allocator, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rctx = buildContext(ctx, w, null);
     switch (rules.decide(col.deleteRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => {},
         .check => if (!try rules.matches(ctx.allocator, w, col, rid, col.deleteRule.?, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
     }
+    var ex_mut = existing;
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .before_delete) catch return hookRejected(ctx);
     if (!try records.delete(ctx.allocator, w, col, rid)) return ApiError.notFound().toResponse(ctx.allocator);
     if (col.type == .auth) {
         var st = try w.prepare("DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
@@ -217,6 +300,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         _ = try st.step();
     }
     if (app.storage) |storage| storage.deleteRecord(app.io, col.name, rid) catch {};
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .after_delete) catch {};
     realtime_ws.broadcast(app, col, .delete, rid, null);
     return .{ .status = 204, .body = "" };
 }

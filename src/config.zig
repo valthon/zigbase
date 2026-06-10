@@ -12,6 +12,7 @@ pub const Config = struct {
     realtime_allowed_origins: []const u8 = "", // CSV of allowed WS Origins; "" = allow any (dev)
     max_upload_size: u64 = 50 << 20, // 50 MiB per request body
     file_token_ttl_s: i64 = 120, // short-lived file-access token
+    sentry_dsn: []const u8 = "", // "" = log errors to stderr; set to enable Sentry reporting
 
     /// Pure loader: applies overrides from a getter (env in prod, a stub in tests).
     pub fn load(getter: *const fn ([]const u8) ?[]const u8) !Config {
@@ -27,6 +28,7 @@ pub const Config = struct {
         if (getter("ZIGBASE_REALTIME_ORIGINS")) |v| cfg.realtime_allowed_origins = v;
         if (getter("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
         if (getter("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
         return cfg;
     }
 };

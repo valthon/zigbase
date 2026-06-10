@@ -127,6 +127,7 @@ fn respondSession(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, r
     const tk = (try auth_api.tokenKeyFor(ctx.allocator, conn, col.name, rid)) orelse return ApiError.internal().toResponse(ctx.allocator);
     const issued = try auth_api.issue(ctx, conn, col.name, rid, tk);
     const rec = (try records.get(ctx.allocator, conn, col, rid)) orelse return ApiError.internal().toResponse(ctx.allocator);
+    auth_api.emitAuth(ctx, col.name, rec, .oauth2);
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator, "token", .{ .string = issued.token });
     try root.put(ctx.allocator, "record", rec);

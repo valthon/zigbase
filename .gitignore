@@ -9,3 +9,8 @@ zig-pkg/
 
 tests/admin/__pycache__/
 .pytest_cache/
+
+examples/*/zig-out/
+examples/*/.zig-cache/
+examples/*/data/
+dist/

@@ -13,6 +13,9 @@ const realtime_ws = @import("realtime/ws.zig");
 const files_multipart = @import("files/multipart.zig");
 const admin = @import("admin.zig");
 const ApiError = @import("api/error.zig").ApiError;
+const auth = @import("auth.zig");
+const events = @import("events.zig");
+const request = @import("request.zig");
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
     return health.handle(ctx);
@@ -89,6 +92,54 @@ fn setZapStatus(r: zap.Request, status: u16) void {
     r.setStatus(code);
 }
 
+fn forbiddenResp(ctx: *http.RequestCtx) !http.Response {
+    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+}
+
+/// Try the consumer's custom routes (after built-ins). Resolves auth on a fresh reader,
+/// enforces the route's AuthLevel, then calls the handler. Returns null if no custom route
+/// matches the path+method. A handler error routes to the error backstop and yields 500.
+fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
+    const app = ctx.app orelse return null;
+    const d = app.dispatch orelse return null;
+    if (d.routes.len == 0) return null;
+    for (d.routes) |rt| {
+        if (rt.method != ctx.method) continue;
+        if (try router.matchPath(ctx.allocator, rt.pattern, ctx.path)) |params| {
+            ctx.params = params;
+            // Resolve auth on a fresh read-only connection (never the writer lock).
+            var reader = app.pool.openReader() catch return try ApiError.internal().toResponse(ctx.allocator);
+            defer reader.close();
+            const authed = auth.authenticate(app.io, ctx.allocator, app, ctx, &reader) catch null;
+            switch (rt.auth) {
+                .public => {},
+                .authed => if (authed == null) return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator),
+                .superuser => if (authed == null or !authed.?.is_superuser) return try forbiddenResp(ctx),
+            }
+            var rctx = request.RequestContext{
+                .auth = if (authed) |a| a.record else null,
+                .is_superuser = if (authed) |a| a.is_superuser else false,
+                .method = @tagName(ctx.method),
+            };
+            var ev = events.RouteEvent{ .app = app, .ctx = ctx, .rctx = rctx };
+            return rt.handler(&ev) catch |e| {
+                var err_ev = events.ErrorEvent{ .app = app, .ctx = &rctx, .err = e, .phase = .request, .message = @errorName(e) };
+                events.dispatchError(app, app.dispatch, &err_ev);
+                return try ApiError.internal().toResponse(ctx.allocator);
+            };
+        }
+    }
+    return null;
+}
+
+/// Last-resort raw error envelope, used only when even building the normal ApiError
+/// response fails (allocation failure). Sends a fixed JSON body bypassing the arena.
+fn sendRawEnvelope(r: zap.Request, status: u16, body: []const u8) void {
+    setZapStatus(r, status);
+    r.setContentType(.JSON) catch {};
+    r.sendBody(body) catch {};
+}
+
 fn onRequest(r: zap.Request) !void {
     const self = Server.instance.?;
     var arena = std.heap.ArenaAllocator.init(self.app.allocator);
@@ -111,16 +162,23 @@ fn onRequest(r: zap.Request) !void {
             ctx.files = ex.files;
         } else |_| {}
     }
-    const resp = if (std.mem.startsWith(u8, ctx.path, "/_/") or std.mem.eql(u8, ctx.path, "/_"))
-        admin.serve(&ctx)
-    else
-        router.dispatch(&routes, &ctx) catch
-            ApiError.internal().toResponse(arena.allocator()) catch {
-            setZapStatus(r, 500);
-            r.setContentType(.JSON) catch {};
-            r.sendBody("{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}") catch {};
+    const resp = blk: {
+        if (std.mem.startsWith(u8, ctx.path, "/_/") or std.mem.eql(u8, ctx.path, "/_"))
+            break :blk admin.serve(&ctx);
+        // Built-in API routes win over custom routes.
+        const builtin = router.tryDispatch(&routes, &ctx) catch {
+            break :blk ApiError.internal().toResponse(arena.allocator()) catch {
+                sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
+                return;
+            };
+        };
+        if (builtin) |hit| break :blk hit;
+        if (dispatchCustom(&ctx) catch null) |hit| break :blk hit;
+        break :blk ApiError.notFound().toResponse(arena.allocator()) catch {
+            sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
             return;
         };
+    };
     setZapStatus(r, resp.status);
     for (resp.cookies) |c| {
         r.setCookie(.{
@@ -141,9 +199,7 @@ fn onRequest(r: zap.Request) !void {
     for (resp.extra_headers) |h| r.setHeader(h.name, h.value) catch {};
     if (resp.file_path) |path| {
         r.sendFile(path) catch {
-            setZapStatus(r, 404);
-            r.setContentType(.JSON) catch {};
-            r.sendBody("{\"code\":404,\"message\":\"Not found.\",\"data\":{}}") catch {};
+            sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
         };
         return;
     }

@@ -11,6 +11,7 @@ const jwt = @import("../jwt.zig");
 const crypto = @import("../crypto.zig");
 const auth_api = @import("auth.zig");
 const params_mod = @import("../query/params.zig");
+const events = @import("../events.zig");
 const ApiError = @import("error.zig").ApiError;
 
 /// Extensions safe to render inline in a browser (no script execution). Everything else downloads.
@@ -76,6 +77,13 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         .allow => {},
         .check => if (!try rules.matches(ctx.allocator, &r, col, rid, col.viewRule.?, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
     }
+
+    // file.beforeServe runs only on files the requester may already access; a handler
+    // returning an error denies the download as 404 (hides existence, like viewRule).
+    if (app.dispatch) |d| if (d.on_file_serve) |h| {
+        var fev = events.FileEvent{ .app = app, .ctx = &rctx, .collection = col_name, .record_id = rid, .filename = name };
+        h(&fev) catch return ApiError.notFound().toResponse(ctx.allocator);
+    };
 
     const storage = app.storage orelse return ApiError.internal().toResponse(ctx.allocator);
     const path = (try storage.localPath(ctx.allocator, col.name, rid, name)) orelse return ApiError.internal().toResponse(ctx.allocator);
