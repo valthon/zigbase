@@ -12,26 +12,37 @@ pub const SuperuserArgs = struct {
     password: ?[]const u8 = null,
 };
 
+/// Identifies which command a per-command `--help` request targets.
+pub const HelpTopic = enum { top, serve, migrate, superuser_create };
+
 pub const Command = union(enum) {
-    help,
+    /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
+    help: HelpTopic,
     serve: ServeArgs,
     migrate: ServeArgs,
     superuser_create: SuperuserArgs,
 };
 
+/// True when an arg is a help flag (`--help` or `-h`).
+fn isHelpFlag(a: []const u8) bool {
+    return std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h");
+}
+
 pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValue };
 
 /// Parse argv (excluding the program name).
 pub fn parse(args: []const []const u8) ParseError!Command {
-    if (args.len == 0) return .help;
-    if (std.mem.eql(u8, args[0], "help") or std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h"))
-        return .help;
+    if (args.len == 0) return .{ .help = .top };
+    if (std.mem.eql(u8, args[0], "help") or isHelpFlag(args[0]))
+        return .{ .help = .top };
     if (std.mem.eql(u8, args[0], "migrate")) {
         var sa = ServeArgs{};
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
             const a = args[i];
-            if (std.mem.eql(u8, a, "--data-dir")) {
+            if (isHelpFlag(a)) {
+                return .{ .help = .migrate };
+            } else if (std.mem.eql(u8, a, "--data-dir")) {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 sa.data_dir = args[i];
@@ -40,12 +51,16 @@ pub fn parse(args: []const []const u8) ParseError!Command {
         return .{ .migrate = sa };
     }
     if (std.mem.eql(u8, args[0], "superuser")) {
+        // `superuser --help` / `superuser -h` -> the superuser-create help screen.
+        if (args.len >= 2 and isHelpFlag(args[1])) return .{ .help = .superuser_create };
         if (args.len < 2 or !std.mem.eql(u8, args[1], "create")) return ParseError.UnknownCommand;
         var sa = SuperuserArgs{};
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const a = args[i];
-            if (std.mem.eql(u8, a, "--email")) {
+            if (isHelpFlag(a)) {
+                return .{ .help = .superuser_create };
+            } else if (std.mem.eql(u8, a, "--email")) {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 sa.email = args[i];
@@ -67,7 +82,9 @@ pub fn parse(args: []const []const u8) ParseError!Command {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--http-host")) {
+        if (isHelpFlag(a)) {
+            return .{ .help = .serve };
+        } else if (std.mem.eql(u8, a, "--http-host")) {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
             sa.http_host = args[i];
@@ -86,10 +103,26 @@ pub fn parse(args: []const []const u8) ParseError!Command {
     return .{ .serve = sa };
 }
 
-test "no args -> help" {
+test "no args -> top-level help" {
     // Use std.meta.activeTag for union-tag comparison; direct `== .help` on a
     // tagged union value does not compile in Zig 0.16.0.
-    try std.testing.expect(std.meta.activeTag(try parse(&.{})) == .help);
+    const cmd = try parse(&.{});
+    try std.testing.expect(std.meta.activeTag(cmd) == .help);
+    try std.testing.expectEqual(HelpTopic.top, cmd.help);
+}
+
+test "--help and -h and help -> top-level help" {
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{"--help"})).help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{"-h"})).help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{"help"})).help);
+}
+
+test "per-command --help routes to that command's help topic" {
+    try std.testing.expectEqual(HelpTopic.serve, (try parse(&.{ "serve", "--help" })).help);
+    try std.testing.expectEqual(HelpTopic.serve, (try parse(&.{ "serve", "-h" })).help);
+    try std.testing.expectEqual(HelpTopic.migrate, (try parse(&.{ "migrate", "--help" })).help);
+    try std.testing.expectEqual(HelpTopic.superuser_create, (try parse(&.{ "superuser", "create", "--help" })).help);
+    try std.testing.expectEqual(HelpTopic.superuser_create, (try parse(&.{ "superuser", "--help" })).help);
 }
 
 test "serve with all three flags" {

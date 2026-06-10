@@ -82,7 +82,12 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     };
 
     switch (cmd) {
-        .help => printUsage(),
+        .help => |topic| switch (topic) {
+            .top => printUsage(),
+            .serve => printServeUsage(),
+            .migrate => printMigrateUsage(),
+            .superuser_create => printSuperuserUsage(),
+        },
         .serve => |sa| {
             const cfg = try loadCfg(sa);
             try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size);
@@ -92,15 +97,131 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     }
 }
 
+/// Print the comprehensive top-level usage guide to stderr. We use std.debug.print
+/// (not std.log.info) so each line is emitted cleanly without log-level/metadata
+/// prefixes, which keeps a multi-section help screen readable.
 fn printUsage() void {
-    std.log.info(
-        \\zigbase — a single-binary backend (https://github.com/valthon/zigbase)
+    std.debug.print(
+        \\zigbase — a single-binary backend (REST + WebSocket + admin UI)
+        \\Docs & source: https://github.com/valthon/zigbase
         \\
-        \\usage:
+        \\USAGE:
+        \\  zigbase <command> [flags]
+        \\
+        \\COMMANDS:
+        \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
+        \\  migrate             Apply database migrations, then exit.
+        \\  superuser create    Create an admin (superuser) account.
+        \\  help                Show this help. Also: --help, -h, or no arguments.
+        \\
+        \\  Per-command help is available via `zigbase <command> --help`, e.g.
+        \\  `zigbase serve --help` or `zigbase superuser create --help`.
+        \\
+        \\COMMON FLAGS (serve / migrate):
+        \\  --http-host H       Address to bind (serve only).      [env ZIGBASE_HTTP_HOST, default 0.0.0.0]
+        \\  --http-port N       TCP port to listen on (serve only). [env ZIGBASE_HTTP_PORT, default 8090]
+        \\  --data-dir PATH     Directory for the SQLite db + file storage. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\
+        \\ENVIRONMENT VARIABLES:
+        \\  ZIGBASE_JWT_SECRET        Token-signing secret. REQUIRED in production; the server
+        \\                           refuses to start with the insecure default when cookies are
+        \\                           secure.                         [default dev-insecure-secret-change-me]
+        \\  ZIGBASE_HTTP_HOST         Bind address.                  [default 0.0.0.0]
+        \\  ZIGBASE_HTTP_PORT         Listen port.                   [default 8090]
+        \\  ZIGBASE_DATA_DIR          Data directory (db + storage). [default ./zb_data]
+        \\  ZIGBASE_COOKIE_SECURE     Set the Secure flag on auth cookies (true/1). Enable behind
+        \\                           HTTPS.                          [default false]
+        \\  ZIGBASE_SENTRY_DSN        Sentry DSN for error reporting; empty logs errors to stderr.
+        \\                           [default empty]
+        \\  ZIGBASE_REALTIME_ORIGINS  CSV of allowed WebSocket Origins; empty allows any (dev).
+        \\                           [default empty]
+        \\  ZIGBASE_MAX_UPLOAD_SIZE   Max request body for uploads, in bytes. [default 52428800 = 50 MiB]
+        \\  ZIGBASE_AUTH_TOKEN_TTL    Auth token lifetime, seconds.  [default 1209600 = 14 days]
+        \\  ZIGBASE_VERIFICATION_TTL  Email-verification token TTL, seconds. [default 604800 = 7 days]
+        \\  ZIGBASE_PASSWORD_RESET_TTL Password-reset token TTL, seconds.    [default 3600 = 1 hour]
+        \\  ZIGBASE_FILE_TOKEN_TTL    Short-lived file-access token TTL, seconds. [default 120 = 2 min]
+        \\
+        \\EXAMPLES:
+        \\  # Create the first superuser (admin) account:
+        \\  zigbase superuser create --email you@example.com --password "<a strong password>" --data-dir ./zb_data
+        \\
+        \\  # Serve with a fresh random JWT secret (recommended):
+        \\  ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" zigbase serve --data-dir ./zb_data
+        \\
+        \\  # Serve on a custom host/port/data-dir:
+        \\  zigbase serve --http-host 127.0.0.1 --http-port 9000 --data-dir /var/lib/zigbase
+        \\
+        \\  # Apply pending migrations and exit:
+        \\  zigbase migrate --data-dir ./zb_data
+        \\
+        \\After `serve` starts, open http://127.0.0.1:8090/_/ for the admin UI.
+        \\More docs: README.md, docs/api.md, docs/framework.md, docs/tutorial.md.
+        \\
+    , .{});
+}
+
+fn printServeUsage() void {
+    std.debug.print(
+        \\zigbase serve — start the HTTP server (REST API + WebSocket + admin UI at /_/).
+        \\
+        \\USAGE:
         \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
+        \\
+        \\FLAGS:
+        \\  --http-host H    Address to bind.    [env ZIGBASE_HTTP_HOST, default 0.0.0.0]
+        \\  --http-port N    TCP port to listen. [env ZIGBASE_HTTP_PORT, default 8090]
+        \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\
+        \\KEY ENVIRONMENT VARIABLES:
+        \\  ZIGBASE_JWT_SECRET      Token-signing secret. REQUIRED in production; the server refuses
+        \\                         to start with the insecure default while ZIGBASE_COOKIE_SECURE is on.
+        \\  ZIGBASE_COOKIE_SECURE  Secure flag on auth cookies (true/1). Enable behind HTTPS. [default false]
+        \\  ZIGBASE_SENTRY_DSN     Sentry DSN for error reporting; empty logs to stderr.
+        \\  (See `zigbase help` for the full list of ZIGBASE_* variables.)
+        \\
+        \\EXAMPLE:
+        \\  ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" zigbase serve --http-port 9000 --data-dir ./zb_data
+        \\
+    , .{});
+}
+
+fn printMigrateUsage() void {
+    std.debug.print(
+        \\zigbase migrate — apply pending database migrations, then exit.
+        \\
+        \\USAGE:
         \\  zigbase migrate [--data-dir PATH]
+        \\
+        \\FLAGS:
+        \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\
+        \\Note: `zigbase serve` also runs migrations on startup; use `migrate` to apply
+        \\them ahead of time (e.g. in a deploy step) without starting the server.
+        \\
+        \\EXAMPLE:
+        \\  zigbase migrate --data-dir ./zb_data
+        \\
+    , .{});
+}
+
+fn printSuperuserUsage() void {
+    std.debug.print(
+        \\zigbase superuser create — create an admin (superuser) account.
+        \\
+        \\USAGE:
         \\  zigbase superuser create --email E --password P [--data-dir PATH]
-        \\  zigbase help
+        \\
+        \\FLAGS:
+        \\  --email E        Superuser email address (required).
+        \\  --password P     Superuser password (required, at least 8 characters).
+        \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\
+        \\Collection management and the admin UI at /_/ are superuser-only, so create one
+        \\before configuring collections.
+        \\
+        \\EXAMPLE:
+        \\  zigbase superuser create --email you@example.com --password "<a strong password>" --data-dir ./zb_data
+        \\
     , .{});
 }
 
