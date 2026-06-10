@@ -93,7 +93,15 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
 }
 
 fn printUsage() void {
-    std.log.info("usage: zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]", .{});
+    std.log.info(
+        \\zigbase — a single-binary backend (https://github.com/<owner>/zigbase)
+        \\
+        \\usage:
+        \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
+        \\  zigbase migrate [--data-dir PATH]
+        \\  zigbase superuser create --email E --password P [--data-dir PATH]
+        \\  zigbase help
+    , .{});
 }
 
 fn loadCfg(sa: cli.ServeArgs) !config.Config {
