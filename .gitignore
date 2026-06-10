@@ -13,3 +13,4 @@ tests/admin/__pycache__/
 examples/*/zig-out/
 examples/*/.zig-cache/
 examples/*/data/
+dist/
