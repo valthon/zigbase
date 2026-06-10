@@ -244,13 +244,13 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
 
     const cmd = cli.parse(args[1..], .{ .serve_static = std.meta.activeTag(opts.static_mode) == .default }) catch |err| {
         std.log.err("argument error: {s}", .{@errorName(err)});
-        printUsage();
+        printUsage(std.meta.activeTag(opts.static_mode) == .default);
         return;
     };
 
     switch (cmd) {
         .help => |topic| switch (topic) {
-            .top => printUsage(),
+            .top => printUsage(std.meta.activeTag(opts.static_mode) == .default),
             .serve => printServeUsage(std.meta.activeTag(opts.static_mode) == .default),
             .migrate => printMigrateUsage(),
             .superuser_create => printSuperuserUsage(),
@@ -267,7 +267,9 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
 /// Print the comprehensive top-level usage guide to stderr. We use std.debug.print
 /// (not std.log.info) so each line is emitted cleanly without log-level/metadata
 /// prefixes, which keeps a multi-section help screen readable.
-fn printUsage() void {
+/// `show_serve_static` mirrors the parser gate: --serve-static is only listed in
+/// the default comptime mode (in .disabled/.dir/.embedded it's an unknown flag).
+fn printUsage(show_serve_static: bool) void {
     std.debug.print(
         \\zigbase — a single-binary backend (REST + WebSocket + admin UI)
         \\Docs & source: https://github.com/valthon/zigbase
@@ -288,8 +290,14 @@ fn printUsage() void {
         \\  --http-host H       Address to bind (serve only).      [env ZIGBASE_HTTP_HOST, default 0.0.0.0]
         \\  --http-port N       TCP port to listen on (serve only). [env ZIGBASE_HTTP_PORT, default 8090]
         \\  --data-dir PATH     Directory for the SQLite db + file storage. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\
+    , .{});
+    if (show_serve_static) std.debug.print(
         \\  --serve-static DIR  Serve static files from DIR at the root path (serve only;
         \\                      available unless the app hardcodes static files at comptime).
+        \\
+    , .{});
+    std.debug.print(
         \\
         \\ENVIRONMENT VARIABLES:
         \\  ZIGBASE_JWT_SECRET        Token-signing secret. REQUIRED in production; the server
@@ -479,7 +487,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
         .default => if (cfg.static_dir.len > 0) static_files.Source{ .dir = cfg.static_dir } else .none,
     };
     if (std.meta.activeTag(static_source) == .dir) {
-        var probe = std.Io.Dir.cwd().openDir(io, static_source.dir, .{}) catch {
+        const probe = std.Io.Dir.cwd().openDir(io, static_source.dir, .{}) catch {
             std.log.err("static dir '{s}' is missing or unreadable (from {s})", .{
                 static_source.dir,
                 if (std.meta.activeTag(opts.static_mode) == .dir) "comptime .static_files" else "--serve-static",
