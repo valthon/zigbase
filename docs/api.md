@@ -375,8 +375,8 @@ static miss returns a plain-text 404 (`text/plain`).
   caching is delegated to facil.io's `sendFile`, which emits its own `ETag`,
   `Last-Modified`, `Cache-Control: max-age=3600`, and handles `If-None-Match`/`304`.
 - Every response includes `X-Content-Type-Options: nosniff`; content types are
-  derived from the file extension (html, css, js, json, svg, png, jpg/jpeg, gif,
-  webp, avif, ico, woff/woff2, ttf, wasm, txt, xml, pdf, mp4, webm; unknown →
+  derived from the file extension (html, css, js, mjs, json, map, svg, png, jpg/jpeg,
+  gif, webp, avif, ico, woff/woff2, ttf, wasm, txt, xml, pdf, mp4, webm; unknown →
   `application/octet-stream`).
 - Paths containing `..`, backslashes, or NUL bytes are rejected (404). There are no
   directory listings and no `Range`/partial-content support.

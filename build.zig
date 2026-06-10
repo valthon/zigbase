@@ -67,7 +67,7 @@ pub fn embedStaticDir(b: *std.Build, dir_rel: []const u8) *std.Build.Module {
     const alloc = b.allocator;
     const io = b.graph.io;
     var dir = b.build_root.handle.openDir(io, dir_rel, .{ .iterate = true }) catch
-        std.debug.panic("embedStaticDir: cannot open '{s}' — build the frontend first (e.g. `cd {s}/.. && npm run build`)", .{ dir_rel, dir_rel });
+        std.debug.panic("embedStaticDir: cannot open '{s}' — build the frontend first (e.g. `cd {s}/.. && npm install && npm run build`)", .{ dir_rel, dir_rel });
     defer dir.close(io);
 
     var names: std.ArrayList([]const u8) = .empty;
