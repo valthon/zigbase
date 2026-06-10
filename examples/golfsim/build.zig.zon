@@ -1,0 +1,10 @@
+.{
+    .name = .zigbase_golfsim_example,
+    .version = "0.0.0",
+    .fingerprint = 0xcdcf8824241ab87,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zigbase = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

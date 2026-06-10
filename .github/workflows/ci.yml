@@ -16,6 +16,8 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build test --summary all
       - name: Build example consumer (dependency-graph proof)
         run: cd examples/blog && mise exec zig@0.16.0 -- zig build
+      - name: Build golfsim example consumer (realistic app)
+        run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build
 
   browser:
     runs-on: ubuntu-latest
