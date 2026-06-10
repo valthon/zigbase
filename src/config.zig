@@ -22,6 +22,9 @@ pub const Config = struct {
     max_upload_size: u64 = 50 << 20, // 50 MiB per request body
     file_token_ttl_s: i64 = 120, // short-lived file-access token
     sentry_dsn: []const u8 = "", // "" = log errors to stderr; set to enable Sentry reporting
+    // Static-file root for the default (runtime-flag) mode; set by `--serve-static`.
+    // "" = no static serving. Comptime modes (.dir/.embedded/.disabled) ignore it.
+    static_dir: []const u8 = "",
 
     // In-memory rate limiting for sensitive auth endpoints (login / password-reset /
     // email-verification). Fixed window: at most `rate_limit_max` requests per client

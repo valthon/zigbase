@@ -1,4 +1,5 @@
 const std = @import("std");
+const static_files = @import("static_files.zig");
 const app_mod = @import("app.zig");
 const events = @import("events.zig");
 const config = @import("config.zig");
@@ -98,7 +99,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -156,6 +157,29 @@ pub fn App(comptime cfg: anytype) type {
         /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
         pub const MailerPlugin: type = if (@hasField(@TypeOf(cfg), "mailer")) cfg.mailer else DefaultMailerPlugin;
 
+        /// Comptime static-files mode (see static_files.Mode). Field absent -> .default,
+        /// which enables the runtime `--serve-static <dir>` flag on `serve`.
+        pub const static_mode: static_files.Mode = blk: {
+            if (!@hasField(@TypeOf(cfg), "static_files")) break :blk .default;
+            const sf = cfg.static_files;
+            const T = @TypeOf(sf);
+            if (T == @TypeOf(.enum_literal)) {
+                if (std.mem.eql(u8, @tagName(sf), "disabled")) break :blk .disabled;
+                @compileError("static_files: unknown value '." ++ @tagName(sf) ++ "'; expected .disabled, .{ .dir = \"<path>\" }, or .{ .embedded = &<manifest>.files }");
+            }
+            if (@hasField(T, "dir")) break :blk .{ .dir = sf.dir };
+            if (@hasField(T, "embedded")) {
+                // Coerce the generated manifest's structurally-identical struct type
+                // into static_files.StaticFile (the generated module can't import it).
+                const src = sf.embedded;
+                var out: [src.len]static_files.StaticFile = undefined;
+                for (src, 0..) |f, i| out[i] = .{ .path = f.path, .bytes = f.bytes, .etag = f.etag };
+                const final = out;
+                break :blk .{ .embedded = &final };
+            }
+            @compileError("static_files: expected .disabled, .{ .dir = \"<path>\" }, or .{ .embedded = &<manifest>.files }");
+        };
+
         /// Comptime-lowered collection specs from `.collections` (empty when absent).
         /// Relation fields carry their target collection BY NAME in `targetCollectionId`;
         /// `provision.applySpecs` resolves names -> ids at startup. When empty, no
@@ -180,6 +204,7 @@ pub fn App(comptime cfg: anytype) type {
             .reader_pool_size = reader_pool_size,
             .job_stack_size = job_stack_size,
             .cache_kib = cache_kib,
+            .static_mode = static_mode,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -203,6 +228,7 @@ pub const ServeOpts = struct {
     reader_pool_size: usize,
     job_stack_size: usize = scheduler.default_job_stack_size,
     cache_kib: u32 = db.default_cache_kib,
+    static_mode: static_files.Mode = .default,
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -434,6 +460,25 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
     var rate_limiter = ratelimit.RateLimiter.init(allocator, cfg.rate_limit_max, cfg.rate_limit_window_s);
     defer rate_limiter.deinit();
 
+    // Resolve the static-file source from the comptime mode (+ --serve-static in
+    // default mode). A configured-but-missing dir is a fatal startup error.
+    const static_source: static_files.Source = switch (opts.static_mode) {
+        .disabled => .none,
+        .dir => |d| .{ .dir = d },
+        .embedded => |files| .{ .embedded = files },
+        .default => if (cfg.static_dir.len > 0) static_files.Source{ .dir = cfg.static_dir } else .none,
+    };
+    if (std.meta.activeTag(static_source) == .dir) {
+        var probe = std.Io.Dir.cwd().openDir(io, static_source.dir, .{}) catch {
+            std.log.err("static dir '{s}' is missing or unreadable (from {s})", .{
+                static_source.dir,
+                if (std.meta.activeTag(opts.static_mode) == .dir) "comptime .static_files" else "--serve-static",
+            });
+            return error.StaticDirUnavailable;
+        };
+        probe.close(io);
+    }
+
     var app = app_mod.App{
         .allocator = allocator,
         .io = io,
@@ -447,6 +492,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
         .max_upload_size = cfg.max_upload_size,
         .file_token_ttl_s = cfg.file_token_ttl_s,
         .sentry_dsn = cfg.sentry_dsn,
+        .static_source = static_source,
         .storage = &storage_iface,
         .mailer = &mailer_iface,
         .dispatch = dispatch,
@@ -657,4 +703,23 @@ test "App(.{}) has no comptime collections and no provision migrations" {
     const A = App(.{});
     try std.testing.expectEqual(@as(usize, 0), A.collections.len);
     try std.testing.expectEqual(@as(usize, 0), A.provision_migrations.len);
+}
+
+test "App(cfg) static_files modes: default, disabled, dir, embedded (with coercion)" {
+    try std.testing.expectEqual(static_files.Mode.default, std.meta.activeTag(App(.{}).static_mode));
+    try std.testing.expectEqual(static_files.Mode.disabled, std.meta.activeTag(App(.{ .static_files = .disabled }).static_mode));
+
+    const D = App(.{ .static_files = .{ .dir = "frontend/dist" } });
+    try std.testing.expectEqual(static_files.Mode.dir, std.meta.activeTag(D.static_mode));
+    try std.testing.expectEqualStrings("frontend/dist", D.static_mode.dir);
+
+    const manifest = struct {
+        const F = struct { path: []const u8, bytes: []const u8, etag: []const u8 };
+        pub const files = [_]F{.{ .path = "index.html", .bytes = "<p>hi</p>", .etag = "\"abc\"" }};
+    };
+    const E = App(.{ .static_files = .{ .embedded = &manifest.files } });
+    try std.testing.expectEqual(static_files.Mode.embedded, std.meta.activeTag(E.static_mode));
+    try std.testing.expectEqual(@as(usize, 1), E.static_mode.embedded.len);
+    try std.testing.expectEqualStrings("index.html", E.static_mode.embedded[0].path);
+    try std.testing.expectEqualStrings("\"abc\"", E.static_mode.embedded[0].etag);
 }
