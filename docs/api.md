@@ -266,13 +266,36 @@ password must be at least `minPasswordLength` (default 8) — otherwise the crea
 a `400`. After signup, obtain a token via `auth-with-password` above. Full walkthrough:
 [recipes.md → User registration](recipes.md#recipe-user-registration-signup).
 
-### Verification & password reset — mailer limitation
+### Verification & password reset — email delivery
 
-> **Important:** ZigBase currently has **no mailer**. The verification and
-> password-reset endpoints **write their tokens to the server log** instead of
-> emailing them. See [KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md). To complete a
-> flow, read the token from the server log and POST it to the matching
-> `confirm-*` endpoint (each `confirm-*` request takes a `token` field).
+The `request-verification` and `request-password-reset` endpoints mint a token and
+deliver it via the configured mailer, then return `204` (they never reveal whether
+the email exists). The matching `confirm-*` endpoint takes that `token` in its body.
+
+- **With SMTP configured** (`ZIGBASE_SMTP_HOST` + friends — see the
+  [README config table](../README.md#configuration)), the token is **emailed** over
+  the configured transport (`none` / `starttls` / `implicit` / `auto`).
+- **Without SMTP** (the default), the token is **logged to the server** instead — a
+  dev/CI convenience. To complete a flow locally, read the token from the log and POST
+  it to the matching `confirm-*` endpoint.
+
+Configure SMTP for production; see
+[KNOWN_LIMITATIONS.md → Auth & email](../KNOWN_LIMITATIONS.md).
+
+### Rate limiting
+
+The sensitive auth endpoints — `auth-with-password` (login), `request-verification`,
+and `request-password-reset` — are rate limited. Over the limit, the endpoint returns
+**`429 Too Many Requests`** (`{ "message": "Too many requests. Try again later." }`).
+
+- **Config:** `ZIGBASE_RATE_LIMIT_MAX` attempts (default `10`) per
+  `ZIGBASE_RATE_LIMIT_WINDOW` seconds (default `60`), per client key, per endpoint.
+  Set `ZIGBASE_RATE_LIMIT_MAX=0` to disable rate limiting entirely.
+- **Keying:** the client key is the IP from `X-Forwarded-For` (first hop) or
+  `X-Real-IP`. **Deploy behind a reverse proxy that sets one of these headers** —
+  otherwise (direct exposure) the limiter falls back to keying on the submitted
+  identity/email, which is still spoofable. See
+  [KNOWN_LIMITATIONS.md → Auth & email](../KNOWN_LIMITATIONS.md).
 
 ### OAuth2
 

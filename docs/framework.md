@@ -84,6 +84,11 @@ error.**
 | `onBeforeTerminate` | Lifecycle: just before shutdown. |
 | `cron` | Scheduled job table. |
 | `jobs` | Scheduler settings (e.g. `.pool_size`). |
+| `collections` | Comptime schema: collections provisioned at startup (additive auto-migration). |
+| `migrations` | Explicit migrations (the escape hatch for non-additive schema changes). |
+| `storage` | Storage plugin TYPE (defaults to local-disk storage). |
+| `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). |
+| `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
 
 ## 4. Record hooks (`.hooks`)
 
@@ -214,6 +219,31 @@ the framework before your handler runs. The framework **enforces `.auth`
 before** calling the handler. **Built-in routes always win** over custom routes
 that would match the same method + path.
 
+### DB access from a route (`ev.writer()` / `ev.reader()`)
+
+Unlike `RecordEvent` (whose `ev.data` is already bound to the in-transaction
+writer), a `RouteEvent` has no ambient connection. Use the RAII accessors to
+check a connection out of the pool and hand it back — both `RouteEvent` and
+`JobEvent` / `LifecycleEvent` expose them:
+
+```zig
+// writes — acquires the shared, mutex-guarded pool writer
+var w = ev.writer();
+defer w.deinit();                 // releases the writer back to the pool (no leak)
+const created = try w.data().create("posts", value);
+
+// reads — checks out a warm pooled read-only connection
+var r = try ev.reader();
+defer r.deinit();                 // returns the connection to the warm pool
+const rec = try r.data().findById("posts", id);
+```
+
+`ev.writer()` returns a `WriterData` and `ev.reader()` returns `!ReaderData`; each
+handle's `data()` yields a `zigbase.Data` bound to that connection (same facade as
+`RecordEvent.data`: `findById` / `create` / `update` / `delete` / `list`).
+**Always `defer <handle>.deinit()`** — the writer is a single shared connection, so
+hold it no longer than necessary.
+
 ## 6. Auth / file / lifecycle events
 
 One handler each, registered by the matching config key:
@@ -270,7 +300,10 @@ fn (ev: *zigbase.events.JobEvent) anyerror!zigbase.schedule.Reactive
 
 It returns either `.{ .after = <Interval> }` (re-run after that interval, e.g.
 `.{ .after = .{ .minutes = 5 } }` or `.{ .after = .daily }`) or `.stop` (retire
-the job). `JobEvent` carries `app` and `name`.
+the job). `JobEvent` carries `app` and `name`, and exposes the same `ev.writer()`
+/ `ev.reader()` DB accessors as `RouteEvent` (see
+[DB access from a route](#db-access-from-a-route-evwriter--evreader)) — use them to
+touch the database from a job rather than hand-building a `Data` from the pool.
 
 ### Caveats
 
@@ -306,7 +339,161 @@ CLI/tests/no jobs configured).
 > outlives it indefinitely. Cron/interval jobs, by contrast, use the bounded,
 > cleanly-joined worker pool.
 
-## 8. Errors + Sentry
+## 8. Define your schema in code (`.collections` + `.migrations`)
+
+Instead of provisioning collections over the REST API (see
+[recipes.md](recipes.md#recipe-provisioning-your-schema)), you can declare them at
+**comptime** and have ZigBase provision them at startup:
+
+```zig
+zigbase.App(.{
+    .collections = .{
+        .users = .{ .type = .auth, .fields = .{
+            .{ .name = "display_name", .type = .text },
+        } },
+        .posts = .{ .fields = .{
+            .{ .name = "title",  .type = .text, .required = true },
+            .{ .name = "author", .type = .relation, .target = "users" }, // by NAME
+            .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
+        }, .rules = .{ .list = "status = \"published\"" } },
+    },
+}).runCli(init);
+```
+
+### The `.collections` shape
+
+`.collections` is a struct literal whose **field name is the collection name**.
+Each value is a struct with:
+
+- `.type` — `.base` (default) / `.auth` / `.view` (a `schema.CollectionType`).
+- `.fields` — a **tuple** of field literals (see below).
+- `.rules` — optional `.{ .list, .view, .create, .update, .delete }` (any subset;
+  each is a filter-expression string).
+
+Each field literal needs `.name` and `.type`, plus optional `.required`,
+`.unique`, `.hidden`, and type-specific options:
+
+```zig
+.{ .name = "title",  .type = .text, .required = true, .min = 1, .max = 200 }
+.{ .name = "price",  .type = .number, .mode = .fixed, .scale = 2 }   // .float (default) / .int / .fixed
+.{ .name = "owner",  .type = .relation, .target = "users", .maxSelect = 1, .cascadeDelete = false }
+.{ .name = "status", .type = .select, .values = .{ "draft", "published" }, .maxSelect = 1 }
+.{ .name = "avatar", .type = .file, .maxSelect = 1, .mimeTypes = .{ "image/png" } }
+.{ .name = "meta",   .type = .json }
+```
+
+The full field-type catalog (text / email / url / editor / date / autodate /
+bool / number / json / select / relation / file) and their options is in
+[fields.md](fields.md). A relation field's `.target` is the **target collection
+name** — provisioning resolves it to the target's id (no need to capture ids as
+you would over the REST API). Mistakes are caught at compile time: an unknown
+field type, a `select` without `.values`, a `fixed` number without a valid
+`.scale = 1..8`, or a relation without `.target` is a **compile error**.
+
+### Startup provisioning + additive auto-migration
+
+On every startup, ZigBase diffs each declared collection against the live database
+and applies the **minimal safe change set** (running it twice is a clean no-op):
+
+- A collection that doesn't exist yet is **created**.
+- A field present in the spec but missing from the live collection is **added**,
+  rebuilding the table while **preserving existing data** (the new column is null
+  for old rows).
+- A **non-additive** change — a field rename, drop, or type/storage-class change —
+  is **detected, logged, and SKIPPED** (never applied, so no data loss). Relation
+  targets must reference a known collection (a comptime collection or a pre-existing
+  live one such as `_superusers`); an unknown target is a startup error.
+
+For the changes auto-migration won't do, use the `.migrations` escape hatch.
+
+### Explicit migrations (`.migrations`)
+
+`.migrations` is a slice of migration records, each run **once** (recorded in
+`_migrations` under a `prov:` prefix) **before** provisioning:
+
+```zig
+.migrations = &.{
+    .{ .id = "0001_rename_title", .up = renameTitle },
+},
+// .up signature: fn (alloc: std.mem.Allocator, io: std.Io, w: *Db) anyerror!void
+//   (Db is the writer connection; it exposes exec/prepare/begin/commit/rollback.)
+fn renameTitle(alloc: std.mem.Allocator, io: std.Io, w: anytype) anyerror!void {
+    _ = alloc; _ = io;
+    try w.exec("ALTER TABLE \"posts\" RENAME COLUMN \"headline\" TO \"title\";");
+}
+```
+
+Each migration has an `.id` (used for the once-only record) and an `.up` function
+`fn (alloc, io, w: *Db) anyerror!void` run inside a transaction (rolled back on
+error). Use migrations for renames, drops, type changes, and data backfills.
+
+## 9. Pluggable storage & mailer backends (`.storage` / `.mailer`)
+
+`.storage` and `.mailer` each select a comptime **plugin type**. The defaults
+reproduce the built-in wiring:
+
+- `.storage` defaults to **`zigbase`'s `DefaultStoragePlugin`** — local-disk
+  storage rooted at `<data_dir>/storage`.
+- `.mailer` defaults to **`DefaultMailerPlugin`** — a `LogMailer` (logs the email)
+  when no SMTP is configured, or an `SmtpMailer` (STARTTLS / implicit TLS /
+  plaintext) when `ZIGBASE_SMTP_HOST` is set. Switching is config-driven; no code
+  change is needed to upgrade from logging to real SMTP.
+
+A plugin is a type with this uniform contract (built from the runtime
+`zigbase.Config`):
+
+```zig
+pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !Self;
+pub fn interface(self: *Self) Storage; // or Mailer — the type-erased vtable view
+pub fn deinit(self: *Self) void;       // release owned resources
+```
+
+`create` builds the backend from config; `interface` returns the type-erased
+vtable handle stored on the app; `deinit` tears it down (the instance outlives the
+server). Supply your own to back storage or mail with a different system (e.g. an
+S3 storage backend — the slot exists, though only local-disk ships):
+
+```zig
+const MyS3Storage = struct {
+    backend: S3Backend,
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !@This() {
+        return .{ .backend = try S3Backend.init(gpa, cfg) };
+    }
+    pub fn interface(self: *@This()) Storage { return self.backend.storage(); }
+    pub fn deinit(self: *@This()) void { self.backend.deinit(); }
+};
+
+zigbase.App(.{ .storage = MyS3Storage }).runCli(init);
+```
+
+The `Storage` vtable is defined in `src/files/storage.zig` (the default plugin
+wraps `LocalStorage`); the `Mailer` vtable — a single
+`send(io, alloc, Email)` — is in `src/mail/mailer.zig`. A custom mailer implements
+`send` and returns a `Mailer` view from `interface()`. (The default plugin types,
+`DefaultStoragePlugin` / `DefaultMailerPlugin`, live in `src/framework.zig`.)
+
+## 10. Footprint levers (`.pools`)
+
+`.pools` tunes ZigBase's memory/connection footprint at comptime. All fields are
+optional; each defaults to the historical value:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `.readers` | `16` | warm reader-connection pool cap — shrink to reduce the connection footprint. |
+| `.jobs` | `2` | scheduler worker-pool size (same as `.jobs.pool_size`). |
+| `.stack_size` | `1 MiB` | per-thread stack for scheduler/job/`submit` threads (vs `std.Thread`'s 16 MiB default). **Clamped up** to a safe floor — the lever can only *raise* the stack, e.g. for unusually deep job handlers. |
+| `.cache_kib` | `1024` | SQLite per-connection page cache (KiB), across the writer + warm readers — shrink to save memory, raise for large working sets. |
+
+```zig
+zigbase.App(.{
+    .pools = .{ .readers = 4, .jobs = 2, .stack_size = 2 << 20, .cache_kib = 256 },
+}).runCli(init);
+```
+
+`.pools.jobs` is the unified job-pool lever; the legacy `.jobs = .{ .pool_size = N }`
+still works (and `.pools.jobs` takes precedence when both are set).
+
+## 11. Errors + Sentry
 
 ```zig
 .onError = handleError, // fn (ev: *zigbase.ErrorEvent) void
@@ -318,7 +505,7 @@ When the framework catches an error, your `onError` handler (if any) runs
 `ctx` (optional), `err`, `phase` (`request` / `before_hook` / `after_hook` /
 `cron` / `job` / `file_serve`), and `message`. The backstop never propagates.
 
-## 9. The worked example
+## 12. The worked example
 
 See [`examples/blog/`](../examples/blog/) for a complete, buildable app. Its
 `App(.{...})` block is the canonical reference (hooks + route + job):

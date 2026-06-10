@@ -4,7 +4,7 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - 2026-06-09
+## [0.1.0] - 2026-06-10
 
 First public release: a single-binary, PocketBase-inspired (not API-compatible)
 backend-as-a-service in Zig 0.16, plus an embeddable Zig framework.
@@ -18,10 +18,16 @@ backend-as-a-service in Zig 0.16, plus an embeddable Zig framework.
 - **Realtime** over WebSocket — rule-filtered create/update/delete events, per-subscription filters.
 - **File storage** — local-disk backend behind an S3-ready storage interface; protected files via short-lived tokens.
 - **Embedded admin UI** at `/_/` — a no-build Preact SPA (collections, records, schema editor, realtime live-view, OAuth2 config).
-- **Embeddable Zig framework** — extend ZigBase from your own Zig app via comptime configuration: record lifecycle hooks, custom HTTP routes (with `public`/`authed`/`superuser` gating), auth/file/lifecycle/error events, a cron/interval/reactive job scheduler with a worker pool, and `app.submit` for ad-hoc background work. Misconfiguration (unknown config keys, typo'd hook phases) is a compile error.
+- **Embeddable Zig framework** — extend ZigBase from your own Zig app via comptime configuration: record lifecycle hooks, custom HTTP routes (with `public`/`authed`/`superuser` gating), auth/file/lifecycle/error events, a cron/interval/reactive job scheduler with backoff-retry and a worker pool, and `app.submit` for ad-hoc background work. Events expose `writer()` / `reader()` RAII DB accessors. Misconfiguration (unknown config keys, typo'd hook phases) is a compile error.
+- **Comptime schema definition** — declare collections in Zig via `App(.{ .collections = .{ ... } })`, provisioned at startup with **additive auto-migration** (creates missing collections, adds new fields, resolves relations by name); non-additive changes go through an explicit `.migrations` escape hatch.
+- **Pluggable storage & mailer backends** — `App(.{ .storage = T, .mailer = T })` selects a comptime backend type; defaults are local-disk storage and a log/SMTP mailer.
+- **SMTP mailer with TLS** — verification and password-reset email is delivered over SMTP (plaintext / STARTTLS / implicit TLS) when configured; logs the tokens in dev when SMTP is unset.
+- **Auth rate limiting** — login, verification, and password-reset endpoints are rate limited (fixed window, configurable, disable-able), keyed on the proxy-supplied client IP with a per-identity fallback.
+- **Comptime footprint levers** — `App(.{ .pools = .{ ... } })` tunes the warm-reader pool, job-worker pool, per-thread stack size, and SQLite page cache.
+- **Performance** — a warm reader-connection pool and a blocking-mutex writer for higher write throughput under contention.
 - **Apache-2.0 license** and cross-platform release binaries (Linux + macOS).
 
 ### Known limitations
-See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — notably: no mailer (auth tokens are logged, not emailed), no auth rate-limiting, and a single-process scheduler.
+See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — notably: SMTP must be configured for email delivery in production (tokens are logged otherwise); rate limiting trusts proxy-supplied client IPs; auto-migration is additive-only; and the scheduler is single-process.
 
 [0.1.0]: https://github.com/valthon/zigbase/releases/tag/v0.1.0

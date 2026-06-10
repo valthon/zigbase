@@ -20,12 +20,18 @@ and rule semantics are in [api.md](api.md); the framework hook/route/job APIs ar
 
 ## Recipe: provisioning your schema
 
-There is no "import a schema file" endpoint — you **provision by calling
-`POST /api/collections`** for each collection, as a superuser. Because relation
-fields reference their target by **id** (not name — see
+There is no "import a schema file" endpoint — over the REST API you **provision by
+calling `POST /api/collections`** for each collection, as a superuser. Because
+relation fields reference their target by **id** (not name — see
 [fields.md → relation gotcha](fields.md#critical-targetcollectionid-is-an-id-not-a-name)),
 you must create collections **in dependency order** and **capture each `id`** from
 the response to feed the next collection's `targetCollectionId`.
+
+> **Embedding ZigBase?** You can skip the REST dance entirely and **declare your
+> schema in Zig at comptime** via `App(.{ .collections = .{ ... } })`, provisioned
+> at startup with additive auto-migration — relations reference their target **by
+> name** (no id-capturing). See
+> [framework.md → Define your schema in code](framework.md#8-define-your-schema-in-code-collections--migrations).
 
 The script below logs in as the superuser, then creates `users` (auth) →
 `simulators` → `listings` → `bookings`, wiring relations by captured id, and seeds a
@@ -197,8 +203,8 @@ curl -s -X POST "$BASE/api/collections/users/auth-with-password" \
 
 `identity` is matched against the collection's `identityFields` (default `["email"]`).
 See [api.md → auth-with-password](api.md#auth-with-password). Email **verification**
-is optional and, since there is no mailer, the token is written to the server log —
-see [api.md → Verification](api.md#verification--password-reset--mailer-limitation).
+is optional; the token is emailed when SMTP is configured, or logged in dev otherwise —
+see [api.md → Verification & password reset](api.md#verification--password-reset--email-delivery).
 
 ---
 
@@ -417,14 +423,16 @@ Key points:
 
 ## Recipe: DB access inside a cron / lifecycle job
 
-A `JobEvent` carries only `app` and `name` — **no `Data` facade and no connection**.
-To touch the database from a job, acquire a connection from the pool yourself and
-build a `Data` around it:
+A `JobEvent` carries `app` and `name` — but no ambient connection. Use the RAII
+DB accessors it exposes to check a connection out of the pool and hand it back:
 
-- For **writes**: `ev.app.pool.acquireWriter()` + `defer ev.app.pool.releaseWriter()`.
-- For **reads**: `var r = try ev.app.pool.openReader(); defer r.close();`.
+- For **writes**: `var w = ev.writer(); defer w.deinit();` then `w.data()`.
+- For **reads**: `var r = try ev.reader(); defer r.deinit();` then `r.data()`.
 
-Then `Data{ .app = ev.app, .conn = <conn>, .io = ev.app.io }`.
+`w.data()` / `r.data()` each yield a `zigbase.Data` bound to that connection
+(`findById` / `create` / `update` / `delete` / `list`). The same accessors exist on
+`RouteEvent` and `LifecycleEvent`. (See
+[framework.md → DB access from a route](framework.md#db-access-from-a-route-evwriter--evreader).)
 
 This nightly job cancels stale `pending` bookings (older than now) by listing them
 and updating each:
@@ -437,12 +445,13 @@ const zigbase = @import("zigbase");
 fn expireStaleBookings(ev: *zigbase.events.JobEvent) anyerror!void {
     const a = ev.app.allocator;
 
-    // Writer connection + Data facade (JobEvent gives us neither).
-    const w = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = w, .io = ev.app.io };
+    // Writer handle + Data facade — the accessor checks the writer out of the pool
+    // and deinit() hands it back (no leak).
+    var w = ev.writer();
+    defer w.deinit();
+    const data = w.data();
 
-    const now = "2026-06-09 00:00:00"; // compute the current timestamp in your format
+    const now = "2026-06-10 00:00:00"; // compute the current timestamp in your format
     const filter = try std.fmt.allocPrint(a,
         "status = \"pending\" && starts_at < \"{s}\"", .{now});
 
@@ -471,9 +480,9 @@ Register it on a schedule (cron/interval handlers have the
 
 Key points:
 
-- **Always release the writer** (`defer ...releaseWriter()`); **always close a
-  reader** (`defer r.close()`). The writer is a single shared, mutex-guarded
-  connection — holding it blocks all other writes.
+- **Always `defer <handle>.deinit()`** on the writer/reader handle — it releases
+  the writer (or returns the reader connection) to the pool. The writer is a single
+  shared, mutex-guarded connection — holding it blocks all other writes.
 - Job allocations can use `ev.app.allocator` (the long-lived gpa) since there is no
   request arena here; free anything large yourself if the job runs often.
 - Scheduling is **single-process, UTC, minute-granularity**; cron is numeric-only.

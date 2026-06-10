@@ -34,7 +34,8 @@ The default bind is `0.0.0.0:8090`. Your `zig` must be 0.16.0 — either activat
 - **Realtime** — subscribe to record changes over WebSocket. → [docs/api.md](docs/api.md)
 - **Files** — local file storage with serving and short-lived file-access tokens. → [docs/api.md](docs/api.md)
 - **Admin UI** — embedded single-page app served at `/_/`. → [docs/api.md](docs/api.md)
-- **Framework** — comptime record hooks, custom routes, and scheduled jobs. → [docs/framework.md](docs/framework.md)
+- **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema (with additive auto-migration), and pluggable storage/mailer backends. → [docs/framework.md](docs/framework.md)
+- **Email** — pluggable SMTP mailer (STARTTLS / implicit TLS / plaintext) delivering verification and password-reset email; logs the tokens in dev when SMTP is unset. → [docs/api.md](docs/api.md)
 
 ## Build an app on ZigBase (use it as a library)
 
@@ -70,7 +71,10 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 `runCli` gives your binary the same `serve` / `migrate` / `superuser create` / `help`
-commands as the stock server. See [docs/framework.md](docs/framework.md) and the worked
+commands as the stock server. Beyond hooks, `App(.{...})` also accepts a comptime
+**schema** (`.collections` + `.migrations`, provisioned at startup with additive
+auto-migration), **pluggable backends** (`.storage` / `.mailer`), and **footprint
+levers** (`.pools`). See [docs/framework.md](docs/framework.md) and the worked
 example in [examples/blog/](examples/blog/).
 
 ## CLI
@@ -103,9 +107,24 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_MAX_UPLOAD_SIZE` | — | `52428800` (50 MiB) | max request body size, bytes |
 | `ZIGBASE_FILE_TOKEN_TTL` | — | `120` (2 min) | file-access token lifetime, seconds |
 | `ZIGBASE_SENTRY_DSN` | — | `""` (log to stderr) | set to enable Sentry error reporting |
+| `ZIGBASE_RATE_LIMIT_MAX` | — | `10` | max sensitive-auth attempts per window per client; `0` disables rate limiting |
+| `ZIGBASE_RATE_LIMIT_WINDOW` | — | `60` | rate-limit window length, seconds |
+| `ZIGBASE_SMTP_HOST` | — | `""` (use LogMailer) | SMTP server host; set to deliver verify/reset email instead of logging |
+| `ZIGBASE_SMTP_PORT` | — | `25` | SMTP server port |
+| `ZIGBASE_SMTP_USERNAME` | — | `""` | SMTP username; non-empty enables `AUTH LOGIN` |
+| `ZIGBASE_SMTP_PASSWORD` | — | `""` | SMTP password |
+| `ZIGBASE_SMTP_FROM` | — | `noreply@zigbase.dev` | envelope + `From:` address |
+| `ZIGBASE_SMTP_TLS` | — | `auto` | transport security: `none` / `starttls` / `implicit` / `auto` (auto: 465→implicit, 587→starttls, else→none) |
+| `ZIGBASE_SMTP_INSECURE` | — | `false` | skip TLS cert verification (self-signed relays only) |
 
-> Note: verification and password-reset tokens are currently **logged**, not emailed —
-> there is no built-in mail delivery. See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
+> Email delivery: with `ZIGBASE_SMTP_HOST` set, verification and password-reset tokens
+> are **emailed** over the configured SMTP transport. Without it (the default), they are
+> **logged** to the server (a dev/CI convenience). Configure SMTP for production. TLS
+> verifies certificates by default; `ZIGBASE_SMTP_INSECURE` disables verification for
+> self-signed relays.
+>
+> Sensitive auth endpoints (login, verification, password-reset) are **rate limited** —
+> see [docs/api.md → Rate limiting](docs/api.md#rate-limiting).
 
 ## Security
 
