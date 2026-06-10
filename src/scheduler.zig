@@ -62,6 +62,7 @@ pub fn buildJobs(comptime specs: anytype) []const RuntimeJob {
 pub const JobState = struct {
     status: enum { idle, running, stopped },
     next_fire: i64, // unix seconds; meaningful when status == .idle
+    failures: u32 = 0, // consecutive handler failures; drives exponential backoff
 };
 
 /// Pure decision: append the indices of jobs that are `.idle` AND due (`next_fire <= now`)
@@ -85,6 +86,7 @@ pub fn tick(state: []JobState, now: i64, out: []usize) []usize {
 /// jobs (the handler's return). For cron/interval, next_fire is recomputed from `sched`;
 /// if there is no future fire (e.g. an impossible cron), the job is retired (`.stopped`).
 pub fn completeJob(s: *JobState, sched: schedule.Schedule, reactive_result: ?schedule.Reactive, now: i64) void {
+    s.failures = 0; // a successful completion resets the backoff counter
     if (reactive_result) |rr| {
         switch (rr) {
             .stop => {
@@ -102,6 +104,29 @@ pub fn completeJob(s: *JobState, sched: schedule.Schedule, reactive_result: ?sch
         s.status = .stopped;
         return;
     };
+    s.status = .idle;
+}
+
+/// Exponential backoff delay (seconds) for the Nth consecutive failure: 1, 2, 4, 8, ...
+/// capped at 1 hour. `failures` is >= 1.
+pub fn retryDelay(failures: u32) i64 {
+    const cap: i64 = 3600;
+    if (failures == 0) return 1;
+    var d: i64 = 1;
+    var i: u32 = 1;
+    while (i < failures) : (i += 1) {
+        d *= 2;
+        if (d >= cap) return cap;
+    }
+    return @min(d, cap);
+}
+
+/// Apply a job-handler FAILURE to its state: report-count++, retry after exponential
+/// backoff. The job is NOT retired (it keeps retrying with growing, capped delay); each
+/// failure is reported separately by the worker via dispatchError.
+pub fn completeJobError(s: *JobState, now: i64) void {
+    s.failures += 1;
+    s.next_fire = now + retryDelay(s.failures);
     s.status = .idle;
 }
 
@@ -219,15 +244,21 @@ pub const Scheduler = struct {
             };
             const job = self.jobs[idx];
             var ev = events.JobEvent{ .app = self.app, .name = job.name };
-            const result = job.run(&ev) catch |e| blk: {
+            if (job.run(&ev)) |result| {
+                // SUCCESS: resume the normal schedule (resets the backoff counter).
+                const now = unixNow(self.app.io);
+                self.lock();
+                completeJob(&self.state[idx], job.schedule, result, now);
+                self.unlock();
+            } else |e| {
+                // FAILURE: report this failure, then retry with exponential backoff.
                 var err_ev = events.ErrorEvent{ .app = self.app, .ctx = null, .err = e, .phase = .cron, .message = @errorName(e) };
                 events.dispatchError(self.app, self.app.dispatch, &err_ev);
-                break :blk null;
-            };
-            const now = unixNow(self.app.io);
-            self.lock();
-            completeJob(&self.state[idx], job.schedule, result, now);
-            self.unlock();
+                const now = unixNow(self.app.io);
+                self.lock();
+                completeJobError(&self.state[idx], now);
+                self.unlock();
+            }
         }
     }
 
@@ -320,6 +351,34 @@ test "completeJob: interval reschedules; reactive uses returned delay; stop reti
     var s4 = JobState{ .status = .running, .next_fire = 0 };
     completeJob(&s4, .{ .cron = "0 0 30 2 *" }, null, 1609470000); // Feb 30 never occurs
     try std.testing.expect(s4.status == .stopped);
+}
+
+test "retryDelay is exponential, capped at 1h" {
+    try std.testing.expectEqual(@as(i64, 1), retryDelay(1));
+    try std.testing.expectEqual(@as(i64, 2), retryDelay(2));
+    try std.testing.expectEqual(@as(i64, 4), retryDelay(3));
+    try std.testing.expectEqual(@as(i64, 8), retryDelay(4));
+    try std.testing.expectEqual(@as(i64, 3600), retryDelay(20)); // capped at 1h
+    try std.testing.expectEqual(@as(i64, 3600), retryDelay(100)); // no overflow
+}
+
+test "completeJobError backs off and increments failures; success resets" {
+    var s = JobState{ .status = .running, .next_fire = 0, .failures = 0 };
+    completeJobError(&s, 1000);
+    try std.testing.expect(s.status == .idle and s.failures == 1 and s.next_fire == 1000 + 1);
+    completeJobError(&s, 1000);
+    try std.testing.expect(s.failures == 2 and s.next_fire == 1000 + 2);
+    completeJobError(&s, 1000);
+    try std.testing.expect(s.failures == 3 and s.next_fire == 1000 + 4);
+    // a subsequent SUCCESS resets failures and schedules normally
+    completeJob(&s, .{ .interval = .hourly }, null, 2000);
+    try std.testing.expect(s.status == .idle and s.failures == 0 and s.next_fire == 2000 + 3600);
+}
+
+test "reactive job that errors retries with backoff (not retired)" {
+    var s = JobState{ .status = .running, .next_fire = 0, .failures = 0 };
+    completeJobError(&s, 5000); // an errored reactive job is NOT stopped; it backs off
+    try std.testing.expect(s.status == .idle and s.failures == 1 and s.next_fire == 5001);
 }
 
 test "Scheduler runs a due reactive job then stops cleanly" {
