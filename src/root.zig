@@ -13,6 +13,31 @@ pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
 pub const RouteEvent = events.RouteEvent;
 
+// ---- Plugin / schema / migration consumer types ---------------------------
+// Types an external consumer must be able to NAME to write a custom storage or
+// mailer plugin, an explicit migration, or to reference the built-in plugins.
+
+// Storage plugin: a custom storage plugin's `interface()` returns this vtable.
+pub const Storage = @import("files/storage.zig").Storage;
+pub const LocalStorage = @import("files/storage.zig").LocalStorage;
+
+// Mailer plugin: a custom mailer plugin's `interface()` returns `Mailer`, whose
+// `send` is handed an `Email`. `SmtpTls` lets a consumer pick a TLS mode in code.
+pub const Mailer = @import("mail/mailer.zig").Mailer;
+pub const Email = @import("mail/mailer.zig").Email;
+pub const LogMailer = @import("mail/mailer.zig").LogMailer;
+pub const SmtpMailer = @import("mail/mailer.zig").SmtpMailer;
+pub const SmtpTls = @import("config.zig").SmtpTls;
+
+// Built-in plugins (for composition / overriding only one side of the pair).
+pub const DefaultStoragePlugin = @import("framework.zig").DefaultStoragePlugin;
+pub const DefaultMailerPlugin = @import("framework.zig").DefaultMailerPlugin;
+
+// Migration: the `up` fn for an explicit migration receives a `*Db` writer; the
+// `.migrations` config is a list of `Migration` entries.
+pub const Db = @import("db.zig").Db;
+pub const Migration = @import("provision.zig").Migration;
+
 // ---- Test discovery --------------------------------------------------------
 // The unit-test runner is rooted at THIS module. Reference every internal file
 // so its `test {}` blocks are analyzed and run (matches pre-restructure behavior
