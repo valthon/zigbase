@@ -138,8 +138,8 @@ fn writeUploads(ctx: *http.RequestCtx, col: schema.Collection, record_id: []cons
 
 pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    var r = try app.pool.openReader();
-    defer r.close();
+    var r = try app.pool.acquireReader();
+    defer app.pool.releaseReader(&r);
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rctx = buildContext(ctx, &r, null);
@@ -163,8 +163,8 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // writer, so the expensive argon2 hash in prepAuthData does NOT run under the global writer
     // lock. The reader is closed before the writer is taken. M2 fix.
     const col, const all, const data2 = blk: {
-        var r = try app.pool.openReader();
-        defer r.close();
+        var r = try app.pool.acquireReader();
+        defer app.pool.releaseReader(&r);
         const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
         const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, raw, ctx.files, null) catch |e| switch (e) {
             error.TooLarge => return (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator),
@@ -315,8 +315,8 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
 
 pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    var r = try app.pool.openReader();
-    defer r.close();
+    var r = try app.pool.acquireReader();
+    defer app.pool.releaseReader(&r);
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rctx = buildContext(ctx, &r, null);
     var rule_expr: ?[]const u8 = null;

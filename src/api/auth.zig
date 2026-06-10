@@ -111,8 +111,8 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     // Login is read-only (identity lookup, password hash, tokenKey, unixepoch; issue() only
     // reads + signs). Use a READER so the expensive argon2 verify below does NOT run while
     // holding the single global writer lock — otherwise every login serializes all writes.
-    var r = try app.pool.openReader();
-    defer r.close();
+    var r = try app.pool.acquireReader();
+    defer app.pool.releaseReader(&r);
     const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const col = (try collections.get(ctx.allocator, &r, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);

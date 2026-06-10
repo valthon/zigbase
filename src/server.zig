@@ -108,8 +108,8 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
         if (try router.matchPath(ctx.allocator, rt.pattern, ctx.path)) |params| {
             ctx.params = params;
             // Resolve auth on a fresh read-only connection (never the writer lock).
-            var reader = app.pool.openReader() catch return try ApiError.internal().toResponse(ctx.allocator);
-            defer reader.close();
+            var reader = app.pool.acquireReader() catch return try ApiError.internal().toResponse(ctx.allocator);
+            defer app.pool.releaseReader(&reader);
             const authed = auth.authenticate(app.io, ctx.allocator, app, ctx, &reader) catch null;
             switch (rt.auth) {
                 .public => {},

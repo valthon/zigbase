@@ -165,8 +165,8 @@ pub fn authWithOAuth2Impl(ctx: *http.RequestCtx, transport: oauth_client.Transpo
     // Phase 1: load collection + provider config under a short-lived reader (no lock held during HTTP).
     var col: schema.Collection = undefined;
     {
-        var r = app.pool.openReader() catch return ApiError.internal().toResponse(ctx.allocator);
-        defer r.close();
+        var r = app.pool.acquireReader() catch return ApiError.internal().toResponse(ctx.allocator);
+        defer app.pool.releaseReader(&r);
         col = (collections.get(ctx.allocator, &r, col_name) catch return ApiError.internal().toResponse(ctx.allocator)) orelse
             return ApiError.notFound().toResponse(ctx.allocator);
     }

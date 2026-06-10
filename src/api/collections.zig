@@ -45,8 +45,8 @@ fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: 
 /// True if the request carries a valid superuser token. Uses a short-lived reader connection.
 fn isSuperuser(ctx: *http.RequestCtx) bool {
     const app = ctx.app orelse return false;
-    var r = app.pool.openReader() catch return false;
-    defer r.close();
+    var r = app.pool.acquireReader() catch return false;
+    defer app.pool.releaseReader(&r);
     const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, &r) catch null) orelse return false;
     return authed.is_superuser;
 }

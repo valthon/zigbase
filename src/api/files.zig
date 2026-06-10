@@ -55,8 +55,8 @@ fn fileIdentity(ctx: *http.RequestCtx, conn: *db.Db) ?auth.Verified {
 /// GET /api/files/:col/:rec/:name
 pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    var r = try app.pool.openReader();
-    defer r.close();
+    var r = try app.pool.acquireReader();
+    defer app.pool.releaseReader(&r);
     const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("rec") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const name = ctx.param("name") orelse return ApiError.notFound().toResponse(ctx.allocator);

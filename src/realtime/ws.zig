@@ -106,11 +106,11 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
     };
     switch (msg) {
         .auth => |m| {
-            var r = lc.app.pool.openReader() catch {
+            var r = lc.app.pool.acquireReader() catch {
                 WS.write(handle, try protocol.authFrame(fa, false), true) catch {};
                 return;
             };
-            defer r.close();
+            defer lc.app.pool.releaseReader(&r);
             // auth record must persist across frames -> durable allocator
             if (auth.verifyToken(da, lc.app, &r, m.token)) |v| {
                 lc.conn.setAuth(.{ .record = v.record, .is_superuser = v.is_superuser, .exp = v.exp });
@@ -125,9 +125,9 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
                 WS.write(handle, try protocol.errorFrame(fa, "subscription limit reached"), true) catch {};
                 return;
             }
-            var r = lc.app.pool.openReader() catch return;
+            var r = lc.app.pool.acquireReader() catch return;
             const ok = blk: {
-                defer r.close();
+                defer lc.app.pool.releaseReader(&r);
                 const t = protocol.parseTopic(m.topic);
                 const col = (collections.get(fa, &r, t.collection) catch break :blk false) orelse break :blk false;
                 _ = col;
@@ -181,8 +181,8 @@ fn onChannelMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, channe
     const record_id = idv.string;
 
     const t = protocol.parseTopic(channel);
-    var r = lc.app.pool.openReader() catch return;
-    defer r.close();
+    var r = lc.app.pool.acquireReader() catch return;
+    defer lc.app.pool.releaseReader(&r);
     const col = (collections.get(a, &r, t.collection) catch return) orelse return;
     const now = auth.nowUnixPub(&r) catch return;
     const filter_ptr = lc.conn.subFilter(channel);
