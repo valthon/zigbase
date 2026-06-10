@@ -24,9 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-      - name: Install Playwright + Chromium
+      - name: Install Playwright + Chromium + aiosmtpd
         run: |
-          mise exec python@3.13 -- python -m pip install --quiet pytest playwright
+          mise exec python@3.13 -- python -m pip install --quiet pytest playwright aiosmtpd
           mise exec python@3.13 -- python -m playwright install --with-deps chromium
       - name: Headless browser tests
         run: mise exec python@3.13 -- python -m pytest tests/admin -q
+      - name: Live SMTP-over-TLS (STARTTLS) delivery test
+        run: mise exec python@3.13 -- python -m pytest tests/smtp -q

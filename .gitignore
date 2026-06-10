@@ -8,6 +8,8 @@ zig-pkg/
 .superpowers/
 
 tests/admin/__pycache__/
+tests/smtp/__pycache__/
+__pycache__/
 .pytest_cache/
 
 examples/*/zig-out/
