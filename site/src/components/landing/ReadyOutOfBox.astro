@@ -1,0 +1,120 @@
+---
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
+const modules = [
+  {
+    title: 'Database schema + REST API',
+    body: 'Typed collections with filter / sort / expand and per-collection access rules.',
+    href: base + 'docs/api',
+  },
+  {
+    title: 'User management + OAuth2',
+    body: 'argon2id passwords, JWT, verification & reset flows, OAuth2 + PKCE login.',
+    href: base + 'docs/api',
+  },
+  {
+    title: 'Realtime subscriptions',
+    body: 'Subscribe to create / update / delete events on records over WebSocket.',
+    href: base + 'docs/api',
+  },
+  {
+    title: 'Local / S3 file storage',
+    body: 'Upload, serve, and gate files behind short-lived file-access tokens.',
+    href: base + 'docs/api',
+  },
+  {
+    title: 'Admin dashboard',
+    body: 'An embedded single-page admin UI served at /_/ — no extra deploy.',
+    href: base + 'docs/api',
+  },
+  {
+    title: 'Extensible in Zig',
+    body: 'Comptime record hooks, custom routes, scheduled jobs, and plugins.',
+    href: base + 'docs/framework',
+  },
+];
+---
+
+<section class="ready">
+  <div class="container">
+    <header class="ready__head">
+      <h2>Ready out of the box</h2>
+      <p>Everything a typical app backend needs, bundled into the binary.</p>
+    </header>
+
+    <div class="ready__grid">
+      {
+        modules.map((m) => (
+          <a class="ready__module" href={m.href}>
+            <h3 class="ready__title">{m.title}</h3>
+            <p class="ready__body">{m.body}</p>
+            <span class="ready__link" aria-hidden="true">
+              Learn more →
+            </span>
+          </a>
+        ))
+      }
+    </div>
+  </div>
+</section>
+
+<style>
+  .ready {
+    padding-block: var(--space-8);
+    background-color: var(--color-surface);
+    border-block: 1px solid var(--color-border);
+  }
+
+  .ready__head {
+    text-align: center;
+    margin-bottom: var(--space-6);
+  }
+
+  .ready__head p {
+    color: var(--color-muted);
+    margin-top: var(--space-3);
+  }
+
+  .ready__grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+    gap: var(--space-4);
+  }
+
+  .ready__module {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-5);
+    background-color: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    color: var(--color-text);
+    text-decoration: none;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+  }
+
+  .ready__module:hover {
+    border-color: var(--color-accent);
+    transform: translateY(-2px);
+    text-decoration: none;
+  }
+
+  .ready__title {
+    font-size: var(--text-lg);
+    margin: 0;
+  }
+
+  .ready__body {
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+    line-height: var(--leading-normal);
+  }
+
+  .ready__link {
+    margin-top: auto;
+    color: var(--color-accent);
+    font-size: var(--text-sm);
+    font-weight: 600;
+  }
+</style>

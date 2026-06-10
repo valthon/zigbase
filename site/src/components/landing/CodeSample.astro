@@ -1,0 +1,117 @@
+---
+import { Code } from 'astro:components';
+import CodeTabs from '../CodeTabs.astro';
+import CopyButton from '../CopyButton.astro';
+
+const zigCode = `const std = @import("std");
+const zigbase = @import("zigbase");
+
+// Derive a URL slug from the post title before it is created.
+fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
+    if (ev.record.* != .object) return;
+    if (ev.record.object.get("slug") != null) return;
+    const title = if (ev.record.object.get("title")) |t| switch (t) {
+        .string => |s| s,
+        else => return,
+    } else return;
+
+    // Mutations MUST allocate with ev.arena (owns ev.record).
+    const buf = try ev.arena.alloc(u8, title.len);
+    var len: usize = 0;
+    var in_run = false;
+    for (title) |ch| {
+        if (std.ascii.isAlphanumeric(ch)) {
+            buf[len] = std.ascii.toLower(ch);
+            len += 1;
+            in_run = true;
+        } else if (in_run) {
+            buf[len] = '-';
+            len += 1;
+            in_run = false;
+        }
+    }
+    if (len > 0 and buf[len - 1] == '-') len -= 1;
+    try ev.record.object.put(ev.arena, "slug", .{ .string = buf[0..len] });
+}
+
+pub fn main(init: std.process.Init) !void {
+    return zigbase.App(.{
+        .hooks = .{ .posts = .{ .beforeCreate = slugify } },
+    }).runCli(init);
+}`;
+
+const restCode = `# Create a record
+curl -X POST http://127.0.0.1:8090/api/collections/posts/records \\
+  -H 'Content-Type: application/json' \\
+  -d '{"title": "Hello, World!"}'
+
+# List records (JavaScript)
+const res = await fetch(
+  'http://127.0.0.1:8090/api/collections/posts/records',
+);
+const { items } = await res.json();
+console.log(items);`;
+---
+
+<section class="codesample container">
+  <header class="codesample__head">
+    <h2>One backend, two ways in</h2>
+    <p>
+      Extend the server in typed Zig, or talk to it over a plain REST API —
+      the same collections, the same access rules.
+    </p>
+  </header>
+
+  <CodeTabs
+    tabs={[
+      { id: 'zig', label: 'Extend it in Zig' },
+      { id: 'rest', label: 'Use the REST API' },
+    ]}
+  >
+    <Fragment slot="zig">
+      <div class="codesample__panel">
+        <Code code={zigCode} lang="zig" />
+        <CopyButton class="codesample__copy" />
+      </div>
+    </Fragment>
+
+    <Fragment slot="rest">
+      <div class="codesample__panel">
+        <Code code={restCode} lang="bash" />
+        <CopyButton class="codesample__copy" />
+      </div>
+    </Fragment>
+  </CodeTabs>
+</section>
+
+<style>
+  .codesample {
+    padding-block: var(--space-7);
+  }
+
+  .codesample__head {
+    text-align: center;
+    max-width: 50ch;
+    margin: 0 auto var(--space-6);
+  }
+
+  .codesample__head p {
+    color: var(--color-muted);
+    margin-top: var(--space-3);
+  }
+
+  .codesample__panel {
+    position: relative;
+  }
+
+  .codesample__panel :global(pre) {
+    border: none;
+    border-radius: var(--radius-md);
+  }
+
+  .codesample__copy {
+    position: absolute;
+    top: var(--space-3);
+    right: var(--space-3);
+  }
+</style>
