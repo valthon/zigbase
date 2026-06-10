@@ -183,7 +183,9 @@ fn onRequest(r: zap.Request) !void {
     // X-Forwarded-For (the original client), else X-Real-IP. "" when neither is present.
     ctx.remote_ip = clientIp(r);
     if (std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) {
-        if (files_multipart.extract(r, arena.allocator())) |ex| {
+        // Hand-rolled parser over the raw body: facil.io's param parsing type-guesses
+        // multipart values (text "123" -> int), so it must never see this body.
+        if (files_multipart.parse(arena.allocator(), ctx.content_type, ctx.body)) |ex| {
             ctx.form_fields = ex.form_fields;
             ctx.files = ex.files;
         } else |_| {}
