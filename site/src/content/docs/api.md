@@ -352,8 +352,9 @@ forces a download for any type.
 When static serving is configured (see [Framework](./framework#13-serve-a-frontend-static-files) for
 the comptime modes and the `--serve-static <dir>` flag), GET and HEAD requests that match
 none of the admin UI (`/_/`), the built-in API, or the app's custom routes are served from
-the static root. Requests under `/api/` are never served statically — an unmatched `/api/*`
-path keeps the JSON 404 envelope, while a static miss returns a plain-text 404 (`text/plain`).
+the static root. The `/api` namespace (the bare `/api` path and everything under `/api/`) is
+never served statically — an unmatched API path keeps the JSON 404 envelope, while a static
+miss returns a plain-text 404 (`text/plain`).
 
 Static files are served **without authentication** — collection access rules do not apply to
 the static root, so never place secrets there. For access-controlled file delivery, use
