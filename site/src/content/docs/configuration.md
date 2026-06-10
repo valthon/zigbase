@@ -23,7 +23,7 @@ So a flag overrides the matching environment variable, which overrides the defau
 ## CLI commands
 
 ```text
-zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
+zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
 zigbase migrate [--data-dir PATH]
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase help
@@ -31,7 +31,12 @@ zigbase help
 
 Running `zigbase` with no recognised command prints usage.
 
-- **`serve`** — start the HTTP server.
+- **`serve`** — start the HTTP server. The `--serve-static DIR` flag enables static file
+  serving from `DIR` at the root path (anything not matching `/api/`, `/_/`, or custom
+  routes). Only available when the app uses the default static-files mode (field absent in
+  `App(.{...})`); rejected as an unknown flag when the mode is comptime-hardcoded
+  (`.disabled`, `.dir`, or `.embedded`). See
+  [Framework → Static files](./framework#13-serve-a-frontend-static-files).
 - **`migrate`** — run schema migrations against the data directory and exit.
 - **`superuser create`** — create a superuser (required before managing collections).
 - **`help`** — print usage.
@@ -43,6 +48,7 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_HTTP_HOST` | `--http-host` | `0.0.0.0` | bind address |
 | `ZIGBASE_HTTP_PORT` | `--http-port` | `8090` | listen port |
 | `ZIGBASE_DATA_DIR` | `--data-dir` | `./zb_data` | data directory (holds `data.db` and `storage/`) |
+| — | `--serve-static` | `""` (off) | serve static files from DIR at the root path (default mode only) |
 | `ZIGBASE_JWT_SECRET` | — | `dev-insecure-secret-change-me` | token signing secret (set in production) |
 | `ZIGBASE_COOKIE_SECURE` | — | `false` | mark auth cookies `Secure` (enable behind HTTPS) |
 | `ZIGBASE_AUTH_TOKEN_TTL` | — | `1209600` (14 days) | auth token lifetime, seconds |

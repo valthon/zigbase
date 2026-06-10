@@ -1,6 +1,6 @@
 ---
 title: Golf simulator booking
-summary: Airbnb for golf simulators — the realistic app exercising hooks, a business route, and a DB-touching cron.
+summary: Airbnb for golf simulators — hooks, a business route, a DB-touching cron, and an Astro/React frontend via the comptime-hardcoded static dir.
 rung: A realistic app
 order: 2
 repoPath: examples/golfsim
@@ -110,15 +110,32 @@ pooled writer, wrap it in a `Data`, and release on exit.
 | custom route | `fn(*zigbase.RouteEvent) anyerror!zigbase.http.Response` |
 | cron job | `fn(*zigbase.events.JobEvent) anyerror!void` |
 
+## Frontend (Astro + React islands)
+
+`frontend/` is an Astro site whose React islands drive the whole booking flow: sign in,
+browse published listings, hold a slot (the `beforeCreate` hook validates the listing,
+computes `price_total`, stamps the guest, and forces `status=pending`), then confirm it
+through the custom `POST /api/bookings/:id/confirm` route.
+
+```sh
+cd frontend && npm install && npm run build && cd ..
+zig build
+ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
+  ./zig-out/bin/golfsim serve --data-dir ./data
+# open http://127.0.0.1:8090/  — no --serve-static needed
+```
+
+This demonstrates the **comptime-hardcoded** static mode: `.static_files = .{ .dir =
+"frontend/dist" }` bakes the directory into the binary's config, and `--serve-static` is
+rejected as an unknown flag. The collections (users / simulators / listings / bookings) are
+provisioned at startup from the comptime `.collections` schema.
+
 ## Provisioning the collections
 
-The hook, route and cron reference the collections **by name** (`users` /
-`simulators` / `listings` / `bookings`); until those collections exist they are
-harmless no-ops, which is fine for a compiling example. Provision them at runtime by
-calling `POST /api/collections` as a superuser, **in dependency order**, capturing
-each new collection's `id` to wire the relation fields. The canonical,
-copy-pasteable provisioning script lives in the **Recipes** doc → "provisioning your
-schema".
+The collections are provisioned automatically at startup via the comptime `.collections`
+schema in `src/main.zig` — no manual API calls needed. The canonical REST-API provisioning
+script in [Recipes → Provisioning your schema](./recipes#recipe-provisioning-your-schema)
+remains as an alternative for running the stock binary or fine-grained control.
 
 A quick smoke once the server is up:
 
@@ -133,16 +150,17 @@ This example needs **Zig 0.16**, which you can get via [mise](https://mise.jdx.d
 (`mise exec zig@0.16.0 -- zig ...`). From `examples/golfsim/`:
 
 ```sh
-cd examples/golfsim && zig build       # produces ./zig-out/bin/golfsim
+cd frontend && npm install && npm run build && cd ..
+zig build       # produces ./zig-out/bin/golfsim
 ./zig-out/bin/golfsim superuser create --email you@example.com --password "<pw>" --data-dir ./data
 ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
   ./zig-out/bin/golfsim serve --data-dir ./data
+# open http://127.0.0.1:8090/  — frontend served automatically, no --serve-static flag
 ```
 
-Then provision the collections (recipe above), register a guest, create a
-`published` listing, and `POST /api/collections/bookings/records` — the hook fills in
-`guest`, `status` and `price_total`; `POST /api/bookings/:id/confirm` flips it to
-`confirmed`; and the `expire-holds` cron sweeps stale pending holds.
+Register a guest, create a `published` listing, and `POST /api/collections/bookings/records`
+— the hook fills in `guest`, `status` and `price_total`; `POST /api/bookings/:id/confirm`
+flips it to `confirmed`; and the `expire-holds` cron sweeps stale pending holds.
 
 ---
 

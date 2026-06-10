@@ -347,6 +347,26 @@ plus pdf). Everything else is served as a download: `Content-Disposition: attach
 `X-Content-Type-Options: nosniff` (this neutralizes HTML/SVG/JS XSS). Appending `?download`
 forces a download for any type.
 
+## Static files
+
+When static serving is configured (see [Framework](./framework#13-serve-a-frontend-static-files) for
+the comptime modes and the `--serve-static <dir>` flag), GET and HEAD requests that match
+none of the admin UI (`/_/`), the built-in API, or the app's custom routes are served from
+the static root. Requests under `/api/` are never served statically — an unmatched `/api/*`
+path keeps the JSON 404 envelope, while a static miss returns a plain-text 404 (`text/plain`).
+
+- `/` and directory paths resolve to that directory's `index.html`.
+- **Caching:** in **embedded** mode, each asset has a precomputed CRC32 content `ETag`; a
+  request with a matching `If-None-Match` gets `304 Not Modified` from zigbase itself. In
+  **dir** mode (comptime-hardcoded `.dir` or `--serve-static`), caching is delegated to
+  facil.io's `sendFile`, which emits its own `ETag`, `Last-Modified`,
+  `Cache-Control: max-age=3600`, and handles `If-None-Match`/304.
+- Every response includes `X-Content-Type-Options: nosniff`; content types are derived from
+  the file extension (html, css, js, mjs, json, map, svg, png, jpg/jpeg, gif, webp, avif,
+  ico, woff/woff2, ttf, wasm, txt, xml, pdf, mp4, webm; unknown → `application/octet-stream`).
+- Paths containing `..`, backslashes, or NUL bytes are rejected (404). There are no
+  directory listings and no `Range`/partial-content support.
+
 ## Realtime (WebSocket)
 
 Connect to `ws://<host>/api/realtime` (the upgrade is gated to that exact path and the

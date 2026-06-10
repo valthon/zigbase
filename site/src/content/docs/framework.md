@@ -91,6 +91,7 @@ pub fn main(init: std.process.Init) !void {
 | `jobs` | Scheduler settings (e.g. `.pool_size`). |
 | `collections` | Comptime schema: collections provisioned at startup (additive auto-migration). |
 | `migrations` | Explicit migrations (the escape hatch for non-additive schema changes). |
+| `static_files` | Comptime static-file mode: absent (default flag), `.disabled`, `.{ .dir = "..." }`, `.{ .embedded = ... }`. |
 | `storage` | Storage plugin TYPE (defaults to local-disk storage). |
 | `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
@@ -520,10 +521,11 @@ never propagates.
 ## 12. The worked example
 
 Three buildable examples form a ladder: the [blog example](../examples/blog) is the basic
-packaging proof, the [golfsim example](../examples/golfsim) is a realistic app (hooks,
-routes, cron), and the [plugins example](../examples/plugins) is the advanced
-framework-feature reference (custom mailer plugin + `.collections` schema + typed
-`.migrations` + `.pools` levers — all against the published `zigbase` module).
+packaging proof (hooks + route + cron + Astro/React frontend served via `--serve-static`),
+the [golfsim example](../examples/golfsim) is a realistic app (hooks, routes, cron, and a
+comptime-hardcoded `.dir` static mode), and the [plugins example](../examples/plugins) is
+the advanced framework-feature reference (custom mailer plugin + `.collections` schema +
+typed `.migrations` + `.pools` levers + fully embedded static assets via `embedStaticDir`).
 
 The blog `App(.{...})` block is the canonical basics reference (hooks + route + job):
 
@@ -542,6 +544,46 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
+## 13. Serve a frontend: static files
+
+Anything that misses `/_/`, the built-in API, and your custom routes falls through to the
+static-file server (GET/HEAD only; `/api/*` misses keep the JSON 404 envelope; static
+misses return a plain-text 404). `/` and directory paths resolve to `index.html`. In
+**embedded** mode, each asset carries a precomputed CRC32 content `ETag` and zigbase
+handles `If-None-Match`/304 itself. In **dir** mode (`--serve-static` or comptime `.dir`),
+caching is delegated to facil.io's `sendFile`, which emits its own `ETag`, `Last-Modified`,
+`Cache-Control: max-age=3600`, and handles `If-None-Match`/304. All modes add
+`X-Content-Type-Options: nosniff`.
+
+Pick a mode at comptime with `.static_files`:
+
+| Mode | Config | `--serve-static` flag |
+|---|---|---|
+| runtime flag (default) | *(field absent)* | enabled |
+| disabled | `.static_files = .disabled` | rejected |
+| hardcoded dir | `.static_files = .{ .dir = "frontend/dist" }` | rejected |
+| embedded | `.static_files = .{ .embedded = &@import("static_assets").files }` | rejected |
+
+In **embedded** mode, assets are compiled into the binary. Generate the manifest from your
+`build.zig` using the helper exported by zigbase's `build.zig`:
+
+```zig
+// build.zig
+const zigbase_build = @import("zigbase");
+const assets = zigbase_build.embedStaticDir(b, "frontend/dist");
+exe_mod.addImport("static_assets", assets);
+
+// main.zig
+.static_files = .{ .embedded = &@import("static_assets").files }
+```
+
+The build fails with a clear error when `frontend/dist` is missing — build the frontend
+first (e.g. `npm run build`). A hardcoded or `--serve-static` directory that is missing or
+unreadable at startup is a **fatal startup error** naming the path.
+
+See the [blog example](../examples/blog) (runtime flag), [golfsim example](../examples/golfsim)
+(hardcoded dir), and [plugins example](../examples/plugins) (embedded).
+
 ## Exported names reference
 
 The public surface (from `src/root.zig`):
@@ -558,6 +600,8 @@ The public surface (from `src/root.zig`):
   for convenience.
 - `zigbase.Migration` — the `.migrations` slice element type; `zigbase.Db` — the writer
   connection passed to a migration's `.up`.
+- `zigbase.StaticFile` — the embedded manifest entry type (path, bytes, etag); used by
+  `.static_files = .{ .embedded = ... }`.
 - `zigbase.Storage` / `zigbase.Mailer` / `zigbase.Email` — the storage & mailer plugin
   vtable types; `zigbase.DefaultStoragePlugin` / `zigbase.DefaultMailerPlugin` — the
   built-in defaults; `zigbase.LocalStorage`, `zigbase.LogMailer`, `zigbase.SmtpMailer`,
