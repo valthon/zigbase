@@ -14,9 +14,11 @@
 //!   4. A trivial public smoke route `GET /api/golfsim/health`.
 //!
 //! The collections (users / simulators / listings / bookings) are provisioned at
-//! RUNTIME via the REST API (see README.md and docs/recipes.md). The hook, route
-//! and cron reference those collections by name; until the collections exist they
-//! are harmless no-ops, which is fine for a compiling example.
+//! COMPTIME via `.collections` in the App config — the schema is set up
+//! automatically at startup (additive auto-migration). The Astro + React frontend
+//! in `frontend/` is served at the root path via the comptime-hardcoded
+//! `.static_files = .{ .dir = "frontend/dist" }` — no `--serve-static` flag needed
+//! (and that flag is rejected as unknown in this mode).
 
 const std = @import("std");
 const zigbase = @import("zigbase");
@@ -233,6 +235,59 @@ pub fn main(init: std.process.Init) !void {
                 .name = "expire-holds",
                 .schedule = zigbase.schedule.Schedule{ .interval = .{ .minutes = 15 } },
                 .handler = expireHolds,
+            },
+        },
+        // Comptime-hardcoded static dir: the Astro frontend in frontend/dist is
+        // served at the root path, no flag needed (and --serve-static is rejected).
+        .static_files = .{ .dir = "frontend/dist" },
+        // The schema the hooks/route/cron reference, provisioned at startup.
+        // Mirrors the runtime-provisioning recipe in docs/recipes.md.
+        .collections = .{
+            .users = .{
+                .type = .auth,
+                .fields = .{
+                    .{ .name = "name", .type = .text, .max = 100 },
+                },
+                .rules = .{ .list = "", .view = "", .create = "", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
+            },
+            .simulators = .{
+                .fields = .{
+                    .{ .name = "label", .type = .text, .required = true, .max = 120 },
+                    .{ .name = "owner", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+                },
+                .rules = .{ .list = "", .view = "", .create = "@request.auth.id != \"\"", .update = "@request.auth.id = owner", .delete = "@request.auth.id = owner" },
+            },
+            .listings = .{
+                .fields = .{
+                    .{ .name = "title", .type = .text, .required = true, .max = 140 },
+                    .{ .name = "price_per_hour", .type = .number, .required = true },
+                    .{ .name = "status", .type = .select, .required = true, .values = .{ "draft", "published", "archived" } },
+                    .{ .name = "simulator", .type = .relation, .target = "simulators", .required = true, .cascadeDelete = true },
+                },
+                .rules = .{
+                    .list = "status = \"published\"",
+                    .view = "status = \"published\" || @request.auth.id = simulator.owner",
+                    .create = "@request.auth.id != \"\"",
+                    .update = "@request.auth.id = simulator.owner",
+                    .delete = "@request.auth.id = simulator.owner",
+                },
+            },
+            .bookings = .{
+                .fields = .{
+                    .{ .name = "listing", .type = .relation, .target = "listings", .required = true, .cascadeDelete = true },
+                    .{ .name = "guest", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+                    .{ .name = "starts_at", .type = .date, .required = true },
+                    .{ .name = "ends_at", .type = .date, .required = true },
+                    .{ .name = "price_total", .type = .number },
+                    .{ .name = "status", .type = .select, .values = .{ "pending", "confirmed", "cancelled" } },
+                },
+                .rules = .{
+                    .list = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner",
+                    .view = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner",
+                    .create = "@request.auth.id != \"\"",
+                    .update = "@request.auth.id = listing.simulator.owner",
+                    .delete = "@request.auth.id = guest",
+                },
             },
         },
     }).runCli(init);
