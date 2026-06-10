@@ -134,7 +134,7 @@ provisioned at startup from the comptime `.collections` schema.
 
 The collections are provisioned automatically at startup via the comptime `.collections`
 schema in `src/main.zig` — no manual API calls needed. The canonical REST-API provisioning
-script in [Recipes → Provisioning your schema](./recipes#recipe-provisioning-your-schema)
+script in [Recipes → Provisioning your schema](../docs/recipes#recipe-provisioning-your-schema)
 remains as an alternative for running the stock binary or fine-grained control.
 
 A quick smoke once the server is up:
