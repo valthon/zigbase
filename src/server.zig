@@ -153,6 +153,66 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
     return null;
 }
 
+/// Parse a multipart/form-data body into ctx.form_fields/ctx.files.
+/// Returns a 400 response for a malformed multipart body — handled here, at the
+/// layer that owns body parsing, so every multipart endpoint (current and future)
+/// gets the same clear error instead of falling through to the JSON parser's
+/// misleading "Invalid JSON body.". OutOfMemory propagates; it must never
+/// masquerade as a client error.
+fn applyMultipart(ctx: *http.RequestCtx) error{OutOfMemory}!?http.Response {
+    if (!std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) return null;
+    // Hand-rolled parser over the raw body: facil.io's param parsing type-guesses
+    // multipart values (text "123" -> int), so it must never see this body.
+    const ex = files_multipart.parse(ctx.allocator, ctx.content_type, ctx.body) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadMultipart => return try ApiError.badRequest("Invalid multipart body.").toResponse(ctx.allocator),
+    };
+    ctx.form_fields = ex.form_fields;
+    ctx.files = ex.files;
+    return null;
+}
+
+test "applyMultipart: malformed multipart body -> 400 'Invalid multipart body.', not the JSON-body error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = http.RequestCtx{
+        .method = .POST,
+        .path = "/",
+        .allocator = arena.allocator(),
+        .content_type = "multipart/form-data; boundary=XB",
+        .body = "--XB\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv", // never terminated
+    };
+    const resp = (try applyMultipart(&ctx)).?;
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "Invalid multipart body.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "Invalid JSON body.") == null);
+    try std.testing.expect(ctx.form_fields == null);
+}
+
+test "applyMultipart: valid multipart populates ctx and returns null; non-multipart is a no-op" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = http.RequestCtx{
+        .method = .POST,
+        .path = "/",
+        .allocator = arena.allocator(),
+        .content_type = "multipart/form-data; boundary=XB",
+        .body = "--XB\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--XB--\r\n",
+    };
+    try std.testing.expect((try applyMultipart(&ctx)) == null);
+    try std.testing.expectEqualStrings("v", ctx.form_fields.?.object.get("a").?.string);
+
+    var jctx = http.RequestCtx{
+        .method = .POST,
+        .path = "/",
+        .allocator = arena.allocator(),
+        .content_type = "application/json",
+        .body = "{}",
+    };
+    try std.testing.expect((try applyMultipart(&jctx)) == null);
+    try std.testing.expect(jctx.form_fields == null);
+}
+
 /// Last-resort raw error envelope, used only when even building the normal ApiError
 /// response fails (allocation failure). Sends a fixed JSON body bypassing the arena.
 fn sendRawEnvelope(r: zap.Request, status: u16, body: []const u8) void {
@@ -182,15 +242,9 @@ fn onRequest(r: zap.Request) !void {
     // accessor on Request, so we trust the reverse-proxy hop headers: the FIRST hop in
     // X-Forwarded-For (the original client), else X-Real-IP. "" when neither is present.
     ctx.remote_ip = clientIp(r);
-    if (std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) {
-        // Hand-rolled parser over the raw body: facil.io's param parsing type-guesses
-        // multipart values (text "123" -> int), so it must never see this body.
-        if (files_multipart.parse(arena.allocator(), ctx.content_type, ctx.body)) |ex| {
-            ctx.form_fields = ex.form_fields;
-            ctx.files = ex.files;
-        } else |_| {}
-    }
+    const multipart_err = try applyMultipart(&ctx);
     const resp = blk: {
+        if (multipart_err) |er| break :blk er;
         if (std.mem.startsWith(u8, ctx.path, "/_/") or std.mem.eql(u8, ctx.path, "/_"))
             break :blk admin.serve(&ctx);
         // Built-in API routes win over custom routes.
