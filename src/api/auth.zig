@@ -189,6 +189,19 @@ fn findByEmail(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, e
     return null;
 }
 
+/// Deliver a verification/reset token to `email` via the configured mailer. The
+/// default mailer (LogMailer) logs the message, preserving the pre-mailer dev/CI
+/// behavior; with SMTP configured it sends a real email. Falls back to logging
+/// when no mailer is wired (tests/CLI). A real SMTP send failure propagates so it
+/// is not silently dropped.
+fn deliverToken(app: *@import("../app.zig").App, alloc: std.mem.Allocator, email: []const u8, subject: []const u8, body: []const u8) !void {
+    if (app.mailer) |m| {
+        try m.send(app.io, alloc, .{ .to = email, .subject = subject, .text_body = body });
+    } else {
+        std.log.info("[mail:fallback] to={s} subject={s} body={s}", .{ email, subject, body });
+    }
+}
+
 fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid: []const u8, token_key: []const u8, tt: jwt.TokenType, ttl: i64) ![]const u8 {
     const app = ctx.app.?;
     const now = try nowUnix(conn);
@@ -226,7 +239,8 @@ pub fn requestVerification(ctx: *http.RequestCtx) anyerror!http.Response {
         if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
             if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
                 const token = try mintToken(ctx, w, col.name, rid, tk, .verification, app.verification_ttl_s);
-                std.log.info("verification token for {s}/{s}: {s}", .{ col.name, email, token });
+                const mail_body = try std.fmt.allocPrint(ctx.allocator, "Verify your email ({s}). Your verification token:\n\n{s}\n", .{ col.name, token });
+                try deliverToken(app, ctx.allocator, email, "Verify your email", mail_body);
             }
         }
     }
@@ -260,7 +274,8 @@ pub fn requestPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
         if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
             if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
                 const token = try mintToken(ctx, w, col.name, rid, tk, .password_reset, app.password_reset_ttl_s);
-                std.log.info("password-reset token for {s}/{s}: {s}", .{ col.name, email, token });
+                const mail_body = try std.fmt.allocPrint(ctx.allocator, "Reset your password ({s}). Your password-reset token:\n\n{s}\n", .{ col.name, token });
+                try deliverToken(app, ctx.allocator, email, "Reset your password", mail_body);
             }
         }
     }

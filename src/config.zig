@@ -14,6 +14,15 @@ pub const Config = struct {
     file_token_ttl_s: i64 = 120, // short-lived file-access token
     sentry_dsn: []const u8 = "", // "" = log errors to stderr; set to enable Sentry reporting
 
+    // SMTP / mailer. When smtp_host is empty (default), the default mailer plugin
+    // resolves to LogMailer (logs verify/reset emails — pre-mailer dev/CI behavior).
+    // Set smtp_host to upgrade to a real SMTP client with NO code change.
+    smtp_host: []const u8 = "", // "" = use LogMailer; non-empty = SmtpMailer
+    smtp_port: u16 = 25,
+    smtp_username: []const u8 = "", // non-empty enables AUTH LOGIN
+    smtp_password: []const u8 = "",
+    smtp_from: []const u8 = "noreply@zigbase.dev", // envelope + From: header address
+
     /// Pure loader: applies overrides from a getter (env in prod, a stub in tests).
     pub fn load(getter: *const fn ([]const u8) ?[]const u8) !Config {
         var cfg = Config{};
@@ -29,6 +38,11 @@ pub const Config = struct {
         if (getter("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
         if (getter("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
+        if (getter("ZIGBASE_SMTP_HOST")) |v| cfg.smtp_host = v;
+        if (getter("ZIGBASE_SMTP_PORT")) |v| cfg.smtp_port = try std.fmt.parseInt(u16, v, 10);
+        if (getter("ZIGBASE_SMTP_USERNAME")) |v| cfg.smtp_username = v;
+        if (getter("ZIGBASE_SMTP_PASSWORD")) |v| cfg.smtp_password = v;
+        if (getter("ZIGBASE_SMTP_FROM")) |v| cfg.smtp_from = v;
         return cfg;
     }
 };

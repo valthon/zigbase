@@ -207,6 +207,10 @@ test "commit persists writes" {
 /// serves a query in ~1.3us, so caching connections avoids the per-request open.
 /// Sized to comfortably cover the zap worker threads (4) plus the scheduler/job
 /// threads with headroom; concurrency beyond this falls back to a fresh open.
+/// This is the COMPILE-TIME upper bound on warm readers (the backing array size).
+/// The actual warm-pool cap is a runtime `reader_cap` field (<= this), set from the
+/// comptime `.pools.readers` lever via `Pool.init`, defaulting to this value so the
+/// historical behavior (16 warm readers) is preserved.
 const reader_pool_size = 16;
 
 pub const Pool = struct {
@@ -222,8 +226,21 @@ pub const Pool = struct {
     reader_mutex: std.atomic.Mutex = .unlocked,
     readers: [reader_pool_size]Db = undefined,
     reader_count: usize = 0,
+    // Runtime cap on warm pooled readers (<= reader_pool_size). Comptime lever
+    // `.pools.readers` sets this; defaults to reader_pool_size (16) for legacy behavior.
+    reader_cap: usize = reader_pool_size,
 
+    /// Open a pool with the default warm-reader cap (16). Thin wrapper over
+    /// `initCapped` kept for the many call sites (tests/CLI) that don't tune pools.
     pub fn init(allocator: std.mem.Allocator, path: [:0]const u8) (DbError || std.mem.Allocator.Error)!Pool {
+        return initCapped(allocator, path, reader_pool_size);
+    }
+
+    /// Open a pool, capping the warm reader pool at `reader_cap` (clamped to the
+    /// compile-time backing-array size). Excess concurrent readers still fall back
+    /// to a fresh open and are closed on release, so a small cap shrinks the warm
+    /// footprint without changing read-only/thread-safe/WAL semantics.
+    pub fn initCapped(allocator: std.mem.Allocator, path: [:0]const u8, reader_cap: usize) (DbError || std.mem.Allocator.Error)!Pool {
         const owned = try allocator.dupeZ(u8, path);
         errdefer allocator.free(owned);
         var writer = try Db.open(owned);
@@ -240,7 +257,12 @@ pub const Pool = struct {
         try writer.exec("PRAGMA synchronous=NORMAL;");
         try writer.exec("PRAGMA foreign_keys=ON;");
         try writer.exec("PRAGMA busy_timeout=5000;");
-        return .{ .allocator = allocator, .path = owned, .writer = writer };
+        return .{
+            .allocator = allocator,
+            .path = owned,
+            .writer = writer,
+            .reader_cap = @min(reader_cap, reader_pool_size),
+        };
     }
 
     pub fn deinit(self: *Pool) void {
@@ -310,7 +332,7 @@ pub const Pool = struct {
     /// reset between uses. Pass the same `*Db` you received from acquireReader().
     pub fn releaseReader(self: *Pool, reader: *Db) void {
         while (!self.reader_mutex.tryLock()) std.atomic.spinLoopHint();
-        if (self.reader_count < reader_pool_size) {
+        if (self.reader_count < self.reader_cap) {
             self.readers[self.reader_count] = reader.*;
             self.reader_count += 1;
             self.reader_mutex.unlock();

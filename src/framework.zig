@@ -10,6 +10,79 @@ const db = @import("db.zig");
 const crypto = @import("crypto.zig");
 const id_gen = @import("id.zig");
 const scheduler = @import("scheduler.zig");
+const mail = @import("mail/mailer.zig");
+
+// ============================================================================
+// Comptime plugins (storage + mailer)
+// ----------------------------------------------------------------------------
+// A *plugin* is a comptime TYPE selected via `App(.{ .storage = T, .mailer = T })`
+// and instantiated in serveImpl. Both contracts are uniform:
+//
+//   pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !Self;
+//   pub fn interface(self: *Self) <Storage|Mailer>;  // returns the vtable view
+//   pub fn deinit(self: *Self) void;                 // release any owned resources
+//
+// `create` builds the backend from runtime config; `interface` returns the
+// type-erased vtable handle stored on `App`; `deinit` tears it down. The instance
+// is a serveImpl stack var that outlives the server (the vtable points at it).
+//
+// Defaults below reproduce the historical wiring: LocalStorage rooted at
+// <data_dir>/storage, and a mailer that logs (LogMailer) unless SMTP is
+// configured, in which case it speaks SMTP (SmtpMailer). A consumer overrides
+// either by supplying their own comptime type implementing the same contract.
+// ============================================================================
+
+/// Default storage plugin: wraps `LocalStorage` rooted at `<data_dir>/storage`,
+/// reproducing the pre-plugin file wiring. Owns the heap-allocated root string.
+pub const DefaultStoragePlugin = struct {
+    gpa: std.mem.Allocator,
+    root: []const u8,
+    backend: files_storage.LocalStorage,
+
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !DefaultStoragePlugin {
+        _ = io;
+        const root = try std.fmt.allocPrint(gpa, "{s}/storage", .{cfg.data_dir});
+        return .{ .gpa = gpa, .root = root, .backend = files_storage.LocalStorage.init(root) };
+    }
+
+    pub fn interface(self: *DefaultStoragePlugin) files_storage.Storage {
+        return self.backend.storage();
+    }
+
+    pub fn deinit(self: *DefaultStoragePlugin) void {
+        self.gpa.free(self.root);
+    }
+};
+
+/// Default mailer plugin: `LogMailer` when `cfg.smtp_host` is empty (logs the
+/// email — pre-mailer dev/CI behavior), else an `SmtpMailer` built from the SMTP
+/// config. Switching is purely config-driven; no code change is needed to upgrade.
+pub const DefaultMailerPlugin = struct {
+    log_backend: mail.LogMailer = .{},
+    smtp_backend: ?mail.SmtpMailer = null,
+
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !DefaultMailerPlugin {
+        _ = gpa;
+        _ = io;
+        if (cfg.smtp_host.len == 0) return .{};
+        return .{ .smtp_backend = mail.SmtpMailer.init(
+            cfg.smtp_host,
+            cfg.smtp_port,
+            cfg.smtp_username,
+            cfg.smtp_password,
+            cfg.smtp_from,
+        ) };
+    }
+
+    pub fn interface(self: *DefaultMailerPlugin) mail.Mailer {
+        if (self.smtp_backend) |*s| return s.mailer();
+        return self.log_backend.mailer();
+    }
+
+    pub fn deinit(self: *DefaultMailerPlugin) void {
+        _ = self;
+    }
+};
 
 /// Comptime application builder. `cfg` is an anonymous struct VALUE with optional
 /// `.hooks` (record hook groups) and optional `.onError` (an ErrorHandler).
@@ -20,7 +93,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -48,24 +121,54 @@ pub fn App(comptime cfg: anytype) type {
 
         /// The comptime-assembled cron/interval/reactive job table (empty when no `.cron`).
         pub const jobs: []const scheduler.RuntimeJob = if (@hasField(@TypeOf(cfg), "cron")) scheduler.buildJobs(cfg.cron) else &.{};
-        /// Worker pool size for the scheduler (defaults to 2 when `.jobs.pool_size` is unset).
-        pub const job_pool_size: usize = if (@hasField(@TypeOf(cfg), "jobs") and @hasField(@TypeOf(cfg.jobs), "pool_size")) cfg.jobs.pool_size else 2;
+        /// Worker pool size for the scheduler. Precedence: `.pools.jobs` (the new
+        /// unified lever), then the legacy `.jobs.pool_size`, then the default 2.
+        pub const job_pool_size: usize = blk: {
+            if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "jobs")) break :blk cfg.pools.jobs;
+            if (@hasField(@TypeOf(cfg), "jobs") and @hasField(@TypeOf(cfg.jobs), "pool_size")) break :blk cfg.jobs.pool_size;
+            break :blk 2;
+        };
+
+        /// Comptime warm-reader-pool cap (the `.pools.readers` lever). Defaults to 16,
+        /// the historical hardcoded value; shrink it to reduce the connection footprint.
+        pub const reader_pool_size: usize = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "readers")) cfg.pools.readers else 16;
+
+        /// Comptime-selected storage plugin type (defaults to `DefaultStoragePlugin`).
+        pub const StoragePlugin: type = if (@hasField(@TypeOf(cfg), "storage")) cfg.storage else DefaultStoragePlugin;
+        /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
+        pub const MailerPlugin: type = if (@hasField(@TypeOf(cfg), "mailer")) cfg.mailer else DefaultMailerPlugin;
+
+        /// Bundle of comptime-resolved knobs threaded into the serve path: the
+        /// selected storage/mailer plugin TYPES and the reader-pool cap.
+        const Opts = ServeOpts{
+            .StoragePlugin = StoragePlugin,
+            .MailerPlugin = MailerPlugin,
+            .reader_pool_size = reader_pool_size,
+        };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
         /// wiring this app's `dispatch` into the runtime context for `serve`.
         pub fn runCli(init: std.process.Init) !void {
-            return runCliImpl(init, &dispatch, jobs, job_pool_size);
+            return runCliImpl(init, &dispatch, jobs, job_pool_size, Opts);
         }
 
         /// Start the HTTP server directly with an explicit config (no CLI parsing).
         pub fn run(init: std.process.Init, cfg_runtime: config.Config) !void {
-            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size);
+            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, Opts);
         }
     };
 }
 
+/// Comptime knobs threaded from `App(cfg)` into the serve path: which storage /
+/// mailer plugin TYPES to instantiate and the warm-reader-pool cap.
+pub const ServeOpts = struct {
+    StoragePlugin: type,
+    MailerPlugin: type,
+    reader_pool_size: usize,
+};
+
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
-fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize) !void {
+fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, comptime opts: ServeOpts) !void {
     const allocator = init.gpa;
     const arena = init.arena.allocator();
 
@@ -90,7 +193,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         },
         .serve => |sa| {
             const cfg = try loadCfg(sa);
-            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size);
+            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, opts);
         },
         .migrate => |sa| try migrateImpl(allocator, init.io, sa),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, sa),
@@ -233,16 +336,16 @@ fn loadCfg(sa: cli.ServeArgs) !config.Config {
     return cfg;
 }
 
-fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) !db.Pool {
+fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, reader_cap: usize) !db.Pool {
     std.Io.Dir.cwd().createDirPath(io, cfg.data_dir) catch {};
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/data.db", .{cfg.data_dir}, 0);
     defer allocator.free(db_path);
-    return db.Pool.init(allocator, db_path);
+    return db.Pool.initCapped(allocator, db_path, reader_cap);
 }
 
 fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
     const cfg = try loadCfg(sa);
-    var pool = try openPool(allocator, io, cfg);
+    var pool = try openPool(allocator, io, cfg, 16);
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
@@ -250,7 +353,7 @@ fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !voi
     std.log.info("migrations applied", .{});
 }
 
-fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize) !void {
+fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, comptime opts: ServeOpts) !void {
     if (std.mem.eql(u8, cfg.jwt_secret, "dev-insecure-secret-change-me")) {
         if (cfg.cookie_secure) {
             std.log.err("refusing to start: ZIGBASE_JWT_SECRET is unset/default while cookie_secure is enabled; set a strong secret", .{});
@@ -258,17 +361,24 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
         }
         std.log.warn("ZIGBASE_JWT_SECRET is using the insecure default; set it before production.", .{});
     }
-    var pool = try openPool(allocator, io, cfg);
+    var pool = try openPool(allocator, io, cfg, opts.reader_pool_size);
     defer pool.deinit();
     {
         const w = pool.acquireWriter();
         defer pool.releaseWriter();
         try migrations.run(w);
     }
-    const storage_root = try std.fmt.allocPrint(allocator, "{s}/storage", .{cfg.data_dir});
-    defer allocator.free(storage_root);
-    var local_storage = files_storage.LocalStorage.init(storage_root);
-    const storage_iface = local_storage.storage();
+    // Instantiate the comptime-selected storage + mailer plugins. The instances are
+    // serveImpl stack vars that outlive the server (srv.listen() runs to shutdown),
+    // and the vtable handles below point at them.
+    var storage_inst = try opts.StoragePlugin.create(allocator, io, cfg);
+    defer storage_inst.deinit();
+    const storage_iface = storage_inst.interface();
+
+    var mailer_inst = try opts.MailerPlugin.create(allocator, io, cfg);
+    defer mailer_inst.deinit();
+    const mailer_iface = mailer_inst.interface();
+
     var app = app_mod.App{
         .allocator = allocator,
         .io = io,
@@ -283,6 +393,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
         .file_token_ttl_s = cfg.file_token_ttl_s,
         .sentry_dsn = cfg.sentry_dsn,
         .storage = &storage_iface,
+        .mailer = &mailer_iface,
         .dispatch = dispatch,
     };
     if (dispatch.on_bootstrap) |h| {
@@ -303,7 +414,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
     var srv = server.Server{ .app = &app, .host = host_z, .port = cfg.http_port };
     // Start the scheduler only when jobs are configured. Registered LAST among the teardown
     // defers, so (LIFO) its stop()+deinit() runs FIRST on return — joining worker threads
-    // before pool.deinit()/local_storage go out of scope, since workers touch app.pool/storage.
+    // before pool.deinit()/storage_inst go out of scope, since workers touch app.pool/storage.
     var sched: ?scheduler.Scheduler = if (jobs.len > 0) try scheduler.Scheduler.init(allocator, &app, jobs, pool_size) else null;
     if (sched) |*s| try s.start();
     defer if (sched) |*s| {
@@ -327,7 +438,7 @@ fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.Superus
         return;
     }
     const cfg = try loadCfg(.{ .data_dir = sa.data_dir });
-    var pool = try openPool(allocator, io, cfg);
+    var pool = try openPool(allocator, io, cfg, 16);
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
@@ -402,4 +513,42 @@ test "App(cfg) exposes the comptime job table and pool size" {
     const B = App(.{});
     try std.testing.expectEqual(@as(usize, 0), B.jobs.len);
     try std.testing.expectEqual(@as(usize, 2), B.job_pool_size); // default pool size
+}
+
+test "App(.{}) resolves the default storage + mailer plugins and reader pool" {
+    const A = App(.{});
+    try std.testing.expectEqual(DefaultStoragePlugin, A.StoragePlugin);
+    try std.testing.expectEqual(DefaultMailerPlugin, A.MailerPlugin);
+    try std.testing.expectEqual(@as(usize, 16), A.reader_pool_size);
+}
+
+test "App(cfg) carries comptime pool-size levers (readers + jobs)" {
+    const A = App(.{ .pools = .{ .readers = 4, .jobs = 2 } });
+    try std.testing.expectEqual(@as(usize, 4), A.reader_pool_size);
+    try std.testing.expectEqual(@as(usize, 2), A.job_pool_size);
+    // readers-only lever; jobs default preserved.
+    const B = App(.{ .pools = .{ .readers = 8 } });
+    try std.testing.expectEqual(@as(usize, 8), B.reader_pool_size);
+    try std.testing.expectEqual(@as(usize, 2), B.job_pool_size);
+}
+
+test "App(cfg) accepts a custom storage + mailer plugin type override" {
+    const MyStorage = struct {
+        backend: files_storage.LocalStorage = files_storage.LocalStorage.init("/tmp/x"),
+        pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !@This() {
+            _ = gpa;
+            _ = io;
+            _ = cfg;
+            return .{};
+        }
+        pub fn interface(self: *@This()) files_storage.Storage {
+            return self.backend.storage();
+        }
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+    const A = App(.{ .storage = MyStorage, .mailer = DefaultMailerPlugin });
+    try std.testing.expectEqual(MyStorage, A.StoragePlugin);
+    try std.testing.expectEqual(DefaultMailerPlugin, A.MailerPlugin);
 }
