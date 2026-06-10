@@ -7,7 +7,15 @@ import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 export default defineConfig({
   site: 'https://valthon.github.io',
   base: '/zigbase',
-  trailingSlash: 'ignore',
+  trailingSlash: 'never',
+  build: {
+    // Emit `docs/tutorial.html` (served at `/zigbase/docs/tutorial`, no trailing
+    // slash) rather than `docs/tutorial/index.html` (served at `.../tutorial/`).
+    // This is what makes the authored relative cross-links in the markdown content
+    // (e.g. `./api`, `../download`) resolve correctly on GitHub Pages — a sibling
+    // `./api` from `/zigbase/docs/tutorial` points at `/zigbase/docs/api`.
+    format: 'file',
+  },
   markdown: {
     // Astro auto-adds heading ids; append a small '#' anchor link to each
     // h2–h4 so the prose CSS can render hover anchors and the TOC can target them.

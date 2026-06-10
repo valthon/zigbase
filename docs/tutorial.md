@@ -1,5 +1,7 @@
 # Tutorial: build an app on ZigBase, end to end
 
+> 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/tutorial> — the site is the canonical reading experience.
+
 This walkthrough takes you from an empty database to a working backend for
 **"Airbnb for golf simulators"** — hosts list simulators, guests book slots. It ties
 together every moving part: provisioning collections, setting access rules,

@@ -1,5 +1,7 @@
 # ZigBase REST + WebSocket API
 
+> 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/api> — the site is the canonical reading experience.
+
 ZigBase is a single-binary backend. This document is the user-facing reference for
 its HTTP REST API and its realtime WebSocket interface. It describes only what the
 server actually implements.

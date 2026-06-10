@@ -1,5 +1,7 @@
 # Field types & options reference
 
+> 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/fields> — the site is the canonical reading experience.
+
 This is the complete catalog of ZigBase field types and their `options` shapes. It
 is the companion reference to the [API docs](api.md) (which describe the request/
 response envelopes) and the [recipes](recipes.md) (which show provisioning in

@@ -1,5 +1,7 @@
 # Recipes: building a real app on ZigBase
 
+> 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/recipes> — the site is the canonical reading experience.
+
 Task-oriented, copy-pasteable recipes for going from an empty database to a working
 backend. The running example is **"Airbnb for golf simulators"**: hosts list golf
 simulators, guests book time slots.
