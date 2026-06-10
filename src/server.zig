@@ -200,9 +200,12 @@ fn onRequest(r: zap.Request) !void {
         };
         if (builtin) |hit| break :blk hit;
         if (dispatchCustom(&ctx) catch null) |hit| break :blk hit;
+        // The whole /api namespace stays JSON — including the bare "/api" path
+        // (mirrors the exact-"/_" handling in the admin guard above).
         if (std.meta.activeTag(self.app.static_source) != .none and
             (ctx.method == .GET or ctx.method == .HEAD) and
-            !std.mem.startsWith(u8, ctx.path, "/api/"))
+            !std.mem.startsWith(u8, ctx.path, "/api/") and
+            !std.mem.eql(u8, ctx.path, "/api"))
         {
             if (static_files.serve(self.app.io, &ctx, self.app.static_source) catch null) |hit| break :blk hit;
             // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.

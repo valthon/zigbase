@@ -82,6 +82,11 @@ def test_serve_static_runtime_mode():
             assert st == 404
             assert "application/json" in _hdr(hdr, "content-type")
 
+            # bare /api (no trailing slash) also stays in the API namespace
+            st, hdr, _ = _get(f"{base}/api")
+            assert st == 404
+            assert "application/json" in _hdr(hdr, "content-type")
+
             # traversal blocked
             st, _, _ = _get(f"{base}/..%2f..%2fetc%2fpasswd")
             assert st in (400, 404)
