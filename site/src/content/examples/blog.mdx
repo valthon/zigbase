@@ -6,6 +6,11 @@ order: 1
 repoPath: examples/blog
 ---
 
+import { Image } from 'astro:assets';
+import Browser from '../../components/Browser.astro';
+import blogHome from '../../assets/screenshots/example-blog-home.png';
+import blogWrite from '../../assets/screenshots/example-blog-write.png';
+
 # Blog
 
 A minimal application built on **ZigBase as a library**. It imports the
@@ -13,6 +18,18 @@ A minimal application built on **ZigBase as a library**. It imports the
 `posts` collection that derives a URL `slug` from the post `title` when one
 isn't supplied. Everything else — HTTP API, SQLite storage, auth, CLI — comes
 straight from the framework.
+
+<Browser url="http://127.0.0.1:8090/">
+  <Image
+    src={blogHome}
+    width={blogHome.width}
+    height={blogHome.height}
+    alt="The blog example's dark-themed home page: a 'Latest posts' list of post cards with titles, dates, and excerpts, served by the blog binary itself"
+    loading="lazy"
+    decoding="async"
+    sizes="(max-width: 960px) 100vw, 820px"
+  />
+</Browser>
 
 ## What it proves
 
@@ -88,6 +105,18 @@ Your executable module must `.link_libc = true` (SQLite needs libc).
 "write a post" island that exercises the `slugify` hook. The example's comptime
 `.collections` schema (users + posts) provisions itself on startup, so the whole thing works
 from a fresh data directory.
+
+<Browser url="http://127.0.0.1:8090/write">
+  <Image
+    src={blogWrite}
+    width={blogWrite.width}
+    height={blogWrite.height}
+    alt="The blog example's authenticated 'Write a post' editor: a logged-in 'New post' form with title and body fields and a Publish button — leaving the slug out lets the server's beforeCreate hook derive it from the title"
+    loading="lazy"
+    decoding="async"
+    sizes="(max-width: 960px) 100vw, 820px"
+  />
+</Browser>
 
 ```sh
 cd frontend && npm install && npm run build && cd ..

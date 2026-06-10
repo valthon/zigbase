@@ -1,11 +1,32 @@
 ---
 import { getCollection } from 'astro:content';
+import { Image } from 'astro:assets';
+import type { ImageMetadata } from 'astro';
 import Base from '../../layouts/Base.astro';
 import Nav from '../../components/Nav.astro';
 import Footer from '../../components/Footer.astro';
+import blogHome from '../../assets/screenshots/example-blog-home.png';
+import golfsimListings from '../../assets/screenshots/example-golfsim-listings.png';
+import pluginsBrowser from '../../assets/screenshots/example-plugins-browser.png';
 
 // BASE_URL is '/zigbase' (no trailing slash) — normalise to trailing slash.
 const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
+// Home-page screenshot for each example's card thumbnail, keyed by entry id.
+const shots: Record<string, { src: ImageMetadata; alt: string }> = {
+  blog: {
+    src: blogHome,
+    alt: "The blog example's home page: a dark-themed 'Latest posts' list of post cards",
+  },
+  golfsim: {
+    src: golfsimListings,
+    alt: "The golfsim example's listings page: simulator listings with time pickers and a 'Hold this slot' booking button",
+  },
+  plugins: {
+    src: pluginsBrowser,
+    alt: "The plugins example's embedded frontend: Authors and Published posts panels served from assets compiled into the binary",
+  },
+};
 
 const examples = (await getCollection('examples')).sort(
   (a, b) => a.data.order - b.data.order,
@@ -37,17 +58,32 @@ const examples = (await getCollection('examples')).sort(
         examples.map((ex, i) => (
           <li class="ex__card">
             <a class="ex__card-link" href={`${base}examples/${ex.id}`}>
-              <span class="ex__rung">
-                <span class="ex__step">{i + 1}</span>
-                {ex.data.rung}
-              </span>
-              <h2 class="ex__card-title">{ex.data.title}</h2>
-              <p class="ex__card-summary">{ex.data.summary}</p>
-              <span class="ex__cta">
-                Read the walkthrough
-                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                  <path d="M5 12h14M13 6l6 6-6 6" />
-                </svg>
+              {shots[ex.id] && (
+                <span class="ex__thumb">
+                  <Image
+                    src={shots[ex.id].src}
+                    width={shots[ex.id].src.width}
+                    height={shots[ex.id].src.height}
+                    alt={shots[ex.id].alt}
+                    loading="lazy"
+                    decoding="async"
+                    sizes="(max-width: 960px) 100vw, 400px"
+                  />
+                </span>
+              )}
+              <span class="ex__card-body">
+                <span class="ex__rung">
+                  <span class="ex__step">{i + 1}</span>
+                  {ex.data.rung}
+                </span>
+                <h2 class="ex__card-title">{ex.data.title}</h2>
+                <p class="ex__card-summary">{ex.data.summary}</p>
+                <span class="ex__cta">
+                  Read the walkthrough
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                    <path d="M5 12h14M13 6l6 6-6 6" />
+                  </svg>
+                </span>
               </span>
             </a>
             <a
@@ -113,6 +149,7 @@ const examples = (await getCollection('examples')).sort(
     background-color: var(--color-surface);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-lg);
+    overflow: hidden;
     transition: transform 0.15s ease, border-color 0.15s ease,
       box-shadow 0.15s ease;
   }
@@ -125,14 +162,35 @@ const examples = (await getCollection('examples')).sort(
   .ex__card-link {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-5);
     color: inherit;
     text-decoration: none;
     flex: 1;
   }
   .ex__card-link:hover {
     text-decoration: none;
+  }
+
+  .ex__thumb {
+    display: block;
+    aspect-ratio: 16 / 10;
+    overflow: hidden;
+    border-bottom: 1px solid var(--color-border);
+    background-color: var(--color-bg);
+  }
+  .ex__thumb img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: top;
+  }
+
+  .ex__card-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-5);
+    flex: 1;
   }
 
   .ex__rung {

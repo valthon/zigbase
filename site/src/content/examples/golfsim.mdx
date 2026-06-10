@@ -6,12 +6,29 @@ order: 2
 repoPath: examples/golfsim
 ---
 
+import { Image } from 'astro:assets';
+import Browser from '../../components/Browser.astro';
+import golfsimListings from '../../assets/screenshots/example-golfsim-listings.png';
+import golfsimBookings from '../../assets/screenshots/example-golfsim-bookings.png';
+
 # Golf simulator booking
 
 "**Airbnb for golf simulators**": hosts list golf simulators, guests book time
 slots. This is the **realistic** counterpart to the blog example — where the blog
 example is a bare packaging proof (one slug hook), `golfsim` exercises the **hard
 parts** of building a real backend on ZigBase *as a library*.
+
+<Browser url="http://127.0.0.1:8090/">
+  <Image
+    src={golfsimListings}
+    width={golfsimListings.width}
+    height={golfsimListings.height}
+    alt="The golfsim example's signed-in listings page: published simulator listings ('Sunset Tee Times', 'Early Bird Range Hour') with bay, launch monitor, and hourly price, each with start/end time pickers and a 'Hold this slot' booking button"
+    loading="lazy"
+    decoding="async"
+    sizes="(max-width: 960px) 100vw, 820px"
+  />
+</Browser>
 
 ## What it proves
 
@@ -79,6 +96,22 @@ fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
 
 The route is registered with `.auth = .authed`, so the framework enforces
 authentication before the handler runs.
+
+The frontend's "My bookings" page drives exactly this flow: a held slot starts out
+`pending` (stamped by the hook, with the computed `price_total`), and the
+"Confirm (custom route)" button POSTs to `/api/bookings/:id/confirm`:
+
+<Browser url="http://127.0.0.1:8090/bookings">
+  <Image
+    src={golfsimBookings}
+    width={golfsimBookings.width}
+    height={golfsimBookings.height}
+    alt="The golfsim example's 'My bookings' page: a 'Sunset Tee Times' booking card showing the booked time range, the hook-computed $90.00 price total, a 'pending' status, and a 'Confirm (custom route)' button that hits POST /api/bookings/:id/confirm"
+    loading="lazy"
+    decoding="async"
+    sizes="(max-width: 960px) 100vw, 820px"
+  />
+</Browser>
 
 ## The DB-touching cron job
 
