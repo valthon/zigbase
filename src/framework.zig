@@ -242,7 +242,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     const args = try arena.alloc([]const u8, argv.len);
     for (argv, 0..) |a, i| args[i] = a;
 
-    const cmd = cli.parse(args[1..]) catch |err| {
+    const cmd = cli.parse(args[1..], .{ .serve_static = std.meta.activeTag(opts.static_mode) == .default }) catch |err| {
         std.log.err("argument error: {s}", .{@errorName(err)});
         printUsage();
         return;
@@ -251,7 +251,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     switch (cmd) {
         .help => |topic| switch (topic) {
             .top => printUsage(),
-            .serve => printServeUsage(),
+            .serve => printServeUsage(std.meta.activeTag(opts.static_mode) == .default),
             .migrate => printMigrateUsage(),
             .superuser_create => printSuperuserUsage(),
         },
@@ -288,6 +288,8 @@ fn printUsage() void {
         \\  --http-host H       Address to bind (serve only).      [env ZIGBASE_HTTP_HOST, default 0.0.0.0]
         \\  --http-port N       TCP port to listen on (serve only). [env ZIGBASE_HTTP_PORT, default 8090]
         \\  --data-dir PATH     Directory for the SQLite db + file storage. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\  --serve-static DIR  Serve static files from DIR at the root path (serve only;
+        \\                      available unless the app hardcodes static files at comptime).
         \\
         \\ENVIRONMENT VARIABLES:
         \\  ZIGBASE_JWT_SECRET        Token-signing secret. REQUIRED in production; the server
@@ -327,18 +329,25 @@ fn printUsage() void {
     , .{});
 }
 
-fn printServeUsage() void {
+fn printServeUsage(show_serve_static: bool) void {
     std.debug.print(
         \\zigbase serve — start the HTTP server (REST API + WebSocket + admin UI at /_/).
         \\
         \\USAGE:
-        \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
+        \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]{s}
         \\
         \\FLAGS:
         \\  --http-host H    Address to bind.    [env ZIGBASE_HTTP_HOST, default 0.0.0.0]
         \\  --http-port N    TCP port to listen. [env ZIGBASE_HTTP_PORT, default 8090]
         \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
         \\
+    , .{if (show_serve_static) " [--serve-static DIR]" else ""});
+    if (show_serve_static) std.debug.print(
+        \\  --serve-static DIR  Serve static files from DIR at the root path (anything
+        \\                      not matching /api/, /_/, or custom routes). [default: off]
+        \\
+    , .{});
+    std.debug.print(
         \\KEY ENVIRONMENT VARIABLES:
         \\  ZIGBASE_JWT_SECRET      Token-signing secret. REQUIRED in production; the server refuses
         \\                         to start with the insecure default while ZIGBASE_COOKIE_SECURE is on.
@@ -397,6 +406,7 @@ fn loadCfg(sa: cli.ServeArgs) !config.Config {
     if (sa.http_host) |v| cfg.http_host = v;
     if (sa.http_port) |v| cfg.http_port = v;
     if (sa.data_dir) |v| cfg.data_dir = v;
+    if (sa.serve_static) |v| cfg.static_dir = v;
     return cfg;
 }
 
