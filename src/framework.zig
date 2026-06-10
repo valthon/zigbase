@@ -340,7 +340,7 @@ fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, reader
     std.Io.Dir.cwd().createDirPath(io, cfg.data_dir) catch {};
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/data.db", .{cfg.data_dir}, 0);
     defer allocator.free(db_path);
-    return db.Pool.initCapped(allocator, db_path, reader_cap);
+    return db.Pool.initCapped(allocator, io, db_path, reader_cap);
 }
 
 fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {

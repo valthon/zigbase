@@ -292,7 +292,7 @@ const TestEnv = struct {
         defer std.testing.allocator.free(dir);
         const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/t.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
-        env.pool = try db.Pool.init(std.testing.allocator, path);
+        env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         {
             const w = env.pool.acquireWriter();
             defer env.pool.releaseWriter();

@@ -518,7 +518,7 @@ const TestEnv = struct {
         env.db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
         errdefer ga.free(env.db_path);
 
-        env.pool = try db.Pool.init(ga, env.db_path);
+        env.pool = try db.Pool.init(ga, std.testing.io, env.db_path);
         errdefer env.pool.deinit();
 
         env.arena = std.heap.ArenaAllocator.init(ga);
