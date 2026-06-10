@@ -213,6 +213,25 @@ test "commit persists writes" {
 /// historical behavior (16 warm readers) is preserved.
 const reader_pool_size = 16;
 
+/// Per-connection SQLite page-cache size, in KiB, applied via `PRAGMA cache_size=-N`
+/// to the writer AND every reader (warm or fallback). SQLite's built-in default is
+/// 2000 KiB (~2 MiB) PER connection, so with the writer + up to `reader_cap` (16) warm
+/// readers the page cache alone can reach ~34 MiB. 1024 KiB halves that to ~17 MiB max
+/// while keeping a healthy cache for the small-row record workloads ZigBase serves
+/// (rows are looked up by indexed id; hot pages stay resident). Tunable per-deploy via
+/// the `.pools.cache_kib` comptime lever -> `Pool.initOpts.cache_kib`. A larger value
+/// trades RAM for fewer page faults on big working sets; a smaller one shrinks a
+/// memory-constrained deploy. The negative form pins the cache to a byte budget
+/// (page-size independent), unlike a positive page count.
+pub const default_cache_kib: u32 = 1024;
+
+pub const PoolOptions = struct {
+    /// Warm-reader-pool cap (<= reader_pool_size); see `initCapped`.
+    reader_cap: usize = reader_pool_size,
+    /// Per-connection page-cache budget in KiB; see `default_cache_kib`.
+    cache_kib: u32 = default_cache_kib,
+};
+
 pub const Pool = struct {
     allocator: std.mem.Allocator,
     path: [:0]const u8, // owned copy
@@ -234,18 +253,31 @@ pub const Pool = struct {
     // Runtime cap on warm pooled readers (<= reader_pool_size). Comptime lever
     // `.pools.readers` sets this; defaults to reader_pool_size (16) for legacy behavior.
     reader_cap: usize = reader_pool_size,
+    // Per-connection SQLite page-cache budget (KiB), applied to the writer and every
+    // reader. Comptime lever `.pools.cache_kib`; defaults to default_cache_kib.
+    cache_kib: u32 = default_cache_kib,
 
-    /// Open a pool with the default warm-reader cap (16). Thin wrapper over
-    /// `initCapped` kept for the many call sites (tests/CLI) that don't tune pools.
+    /// Open a pool with the default warm-reader cap (16) and page-cache budget. Thin
+    /// wrapper over `initOpts` kept for the many call sites (tests/CLI) that don't tune.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, path: [:0]const u8) (DbError || std.mem.Allocator.Error)!Pool {
-        return initCapped(allocator, io, path, reader_pool_size);
+        return initOpts(allocator, io, path, .{});
     }
 
     /// Open a pool, capping the warm reader pool at `reader_cap` (clamped to the
     /// compile-time backing-array size). Excess concurrent readers still fall back
     /// to a fresh open and are closed on release, so a small cap shrinks the warm
-    /// footprint without changing read-only/thread-safe/WAL semantics.
+    /// footprint without changing read-only/thread-safe/WAL semantics. Uses the
+    /// default page-cache budget; `initOpts` to tune both.
     pub fn initCapped(allocator: std.mem.Allocator, io: std.Io, path: [:0]const u8, reader_cap: usize) (DbError || std.mem.Allocator.Error)!Pool {
+        return initOpts(allocator, io, path, .{ .reader_cap = reader_cap });
+    }
+
+    /// Open a pool with explicit `PoolOptions` (warm-reader cap + per-connection page-cache
+    /// budget). The cache budget is applied as `PRAGMA cache_size=-cache_kib` on the writer
+    /// here and on every reader in `openReader`, so it bounds the page cache across all
+    /// connections; it changes only memory/perf trade-off, not read/write/WAL semantics.
+    pub fn initOpts(allocator: std.mem.Allocator, io: std.Io, path: [:0]const u8, options: PoolOptions) (DbError || std.mem.Allocator.Error)!Pool {
+        const reader_cap = options.reader_cap;
         const owned = try allocator.dupeZ(u8, path);
         errdefer allocator.free(owned);
         var writer = try Db.open(owned);
@@ -268,13 +300,27 @@ pub const Pool = struct {
         // measurement, while keeping the WAL bounded (~2000 pages ≈ 8 MiB peak).
         // synchronous=NORMAL still governs fsync, so durability is unchanged.
         try writer.exec("PRAGMA wal_autocheckpoint=2000;");
+        // Bound the writer's page cache to cache_kib (negative = KiB budget). PRAGMA
+        // values can't be bound, so format the (trusted, in-range) integer into the SQL.
+        try setCacheSize(&writer, options.cache_kib);
         return .{
             .allocator = allocator,
             .path = owned,
             .writer = writer,
             .io = io,
             .reader_cap = @min(reader_cap, reader_pool_size),
+            .cache_kib = options.cache_kib,
         };
+    }
+
+    /// Apply `PRAGMA cache_size=-kib` to `db` (negative pins a KiB byte budget rather
+    /// than a page count). cache_kib is clamped to i32 range; 0 leaves SQLite's default.
+    fn setCacheSize(db: *Db, cache_kib: u32) DbError!void {
+        if (cache_kib == 0) return;
+        const kib: i64 = @min(@as(i64, cache_kib), std.math.maxInt(i32));
+        var buf: [64]u8 = undefined;
+        const sql = std.fmt.bufPrintZ(&buf, "PRAGMA cache_size=-{d};", .{kib}) catch return DbError.ExecFailed;
+        try db.exec(sql);
     }
 
     pub fn deinit(self: *Pool) void {
@@ -312,6 +358,9 @@ pub const Pool = struct {
         var db = Db{ .handle = handle.? };
         errdefer db.close();
         try db.exec("PRAGMA busy_timeout=5000;");
+        // Match the writer's page-cache budget on every reader (warm + fallback) so the
+        // pool's total page-cache footprint is bounded by (1 + reader_cap) * cache_kib.
+        try setCacheSize(&db, self.cache_kib);
         return db;
     }
 
@@ -477,4 +526,53 @@ test "pool: releaseReader closes overflow beyond the warm pool capacity" {
     for (&readers) |*rd| rd.* = try pool.acquireReader();
     for (&readers) |*rd| pool.releaseReader(rd);
     try std.testing.expectEqual(reader_pool_size, pool.reader_count);
+}
+
+fn readCacheSize(db: *Db) !i64 {
+    var stmt = try db.prepare("PRAGMA cache_size;");
+    defer stmt.finalize();
+    try std.testing.expect((try stmt.step()) == true);
+    return stmt.columnInt(0);
+}
+
+test "pool: cache_kib lever bounds the page cache on writer AND readers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir_path}, 0);
+    defer std.testing.allocator.free(db_path);
+
+    // 512 KiB budget -> PRAGMA cache_size reports -512 (negative = KiB) on every connection.
+    var pool = try Pool.initOpts(std.testing.allocator, std.testing.io, db_path, .{ .cache_kib = 512 });
+    defer pool.deinit();
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try std.testing.expectEqual(@as(i64, -512), try readCacheSize(w));
+    }
+    var reader = try pool.openReader();
+    defer reader.close();
+    try std.testing.expectEqual(@as(i64, -512), try readCacheSize(&reader));
+}
+
+test "pool: default cache_kib applies the memory-conscious default to connections" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir_path}, 0);
+    defer std.testing.allocator.free(db_path);
+
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, db_path);
+    defer pool.deinit();
+    const expected: i64 = -@as(i64, default_cache_kib);
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try std.testing.expectEqual(expected, try readCacheSize(w));
+    }
+    var reader = try pool.openReader();
+    defer reader.close();
+    try std.testing.expectEqual(expected, try readCacheSize(&reader));
 }

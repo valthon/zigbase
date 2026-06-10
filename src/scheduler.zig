@@ -132,6 +132,24 @@ pub fn completeJobError(s: *JobState, now: i64) void {
 
 const Thread = std.Thread;
 
+/// Per-thread stack size (bytes) for the scheduler's spawned threads (the tick thread,
+/// each job-pool worker, and detached `app.submit` task threads). `std.Thread`'s default
+/// is 16 MiB EACH, so the default pool reserves ~48 MiB of address space for stacks that
+/// the scheduler/job handlers never come close to using. 1 MiB is generous for cron/job
+/// handlers (they heap-allocate; argon2/DB work lives off-stack) while cutting the reserved
+/// footprint by ~15x per thread. Overridable per-deploy via the `.pools.stack_size` comptime
+/// lever (threaded through `Scheduler.init`), which RAISES the stack for unusually deep
+/// handlers — the default already minimizes the footprint.
+pub const default_job_stack_size: usize = 1 << 20; // 1 MiB
+
+/// Hard floor the `.pools.stack_size` lever is clamped up to. The OS's effective minimum
+/// thread stack is `PTHREAD_STACK_MIN` PLUS the binary's static-TLS block, which is
+/// binary-dependent: in the full ZigBase binary (SQLite + zap linked) it exceeds 256 KiB,
+/// so `pthread_create` returns EINVAL below it — a hard `unreachable` abort, not a catchable
+/// error. 1 MiB is proven safe across the test and server binaries, so a too-small request
+/// is clamped up to it rather than allowed to crash the process at startup.
+pub const min_job_stack_size: usize = 1 << 20; // 1 MiB
+
 fn unixNow(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
@@ -147,6 +165,7 @@ pub const Scheduler = struct {
     app: *App,
     jobs: []const RuntimeJob,
     pool_size: usize,
+    stack_size: usize = default_job_stack_size,
     state: []JobState,
     queue: []usize,
     q_head: usize = 0,
@@ -156,7 +175,18 @@ pub const Scheduler = struct {
     sched_thread: ?Thread = null,
     workers: []Thread = &.{},
 
+    /// Open a scheduler with the default per-thread stack size. Thin wrapper over
+    /// `initSized` kept for the call sites (tests/serve) that don't tune the stack.
     pub fn init(allocator: std.mem.Allocator, app: *App, jobs: []const RuntimeJob, pool_size: usize) !Scheduler {
+        return initSized(allocator, app, jobs, pool_size, default_job_stack_size);
+    }
+
+    /// Open a scheduler, spawning the tick/worker/submit threads with `stack_size`-byte
+    /// stacks instead of `std.Thread`'s 16 MiB default — far less reserved address space per
+    /// thread, same scheduling behavior. `stack_size` is clamped UP to `min_job_stack_size`
+    /// (a too-small value would EINVAL-abort `pthread_create` in the full binary), so the
+    /// lever can only raise the stack above the 1 MiB default, never below the safe floor.
+    pub fn initSized(allocator: std.mem.Allocator, app: *App, jobs: []const RuntimeJob, pool_size: usize, stack_size: usize) !Scheduler {
         const state = try allocator.alloc(JobState, jobs.len);
         errdefer allocator.free(state);
         const now = unixNow(app.io);
@@ -164,7 +194,7 @@ pub const Scheduler = struct {
             s.* = .{ .status = .idle, .next_fire = schedule.nextFire(jobs[i].schedule, now) orelse now };
         }
         const queue = try allocator.alloc(usize, jobs.len);
-        return .{ .allocator = allocator, .app = app, .jobs = jobs, .pool_size = pool_size, .state = state, .queue = queue };
+        return .{ .allocator = allocator, .app = app, .jobs = jobs, .pool_size = pool_size, .stack_size = @max(stack_size, min_job_stack_size), .state = state, .queue = queue };
     }
 
     pub fn deinit(self: *Scheduler) void {
@@ -204,10 +234,10 @@ pub const Scheduler = struct {
             for (self.workers[0..spawned]) |t| t.join();
         }
         for (self.workers) |*t| {
-            t.* = try Thread.spawn(.{}, workerLoop, .{self});
+            t.* = try Thread.spawn(.{ .stack_size = self.stack_size }, workerLoop, .{self});
             spawned += 1;
         }
-        self.sched_thread = try Thread.spawn(.{}, schedulerLoop, .{self});
+        self.sched_thread = try Thread.spawn(.{ .stack_size = self.stack_size }, schedulerLoop, .{self});
     }
 
     pub fn stop(self: *Scheduler) void {
@@ -273,7 +303,7 @@ pub const Scheduler = struct {
                 };
             }
         };
-        const th = try Thread.spawn(.{}, Holder.go, .{ self.app, name, task });
+        const th = try Thread.spawn(.{ .stack_size = self.stack_size }, Holder.go, .{ self.app, name, task });
         th.detach();
     }
 };
@@ -405,6 +435,45 @@ test "Scheduler runs a due reactive job then stops cleanly" {
 
     var sched = try Scheduler.init(std.testing.allocator, &app, jobs, 2);
     defer sched.deinit();
+    try sched.start();
+    var waited: usize = 0;
+    while (Counter.n.load(.monotonic) == 0 and waited < 300) : (waited += 1) {
+        app.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    sched.stop();
+    try std.testing.expectEqual(@as(u32, 1), Counter.n.load(.monotonic));
+}
+
+test "Scheduler initSized clamps a too-small stack to the safe floor and still runs the job" {
+    const Counter = struct {
+        var n: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+        fn run(ev: *events.JobEvent) anyerror!schedule.Reactive {
+            _ = ev;
+            // Touch a few KiB of stack so a too-small worker stack would fault here.
+            var scratch: [4096]u8 = undefined;
+            for (&scratch, 0..) |*b, i| b.* = @truncate(i);
+            std.mem.doNotOptimizeAway(&scratch);
+            _ = n.fetchAdd(1, .monotonic);
+            return .stop;
+        }
+    };
+    Counter.n.store(0, .monotonic);
+    const jobs = buildJobs(.{
+        .{ .name = "once", .schedule = schedule.Schedule.reactive, .handler = Counter.run },
+    });
+    var app: App = undefined;
+    app.io = std.testing.io;
+    app.allocator = std.testing.allocator;
+    app.pool = undefined;
+    app.dispatch = null;
+    app.scheduler = null;
+    app.submit_fn = null;
+
+    // A below-floor request (256 KiB) is clamped UP to min_job_stack_size, so it can't
+    // trigger a pthread EINVAL abort in the real binary; the job still runs on the threads.
+    var sched = try Scheduler.initSized(std.testing.allocator, &app, jobs, 2, 256 << 10);
+    defer sched.deinit();
+    try std.testing.expectEqual(min_job_stack_size, sched.stack_size);
     try sched.start();
     var waited: usize = 0;
     while (Counter.n.load(.monotonic) == 0 and waited < 300) : (waited += 1) {

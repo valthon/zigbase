@@ -135,6 +135,19 @@ pub fn App(comptime cfg: anytype) type {
         /// the historical hardcoded value; shrink it to reduce the connection footprint.
         pub const reader_pool_size: usize = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "readers")) cfg.pools.readers else 16;
 
+        /// Per-thread stack size (bytes) for the scheduler/job-pool/submit threads
+        /// (the `.pools.stack_size` lever). Defaults to `scheduler.default_job_stack_size`
+        /// (1 MiB), far below `std.Thread`'s 16 MiB default; raise it for unusually deep
+        /// job handlers. Clamped up to `scheduler.min_job_stack_size` — a below-floor value
+        /// would EINVAL-abort `pthread_create` in the full binary, so the lever can only
+        /// raise the stack, never crash the server. Only consumed when jobs are configured.
+        pub const job_stack_size: usize = @max(scheduler.min_job_stack_size, if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "stack_size")) cfg.pools.stack_size else scheduler.default_job_stack_size);
+
+        /// Per-connection SQLite page-cache budget in KiB (the `.pools.cache_kib` lever).
+        /// Defaults to `db.default_cache_kib` (1024 KiB); shrink it to reduce the page-cache
+        /// footprint across the writer + warm readers, or raise it for large working sets.
+        pub const cache_kib: u32 = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "cache_kib")) cfg.pools.cache_kib else db.default_cache_kib;
+
         /// Comptime-selected storage plugin type (defaults to `DefaultStoragePlugin`).
         pub const StoragePlugin: type = if (@hasField(@TypeOf(cfg), "storage")) cfg.storage else DefaultStoragePlugin;
         /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
@@ -162,6 +175,8 @@ pub fn App(comptime cfg: anytype) type {
             .StoragePlugin = StoragePlugin,
             .MailerPlugin = MailerPlugin,
             .reader_pool_size = reader_pool_size,
+            .job_stack_size = job_stack_size,
+            .cache_kib = cache_kib,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -183,6 +198,8 @@ pub const ServeOpts = struct {
     StoragePlugin: type,
     MailerPlugin: type,
     reader_pool_size: usize,
+    job_stack_size: usize = scheduler.default_job_stack_size,
+    cache_kib: u32 = db.default_cache_kib,
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -354,16 +371,16 @@ fn loadCfg(sa: cli.ServeArgs) !config.Config {
     return cfg;
 }
 
-fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, reader_cap: usize) !db.Pool {
+fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions) !db.Pool {
     std.Io.Dir.cwd().createDirPath(io, cfg.data_dir) catch {};
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/data.db", .{cfg.data_dir}, 0);
     defer allocator.free(db_path);
-    return db.Pool.initCapped(allocator, io, db_path, reader_cap);
+    return db.Pool.initOpts(allocator, io, db_path, options);
 }
 
 fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
     const cfg = try loadCfg(sa);
-    var pool = try openPool(allocator, io, cfg, 16);
+    var pool = try openPool(allocator, io, cfg, .{});
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
@@ -379,7 +396,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
         }
         std.log.warn("ZIGBASE_JWT_SECRET is using the insecure default; set it before production.", .{});
     }
-    var pool = try openPool(allocator, io, cfg, opts.reader_pool_size);
+    var pool = try openPool(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib });
     defer pool.deinit();
     {
         const w = pool.acquireWriter();
@@ -445,7 +462,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
     // Start the scheduler only when jobs are configured. Registered LAST among the teardown
     // defers, so (LIFO) its stop()+deinit() runs FIRST on return — joining worker threads
     // before pool.deinit()/storage_inst go out of scope, since workers touch app.pool/storage.
-    var sched: ?scheduler.Scheduler = if (jobs.len > 0) try scheduler.Scheduler.init(allocator, &app, jobs, pool_size) else null;
+    var sched: ?scheduler.Scheduler = if (jobs.len > 0) try scheduler.Scheduler.initSized(allocator, &app, jobs, pool_size, opts.job_stack_size) else null;
     if (sched) |*s| try s.start();
     defer if (sched) |*s| {
         s.stop();
@@ -468,7 +485,7 @@ fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.Superus
         return;
     }
     const cfg = try loadCfg(.{ .data_dir = sa.data_dir });
-    var pool = try openPool(allocator, io, cfg, 16);
+    var pool = try openPool(allocator, io, cfg, .{});
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
@@ -560,6 +577,27 @@ test "App(cfg) carries comptime pool-size levers (readers + jobs)" {
     const B = App(.{ .pools = .{ .readers = 8 } });
     try std.testing.expectEqual(@as(usize, 8), B.reader_pool_size);
     try std.testing.expectEqual(@as(usize, 2), B.job_pool_size);
+}
+
+test "App(cfg) carries comptime footprint levers (stack_size + cache_kib) with memory-conscious defaults" {
+    // Defaults: 1 MiB job-thread stacks (vs std.Thread's 16 MiB) and 1024 KiB page cache.
+    const D = App(.{});
+    try std.testing.expectEqual(scheduler.default_job_stack_size, D.job_stack_size);
+    try std.testing.expectEqual(@as(usize, 1 << 20), D.job_stack_size);
+    try std.testing.expectEqual(db.default_cache_kib, D.cache_kib);
+    try std.testing.expectEqual(@as(u32, 1024), D.cache_kib);
+
+    // Both tunable via .pools, independently of the other levers. stack_size RAISES
+    // above the 1 MiB default (its real use — deeper handlers); cache_kib shrinks freely.
+    const A = App(.{ .pools = .{ .stack_size = 2 << 20, .cache_kib = 256 } });
+    try std.testing.expectEqual(@as(usize, 2 << 20), A.job_stack_size);
+    try std.testing.expectEqual(@as(u32, 256), A.cache_kib);
+    // A below-floor stack request is clamped UP to the safe floor (can't crash the server).
+    const C = App(.{ .pools = .{ .stack_size = 64 << 10 } });
+    try std.testing.expectEqual(scheduler.min_job_stack_size, C.job_stack_size);
+    // Untouched levers keep their defaults alongside the tuned ones.
+    try std.testing.expectEqual(@as(usize, 16), A.reader_pool_size);
+    try std.testing.expectEqual(@as(usize, 2), A.job_pool_size);
 }
 
 test "App(cfg) accepts a custom storage + mailer plugin type override" {
