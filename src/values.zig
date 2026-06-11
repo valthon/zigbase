@@ -4,6 +4,16 @@ const schema = @import("schema.zig");
 
 pub const ValueError = error{ TypeMismatch, TooPrecise, Overflow, BadNumber, BadSelect, NotObject } || std.mem.Allocator.Error;
 
+/// 10^scale as i64. error.Overflow when scale > 18 (i64 holds up to 10^18).
+/// The single source of scale arithmetic for fixed/int number handling.
+pub fn pow10(scale: u8) error{Overflow}!i64 {
+    if (scale > 18) return error.Overflow;
+    var p: i64 = 1;
+    var k: u8 = 0;
+    while (k < scale) : (k += 1) p *= 10;
+    return p;
+}
+
 pub fn decimalToScaledInt(s: []const u8, scale: u8) ValueError!i64 {
     if (s.len == 0) return error.BadNumber;
     var i: usize = 0;
@@ -30,9 +40,7 @@ pub fn decimalToScaledInt(s: []const u8, scale: u8) ValueError!i64 {
         }
     }
     if (!seen) return error.BadNumber;
-    var pow: i64 = 1;
-    var k: u8 = 0;
-    while (k < scale) : (k += 1) pow = std.math.mul(i64, pow, 10) catch return error.Overflow;
+    const pow = try pow10(scale);
     while (fdigits < scale) : (fdigits += 1) frac *= 10;
     var result = std.math.mul(i64, int_part, pow) catch return error.Overflow;
     result = std.math.add(i64, result, frac) catch return error.Overflow;
@@ -44,9 +52,7 @@ pub fn scaledIntToDecimal(alloc: std.mem.Allocator, v: i64, scale: u8) ![]u8 {
     // -minInt(i64) overflows; only reachable via direct DB tampering since
     // decimalToScaledInt is overflow-checked. Reject rather than panic.
     if (v == std.math.minInt(i64)) return error.Overflow;
-    var pow: i64 = 1;
-    var k: u8 = 0;
-    while (k < scale) : (k += 1) pow *= 10;
+    const pow = try pow10(scale);
     const neg = v < 0;
     const av: i64 = if (neg) -v else v;
     const int_part = @divTrunc(av, pow);
@@ -223,6 +229,13 @@ test "null round-trips" {
     const f = schema.Field{ .id = "f", .name = "title", .options = .{ .text = .{} } };
     const out = try roundTrip(a, f, "TEXT", .null);
     try std.testing.expect(out == .null);
+}
+
+test "pow10: exact powers and the >18 overflow guard" {
+    try std.testing.expectEqual(@as(i64, 1), try pow10(0));
+    try std.testing.expectEqual(@as(i64, 100), try pow10(2));
+    try std.testing.expectEqual(@as(i64, 1_000_000_000_000_000_000), try pow10(18));
+    try std.testing.expectError(error.Overflow, pow10(19));
 }
 
 test "decimalToScaledInt: scale 2" {

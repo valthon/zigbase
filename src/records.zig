@@ -117,14 +117,52 @@ fn convCode(e: anyerror) []const u8 {
     };
 }
 
-/// Validate select membership/count, relation existence/count, and number string parsing.
-/// Appends field errors to `errs`. `conn` is used for relation existence lookups.
+fn appendMinMax(alloc: std.mem.Allocator, errs: *std.ArrayList(schema.ValidationError), field: []const u8, x: f64, min: ?f64, max: ?f64) !void {
+    if (min) |mn| if (x < mn)
+        try errs.append(alloc, .{ .field = field, .code = "validation_min", .message = "Value is below the minimum." });
+    if (max) |mx| if (x > mx)
+        try errs.append(alloc, .{ .field = field, .code = "validation_max", .message = "Value is above the maximum." });
+}
+
+/// Validate text/number min/max constraints, select membership/count, relation
+/// existence/count, and number string parsing. Appends field errors to `errs`.
+/// `conn` is used for relation existence lookups. Null and empty values skip the
+/// min/max constraint checks (required-ness is enforced separately by the caller,
+/// and an optional field must stay clearable).
 fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v: std.json.Value, errs: *std.ArrayList(schema.ValidationError)) !void {
     switch (f.options) {
-        .number => |o| if (v == .string and o.mode != .float) {
+        .text => |o| if (v == .string and v.string.len > 0) {
+            // min/max are documented as length in unicode codepoints (docs/fields.md).
+            const n = std.unicode.utf8CountCodepoints(v.string) catch v.string.len;
+            if (o.min) |mn| if (n < mn)
+                try errs.append(alloc, .{ .field = f.name, .code = "validation_min", .message = "Value is too short." });
+            if (o.max) |mx| if (n > mx)
+                try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Value is too long." });
+        },
+        // date min/max are deliberately NOT enforced: a lexical compare is unsound
+        // without date normalization (mixed "T"/"Z" vs space formats false-reject,
+        // garbage like "25:99:99" false-accepts). See KNOWN_LIMITATIONS.md.
+        .number => |o| if (o.mode == .float) {
+            const x: f64 = switch (v) {
+                .float => |fl| fl,
+                .integer => |i| @floatFromInt(i),
+                else => return,
+            };
+            try appendMinMax(alloc, errs, f.name, x, o.min, o.max);
+        } else if (v == .string) {
             const scale: u8 = if (o.mode == .fixed) (o.scale orelse 0) else 0;
-            _ = values.decimalToScaledInt(v.string, scale) catch |e|
+            const sv = values.decimalToScaledInt(v.string, scale) catch |e| {
                 try errs.append(alloc, .{ .field = f.name, .code = convCode(e), .message = "Invalid number." });
+                return;
+            };
+            // Compare the decimal value as f64 (value/10^scale vs the f64 bound).
+            // Dividing — not multiplying the bound out — is deliberate: the division
+            // correctly rounds to the same f64 a decimal-equal bound parsed to, so
+            // "0.10" passes min=0.1, whereas f64(0.1)*100 = 10.000000000000002 would
+            // false-reject sv=10. Bounds are f64, so values beyond 2^53 cannot be
+            // bounded exactly anyway (see the documented-edge test).
+            const pow: f64 = @floatFromInt(values.pow10(scale) catch return); // unreachable: decimalToScaledInt already validated scale
+            try appendMinMax(alloc, errs, f.name, @as(f64, @floatFromInt(sv)) / pow, o.min, o.max);
         },
         .select => |o| {
             if (countValues(v) > o.maxSelect)
@@ -168,6 +206,241 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
         },
         else => {},
     }
+}
+
+/// Schema-aware coercion of multipart form fields, applied ONLY to multipart
+/// input (never JSON bodies), BEFORE validation. Multipart values arrive as
+/// verbatim strings (see src/files/multipart.zig); this makes them look like a
+/// well-formed JSON client per the collection schema:
+///   bool          "" -> null; "true"/"false" -> JSON bool (else left as-is)
+///   number (all)  "" -> null; float mode: parseable, finite -> JSON float
+///                 (else left as a string); int/fixed: kept as a string
+///                 (the accepted form)
+///   select/relation (multi)  "" -> null; JSON-array string -> array (the admin
+///                 UI sends JSON.stringify(array)); any other string wraps as a
+///                 one-element array of the ORIGINAL string ("123" -> ["123"])
+///   json          "" -> null; any parseable JSON -> the parsed value; else the
+///                 raw string
+///   everything else (text/email/url/editor/date/single select/relation/file)
+///                 kept verbatim — including "", which is their JSON clear form
+/// So an empty multipart value clears every field type: text-likes store "",
+/// bool/number/json/multi-value fields store null. Keys that match no schema
+/// field ("<field>-" removal keys, auth password/passwordConfirm) and
+/// non-string values pass through untouched. Allocates into `alloc` (arena).
+pub fn coerceFormFields(alloc: std.mem.Allocator, col: schema.Collection, data: std.json.Value) std.mem.Allocator.Error!std.json.Value {
+    if (data != .object) return data;
+    var out: std.json.ObjectMap = .empty;
+    var it = data.object.iterator();
+    while (it.next()) |e| {
+        try out.put(alloc, e.key_ptr.*, try coerceFieldValue(alloc, col, e.key_ptr.*, e.value_ptr.*));
+    }
+    return .{ .object = out };
+}
+
+fn coerceFieldValue(alloc: std.mem.Allocator, col: schema.Collection, key: []const u8, v: std.json.Value) std.mem.Allocator.Error!std.json.Value {
+    const f = schema.fieldByName(col, key) orelse return v;
+    if (v != .string) return v;
+    const s = v.string;
+    switch (f.options) {
+        .@"bool" => {
+            if (s.len == 0) return .null; // multipart "" = clear
+            if (std.mem.eql(u8, s, "true")) return .{ .bool = true };
+            if (std.mem.eql(u8, s, "false")) return .{ .bool = false };
+            return v;
+        },
+        .number => |o| {
+            if (s.len == 0) return .null; // multipart "" = clear (all modes)
+            if (o.mode != .float) return v; // int/fixed: strings are the accepted JSON form
+            const x = std.fmt.parseFloat(f64, s) catch return v;
+            if (!std.math.isFinite(x)) return v; // JSON can't carry nan/inf; let validation reject
+            return .{ .float = x };
+        },
+        .json => {
+            if (s.len == 0) return .null; // multipart "" = clear
+            // Leaked into the arena deliberately (the codebase-wide pattern for parse trees).
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return v;
+            return parsed.value;
+        },
+        .select, .relation => {
+            if (!f.isMultiValue()) return v;
+            if (s.len == 0) return .null; // multipart "" = clear
+            if (std.json.parseFromSlice(std.json.Value, alloc, s, .{})) |parsed| {
+                if (parsed.value == .array) return parsed.value;
+            } else |_| {}
+            // A single occurrence (-F tags=x) wraps as a one-element array of the
+            // ORIGINAL string, mirroring how repeated keys arrive as string arrays.
+            var arr = std.json.Array.init(alloc);
+            try arr.append(v);
+            return .{ .array = arr };
+        },
+        else => return v,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multipart coercion tests (TDD: written before coerceFormFields exists).
+// Multipart values are all strings; coercion makes them look like a
+// well-formed JSON client per the collection schema, BEFORE validation.
+// ---------------------------------------------------------------------------
+
+fn coerceCol() schema.Collection {
+    const S = struct {
+        const fields = [_]schema.Field{
+            .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+            .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
+            .{ .id = "f3", .name = "ratio", .options = .{ .number = .{ .mode = .float } } },
+            .{ .id = "f4", .name = "qty", .options = .{ .number = .{ .mode = .int } } },
+            .{ .id = "f5", .name = "flag", .options = .{ .@"bool" = .{} } },
+            .{ .id = "f6", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 3 } } },
+            .{ .id = "f7", .name = "status", .options = .{ .select = .{ .values = &.{ "a", "b" }, .maxSelect = 1 } } },
+            .{ .id = "f8", .name = "meta", .options = .{ .json = .{} } },
+            .{ .id = "f9", .name = "photos", .options = .{ .file = .{ .maxSelect = 3 } } },
+        };
+    };
+    return .{ .id = "c", .name = "things", .fields = &S.fields };
+}
+
+fn coerceOneField(a: std.mem.Allocator, key: []const u8, s: []const u8) !std.json.Value {
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, key, .{ .string = s });
+    const out = try coerceFormFields(a, coerceCol(), .{ .object = data });
+    return out.object.get(key).?;
+}
+
+test "coerce: text keeps scalar-looking strings verbatim" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "123", "true", "false", "b", "007", "+15551234" }) |s| {
+        const v = try coerceOneField(a, "title", s);
+        try std.testing.expect(v == .string);
+        try std.testing.expectEqualStrings(s, v.string);
+    }
+}
+
+test "coerce: bool 'true'/'false' become JSON bools; anything else is left alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(true, (try coerceOneField(a, "flag", "true")).bool);
+    try std.testing.expectEqual(false, (try coerceOneField(a, "flag", "false")).bool);
+    const odd = try coerceOneField(a, "flag", "yes");
+    try std.testing.expect(odd == .string);
+}
+
+test "coerce: float mode parses to a JSON float; unparseable/non-finite stays string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try coerceOneField(a, "ratio", "45.00");
+    try std.testing.expectApproxEqAbs(@as(f64, 45.0), v.float, 0.0001);
+    try std.testing.expect((try coerceOneField(a, "ratio", "abc")) == .string);
+    try std.testing.expect((try coerceOneField(a, "ratio", "nan")) == .string);
+    try std.testing.expect((try coerceOneField(a, "ratio", "inf")) == .string);
+}
+
+test "coerce: int/fixed number modes keep the decimal string (the accepted JSON form)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try coerceOneField(a, "price", "45.00");
+    try std.testing.expectEqualStrings("45.00", p.string);
+    const q = try coerceOneField(a, "qty", "42");
+    try std.testing.expectEqualStrings("42", q.string);
+}
+
+test "coerce: multi-select JSON-array string becomes an array; single select stays a string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try coerceOneField(a, "tags", "[\"x\",\"y\"]");
+    try std.testing.expect(v == .array);
+    try std.testing.expectEqual(@as(usize, 2), v.array.items.len);
+    try std.testing.expectEqualStrings("x", v.array.items[0].string);
+    // single-valued select: a JSON-looking string is the literal value
+    const sv = try coerceOneField(a, "status", "[\"a\"]");
+    try std.testing.expect(sv == .string);
+}
+
+test "coerce: a single plain value for a multi-value field wraps as a one-element array of the ORIGINAL string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // -F tags=x (one occurrence) must behave like ["x"], matching -F tags=x -F tags=y
+    const v = try coerceOneField(a, "tags", "x");
+    try std.testing.expect(v == .array);
+    try std.testing.expectEqual(@as(usize, 1), v.array.items.len);
+    try std.testing.expectEqualStrings("x", v.array.items[0].string);
+    // valid-JSON-but-not-array strings wrap the ORIGINAL string, never the parsed value
+    const n = try coerceOneField(a, "tags", "123");
+    try std.testing.expect(n == .array);
+    try std.testing.expectEqualStrings("123", n.array.items[0].string);
+    const b = try coerceOneField(a, "tags", "true");
+    try std.testing.expect(b == .array);
+    try std.testing.expectEqualStrings("true", b.array.items[0].string);
+}
+
+test "coerce: an empty multipart value clears optional non-text fields to null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // bool, number (all modes), json, and multi-value fields: "" -> null
+    try std.testing.expect((try coerceOneField(a, "flag", "")) == .null);
+    try std.testing.expect((try coerceOneField(a, "price", "")) == .null);
+    try std.testing.expect((try coerceOneField(a, "qty", "")) == .null);
+    try std.testing.expect((try coerceOneField(a, "ratio", "")) == .null);
+    try std.testing.expect((try coerceOneField(a, "meta", "")) == .null);
+    try std.testing.expect((try coerceOneField(a, "tags", "")) == .null);
+    // text-like and single select keep "" (their JSON form accepts it)
+    const tv = try coerceOneField(a, "title", "");
+    try std.testing.expect(tv == .string and tv.string.len == 0);
+    const sv = try coerceOneField(a, "status", "");
+    try std.testing.expect(sv == .string and sv.string.len == 0);
+}
+
+test "coerce: json field parses any valid JSON; invalid stays string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const obj = try coerceOneField(a, "meta", "{\"a\":1}");
+    try std.testing.expect(obj == .object);
+    try std.testing.expectEqual(@as(i64, 1), obj.object.get("a").?.integer);
+    try std.testing.expectEqual(true, (try coerceOneField(a, "meta", "true")).bool);
+    try std.testing.expect((try coerceOneField(a, "meta", "not json")) == .string);
+}
+
+test "coerce: non-schema keys (removal/auth) and non-string values pass through untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "photos-", .{ .string = "[\"old.jpg\"]" });
+    try data.put(a, "password", .{ .string = "true" });
+    try data.put(a, "passwordConfirm", .{ .string = "true" });
+    var arr = std.json.Array.init(a);
+    try arr.append(.{ .string = "x" });
+    try data.put(a, "tags", .{ .array = arr });
+    const out = try coerceFormFields(a, coerceCol(), .{ .object = data });
+    try std.testing.expectEqualStrings("[\"old.jpg\"]", out.object.get("photos-").?.string);
+    try std.testing.expectEqualStrings("true", out.object.get("password").?.string);
+    try std.testing.expectEqualStrings("true", out.object.get("passwordConfirm").?.string);
+    try std.testing.expect(out.object.get("tags").? == .array);
+}
+
+test "coerce: file field values are untouched (the file plan owns them)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try coerceOneField(a, "photos", "[\"a.jpg\"]");
+    try std.testing.expect(v == .string);
+}
+
+test "coerce: non-object data is returned as-is" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const out = try coerceFormFields(a, coerceCol(), .{ .string = "nope" });
+    try std.testing.expect(out == .string);
 }
 
 pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value) RecordError!std.json.Value {
@@ -330,6 +603,183 @@ test "create rejects a value outside a select's allowed set" {
     var data: std.json.ObjectMap = .empty;
     try data.put(a, "status", .{ .string = "banana" });
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
+}
+
+// ---------------------------------------------------------------------------
+// Field-constraint enforcement tests (TDD; Bug 3). The schema stores
+// text min/max, number min/max, and date min/max, but validateFieldValue
+// never enforced them.
+// ---------------------------------------------------------------------------
+
+fn seedConstrained(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
+    try migrations.run(d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{ .min = 2, .max = 5 } } },
+        .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2, .min = 0, .max = 100 } } },
+        .{ .id = "f3", .name = "seats", .options = .{ .number = .{ .mode = .int, .min = 1, .max = 8 } } },
+        .{ .id = "f4", .name = "ratio", .options = .{ .number = .{ .mode = .float, .min = 0, .max = 1 } } },
+        .{ .id = "f5", .name = "when", .options = .{ .date = .{ .min = "2026-01-01 00:00:00", .max = "2026-12-31 23:59:59" } } },
+    };
+    return collections.create(a, std.testing.io, d, .{ .id = "", .name = "limits", .fields = &fields });
+}
+
+fn expectFieldCode(field: []const u8, code: []const u8) !void {
+    const errs = last_errors orelse return error.TestExpectedEqual;
+    for (errs) |e| {
+        if (std.mem.eql(u8, e.field, field) and std.mem.eql(u8, e.code, code)) return;
+    }
+    return error.TestExpectedEqual;
+}
+
+fn createOne(a: std.mem.Allocator, d: *db.Db, col: schema.Collection, key: []const u8, v: std.json.Value) RecordError!std.json.Value {
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, key, v);
+    return create(a, std.testing.io, d, col, .{ .object = data });
+}
+
+test "text min/max enforce unicode codepoint counts" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "title", .{ .string = "a" }));
+    try expectFieldCode("title", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "title", .{ .string = "abcdef" }));
+    try expectFieldCode("title", "validation_max");
+    // "héllo" is 5 codepoints but 6 bytes: max=5 must count codepoints, not bytes
+    _ = try createOne(a, &d, col, "title", .{ .string = "héllo" });
+    _ = try createOne(a, &d, col, "title", .{ .string = "ab" });
+}
+
+test "text min does not reject an explicitly empty optional value (clearing stays possible)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    _ = try createOne(a, &d, col, "title", .{ .string = "" });
+    _ = try createOne(a, &d, col, "title", .null);
+}
+
+test "fixed-mode number min/max compare the decimal value" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "price", .{ .string = "-1" }));
+    try expectFieldCode("price", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "price", .{ .string = "-0.01" }));
+    try expectFieldCode("price", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "price", .{ .string = "100.01" }));
+    try expectFieldCode("price", "validation_max");
+    _ = try createOne(a, &d, col, "price", .{ .string = "0" });
+    _ = try createOne(a, &d, col, "price", .{ .string = "100.00" });
+    _ = try createOne(a, &d, col, "price", .{ .string = "45.00" });
+}
+
+test "int-mode number min/max" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "seats", .{ .string = "0" }));
+    try expectFieldCode("seats", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "seats", .{ .string = "9" }));
+    try expectFieldCode("seats", "validation_max");
+    _ = try createOne(a, &d, col, "seats", .{ .string = "1" });
+    _ = try createOne(a, &d, col, "seats", .{ .string = "8" });
+}
+
+test "fixed-mode bound equality: a value textually equal to the f64 bound passes (divide semantics)" {
+    // Pins the divide-based compare: "0.10" with min=0.1 must pass. Multiplying the
+    // bound out instead (f64(0.1)*100 = 10.000000000000002 > sv=10) would false-reject.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "amt", .options = .{ .number = .{ .mode = .fixed, .scale = 2, .min = 0.1, .max = 0.3 } } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tenths", .fields = &fields });
+    _ = try createOne(a, &d, col, "amt", .{ .string = "0.10" }); // == min
+    _ = try createOne(a, &d, col, "amt", .{ .string = "0.30" }); // == max
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "amt", .{ .string = "0.09" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "amt", .{ .string = "0.31" }));
+}
+
+test "int-mode bounds compare as f64: values beyond 2^53 lose precision (documented edge)" {
+    // The schema stores min/max as f64, so bounds themselves cannot represent
+    // integers above 2^53 exactly. 9007199254740993 (2^53+1) rounds to 2^53 when
+    // compared, so a max of 9007199254740992 does NOT reject it. This is the
+    // accepted behavior; exact enforcement would need decimal bounds in the schema.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "big", .options = .{ .number = .{ .mode = .int, .max = 9007199254740992.0 } } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "bigints", .fields = &fields });
+    _ = try createOne(a, &d, col, "big", .{ .string = "9007199254740993" });
+}
+
+test "float-mode number min/max (float and integer JSON values)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "ratio", .{ .float = -0.5 }));
+    try expectFieldCode("ratio", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "ratio", .{ .float = 1.5 }));
+    try expectFieldCode("ratio", "validation_max");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "ratio", .{ .integer = 2 }));
+    try expectFieldCode("ratio", "validation_max");
+    _ = try createOne(a, &d, col, "ratio", .{ .float = 0.5 });
+    _ = try createOne(a, &d, col, "ratio", .{ .integer = 1 });
+}
+
+test "date min/max are accepted but NOT enforced (no date normalization in the write path)" {
+    // A lexical compare is unsound without normalization: clients legitimately mix
+    // "2026-06-10 08:00:00" and "2026-06-10T08:00:00Z", which order incorrectly as
+    // bytes, and garbage like "2026-06-10 25:99:99" would still pass. Enforcement
+    // is deferred until dates are parsed/normalized (see KNOWN_LIMITATIONS.md).
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a); // "when": min 2026-01-01, max 2026-12-31
+    _ = try createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }); // below min: accepted
+    _ = try createOne(a, &d, col, "when", .{ .string = "2027-01-01 00:00:00" }); // above max: accepted
+    _ = try createOne(a, &d, col, "when", .{ .string = "2026-06-10T08:00:00Z" }); // mixed format: accepted
+}
+
+test "update enforces the same constraints" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    const rec = try createOne(a, &d, col, "price", .{ .string = "1.00" });
+    const rid = rec.object.get("id").?.string;
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "price", .{ .string = "-1" });
+    try std.testing.expectError(error.Validation, update(a, &d, col, rid, .{ .object = data }));
+    try expectFieldCode("price", "validation_min");
 }
 
 pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {

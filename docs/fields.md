@@ -78,9 +78,13 @@ A string column.
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `min` | integer (≥0) | unset | minimum length |
-| `max` | integer (≥0) | unset | maximum length |
-| `pattern` | string | unset | a regex the value must match |
+| `min` | integer (≥0) | unset | minimum length, counted in **unicode codepoints** |
+| `max` | integer (≥0) | unset | maximum length, counted in **unicode codepoints** |
+| `pattern` | string | unset | a regex the value must match — **accepted but not yet enforced** (see KNOWN_LIMITATIONS.md) |
+
+`min`/`max` violations are a `400` with a `validation_min` / `validation_max`
+field error. An explicitly empty value (`""`) on an optional field skips the
+`min` check so the field stays clearable; use `required` to forbid empty.
 
 ```json
 { "name": "title", "type": "text", "required": true, "options": { "min": 1, "max": 200 } }
@@ -117,8 +121,12 @@ A date/time string column.
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `min` | string | unset | earliest allowed value (a date string) |
-| `max` | string | unset | latest allowed value (a date string) |
+| `min` | string | unset | earliest allowed value (a date string) — **accepted but not yet enforced** |
+| `max` | string | unset | latest allowed value (a date string) — **accepted but not yet enforced** |
+
+`min`/`max` are stored and round-tripped, but record validation does not apply
+them yet: enforcement needs date parsing/normalization, which the write path
+doesn't have (see KNOWN_LIMITATIONS.md).
 
 ```json
 { "name": "starts_at", "type": "date", "options": { "min": "2026-01-01 00:00:00" } }
@@ -157,8 +165,8 @@ A numeric column. **The `mode` decides storage and precision.**
 | --- | --- | --- | --- |
 | `mode` | `"float"` \| `"int"` \| `"fixed"` | `"float"` | numeric kind (see below) |
 | `scale` | integer **1..8** | unset | decimal places — **required when `mode` is `"fixed"`** |
-| `min` | number | unset | minimum value |
-| `max` | number | unset | maximum value |
+| `min` | number | unset | minimum value, inclusive (`validation_min` on violation) |
+| `max` | number | unset | maximum value, inclusive (`validation_max` on violation) |
 
 - **`float`** — stored as SQLite `REAL` (IEEE-754 double). The default.
 - **`int`** — stored as `INTEGER` (whole numbers).
