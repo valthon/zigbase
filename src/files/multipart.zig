@@ -11,12 +11,14 @@ fn boundaryFromContentType(ct_header: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, ct_header, ';');
     _ = it.next(); // skip the media type itself
     while (it.next()) |raw| {
-        const p = std.mem.trim(u8, raw, " \t");
-        if (p.len > 9 and std.ascii.eqlIgnoreCase(p[0..9], "boundary=")) {
-            var v = p[9..];
-            if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];
-            if (v.len > 0) return v;
-        }
+        // Tolerate LWSP around '=' (legal in MIME structured fields; HTTP
+        // senders must not generate it, but accepting it is harmless).
+        const eq = std.mem.indexOfScalar(u8, raw, '=') orelse continue;
+        const attr = std.mem.trim(u8, raw[0..eq], " \t");
+        if (!std.ascii.eqlIgnoreCase(attr, "boundary")) continue;
+        var v = std.mem.trim(u8, raw[eq + 1 ..], " \t");
+        if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];
+        if (v.len > 0) return v;
     }
     return null;
 }
@@ -332,6 +334,26 @@ test "parse: quoted boundary in the content-type header" {
         "--q1=z--\r\n";
     const ex = try parse(a, "multipart/form-data; boundary=\"q1=z\"", body);
     try t.expectEqualStrings("v", ex.form_fields.object.get("x").?.string);
+}
+
+test "parse: whitespace around '=' in the boundary parameter is tolerated" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "--bnd\r\n" ++
+        "Content-Disposition: form-data; name=\"x\"\r\n\r\nv\r\n" ++
+        "--bnd--\r\n";
+    // MIME-origin clients may emit LWSP around '=' (RFC 822 structured fields);
+    // HTTP senders must not generate it (RFC 9110) but tolerating it is harmless.
+    for ([_][]const u8{
+        "multipart/form-data; boundary = bnd",
+        "multipart/form-data; boundary= bnd",
+        "multipart/form-data; boundary =\"bnd\"",
+        "multipart/form-data; charset=utf-8; boundary = bnd",
+    }) |hdr| {
+        const ex = try parse(a, hdr, body);
+        try t.expectEqualStrings("v", ex.form_fields.object.get("x").?.string);
+    }
 }
 
 test "parse: empty-filename empty-content file part is skipped (no file chosen)" {
