@@ -6,12 +6,28 @@ order: 3
 repoPath: examples/plugins
 ---
 
+import { Image } from 'astro:assets';
+import Browser from '../../components/Browser.astro';
+import pluginsBrowser from '../../assets/screenshots/example-plugins-browser.png';
+
 # Plugins & comptime config
 
 This is the **advanced framework** example. It is a standalone package with a path
 dependency on the repo root (`../..`) and exercises — using **only public
 `zigbase.*` exports**, no reaching into ZigBase internals — the comptime-config
 features a consumer configures in code.
+
+<Browser url="http://127.0.0.1:8090/">
+  <Image
+    src={pluginsBrowser}
+    width={pluginsBrowser.width}
+    height={pluginsBrowser.height}
+    alt="The plugins example's 'Everything in one binary' page: an Authors panel listing two authors and a Published posts panel listing three posts with their authors resolved via relation expand — all HTML, JS, and CSS served from assets embedded in the executable"
+    loading="lazy"
+    decoding="async"
+    sizes="(max-width: 960px) 100vw, 820px"
+  />
+</Browser>
 
 ## What it proves
 
