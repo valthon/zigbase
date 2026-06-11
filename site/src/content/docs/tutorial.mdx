@@ -86,7 +86,8 @@ the schema editor. Create the three collections in order:
    **deleteRule** to `@request.auth.id = owner`. Save.
 
 3. **`listings`** — type **base**, five fields: `title` (**text**, *req*),
-   `price_per_hour` (**number**, *req* — leave the mode dropdown on **float**), `status`
+   `price_per_hour` (**number**, *req* — pick **fixed** from the mode dropdown and enter
+   `2` in the scale input that appears), `status`
    (**select**, *req* — type `draft,published,archived` into the values input), `simulator`
    (**relation**, *req* — target `simulators`), and `photos` (**file** — set *maxSel* to
    `6`).
@@ -100,7 +101,7 @@ the schema editor. Create the three collections in order:
 
 > **What the UI can't set (yet):** advanced field options are API-only today —
 > `cascadeDelete` / `minSelect` on relations, `min` / `max` / `pattern` on text,
-> `min` / `max` / `scale` on number, and `maxSize` / `mimeTypes` on file. The schema the
+> `min` / `max` on number, and `maxSize` / `mimeTypes` on file. The schema the
 > UI saves is the same shape as the terminal path's payloads, minus those constraints.
 
   </Fragment>
@@ -165,7 +166,7 @@ LISTINGS_ID=$(curl -s -X POST "$BASE/api/collections" \
     \"fields\": [
       { \"id\": \"f_title\", \"name\": \"title\", \"type\": \"text\", \"required\": true, \"options\": { \"min\": 1, \"max\": 140 } },
       { \"id\": \"f_price\", \"name\": \"price_per_hour\", \"type\": \"number\", \"required\": true,
-        \"options\": { \"mode\": \"float\", \"min\": 0 } },
+        \"options\": { \"mode\": \"fixed\", \"scale\": 2, \"min\": 0 } },
       { \"id\": \"f_status\", \"name\": \"status\", \"type\": \"select\", \"required\": true,
         \"options\": { \"values\": [\"draft\", \"published\", \"archived\"], \"maxSelect\": 1 } },
       { \"id\": \"f_sim\", \"name\": \"simulator\", \"type\": \"relation\", \"required\": true,
@@ -186,12 +187,11 @@ The field shapes used here are catalogued in [Fields](./fields).
   </Fragment>
 </PathTabs>
 
-> **Money fields:** `price_per_hour` uses the default **float** number mode here so both
-> paths build the same schema. A fixed-point **fixed** mode (exact decimal strings like
-> `"45.00"`, no float drift) exists for money — see [Fields → number](./fields#number) —
-> but it requires a `scale` option the admin UI doesn't expose yet, so creating
-> fixed-mode fields is API-only for now. The `min: 0` in the terminal path keeps prices
-> non-negative (`validation_min` on violation).
+> **Money fields:** `price_per_hour` is a **fixed**-point number (`scale: 2`) — values
+> are exact decimal strings like `"45.00"`, stored as scaled integers, so there is no
+> float drift; inputs and responses both carry the string form. The `min: 0` in the
+> terminal path still keeps prices non-negative (`validation_min` on violation). See
+> [Fields → number](./fields#number).
 
 ## 2. Understand the access rules you just set
 
@@ -315,8 +315,9 @@ from the `simulator` relation dropdown, and choose a photo (say, `bay1.jpg`) in 
 
 Save. The drawer sends plain JSON normally, and switches to a `multipart/form-data` upload
 automatically when files are chosen — the same two request shapes the terminal path makes
-by hand. The listings table now shows the record, uploaded filename included (and on
-edit, existing files get "(remove)" checkboxes):
+by hand. The listings table now shows the record — the fixed-point price renders as the
+exact `45.00` you typed, uploaded filename included (and on edit, existing files get
+"(remove)" checkboxes):
 
 ![The listings records table with the saved Sunset Tee Times row and its photo filename](../../assets/screenshots/admin-records-listings.png)
 
@@ -344,6 +345,10 @@ curl -s -X POST "$BASE/api/collections/listings/records" \
   -F "simulator=$SIM_ID" \
   -F "photos=@./bay1.jpg;type=image/jpeg"
 ```
+
+The `201` response echoes the record, with `price_per_hour` round-tripping as the exact
+string `"45.00"` (fixed-point) and `photos` holding the stored, randomized filename. A
+negative price (`-F "price_per_hour=-1"`) is rejected with a `400` `validation_min`.
 
   </Fragment>
 </PathTabs>

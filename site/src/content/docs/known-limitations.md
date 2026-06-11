@@ -46,9 +46,6 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
 - **The date field's `min`/`max` options are accepted but not yet enforced.** Enforcement
   is pending date parsing/normalization in the write path — a raw lexical compare is
   unsound when clients mix formats (`2026-06-10 08:00:00` vs `2026-06-10T08:00:00Z`).
-- **Fixed-mode numbers aren't configurable from the admin UI yet.** `fixed` mode requires
-  a `scale` option (1..8) that the schema editor doesn't expose — create fixed-mode
-  fields via the API (the admin UI edits records on them just fine).
 
 ## Scheduler
 
