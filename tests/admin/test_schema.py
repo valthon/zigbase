@@ -60,6 +60,25 @@ def test_number_fixed_without_scale_shows_field_error(page):
     assert 'scale' in page.inner_text('[data-test=field-row] .error')
     assert not any(c["name"] == "badprices" for c in api_request(page, "GET", "/api/collections").json())
 
+def test_number_fixed_non_integer_scale_shows_field_error(page):
+    login(page)
+    page.click('[data-test=nav-collections]')
+    page.click('[data-test=new-collection]')
+    page.wait_for_selector('[data-test=schema-editor]')
+    page.fill('[data-test=col-name]', 'floatscale')
+    page.click('[data-test=add-field]')
+    page.fill('[data-test=field-name]', 'amount')
+    page.select_option('[data-test=field-type]', 'number')
+    page.select_option('[data-test=opt-mode]', 'fixed')
+    # a non-integer scale must not be sent (it would 400 with a top-level
+    # "Invalid request body." and no field attribution); omitting it instead
+    # surfaces the server's inline validation_invalid_scale under the row
+    page.fill('[data-test=opt-scale]', '2.5')
+    page.click('[data-test=save-collection]')
+    page.wait_for_selector('[data-test=field-row] .error', timeout=8000)
+    assert 'scale' in page.inner_text('[data-test=field-row] .error')
+    assert not any(c["name"] == "floatscale" for c in api_request(page, "GET", "/api/collections").json())
+
 def test_edit_rules_lock_toggle(page):
     login(page)
     # seed a base collection via the API (uses the session cookie + csrf)
