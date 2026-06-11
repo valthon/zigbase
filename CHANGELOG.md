@@ -4,6 +4,51 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-06-11
+
+### Fixed
+- **Multipart form values are no longer type-guessed by the HTTP layer.** The
+  multipart parser was rewritten as a self-contained RFC 2046 parser over the
+  raw request body. Previously, facil.io coerced form values at parse time
+  (`45.00` → float, `"true"` → bool, `"123"` → int, `"007"` → `7` with the
+  original text destroyed), so string-expecting fields failed validation and
+  **fixed-mode number fields could not be set in a file-upload request at
+  all**. Values now arrive byte-for-byte as sent, then a schema-aware coercion
+  pass makes multipart input behave exactly like a well-formed JSON client.
+- **Malformed multipart bodies return a clear `400` ("Invalid multipart
+  body.")** instead of falling through to the JSON parser's misleading
+  "Invalid JSON body."; out-of-memory during parsing propagates instead of
+  masquerading as a 400.
+- **Multipart parser edge cases:** boundary delimiters are validated per
+  RFC 2046, so content containing a boundary-prefixed decoy can no longer
+  truncate a value or smuggle extra form fields; flag-style (valueless)
+  `Content-Disposition` parameters no longer drop the part; `name[]` bracket
+  notation (PHP/jQuery convention) is normalized again; repeated `<field>-`
+  removal keys delete all listed files; zero-byte file parts are skipped
+  (matching the previous behavior); LWSP around `=` in the boundary parameter
+  is tolerated.
+
+### Added
+- **Admin UI: a `scale` input for fixed-mode number fields** in the schema
+  editor (shown when the mode dropdown is set to `fixed`). Together with the
+  multipart fix above, fixed-point (money) fields are now fully usable from
+  the admin UI — creatable in the editor and editable in the record drawer,
+  file uploads included.
+
+### Changed
+- **`min`/`max` on text and number fields are now enforced** on record writes
+  (previously stored but silently ignored). Violations return `400` with
+  `validation_min` / `validation_max` on the offending field; text length is
+  counted in unicode codepoints; number bounds are inclusive. **Note:**
+  pre-existing records that violate their declared bounds will fail
+  full-record re-saves (e.g. from the admin UI drawer) until corrected. Date
+  `min`/`max` and text `pattern` remain accepted-but-unenforced — see
+  KNOWN_LIMITATIONS.md.
+- **Multipart input semantics:** an empty value clears an optional non-text
+  field to `null` (matching JSON `null`); a single occurrence of a multi-value
+  field wraps into a one-element array (repeated keys already became arrays);
+  repeated non-file keys are preserved as arrays instead of being dropped.
+
 ## [0.2.0] - 2026-06-10
 
 ### Fixed

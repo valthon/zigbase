@@ -11,6 +11,42 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-06-11
+
+### Fixed
+
+- **Multipart form values are no longer type-guessed by the HTTP layer.** The multipart
+  parser was rewritten as a self-contained RFC 2046 parser over the raw request body.
+  Previously the HTTP layer coerced form values at parse time (`45.00` → float, `"true"` →
+  bool, `"007"` → `7` with the original text destroyed), so string-expecting fields failed
+  validation and **fixed-mode number fields could not be set in a file-upload request at
+  all**. Values now arrive byte-for-byte as sent, then a schema-aware coercion pass makes
+  multipart input behave exactly like a well-formed JSON client.
+- **Malformed multipart bodies return a clear `400`** ("Invalid multipart body.") instead
+  of the JSON parser's misleading "Invalid JSON body.".
+- **Multipart parser edge cases:** RFC 2046 boundary-delimiter validation (no truncation
+  or part smuggling from boundary-prefixed content), flag-style `Content-Disposition`
+  params, `name[]` bracket notation, repeated `<field>-` removal keys, zero-byte file
+  parts, LWSP around `=` in the boundary parameter.
+
+### Added
+
+- **Admin UI: a `scale` input for fixed-mode number fields** in the schema editor.
+  Together with the multipart fix, fixed-point (money) fields are now fully usable from
+  the admin UI — creatable in the editor and editable in the record drawer, file uploads
+  included.
+
+### Changed
+
+- **`min`/`max` on text and number fields are now enforced** on record writes
+  (`validation_min` / `validation_max`; text length in unicode codepoints; bounds
+  inclusive). Pre-existing records that violate their declared bounds will fail
+  full-record re-saves until corrected. Date `min`/`max` and text `pattern` remain
+  accepted-but-unenforced — see [Known limitations](./known-limitations).
+- **Multipart input semantics:** an empty value clears an optional non-text field to
+  `null`; a single occurrence of a multi-value field wraps into a one-element array;
+  repeated non-file keys are preserved as arrays instead of being dropped.
+
 ## [0.2.0] - 2026-06-10
 
 ### Added
