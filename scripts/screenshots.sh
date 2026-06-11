@@ -31,7 +31,12 @@
 #   - Node/npm via mise (the repo mise.toml pins node) for the example frontends
 #
 # USAGE:
-#   ./scripts/screenshots.sh
+#   ./scripts/screenshots.sh [all|dashboard|admin|examples]
+#
+#   all (default)  every screenshot
+#   dashboard      admin-dashboard.png only
+#   admin          the admin-UI tutorial flow (admin-*.png minus the dashboard)
+#   examples       the example frontends (example-*.png)
 #
 # Everything runs against throwaway data dirs under a mktemp work dir which is
 # removed at the end — the repo-root ./zb_data is never touched and nothing
@@ -39,6 +44,13 @@
 # killed on exit.
 
 set -euo pipefail
+
+STAGE="${1:-all}"
+case "$STAGE" in
+  all|dashboard|admin|examples) ;;
+  *) echo "usage: $0 [all|dashboard|admin|examples]" >&2; exit 1 ;;
+esac
+run_stage() { [ "$STAGE" = all ] || [ "$STAGE" = "$1" ]; }
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -105,12 +117,13 @@ mkdir -p "$OUT_DIR"
 # ---------------------------------------------------------------------------
 # Sample photo for the tutorial's file upload (stand-in for bay1.jpg).
 # ---------------------------------------------------------------------------
+PHOTO="$WORK/bay1.jpg"
+if run_stage admin; then
 if ! PY -c "import PIL" >/dev/null 2>&1; then
   echo "==> Installing Pillow (needed for the generated sample photo)"
   mise exec python@3.13 -- pip install pillow
 fi
 
-PHOTO="$WORK/bay1.jpg"
 cat > "$WORK/gen_photo.py" <<'PYEOF'
 """Generate a pleasant 1200x800 dusk-over-fairway gradient JPEG."""
 import sys
@@ -135,16 +148,20 @@ Image.frombytes("RGB", (W, H), b"".join(rows)).save(path, "JPEG", quality=88)
 print("generated", path)
 PYEOF
 PY "$WORK/gen_photo.py" "$PHOTO"
+fi  # run_stage admin
 
 # ---------------------------------------------------------------------------
 # Build the stock server once (used by the dashboard + tutorial captures).
 # ---------------------------------------------------------------------------
+if run_stage dashboard || run_stage admin; then
 echo "==> Building server (zig build)"
 ZIG build
+fi
 
 # ===========================================================================
 # PART 0 — admin-dashboard.png (existing posts/authors/comments demo seed)
 # ===========================================================================
+if run_stage dashboard; then
 echo "==> [dashboard] Starting stock server"
 DASH_PORT="${PORT:-$(pick_port)}"
 DASH_DATA="$WORK/dash_data"
@@ -224,11 +241,13 @@ PYEOF
 PY "$CAPTURE" "http://127.0.0.1:$DASH_PORT" "$OUT_DIR/admin-dashboard.png"
 
 stop_server "$DASH_PID"
+fi  # run_stage dashboard
 
 # ===========================================================================
 # PART A — admin UI tutorial flow (fresh data dir, the golfsim schema is
 # built by ACTUALLY DRIVING the schema editor / records UI).
 # ===========================================================================
+if run_stage admin; then
 echo "==> [tutorial] Starting stock server with a fresh data dir"
 TUT_PORT="$(pick_port)"
 TUT_DATA="$WORK/tutorial_data"
@@ -345,6 +364,8 @@ with sync_playwright() as p:
     add_field("title", "text", required=True)
     row = add_field("price_per_hour", "number")
     row.locator('[data-test="opt-mode"]').select_option("fixed")
+    # the scale input only renders once mode=fixed is selected
+    row.locator('[data-test="opt-scale"]').fill("2")
     row = add_field("status", "select")
     row.locator('[data-test="opt-values"]').fill("draft,published,archived")
     row = add_field("simulator", "relation")
@@ -366,17 +387,6 @@ with sync_playwright() as p:
         page.uncheck(f'[data-test="lock-{r}"]')  # null (locked) -> "" editable
         page.fill(f'[data-test="rule-{r}"]', v)
     shot("admin-rules-listings.png")
-
-    # The screenshots above show "fixed" (matching the tutorial's curl path),
-    # but the SAVED schema keeps float mode, for two server-side reasons the
-    # UI cannot work around today:
-    #   1. the UI's number options expose only the mode, while fixed requires
-    #      a `scale` of 1..8 — saving would be rejected; and
-    #   2. multipart record saves (any save with a file attached, like the
-    #      photo upload below) coerce decimal form values to JSON floats,
-    #      which fixed-mode fields reject ("Invalid value.").
-    page.click('[data-test="tab-fields"]')
-    page.locator('[data-test="opt-mode"]').select_option("float")
     save_collection()
 
     # --- 6. sign up an end user via the public API ------------------------
@@ -440,11 +450,24 @@ with sync_playwright() as p:
 PYEOF
 PY "$CAPTURE_ADMIN" "http://127.0.0.1:$TUT_PORT" "$OUT_DIR" "$PHOTO"
 
+echo "==> [tutorial] Verifying the saved listings schema is fixed/scale-2"
+TUT_SU_TOKEN="$(api_json "$TUT_PORT" "" POST /api/collections/_superusers/auth-with-password \
+  "{\"identity\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" | jget token)"
+api_json "$TUT_PORT" "$TUT_SU_TOKEN" GET /api/collections/listings | PY -c '
+import sys, json
+col = json.load(sys.stdin)
+opts = next(f for f in col["schema"] if f["name"] == "price_per_hour")["options"]
+assert opts.get("mode") == "fixed" and opts.get("scale") == 2, opts
+print("OK: listings.price_per_hour options =", opts)
+'
+
 stop_server "$TUT_PID"
+fi  # run_stage admin
 
 # ===========================================================================
 # PART B — example frontends (blog, golfsim, plugins)
 # ===========================================================================
+if run_stage examples; then
 CAPTURE_EXAMPLES="$WORK/capture_examples.py"
 cat > "$CAPTURE_EXAMPLES" <<'PYEOF'
 """Capture the example frontends. argv: mode base outdir [email password]"""
@@ -651,6 +674,7 @@ plug_post "{\"title\":\"Draft: roadmap notes\",\"author\":\"$A2\",\"status\":\"d
 echo "==> [plugins] Capturing"
 PY "$CAPTURE_EXAMPLES" plugins "http://127.0.0.1:$PLUG_PORT" "$OUT_DIR"
 stop_server "$PLUG_PID"
+fi  # run_stage examples
 
-echo "==> Done. Screenshots written to $OUT_DIR:"
+echo "==> Done ($STAGE). Screenshots written to $OUT_DIR:"
 ls -1 "$OUT_DIR"
