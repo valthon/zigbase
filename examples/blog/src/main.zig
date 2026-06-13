@@ -103,9 +103,23 @@ fn ping(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
     return .{ .status = 200, .body = "{\"pong\":true}" };
 }
 
+/// True iff `s` is a non-empty slug of only [A-Za-z0-9-]. We validate the path
+/// param BEFORE interpolating it into a filter string, so a crafted slug can't
+/// inject filter syntax (e.g. `' || status = 'draft`). Slugs we generate match
+/// this set, so a legitimate request never trips it.
+fn isSafeSlug(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+    }
+    return true;
+}
+
 /// GET /api/blog/posts/:slug — return a single published post by slug.
 fn getPostBySlug(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
     const slug = ev.ctx.param("slug") orelse return .{ .status = 404, .body = "{\"message\":\"not found\"}" };
+    // Reject anything that isn't a clean slug before it reaches the filter.
+    if (!isSafeSlug(slug)) return .{ .status = 400, .body = "{\"message\":\"invalid slug\"}" };
     var r = try ev.reader();
     defer r.deinit();
     const data = r.data();

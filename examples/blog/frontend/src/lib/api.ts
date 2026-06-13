@@ -87,7 +87,9 @@ export async function createPost(title: string, body: string): Promise<Post> {
  */
 export function subscribePosts(onEvent: (ev: RealtimeEvent) => void): () => void {
   if (typeof WebSocket === 'undefined') return () => {};
-  const ws = new WebSocket(`ws://${location.host}/api/realtime`);
+  // Pick ws/wss to match the page protocol so realtime works behind HTTPS.
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/api/realtime`);
   ws.addEventListener('open', () => {
     ws.send(JSON.stringify({ action: 'subscribe', topic: 'posts', filter: "status = 'published'" }));
   });

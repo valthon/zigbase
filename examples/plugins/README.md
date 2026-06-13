@@ -50,9 +50,14 @@ configures in code:
    run once each (recorded in `_migrations`):
    - `0001_create_audit_log` — creates a `plugin_audit_log` side table outside
      the comptime-managed schema (the classic escape hatch).
-   - `0002_seed_status_index` — a more realistic multi-statement migration:
-     creates `idx_posts_status` (speeds up the cron filter) **and** seeds a
-     metadata row in the same transaction.
+   - `0002_index_audit_note` — a more realistic multi-statement migration:
+     creates `idx_audit_note` on `plugin_audit_log` **and** seeds a metadata row
+     in the same transaction. It targets the **migration-owned** table on
+     purpose: comptime `.collections` names each collection's SQLite columns by
+     its *stable field id* (8-char hex), not the human field name, so a raw
+     migration like `CREATE INDEX ... ON posts (status)` fails — there is no
+     literal `status` column. Raw SQL migrations should target tables the
+     migration itself owns (or resolve the field id first).
 
 5. **`onError` handler** via `.onError`. Receives `*zigbase.ErrorEvent` with
    `.phase` (`.request` / `.before_hook` / `.after_hook` / `.cron` / `.job` /

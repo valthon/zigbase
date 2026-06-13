@@ -54,6 +54,9 @@ fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
         else => return error.ListingRequired,
     };
     if (listing_id.len == 0) return error.ListingRequired;
+    // listing_id is interpolated into the overlap filter below; reject anything
+    // that isn't a clean record id so it can't inject filter syntax (-> 400).
+    if (!isSafeId(listing_id)) return error.InvalidListingId;
 
     // Read RELATED data through the curated facade: the listing must exist and be
     // bookable. `findById` returns null for both an unknown collection and a
@@ -120,6 +123,8 @@ fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
 
     const id = ev.ctx.param("id") orelse
         return .{ .status = 400, .body = "{\"message\":\"Missing booking id.\"}" };
+    // Validate the id before it touches any query (defense-in-depth + consistency).
+    if (!isSafeId(id)) return .{ .status = 400, .body = "{\"message\":\"Invalid booking id.\"}" };
 
     // The caller's auth id (empty string when unauthenticated — the .authed
     // constraint already rejects anonymous callers, but we guard defensively).
@@ -183,6 +188,7 @@ fn cancelBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
 
     const id = ev.ctx.param("id") orelse
         return .{ .status = 400, .body = "{\"message\":\"Missing booking id.\"}" };
+    if (!isSafeId(id)) return .{ .status = 400, .body = "{\"message\":\"Invalid booking id.\"}" };
 
     const caller_id = ev.rctx.resolveMacro("@request.auth.id") orelse "";
 
@@ -219,6 +225,9 @@ fn cancelBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
 fn listingAvailability(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
     const id = ev.ctx.param("id") orelse
         return .{ .status = 400, .body = "{\"message\":\"Missing listing id.\"}" };
+    // The id is interpolated into the filter below — validate it first so a
+    // crafted id cannot inject filter syntax.
+    if (!isSafeId(id)) return .{ .status = 400, .body = "{\"message\":\"Invalid listing id.\"}" };
 
     var r = try ev.reader();
     defer r.deinit();
@@ -353,6 +362,19 @@ fn prepareReview(ev: *zigbase.RecordEvent) anyerror!void {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// True iff `s` is a non-empty record id of only [A-Za-z0-9]. ZigBase record ids
+/// are alphanumeric, so validating BEFORE interpolating an id into a filter
+/// string (or even a parameterized lookup) closes the filter-injection footgun:
+/// a crafted id like `x" || status != "cancelled` can never reach the filter.
+/// Routes reject a bad id with 400; hooks reject the write with an error (-> 400).
+fn isSafeId(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!std.ascii.isAlphanumeric(c)) return false;
+    }
+    return true;
+}
 
 fn stringField(map: *const std.json.ObjectMap, name: []const u8) ?[]const u8 {
     return switch (map.get(name) orelse return null) {

@@ -65,7 +65,8 @@ function PhotoGallery({ listing, canUpload, onUploaded }: {
   const photos = listing.photos ?? [];
 
   async function upload(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(e.target.files ?? []);
+    const input = e.target;
+    const files = Array.from(input.files ?? []);
     if (!files.length) return;
     setBusy(true); setErr(null);
     try {
@@ -75,6 +76,8 @@ function PhotoGallery({ listing, canUpload, onUploaded }: {
       setErr(ex instanceof Error ? ex.message : String(ex));
     } finally {
       setBusy(false);
+      // Reset the input so selecting the SAME file again still fires onChange.
+      input.value = '';
     }
   }
 

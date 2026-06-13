@@ -9,21 +9,22 @@ export default function PostList() {
     // Initial fetch
     listPosts().then(setPosts).catch((e) => setError(e.message));
 
-    // Realtime updates: subscribe to published post events
+    // Realtime updates: subscribe to published post events. The subscription is
+    // filtered to status = 'published' server-side, so any record we receive is
+    // one that should appear in the list (delete events are id-only).
     const unsub = subscribePosts((ev) => {
       setPosts((prev) => {
         if (!prev) return prev;
-        if (ev.action === 'create') {
-          // Prepend new post (sorted by newest first)
-          return [ev.record, ...prev];
-        }
-        if (ev.action === 'update') {
-          return prev.map((p) => (p.id === ev.record.id ? ev.record : p));
-        }
         if (ev.action === 'delete') {
           return prev.filter((p) => p.id !== ev.record.id);
         }
-        return prev;
+        // create OR update: upsert by id. Dedupe so a create that races the
+        // initial fetch (or an update for a post already shown) never produces
+        // duplicate React keys; replace in place if present, else prepend.
+        if (prev.some((p) => p.id === ev.record.id)) {
+          return prev.map((p) => (p.id === ev.record.id ? ev.record : p));
+        }
+        return [ev.record, ...prev];
       });
     });
 

@@ -23,8 +23,11 @@
 //!
 //!   4. EXPLICIT MIGRATIONS via `.migrations` — two `zigbase.Migration` entries:
 //!      - `0001_create_audit_log`: creates a side table via `w.exec`.
-//!      - `0002_seed_status_index`: multi-statement migration — creates an index
-//!        AND seeds a metadata row (DDL + DML in one transaction).
+//!      - `0002_index_audit_note`: multi-statement migration — creates an index
+//!        on the migration-owned `plugin_audit_log` table AND seeds a metadata
+//!        row (DDL + DML in one transaction). Targets a migration-owned table
+//!        because comptime-provisioned collection columns are id-named, not
+//!        field-name-named (see the note on `addAuditNoteIndex`).
 //!
 //!   5. `onError` HANDLER — `.onError = handleError`, receiving a
 //!      `*zigbase.ErrorEvent` whose `.phase` field identifies where the error
@@ -309,29 +312,41 @@ fn createAuditLog(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror
 // 4b. Migration 0002 — multi-statement migration: index + seeded metadata row.
 //
 //     A more realistic migration demonstrating two statements in one `up` call:
-//       (a) Creates an index on the auto-provisioned `posts` table to speed up
-//           the "published" filter used by the audit-sweep cron job.
+//       (a) Creates an index on the `plugin_audit_log` table (created by 0001).
 //       (b) Seeds a metadata row into plugin_audit_log so operators can confirm
 //           this migration ran by inspecting the table.
+//
+//     CRITICAL LESSON — raw SQL migrations and comptime collections:
+//       A migration is hand-written SQL, so it can only safely reference columns
+//       whose names it KNOWS. The comptime `.collections` provisioner names each
+//       collection's SQLite columns by its STABLE FIELD ID (an 8-char hex string
+//       from `stableFieldId`), NOT by the human-readable field name. So a posts
+//       row's "status" lives in a column like "a1b2c3d4" — there is no literal
+//       `status` column, and `CREATE INDEX ... ON posts (status)` fails with
+//       ExecFailed, aborting startup. The safe target for a raw migration is a
+//       table the MIGRATION ITSELF owns (here `plugin_audit_log`, whose column
+//       names we chose), where the names are known. (To index a provisioned
+//       column you would have to resolve its field id first.)
 //
 //     Both statements run inside the single transaction that ZigBase opens
 //     around every migration's `up` call — either both succeed or neither does.
 // ---------------------------------------------------------------------------
-fn addPostStatusIndex(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void {
+fn addAuditNoteIndex(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void {
     _ = alloc;
     _ = io;
 
-    // (a) Index on the `status` column — speeds up the audit-sweep filter.
-    //     IF NOT EXISTS is defensive; ZigBase already guards against re-runs.
+    // (a) Index on plugin_audit_log.note — a migration-owned table, so the
+    //     column name is known. IF NOT EXISTS is defensive; ZigBase already
+    //     guards against re-runs.
     try w.exec(
-        \\CREATE INDEX IF NOT EXISTS idx_posts_status
-        \\  ON posts (status);
+        \\CREATE INDEX IF NOT EXISTS idx_audit_note
+        \\  ON plugin_audit_log (note);
     );
 
     // (b) Seed a bootstrapping audit row for operator visibility.
     try w.exec(
         \\INSERT INTO plugin_audit_log(note)
-        \\  VALUES ('schema v2: idx_posts_status created');
+        \\  VALUES ('schema v2: idx_audit_note created');
     );
 }
 
@@ -412,7 +427,7 @@ pub fn main(init: std.process.Init) !void {
         //    exactly once, in id order, inside an individual transaction.
         .migrations = &[_]zigbase.Migration{
             .{ .id = "0001_create_audit_log", .up = createAuditLog },
-            .{ .id = "0002_seed_status_index", .up = addPostStatusIndex },
+            .{ .id = "0002_index_audit_note", .up = addAuditNoteIndex },
         },
 
         // 5. onError handler — logs phase + message for every caught error.
