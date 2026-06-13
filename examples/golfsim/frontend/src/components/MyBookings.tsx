@@ -1,16 +1,61 @@
 import { useEffect, useState } from 'react';
 import {
-  myBookings, cancelBooking,
+  myBookings, cancelBooking, createReview,
   subscribeBookings, token,
   type Booking, type RealtimeEvent,
 } from '../lib/api';
 import Auth from './Auth';
 
 // ---------------------------------------------------------------------------
+// ReviewForm — leave a rating + note for a CONFIRMED booking. The backend's
+// prepareReview hook re-checks ownership + confirmed status, so this is a
+// convenience UI, not the source of truth.
+// ---------------------------------------------------------------------------
+function ReviewForm({ bookingId, onDone }: { bookingId: string; onDone: () => void }) {
+  const [rating, setRating] = useState(5);
+  const [body, setBody] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  async function submit() {
+    setErr(null);
+    try {
+      await createReview(bookingId, rating, body);
+      setDone(true);
+      onDone();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  if (done) return <p className="muted" style={{ fontSize: '0.85rem' }}>Review submitted. Thanks!</p>;
+  return (
+    <div style={{ marginTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+      <label style={{ fontSize: '0.85rem' }}>
+        Rating:{' '}
+        <select value={rating} onChange={(e) => setRating(Number(e.target.value))}>
+          {[5, 4, 3, 2, 1].map((n) => <option key={n} value={n}>{n} ★</option>)}
+        </select>
+      </label>
+      <textarea
+        placeholder="How was your session?"
+        value={body}
+        onChange={(e) => setBody(e.target.value)}
+        rows={2}
+        style={{ width: '100%' }}
+      />
+      <button onClick={submit}>Submit review</button>
+      {err && <p className="error">{err}</p>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // BookingCard — a single booking with action buttons.
 // ---------------------------------------------------------------------------
 function BookingCard({ booking, onReload }: { booking: Booking; onReload: () => void }) {
   const [err, setErr] = useState<string | null>(null);
+  const [showReview, setShowReview] = useState(false);
 
   async function cancel() {
     setErr(null);
@@ -35,7 +80,14 @@ function BookingCard({ booking, onReload }: { booking: Booking; onReload: () => 
             Cancel booking
           </button>
         )}
+        {/* Review: only for confirmed bookings (the backend enforces this too) */}
+        {booking.status === 'confirmed' && !showReview && (
+          <button onClick={() => setShowReview(true)}>Leave a review</button>
+        )}
       </div>
+      {showReview && (
+        <ReviewForm bookingId={booking.id} onDone={() => setShowReview(false)} />
+      )}
       {err && <p className="error">{err}</p>}
     </article>
   );

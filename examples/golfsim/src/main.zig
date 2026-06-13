@@ -21,8 +21,11 @@
 //!      expires stale pending holds.
 //!   6. A trivial public smoke route `GET /api/golfsim/health`.
 //!   7. A file-upload logger `onFileUpload` that records every upload.
+//!   8. A validating `before_create` hook on `reviews` that stamps the author
+//!      from the authenticated identity and enforces the review gate (you may
+//!      only review your OWN booking, and only once it is `confirmed`).
 //!
-//! The collections (users / simulators / listings / bookings) are
+//! The five collections (users / simulators / listings / bookings / reviews) are
 //! provisioned at COMPTIME via `.collections` in the App config — the schema is
 //! set up automatically at startup (additive auto-migration). The Astro + React
 //! frontend in `frontend/` is served at the root path via the comptime-hardcoded
@@ -300,6 +303,54 @@ fn logFileUpload(ev: *zigbase.events.FileEvent) void {
 }
 
 // ---------------------------------------------------------------------------
+// 8. Validating before_create hook on `reviews`.
+//
+//    Signature: fn(*zigbase.RecordEvent) anyerror!void. Like `prepareBooking`,
+//    record mutations MUST allocate with `ev.arena`. This hook (a) stamps the
+//    review's `author` from the authenticated identity (server-authoritative —
+//    a client cannot review *as* someone else), and (b) enforces the review
+//    gate: you may only review a booking that EXISTS, was made by YOU (you were
+//    the guest), and is already `confirmed` (you can't review a pending hold or
+//    a session that never happened). Any violation returns an error -> HTTP 400.
+// ---------------------------------------------------------------------------
+fn prepareReview(ev: *zigbase.RecordEvent) anyerror!void {
+    if (ev.record.* != .object) return error.InvalidReview;
+    const rec = &ev.record.object;
+
+    // The review must reference the booking it is about.
+    const booking_id = switch (rec.get("booking") orelse return error.BookingRequired) {
+        .string => |s| s,
+        else => return error.BookingRequired,
+    };
+    if (booking_id.len == 0) return error.BookingRequired;
+
+    // Resolve the authenticated identity (server-authoritative author).
+    var author_id: ?[]const u8 = null;
+    if (ev.ctx.auth) |auth| if (auth == .object) {
+        if (auth.object.get("id")) |idv| if (idv == .string) {
+            author_id = idv.string;
+        };
+    };
+    const author = author_id orelse return error.Unauthenticated;
+
+    // The referenced booking must exist (null = unknown collection or missing).
+    const booking = (try ev.data.findById("bookings", booking_id)) orelse return error.BookingNotFound;
+    if (booking != .object) return error.BookingNotFound;
+
+    // Gate 1: the booking must belong to THIS author (they were the guest).
+    const guest = stringField(&booking.object, "guest") orelse return error.BookingNotYours;
+    if (!std.mem.eql(u8, guest, author)) return error.BookingNotYours;
+
+    // Gate 2: only a CONFIRMED booking (a completed session) may be reviewed.
+    const status = stringField(&booking.object, "status") orelse return error.BookingNotConfirmed;
+    if (!std.mem.eql(u8, status, "confirmed")) return error.BookingNotConfirmed;
+
+    // Stamp the author from the identity (overwriting any client-supplied value).
+    const author_dup = try ev.arena.dupe(u8, author);
+    try rec.put(ev.arena, "author", .{ .string = author_dup });
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -361,6 +412,103 @@ pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{
         .hooks = .{
             .bookings = .{ .beforeCreate = prepareBooking },
+            .reviews = .{ .beforeCreate = prepareReview },
+        },
+        .routes = .{
+            .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
+            .{ .method = .POST, .path = "/api/bookings/:id/cancel", .handler = cancelBooking, .auth = .authed },
+            .{ .method = .GET, .path = "/api/listings/:id/availability", .handler = listingAvailability, .auth = .authed },
+            .{ .method = .GET, .path = "/api/golfsim/health", .handler = health, .auth = .public },
+        },
+        .jobs = .{ .pool_size = 2 },
+        .cron = .{
+            .{
+                .name = "expire-holds",
+                .schedule = zigbase.schedule.Schedule{ .interval = .{ .minutes = 15 } },
+                .handler = expireHolds,
+            },
+        },
+        // Fires after every successful file upload (e.g. a listing photo).
+        .onFileUpload = logFileUpload,
+        // Comptime-hardcoded static dir: the Astro frontend in frontend/dist is
+        // served at the root path, no flag needed (and --serve-static is rejected).
+        .static_files = .{ .dir = "frontend/dist" },
+        // The schema the hooks/route/cron reference, provisioned at startup.
+        // Mirrors the runtime-provisioning recipe in docs/recipes.md.
+        .collections = .{
+            .users = .{
+                .type = .auth,
+                .fields = .{
+                    .{ .name = "name", .type = .text, .max = 100 },
+                },
+                .rules = .{ .list = "", .view = "", .create = "", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
+            },
+            .simulators = .{
+                .fields = .{
+                    .{ .name = "label", .type = .text, .required = true, .max = 120 },
+                    .{ .name = "owner", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+                },
+                // NOTE: any authed user can create a simulator (become a host) — deliberately
+                // simple for a demo; restrict with a role/claim check in a real app.
+                .rules = .{ .list = "", .view = "", .create = "@request.auth.id != \"\"", .update = "@request.auth.id = owner", .delete = "@request.auth.id = owner" },
+            },
+            .listings = .{
+                .fields = .{
+                    .{ .name = "title", .type = .text, .required = true, .max = 140 },
+                    .{ .name = "price_per_hour", .type = .number, .required = true },
+                    .{ .name = "status", .type = .select, .required = true, .values = .{ "draft", "published", "archived" } },
+                    .{ .name = "simulator", .type = .relation, .target = "simulators", .required = true, .cascadeDelete = true },
+                    // Up to six listing photos; uploaded via multipart on record create/update
+                    // and served from GET /api/files/listings/:id/:name.
+                    .{ .name = "photos", .type = .file, .maxSelect = 6, .maxSize = 5242880, .mimeTypes = .{ "image/png", "image/jpeg", "image/webp" } },
+                },
+                .rules = .{
+                    .list = "status = \"published\"",
+                    .view = "status = \"published\" || @request.auth.id = simulator.owner",
+                    .create = "@request.auth.id != \"\"",
+                    .update = "@request.auth.id = simulator.owner",
+                    .delete = "@request.auth.id = simulator.owner",
+                },
+            },
+            .bookings = .{
+                .fields = .{
+                    .{ .name = "listing", .type = .relation, .target = "listings", .required = true, .cascadeDelete = true },
+                    .{ .name = "guest", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+                    .{ .name = "starts_at", .type = .date, .required = true },
+                    .{ .name = "ends_at", .type = .date, .required = true },
+                    .{ .name = "price_total", .type = .number },
+                    .{ .name = "status", .type = .select, .values = .{ "pending", "confirmed", "cancelled" } },
+                },
+                .rules = .{
+                    .list = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner",
+                    .view = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner",
+                    .create = "@request.auth.id != \"\"",
+                    .update = "@request.auth.id = listing.simulator.owner",
+                    .delete = "@request.auth.id = guest",
+                },
+            },
+            // The FIFTH comptime collection. Provisioning five collections / ~19 fields
+            // exceeds Zig's *default* comptime branch quota inside the framework's
+            // `.collections` lowering; ZigBase raises its own quota (see
+            // provision.buildCollections), so a rich schema like this lowers cleanly.
+            .reviews = .{
+                .fields = .{
+                    .{ .name = "booking", .type = .relation, .target = "bookings", .required = true, .cascadeDelete = true },
+                    .{ .name = "author", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+                    .{ .name = "rating", .type = .number, .mode = .int, .min = 1, .max = 5 },
+                    .{ .name = "body", .type = .text, .max = 2000 },
+                },
+                // Reviews are public to read; the prepareReview hook enforces that only
+                // the booking's guest (after a confirmed session) may create one, and
+                // an author may edit/delete only their own review.
+                .rules = .{
+                    .list = "",
+                    .view = "",
+                    .create = "@request.auth.id != \"\"",
+                    .update = "@request.auth.id = author",
+                    .delete = "@request.auth.id = author",
+                },
+            },
         },
     }).runCli(init);
 }

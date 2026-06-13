@@ -55,6 +55,27 @@ Record mutations that enter `ev.record` **must** allocate with `ev.arena`
 (the request-scoped allocator that owns `ev.record`), never `ev.app.allocator`.
 Returning any error rejects the write → HTTP 400 to the client.
 
+#### `prepareReview` — `beforeCreate` on `reviews`
+
+A second invariant hook gates who may leave a review. It stamps the `author`
+from the authenticated identity (server-authoritative) and rejects the write
+unless the referenced booking exists, was made by *this* author (they were the
+`guest`), and is already `confirmed` — you can't review someone else's booking,
+or a session that hasn't happened:
+
+```zig
+fn prepareReview(ev: *zigbase.RecordEvent) anyerror!void {
+    const booking = (try ev.data.findById("bookings", booking_id)) orelse
+        return error.BookingNotFound;
+    // gate 1: the booking must be the caller's own
+    if (!std.mem.eql(u8, guest, author)) return error.BookingNotYours;     // -> 400
+    // gate 2: only a CONFIRMED (completed) session may be reviewed
+    if (!std.mem.eql(u8, status, "confirmed")) return error.BookingNotConfirmed; // -> 400
+    // stamp author from the identity (overwriting any client-supplied value)
+    try rec.put(ev.arena, "author", .{ .string = try ev.arena.dupe(u8, author) });
+}
+```
+
 ---
 
 ### 2. Custom business routes
@@ -172,18 +193,12 @@ Real DB access inside a background job: acquire the pooled writer, wrap it in a
 | `simulators` | base | `label`, `owner` → users |
 | `listings` | base | `title`, `price_per_hour`, `status` (draft/published/archived), `simulator` → simulators, `photos` (file ×6) |
 | `bookings` | base | `listing`, `guest`, `starts_at`, `ends_at`, `price_total`, `status` (pending/confirmed/cancelled) |
+| `reviews` | base | `booking` → bookings, `author` → users, `rating` (int 1–5), `body` (text) |
 
-All collections are provisioned at startup via comptime `.collections` — no
-manual API calls needed.
-
-### Known limitation — comptime collection count
-
-This example provisions **four** comptime collections. Adding a fifth (e.g. a
-`reviews` collection) currently exceeds Zig's default comptime branch quota inside
-the framework's `.collections` lowering; there is no consumer-side
-`@setEvalBranchQuota` workaround (it does not propagate into the framework's
-lazily-evaluated `App.collections` decl), so a fifth collection would need the
-framework to raise its own quota (or runtime/REST provisioning).
+All five collections are provisioned at startup via comptime `.collections` — no
+manual API calls needed. (Lowering a schema this size FNV-hashes every collection
++ field name at comptime, which would exceed Zig's default branch quota; ZigBase
+raises its own quota in `provision.buildCollections`, so it just works.)
 
 ---
 
@@ -210,8 +225,8 @@ RAII helpers in routes: `ev.writer()` (write) / `try ev.reader()` (read-only).
 - **`ListingsBrowser`** — sign in, browse listings with photo gallery, check
   availability (lazy via `/api/listings/:id/availability`), book a slot, upload
   photos via multipart/form-data.
-- **`MyBookings`** — view bookings, cancel pending/confirmed bookings;
-  live-updates via realtime WebSocket.
+- **`MyBookings`** — view bookings, cancel pending/confirmed bookings, leave a
+  rating + review on a confirmed booking; live-updates via realtime WebSocket.
 - **`Auth`** — email/password sign-in + sign-up.
 
 ---

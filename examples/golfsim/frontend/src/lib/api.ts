@@ -28,6 +28,15 @@ export type AvailabilitySlot = {
   status: string;
 };
 
+export type Review = {
+  id: string;
+  booking: string;
+  author: string;
+  rating: number;
+  body: string;
+  created: string;
+};
+
 export function token(): string | null {
   if (typeof localStorage === 'undefined') return null;
   return localStorage.getItem(TOKEN_KEY);
@@ -122,6 +131,15 @@ export async function uploadListingPhotos(listingId: string, files: File[]): Pro
 /** Build a URL for a stored listing photo. Published listings serve directly. */
 export function photoUrl(listingId: string, filename: string): string {
   return `/api/files/listings/${listingId}/${filename}`;
+}
+
+export async function createReview(bookingId: string, rating: number, body: string): Promise<Review> {
+  // The prepareReview beforeCreate hook stamps the author from the auth token and
+  // enforces that the booking is the caller's own AND confirmed (else HTTP 400).
+  return req('/api/collections/reviews/records', {
+    method: 'POST',
+    body: JSON.stringify({ booking: bookingId, rating, body }),
+  });
 }
 
 // ---------------------------------------------------------------------------
