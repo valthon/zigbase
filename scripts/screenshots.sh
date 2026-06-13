@@ -56,7 +56,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 OUT_DIR="$REPO_ROOT/site/src/assets/screenshots"
-JWT_SECRET="${ZIGBASE_JWT_SECRET:-devsecret}"
+# Secret must be >= 32 bytes (enforced since the security hardening in #8). The
+# value is throwaway — it only has to be consistent between `superuser create`
+# and `serve`, and long enough to pass the strength check.
+JWT_SECRET="${ZIGBASE_JWT_SECRET:-screenshots-dev-secret-not-for-production-use}"
 EMAIL="admin@example.com"
 PASSWORD='Password123!'
 
@@ -170,7 +173,7 @@ ZIGBASE_JWT_SECRET="$JWT_SECRET" ./zig-out/bin/zigbase superuser create \
   --email "$EMAIL" --password "$PASSWORD" --data-dir "$DASH_DATA"
 
 ZIGBASE_JWT_SECRET="$JWT_SECRET" ./zig-out/bin/zigbase serve \
-  --http-port "$DASH_PORT" --data-dir "$DASH_DATA" &
+  --http-port "$DASH_PORT" --data-dir "$DASH_DATA" --insecure-cookies &
 DASH_PID=$!
 PIDS+=("$DASH_PID")
 wait_health "$DASH_PORT"
@@ -256,7 +259,7 @@ ZIGBASE_JWT_SECRET="$JWT_SECRET" ./zig-out/bin/zigbase superuser create \
   --email "$EMAIL" --password "$PASSWORD" --data-dir "$TUT_DATA"
 
 ZIGBASE_JWT_SECRET="$JWT_SECRET" ./zig-out/bin/zigbase serve \
-  --http-port "$TUT_PORT" --data-dir "$TUT_DATA" &
+  --http-port "$TUT_PORT" --data-dir "$TUT_DATA" --insecure-cookies &
 TUT_PID=$!
 PIDS+=("$TUT_PID")
 wait_health "$TUT_PORT"
@@ -295,6 +298,9 @@ with sync_playwright() as p:
     ctx = browser.new_context(viewport={"width": 1280, "height": 800},
                               device_scale_factor=2, color_scheme="light")
     page = ctx.new_page()
+    # Selecting a rule's "public" mode fires a JS confirm() dialog; Playwright
+    # auto-dismisses dialogs unless we explicitly accept them.
+    page.on("dialog", lambda d: d.accept())
 
     def shot(name):
         page.wait_for_timeout(350)  # settle fonts/animations
@@ -344,10 +350,16 @@ with sync_playwright() as p:
     page.select_option('[data-test="col-type"]', "auth")
     add_field("name", "text")
     shot("admin-new-collection-users.png")
-    # Open signup: unlock createRule so it becomes "" (empty = public). New
-    # collections default every rule to locked/null (superuser only).
+    # Rules (three-state select per rule). Open signup => createRule PUBLIC
+    # (the "@public" sentinel); list/view also public so the app can read users;
+    # update/delete are self-only expressions. New collections default every
+    # rule to Locked/null (superuser only).
     page.click('[data-test="tab-rules"]')
-    page.uncheck('[data-test="lock-createRule"]')
+    for r in ("listRule", "viewRule", "createRule"):
+        page.select_option(f'[data-test="rulemode-{r}"]', "public")
+    for r in ("updateRule", "deleteRule"):
+        page.select_option(f'[data-test="rulemode-{r}"]', "expr")
+        page.fill(f'[data-test="rule-{r}"]', "@request.auth.id = id")
     save_collection()
 
     # --- 3. simulators (base) — needed for listings' relation dropdown ---
@@ -384,7 +396,8 @@ with sync_playwright() as p:
         "deleteRule": '@request.auth.id = simulator.owner',
     }
     for r, v in rules.items():
-        page.uncheck(f'[data-test="lock-{r}"]')  # null (locked) -> "" editable
+        # null (Locked) -> Expression mode reveals the rule input, then fill it.
+        page.select_option(f'[data-test="rulemode-{r}"]', "expr")
         page.fill(f'[data-test="rule-{r}"]', v)
     shot("admin-rules-listings.png")
     save_collection()
@@ -557,7 +570,7 @@ ZIGBASE_JWT_SECRET="$JWT_SECRET" "$REPO_ROOT/examples/blog/zig-out/bin/blog" \
 echo "==> [blog] Serving on :$BLOG_PORT (runtime --serve-static mode)"
 (cd "$REPO_ROOT/examples/blog" && exec env ZIGBASE_JWT_SECRET="$JWT_SECRET" \
   ./zig-out/bin/blog serve --http-port "$BLOG_PORT" --data-dir "$BLOG_DATA" \
-  --serve-static frontend/dist) &
+  --serve-static frontend/dist --insecure-cookies) &
 BLOG_PID=$!
 PIDS+=("$BLOG_PID")
 wait_health "$BLOG_PORT"
@@ -593,7 +606,7 @@ ZIGBASE_JWT_SECRET="$JWT_SECRET" "$REPO_ROOT/examples/golfsim/zig-out/bin/golfsi
 # must run with CWD = examples/golfsim.
 echo "==> [golfsim] Serving on :$GOLF_PORT (comptime-hardcoded static dir)"
 (cd "$REPO_ROOT/examples/golfsim" && exec env ZIGBASE_JWT_SECRET="$JWT_SECRET" \
-  ./zig-out/bin/golfsim serve --http-port "$GOLF_PORT" --data-dir "$GOLF_DATA") &
+  ./zig-out/bin/golfsim serve --http-port "$GOLF_PORT" --data-dir "$GOLF_DATA" --insecure-cookies) &
 GOLF_PID=$!
 PIDS+=("$GOLF_PID")
 wait_health "$GOLF_PORT"
@@ -651,7 +664,7 @@ ZIGBASE_JWT_SECRET="$JWT_SECRET" "$REPO_ROOT/examples/plugins/zig-out/bin/plugin
 # Fully embedded static assets: no flag and no CWD dependency.
 echo "==> [plugins] Serving on :$PLUG_PORT (embedded static assets)"
 ZIGBASE_JWT_SECRET="$JWT_SECRET" "$REPO_ROOT/examples/plugins/zig-out/bin/plugins" \
-  serve --http-port "$PLUG_PORT" --data-dir "$PLUG_DATA" &
+  serve --http-port "$PLUG_PORT" --data-dir "$PLUG_DATA" --insecure-cookies &
 PLUG_PID=$!
 PIDS+=("$PLUG_PID")
 wait_health "$PLUG_PORT"

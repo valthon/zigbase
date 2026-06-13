@@ -208,6 +208,10 @@ function SchemaEditor({ name }) {
   const [allCols, setAllCols] = useState([]);
   const [err, setErr] = useState('');
   const [fieldErrs, setFieldErrs] = useState({});
+  // Rules whose mode was explicitly switched to "Expression" but whose value is
+  // still empty. Without this, an empty expression (v === '') derives back to
+  // Locked and the text input never appears, making it impossible to TYPE one.
+  const [exprRules, setExprRules] = useState({});
   useEffect(() => {
     API.collections().then(cs => {
       setAllCols(cs);
@@ -282,19 +286,23 @@ function SchemaEditor({ name }) {
           // per record. Render the three states DISTINCTLY so a wide-open rule can never be set
           // by accident (and confirm before opening one up).
           const isPublic = v === PUBLIC_RULE;
-          const isLocked = v == null || v === '';
+          // An empty value is Locked — UNLESS the user explicitly picked
+          // Expression for this rule (so they can type one into a blank input).
+          const isLocked = (v == null || v === '') && !exprRules[r];
           const mode = isPublic ? 'public' : (isLocked ? 'locked' : 'expr');
           function onMode(e) {
             const m = e.target.value;
-            if (m === 'locked') return setRule(r, null);
+            if (m === 'locked') { setExprRules({ ...exprRules, [r]: false }); return setRule(r, null); }
             if (m === 'public') {
               if (!confirm('Make ' + r + ' PUBLIC?\n\nAnyone on the internet will be able to ' +
                   r.replace('Rule','') + ' records in this collection, with no authentication.')) {
                 return; // leave the select where it was
               }
+              setExprRules({ ...exprRules, [r]: false });
               return setRule(r, PUBLIC_RULE);
             }
-            // switching to expression: seed with the current expression or empty text
+            // switching to expression: keep the input visible even while empty
+            setExprRules({ ...exprRules, [r]: true });
             return setRule(r, (typeof v === 'string' && v !== PUBLIC_RULE && v !== '') ? v : '');
           }
           return html`<div class="field" key=${r}>

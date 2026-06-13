@@ -103,3 +103,30 @@ def test_edit_rules_lock_toggle(page):
     page.click('[data-test=tab-rules]')
     assert page.input_value('[data-test=rulemode-viewRule]') == 'locked'
     assert page.is_visible('[data-test=locktag-viewRule]')
+
+
+def test_edit_rules_expression_from_locked(page):
+    # Regression: selecting "Expression" on a Locked rule must REVEAL the text
+    # input and let you type one. Previously the empty seed value derived back to
+    # Locked, so the input never rendered and an expression could never be set.
+    login(page)
+    api_request(page, "POST", "/api/collections", {"name": "memos", "type": "base", "fields": [{"id": "", "name": "body", "type": "text", "options": {}}]})
+    page.goto("/_/?t=1#/collections/memos")
+    page.wait_for_selector('[data-test=schema-editor]')
+    page.click('[data-test=tab-rules]')
+    # default is Locked; no expression input yet
+    assert page.input_value('[data-test=rulemode-listRule]') == 'locked'
+    assert page.locator('[data-test=rule-listRule]').count() == 0
+    # switch to Expression -> select stays on "expr" and the input appears even while empty
+    page.select_option('[data-test=rulemode-listRule]', 'expr')
+    assert page.input_value('[data-test=rulemode-listRule]') == 'expr'
+    page.wait_for_selector('[data-test=rule-listRule]', timeout=8000)
+    page.fill('[data-test=rule-listRule]', 'status = "published"')
+    page.click('[data-test=save-collection]')
+    page.wait_for_selector('[data-test=records-view]', timeout=8000)
+    # reload editor: the expression persisted and reads back as Expression mode
+    page.goto("/_/?t=2#/collections/memos")
+    page.wait_for_selector('[data-test=schema-editor]', timeout=8000)
+    page.click('[data-test=tab-rules]')
+    assert page.input_value('[data-test=rulemode-listRule]') == 'expr'
+    assert page.input_value('[data-test=rule-listRule]') == 'status = "published"'
