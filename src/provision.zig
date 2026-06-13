@@ -45,6 +45,12 @@ const db = @import("db.zig");
 /// optional `.rules = .{ .list, .view, .create, .update, .delete }`.
 pub fn buildCollections(comptime cfg: anytype) []const schema.Collection {
     comptime {
+        // Lowering walks every collection, field, validation, and FNV id hash at
+        // comptime; a realistic multi-collection schema exceeds Zig's default
+        // 1000 backward-branch budget. Raise it here — a downstream consumer
+        // cannot: @setEvalBranchQuota in their code does not propagate into this
+        // lazily-evaluated framework decl. Scaled generously to fit large schemas.
+        @setEvalBranchQuota(1_000_000);
         const Cfg = @TypeOf(cfg);
         const info = @typeInfo(Cfg);
         if (info != .@"struct") @compileError("collections config must be a struct literal");
@@ -581,6 +587,56 @@ test "buildCollections lowers a literal into collection/field specs" {
 
     // field ids are stable + 8 chars
     try std.testing.expectEqual(@as(usize, 8), listings.fields[0].id.len);
+}
+
+test "buildCollections lowers a large schema without exhausting the comptime branch budget" {
+    // Regression: a realistic consumer schema (here 6 collections, ~30 fields)
+    // must lower at comptime without tripping Zig's default 1000 backward-branch
+    // eval quota. There is no consumer-side workaround (@setEvalBranchQuota in the
+    // caller does not propagate into this lazily-evaluated decl), so buildCollections
+    // must raise its own budget. Keep this above the per-call default to stay a guard.
+    const specs = comptime buildCollections(.{
+        .users = .{ .type = .auth, .fields = .{
+            .{ .name = "display_name", .type = .text },
+            .{ .name = "bio", .type = .text },
+            .{ .name = "avatar", .type = .file },
+        } },
+        .listings = .{ .fields = .{
+            .{ .name = "title", .type = .text, .required = true },
+            .{ .name = "summary", .type = .text },
+            .{ .name = "price", .type = .number, .mode = .fixed, .scale = 2 },
+            .{ .name = "owner", .type = .relation, .target = "users" },
+            .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
+        } },
+        .bookings = .{ .fields = .{
+            .{ .name = "listing", .type = .relation, .target = "listings" },
+            .{ .name = "guest", .type = .relation, .target = "users" },
+            .{ .name = "start_at", .type = .date },
+            .{ .name = "end_at", .type = .date },
+            .{ .name = "price_total", .type = .number, .mode = .fixed, .scale = 2 },
+            .{ .name = "status", .type = .select, .values = .{ "pending", "confirmed", "cancelled" } },
+        } },
+        .reviews = .{ .fields = .{
+            .{ .name = "booking", .type = .relation, .target = "bookings" },
+            .{ .name = "author", .type = .relation, .target = "users" },
+            .{ .name = "rating", .type = .number },
+            .{ .name = "body", .type = .text },
+        } },
+        .comments = .{ .fields = .{
+            .{ .name = "review", .type = .relation, .target = "reviews" },
+            .{ .name = "author", .type = .relation, .target = "users" },
+            .{ .name = "body", .type = .text },
+        } },
+        .audits = .{ .fields = .{
+            .{ .name = "actor", .type = .relation, .target = "users" },
+            .{ .name = "action", .type = .text },
+            .{ .name = "detail", .type = .text },
+            .{ .name = "at", .type = .date },
+        } },
+    });
+    try std.testing.expectEqual(@as(usize, 6), specs.len);
+    try std.testing.expectEqualStrings("audits", specs[5].name);
+    try std.testing.expectEqual(@as(usize, 8), specs[5].fields[0].id.len);
 }
 
 test "stable field ids are deterministic and collision-distinct" {
