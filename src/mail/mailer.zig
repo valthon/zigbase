@@ -175,6 +175,14 @@ pub const SmtpMailer = struct {
     /// wait for the 220 banner and EHLO; for STARTTLS the banner was already
     /// consumed on the plaintext leg and we only re-EHLO over TLS.
     fn runExchange(self: *SmtpMailer, io: std.Io, alloc: std.mem.Allocator, email: Email, conn: *Conn, comptime starttls_resumed: bool) anyerror!void {
+        // Reject CR/LF/NUL in the envelope BEFORE writing any command: `self.from`
+        // and `email.to` are interpolated into the `MAIL FROM`/`RCPT TO` command
+        // lines, so a newline would let an attacker inject arbitrary SMTP commands
+        // (extra RCPT TO, DATA, etc.). buildMessage performs the same check for the
+        // headers; doing it here too closes the on-the-wire command path.
+        try checkHeaderField(self.from);
+        try checkHeaderField(email.to);
+        try checkHeaderField(email.subject);
         if (!starttls_resumed) {
             // Greeting (implicit TLS and plaintext both see the banner here).
             try expectCode(conn.r, 220);
@@ -345,10 +353,34 @@ const TlsState = struct {
     }
 };
 
+/// Rejecting a header value that would let an attacker inject extra SMTP commands
+/// or additional RFC5322 headers. `to`/`subject`/`from` are interpolated into
+/// single-line headers and the `MAIL FROM`/`RCPT TO` commands, so a CR, LF, or NUL
+/// in them is a header/command-injection vector (e.g. a `to` of
+/// `victim@x\r\nBcc: spam@evil` would add a Bcc). Email addresses and subjects are
+/// often attacker-controlled (signup/password-reset email fields) and this is also
+/// a public plugin entry point (`Mailer.send`), so we sanitize here as a backstop
+/// regardless of upstream validation. The message body is data after the header
+/// separator and may legitimately contain newlines, so it is NOT checked here.
+pub const HeaderError = error{HeaderInjection};
+
+fn hasControlChar(s: []const u8) bool {
+    for (s) |c| if (c == '\r' or c == '\n' or c == 0) return true;
+    return false;
+}
+
+fn checkHeaderField(s: []const u8) HeaderError!void {
+    if (hasControlChar(s)) return error.HeaderInjection;
+}
+
 /// Build the RFC5322 message bytes (headers + blank line + body). Pure: no I/O,
 /// so it can be unit-tested by asserting the produced bytes. The dot-stuffing
 /// terminator (\r\n.\r\n) is appended by the DATA send path, not here.
+/// Returns error.HeaderInjection if `from`/`to`/`subject` contain CR, LF, or NUL.
 pub fn buildMessage(alloc: std.mem.Allocator, from: []const u8, email: Email, now_unix: i64) ![]u8 {
+    try checkHeaderField(from);
+    try checkHeaderField(email.to);
+    try checkHeaderField(email.subject);
     const date = rfc5322Date(now_unix);
     return std.fmt.allocPrint(
         alloc,
@@ -412,6 +444,41 @@ test "buildMessage produces RFC5322 headers and body" {
     try std.testing.expect(std.mem.indexOf(u8, msg, "\r\nContent-Type: text/plain; charset=utf-8\r\n") != null);
     // Header/body separator then the body verbatim.
     try std.testing.expect(std.mem.endsWith(u8, msg, "\r\n\r\nYour token: abc123"));
+}
+
+test "buildMessage rejects CRLF header injection in to/subject/from" {
+    const a = std.testing.allocator;
+    // CRLF in `to` would inject a Bcc header (and a RCPT TO on the wire).
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
+        .to = "victim@x.io\r\nBcc: spam@evil.com",
+        .subject = "Hi",
+        .text_body = "body",
+    }, 0));
+    // CRLF in the subject would inject an arbitrary header.
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
+        .to = "victim@x.io",
+        .subject = "Hi\r\nX-Injected: yes",
+        .text_body = "body",
+    }, 0));
+    // A bare LF and a NUL are equally rejected (in `from`).
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev\nEvil: 1", .{
+        .to = "victim@x.io",
+        .subject = "Hi",
+        .text_body = "body",
+    }, 0));
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
+        .to = "victim@x.io\x00",
+        .subject = "Hi",
+        .text_body = "body",
+    }, 0));
+    // A newline in the BODY is fine (data, not a header).
+    const ok = try buildMessage(a, "noreply@zigbase.dev", .{
+        .to = "victim@x.io",
+        .subject = "Hi",
+        .text_body = "line1\r\nline2",
+    }, 0);
+    defer a.free(ok);
+    try std.testing.expect(std.mem.endsWith(u8, ok, "\r\n\r\nline1\r\nline2"));
 }
 
 test "rfc5322Date formats a known epoch" {
