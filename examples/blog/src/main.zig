@@ -2,10 +2,18 @@
 //!
 //! Comptime schema (provisioned at startup via additive auto-migration):
 //!   - users  (auth collection, open signup, self-only update/delete)
-//!   - posts  (title + server-derived slug + body + status; public list/view
-//!             only when published; authenticated create/update/delete)
+//!   - posts  (title + server-derived slug + body + status + author relation
+//!             + updated_at autodate + reading_time computed; public list/view
+//!             only when published; author-scoped update/delete)
 //!
-//! The `slugify` beforeCreate hook derives a URL slug from the post title.
+//! Hooks on "posts":
+//!   - beforeCreate: slugify + setAuthor + computeReadingTime (chained)
+//!   - beforeUpdate: computeReadingTime
+//!
+//! Custom routes:
+//!   - GET /api/blog/ping            — public health check
+//!   - GET /api/blog/posts/:slug     — fetch a single published post by slug
+//!
 //! The Astro + React frontend in `frontend/` is served via:
 //!   --serve-static frontend/dist
 
@@ -49,10 +57,65 @@ fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
     try ev.record.object.put(ev.arena, "slug", .{ .string = buf[0..len] });
 }
 
+/// Stamp the author field from the authenticated identity.
+fn setAuthor(ev: *zigbase.RecordEvent) anyerror!void {
+    if (ev.record.* != .object) return;
+    if (ev.ctx.auth) |auth| if (auth == .object) {
+        if (auth.object.get("id")) |idv| if (idv == .string) {
+            const uid = try ev.arena.dupe(u8, idv.string);
+            try ev.record.object.put(ev.arena, "author", .{ .string = uid });
+        };
+    };
+}
+
+/// Compute reading_time (minutes) from body word count: ceil(words / 200), minimum 1.
+fn computeReadingTime(ev: *zigbase.RecordEvent) anyerror!void {
+    if (ev.record.* != .object) return;
+    const body_val = ev.record.object.get("body") orelse return;
+    if (body_val != .string) return;
+    const body = body_val.string;
+    // Count words by splitting on whitespace
+    var word_count: usize = 0;
+    var in_word = false;
+    for (body) |c| {
+        if (c == ' ' or c == '\n' or c == '\t' or c == '\r') {
+            in_word = false;
+        } else if (!in_word) {
+            in_word = true;
+            word_count += 1;
+        }
+    }
+    const minutes = if (word_count == 0) 1 else @max(1, (word_count + 199) / 200);
+    try ev.record.object.put(ev.arena, "reading_time", .{ .integer = @intCast(minutes) });
+}
+
+/// before_create chain for posts: slugify -> setAuthor -> computeReadingTime.
+/// The framework accepts one handler per phase; we compose here.
+fn postsBeforeCreate(ev: *zigbase.RecordEvent) anyerror!void {
+    try slugify(ev);
+    try setAuthor(ev);
+    try computeReadingTime(ev);
+}
+
 /// GET /api/blog/ping — a public custom route returning a small JSON body.
 fn ping(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
     _ = ev;
     return .{ .status = 200, .body = "{\"pong\":true}" };
+}
+
+/// GET /api/blog/posts/:slug — return a single published post by slug.
+fn getPostBySlug(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    const slug = ev.ctx.param("slug") orelse return .{ .status = 404, .body = "{\"message\":\"not found\"}" };
+    var r = try ev.reader();
+    defer r.deinit();
+    const data = r.data();
+    const result = try data.list("posts", .{
+        .filter = try std.fmt.allocPrint(ev.ctx.allocator, "slug = '{s}' && status = 'published'", .{slug}),
+        .perPage = 1,
+    });
+    if (result.items.len == 0) return .{ .status = 404, .body = "{\"message\":\"not found\"}" };
+    const json = try std.json.Stringify.valueAlloc(ev.ctx.allocator, result.items[0], .{});
+    return .{ .status = 200, .body = json };
 }
 
 /// An interval job: logs a heartbeat (demonstrates background scheduling).
@@ -62,9 +125,15 @@ fn heartbeat(ev: *zigbase.events.JobEvent) anyerror!void {
 
 pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{
-        .hooks = .{ .posts = .{ .beforeCreate = slugify } },
+        .hooks = .{
+            .posts = .{
+                .beforeCreate = postsBeforeCreate,
+                .beforeUpdate = computeReadingTime,
+            },
+        },
         .routes = .{
             .{ .method = .GET, .path = "/api/blog/ping", .handler = ping, .auth = .public },
+            .{ .method = .GET, .path = "/api/blog/posts/:slug", .handler = getPostBySlug, .auth = .public },
         },
         .jobs = .{ .pool_size = 2 },
         .cron = .{
@@ -86,16 +155,17 @@ pub fn main(init: std.process.Init) !void {
                     .{ .name = "slug", .type = .text, .max = 220 },
                     .{ .name = "body", .type = .text, .max = 20000 },
                     .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
+                    .{ .name = "author", .type = .relation, .target = "users", .maxSelect = 1, .cascadeDelete = false },
+                    .{ .name = "updated_at", .type = .autodate, .onCreate = true, .onUpdate = true },
+                    .{ .name = "reading_time", .type = .number, .mode = .int },
                 },
-                // NOTE: any authed user can edit/delete any post — deliberately simple for a demo.
-                // For per-author restriction, add an author relation field and use
-                // "@request.auth.id = author" in the update/delete rules.
+                // Authors can edit and delete only their own posts.
                 .rules = .{
-                    .list = "status = \"published\"",
-                    .view = "status = \"published\"",
-                    .create = "@request.auth.id != \"\"",
-                    .update = "@request.auth.id != \"\"",
-                    .delete = "@request.auth.id != \"\"",
+                    .list = "status = 'published'",
+                    .view = "status = 'published'",
+                    .create = "@request.auth.id != ''",
+                    .update = "@request.auth.id = author",
+                    .delete = "@request.auth.id = author",
                 },
             },
         },

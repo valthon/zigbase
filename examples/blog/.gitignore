@@ -1,0 +1,4 @@
+node_modules/
+frontend/dist/
+frontend/.astro/
+zb_data/

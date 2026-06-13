@@ -1,24 +1,19 @@
-# ZigBase golfsim example — a realistic app
+# ZigBase golfsim example — a realistic complete app
 
 "**Airbnb for golf simulators**": hosts list golf simulators, guests book time
-slots. This is the **realistic** counterpart to [`examples/blog`](../blog) — where
-the blog example is a bare packaging proof (one slug hook, a literal ping route, a
-log-only cron), `golfsim` exercises the **hard parts** of building a real backend on
-ZigBase *as a library*:
+slots. This is the **middle rung** of a three-example ladder:
 
-1. **A computed + validating `before_create` hook on `bookings`.** It reads
-   **related** data (the target listing) through `ev.data`, **rejects** invalid
-   input (a 400 to the client), stamps a server-authoritative `guest` from the
-   authenticated identity, and **computes** a derived `price_total` = booked hours ×
-   the listing's `price_per_hour`.
-2. **A custom business route** `POST /api/bookings/:id/confirm` (auth required). It
-   reads the `:id` path param, loads the booking from the DB, flips its `status` to
-   `"confirmed"`, and returns the updated record as JSON — or **404** when the
-   booking does not exist.
-3. **A DB-touching interval cron job** `expire-holds` (every 15 minutes). It opens a
-   `Data` from the connection pool, lists stale **pending** holds whose slot has
-   already started, and marks them `"cancelled"`.
-4. **A public smoke route** `GET /api/golfsim/health` returning a small JSON literal.
+| Rung | Example | Purpose |
+|------|---------|---------|
+| 1 | `examples/blog` | Minimal packaging proof — one hook, one route, one cron |
+| 2 | **`examples/golfsim`** | Realistic complete product — multi-collection relations, hooks, files, realtime |
+| 3 | `examples/plugins` | Advanced framework surface — custom storage, comptime migrations, pool tuning |
+
+`golfsim` covers the **hard parts** of building a real backend on ZigBase *as a
+library*: multi-collection relations with cascadeDelete, invariant-enforcing hooks
+(double-booking prevention), access rules with relation traversal, file uploads,
+WebSocket realtime, and multiple custom business routes — all with a working
+Astro + React frontend.
 
 Everything else (HTTP API, SQLite storage, auth, file storage, the admin UI, the
 CLI) comes straight from the framework via the public `zigbase.*` exports.
@@ -26,54 +21,126 @@ CLI) comes straight from the framework via the public `zigbase.*` exports.
 > **Pre-1.0:** ZigBase is pre-1.0 — the hook/route/job config shapes and the module
 > API may change between releases.
 
-## What each feature looks like
+---
 
-### 1. The computed + validating hook (`before_create` on `bookings`)
+## What golfsim demonstrates
+
+### 1. Invariant-enforcing hooks
+
+#### `prepareBooking` — `beforeCreate` on `bookings`
 
 ```zig
 fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
-    const rec = &ev.record.object;
-    const listing_id = /* read the `listing` relation id from rec */;
+    // 1. Validate listing exists and is published.
+    const listing = (try ev.data.findById("listings", listing_id)) orelse
+        return error.ListingNotFound;
 
-    // Read RELATED data through the curated facade; reject if it's not bookable.
-    const listing = (try ev.data.findById("listings", listing_id)) orelse return error.ListingNotFound;
+    // 2. Double-booking check — allocate filter with ev.arena (NEVER ev.app.allocator).
+    const overlap_filter = try std.fmt.allocPrint(ev.arena,
+        "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
+        .{ listing_id, ends_at, starts_at });
+    const conflicts = try ev.data.list("bookings", .{ .filter = overlap_filter, .perPage = 1 });
+    if (conflicts.totalItems > 0) return error.TimeSlotConflict; // -> HTTP 400
 
-    // COMPUTE a derived field — note: mutations allocate with ev.arena, NOT ev.app.allocator.
-    const price_total = hours * rate;
-    try rec.put(ev.arena, "price_total", .{ .float = price_total });
+    // 3. Compute price_total = hours × rate (server-side, unforgeable).
+    try rec.put(ev.arena, "price_total", .{ .float = hours * rate });
 
-    // Stamp the guest from the authenticated identity (server-authoritative).
-    try rec.put(ev.arena, "guest", .{ .string = guest_id });
+    // 4. Stamp guest and force status=pending from the server.
+    try rec.put(ev.arena, "guest", .{ .string = try ev.arena.dupe(u8, auth_id) });
     try rec.put(ev.arena, "status", .{ .string = "pending" });
 }
 ```
 
-Returning an error from a `before_create` hook **rejects** the write → the client
-gets a `400`. Record mutations **must** allocate with `ev.arena` (the request-scoped
-allocator that owns `ev.record`), never `ev.app.allocator`.
+Record mutations that enter `ev.record` **must** allocate with `ev.arena`
+(the request-scoped allocator that owns `ev.record`), never `ev.app.allocator`.
+Returning any error rejects the write → HTTP 400 to the client.
 
-### 2. The business route (path param + DB write)
+---
+
+### 2. Custom business routes
+
+| Method | Path | Auth | What it does |
+|--------|------|------|--------------|
+| `POST` | `/api/bookings/:id/confirm` | authed | Host confirms a booking. Multi-hop owner check: booking → listing → simulator → owner. 403 if caller doesn't own the simulator. |
+| `POST` | `/api/bookings/:id/cancel` | authed | Guest cancels their own booking. 403 if caller is not the booking's guest. Uses `ev.writer()` RAII helper. |
+| `GET` | `/api/listings/:id/availability` | authed | Returns all non-cancelled bookings for a listing for availability calendar rendering. Uses `ev.reader()` (read-only RAII). |
+| `GET` | `/api/golfsim/health` | public | Smoke endpoint. |
+
+The `confirmBooking` route shows the multi-hop imperative owner check (the access
+rule engine does this via traversal for CRUD endpoints; custom routes do it via
+`findById` hops):
 
 ```zig
 fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const id = ev.ctx.param("id") orelse return .{ .status = 400, .body = "..." };
-
-    // RouteEvent carries no `Data` — build one from the pool (acquire/release the writer).
-    const conn = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = conn, .io = ev.app.io };
-
-    _ = (try data.findById("bookings", id)) orelse return .{ .status = 404, .body = "..." };
-    const updated = (try data.update("bookings", id, /* { "status": "confirmed" } */)).?;
-    const body = try std.json.Stringify.valueAlloc(ev.ctx.allocator, updated, .{});
-    return .{ .status = 200, .body = body };
+    // booking.listing -> listings -> listing.simulator -> simulators -> simulator.owner
+    const listing = (try data.findById("listings", listing_id)) orelse return not_found;
+    const simulator = (try data.findById("simulators", simulator_id)) orelse return not_found;
+    const owner_id = /* simulator.owner */;
+    if (!std.mem.eql(u8, owner_id, caller_id)) return forbidden; // 403
+    _ = try data.update("bookings", id, patch);
 }
 ```
 
-The route is registered with `.auth = .authed`, so the framework enforces
-authentication before the handler runs.
+---
 
-### 3. The DB-touching cron job
+### 3. Files — listing photos
+
+`listings` has a `photos` file field accepting up to 6 images (5 MB each, png/jpeg/webp):
+
+```zig
+.{ .name = "photos", .type = .file, .maxSelect = 6, .maxSize = 5242880,
+   .mimeTypes = .{ "image/png", "image/jpeg", "image/webp" } }
+```
+
+Upload via `PATCH /api/collections/listings/records/:id` with `multipart/form-data`.
+Do NOT set `Content-Type` — the browser sets the multipart boundary automatically.
+Serve stored photos at `/api/files/listings/:recId/:filename`.
+
+An `onFileUpload` handler logs every upload:
+
+```zig
+fn logFileUpload(ev: *zigbase.events.FileEvent) void {
+    std.log.info("file-upload: collection={s} record={s} file={s}",
+        .{ ev.collection, ev.record_id, ev.filename });
+}
+// registered as: .onFileUpload = logFileUpload
+```
+
+---
+
+### 4. Access rules with relation traversal
+
+```
+bookings.list = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner"
+```
+
+The rule engine traverses `booking.listing → listing.simulator → simulator.owner`
+at query time for all CRUD endpoints — the application layer doesn't join manually
+for authorization. Custom routes re-implement this imperatively (via `findById`
+hops) to return a proper 403.
+
+---
+
+### 5. Realtime
+
+`MyBookings` subscribes to the `bookings` topic over WebSocket so the booking
+list live-updates without polling whenever a host confirms, a guest cancels, or
+the `expire-holds` cron sweeps stale holds:
+
+```ts
+// lib/api.ts — subscribeBookings()
+const ws = new WebSocket(`${proto}://${location.host}/api/realtime`);
+ws.onopen = () => ws.send(JSON.stringify({ action: 'auth', token }));
+// on { type:"auth", status:"ok" } → send { action:"subscribe", topic:"bookings" }
+// on { type:"event", topic:"bookings", action, record } → call onEvent
+```
+
+Returns a cleanup function (calls `ws.close()`) wired into a React `useEffect`
+teardown.
+
+---
+
+### 6. DB-touching cron job
 
 ```zig
 fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
@@ -88,56 +155,86 @@ fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
         error.UnknownCollection => return, // no-op until provisioning runs
         else => return err,
     };
-    for (stale.items) |item| _ = try data.update("bookings", /* item.id */, /* cancelled */);
+    for (stale.items) |item| _ = data.update("bookings", id, /* cancelled */) catch continue;
 }
 ```
 
-This is the pattern for **real DB access inside a background job**: acquire the
-pooled writer, wrap it in a `Data`, and release on exit.
+Real DB access inside a background job: acquire the pooled writer, wrap it in a
+`Data`, release on exit.
 
-## Handler signatures (the contract)
+---
+
+## Collections
+
+| Collection | Type | Key fields |
+|---|---|---|
+| `users` | auth | `name` |
+| `simulators` | base | `label`, `owner` → users |
+| `listings` | base | `title`, `price_per_hour`, `status` (draft/published/archived), `simulator` → simulators, `photos` (file ×6) |
+| `bookings` | base | `listing`, `guest`, `starts_at`, `ends_at`, `price_total`, `status` (pending/confirmed/cancelled) |
+
+All collections are provisioned at startup via comptime `.collections` — no
+manual API calls needed.
+
+### Known limitation — comptime collection count
+
+This example provisions **four** comptime collections. Adding a fifth (e.g. a
+`reviews` collection) currently exceeds Zig's default comptime branch quota inside
+the framework's `.collections` lowering; there is no consumer-side
+`@setEvalBranchQuota` workaround (it does not propagate into the framework's
+lazily-evaluated `App.collections` decl), so a fifth collection would need the
+framework to raise its own quota (or runtime/REST provisioning).
+
+---
+
+## Handler signatures
 
 | Feature | Signature |
-| --- | --- |
+|---|---|
 | record hook | `fn(*zigbase.RecordEvent) anyerror!void` |
 | custom route | `fn(*zigbase.RouteEvent) anyerror!zigbase.http.Response` |
 | cron job | `fn(*zigbase.events.JobEvent) anyerror!void` |
+| file upload | `fn(*zigbase.events.FileEvent) void` |
 
-`Data` from the pool: `zigbase.Data{ .app = ev.app, .conn = ev.app.pool.acquireWriter(), .io = ev.app.io }`
+Data from the pool (manual): `zigbase.Data{ .app = ev.app, .conn = ev.app.pool.acquireWriter(), .io = ev.app.io }`
 (with `defer ev.app.pool.releaseWriter();`).
 
-## Frontend (Astro + React islands)
+RAII helpers in routes: `ev.writer()` (write) / `try ev.reader()` (read-only).
 
-`frontend/` is an Astro site whose React islands drive the whole booking flow:
-sign in, browse published listings, hold a slot (the `beforeCreate` hook
-validates the listing, computes `price_total`, stamps the guest, and forces
-`status=pending`), then confirm it through the custom
-`POST /api/bookings/:id/confirm` route.
+---
+
+## Frontend (Astro + React)
+
+`frontend/` is an Astro site with React islands:
+
+- **`ListingsBrowser`** — sign in, browse listings with photo gallery, check
+  availability (lazy via `/api/listings/:id/availability`), book a slot, upload
+  photos via multipart/form-data.
+- **`MyBookings`** — view bookings, cancel pending/confirmed bookings;
+  live-updates via realtime WebSocket.
+- **`Auth`** — email/password sign-in + sign-up.
+
+---
+
+## Building and running
 
 ```sh
+# 1. Build the frontend
 cd frontend && npm install && npm run build && cd ..
-mise exec zig@0.16.0 -- zig build
+
+# 2. Build the backend
+mise exec zig@0.16.0 -- zig build          # -> ./zig-out/bin/golfsim
+
+# 3. Create a superuser (optional — admin UI at /_/)
+./zig-out/bin/golfsim superuser create --email you@example.com --password "<pw>" --data-dir ./data
+
+# 4. Run
 ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
   ./zig-out/bin/golfsim serve --data-dir ./data
-# open http://127.0.0.1:8090/  — no --serve-static needed
+# open http://127.0.0.1:8090/  — frontend served automatically, no --serve-static flag
 ```
 
-This demonstrates the **comptime-hardcoded** static mode:
-`.static_files = .{ .dir = "frontend/dist" }` bakes the directory into the
-binary's config, and `--serve-static` is rejected as an unknown flag. The
-collections (users / simulators / listings / bookings) are provisioned at
-startup from the comptime `.collections` schema.
-
-## Provisioning the collections
-
-The collections are provisioned automatically at startup via the comptime
-`.collections = .{ ... }` schema in `src/main.zig` — no manual API calls
-needed. On first run the framework creates all four collections and their
-fields. The canonical runtime-provisioning recipe in
-[`docs/recipes.md`](../../docs/recipes.md) remains as an alternative reference
-for using the REST API to set up schemas manually.
-
-A quick smoke once the server is up:
+The collections provision themselves at startup. A quick smoke:
 
 ```sh
 curl -s http://127.0.0.1:8090/api/golfsim/health
@@ -156,21 +253,3 @@ exe_mod.addImport("zigbase", zigbase.module("zigbase"));
 ```
 
 Your executable module must `.link_libc = true` (SQLite needs libc).
-
-## Building and running
-
-From `examples/golfsim/`:
-
-```sh
-cd frontend && npm install && npm run build && cd ..
-mise exec zig@0.16.0 -- zig build           # produces ./zig-out/bin/golfsim
-./zig-out/bin/golfsim superuser create --email you@example.com --password "<pw>" --data-dir ./data
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
-  ./zig-out/bin/golfsim serve --data-dir ./data
-# open http://127.0.0.1:8090/  — frontend served automatically, no --serve-static flag
-```
-
-The collections provision themselves at startup. Register a guest, create a
-`published` listing, and `POST /api/collections/bookings/records` — the hook fills in
-`guest`, `status` and `price_total`; `POST /api/bookings/:id/confirm` flips it to
-`confirmed`; and the `expire-holds` cron sweeps stale pending holds.

@@ -8,6 +8,16 @@ export type Post = {
   body: string;
   status: string;
   created: string;
+  updated_at?: string;
+  reading_time?: number;
+  author?: string;
+};
+
+export type RealtimeEvent = {
+  type: 'event';
+  topic: string;
+  action: 'create' | 'update' | 'delete';
+  record: Post;
 };
 
 export function token(): string | null {
@@ -64,4 +74,32 @@ export async function createPost(title: string, body: string): Promise<Post> {
     method: 'POST',
     body: JSON.stringify({ title, body, status: 'published' }),
   });
+}
+
+/**
+ * Subscribe to realtime post events via WebSocket.
+ * Returns an unsubscribe function; call it to close the socket.
+ *
+ * Usage:
+ *   const unsub = subscribePosts((ev) => { ... });
+ *   // later:
+ *   unsub();
+ */
+export function subscribePosts(onEvent: (ev: RealtimeEvent) => void): () => void {
+  if (typeof WebSocket === 'undefined') return () => {};
+  const ws = new WebSocket(`ws://${location.host}/api/realtime`);
+  ws.addEventListener('open', () => {
+    ws.send(JSON.stringify({ action: 'subscribe', topic: 'posts', filter: "status = 'published'" }));
+  });
+  ws.addEventListener('message', (msg) => {
+    try {
+      const data = JSON.parse(msg.data);
+      if (data.type === 'event' && data.topic === 'posts') {
+        onEvent(data as RealtimeEvent);
+      }
+    } catch {
+      // ignore malformed messages
+    }
+  });
+  return () => ws.close();
 }

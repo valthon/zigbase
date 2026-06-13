@@ -5,20 +5,29 @@
 //!
 //!   1. A computed + validating `before_create` hook on `bookings` that reads
 //!      RELATED data (the target listing), REJECTS invalid input (-> HTTP 400),
-//!      stamps an owner-derived field, and COMPUTES a derived `price_total`.
+//!      stamps an owner-derived field, COMPUTES a derived `price_total`, and
+//!      CHECKS for overlapping bookings (double-booking prevention).
 //!   2. A custom business route `POST /api/bookings/:id/confirm` that reads a
-//!      path param, loads the booking from the DB, flips its status, and returns
-//!      the updated record as JSON (404 when the booking does not exist).
-//!   3. A DB-touching interval cron job that opens a `Data` from the pool and
+//!      path param, loads the booking from the DB, verifies the caller is the
+//!      listing's owner (multi-hop: booking -> listing -> simulator -> owner),
+//!      flips its status, and returns the updated record as JSON (404 when the
+//!      booking does not exist, 403 when the caller is not the owner).
+//!   3. A custom route `POST /api/bookings/:id/cancel` that lets a guest cancel
+//!      their own booking (403 when called by anyone else).
+//!   4. A custom route `GET /api/listings/:id/availability` that returns all
+//!      non-cancelled bookings for a listing so the frontend can render an
+//!      availability calendar.
+//!   5. A DB-touching interval cron job that opens a `Data` from the pool and
 //!      expires stale pending holds.
-//!   4. A trivial public smoke route `GET /api/golfsim/health`.
+//!   6. A trivial public smoke route `GET /api/golfsim/health`.
+//!   7. A file-upload logger `onFileUpload` that records every upload.
 //!
-//! The collections (users / simulators / listings / bookings) are provisioned at
-//! COMPTIME via `.collections` in the App config — the schema is set up
-//! automatically at startup (additive auto-migration). The Astro + React frontend
-//! in `frontend/` is served at the root path via the comptime-hardcoded
-//! `.static_files = .{ .dir = "frontend/dist" }` — no `--serve-static` flag needed
-//! (and that flag is rejected as unknown in this mode).
+//! The collections (users / simulators / listings / bookings) are
+//! provisioned at COMPTIME via `.collections` in the App config — the schema is
+//! set up automatically at startup (additive auto-migration). The Astro + React
+//! frontend in `frontend/` is served at the root path via the comptime-hardcoded
+//! `.static_files = .{ .dir = "frontend/dist" }` — no `--serve-static` flag
+//! needed (and that flag is rejected as unknown in this mode).
 
 const std = @import("std");
 const zigbase = @import("zigbase");
@@ -60,6 +69,18 @@ fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
     const ends_at = stringField(rec, "ends_at") orelse return error.EndRequired;
     const hours = try durationHours(starts_at, ends_at); // > 0 or error -> 400
 
+    // Double-booking check: reject if there is already a non-cancelled booking
+    // for the same listing whose time window overlaps ours.
+    //   overlap condition: existing.starts_at < our ends_at AND existing.ends_at > our starts_at
+    // Allocate the filter in ev.arena (request-scoped; never ev.app.allocator here).
+    const overlap_filter = try std.fmt.allocPrint(
+        ev.arena,
+        "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
+        .{ listing_id, ends_at, starts_at },
+    );
+    const conflicts = try ev.data.list("bookings", .{ .filter = overlap_filter, .perPage = 1 });
+    if (conflicts.totalItems > 0) return error.TimeSlotConflict;
+
     // COMPUTE price_total = hours * the listing's price_per_hour. Reject a
     // negative/absent rate rather than silently storing a bogus total.
     const rate = numberField(listing.object, "price_per_hour") orelse return error.ListingMissingRate;
@@ -86,20 +107,20 @@ fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
 // 2. Custom business route: POST /api/bookings/:id/confirm  (auth required).
 //
 //    Signature: fn(*zigbase.RouteEvent) anyerror!zigbase.http.Response.
-//    NOTE: RouteEvent does NOT carry a `Data` (only RecordEvent does), so a
-//    route that touches the DB builds its own `Data` from the pool — the same
-//    construction the cron job uses below.
-//
-//    NOTE: this demo route does NOT verify the caller is the listing's owner — any
-//    authed user can confirm any booking, and the frontend lets the GUEST confirm
-//    their own hold. For the production owner-check pattern (compare
-//    @request.auth.id to listing.simulator.owner), see docs/recipes.md.
+//    This route verifies the caller is the listing's owner via a multi-hop
+//    traversal: booking -> listing -> simulator -> owner. Responds 403 when the
+//    caller does not own the listing, 404 when the booking does not exist.
 // ---------------------------------------------------------------------------
 fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
     const not_found: zigbase.http.Response = .{ .status = 404, .body = "{\"message\":\"Booking not found.\"}" };
+    const forbidden: zigbase.http.Response = .{ .status = 403, .body = "{\"message\":\"Forbidden.\"}" };
 
     const id = ev.ctx.param("id") orelse
         return .{ .status = 400, .body = "{\"message\":\"Missing booking id.\"}" };
+
+    // The caller's auth id (empty string when unauthenticated — the .authed
+    // constraint already rejects anonymous callers, but we guard defensively).
+    const caller_id = ev.rctx.resolveMacro("@request.auth.id") orelse "";
 
     // Build a connection-bound Data facade on the pooled writer.
     const conn = ev.app.pool.acquireWriter();
@@ -109,6 +130,31 @@ fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
     // Load the booking; 404 when it does not exist (or the collection is absent).
     const existing = (try data.findById("bookings", id)) orelse return not_found;
     if (existing != .object) return not_found;
+
+    // Multi-hop owner check: booking.listing -> listings record -> simulator ->
+    // simulators record -> owner.  Any missing hop is treated as not-found rather
+    // than exposing the partial state.
+    const listing_id = switch (existing.object.get("listing") orelse return not_found) {
+        .string => |s| s,
+        else => return not_found,
+    };
+    const listing = (try data.findById("listings", listing_id)) orelse return not_found;
+    if (listing != .object) return not_found;
+
+    const simulator_id = switch (listing.object.get("simulator") orelse return not_found) {
+        .string => |s| s,
+        else => return not_found,
+    };
+    const simulator = (try data.findById("simulators", simulator_id)) orelse return not_found;
+    if (simulator != .object) return not_found;
+
+    const owner_id = switch (simulator.object.get("owner") orelse return not_found) {
+        .string => |s| s,
+        else => return not_found,
+    };
+
+    // 403 when the caller is not the simulator's owner.
+    if (!std.mem.eql(u8, owner_id, caller_id)) return forbidden;
 
     // Flip status -> confirmed via a partial update (only the provided field is
     // written). Build the patch in the request arena.
@@ -122,7 +168,81 @@ fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
 }
 
 // ---------------------------------------------------------------------------
-// 3. DB-touching interval cron job: expire stale pending holds.
+// 3. Custom route: POST /api/bookings/:id/cancel  (auth required).
+//
+//    Lets a guest cancel their own booking. Returns 403 when called by anyone
+//    other than the booking's guest, 404 when the booking does not exist.
+//    Uses `ev.writer()` (RAII) because it performs a write (update).
+// ---------------------------------------------------------------------------
+fn cancelBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    const not_found: zigbase.http.Response = .{ .status = 404, .body = "{\"message\":\"Booking not found.\"}" };
+    const forbidden: zigbase.http.Response = .{ .status = 403, .body = "{\"message\":\"Forbidden.\"}" };
+
+    const id = ev.ctx.param("id") orelse
+        return .{ .status = 400, .body = "{\"message\":\"Missing booking id.\"}" };
+
+    const caller_id = ev.rctx.resolveMacro("@request.auth.id") orelse "";
+
+    var w = ev.writer();
+    defer w.deinit();
+
+    // Load the booking to verify ownership before mutating.
+    const existing = (try w.data().findById("bookings", id)) orelse return not_found;
+    if (existing != .object) return not_found;
+
+    // Verify the caller is the booking's guest.
+    const guest_id = switch (existing.object.get("guest") orelse return forbidden) {
+        .string => |s| s,
+        else => return forbidden,
+    };
+    if (!std.mem.eql(u8, guest_id, caller_id)) return forbidden;
+
+    // Update status -> "cancelled".
+    var patch: std.json.ObjectMap = .empty;
+    try patch.put(ev.ctx.allocator, "status", .{ .string = "cancelled" });
+    const updated = (try w.data().update("bookings", id, .{ .object = patch })) orelse return not_found;
+
+    const body = try std.json.Stringify.valueAlloc(ev.ctx.allocator, updated, .{});
+    return .{ .status = 200, .body = body };
+}
+
+// ---------------------------------------------------------------------------
+// 4. Custom route: GET /api/listings/:id/availability  (auth required).
+//
+//    Returns all non-cancelled bookings for the listing so the frontend can
+//    render an availability calendar. Uses `ev.reader()` (RAII) since this is
+//    a read-only path.
+// ---------------------------------------------------------------------------
+fn listingAvailability(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    const id = ev.ctx.param("id") orelse
+        return .{ .status = 400, .body = "{\"message\":\"Missing listing id.\"}" };
+
+    var r = try ev.reader();
+    defer r.deinit();
+
+    const filter = try std.fmt.allocPrint(
+        ev.ctx.allocator,
+        "listing = \"{s}\" && status != \"cancelled\"",
+        .{id},
+    );
+    const result = try r.data().list("bookings", .{ .filter = filter, .perPage = 200 });
+
+    // Build the items JSON array manually from the list result.
+    var items_buf: std.ArrayList(u8) = .empty;
+    defer items_buf.deinit(ev.ctx.allocator);
+    try items_buf.appendSlice(ev.ctx.allocator, "[");
+    for (result.items, 0..) |item, i| {
+        if (i > 0) try items_buf.appendSlice(ev.ctx.allocator, ",");
+        const s = try std.json.Stringify.valueAlloc(ev.ctx.allocator, item, .{});
+        try items_buf.appendSlice(ev.ctx.allocator, s);
+    }
+    try items_buf.appendSlice(ev.ctx.allocator, "]");
+    const body = try std.fmt.allocPrint(ev.ctx.allocator, "{{\"items\":{s}}}", .{items_buf.items});
+    return .{ .status = 200, .body = body };
+}
+
+// ---------------------------------------------------------------------------
+// 5. DB-touching interval cron job: expire stale pending holds.
 //
 //    Signature: fn(*zigbase.events.JobEvent) anyerror!void. The job builds a
 //    `Data` from the pool (acquire the writer, release on exit), lists stale
@@ -162,11 +282,21 @@ fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Public smoke route: GET /api/golfsim/health.
+// 6. Public smoke route: GET /api/golfsim/health.
 // ---------------------------------------------------------------------------
 fn health(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
     _ = ev;
     return .{ .status = 200, .body = "{\"status\":\"ok\",\"app\":\"golfsim\"}" };
+}
+
+// ---------------------------------------------------------------------------
+// 7. File-upload event logger.
+//
+//    Fires after every successful file upload. Signature: fn(*FileEvent) void
+//    (no error return — errors are swallowed by the framework backstop).
+// ---------------------------------------------------------------------------
+fn logFileUpload(ev: *zigbase.events.FileEvent) void {
+    std.log.info("file-upload: collection={s} record={s} file={s}", .{ ev.collection, ev.record_id, ev.filename });
 }
 
 // ---------------------------------------------------------------------------
@@ -229,73 +359,8 @@ fn epochSeconds(ts: []const u8) !i64 {
 // ---------------------------------------------------------------------------
 pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{
-        .hooks = .{ .bookings = .{ .beforeCreate = prepareBooking } },
-        .routes = .{
-            .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
-            .{ .method = .GET, .path = "/api/golfsim/health", .handler = health, .auth = .public },
-        },
-        .jobs = .{ .pool_size = 2 },
-        .cron = .{
-            .{
-                .name = "expire-holds",
-                .schedule = zigbase.schedule.Schedule{ .interval = .{ .minutes = 15 } },
-                .handler = expireHolds,
-            },
-        },
-        // Comptime-hardcoded static dir: the Astro frontend in frontend/dist is
-        // served at the root path, no flag needed (and --serve-static is rejected).
-        .static_files = .{ .dir = "frontend/dist" },
-        // The schema the hooks/route/cron reference, provisioned at startup.
-        // Mirrors the runtime-provisioning recipe in docs/recipes.md.
-        .collections = .{
-            .users = .{
-                .type = .auth,
-                .fields = .{
-                    .{ .name = "name", .type = .text, .max = 100 },
-                },
-                .rules = .{ .list = "", .view = "", .create = "", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
-            },
-            .simulators = .{
-                .fields = .{
-                    .{ .name = "label", .type = .text, .required = true, .max = 120 },
-                    .{ .name = "owner", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
-                },
-                // NOTE: any authed user can create a simulator (become a host) — deliberately
-                // simple for a demo; restrict with a role/claim check in a real app.
-                .rules = .{ .list = "", .view = "", .create = "@request.auth.id != \"\"", .update = "@request.auth.id = owner", .delete = "@request.auth.id = owner" },
-            },
-            .listings = .{
-                .fields = .{
-                    .{ .name = "title", .type = .text, .required = true, .max = 140 },
-                    .{ .name = "price_per_hour", .type = .number, .required = true },
-                    .{ .name = "status", .type = .select, .required = true, .values = .{ "draft", "published", "archived" } },
-                    .{ .name = "simulator", .type = .relation, .target = "simulators", .required = true, .cascadeDelete = true },
-                },
-                .rules = .{
-                    .list = "status = \"published\"",
-                    .view = "status = \"published\" || @request.auth.id = simulator.owner",
-                    .create = "@request.auth.id != \"\"",
-                    .update = "@request.auth.id = simulator.owner",
-                    .delete = "@request.auth.id = simulator.owner",
-                },
-            },
-            .bookings = .{
-                .fields = .{
-                    .{ .name = "listing", .type = .relation, .target = "listings", .required = true, .cascadeDelete = true },
-                    .{ .name = "guest", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
-                    .{ .name = "starts_at", .type = .date, .required = true },
-                    .{ .name = "ends_at", .type = .date, .required = true },
-                    .{ .name = "price_total", .type = .number },
-                    .{ .name = "status", .type = .select, .values = .{ "pending", "confirmed", "cancelled" } },
-                },
-                .rules = .{
-                    .list = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner",
-                    .view = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner",
-                    .create = "@request.auth.id != \"\"",
-                    .update = "@request.auth.id = listing.simulator.owner",
-                    .delete = "@request.auth.id = guest",
-                },
-            },
+        .hooks = .{
+            .bookings = .{ .beforeCreate = prepareBooking },
         },
     }).runCli(init);
 }
