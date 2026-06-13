@@ -334,9 +334,16 @@ fn printUsage(show_serve_static: bool) void {
         \\  `zigbase serve --help` or `zigbase superuser create --help`.
         \\
         \\COMMON FLAGS (serve / migrate):
-        \\  --http-host H       Address to bind (serve only).      [env ZIGBASE_HTTP_HOST, default 0.0.0.0]
+        \\  --http-host H       Address to bind (serve only). Default is loopback; pass
+        \\                      0.0.0.0 to expose on all interfaces. [env ZIGBASE_HTTP_HOST, default 127.0.0.1]
         \\  --http-port N       TCP port to listen on (serve only). [env ZIGBASE_HTTP_PORT, default 8090]
         \\  --data-dir PATH     Directory for the SQLite db + file storage. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\  --insecure-cookies  Drop the Secure flag on auth cookies (serve only); for plain-HTTP
+        \\                      local dev only. Cookies are Secure by default.
+        \\  --trust-proxy       Trust X-Forwarded-For/X-Real-IP for client-IP/rate-limit keying
+        \\                      (serve only). Set ONLY behind a trusted reverse proxy. [default off]
+        \\  --realtime-origins CSV  Allowed WebSocket Origins (serve only). Empty denies cross-origin
+        \\                      browser upgrades. [env ZIGBASE_REALTIME_ORIGINS]
         \\
     , .{});
     if (show_serve_static) std.debug.print(
@@ -347,18 +354,22 @@ fn printUsage(show_serve_static: bool) void {
     std.debug.print(
         \\
         \\ENVIRONMENT VARIABLES:
-        \\  ZIGBASE_JWT_SECRET        Token-signing secret. REQUIRED in production; the server
-        \\                           refuses to start with the insecure default when cookies are
-        \\                           secure.                         [default dev-insecure-secret-change-me]
-        \\  ZIGBASE_HTTP_HOST         Bind address.                  [default 0.0.0.0]
+        \\  ZIGBASE_JWT_SECRET        Token-signing secret (>= 32 bytes). When UNSET, a strong
+        \\                           random secret is generated and persisted at
+        \\                           <data-dir>/.jwt_secret (0600) on first run, then reused.
+        \\                           A provided secret shorter than 32 bytes is refused. [default: auto-generate]
+        \\  ZIGBASE_HTTP_HOST         Bind address; loopback by default. Set 0.0.0.0 to expose
+        \\                           on all interfaces.              [default 127.0.0.1]
         \\  ZIGBASE_HTTP_PORT         Listen port.                   [default 8090]
         \\  ZIGBASE_DATA_DIR          Data directory (db + storage). [default ./zb_data]
-        \\  ZIGBASE_COOKIE_SECURE     Set the Secure flag on auth cookies (true/1). Enable behind
-        \\                           HTTPS.                          [default false]
+        \\  ZIGBASE_COOKIE_SECURE     Secure flag on auth cookies (true/1). Secure by default; set
+        \\                           false only for plain-HTTP local dev. [default true]
+        \\  ZIGBASE_TRUST_PROXY       Trust X-Forwarded-For/X-Real-IP (true/1). Set ONLY behind a
+        \\                           trusted reverse proxy.          [default false]
         \\  ZIGBASE_SENTRY_DSN        Sentry DSN for error reporting; empty logs errors to stderr.
         \\                           [default empty]
-        \\  ZIGBASE_REALTIME_ORIGINS  CSV of allowed WebSocket Origins; empty allows any (dev).
-        \\                           [default empty]
+        \\  ZIGBASE_REALTIME_ORIGINS  CSV of allowed WebSocket Origins. Empty DENIES cross-origin
+        \\                           browser upgrades.               [default empty]
         \\  ZIGBASE_MAX_UPLOAD_SIZE   Max request body for uploads, in bytes. [default 52428800 = 50 MiB]
         \\  ZIGBASE_AUTH_TOKEN_TTL    Auth token lifetime, seconds.  [default 1209600 = 14 days]
         \\  ZIGBASE_VERIFICATION_TTL  Email-verification token TTL, seconds. [default 604800 = 7 days]
@@ -369,11 +380,14 @@ fn printUsage(show_serve_static: bool) void {
         \\  # Create the first superuser (admin) account:
         \\  zigbase superuser create --email you@example.com --password "<a strong password>" --data-dir ./zb_data
         \\
-        \\  # Serve with a fresh random JWT secret (recommended):
-        \\  ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" zigbase serve --data-dir ./zb_data
+        \\  # Serve locally (binds 127.0.0.1; a random JWT secret is generated + persisted):
+        \\  zigbase serve --data-dir ./zb_data
         \\
-        \\  # Serve on a custom host/port/data-dir:
-        \\  zigbase serve --http-host 127.0.0.1 --http-port 9000 --data-dir /var/lib/zigbase
+        \\  # Local dev over plain HTTP (cookies are Secure by default, which won't send on http://):
+        \\  zigbase serve --insecure-cookies --data-dir ./zb_data
+        \\
+        \\  # Expose on all interfaces (front with a firewall / reverse proxy):
+        \\  zigbase serve --http-host 0.0.0.0 --http-port 9000 --trust-proxy --data-dir /var/lib/zigbase
         \\
         \\  # Apply pending migrations and exit:
         \\  zigbase migrate --data-dir ./zb_data
@@ -389,12 +403,17 @@ fn printServeUsage(show_serve_static: bool) void {
         \\zigbase serve — start the HTTP server (REST API + WebSocket + admin UI at /_/).
         \\
         \\USAGE:
-        \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]{s}
+        \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
+        \\                [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]{s}
         \\
         \\FLAGS:
-        \\  --http-host H    Address to bind.    [env ZIGBASE_HTTP_HOST, default 0.0.0.0]
+        \\  --http-host H    Address to bind; loopback by default. Pass 0.0.0.0 for all
+        \\                   interfaces.        [env ZIGBASE_HTTP_HOST, default 127.0.0.1]
         \\  --http-port N    TCP port to listen. [env ZIGBASE_HTTP_PORT, default 8090]
         \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\  --insecure-cookies   Drop the Secure cookie flag (plain-HTTP local dev only).
+        \\  --trust-proxy        Trust X-Forwarded-For/X-Real-IP (behind a trusted proxy only).
+        \\  --realtime-origins CSV  Allowed WebSocket Origins; empty denies cross-origin upgrades.
         \\
     , .{if (show_serve_static) " [--serve-static DIR]" else ""});
     if (show_serve_static) std.debug.print(
@@ -404,14 +423,15 @@ fn printServeUsage(show_serve_static: bool) void {
     , .{});
     std.debug.print(
         \\KEY ENVIRONMENT VARIABLES:
-        \\  ZIGBASE_JWT_SECRET      Token-signing secret. REQUIRED in production; the server refuses
-        \\                         to start with the insecure default while ZIGBASE_COOKIE_SECURE is on.
-        \\  ZIGBASE_COOKIE_SECURE  Secure flag on auth cookies (true/1). Enable behind HTTPS. [default false]
+        \\  ZIGBASE_JWT_SECRET      Token-signing secret (>= 32 bytes). When unset, a random secret
+        \\                         is generated + persisted at <data-dir>/.jwt_secret (0600) on first run.
+        \\  ZIGBASE_COOKIE_SECURE  Secure flag on auth cookies (true/1). Secure by default. [default true]
+        \\  ZIGBASE_TRUST_PROXY    Trust X-Forwarded-For/X-Real-IP (true/1). [default false]
         \\  ZIGBASE_SENTRY_DSN     Sentry DSN for error reporting; empty logs to stderr.
         \\  (See `zigbase help` for the full list of ZIGBASE_* variables.)
         \\
         \\EXAMPLE:
-        \\  ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" zigbase serve --http-port 9000 --data-dir ./zb_data
+        \\  zigbase serve --http-port 9000 --data-dir ./zb_data
         \\
     , .{});
 }
@@ -462,6 +482,10 @@ fn loadCfg(sa: cli.ServeArgs) !config.Config {
     if (sa.http_port) |v| cfg.http_port = v;
     if (sa.data_dir) |v| cfg.data_dir = v;
     if (sa.serve_static) |v| cfg.static_dir = v;
+    // Secure-by-default opt-outs/opt-ins (flags override toward the explicit choice).
+    if (sa.insecure_cookies) cfg.cookie_secure = false;
+    if (sa.trust_proxy) cfg.trust_proxy = true;
+    if (sa.realtime_origins) |v| cfg.realtime_allowed_origins = v;
     return cfg;
 }
 
@@ -482,13 +506,73 @@ fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !voi
     std.log.info("migrations applied", .{});
 }
 
-fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts) !void {
-    if (std.mem.eql(u8, cfg.jwt_secret, "dev-insecure-secret-change-me")) {
-        if (cfg.cookie_secure) {
-            std.log.err("refusing to start: ZIGBASE_JWT_SECRET is unset/default while cookie_secure is enabled; set a strong secret", .{});
-            return error.InsecureJwtSecret;
+/// Minimum acceptable length for an operator-provided JWT secret.
+pub const min_jwt_secret_len = 32;
+/// Filename (under the data dir) of the auto-generated, persisted JWT secret.
+pub const jwt_secret_filename = ".jwt_secret";
+/// Length (chars) of an auto-generated JWT secret. 64 base36 chars ~= 331 bits.
+const generated_jwt_secret_len = 64;
+
+/// Resolve the effective JWT secret (F6/F12). Three cases:
+///   - operator provided a secret (`cfg.jwt_secret` non-empty): use it, but REFUSE
+///     to start if it is shorter than `min_jwt_secret_len` (the old shared
+///     "dev-insecure-secret-change-me" default is gone — "unset" means auto-generate).
+///   - unset (empty) and `<data_dir>/.jwt_secret` exists: reuse the persisted secret.
+///   - unset and no file: generate a strong random secret, persist it 0600, use it.
+/// The returned slice is owned by `allocator` (caller frees). Never logs the secret.
+fn resolveJwtSecret(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) ![]const u8 {
+    if (cfg.jwt_secret.len > 0) {
+        if (cfg.jwt_secret.len < min_jwt_secret_len) {
+            std.log.err("refusing to start: ZIGBASE_JWT_SECRET is too short ({d} bytes); use at least {d} bytes", .{ cfg.jwt_secret.len, min_jwt_secret_len });
+            return error.WeakJwtSecret;
         }
-        std.log.warn("ZIGBASE_JWT_SECRET is using the insecure default; set it before production.", .{});
+        return allocator.dupe(u8, cfg.jwt_secret);
+    }
+    // Unset: persist a per-deployment secret under the data dir so "unset" is never
+    // a shared, guessable default. Ensure the data dir exists first.
+    std.Io.Dir.cwd().createDirPath(io, cfg.data_dir) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.data_dir, jwt_secret_filename });
+    defer allocator.free(path);
+    if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096))) |existing| {
+        const trimmed = std.mem.trim(u8, existing, " \t\r\n");
+        if (trimmed.len >= min_jwt_secret_len) {
+            // Re-own just the trimmed bytes so the caller's free matches the alloc.
+            const owned = try allocator.dupe(u8, trimmed);
+            allocator.free(existing);
+            std.log.info("using persisted JWT secret from {s}/{s}", .{ cfg.data_dir, jwt_secret_filename });
+            return owned;
+        }
+        allocator.free(existing);
+        std.log.warn("persisted JWT secret at {s}/{s} is too short; regenerating", .{ cfg.data_dir, jwt_secret_filename });
+    } else |err| switch (err) {
+        error.FileNotFound => {}, // first run: fall through to generate
+        else => return err,
+    }
+    const secret = try @import("crypto.zig").genToken(io, allocator, generated_jwt_secret_len);
+    // Write 0600 (owner read/write only). createFile truncates by default.
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = secret,
+        .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    }) catch |err| {
+        allocator.free(secret);
+        std.log.err("could not persist generated JWT secret to {s}: {s}", .{ path, @errorName(err) });
+        return err;
+    };
+    std.log.info("generated a new random JWT secret and persisted it to {s}/{s} (0600)", .{ cfg.data_dir, jwt_secret_filename });
+    return secret;
+}
+
+fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts) !void {
+    var cfg = cfg_in;
+    const jwt_secret = try resolveJwtSecret(allocator, io, cfg);
+    defer allocator.free(jwt_secret);
+    cfg.jwt_secret = jwt_secret;
+    if (std.mem.eql(u8, cfg.http_host, "0.0.0.0") or std.mem.eql(u8, cfg.http_host, "::")) {
+        std.log.warn("binding to all interfaces ({s}); ensure a firewall/reverse proxy is in front (default is loopback 127.0.0.1)", .{cfg.http_host});
+    }
+    if (cfg.realtime_allowed_origins.len == 0) {
+        std.log.info("realtime: no allowed Origins configured; cross-origin browser WebSocket upgrades are DENIED (set ZIGBASE_REALTIME_ORIGINS)", .{});
     }
     var pool = try openPool(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib });
     defer pool.deinit();
@@ -557,6 +641,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, dispa
         .verification_ttl_s = cfg.verification_ttl_s,
         .password_reset_ttl_s = cfg.password_reset_ttl_s,
         .realtime_allowed_origins = cfg.realtime_allowed_origins,
+        .trust_proxy = cfg.trust_proxy,
         .max_upload_size = cfg.max_upload_size,
         .file_token_ttl_s = cfg.file_token_ttl_s,
         .sentry_dsn = cfg.sentry_dsn,

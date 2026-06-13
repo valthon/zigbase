@@ -9,9 +9,10 @@ REST + realtime + auth + file storage + embeddable framework).
 - **B — Customized by a non-expert integrator:** hooks, custom routes, access rules, plugins —
   where the extension surface makes it easy to introduce a vulnerability.
 
-Two findings were **fixed directly in this PR** (both with regression tests); the rest are
-written up as recommendations. Several items in `KNOWN_LIMITATIONS.md` are re-assessed for
-severity rather than re-reported as novel.
+Findings were addressed across the security workstream PRs (each fix carries a regression test):
+F1/F2 (mailer/email validation), and — in the deployment & DoS hardening PR (B) — F6, F8, F9
+(perPage + multipart part caps), F10, and F12. The rest are written up as recommendations. Several
+items in `KNOWN_LIMITATIONS.md` are re-assessed for severity rather than re-reported as novel.
 
 ---
 
@@ -39,13 +40,13 @@ set of **footguns for non-expert integrators** — chiefly that an empty-string 
 | F3 | Empty-string rule = allow-all; `null` = deny (inverted-from-intuition default) | Authz | **Med** | B | n/a (misconfig trap) | Recommended |
 | F4 | Realtime `delete` events use coarse authz (existence leak) | Authz / Realtime | Low | A | Low (id-only leak) | Recommended (documented) |
 | F5 | WS subscribe does not require auth | Authz / Realtime | Low | A | Low (delivery still viewRule-gated) | Recommended |
-| F6 | JWT secret has a usable insecure default in non-HTTPS mode | Auth/Config | Med | A | Conditional (dev default in prod-without-TLS) | Recommended |
+| F6 | JWT secret has a usable insecure default in non-HTTPS mode | Auth/Config | Med | A | Conditional (dev default in prod-without-TLS) | **Fixed** |
 | F7 | Verification/reset tokens are not explicitly single-use | Auth | Low | A | Low (rotation + 1h TTL mitigate) | Recommended |
-| F8 | Rate limiter keyed on spoofable `X-Forwarded-For` on direct exposure | DoS | Med | A | Moderate (direct exposure only) | Known-limitation; assessed |
-| F9 | No global WS connection cap / no per-field body limit | DoS | Low/Med | A | Moderate | Recommended |
-| F10 | Static dir mode follows symlinks out of root | Path traversal | Low | A | Low (operator must plant the symlink) | Known-limitation; assessed |
+| F8 | Rate limiter keyed on spoofable `X-Forwarded-For` on direct exposure | DoS | Med | A | Moderate (direct exposure only) | **Fixed** |
+| F9 | No global WS connection cap / no per-field body limit | DoS | Low/Med | A | Moderate | **Partially fixed** (perPage clamp + multipart part cap) |
+| F10 | Static dir mode follows symlinks out of root | Path traversal | Low | A | Low (operator must plant the symlink) | **Fixed** |
 | F11 | OAuth `state` is delegated to the client, not enforced server-side | Auth/OAuth | Low/Med | A | Low (redirect-URI allowlist + PKCE present) | Recommended |
-| F12 | Insecure deployment defaults (bind `0.0.0.0`, `cookie_secure=false`, open WS origins) | Config | Med | A | n/a (posture) | Recommended (checklist) |
+| F12 | Insecure deployment defaults (bind `0.0.0.0`, `cookie_secure=false`, open WS origins) | Config | Med | A | n/a (posture) | **Fixed** |
 
 Items deliberately re-assessed as **not exploitable**: rule **parse errors fail *closed*** (a
 malformed rule yields a 500, the write never runs — see F3 notes); `expand` **does** re-apply the
@@ -188,21 +189,28 @@ subscribers on public collections.
 
 ---
 
-### F6 — JWT secret insecure default usable in non-HTTPS mode
+### F6 — JWT secret insecure default usable in non-HTTPS mode (FIXED)
 
-**Location:** `src/config.zig` (`jwt_secret = "dev-insecure-secret-change-me"`),
-`src/framework.zig:439-444` (startup guard).
+**Location:** `src/config.zig` (`jwt_secret` default), `src/framework.zig`
+(`resolveJwtSecret`, called at the top of `serveImpl`).
 
-**Description.** If `ZIGBASE_JWT_SECRET` is unset the binary uses a well-known default. The
-framework **refuses to start** with the default *only when* `cookie_secure` is enabled; otherwise
-it boots with a `warn`. Anyone who knows the default can forge any auth/superuser JWT. The guard
-is adequate for an HTTPS deployment (which sets `cookie_secure`) but a plaintext/proxied
-deployment that forgets to set both can run with a guessable secret. Empty-string secret is also
-not explicitly rejected, and no minimum length is enforced.
+**Description.** If `ZIGBASE_JWT_SECRET` was unset the binary used a well-known shared default
+(`dev-insecure-secret-change-me`) and only **refused to start** when `cookie_secure` was enabled;
+otherwise it booted with a `warn`. Anyone who knew the default could forge any auth/superuser JWT.
 
-**Recommendation.** Reject an empty secret outright; warn (or refuse) on a secret shorter than 32
-bytes; consider generating a random secret on first run and persisting it under the data dir, the
-way many backends do, so "unset" is never "default."
+**Fix.** The shared default is gone. `Config.jwt_secret` now defaults to `""` meaning
+"auto-generate". At startup `resolveJwtSecret`:
+- if a secret is provided, **refuses to start** when it is shorter than 32 bytes
+  (`min_jwt_secret_len`, `error.WeakJwtSecret`) — verified at runtime;
+- if unset and `<data_dir>/.jwt_secret` exists (and is long enough), **reuses** the persisted
+  secret;
+- if unset and no file exists, **generates** a 64-char random secret (`crypto.genToken`) and
+  **persists** it at `<data_dir>/.jwt_secret` with mode **0600**, never logging the value.
+
+So "unset" now means a strong, per-deployment, persisted secret — never a shared guessable one.
+Runtime evidence: a fresh `--data-dir` run logs "generated a new random JWT secret … (0600)" and
+creates the 0600 file; a second run against the same dir logs "using persisted JWT secret" and
+reuses it byte-for-byte.
 
 ---
 
@@ -223,53 +231,65 @@ redemption) to make these strictly single-use, independent of the rotation side 
 
 ---
 
-### F8 — Rate limiter keyed on spoofable `X-Forwarded-For` (re-assessed known limitation)
+### F8 — Rate limiter keyed on spoofable `X-Forwarded-For` (FIXED)
 
-**Location:** `src/server.zig` (clientIp from `x-forwarded-for`/`x-real-ip`), `src/ratelimit.zig`.
+**Location:** `src/config.zig` (`trust_proxy`), `src/server.zig` (`clientIpFrom`/`clientIp`),
+`src/app.zig` (`trust_proxy` field), `src/ratelimit.zig` (unchanged).
 
-**Assessment.** Documented in `KNOWN_LIMITATIONS.md`. Behind a trusted reverse proxy this is
-fine. On **direct exposure** an attacker spoofs `X-Forwarded-For` per request and bypasses the
-login/reset/verify limiter (the code falls back to a per-identity key, still spoofable). The
-limiter also **fails open** under memory pressure (`ratelimit.zig` returns `true` when the entry
-cap is hit and the sweep can't free room) — acceptable for availability but it means the limit
-isn't a hard guarantee. Mitigation (require a proxy) is adequate *if followed*; the gap is that
-nothing enforces it.
+**Description.** On **direct exposure** an attacker could spoof `X-Forwarded-For` per request and
+bypass the login/reset/verify limiter, since `clientIp` always trusted those headers.
 
-**Recommendation.** Add a config flag `trust_proxy` (default false). When false, key the limiter
-on the real socket peer IP and ignore `X-Forwarded-For` entirely; only honor the header when
-`trust_proxy` is set. This makes direct exposure safe by default.
+**Fix.** Added a config flag `trust_proxy` (default **false**; `--trust-proxy` /
+`ZIGBASE_TRUST_PROXY`). `clientIpFrom(trust_proxy, xff, xri)` now returns `""` whenever
+`trust_proxy` is false — `X-Forwarded-For`/`X-Real-IP` are ignored entirely — so the limiter
+keys on the submitted identity, which is **not** header-spoofable. The proxy headers are honored
+only when `trust_proxy` is set (the deployment is behind a trusted proxy that rewrites them).
+This makes direct exposure safe by default. Regression test:
+`clientIpFrom ignores X-Forwarded-For/X-Real-IP unless trust_proxy is set (F8)` (`src/server.zig`).
+The limiter still **fails open** under memory pressure by design (it can't become a self-DoS), so
+it remains a throttle, not a hard guarantee — documented in `KNOWN_LIMITATIONS.md`.
 
 ---
 
-### F9 — No global WS connection cap; no per-field body limit
+### F9 — No global WS connection cap; no per-field body limit (PARTIALLY FIXED)
 
 **Location:** `src/realtime/ws.zig:19` (per-conn `MAX_SUBS = 256`, but no global cap);
-`src/config.zig` (`max_upload_size = 50<<20` global only), `src/server.zig` listener.
+`src/records.zig` (`list` perPage clamp); `src/files/multipart.zig` (`max_parts`).
 
 **Assessment.** Per-connection subscriptions are bounded (256) and the global body cap (50 MiB)
-is enforced at the listener. There is **no cap on concurrent WS connections** and **no per-field
-size limit** within a body, so an attacker can open many sockets (each up to 256 subs) or send a
-single 50 MiB body of many tiny multipart parts / deeply nested JSON. Filter nesting is bounded
-at depth 32 (`query/parser.zig`), and `perPage` is an unbounded `u32` (large pages cost memory).
+is enforced at the listener. Filter nesting is bounded at depth 32 (`query/parser.zig`).
 
-**Recommendation.** Add a global connection limit and a `perPage` clamp (e.g. max 500); consider a
-multipart part-count cap. Low/Med because a single host's 50 MiB ceiling and reader/writer pool
-already bound the worst case somewhat.
+**Fixed here (the two memory-cost DoS caps):**
+- **`perPage` clamp.** `records.list` clamps `perPage` to **500** (`@min(q.perPage, 500)`), so an
+  oversized page can't drive a huge SQL `LIMIT` / allocation. Regression test (end-to-end through
+  the API handler): `list handler clamps an oversized perPage to the 500 cap (F9 DoS)`
+  (`src/api/records.zig`), plus the existing unit test in `records.zig`.
+- **Multipart part-count cap.** `multipart.parse` rejects a body with more than **1024** parts
+  (`max_parts`, `error.BadMultipart`), so a 50 MiB body of many tiny parts can't force thousands
+  of map insertions / file structs. Regression test:
+  `a body exceeding the part-count cap is rejected (F9 DoS)` (`src/files/multipart.zig`).
+
+**Still open (out of scope for this PR):** there is no global cap on concurrent WS connections.
+A single host's 50 MiB body ceiling and the reader/writer pool bound the worst case somewhat;
+a global connection limit is the remaining hardening.
 
 ---
 
-### F10 — Static dir mode follows symlinks (re-assessed known limitation)
+### F10 — Static dir mode follows symlinks (FIXED)
 
-**Location:** `src/static_files.zig` (`statFile` follows symlinks; lexical `..`/backslash/NUL
-rejection is correct and tested).
+**Location:** `src/static_files.zig` (`serveDir`, new `withinRoot` helper).
 
-**Assessment.** Documented. The lexical path safety is solid and verified. The only gap is that a
-symlink *inside* the static root pointing outside it is followed (`statFile`, not `lstat`). This
-requires an operator (or a compromised upload path — but uploads go to storage, not the static
-root) to plant the symlink, so it's Low.
+**Description.** The lexical path safety (`..`/backslash/NUL) is correct, but a symlink *inside*
+the static root pointing outside it was followed (`statFile` follows symlinks), so a planted
+symlink could expose files outside the configured root.
 
-**Recommendation.** Use `lstat` and reject symlinked components, or `realpath` and verify the
-result is still within the root, if you want defense against a hostile static tree.
+**Fix.** `serveDir` now canonicalizes both the configured root and the matched file with
+`realPathFileAlloc` (which resolves every symlinked component) and refuses to serve anything whose
+real path is not within the real root (`withinRoot`, a `/`-bounded prefix check so a sibling like
+`/srv/wwwEVIL` is not treated as inside `/srv/www`). The lexical checks are kept as a cheap first
+gate. Regression tests: `a symlink inside the root pointing OUTSIDE it is refused (F10)` (creates a
+symlink in a temp root pointing at a file in a sibling dir and asserts a 404 while a legitimate
+in-root file still serves) and `withinRoot: prefix must be '/'-bounded` (`src/static_files.zig`).
 
 ---
 
@@ -289,16 +309,27 @@ an optional server-side state store for integrators who can't guarantee a correc
 
 ---
 
-### F12 — Insecure deployment defaults
+### F12 — Insecure deployment defaults (FIXED)
 
-**Location:** `src/config.zig`.
+**Location:** `src/config.zig`, `src/cli.zig`, `src/framework.zig`, `src/realtime/ws.zig`,
+`src/app.zig`.
 
-- Default bind `0.0.0.0:8090` (all interfaces).
-- `cookie_secure = false` (dev default).
-- `realtime_allowed_origins = ""` → **any** WS Origin allowed.
-- `jwt_secret` default (F6).
+The defaults are now secure-by-default (the project is pre-1.0; these are intentional breaking
+changes, with quickstart docs/examples/tests updated to match):
 
-**Assessment.** Reasonable for local dev, risky if shipped unchanged. See hardening checklist.
+- **Bind `127.0.0.1:8090`** (loopback) instead of `0.0.0.0`. Expose all interfaces explicitly with
+  `--http-host 0.0.0.0` / `ZIGBASE_HTTP_HOST`; binding all interfaces logs a warning.
+- **`cookie_secure = true`** (HTTPS-only auth cookies). Opt out for plain-HTTP local dev with
+  `--insecure-cookies` / `ZIGBASE_COOKIE_SECURE=false`.
+- **`realtime_allowed_origins = ""` now DENIES** cross-origin browser WS upgrades (an empty
+  allowlist is no longer "allow any"). A request with no `Origin` header (non-browser client) is
+  still allowed; set explicit origins (`--realtime-origins` / `ZIGBASE_REALTIME_ORIGINS`) for
+  browser apps. `originAllowed` updated accordingly (`src/realtime/ws.zig`, with an updated test).
+- **`jwt_secret`** auto-generated + persisted (F6).
+
+The quickstart in `README.md`, `docs/tutorial.md`, and the `examples/{blog,golfsim}` READMEs were
+updated so copy-paste local runs still work under the new defaults (they pass `--insecure-cookies`,
+and the realtime examples pass `--realtime-origins http://127.0.0.1:8090`).
 
 ---
 
@@ -338,18 +369,28 @@ The framework invites custom rules, hooks, routes, and plugins. The sharp edges:
 
 ## Hardening checklist for operators (stock ZigBase)
 
-- [ ] Set a strong random `ZIGBASE_JWT_SECRET` (≥32 bytes). Never ship the default.
-- [ ] Terminate TLS in front and set `cookie_secure=true` (this also makes the JWT-secret guard
-      refuse the default).
-- [ ] Bind to `127.0.0.1` and front with a reverse proxy, **or** firewall `0.0.0.0:8090`.
-- [ ] Put ZigBase behind a proxy that sets `X-Forwarded-For` from the real peer; do **not** expose
-      it directly while relying on the rate limiter (F8).
+Several of these are now **the default** (marked ✓ done-by-default) after this PR; the rest remain
+operator responsibilities.
+
+- [x] **JWT secret — now automatic.** `ZIGBASE_JWT_SECRET` unset → a strong random secret is
+      generated and persisted at `<data-dir>/.jwt_secret` (0600), reused thereafter; a provided
+      secret < 32 bytes is refused. There is no shared default. Manage it yourself only if you want
+      to (e.g. a secrets store) (F6).
+- [ ] Terminate TLS in front. `cookie_secure` is **true by default** now; keep it on in production
+      (only `--insecure-cookies` for plain-HTTP local dev).
+- [x] **Bind — now loopback by default** (`127.0.0.1:8090`). Expose all interfaces only via
+      `--http-host 0.0.0.0`, fronted by a firewall / reverse proxy (F12).
+- [x] **Rate-limiter proxy headers — now ignored by default.** `X-Forwarded-For`/`X-Real-IP` are
+      honored only with `--trust-proxy`; set it only behind a trusted reverse proxy. Direct
+      exposure is safe by default (F8).
 - [ ] Configure SMTP (`ZIGBASE_SMTP_*`) so verify/reset tokens are emailed, not logged. Leave
       `ZIGBASE_SMTP_INSECURE` off except for known self-signed relays.
-- [ ] Set `realtime_allowed_origins` to your app origin(s); don't leave it empty in production.
+- [x] **Realtime origins — empty now DENIES** cross-origin browser upgrades. Set
+      `realtime_allowed_origins` / `--realtime-origins` to your app origin(s) to allow them (F12).
 - [ ] Audit every collection's list/view/create/update/delete rules. Treat an **empty** rule as
       **"public to the entire internet"** and confirm that's intended (F3).
-- [ ] Don't place symlinks pointing outside the root inside a `--serve-static` directory (F10).
+- [x] **Static symlink escapes — now refused** (served files are canonicalized and must remain
+      within the static root) (F10). Planting such a symlink is no longer a leak.
 - [ ] Set a Sentry DSN if you want errors captured off-box; error responses to clients are already
       generic (no stack traces / SQL leaked — verified in `src/api/error.zig`).
 
@@ -358,8 +399,21 @@ The framework invites custom rules, hooks, routes, and plugins. The sharp edges:
 ## What was fixed in this PR
 
 - **F1 / F2:** mailer header/command injection + email-field control-char validation, with two
-  regression tests (`src/mail/mailer.zig`, `src/records.zig`). `zig build` and all 362 unit tests
-  pass.
+  regression tests (`src/mail/mailer.zig`, `src/records.zig`).
 
-Everything else is a recommendation (design/behavior change, deployment posture, or doc work) and
-is intentionally **not** half-implemented.
+Deployment & DoS hardening (PR B):
+
+- **F6 / F12 — secure-by-default config:** loopback bind (`127.0.0.1`), `cookie_secure=true`,
+  auto-generated + persisted JWT secret (0600, ≥32-byte minimum on provided secrets), empty
+  realtime origins = deny cross-origin browser upgrades. New opt-out/opt-in flags
+  `--insecure-cookies`, `--trust-proxy`, `--realtime-origins`, plus `--http-host 0.0.0.0` to
+  expose. Quickstart docs/examples/tests updated.
+- **F8 — `trust_proxy` (default false):** `X-Forwarded-For`/`X-Real-IP` ignored unless trusted.
+- **F9 — DoS caps:** `perPage` clamped to 500; multipart bodies capped at 1024 parts.
+- **F10 — static symlink escape:** served files canonicalized and verified within the static root.
+
+Each fix has a regression test; `zig build` succeeds and all **369** unit tests pass. Runtime
+evidence verified the secret generate/persist (0600) + reuse and the 127.0.0.1 bind.
+
+The remaining items (F3, F4, F5, F7, F11, and the F9 global WS-connection cap) are recommendations
+(design/behavior change or further hardening) and are intentionally **not** half-implemented here.

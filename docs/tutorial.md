@@ -27,10 +27,12 @@ then start serving:
 mise install                                     # Zig 0.16.0, pinned in mise.toml
 zig build                                         # -> zig-out/bin/zigbase
 ./zig-out/bin/zigbase superuser create --email admin@example.com --password "a-strong-password" --data-dir ./zb_data
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" ./zig-out/bin/zigbase serve --data-dir ./zb_data
+# --insecure-cookies: this tutorial runs over plain HTTP, and auth cookies are Secure by default.
+./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
 ```
 
-The server listens on `http://127.0.0.1:8090`. Sanity check:
+The server listens on `http://127.0.0.1:8090` (loopback by default; a random JWT secret is
+generated and persisted at `zb_data/.jwt_secret` on first run). Sanity check:
 
 ```sh
 curl http://127.0.0.1:8090/api/health   # {"status":"ok"}

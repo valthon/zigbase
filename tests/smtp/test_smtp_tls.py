@@ -149,7 +149,8 @@ def test_smtp_starttls_delivery(binary):
         )
         env = {
             **os.environ,
-            "ZIGBASE_JWT_SECRET": "test-secret-not-default",
+            # >= 32 bytes: the server now refuses a shorter operator-provided secret.
+            "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
             "ZIGBASE_DATA_DIR": data,
             "ZIGBASE_HTTP_PORT": str(http_port),
             "ZIGBASE_SMTP_HOST": "127.0.0.1",
