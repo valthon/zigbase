@@ -222,6 +222,31 @@ the framework before your handler runs. The framework **enforces `.auth`
 before** calling the handler. **Built-in routes always win** over custom routes
 that would match the same method + path.
 
+### Reading the request (`ev.ctx`)
+
+The request data lives on `ev.ctx` (a `*http.RequestCtx`), **not** on `ev.rctx`
+(which is only the resolved auth identity). Useful members:
+
+- `ev.ctx.allocator` — the **request-scoped arena**. Allocate any dynamic
+  response `body` here (the `http.Response.body` slice must outlive the handler
+  return but is freed with the request; a string *literal* needs no allocation).
+- `ev.ctx.param("id")` — `?[]const u8`, a path param captured from a `:id`-style
+  pattern segment.
+- `ev.ctx.query` / `ev.ctx.body` — raw query string / request body.
+- `ev.ctx.bearerToken()` / `ev.ctx.cookie(name)` — auth header / cookie helpers.
+
+```zig
+fn confirm(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    const id = ev.ctx.param("id") orelse
+        return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\"}" };
+    const body = try std.fmt.allocPrint(ev.ctx.allocator, "{{\"id\":\"{s}\"}}", .{id});
+    return .{ .status = 200, .body = body }; // body lives in the request arena
+}
+```
+
+See [recipes.md → a custom business route with a path param](recipes.md#recipe-a-custom-business-route-with-a-path-param--db-write)
+for a full worked route.
+
 ### DB access from a route (`ev.writer()` / `ev.reader()`)
 
 Unlike `RecordEvent` (whose `ev.data` is already bound to the in-transaction

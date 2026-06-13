@@ -1,6 +1,6 @@
 # Known Limitations
 
-ZigBase v0.1.0 is an early release. The gaps below are known and tracked for post-v0.1.
+ZigBase v0.3.0 is an early release. The gaps below are known and tracked for future releases.
 
 ## Auth & email
 - **Mailer requires SMTP configuration for production.** Verification and password-reset email is delivered when SMTP is configured (`ZIGBASE_SMTP_HOST` + friends; supports `none` / `starttls` / `implicit` TLS). **Without SMTP configured, those tokens are logged to the server** (the dev/CI default) rather than emailed — a real deployment must set SMTP. TLS verifies certificates by default; `ZIGBASE_SMTP_INSECURE` disables verification for self-signed relays only.
