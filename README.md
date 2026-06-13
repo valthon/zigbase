@@ -8,7 +8,7 @@ embedded admin UI at `/_/` — all in one statically-linked executable backed by
 It is also an **embeddable Zig framework**: import it as a library and extend the server
 with comptime record hooks, custom HTTP routes, and scheduled jobs.
 
-`v0.2.0 — early release` · `License: Apache-2.0` · see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
+`v0.3.0 — early release` · `License: Apache-2.0` · see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
 
 **Website & docs:** <https://valthon.github.io/zigbase>
 

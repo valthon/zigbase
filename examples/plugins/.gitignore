@@ -1,0 +1,6 @@
+node_modules/
+frontend/dist/
+frontend/.astro/
+.zig-cache/
+zig-out/
+zb_data/

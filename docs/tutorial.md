@@ -202,6 +202,48 @@ a bearer token, the auth cookie, or a short-lived **file token**. See
 
 ---
 
+## 4.5 Set up the project (embed ZigBase)
+
+Steps 0–4 used the stock binary over REST. From here on you extend it in Zig, so you
+need ZigBase as a *library dependency* of your own package. Fetch it:
+
+```sh
+zig fetch --save git+https://github.com/valthon/zigbase
+```
+
+Wire it into your `build.zig` (ZigBase bundles SQLite's C source and zap, so the
+consuming module must `link_libc`):
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // required: zigbase carries SQLite + zap transitively
+    });
+    const zigbase = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
+    exe_mod.addImport("zigbase", zigbase.module("zigbase"));
+
+    const exe = b.addExecutable(.{ .name = "myapp", .root_module = exe_mod });
+    b.installArtifact(exe);
+}
+```
+
+All the handlers below (the route, the job, and the `App(.{...})` wiring) live in your
+`src/main.zig`. `zig build` produces a binary with the same `serve` / `migrate` /
+`superuser create` commands as the stock server, plus your extensions. See
+[framework.md → Add the dependency](framework.md#2-add-the-dependency) for the full
+reference and [examples/blog/build.zig](../examples/blog/build.zig) for a complete
+working build file.
+
+---
+
 ## 5. Add a custom business route (the Zig framework)
 
 REST CRUD covers most needs, but "confirm a booking" is business logic. ZigBase is an
@@ -244,7 +286,7 @@ A nightly job cancels stale pending bookings. A `JobEvent` carries only `app` an
 `name`, so — like the route above — you acquire a connection and build `Data`:
 
 ```zig
-fn expireStaleBookings(ev: *zigbase.events.JobEvent) anyerror!void {
+fn expireStaleBookings(ev: *zigbase.JobEvent) anyerror!void {
     const a = ev.app.allocator;
     const w = ev.app.pool.acquireWriter();
     defer ev.app.pool.releaseWriter();

@@ -1,6 +1,6 @@
 # Known Limitations
 
-ZigBase v0.1.0 is an early release. The gaps below are known and tracked for post-v0.1.
+ZigBase v0.3.0 is an early release. The gaps below are known and tracked for future releases.
 
 ## Auth & email
 - **Mailer requires SMTP configuration for production.** Verification and password-reset email is delivered when SMTP is configured (`ZIGBASE_SMTP_HOST` + friends; supports `none` / `starttls` / `implicit` TLS). **Without SMTP configured, those tokens are logged to the server** (the dev/CI default) rather than emailed — a real deployment must set SMTP. TLS verifies certificates by default; `ZIGBASE_SMTP_INSECURE` disables verification for self-signed relays only.
@@ -42,4 +42,4 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
 - Image thumbnails / transforms; an S3 (or other remote) storage backend — a pluggable `.storage` slot exists, but only the local-disk backend ships; `fields=` response projection; resumable/chunked uploads; realtime backfill/replay and per-event-guard load-tuning.
 
 ---
-These are tracked for post-v0.1. Contributions welcome.
+These are tracked for upcoming releases. Contributions welcome.
