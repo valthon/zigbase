@@ -100,7 +100,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     const disp_kind: []const u8 = if (force_download or !inline_safe) "attachment" else "inline";
     const disposition = try std.fmt.allocPrint(ctx.allocator, "{s}; filename=\"{s}\"", .{ disp_kind, name });
 
-    const cache: []const u8 = if (col.viewRule != null and col.viewRule.?.len == 0) "public, max-age=3600" else "private";
+    const cache: []const u8 = if (rules.isPublic(col.viewRule)) "public, max-age=3600" else "private";
     const headers = try ctx.allocator.dupe(http.Header, &.{
         .{ .name = "Referrer-Policy", .value = "no-referrer" },
         .{ .name = "X-Content-Type-Options", .value = "nosniff" },

@@ -17,6 +17,28 @@ const std = @import("std");
 const schema = @import("schema.zig");
 const collections = @import("collections.zig");
 const db = @import("db.zig");
+const rules = @import("rules.zig");
+
+/// F3 startup lint: log a prominent warning for every `@public` (allow-all) rule on `col`, so a
+/// wide-open collection is never silent. Called once per collection during provisioning.
+fn warnPublicRules(col: schema.Collection) void {
+    const Pair = struct { op: []const u8, rule: ?[]const u8 };
+    const pairs = [_]Pair{
+        .{ .op = "list", .rule = col.listRule },
+        .{ .op = "view", .rule = col.viewRule },
+        .{ .op = "create", .rule = col.createRule },
+        .{ .op = "update", .rule = col.updateRule },
+        .{ .op = "delete", .rule = col.deleteRule },
+    };
+    for (pairs) |p| {
+        if (rules.isPublic(p.rule)) {
+            std.log.warn(
+                "collection '{s}' is PUBLIC for {s} (anyone can {s}) — @public rule",
+                .{ col.name, p.op, p.op },
+            );
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Comptime builder: a `.collections` literal -> []const schema.Collection
@@ -357,6 +379,9 @@ pub fn ensureCollection(
     spec_in: schema.Collection,
 ) ProvisionError!void {
     const spec = try resolveTargets(alloc, w, spec_in);
+
+    // F3 lint: surface any allow-all (@public) rule prominently at startup.
+    warnPublicRules(spec);
 
     const existing = try collections.get(alloc, w, spec.name);
     if (existing == null) {

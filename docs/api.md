@@ -204,18 +204,24 @@ Each collection defines five rules: **list**, **view**, **create**, **update**,
 
 | Rule value | Meaning |
 | --- | --- |
-| `null` | Locked — only a superuser may perform the operation; everyone else is denied. |
-| `""` (empty string) | Public — anyone may perform the operation. |
+| `null` | **Locked** — only a superuser may perform the operation; everyone else is denied. |
+| `""` (empty string) | **Locked** — same as `null` (safe-by-default). An empty rule is **not** public. |
+| `"@public"` | **Public** — anyone may perform the operation. This explicit sentinel is the *only* way to open a collection. |
 | a filter expression | The operation is allowed only when the expression matches (using the [filter grammar](#filter-grammar), including `@request.*` macros). |
 
 Superusers bypass all rules.
+
+> **Safe-by-default (changed):** a blank rule (`null` or `""`) is **locked to superusers**.
+> To open an operation to the public you must set the rule to exactly `"@public"`. On startup,
+> ZigBase logs a prominent warning for every `@public` rule (`collection 'X' is PUBLIC for <op>`)
+> so a wide-open collection is never silent.
 
 **Denial status codes:**
 
 - **view / update / delete** on a record that does not exist *or* does not satisfy
   the rule return **404** — this hides record existence.
 - **create** denial returns **403**.
-- A **locked** (`null`) list/view rule denies non-superusers (list returns 403; view
+- A **locked** (`null` or `""`) list/view rule denies non-superusers (list returns 403; view
   returns 404).
 
 ---
@@ -263,7 +269,7 @@ POST /api/collections/users/records
 On this create the server hashes the password (argon2id), strips the plaintext,
 mints a `tokenKey`, and **forces `verified` to `false`** (a client-supplied
 `verified` is ignored); `passwordHash`/`tokenKey` are hidden in the response. The
-auth collection needs a **public create rule** (`""`) for open signup, and the
+auth collection needs a **public create rule** (`"@public"`) for open signup, and the
 password must be at least `minPasswordLength` (default 8) — otherwise the create is
 a `400`. After signup, obtain a token via `auth-with-password` above. Full walkthrough:
 [recipes.md → User registration](recipes.md#recipe-user-registration-signup).
@@ -343,7 +349,7 @@ File-type fields hold uploaded files.
 
 File access reuses the collection's **view** rule:
 
-- Files in a **public** collection (empty view rule) serve directly.
+- Files in a **public** collection (`@public` view rule) serve directly (cacheable).
 - Files in a **protected** collection require an authenticated identity. Supply it
   via a bearer token, the auth cookie, or a short-lived **file token**:
   `POST /api/files/token` returns `{ "token": "<jwt>" }` (the caller must already be
@@ -418,6 +424,16 @@ A topic is either a whole collection (`<collection>`) or a single record
 unsubscribe with `{ "type": "ack", "action": "...", "topic": "..." }`. On connect it
 sends `{ "type": "connect", "clientId": "..." }`.
 
+**Authentication is required to subscribe** to any collection whose `viewRule` is not
+`"@public"`. A socket may subscribe anonymously *only* to a public (`@public`) collection;
+for a locked, owner-scoped, or expression-gated collection you must send a successful
+`auth` frame first, otherwise `subscribe` is rejected with
+`{ "type": "error", "message": "authentication required to subscribe" }`. (Delivery is
+*also* re-authorized per record, so auth-before-subscribe is a layered, not the only, check.)
+
+The server enforces a global cap on concurrent WebSocket connections; once reached, new
+upgrades are rejected with HTTP `503`.
+
 ### Event frames
 
 When a subscribed record changes, the server pushes:
@@ -432,6 +448,9 @@ When a subscribed record changes, the server pushes:
 ```
 
 `action` is one of `create`, `update`, `delete`. For `delete`, `record` is id-only.
+Delete events are authorized per subscriber against a snapshot of the just-deleted record,
+so an owner-scoped (or otherwise gated) `viewRule` only notifies subscribers who were allowed
+to view that record — a delete on someone else's record is not leaked to other subscribers.
 
 Malformed or unknown client frames produce
 `{ "type": "error", "message": "..." }`.

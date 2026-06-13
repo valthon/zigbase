@@ -9,9 +9,10 @@ REST + realtime + auth + file storage + embeddable framework).
 - **B — Customized by a non-expert integrator:** hooks, custom routes, access rules, plugins —
   where the extension surface makes it easy to introduce a vulnerability.
 
-Two findings were **fixed directly in this PR** (both with regression tests); the rest are
-written up as recommendations. Several items in `KNOWN_LIMITATIONS.md` are re-assessed for
-severity rather than re-reported as novel.
+F1 and F2 were **fixed in the original audit PR**; F3, F4, F5, and the WS-connection-cap portion
+of F9 are **fixed in the access-control & realtime-authz follow-up** (all with regression tests).
+The rest are written up as recommendations. Several items in `KNOWN_LIMITATIONS.md` are re-assessed
+for severity rather than re-reported as novel.
 
 ---
 
@@ -27,8 +28,11 @@ ZigBase.**
 
 The real exposure is at the **outbound and extension boundaries**: an unsanitized email-header
 path (fixed here), an email field that accepted arbitrary control characters (fixed here), and a
-set of **footguns for non-expert integrators** — chiefly that an empty-string access rule means
-*allow-all* and a `null` rule means *deny*, an easy way to misconfigure a collection wide open.
+set of **footguns for non-expert integrators** — chiefly that an empty-string access rule used to
+mean *allow-all* while a `null` rule means *deny*, an easy way to misconfigure a collection wide
+open. That trap is now **fixed** (F3): the access model is safe-by-default — a blank rule (`null`
+or `""`) is locked to superusers, and the explicit sentinel `"@public"` is the only way to open a
+collection (with a prominent startup warning for every one).
 
 ### Findings table
 
@@ -36,13 +40,13 @@ set of **footguns for non-expert integrators** — chiefly that an empty-string 
 |----|-------|-------|----------|--------|----------------|--------|
 | F1 | SMTP/RFC5322 header injection via `to`/`subject`/`from` | SSRF/Injection | **High** | A+B | Moderate (needs a record with a crafted email + SMTP configured) | **Fixed** |
 | F2 | Email field accepts CR/LF/NUL and bogus addresses | Injection / data integrity | **Med** | A | Low alone; enables F1 | **Fixed** |
-| F3 | Empty-string rule = allow-all; `null` = deny (inverted-from-intuition default) | Authz | **Med** | B | n/a (misconfig trap) | Recommended |
-| F4 | Realtime `delete` events use coarse authz (existence leak) | Authz / Realtime | Low | A | Low (id-only leak) | Recommended (documented) |
-| F5 | WS subscribe does not require auth | Authz / Realtime | Low | A | Low (delivery still viewRule-gated) | Recommended |
+| F3 | Empty-string rule = allow-all; `null` = deny (inverted-from-intuition default) | Authz | **Med** | B | n/a (misconfig trap) | **Fixed** |
+| F4 | Realtime `delete` events use coarse authz (existence leak) | Authz / Realtime | Low | A | Low (id-only leak) | **Fixed** |
+| F5 | WS subscribe does not require auth | Authz / Realtime | Low | A | Low (delivery still viewRule-gated) | **Fixed** |
 | F6 | JWT secret has a usable insecure default in non-HTTPS mode | Auth/Config | Med | A | Conditional (dev default in prod-without-TLS) | Recommended |
 | F7 | Verification/reset tokens are not explicitly single-use | Auth | Low | A | Low (rotation + 1h TTL mitigate) | Recommended |
 | F8 | Rate limiter keyed on spoofable `X-Forwarded-For` on direct exposure | DoS | Med | A | Moderate (direct exposure only) | Known-limitation; assessed |
-| F9 | No global WS connection cap / no per-field body limit | DoS | Low/Med | A | Moderate | Recommended |
+| F9 | No global WS connection cap / no per-field body limit | DoS | Low/Med | A | Moderate | **Partly fixed** (WS connection cap done; per-field/`perPage`/multipart-count limits still recommended) |
 | F10 | Static dir mode follows symlinks out of root | Path traversal | Low | A | Low (operator must plant the symlink) | Known-limitation; assessed |
 | F11 | OAuth `state` is delegated to the client, not enforced server-side | Auth/OAuth | Low/Med | A | Low (redirect-URI allowlist + PKCE present) | Recommended |
 | F12 | Insecure deployment defaults (bind `0.0.0.0`, `cookie_secure=false`, open WS origins) | Config | Med | A | n/a (posture) | Recommended (checklist) |
@@ -104,9 +108,9 @@ Regression test: `email field rejects control chars (CRLF/NUL) and obviously-bog
 
 ---
 
-### F3 — Empty-string rule means allow-all; `null` means deny (Perspective B footgun)
+### F3 — Empty-string rule means allow-all; `null` means deny (Perspective B footgun) — FIXED
 
-**Location:** `src/rules.zig:14-19` (`decide`).
+**Location:** `src/rules.zig` (`decide`).
 
 ```zig
 pub fn decide(rule: ?[]const u8, rctx: *const request.RequestContext) Decision {
@@ -131,22 +135,37 @@ purely the *deliberate* empty-string-equals-public semantics.
 Combined with `expand` (which correctly re-applies the *target's* `viewRule`), an empty viewRule
 on a related collection also makes it expandable by anyone.
 
-**Recommended guardrails (framework):**
+**Fix (safe-by-default, breaking — pre-1.0).** `rules.decide` now treats a blank rule (`null` *or*
+`""`) as `deny_locked` (superuser only), and an explicit new sentinel **`"@public"`** as the only
+allow-all. Any other string is still compiled and checked per record. Implemented:
 
-- Make the admin UI render `null` vs `""` distinctly ("Locked (admins only)" vs **"Public —
-  anyone"**) with a confirmation when switching a rule to public.
-- Provide a startup/provision **lint** that logs a prominent warning for every collection with an
-  empty-string rule (`"collection X is PUBLIC for <op> (empty rule)"`), so the wide-open state is
-  never silent.
-- Consider an explicit sentinel (`"@true"` or a typed `.public`) for allow-all so that "" can be
-  reserved as a no-op, removing the trap entirely. (Behavior change — design decision, hence not
-  done here.)
+- `src/rules.zig`: `pub const public_sentinel = "@public"`, a `pub fn isPublic`, and the new
+  `decide` semantics. The previous `r.len == 0 => .allow` trap is gone.
+- Every site that special-cased an empty rule as public was made consistent:
+  `src/api/files.zig` (cacheable-file header now keys on `rules.isPublic`), `src/realtime/hub.zig`
+  / `src/realtime/ws.zig` (see F4/F5), `src/query/expand.zig` (public-target expand test).
+- **Startup lint:** `src/provision.zig` `warnPublicRules` logs
+  `collection 'X' is PUBLIC for <op> (anyone can <op>) — @public rule` for every `@public` rule at
+  provision time, so a wide-open state is never silent (verified live on the golfsim example).
+- **Admin UI** (`src/admin/app.js`, editable source present): the rule editor renders three
+  distinct states — *Locked (admins only)* for `null`/`""`, *Expression…*, and *PUBLIC — anyone*
+  (the `@public` sentinel) — with a `confirm()` before a rule can be set public.
+- **Examples** migrated (`examples/{blog,golfsim,plugins}/src/main.zig`): every `""` that meant
+  public became `"@public"` (public profiles/open signup; the golfsim simulators directory and
+  public reviews; plugins authors and the open comment-create rule). Expression rules were left
+  as-is.
+- **Docs** updated (`docs/api.md`, `docs/framework.md`, `docs/recipes.md`, `docs/tutorial.md`):
+  the value table, signup requirement, and rule-semantics prose now state "blank = Locked,
+  `@public` = public."
+- **Tests:** `decide` and `isPublic` unit tests (empty denies a non-superuser; `@public` allows
+  anyone; an expression still checks per record; superuser still bypasses), plus a realtime
+  "empty viewRule is now LOCKED" delivery test.
 
 ---
 
-### F4 — Realtime `delete` events: coarse authorization (existence leak)
+### F4 — Realtime `delete` events: coarse authorization (existence leak) — FIXED
 
-**Location:** `src/realtime/hub.zig:43-44`.
+**Location:** `src/realtime/hub.zig` (`shouldDeliver`).
 
 ```zig
 if (action == .delete) {
@@ -163,28 +182,39 @@ owner-scoped `viewRule` (e.g. `owner = @request.auth.id`) thus learns that *some
 deleted even if it was never theirs to view.
 
 **Impact.** Low — leaks only record *ids* and their deletion timing for non-locked collections;
-no record contents. Already acknowledged in the in-code comment.
+no record contents.
 
-**Recommendation.** Document explicitly in the realtime docs. If tighter behavior is wanted,
-snapshot the deleted record's authorization *before* the delete commits (the writer already holds
-the row in `existing` in `api/records.zig:307`) and pass that decision to the broadcast, so an
-owner-scoped collection only notifies the owner.
+**Fix.** The delete event is now authorized per subscriber against a **snapshot** of the deleted
+row. The writer (`src/api/records.zig` `delete`) passes the row it already holds in `existing` into
+`realtime_ws.broadcast`; `buildEventFrames` embeds it in the *published* delete frame under a
+private key (`_deleteSnapshot`). `hub.shouldDeliver` for `delete` evaluates the collection's
+`viewRule` against that snapshot in a throwaway in-memory DB (reusing the standard guarded-SELECT
+machinery), so an owner-scoped collection only notifies subscribers who were allowed to view the
+record. `onChannelMessage` strips the private snapshot and re-serializes an **id-only** frame
+before delivery, so the snapshot never reaches a client. A `@public` viewRule still notifies anyone
+(no snapshot needed); a `null`/locked one still notifies only superusers; with no snapshot the
+delete is conservatively *not* delivered to `check`-state subscribers. Relation-traversing delete
+rules deny (the temp DB has empty target tables) — a safe direction. Regression test:
+`F4: owner-scoped delete only notifies the owner (snapshot authz)`.
 
 ---
 
-### F5 — WS subscription does not require authentication
+### F5 — WS subscription does not require authentication — FIXED
 
-**Location:** `src/realtime/ws.zig:123-149` (`.subscribe` accepted with no auth check).
+**Location:** `src/realtime/ws.zig` (`.subscribe` handler).
 
-**Description.** A socket can `.subscribe` to any existing collection before (or without) sending
-`.auth`. This is *largely defanged* because delivery is still gated by `hub.shouldDeliver`: for a
-locked or owner-scoped collection an anonymous subscriber receives nothing on create/update. The
-residual exposure is (a) the F4 delete-existence leak to anonymous subscribers on non-locked
-collections, and (b) resource consumption from anonymous subscribers (see F9).
+**Description.** A socket could `.subscribe` to any existing collection before (or without) sending
+`.auth`. This was *largely defanged* because delivery is still gated by `hub.shouldDeliver`, but it
+allowed anonymous sockets to register subscriptions on gated data (and combined with F4's old
+behavior, leak delete ids).
 
-**Recommendation.** Optionally require `.auth` before `.subscribe` for collections whose
-`viewRule` is not `""` (public); at minimum, document that delete events reach anonymous
-subscribers on public collections.
+**Fix.** `.subscribe` now requires a live authenticated (or superuser) identity for any collection
+whose `viewRule` is **not** `"@public"`. A public (`@public`) collection may still be subscribed
+anonymously. The gate is a pure helper `subscribeAuthorized(view_rule, authed, is_superuser)` (so
+it is unit-tested directly), and an unauthorized subscribe is rejected with
+`{ "type": "error", "message": "authentication required to subscribe" }`. Per-record delivery
+authorization (`shouldDeliver`) is unchanged, so this is a layered defense. Regression test:
+`F5: anonymous subscribe allowed only on @public; gated collections require auth`.
 
 ---
 
@@ -241,7 +271,7 @@ on the real socket peer IP and ignore `X-Forwarded-For` entirely; only honor the
 
 ---
 
-### F9 — No global WS connection cap; no per-field body limit
+### F9 — No global WS connection cap; no per-field body limit — WS CAP FIXED
 
 **Location:** `src/realtime/ws.zig:19` (per-conn `MAX_SUBS = 256`, but no global cap);
 `src/config.zig` (`max_upload_size = 50<<20` global only), `src/server.zig` listener.
@@ -252,9 +282,17 @@ size limit** within a body, so an attacker can open many sockets (each up to 256
 single 50 MiB body of many tiny multipart parts / deeply nested JSON. Filter nesting is bounded
 at depth 32 (`query/parser.zig`), and `perPage` is an unbounded `u32` (large pages cost memory).
 
-**Recommendation.** Add a global connection limit and a `perPage` clamp (e.g. max 500); consider a
-multipart part-count cap. Low/Med because a single host's 50 MiB ceiling and reader/writer pool
-already bound the worst case somewhat.
+**Fix (WS connection cap).** A global cap on concurrent WebSocket connections is now enforced:
+`src/realtime/ws.zig` holds `pub const MAX_CONNECTIONS = 10_000` (kept as a realtime-layer constant,
+deliberately *not* in `config.zig`) and an atomic live-connection counter. `handleUpgrade` reserves
+a slot before allocating the connection and rejects upgrades past the cap with HTTP `503`; the slot
+is released on upgrade failure and on close. Reservation/release is a tested pure helper
+(`reserveConnectionSlot`/`releaseConnectionSlot`). Regression test:
+`F9: global connection cap reserves/releases and rejects past MAX_CONNECTIONS`.
+
+**Still recommended (not in this PR).** A `perPage` clamp (e.g. max 500), a per-field body-size
+limit, and a multipart part-count cap. Low/Med because a single host's 50 MiB ceiling and the
+reader/writer pool already bound the worst case somewhat.
 
 ---
 
@@ -306,9 +344,10 @@ an optional server-side state store for integrators who can't guarantee a correc
 
 The framework invites custom rules, hooks, routes, and plugins. The sharp edges:
 
-1. **Empty-string rule = public (F3).** The single most likely way to ship a wide-open
-   collection. *Guardrail:* startup lint warning on every empty rule; distinct admin-UI wording;
-   optional explicit `.public` sentinel.
+1. **Empty-string rule = public (F3) — FIXED.** This was the single most likely way to ship a
+   wide-open collection. Now safe-by-default: a blank rule (`null`/`""`) is Locked, and only the
+   explicit `"@public"` sentinel opens a collection — with a startup lint warning on every one and
+   distinct admin-UI wording (Locked / Expression / PUBLIC, confirmed before opening).
 2. **The mailer plugin trusts its inputs (F1).** `Mailer.send(to, subject, body)` is a public
    vtable; an integrator wiring a custom route that emails user input would have injected headers.
    *Guardrail (now in place):* the built-in builder/SMTP path rejects CR/LF/NUL in headers, so even
@@ -347,19 +386,29 @@ The framework invites custom rules, hooks, routes, and plugins. The sharp edges:
 - [ ] Configure SMTP (`ZIGBASE_SMTP_*`) so verify/reset tokens are emailed, not logged. Leave
       `ZIGBASE_SMTP_INSECURE` off except for known self-signed relays.
 - [ ] Set `realtime_allowed_origins` to your app origin(s); don't leave it empty in production.
-- [ ] Audit every collection's list/view/create/update/delete rules. Treat an **empty** rule as
-      **"public to the entire internet"** and confirm that's intended (F3).
+- [ ] Audit every collection's list/view/create/update/delete rules. Only the explicit
+      **`"@public"`** sentinel is "public to the entire internet" — confirm each one is intended
+      (ZigBase logs a startup warning for every `@public` rule). A blank rule (`null`/`""`) is
+      Locked to superusers (F3).
 - [ ] Don't place symlinks pointing outside the root inside a `--serve-static` directory (F10).
 - [ ] Set a Sentry DSN if you want errors captured off-box; error responses to clients are already
       generic (no stack traces / SQL leaked — verified in `src/api/error.zig`).
 
 ---
 
-## What was fixed in this PR
+## What was fixed
 
-- **F1 / F2:** mailer header/command injection + email-field control-char validation, with two
-  regression tests (`src/mail/mailer.zig`, `src/records.zig`). `zig build` and all 362 unit tests
-  pass.
+- **F1 / F2** (original audit PR): mailer header/command injection + email-field control-char
+  validation, with two regression tests (`src/mail/mailer.zig`, `src/records.zig`).
+- **F3** — safe-by-default access rules: blank (`null`/`""`) = Locked; explicit `"@public"` =
+  allow-all; startup lint; admin-UI three-state editor; examples + docs migrated.
+- **F4** — realtime delete events authorized against a per-record deletion snapshot (owner-scoped
+  collections no longer leak delete ids to unauthorized subscribers).
+- **F5** — WS `subscribe` requires auth for any non-`@public` collection.
+- **F9 (WS-cap portion)** — global concurrent-WebSocket-connection cap (`MAX_CONNECTIONS = 10_000`)
+  enforced at upgrade; over-cap upgrades get `503`.
 
-Everything else is a recommendation (design/behavior change, deployment posture, or doc work) and
-is intentionally **not** half-implemented.
+All of the above ship with regression tests; `zig build` succeeds and all unit tests pass.
+
+The remaining recommendations (F6, F7, F8, F9 per-field/perPage limits, F10, F11, F12) are
+deployment posture or further design/behavior changes and are intentionally **not** half-implemented.

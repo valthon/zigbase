@@ -204,16 +204,16 @@ test "expand silently skips a non-relation or unknown head" {
     }
 }
 
-test "H1: a public (empty-rule) target is expanded for anyone" {
+test "H1: a public (@public) target is expanded for anyone" {
     var d = try db.Db.openMemory();
     defer d.close();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     try migrations.run(&d);
-    const pub_users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "pubusers", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }}, .viewRule = "" });
+    const pub_users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "pubusers", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }}, .viewRule = "@public" });
     const pf = [_]schema.Field{.{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = pub_users.id, .maxSelect = 1 } } }};
-    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf, .viewRule = "" });
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf, .viewRule = "@public" });
     try d.exec("INSERT INTO pubusers (id,created,updated,name) VALUES ('u_1','t','t','Ada');");
     try d.exec("INSERT INTO posts (id,created,updated,author) VALUES ('p_1','t','t','u_1');");
 

@@ -405,7 +405,10 @@ Each value is a struct with:
 - `.type` — `.base` (default) / `.auth` / `.view` (a `schema.CollectionType`).
 - `.fields` — a **tuple** of field literals (see below).
 - `.rules` — optional `.{ .list, .view, .create, .update, .delete }` (any subset;
-  each is a filter-expression string).
+  each is a filter-expression string). **Safe-by-default:** an omitted rule, `null`, or
+  `""` is **Locked** (superuser only). Use the explicit sentinel `"@public"` to open an
+  operation to everyone (ZigBase logs a startup warning for every `@public` rule). Any other
+  string is a filter expression checked per record.
 
 Each field literal needs `.name` and `.type`, plus optional `.required`,
 `.unique`, `.hidden`, and type-specific options:

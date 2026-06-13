@@ -119,16 +119,17 @@ create_collection() { # $1 = JSON body
     -H 'Content-Type: application/json' -d "$1" | jq -r .id
 }
 
-# 2) users — an AUTH collection. Public create rule ("") enables open signup.
+# 2) users — an AUTH collection. Public create rule ("@public") enables open signup.
+#    (Safe-by-default: an empty "" rule is LOCKED, not public — use "@public" to open.)
 USERS_ID=$(create_collection '{
   "name": "users",
   "type": "auth",
   "fields": [
     { "id": "f_name", "name": "name", "type": "text", "options": { "max": 100 } }
   ],
-  "listRule": "",
-  "viewRule": "",
-  "createRule": "",
+  "listRule": "@public",
+  "viewRule": "@public",
+  "createRule": "@public",
   "updateRule": "@request.auth.id = id",
   "deleteRule": "@request.auth.id = id"
 }')
@@ -143,8 +144,8 @@ SIMS_ID=$(create_collection "{
     { \"id\": \"f_owner\", \"name\": \"owner\", \"type\": \"relation\", \"required\": true,
       \"options\": { \"targetCollectionId\": \"$USERS_ID\", \"cascadeDelete\": true, \"maxSelect\": 1 } }
   ],
-  \"listRule\": \"\",
-  \"viewRule\": \"\",
+  \"listRule\": \"@public\",
+  \"viewRule\": \"@public\",
   \"createRule\": \"@request.auth.id != \\\"\\\"\",
   \"updateRule\": \"@request.auth.id = owner\",
   \"deleteRule\": \"@request.auth.id = owner\"
@@ -246,9 +247,9 @@ What the server does on this create (auth collections only):
 
 Requirements:
 
-- The `users` collection needs a **public create rule** (`"createRule": ""`) for
-  open signup. With any other rule, anonymous signup is denied (a non-public,
-  non-empty rule yields `403`; a `null`/locked rule yields `403`).
+- The `users` collection needs a **public create rule** (`"createRule": "@public"`) for
+  open signup. Any non-public rule denies anonymous signup with `403` — including a blank
+  rule (`""` or `null`), which is now **Locked** (safe-by-default), not public.
 - `password` must be at least **`minPasswordLength`** characters (default **8**;
   configurable in the collection's `options.auth.minPasswordLength`). A missing or
   too-short password is a **`400`** ("A password of the required length is
@@ -272,7 +273,9 @@ see [api.md → Verification & password reset](api.md#verification--password-res
 
 ## Recipe: owner-scoped access rules
 
-Access rules are filter expressions evaluated per request (full grammar in
+A rule is one of: **Locked** (`null` or `""` — superuser only; the safe default),
+**Public** (`"@public"` — anyone; the only allow-all value, logged at startup), or a
+**filter expression** evaluated per request (full grammar in
 [api.md → Filter grammar](api.md#filter-grammar)). Relevant pieces:
 
 - `@request.auth.id` — the authenticated user's record id (`""` when anonymous).
