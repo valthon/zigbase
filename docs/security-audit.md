@@ -456,7 +456,6 @@ operator responsibilities.
 
 Access-control & realtime authz (PR A):
 
-<<<<<<< HEAD
 - **F1 / F2** (original audit PR): mailer header/command injection + email-field control-char
   validation, with two regression tests (`src/mail/mailer.zig`, `src/records.zig`).
 - **F3** — safe-by-default access rules: blank (`null`/`""`) = Locked; explicit `"@public"` =
