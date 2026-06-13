@@ -11,6 +11,10 @@ pub const Claims = struct {
     collection: []const u8,
     type: TokenType,
     csrf: []const u8 = "",
+    /// Unique token id. Set on single-use tokens (verification / password-reset) so a
+    /// redemption can be recorded in `_consumedTokens` and a replay rejected. Empty on
+    /// auth/file tokens, which are not single-use.
+    jti: []const u8 = "",
     iat: i64,
     exp: i64,
 };

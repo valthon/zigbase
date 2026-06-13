@@ -33,6 +33,14 @@ pub const Config = struct {
     rate_limit_max: u32 = 10, // attempts per window per key; 0 = disabled
     rate_limit_window_s: i64 = 60, // window length in seconds
 
+    // Server-side OAuth `state` (CSRF) store (F11). When false (default), CSRF on the
+    // OAuth flow is the client's job (client-driven PKCE + client-held state — the
+    // documented flow). When true, the backend mints a `state` at `oauth2-init` and
+    // requires/verifies it on `auth-with-oauth2`, rejecting a missing/mismatched/
+    // expired/reused state. Opt-in so the existing client-driven flow is unchanged.
+    oauth_state_server: bool = false,
+    oauth_state_ttl_s: i64 = 600, // server-side state lifetime (10 min)
+
     // SMTP / mailer. When smtp_host is empty (default), the default mailer plugin
     // resolves to LogMailer (logs verify/reset emails — pre-mailer dev/CI behavior).
     // Set smtp_host to upgrade to a real SMTP client with NO code change.
@@ -73,6 +81,8 @@ pub const Config = struct {
         if (getter("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
         if (getter("ZIGBASE_RATE_LIMIT_MAX")) |v| cfg.rate_limit_max = try std.fmt.parseInt(u32, v, 10);
         if (getter("ZIGBASE_RATE_LIMIT_WINDOW")) |v| cfg.rate_limit_window_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter("ZIGBASE_OAUTH_STATE_SERVER")) |v| cfg.oauth_state_server = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        if (getter("ZIGBASE_OAUTH_STATE_TTL")) |v| cfg.oauth_state_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_SMTP_HOST")) |v| cfg.smtp_host = v;
         if (getter("ZIGBASE_SMTP_PORT")) |v| cfg.smtp_port = try std.fmt.parseInt(u16, v, 10);
         if (getter("ZIGBASE_SMTP_USERNAME")) |v| cfg.smtp_username = v;
