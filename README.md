@@ -156,8 +156,10 @@ ZigBase is **secure by default**:
 - **Auth cookies** are `Secure` by default (HTTPS-only). For plain-HTTP local dev, pass
   `--insecure-cookies` (or `ZIGBASE_COOKIE_SECURE=false`).
 - **Realtime origins**: an empty `ZIGBASE_REALTIME_ORIGINS` **denies** cross-origin browser
-  WebSocket upgrades (a request with no `Origin` header — a non-browser client — is still
-  allowed). Set explicit origins for your browser app.
+  WebSocket upgrades. **Same-origin upgrades are always allowed** — the embedded admin UI and any
+  frontend served from this same binary work out of the box. A request with no `Origin` header
+  (a non-browser client) is also allowed. Set explicit origins only for a *separate-origin*
+  browser app.
 - **Rate limiting / client IP**: `X-Forwarded-For` / `X-Real-IP` are ignored unless
   `--trust-proxy` (`ZIGBASE_TRUST_PROXY=true`) is set, so direct exposure can't be bypassed
   by spoofing those headers. Enable it only behind a trusted reverse proxy.

@@ -79,15 +79,26 @@ pub const LiveConn = struct {
 
 pub const WS = zap.WebSockets.Handler(LiveConn);
 
-/// Is `origin` allowed by the CSV allowlist? (F12, secure-by-default)
-/// An empty allowlist no longer means "allow any". A request carrying an `Origin`
-/// header (i.e. a browser cross-origin upgrade) is DENIED unless its origin is on
-/// the explicit allowlist. A request with NO Origin header (a non-browser client —
-/// CLI/server-to-server, which cannot be CSRF'd via a victim's browser) is allowed;
-/// it is still subject to per-record viewRule authorization on delivery.
-pub fn originAllowed(allowlist: []const u8, origin: ?[]const u8) bool {
+/// Is `origin` allowed for an upgrade? (F12, secure-by-default)
+/// An empty allowlist no longer means "allow any". The rules, in order:
+///   1. No `Origin` header (a non-browser client — CLI/server-to-server, which cannot
+///      be CSRF'd via a victim's browser) => allowed.
+///   2. **Same-origin**: the Origin's authority equals the request `Host`. This is the
+///      embedded admin UI and any frontend served from this same binary; a malicious
+///      cross-site page cannot forge `Origin` to match the target's Host, so same-origin
+///      is always safe and must work out of the box without configuring an allowlist.
+///   3. Otherwise (a genuine cross-origin browser upgrade) => allowed only if the origin
+///      is on the explicit CSV allowlist.
+/// Delivery is still subject to per-record viewRule authorization regardless.
+pub fn originAllowed(allowlist: []const u8, origin: ?[]const u8, host: ?[]const u8) bool {
     const o = origin orelse return true; // no Origin header => non-browser client
-    if (allowlist.len == 0) return false; // browser origin present but no allowlist => deny
+    // Same-origin: Origin is `scheme://authority`; allow when authority == Host.
+    if (host) |h| {
+        if (std.mem.indexOf(u8, o, "://")) |i| {
+            if (std.mem.eql(u8, o[i + 3 ..], h)) return true;
+        }
+    }
+    if (allowlist.len == 0) return false; // cross-origin browser upgrade but no allowlist => deny
     var it = std.mem.splitScalar(u8, allowlist, ',');
     while (it.next()) |allowed| {
         if (std.mem.eql(u8, std.mem.trim(u8, allowed, " "), o)) return true;
@@ -105,7 +116,7 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
         r.markAsFinished(true);
         return;
     }
-    if (!originAllowed(app.realtime_allowed_origins, r.getHeader("origin"))) {
+    if (!originAllowed(app.realtime_allowed_origins, r.getHeader("origin"), r.getHeader("host"))) {
         r.setStatus(.forbidden);
         r.markAsFinished(true);
         return;
@@ -299,15 +310,21 @@ pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, rec
     WS.publish(.{ .channel = ef.record_channel, .message = ef.frame_record });
 }
 
-test "originAllowed: empty allowlist denies browser origins (F12); CSV matches exactly" {
-    // Secure-by-default: an empty allowlist DENIES any cross-origin browser upgrade...
-    try std.testing.expect(!originAllowed("", "https://anything"));
+test "originAllowed: empty allowlist denies cross-origin browser upgrades (F12); same-origin + CSV allowed" {
+    // Secure-by-default: an empty allowlist DENIES a cross-origin browser upgrade...
+    try std.testing.expect(!originAllowed("", "https://anything", "myhost:8090"));
     // ...but a request with no Origin header (non-browser client) is still allowed.
-    try std.testing.expect(originAllowed("", null));
-    try std.testing.expect(originAllowed("https://a.com", null));
-    // Explicit allowlist matches exactly.
-    try std.testing.expect(originAllowed("https://a.com, https://b.com", "https://b.com"));
-    try std.testing.expect(!originAllowed("https://a.com", "https://evil.com"));
+    try std.testing.expect(originAllowed("", null, null));
+    try std.testing.expect(originAllowed("https://a.com", null, null));
+    // Same-origin (Origin authority == Host) is always allowed, even with no allowlist —
+    // this is the embedded admin UI / a frontend served from the same binary.
+    try std.testing.expect(originAllowed("", "http://127.0.0.1:8090", "127.0.0.1:8090"));
+    try std.testing.expect(originAllowed("", "https://app.example.com", "app.example.com"));
+    // A cross-origin request whose authority differs from Host is NOT same-origin.
+    try std.testing.expect(!originAllowed("", "https://evil.com", "127.0.0.1:8090"));
+    // Explicit allowlist matches exactly (cross-origin, host differs).
+    try std.testing.expect(originAllowed("https://a.com, https://b.com", "https://b.com", "api.myhost"));
+    try std.testing.expect(!originAllowed("https://a.com", "https://evil.com", "api.myhost"));
 }
 
 test "broadcast is a no-op when inactive" {

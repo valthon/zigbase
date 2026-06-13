@@ -245,10 +245,10 @@ mise exec zig@0.16.0 -- zig build          # -> ./zig-out/bin/golfsim
 
 # 4. Run
 # --insecure-cookies: local dev over plain HTTP (auth cookies are Secure by default).
-# --realtime-origins: allow the browser's same-origin WebSocket upgrade (live bookings).
+# The frontend is served from this same binary, so its live-bookings WebSocket is
+# same-origin and allowed by default — no --realtime-origins needed.
 # A random JWT secret is generated + persisted at data/.jwt_secret on first run.
-./zig-out/bin/golfsim serve --insecure-cookies --realtime-origins http://127.0.0.1:8090 \
-  --data-dir ./data
+./zig-out/bin/golfsim serve --insecure-cookies --data-dir ./data
 # open http://127.0.0.1:8090/  — frontend served automatically, no --serve-static flag
 ```
 

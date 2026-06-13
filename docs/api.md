@@ -422,9 +422,12 @@ file delivery, use [file storage](#files) instead.
 Connect to `ws://<host>/api/realtime` (the upgrade is gated to that exact path and
 the connection Origin is validated against the server's allowlist). The allowlist is
 `ZIGBASE_REALTIME_ORIGINS` / `--realtime-origins` (CSV). It is **empty by default, which
-denies cross-origin browser upgrades** — set your app origin(s) to allow them. A request
-with **no** `Origin` header (a non-browser client) is allowed regardless; delivery is still
-gated per-record by each collection's `viewRule`.
+denies cross-origin browser upgrades** — set your app origin(s) only if your frontend is served
+from a *different* origin. **Same-origin upgrades** (the embedded admin UI, or a frontend served
+from this same binary — the Origin authority equals the request `Host`) are **always allowed**,
+so the common single-binary deployment needs no configuration. A request with **no** `Origin`
+header (a non-browser client) is allowed regardless; delivery is still gated per-record by each
+collection's `viewRule`.
 
 ### Authenticating
 

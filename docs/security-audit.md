@@ -375,14 +375,19 @@ changes, with quickstart docs/examples/tests updated to match):
 - **`cookie_secure = true`** (HTTPS-only auth cookies). Opt out for plain-HTTP local dev with
   `--insecure-cookies` / `ZIGBASE_COOKIE_SECURE=false`.
 - **`realtime_allowed_origins = ""` now DENIES** cross-origin browser WS upgrades (an empty
-  allowlist is no longer "allow any"). A request with no `Origin` header (non-browser client) is
-  still allowed; set explicit origins (`--realtime-origins` / `ZIGBASE_REALTIME_ORIGINS`) for
-  browser apps. `originAllowed` updated accordingly (`src/realtime/ws.zig`, with an updated test).
+  allowlist is no longer "allow any"). **Same-origin upgrades are always allowed** (the Origin
+  authority equals the request `Host` — the embedded admin UI and any frontend served from the
+  same binary; a malicious cross-site page cannot forge `Origin` to match, so this is CSRF-safe),
+  so the common single-binary deployment needs no origin configuration. A request with no `Origin`
+  header (non-browser client) is still allowed; set explicit origins (`--realtime-origins` /
+  `ZIGBASE_REALTIME_ORIGINS`) only for a separate-origin browser app. `originAllowed(allowlist,
+  origin, host)` enforces this (`src/realtime/ws.zig`, with updated tests).
 - **`jwt_secret`** auto-generated + persisted (F6).
 
 The quickstart in `README.md`, `docs/tutorial.md`, and the `examples/{blog,golfsim}` READMEs were
-updated so copy-paste local runs still work under the new defaults (they pass `--insecure-cookies`,
-and the realtime examples pass `--realtime-origins http://127.0.0.1:8090`).
+updated so copy-paste local runs still work under the new defaults (they pass `--insecure-cookies`).
+The example frontends are served from the same binary, so their realtime is same-origin and needs
+no `--realtime-origins` flag.
 
 ---
 

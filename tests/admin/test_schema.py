@@ -81,21 +81,25 @@ def test_number_fixed_non_integer_scale_shows_field_error(page):
 
 def test_edit_rules_lock_toggle(page):
     login(page)
-    # seed a base collection via the API (uses the session cookie + csrf)
-    api_request(page, "POST", "/api/collections", {"name": "notes", "type": "base", "fields": [{"id": "", "name": "body", "type": "text", "options": {}}], "viewRule": ""})
+    # seed a base collection that starts PUBLIC via the explicit "@public" sentinel, so we can
+    # toggle it to Locked. Safe-by-default semantics (F3): null/"" both mean Locked (admins only);
+    # only "@public" is allow-all. The rule editor is a three-state select (locked/expr/public).
+    api_request(page, "POST", "/api/collections", {"name": "notes", "type": "base", "fields": [{"id": "", "name": "body", "type": "text", "options": {}}], "viewRule": "@public"})
     # full document load (query-busted) onto the schema route so the SPA mounts fresh on the editor
     page.goto("/_/?t=1#/collections/notes")
     page.wait_for_selector('[data-test=schema-editor]')
     page.click('[data-test=tab-rules]')
-    # viewRule was "" (public) -> not locked; lock it
-    page.check('[data-test=lock-viewRule]')
+    # viewRule was "@public" -> the rule-mode select reads "public"; toggle it to Locked
+    assert page.input_value('[data-test=rulemode-viewRule]') == 'public'
+    page.select_option('[data-test=rulemode-viewRule]', 'locked')  # -> sets the rule to "" (no confirm)
     page.click('[data-test=save-collection]')
     page.wait_for_selector('[data-test=nav-notes]', timeout=8000)
     # save navigates to the records view and reloads the page to refresh the sidebar;
     # wait for that post-save reload to settle before navigating back to the editor.
     page.wait_for_selector('[data-test=records-view]', timeout=8000)
-    # reload editor: viewRule should now be locked (null -> checkbox checked)
+    # reload editor: viewRule should now be Locked (persisted null/"" -> mode "locked")
     page.goto("/_/?t=2#/collections/notes")
     page.wait_for_selector('[data-test=schema-editor]', timeout=8000)
     page.click('[data-test=tab-rules]')
-    assert page.is_checked('[data-test=lock-viewRule]')
+    assert page.input_value('[data-test=rulemode-viewRule]') == 'locked'
+    assert page.is_visible('[data-test=locktag-viewRule]')

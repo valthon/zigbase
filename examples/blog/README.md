@@ -163,10 +163,10 @@ updates, post detail, and a login + "write a post" island.
 ```sh
 cd frontend && npm install && npm run build && cd ..
 mise exec zig@0.16.0 -- zig build
-# --insecure-cookies for plain-HTTP local dev; --realtime-origins so the browser's
-# same-origin WebSocket upgrade (which carries an Origin header) is allowed — the live
-# post-list updates rely on it. An empty allowlist denies cross-origin browser upgrades.
-./zig-out/bin/blog serve --insecure-cookies --realtime-origins http://127.0.0.1:8090 \
+# --insecure-cookies for plain-HTTP local dev. The frontend is served from this same
+# binary, so the live post-list WebSocket is same-origin and allowed by default; only a
+# separate-origin browser app needs --realtime-origins.
+./zig-out/bin/blog serve --insecure-cookies \
   --data-dir ./zb_data --serve-static frontend/dist
 # open http://127.0.0.1:8090/
 ```
