@@ -124,6 +124,8 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_SENTRY_DSN` | — | `""` (log to stderr) | set to enable Sentry error reporting |
 | `ZIGBASE_RATE_LIMIT_MAX` | — | `10` | max sensitive-auth attempts per window per client; `0` disables rate limiting |
 | `ZIGBASE_RATE_LIMIT_WINDOW` | — | `60` | rate-limit window length, seconds |
+| `ZIGBASE_OAUTH_STATE_SERVER` | — | `false` | enable server-side OAuth `state` (CSRF) store; clients must call `oauth2-init` and echo `state` on callback (PKCE still required) |
+| `ZIGBASE_OAUTH_STATE_TTL` | — | `600` (10 min) | server-side OAuth `state` lifetime, seconds |
 | `ZIGBASE_SMTP_HOST` | — | `""` (use LogMailer) | SMTP server host; set to deliver verify/reset email instead of logging |
 | `ZIGBASE_SMTP_PORT` | — | `25` | SMTP server port |
 | `ZIGBASE_SMTP_USERNAME` | — | `""` | SMTP username; non-empty enables `AUTH LOGIN` |

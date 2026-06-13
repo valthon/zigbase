@@ -46,10 +46,40 @@ fn init_0003(w: *db.Db) db.DbError!void {
     try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_extauth_rec_provider\" ON \"_externalAuths\" (\"collectionRef\",\"recordRef\",\"provider\");");
 }
 
+fn init_0004(w: *db.Db) db.DbError!void {
+    // Single-use ledger for verification / password-reset tokens (F7). A token's
+    // random "jti" claim is recorded here on first redemption; a UNIQUE primary key
+    // makes a second redemption fail atomically under the writer lock, independent of
+    // any tokenKey-rotation side effect. "expires" is the token's own exp (unix secs)
+    // so a sweeper can prune entries once the token could no longer verify anyway.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_consumedTokens" (
+        \\  "jti" TEXT PRIMARY KEY, "expires" INTEGER NOT NULL, "consumed" TEXT NOT NULL
+        \\);
+    );
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_consumed_expires\" ON \"_consumedTokens\" (\"expires\");");
+}
+
+fn init_0005(w: *db.Db) db.DbError!void {
+    // Optional server-side OAuth `state` store (F11). When server-side CSRF protection
+    // is enabled, auth-init mints a random state here; the callback verifies and deletes
+    // it (single-use). "expires" is a unix-seconds TTL; a missing/mismatched/expired/reused
+    // state is rejected. Unused when server-side state is disabled (client-driven flow).
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_oauthStates" (
+        \\  "state" TEXT PRIMARY KEY, "collectionRef" TEXT NOT NULL, "provider" TEXT NOT NULL,
+        \\  "expires" INTEGER NOT NULL, "created" TEXT NOT NULL
+        \\);
+    );
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_oauthstate_expires\" ON \"_oauthStates\" (\"expires\");");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
     .{ .name = "0003_external_auths", .up = init_0003 },
+    .{ .name = "0004_consumed_tokens", .up = init_0004 },
+    .{ .name = "0005_oauth_states", .up = init_0005 },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {

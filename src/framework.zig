@@ -640,6 +640,8 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .auth_token_ttl_s = cfg.auth_token_ttl_s,
         .verification_ttl_s = cfg.verification_ttl_s,
         .password_reset_ttl_s = cfg.password_reset_ttl_s,
+        .oauth_state_server = cfg.oauth_state_server,
+        .oauth_state_ttl_s = cfg.oauth_state_ttl_s,
         .realtime_allowed_origins = cfg.realtime_allowed_origins,
         .trust_proxy = cfg.trust_proxy,
         .max_upload_size = cfg.max_upload_size,

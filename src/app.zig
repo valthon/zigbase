@@ -13,6 +13,10 @@ pub const App = struct {
     auth_token_ttl_s: i64 = 14 * 24 * 3600,
     verification_ttl_s: i64 = 7 * 24 * 3600,
     password_reset_ttl_s: i64 = 3600,
+    /// Server-side OAuth `state` CSRF protection (F11). Opt-in: when true, the backend
+    /// issues a `state` at oauth2-init and verifies+consumes it on auth-with-oauth2.
+    oauth_state_server: bool = false,
+    oauth_state_ttl_s: i64 = 600,
     realtime_allowed_origins: []const u8 = "",
     /// When false (default), client-IP logic ignores X-Forwarded-For/X-Real-IP and
     /// keys on the real socket peer. Only honor proxy headers when true (behind a

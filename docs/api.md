@@ -314,6 +314,7 @@ authorization `code` to the server.
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/api/collections/:col/oauth2-providers` | List enabled providers (name, `authURL`, `clientId`, `scopes`). Secrets are never returned. |
+| POST | `/api/collections/:col/oauth2-init` | (Server-side state mode only) Mint a server-issued `state` for a provider. `404` when server-side state is disabled. |
 | POST | `/api/collections/:col/auth-with-oauth2` | Exchange an authorization code for a session. |
 | DELETE | `/api/collections/:col/records/:id/external-auths/:provider` | Unlink a provider from a record. |
 
@@ -333,6 +334,28 @@ authorization `code` to the server.
 ```
 
 `redirectUrl` must be in the provider's configured allowlist.
+
+#### CSRF on the OAuth flow: `state`
+
+The OAuth `state` parameter prevents login-CSRF. ZigBase supports two modes:
+
+- **Client-driven (default).** The SPA generates `state`, embeds it in the provider
+  authorization URL, and verifies the returned `state` against what it stored before
+  calling `auth-with-oauth2`. The backend does not see or check `state`. This is the
+  documented flow and is unchanged.
+- **Server-side (opt-in).** Set `ZIGBASE_OAUTH_STATE_SERVER=true` (TTL via
+  `ZIGBASE_OAUTH_STATE_TTL`, default 600s). Then:
+  1. The client calls `POST .../oauth2-init` with `{ "provider": "<name>" }` and
+     receives `{ "state": "<value>" }`.
+  2. The client embeds that `state` in the provider authorization URL.
+  3. On callback, the client adds `"state": "<value>"` to the `auth-with-oauth2` body.
+
+  The backend verifies the state exists, matches the (collection, provider), is
+  unexpired, and is **single-use** (deleted on first use). A missing, mismatched,
+  expired, or replayed `state` is rejected with `400` before the provider is contacted.
+  Use this when you can't guarantee a correct SPA. **PKCE (`codeVerifier`) is still
+  required in both modes** — server-side `state` adds CSRF protection, it does not
+  replace PKCE.
 
 ---
 

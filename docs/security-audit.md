@@ -45,11 +45,11 @@ collection (with a prominent startup warning for every one).
 | F4 | Realtime `delete` events use coarse authz (existence leak) | Authz / Realtime | Low | A | Low (id-only leak) | **Fixed** |
 | F5 | WS subscribe does not require auth | Authz / Realtime | Low | A | Low (delivery still viewRule-gated) | **Fixed** |
 | F6 | JWT secret has a usable insecure default in non-HTTPS mode | Auth/Config | Med | A | Conditional (dev default in prod-without-TLS) | **Fixed** |
-| F7 | Verification/reset tokens are not explicitly single-use | Auth | Low | A | Low (rotation + 1h TTL mitigate) | Recommended |
+| F7 | Verification/reset tokens are not explicitly single-use | Auth | Low | A | Low (rotation + 1h TTL mitigate) | **Fixed** |
 | F8 | Rate limiter keyed on spoofable `X-Forwarded-For` on direct exposure | DoS | Med | A | Moderate (direct exposure only) | **Fixed** |
 | F9 | No global WS connection cap / no per-field body limit | DoS | Low/Med | A | Moderate | **Fixed** (WS connection cap + perPage clamp + multipart part cap) |
 | F10 | Static dir mode follows symlinks out of root | Path traversal | Low | A | Low (operator must plant the symlink) | **Fixed** |
-| F11 | OAuth `state` is delegated to the client, not enforced server-side | Auth/OAuth | Low/Med | A | Low (redirect-URI allowlist + PKCE present) | Recommended |
+| F11 | OAuth `state` is delegated to the client, not enforced server-side | Auth/OAuth | Low/Med | A | Low (redirect-URI allowlist + PKCE present) | **Fixed** (opt-in server-side store) |
 | F12 | Insecure deployment defaults (bind `0.0.0.0`, `cookie_secure=false`, open WS origins) | Config | Med | A | n/a (posture) | **Fixed** |
 
 Items deliberately re-assessed as **not exploitable**: rule **parse errors fail *closed*** (a
@@ -244,20 +244,27 @@ reuses it byte-for-byte.
 
 ---
 
-### F7 — Verification / password-reset tokens not explicitly single-use
+### F7 — Verification / password-reset tokens not explicitly single-use (FIXED)
 
-**Location:** `src/api/auth.zig:289-304` (confirm verification), `337-360` (confirm reset);
-tokens minted in `mintToken` (`230-236`).
+**Location:** `src/api/auth.zig` (confirm verification / confirm reset; `mintToken`);
+`src/jwt.zig` (`Claims.jti`); `src/migrations.zig` (`0004_consumed_tokens`).
 
 **Description.** Reset/verification tokens are signed JWTs with short TTLs (reset 1h, verify 7d)
-and good entropy. Reuse is prevented only *incidentally*: confirming a reset rotates the user's
+and good entropy. Reuse was prevented only *incidentally*: confirming a reset rotates the user's
 `tokenKey`, which invalidates the token's derived signing key — so a second confirm fails. There
-is no explicit consumed-token store, so within the validity window before the legitimate user
-acts, a leaked token could be redeemed (and, for verification, re-redeemed since verify doesn't
-rotate the key).
+was no explicit consumed-token store, so within the validity window before the legitimate user
+acts, a leaked token could be redeemed (and, for verification, **re-redeemed** since verify does
+not rotate the key).
 
-**Recommendation.** Track consumed token ids (or bump a per-user token version on first
-redemption) to make these strictly single-use, independent of the rotation side effect.
+**Fix.** Each verification/reset token now carries a random `jti` claim (minted in `mintToken`).
+A new `_consumedTokens` table (migration `0004`, PRIMARY KEY on `jti`) records the `jti` on first
+redemption. `consumeToken` performs an `INSERT` under the writer lock; a second redemption hits
+the UNIQUE constraint and is rejected with `400` — strictly single-use, **independent of the
+tokenKey-rotation side effect** and effective even within the TTL (the gap that let a verify token
+replay). The reset path validates the new password *before* consuming, so a too-short password
+does not burn the token. The table stores the token `exp` for later pruning. Regression tests:
+*F7: a verification token cannot be redeemed twice*, *F7: a password-reset token cannot be
+redeemed twice*, *F7: a too-short password does not consume the reset token*.
 
 ---
 
@@ -327,19 +334,31 @@ in-root file still serves) and `withinRoot: prefix must be '/'-bounded` (`src/st
 
 ---
 
-### F11 — OAuth `state` delegated to the client
+### F11 — OAuth `state` delegated to the client (FIXED — opt-in server-side store)
 
-**Location:** `src/api/oauth.zig` (`authWithOAuth2Impl`), `src/oauth/client.zig`.
+**Location:** `src/api/oauth.zig` (`oauth2Init`, `authWithOAuth2Impl`, `issueState`/`consumeState`),
+`src/config.zig` / `src/app.zig` (`oauth_state_server`, `oauth_state_ttl_s`),
+`src/migrations.zig` (`0005_oauth_states`).
 
 **Assessment.** ZigBase follows the PocketBase split: the **client** generates and checks the
 `state`/PKCE pair and the SPA holds the verifier; the backend enforces (a) `redirect_url` against
 a per-provider **exact-match allowlist** (`redirectAllowed`), (b) **https-only** effective
 provider endpoints (`resolveProvider` → `isHttps`), and (c) requires the `codeVerifier` on
-exchange (PKCE). CSRF on the OAuth flow therefore depends on the client honoring `state`. This is
-a defensible design but it puts a security-critical step in integrator hands (Perspective B).
+exchange (PKCE). CSRF on the OAuth flow therefore depended on the client honoring `state`.
 
-**Recommendation.** Document loudly that the client *must* generate and verify `state`; consider
-an optional server-side state store for integrators who can't guarantee a correct SPA.
+**Fix.** Added an **opt-in server-side `state` store** (`ZIGBASE_OAUTH_STATE_SERVER=true`, default
+**off** to preserve the documented client-driven flow). When enabled, `POST .../oauth2-init` mints
+a random `state` into `_oauthStates` (migration `0005`, keyed by `state` with a TTL `expires`),
+scoped to (collection, provider). `auth-with-oauth2` then **requires** a `state` in the body and
+verifies+consumes it via a single `DELETE ... RETURNING` (single-use) **before** contacting the
+provider — so a missing, mismatched, expired, or **replayed** state is rejected with `400` without
+burning the authorization code. PKCE remains mandatory in both modes. Default-on was rejected
+because the documented flow does not send `state` to the backend; opt-in lets integrators who
+can't guarantee a correct SPA get server-enforced CSRF protection without breaking existing
+clients. Regression tests: *F11: server-side state — valid accepted; missing/mismatched/replayed
+rejected*, *F11: oauth2-init 404 when server-side state disabled*, *F11: client-driven flow still
+works when server-side state is disabled*. Docs: `docs/api.md` (OAuth2 → CSRF on the OAuth flow),
+`README.md` (env vars).
 
 ---
 
@@ -437,6 +456,7 @@ operator responsibilities.
 
 Access-control & realtime authz (PR A):
 
+<<<<<<< HEAD
 - **F1 / F2** (original audit PR): mailer header/command injection + email-field control-char
   validation, with two regression tests (`src/mail/mailer.zig`, `src/records.zig`).
 - **F3** — safe-by-default access rules: blank (`null`/`""`) = Locked; explicit `"@public"` =
@@ -458,7 +478,16 @@ Deployment & DoS hardening (PR B):
 - **F9 — DoS caps:** `perPage` clamped to 500; multipart bodies capped at 1024 parts.
 - **F10 — static symlink escape:** served files canonicalized and verified within the static root.
 
+Auth token lifecycle & OAuth (PR C):
+
+- **F7** — strictly single-use verification/reset tokens via a random `jti` claim recorded in a new
+  `_consumedTokens` table (migration `0004`), enforced in the confirm handlers — independent of the
+  tokenKey-rotation side effect. Three regression tests.
+- **F11** — opt-in **server-side OAuth `state`** store (migration `0005`, `oauth2-init` endpoint,
+  `ZIGBASE_OAUTH_STATE_SERVER`, default off), single-use and verified before the provider exchange.
+  Three regression tests; docs updated.
+
 All of the above ship with regression tests; `zig build` succeeds and all unit tests pass.
 
-The remaining recommendations (F7, F11, and a per-field body-size limit) are further design/behavior
-changes and are intentionally **not** half-implemented here.
+The one residual hardening (a per-field body-size limit within the global 50 MiB body cap) is left
+as a recommendation and intentionally **not** half-implemented here.
