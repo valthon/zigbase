@@ -79,10 +79,15 @@ pub const LiveConn = struct {
 
 pub const WS = zap.WebSockets.Handler(LiveConn);
 
-/// Is `origin` allowed by the CSV allowlist? Empty allowlist allows any (dev default).
+/// Is `origin` allowed by the CSV allowlist? (F12, secure-by-default)
+/// An empty allowlist no longer means "allow any". A request carrying an `Origin`
+/// header (i.e. a browser cross-origin upgrade) is DENIED unless its origin is on
+/// the explicit allowlist. A request with NO Origin header (a non-browser client —
+/// CLI/server-to-server, which cannot be CSRF'd via a victim's browser) is allowed;
+/// it is still subject to per-record viewRule authorization on delivery.
 pub fn originAllowed(allowlist: []const u8, origin: ?[]const u8) bool {
-    if (allowlist.len == 0) return true;
-    const o = origin orelse return false;
+    const o = origin orelse return true; // no Origin header => non-browser client
+    if (allowlist.len == 0) return false; // browser origin present but no allowlist => deny
     var it = std.mem.splitScalar(u8, allowlist, ',');
     while (it.next()) |allowed| {
         if (std.mem.eql(u8, std.mem.trim(u8, allowed, " "), o)) return true;
@@ -294,12 +299,15 @@ pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, rec
     WS.publish(.{ .channel = ef.record_channel, .message = ef.frame_record });
 }
 
-test "originAllowed: empty allowlist allows any; CSV matches exactly" {
+test "originAllowed: empty allowlist denies browser origins (F12); CSV matches exactly" {
+    // Secure-by-default: an empty allowlist DENIES any cross-origin browser upgrade...
+    try std.testing.expect(!originAllowed("", "https://anything"));
+    // ...but a request with no Origin header (non-browser client) is still allowed.
     try std.testing.expect(originAllowed("", null));
-    try std.testing.expect(originAllowed("", "https://anything"));
+    try std.testing.expect(originAllowed("https://a.com", null));
+    // Explicit allowlist matches exactly.
     try std.testing.expect(originAllowed("https://a.com, https://b.com", "https://b.com"));
     try std.testing.expect(!originAllowed("https://a.com", "https://evil.com"));
-    try std.testing.expect(!originAllowed("https://a.com", null));
 }
 
 test "broadcast is a no-op when inactive" {

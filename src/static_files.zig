@@ -117,6 +117,16 @@ fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const 
     };
 }
 
+/// True iff `candidate` is the same path as `root` or lives strictly beneath it
+/// (a '/'-bounded prefix, so "/a/rootEVIL" is NOT considered inside "/a/root").
+fn withinRoot(root: []const u8, candidate: []const u8) bool {
+    if (!std.mem.startsWith(u8, candidate, root)) return false;
+    if (candidate.len == root.len) return true;
+    // Allow a trailing slash on either side; require a separator at the boundary.
+    const r = if (root.len > 0 and root[root.len - 1] == '/') root.len - 1 else root.len;
+    return candidate.len > r and candidate[r] == '/';
+}
+
 fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8) !?http.Response {
     const first = if (rel.len == 0) "index.html" else rel;
     var full = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ root, first });
@@ -126,6 +136,13 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
         st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
     }
     if (st.kind != .file) return null;
+    // F10: lexical sanitize() already blocks ".."/backslash/NUL, but a symlink INSIDE
+    // the root can still point outside it (statFile follows symlinks). Canonicalize the
+    // matched file AND the root, and refuse to serve anything whose real path escapes the
+    // real root. realPathFile resolves every symlinked component; a miss/escape => 404.
+    const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, ctx.allocator) catch return null;
+    const real_full = std.Io.Dir.cwd().realPathFileAlloc(io, full, ctx.allocator) catch return null;
+    if (!withinRoot(real_root, real_full)) return null;
     // Dir mode delegates ETag/Last-Modified/Cache-Control(max-age=3600)/If-None-Match/304
     // handling to facil.io's sendFile (http_sendfile2), which always emits its own etag
     // and answers conditional requests itself — adding ours would put two ETag headers
@@ -283,4 +300,49 @@ test "dir: serves files via file_path; index resolution; miss; traversal" {
     try std.testing.expect((try serve(std.testing.io, &miss, src)) == null);
     var trav = http.RequestCtx{ .method = .GET, .path = "/../secret", .allocator = arena.allocator() };
     try std.testing.expect((try serve(std.testing.io, &trav, src)) == null);
+}
+
+test "withinRoot: prefix must be '/'-bounded (no sibling-prefix bypass)" {
+    try std.testing.expect(withinRoot("/srv/www", "/srv/www"));
+    try std.testing.expect(withinRoot("/srv/www", "/srv/www/a/b.js"));
+    try std.testing.expect(withinRoot("/srv/www/", "/srv/www/a.js"));
+    try std.testing.expect(!withinRoot("/srv/www", "/srv/wwwEVIL/x"));
+    try std.testing.expect(!withinRoot("/srv/www", "/etc/passwd"));
+}
+
+test "dir: a symlink inside the root pointing OUTSIDE it is refused (F10)" {
+    // Two sibling temp dirs: `root` is served; `outside` is not. A symlink planted
+    // inside root that points at a file in `outside` must NOT be served, even though
+    // the lexical path is clean and statFile would happily follow the link.
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+    var out_tmp = std.testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A legitimate in-root file still serves.
+    try root_tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ok.txt", .data = "in-root" });
+    // The secret lives outside the served root.
+    try out_tmp.dir.writeFile(std.testing.io, .{ .sub_path = "secret.txt", .data = "TOPSECRET" });
+
+    const root = try root_tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const out_abs = try out_tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const secret_abs = try std.fmt.allocPrint(a, "{s}/secret.txt", .{out_abs});
+    // Plant the escaping symlink inside the served root: root/leak.txt -> outside/secret.txt
+    try root_tmp.dir.symLink(std.testing.io, secret_abs, "leak.txt", .{});
+
+    const src = Source{ .dir = root };
+
+    // The escaping symlink is refused (404 / null).
+    var leak = http.RequestCtx{ .method = .GET, .path = "/leak.txt", .allocator = a };
+    try std.testing.expect((try serve(std.testing.io, &leak, src)) == null);
+
+    // The legitimate file is unaffected.
+    var ok = http.RequestCtx{ .method = .GET, .path = "/ok.txt", .allocator = a };
+    const r = (try serve(std.testing.io, &ok, src)).?;
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(r.file_path != null);
 }

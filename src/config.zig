@@ -10,15 +10,28 @@ const std = @import("std");
 pub const SmtpTls = enum { none, starttls, implicit, auto };
 
 pub const Config = struct {
-    http_host: []const u8 = "0.0.0.0",
+    // Secure-by-default bind: loopback only. The server only listens on all
+    // interfaces when explicitly opted in (`--http-host 0.0.0.0` / ZIGBASE_HTTP_HOST).
+    http_host: []const u8 = "127.0.0.1",
     http_port: u16 = 8090,
     data_dir: []const u8 = "./zb_data",
-    jwt_secret: []const u8 = "dev-insecure-secret-change-me",
-    cookie_secure: bool = false, // dev default; set true behind HTTPS
+    // "" = no operator-provided secret: serveImpl auto-generates a strong random
+    // secret on first run and persists it at <data_dir>/.jwt_secret (0600), reusing
+    // it thereafter. An operator-provided secret must be >= 32 bytes; the old shared
+    // "dev-insecure-secret-change-me" default is gone.
+    jwt_secret: []const u8 = "",
+    cookie_secure: bool = true, // secure-by-default; opt out with --insecure-cookies for plain-HTTP local dev
     auth_token_ttl_s: i64 = 14 * 24 * 3600, // 14 days
     verification_ttl_s: i64 = 7 * 24 * 3600, // 7 days
     password_reset_ttl_s: i64 = 3600, // 1 hour
-    realtime_allowed_origins: []const u8 = "", // CSV of allowed WS Origins; "" = allow any (dev)
+    // CSV of allowed WS Origins. Empty = DENY all cross-origin upgrades (an upgrade
+    // is permitted only when no Origin header is present, i.e. a non-browser client).
+    // Set explicit origins to allow browser clients. Empty no longer means "allow any".
+    realtime_allowed_origins: []const u8 = "",
+    // When false (default), the rate limiter and any client-IP logic key on the real
+    // socket peer and IGNORE X-Forwarded-For / X-Real-IP (which a direct attacker can
+    // spoof). Set true ONLY when behind a trusted reverse proxy that sets those headers.
+    trust_proxy: bool = false,
     max_upload_size: u64 = 50 << 20, // 50 MiB per request body
     file_token_ttl_s: i64 = 120, // short-lived file-access token
     sentry_dsn: []const u8 = "", // "" = log errors to stderr; set to enable Sentry reporting
@@ -68,6 +81,7 @@ pub const Config = struct {
         if (getter("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_PASSWORD_RESET_TTL")) |v| cfg.password_reset_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_REALTIME_ORIGINS")) |v| cfg.realtime_allowed_origins = v;
+        if (getter("ZIGBASE_TRUST_PROXY")) |v| cfg.trust_proxy = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
         if (getter("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
         if (getter("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
@@ -112,7 +126,11 @@ test "defaults apply when getter returns null" {
     };
     const cfg = try Config.load(&G.get);
     try std.testing.expectEqual(@as(u16, 8090), cfg.http_port);
-    try std.testing.expectEqualStrings("0.0.0.0", cfg.http_host);
+    // Secure-by-default: loopback bind, no operator secret yet, secure cookies, no trusted proxy.
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.http_host);
+    try std.testing.expectEqualStrings("", cfg.jwt_secret);
+    try std.testing.expectEqual(true, cfg.cookie_secure);
+    try std.testing.expectEqual(false, cfg.trust_proxy);
 }
 
 test "env overrides are applied and parsed" {
@@ -133,19 +151,33 @@ test "auth defaults and overrides" {
         fn get(_: []const u8) ?[]const u8 { return null; }
     };
     const d = try Config.load(&G0.get);
-    try std.testing.expectEqual(false, d.cookie_secure);
+    try std.testing.expectEqual(true, d.cookie_secure); // secure-by-default
     try std.testing.expectEqual(@as(i64, 14 * 24 * 3600), d.auth_token_ttl_s);
 
     const G1 = struct {
         fn get(key: []const u8) ?[]const u8 {
-            if (std.mem.eql(u8, key, "ZIGBASE_COOKIE_SECURE")) return "true";
+            if (std.mem.eql(u8, key, "ZIGBASE_COOKIE_SECURE")) return "false";
             if (std.mem.eql(u8, key, "ZIGBASE_AUTH_TOKEN_TTL")) return "3600";
             return null;
         }
     };
     const c = try Config.load(&G1.get);
-    try std.testing.expectEqual(true, c.cookie_secure);
+    try std.testing.expectEqual(false, c.cookie_secure); // opt-out for plain-HTTP local dev
     try std.testing.expectEqual(@as(i64, 3600), c.auth_token_ttl_s);
+}
+
+test "trust_proxy defaults off, opt-in via env" {
+    const G0 = struct {
+        fn get(_: []const u8) ?[]const u8 { return null; }
+    };
+    try std.testing.expectEqual(false, (try Config.load(&G0.get)).trust_proxy);
+    const G1 = struct {
+        fn get(key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_TRUST_PROXY")) return "true";
+            return null;
+        }
+    };
+    try std.testing.expectEqual(true, (try Config.load(&G1.get)).trust_proxy);
 }
 
 test "smtp_tls auto inference from port" {

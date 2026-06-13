@@ -147,7 +147,9 @@ From `examples/blog/`:
 ```sh
 mise exec zig@0.16.0 -- zig build           # produces ./zig-out/bin/blog
 ./zig-out/bin/blog superuser create --email you@example.com --password <pw> --data-dir ./zb_data
-./zig-out/bin/blog serve --data-dir ./zb_data
+# --insecure-cookies: local dev over plain HTTP (auth cookies are Secure by default).
+# A random JWT secret is generated + persisted at zb_data/.jwt_secret on first run.
+./zig-out/bin/blog serve --insecure-cookies --data-dir ./zb_data
 ```
 
 Then create a `posts` record without a `slug` and the hook fills it in from the
@@ -161,7 +163,11 @@ updates, post detail, and a login + "write a post" island.
 ```sh
 cd frontend && npm install && npm run build && cd ..
 mise exec zig@0.16.0 -- zig build
-ZIGBASE_JWT_SECRET=... ./zig-out/bin/blog serve --data-dir ./zb_data --serve-static frontend/dist
+# --insecure-cookies for plain-HTTP local dev; --realtime-origins so the browser's
+# same-origin WebSocket upgrade (which carries an Origin header) is allowed — the live
+# post-list updates rely on it. An empty allowlist denies cross-origin browser upgrades.
+./zig-out/bin/blog serve --insecure-cookies --realtime-origins http://127.0.0.1:8090 \
+  --data-dir ./zb_data --serve-static frontend/dist
 # open http://127.0.0.1:8090/
 ```
 

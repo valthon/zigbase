@@ -18,7 +18,10 @@ def server(binary):
     subprocess.run([binary, "superuser", "create", "--email", "admin@x.io", "--password", "adminpassword", "--data-dir", data], check=True)
     port = _free_port()
     env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
-    proc = subprocess.Popen([binary, "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Plain-HTTP local test server: opt out of Secure cookies (default-on) so the
+    # browser stores the auth/CSRF cookies over http://; the default loopback bind
+    # and auto-generated JWT secret are exactly what we want.
+    proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(50):
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2): break

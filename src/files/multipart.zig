@@ -181,6 +181,12 @@ fn nextDelimiter(body: []const u8, delim: []const u8, from: usize) ?Delim {
     return null;
 }
 
+/// DoS cap (F9): the maximum number of parts a single multipart body may contain.
+/// A 50 MiB body (the global upload cap) of many tiny parts would otherwise force
+/// thousands of map insertions / file structs; 1024 parts is far above any real form
+/// (typical uploads are a handful of fields + a few files) yet bounds the worst case.
+pub const max_parts = 1024;
+
 /// Field values and file bytes borrow from `body`; names are duped into `alloc`.
 pub fn parse(alloc: std.mem.Allocator, content_type: []const u8, body: []const u8) ParseError!Extracted {
     var fields: std.json.ObjectMap = .empty;
@@ -198,7 +204,12 @@ pub fn parse(alloc: std.mem.Allocator, content_type: []const u8, body: []const u
         }
         break :blk nextDelimiter(body, delim, 0) orelse return error.BadMultipart;
     };
+    var part_count: usize = 0;
     while (cur.kind == .open) {
+        part_count += 1;
+        // DoS cap: refuse a body with an absurd number of parts (F9). Treated as a
+        // malformed/abusive body rather than silently truncating it.
+        if (part_count > max_parts) return error.BadMultipart;
         const hdr_start = cur.after;
         const hdr_end = std.mem.indexOfPos(u8, body, hdr_start, "\r\n\r\n") orelse return error.BadMultipart;
         const content_start = hdr_end + 4;
@@ -490,6 +501,30 @@ test "parse: trailing '[]' (PHP/jQuery convention) is stripped from part names" 
     try t.expectEqualStrings("photos", ex.files[1].field);
     try t.expectEqualStrings("x", ex.form_fields.object.get("tags").?.string);
     try t.expect(ex.form_fields.object.get("tags[]") == null);
+}
+
+test "parse: a body exceeding the part-count cap is rejected (F9 DoS)" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Build a body of (max_parts + 1) tiny parts.
+    var buf: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < max_parts + 1) : (i += 1) {
+        try buf.appendSlice(a, "--XBOUND\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nx\r\n");
+    }
+    try buf.appendSlice(a, "--XBOUND--\r\n");
+    try t.expectError(error.BadMultipart, parseBody(a, buf.items));
+
+    // A body exactly at the cap parses fine (repeated key -> array of max_parts items).
+    var ok: std.ArrayList(u8) = .empty;
+    i = 0;
+    while (i < max_parts) : (i += 1) {
+        try ok.appendSlice(a, "--XBOUND\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nx\r\n");
+    }
+    try ok.appendSlice(a, "--XBOUND--\r\n");
+    const ex = try parseBody(a, ok.items);
+    try t.expectEqual(@as(usize, max_parts), ex.form_fields.object.get("f").?.array.items.len);
 }
 
 test "parse: final terminator without trailing CRLF is accepted" {

@@ -299,11 +299,11 @@ and `request-password-reset` — are rate limited. Over the limit, the endpoint 
 - **Config:** `ZIGBASE_RATE_LIMIT_MAX` attempts (default `10`) per
   `ZIGBASE_RATE_LIMIT_WINDOW` seconds (default `60`), per client key, per endpoint.
   Set `ZIGBASE_RATE_LIMIT_MAX=0` to disable rate limiting entirely.
-- **Keying:** the client key is the IP from `X-Forwarded-For` (first hop) or
-  `X-Real-IP`. **Deploy behind a reverse proxy that sets one of these headers** —
-  otherwise (direct exposure) the limiter falls back to keying on the submitted
-  identity/email, which is still spoofable. See
-  [KNOWN_LIMITATIONS.md → Auth & email](../KNOWN_LIMITATIONS.md).
+- **Keying:** `X-Forwarded-For` / `X-Real-IP` are **ignored by default** — they are
+  attacker-controlled on direct exposure. With `--trust-proxy` (`ZIGBASE_TRUST_PROXY=true`),
+  set **only** behind a trusted reverse proxy that rewrites them, the key is the IP from
+  `X-Forwarded-For` (first hop) or `X-Real-IP`. Otherwise the limiter keys on the submitted
+  identity/email, which is not header-spoofable. This makes direct exposure safe by default.
 
 ### OAuth2
 
@@ -397,7 +397,11 @@ file delivery, use [file storage](#files) instead.
 ## Realtime (WebSocket)
 
 Connect to `ws://<host>/api/realtime` (the upgrade is gated to that exact path and
-the connection Origin is validated against the server's allowlist).
+the connection Origin is validated against the server's allowlist). The allowlist is
+`ZIGBASE_REALTIME_ORIGINS` / `--realtime-origins` (CSV). It is **empty by default, which
+denies cross-origin browser upgrades** — set your app origin(s) to allow them. A request
+with **no** `Origin` header (a non-browser client) is allowed regardless; delivery is still
+gated per-record by each collection's `viewRule`.
 
 ### Authenticating
 

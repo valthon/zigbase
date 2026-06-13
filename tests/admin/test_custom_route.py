@@ -15,7 +15,7 @@ def test_custom_public_route_responds():
         port = _free_port()
         proc = subprocess.Popen(
             [str(blog), "serve", "--http-port", str(port), "--data-dir", data],
-            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default"},
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
         )
         try:
             url = f"http://127.0.0.1:{port}/api/blog/ping"

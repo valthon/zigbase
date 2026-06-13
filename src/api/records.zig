@@ -473,6 +473,22 @@ test "list handler returns the page envelope" {
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"page\":1") != null);
 }
 
+test "list handler clamps an oversized perPage to the 500 cap (F9 DoS)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    // A client asking for a huge page cannot force a huge SQL LIMIT / allocation:
+    // the response echoes the clamped perPage (500), not the requested 100000.
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "perPage=100000", .allocator = a, .app = &env.app, .params = &col_param };
+    const res = try list(&lctx);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"perPage\":500") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"perPage\":100000") == null);
+}
+
 fn seedRuled(env: *TestEnv, name: []const u8, listR: ?[]const u8, viewR: ?[]const u8, createR: ?[]const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

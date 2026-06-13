@@ -244,8 +244,11 @@ mise exec zig@0.16.0 -- zig build          # -> ./zig-out/bin/golfsim
 ./zig-out/bin/golfsim superuser create --email you@example.com --password "<pw>" --data-dir ./data
 
 # 4. Run
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
-  ./zig-out/bin/golfsim serve --data-dir ./data
+# --insecure-cookies: local dev over plain HTTP (auth cookies are Secure by default).
+# --realtime-origins: allow the browser's same-origin WebSocket upgrade (live bookings).
+# A random JWT secret is generated + persisted at data/.jwt_secret on first run.
+./zig-out/bin/golfsim serve --insecure-cookies --realtime-origins http://127.0.0.1:8090 \
+  --data-dir ./data
 # open http://127.0.0.1:8090/  — frontend served automatically, no --serve-static flag
 ```
 

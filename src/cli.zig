@@ -5,6 +5,10 @@ pub const ServeArgs = struct {
     http_port: ?u16 = null,
     data_dir: ?[]const u8 = null,
     serve_static: ?[]const u8 = null,
+    // Secure-by-default opt-outs / opt-ins (F8/F12). null = leave the config default.
+    insecure_cookies: bool = false, // --insecure-cookies => cookie_secure=false (plain-HTTP local dev)
+    trust_proxy: bool = false, // --trust-proxy => honor X-Forwarded-For/X-Real-IP
+    realtime_origins: ?[]const u8 = null, // --realtime-origins CSV => allowed WS Origins
 };
 
 pub const SuperuserArgs = struct {
@@ -107,6 +111,14 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
             sa.serve_static = args[i];
+        } else if (std.mem.eql(u8, a, "--insecure-cookies")) {
+            sa.insecure_cookies = true;
+        } else if (std.mem.eql(u8, a, "--trust-proxy")) {
+            sa.trust_proxy = true;
+        } else if (std.mem.eql(u8, a, "--realtime-origins")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            sa.realtime_origins = args[i];
         } else {
             return ParseError.UnknownFlag;
         }
