@@ -90,6 +90,34 @@ pub const DefaultMailerPlugin = struct {
     }
 };
 
+/// True iff a value of type `M` coerces to `[]const provision.Migration` — i.e. it is
+/// the slice itself or a pointer to an array of `Migration` (`&[_]Migration{ ... }`).
+/// A bare anonymous tuple (`.{ .{ ... } }`) does NOT, which is the footgun P2-b guards.
+fn migrationsCoerce(comptime M: type) bool {
+    if (M == []const provision.Migration) return true;
+    const info = @typeInfo(M);
+    if (info != .pointer) return false;
+    const ptr = info.pointer;
+    if (ptr.size == .slice) return ptr.child == provision.Migration;
+    if (ptr.size == .one) {
+        const child = @typeInfo(ptr.child);
+        return child == .array and child.array.child == provision.Migration;
+    }
+    return false;
+}
+
+/// `@compileError` unless plugin type `P` (selected via `.storage`/`.mailer`) declares
+/// the three contract methods. Without this, a missing method surfaces as a generic
+/// "no member named 'deinit'" at the instantiation site rather than a contract message.
+fn assertPluginContract(comptime P: type, comptime kind: []const u8) void {
+    inline for (.{ "create", "interface", "deinit" }) |decl| {
+        if (!@hasDecl(P, decl)) {
+            @compileError("'." ++ kind ++ "' plugin type '" ++ @typeName(P) ++ "' is missing the '" ++ decl ++
+                "' method; a plugin must declare create(gpa, io, cfg) !Self / interface(*Self) view / deinit(*Self) void");
+        }
+    }
+}
+
 /// Comptime application builder. `cfg` is an anonymous struct VALUE with optional
 /// `.hooks` (record hook groups) and optional `.onError` (an ErrorHandler).
 /// Returns a type exposing the prebuilt `dispatch` and the CLI/serve entry points.
@@ -153,9 +181,19 @@ pub fn App(comptime cfg: anytype) type {
         pub const cache_kib: u32 = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "cache_kib")) cfg.pools.cache_kib else db.default_cache_kib;
 
         /// Comptime-selected storage plugin type (defaults to `DefaultStoragePlugin`).
-        pub const StoragePlugin: type = if (@hasField(@TypeOf(cfg), "storage")) cfg.storage else DefaultStoragePlugin;
+        /// A custom type missing a contract method fails with a contract-specific message.
+        pub const StoragePlugin: type = blk: {
+            const P = if (@hasField(@TypeOf(cfg), "storage")) cfg.storage else DefaultStoragePlugin;
+            assertPluginContract(P, "storage");
+            break :blk P;
+        };
         /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
-        pub const MailerPlugin: type = if (@hasField(@TypeOf(cfg), "mailer")) cfg.mailer else DefaultMailerPlugin;
+        /// A custom type missing a contract method fails with a contract-specific message.
+        pub const MailerPlugin: type = blk: {
+            const P = if (@hasField(@TypeOf(cfg), "mailer")) cfg.mailer else DefaultMailerPlugin;
+            assertPluginContract(P, "mailer");
+            break :blk P;
+        };
 
         /// Comptime static-files mode (see static_files.Mode). Field absent -> .default,
         /// which enables the runtime `--serve-static <dir>` flag on `serve`.
@@ -191,10 +229,19 @@ pub fn App(comptime cfg: anytype) type {
 
         /// Explicit migrations (the escape hatch for non-additive changes), run in
         /// order before provisioning and recorded once in `_migrations`. Empty by default.
-        pub const provision_migrations: []const provision.Migration = if (@hasField(@TypeOf(cfg), "migrations"))
-            cfg.migrations
-        else
-            &.{};
+        ///
+        /// `.migrations` must be a TYPED slice `&[_]zigbase.Migration{ ... }`; a bare
+        /// anonymous tuple does not coerce to `[]const Migration`. Guard it here so the
+        /// failure names the PUBLIC type and the fix, rather than the raw coercion error
+        /// (which leaks the internal `provision.Migration` name).
+        pub const provision_migrations: []const provision.Migration = blk: {
+            if (!@hasField(@TypeOf(cfg), "migrations")) break :blk &.{};
+            if (!migrationsCoerce(@TypeOf(cfg.migrations))) {
+                @compileError("'.migrations' must be a typed slice '&[_]zigbase.Migration{ ... }' " ++
+                    "(a bare tuple does not coerce to []const Migration); got '" ++ @typeName(@TypeOf(cfg.migrations)) ++ "'");
+            }
+            break :blk cfg.migrations;
+        };
 
         /// Bundle of comptime-resolved knobs threaded into the serve path: the
         /// selected storage/mailer plugin TYPES and the reader-pool cap.

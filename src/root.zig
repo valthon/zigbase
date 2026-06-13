@@ -12,6 +12,7 @@ pub const schedule = @import("schedule.zig");
 pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
 pub const RouteEvent = events.RouteEvent;
+pub const JobEvent = events.JobEvent; // cron/interval/reactive job + app.submit handlers
 
 // ---- Plugin / schema / migration consumer types ---------------------------
 // Types an external consumer must be able to NAME to write a custom storage or
