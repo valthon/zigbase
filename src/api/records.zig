@@ -323,7 +323,10 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     }
     if (app.storage) |storage| storage.deleteRecord(app.io, col.name, rid) catch {};
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .after_delete) catch {};
-    realtime_ws.broadcast(app, col, .delete, rid, null);
+    // F4: pass the deleted row's snapshot so subscribers to an owner/expression-scoped collection
+    // can re-authorize the delete event (the live row is gone). The snapshot rides in the published
+    // frame under a private key and is stripped before any client receives the id-only delete frame.
+    realtime_ws.broadcast(app, col, .delete, rid, ex_mut);
     return .{ .status = 204, .body = "" };
 }
 
@@ -400,7 +403,8 @@ const TestEnv = struct {
             _ = try collections.create(sa, std.testing.io, w, .{
                 .id = "", .name = "posts",
                 .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
-                .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+                // Open fixture: "@public" is the allow-all sentinel (empty "" is now LOCKED).
+                .listRule = "@public", .viewRule = "@public", .createRule = "@public", .updateRule = "@public", .deleteRule = "@public",
             });
         }
         env.app = .{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = &env.pool };
@@ -469,6 +473,22 @@ test "list handler returns the page envelope" {
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"page\":1") != null);
 }
 
+test "list handler clamps an oversized perPage to the 500 cap (F9 DoS)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    // A client asking for a huge page cannot force a huge SQL LIMIT / allocation:
+    // the response echoes the clamped perPage (500), not the requested 100000.
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "perPage=100000", .allocator = a, .app = &env.app, .params = &col_param };
+    const res = try list(&lctx);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"perPage\":500") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"perPage\":100000") == null);
+}
+
 fn seedRuled(env: *TestEnv, name: []const u8, listR: ?[]const u8, viewR: ?[]const u8, createR: ?[]const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -519,8 +539,8 @@ fn seedUpDelRuled(env: *TestEnv, name: []const u8, updateR: ?[]const u8, deleteR
     _ = try collections.create(a, std.testing.io, w, .{
         .id = "", .name = name,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
-        // create/view permissive so a row can be seeded over the handler.
-        .listRule = "", .viewRule = "", .createRule = "", .updateRule = updateR, .deleteRule = deleteR,
+        // create/view permissive so a row can be seeded over the handler ("@public" = allow-all).
+        .listRule = "@public", .viewRule = "@public", .createRule = "@public", .updateRule = updateR, .deleteRule = deleteR,
     });
 }
 
@@ -588,14 +608,15 @@ fn seedAuth(env: *TestEnv, name: []const u8, createR: ?[]const u8) !void {
     _ = try collections.create(a, std.testing.io, w, .{
         .id = "", .name = name, .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
-        .listRule = "", .viewRule = "", .createRule = createR, .updateRule = "", .deleteRule = "",
+        // Open fixture for list/view ("@public"); createR is supplied per test.
+        .listRule = "@public", .viewRule = "@public", .createRule = createR, .updateRule = "@public", .deleteRule = "@public",
     });
 }
 
 test "creating an auth record hashes the password, hides secrets, forces verified=false" {
     var env = try TestEnv.init();
     defer env.deinit();
-    try seedAuth(env, "users", "");
+    try seedAuth(env, "users", "@public");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -631,7 +652,8 @@ fn seedTyped(env: *TestEnv, name: []const u8) !void {
             .{ .id = "f5", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 3 } } },
             .{ .id = "f6", .name = "photos", .options = .{ .file = .{ .maxSelect = 3 } } },
         },
-        .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+        // Open fixture ("@public" allow-all; empty "" is now LOCKED).
+        .listRule = "@public", .viewRule = "@public", .createRule = "@public", .updateRule = "@public", .deleteRule = "@public",
     });
 }
 
@@ -743,7 +765,7 @@ test "JSON bodies are NEVER coerced: a string for a bool/float field stays a 400
 test "multipart auth signup still works (password keys pass through untouched)" {
     var env = try TestEnv.init();
     defer env.deinit();
-    try seedAuth(env, "mp_users", "");
+    try seedAuth(env, "mp_users", "@public");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -795,7 +817,7 @@ test "validation error is attributed to the offending field, not the first (Bug 
 test "creating an auth record without a password is a 400" {
     var env = try TestEnv.init();
     defer env.deinit();
-    try seedAuth(env, "users2", "");
+    try seedAuth(env, "users2", "@public");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -50,7 +50,7 @@ def test_serve_static_runtime_mode():
         proc = subprocess.Popen(
             [str(binary), "serve", "--http-port", str(port), "--data-dir", data,
              "--serve-static", static],
-            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default"},
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
         )
         try:
             base = f"http://127.0.0.1:{port}"
@@ -106,7 +106,7 @@ def test_serve_static_missing_dir_is_fatal():
         proc = subprocess.Popen(
             [str(binary), "serve", "--http-port", str(port), "--data-dir", data,
              "--serve-static", "/nonexistent/static/dir"],
-            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default"},
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
         )
         assert proc.wait(timeout=20) != 0
 
@@ -125,7 +125,7 @@ def test_embedded_static_in_plugins_example():
         port = _free_port()
         proc = subprocess.Popen(
             [str(binary), "serve", "--http-port", str(port), "--data-dir", data],
-            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default"},
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
         )
         try:
             base = f"http://127.0.0.1:{port}"

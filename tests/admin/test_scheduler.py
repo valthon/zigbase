@@ -14,7 +14,7 @@ def test_server_runs_and_shuts_down_with_a_job_registered():
         port = _free_port()
         proc = subprocess.Popen(
             [str(blog), "serve", "--http-port", str(port), "--data-dir", data],
-            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default"},
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
         )
         try:
             url = f"http://127.0.0.1:{port}/api/blog/ping"

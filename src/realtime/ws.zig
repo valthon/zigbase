@@ -5,6 +5,7 @@ const App = @import("../app.zig").App;
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
+const rules = @import("../rules.zig");
 const auth = @import("../auth.zig");
 const id = @import("../id.zig");
 const protocol = @import("protocol.zig");
@@ -17,6 +18,46 @@ pub var active: bool = false;
 
 /// Max concurrent subscriptions per connection (bounds per-conn facil.io subscription state).
 const MAX_SUBS = 256;
+
+/// F9: global cap on concurrent WebSocket connections. Deliberately a module-level constant in the
+/// realtime layer (NOT config.zig) so an operator can't accidentally disable it and a parallel
+/// config workstream doesn't conflict. New upgrades past this cap are rejected with 503.
+pub const MAX_CONNECTIONS: usize = 10_000;
+
+/// Live WS connection count. Bumped on a successful upgrade, decremented on close. Connection
+/// callbacks for one socket are serialized by facil.io but different sockets run on different
+/// threads, so this is an atomic.
+var live_connections: std.atomic.Value(usize) = .init(0);
+
+/// Current live WS connection count (test/introspection helper).
+pub fn connectionCount() usize {
+    return live_connections.load(.monotonic);
+}
+
+/// Atomically reserve a global connection slot (F9). Returns false (and leaves the count unchanged)
+/// when the cap is already reached, so the caller must reject the upgrade. Pair a successful
+/// reservation with exactly one `releaseConnectionSlot`.
+fn reserveConnectionSlot() bool {
+    if (live_connections.fetchAdd(1, .monotonic) >= MAX_CONNECTIONS) {
+        _ = live_connections.fetchSub(1, .monotonic);
+        return false;
+    }
+    return true;
+}
+
+fn releaseConnectionSlot() void {
+    _ = live_connections.fetchSub(1, .monotonic);
+}
+
+/// F5: may a socket subscribe to a collection with this `view_rule`? Anonymous sockets may
+/// subscribe ONLY to a public (@public) collection. Any other collection — locked, owner-scoped,
+/// or any expression — requires a live authenticated (or superuser) identity first. Delivery is
+/// still independently gated per record by `hub.shouldDeliver`; this just stops anonymous sockets
+/// from registering subscriptions on gated data.
+fn subscribeAuthorized(view_rule: ?[]const u8, authed: bool, is_superuser: bool) bool {
+    if (rules.isPublic(view_rule)) return true;
+    return authed or is_superuser;
+}
 
 /// Live per-connection state: the pure 7a `Conn` plus the zap handle / settings / app.
 ///
@@ -38,10 +79,26 @@ pub const LiveConn = struct {
 
 pub const WS = zap.WebSockets.Handler(LiveConn);
 
-/// Is `origin` allowed by the CSV allowlist? Empty allowlist allows any (dev default).
-pub fn originAllowed(allowlist: []const u8, origin: ?[]const u8) bool {
-    if (allowlist.len == 0) return true;
-    const o = origin orelse return false;
+/// Is `origin` allowed for an upgrade? (F12, secure-by-default)
+/// An empty allowlist no longer means "allow any". The rules, in order:
+///   1. No `Origin` header (a non-browser client — CLI/server-to-server, which cannot
+///      be CSRF'd via a victim's browser) => allowed.
+///   2. **Same-origin**: the Origin's authority equals the request `Host`. This is the
+///      embedded admin UI and any frontend served from this same binary; a malicious
+///      cross-site page cannot forge `Origin` to match the target's Host, so same-origin
+///      is always safe and must work out of the box without configuring an allowlist.
+///   3. Otherwise (a genuine cross-origin browser upgrade) => allowed only if the origin
+///      is on the explicit CSV allowlist.
+/// Delivery is still subject to per-record viewRule authorization regardless.
+pub fn originAllowed(allowlist: []const u8, origin: ?[]const u8, host: ?[]const u8) bool {
+    const o = origin orelse return true; // no Origin header => non-browser client
+    // Same-origin: Origin is `scheme://authority`; allow when authority == Host.
+    if (host) |h| {
+        if (std.mem.indexOf(u8, o, "://")) |i| {
+            if (std.mem.eql(u8, o[i + 3 ..], h)) return true;
+        }
+    }
+    if (allowlist.len == 0) return false; // cross-origin browser upgrade but no allowlist => deny
     var it = std.mem.splitScalar(u8, allowlist, ',');
     while (it.next()) |allowed| {
         if (std.mem.eql(u8, std.mem.trim(u8, allowed, " "), o)) return true;
@@ -59,11 +116,19 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
         r.markAsFinished(true);
         return;
     }
-    if (!originAllowed(app.realtime_allowed_origins, r.getHeader("origin"))) {
+    if (!originAllowed(app.realtime_allowed_origins, r.getHeader("origin"), r.getHeader("host"))) {
         r.setStatus(.forbidden);
         r.markAsFinished(true);
         return;
     }
+    // F9: reserve a global connection slot up front; reject past the cap. Reserving before alloc
+    // (and releasing on any failure below) keeps the counter exact under concurrent upgrades.
+    if (!reserveConnectionSlot()) {
+        r.setStatus(.service_unavailable);
+        r.markAsFinished(true);
+        return;
+    }
+    errdefer releaseConnectionSlot();
     const lc = try app.allocator.create(LiveConn);
     lc.* = .{
         .app = app,
@@ -82,6 +147,7 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
         lc.durable.deinit();
         lc.frame.deinit();
         app.allocator.destroy(lc);
+        releaseConnectionSlot(); // release the reserved slot
         return;
     };
 }
@@ -126,16 +192,30 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
                 return;
             }
             var r = lc.app.pool.acquireReader() catch return;
-            const ok = blk: {
+            const Outcome = enum { ok, unknown, auth_required };
+            const outcome: Outcome = blk: {
                 defer lc.app.pool.releaseReader(&r);
                 const t = protocol.parseTopic(m.topic);
-                const col = (collections.get(fa, &r, t.collection) catch break :blk false) orelse break :blk false;
-                _ = col;
-                break :blk true;
+                const col = (collections.get(fa, &r, t.collection) catch break :blk .unknown) orelse break :blk .unknown;
+                // F5: a socket may subscribe anonymously ONLY to a public (@public viewRule)
+                // collection. For any other collection require a live (non-expired) auth first, so
+                // an unauthenticated socket cannot subscribe to (and tie up resources on) gated data.
+                const now = auth.nowUnixPub(&r) catch 0;
+                const rctx = lc.conn.requestContext(now);
+                if (!subscribeAuthorized(col.viewRule, rctx.auth != null, rctx.is_superuser))
+                    break :blk .auth_required;
+                break :blk .ok;
             };
-            if (!ok) {
-                WS.write(handle, try protocol.errorFrame(fa, "unknown collection"), true) catch {};
-                return;
+            switch (outcome) {
+                .ok => {},
+                .unknown => {
+                    WS.write(handle, try protocol.errorFrame(fa, "unknown collection"), true) catch {};
+                    return;
+                },
+                .auth_required => {
+                    WS.write(handle, try protocol.errorFrame(fa, "authentication required to subscribe"), true) catch {};
+                    return;
+                },
             }
             // subscription keys/filters + sub_args must persist across frames -> durable allocator
             lc.conn.addSub(da, m.topic, m.filter) catch return;
@@ -180,6 +260,10 @@ fn onChannelMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, channe
     if (idv != .string) return;
     const record_id = idv.string;
 
+    // F4: the deleted-record authorization snapshot rides in the published delete frame under a
+    // private key. Pull it out for per-subscriber authz, then strip it so the client frame is id-only.
+    const delete_snapshot: ?std.json.Value = if (action == .delete) rv.object.get(hub.delete_snapshot_key) else null;
+
     const t = protocol.parseTopic(channel);
     var r = lc.app.pool.acquireReader() catch return;
     defer lc.app.pool.releaseReader(&r);
@@ -188,8 +272,18 @@ fn onChannelMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, channe
     const filter_ptr = lc.conn.subFilter(channel);
     const sub_filter: ?[]const u8 = if (filter_ptr) |p| p.* else null;
 
-    const deliver = hub.shouldDeliver(a, &r, col, &lc.conn, now, action, record_id, sub_filter) catch return;
-    if (deliver) WS.write(handle, message, true) catch {};
+    const deliver = hub.shouldDeliver(a, lc.app.io, &r, col, &lc.conn, now, action, record_id, sub_filter, delete_snapshot) catch return;
+    if (!deliver) return;
+
+    if (action == .delete and delete_snapshot != null) {
+        // Re-serialize an id-only delete frame so the private snapshot never reaches the client.
+        var clean: std.json.ObjectMap = .empty;
+        clean.put(a, "id", idv) catch return;
+        const frame = protocol.serializeEvent(a, channel, .delete, .{ .object = clean }) catch return;
+        WS.write(handle, frame, true) catch {};
+    } else {
+        WS.write(handle, message, true) catch {};
+    }
 }
 
 fn onClose(context: ?*LiveConn, uuid: isize) anyerror!void {
@@ -199,6 +293,7 @@ fn onClose(context: ?*LiveConn, uuid: isize) anyerror!void {
     lc.durable.deinit();
     lc.frame.deinit();
     app.allocator.destroy(lc);
+    releaseConnectionSlot(); // F9: free the global connection slot
 }
 
 /// Publish a record event to its collection + record channels. Called from the record-writer path
@@ -215,12 +310,21 @@ pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, rec
     WS.publish(.{ .channel = ef.record_channel, .message = ef.frame_record });
 }
 
-test "originAllowed: empty allowlist allows any; CSV matches exactly" {
-    try std.testing.expect(originAllowed("", null));
-    try std.testing.expect(originAllowed("", "https://anything"));
-    try std.testing.expect(originAllowed("https://a.com, https://b.com", "https://b.com"));
-    try std.testing.expect(!originAllowed("https://a.com", "https://evil.com"));
-    try std.testing.expect(!originAllowed("https://a.com", null));
+test "originAllowed: empty allowlist denies cross-origin browser upgrades (F12); same-origin + CSV allowed" {
+    // Secure-by-default: an empty allowlist DENIES a cross-origin browser upgrade...
+    try std.testing.expect(!originAllowed("", "https://anything", "myhost:8090"));
+    // ...but a request with no Origin header (non-browser client) is still allowed.
+    try std.testing.expect(originAllowed("", null, null));
+    try std.testing.expect(originAllowed("https://a.com", null, null));
+    // Same-origin (Origin authority == Host) is always allowed, even with no allowlist —
+    // this is the embedded admin UI / a frontend served from the same binary.
+    try std.testing.expect(originAllowed("", "http://127.0.0.1:8090", "127.0.0.1:8090"));
+    try std.testing.expect(originAllowed("", "https://app.example.com", "app.example.com"));
+    // A cross-origin request whose authority differs from Host is NOT same-origin.
+    try std.testing.expect(!originAllowed("", "https://evil.com", "127.0.0.1:8090"));
+    // Explicit allowlist matches exactly (cross-origin, host differs).
+    try std.testing.expect(originAllowed("https://a.com, https://b.com", "https://b.com", "api.myhost"));
+    try std.testing.expect(!originAllowed("https://a.com", "https://evil.com", "api.myhost"));
 }
 
 test "broadcast is a no-op when inactive" {
@@ -228,4 +332,36 @@ test "broadcast is a no-op when inactive" {
     try std.testing.expect(!active);
     var app: App = undefined;
     broadcast(&app, undefined, .create, "rec1", null); // would crash if it didn't early-return
+}
+
+test "F5: anonymous subscribe allowed only on @public; gated collections require auth" {
+    // @public -> anyone (incl. anonymous) may subscribe.
+    try std.testing.expect(subscribeAuthorized("@public", false, false));
+    try std.testing.expect(subscribeAuthorized("@public", true, false));
+    // null (locked): anonymous rejected; authed/superuser allowed (delivery still gated later).
+    try std.testing.expect(!subscribeAuthorized(null, false, false));
+    try std.testing.expect(subscribeAuthorized(null, true, false));
+    try std.testing.expect(subscribeAuthorized(null, false, true));
+    // "" (now LOCKED): anonymous rejected.
+    try std.testing.expect(!subscribeAuthorized("", false, false));
+    // owner/expression rule: anonymous rejected, authed allowed to subscribe.
+    try std.testing.expect(!subscribeAuthorized("owner = @request.auth.id", false, false));
+    try std.testing.expect(subscribeAuthorized("owner = @request.auth.id", true, false));
+}
+
+test "F9: global connection cap reserves/releases and rejects past MAX_CONNECTIONS" {
+    // Drive the count up to the cap, confirm the next reservation is rejected, then release.
+    const start = connectionCount();
+    try std.testing.expectEqual(@as(usize, 0), start); // tests run single-threaded; clean slate
+    // Pre-load to one below the cap without spinning MAX_CONNECTIONS times.
+    live_connections.store(MAX_CONNECTIONS - 1, .monotonic);
+    try std.testing.expect(reserveConnectionSlot()); // fills the last slot
+    try std.testing.expectEqual(MAX_CONNECTIONS, connectionCount());
+    try std.testing.expect(!reserveConnectionSlot()); // at cap -> rejected, count unchanged
+    try std.testing.expectEqual(MAX_CONNECTIONS, connectionCount());
+    releaseConnectionSlot();
+    try std.testing.expectEqual(MAX_CONNECTIONS - 1, connectionCount());
+    try std.testing.expect(reserveConnectionSlot()); // a freed slot is reusable
+    // Clean up the counter so a later test sees a clean slate.
+    live_connections.store(0, .monotonic);
 }

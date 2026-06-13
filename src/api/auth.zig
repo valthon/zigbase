@@ -232,7 +232,34 @@ fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid: []c
     const app = ctx.app.?;
     const now = try nowUnix(conn);
     const key = crypto.deriveKey(app.jwt_secret, token_key);
-    return jwt.sign(ctx.allocator, .{ .id = rid, .collection = col_name, .type = tt, .iat = now, .exp = now + ttl }, &key);
+    // Random jti makes the token single-use (F7): redemption records it in
+    // _consumedTokens; a replay is rejected even within the TTL and independent of
+    // the tokenKey-rotation side effect.
+    const jti = try crypto.genToken(app.io, ctx.allocator, 32);
+    return jwt.sign(ctx.allocator, .{ .id = rid, .collection = col_name, .type = tt, .jti = jti, .iat = now, .exp = now + ttl }, &key);
+}
+
+/// Record a single-use token's `jti` as consumed, or return error.AlreadyConsumed if it
+/// was already redeemed. Atomic under the writer lock via the _consumedTokens PRIMARY KEY.
+/// A token minted before this mechanism (empty jti) is treated as non-replayable-safe only
+/// by the legacy rotation path; we reject an empty jti so every single-use redemption is tracked.
+fn consumeToken(conn: *db.Db, claims: jwt.Claims) !void {
+    if (claims.jti.len == 0) return error.AlreadyConsumed; // no jti => cannot guarantee single-use
+    // Classify "already consumed" by the jti's PRESENCE, checked first. consumeToken runs
+    // under the single writer lock, so this SELECT-then-INSERT is race-free. This is what
+    // lets a genuine INSERT failure below (disk-full, I/O error, etc.) PROPAGATE as an
+    // internal error instead of masquerading as error.AlreadyConsumed (a 400).
+    {
+        var sel = try conn.prepare("SELECT 1 FROM \"_consumedTokens\" WHERE \"jti\" = ?1;");
+        defer sel.finalize();
+        try sel.bindText(1, claims.jti);
+        if (try sel.step()) return error.AlreadyConsumed; // a row exists => already redeemed
+    }
+    var st = try conn.prepare("INSERT INTO \"_consumedTokens\" (\"jti\",\"expires\",\"consumed\") VALUES (?1,?2,datetime('now'));");
+    defer st.finalize();
+    try st.bindText(1, claims.jti);
+    try st.bindInt(2, claims.exp);
+    _ = try st.step(); // a real DB failure propagates (500); it is no longer mistaken for a replay
 }
 
 fn loadAuthCollection(ctx: *http.RequestCtx, conn: *db.Db) !?schema.Collection {
@@ -295,6 +322,9 @@ pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
     const token = strField(body, "token") orelse return ApiError.badRequest("token is required.").toResponse(ctx.allocator);
     const claims = (try verifyTyped(ctx, w, col, token, .verification)) orelse
         return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
+    // Single-use (F7): redeeming the same token twice fails here even within the TTL.
+    consumeToken(w, claims) catch
+        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
     const sql = try std.fmt.allocPrintSentinel(ctx.allocator, "UPDATE \"{s}\" SET \"verified\" = 1 WHERE \"id\" = ?1;", .{col.name}, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
@@ -344,8 +374,14 @@ pub fn confirmPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
     const password = strField(body, "password") orelse return ApiError.badRequest("password is required.").toResponse(ctx.allocator);
     const claims = (try verifyTyped(ctx, w, col, token, .password_reset)) orelse
         return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
+    // Validate the new password BEFORE consuming so a too-short password does not burn
+    // the (still single-use) token.
     if (password.len < col.options.auth.minPasswordLength)
         return ApiError.badRequest("Password too short.").toResponse(ctx.allocator);
+    // Single-use (F7): consume before applying the change so a replay (even within the
+    // TTL, before the tokenKey rotation that records.update triggers) is rejected.
+    consumeToken(w, claims) catch
+        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
     var data: std.json.ObjectMap = .empty;
     try data.put(ctx.allocator, "password", .{ .string = password });
     const updated = auth.applyUpdate(app.io, ctx.allocator, .{ .object = data }, col.options.auth.minPasswordLength) catch
@@ -430,7 +466,8 @@ const TestEnv = struct {
         const tk = (try tokenKeyFor(a, w, col.name, rid)).?;
         const now = try nowUnix(w);
         const key = crypto.deriveKey(self.app.jwt_secret, tk);
-        return jwt.sign(a, .{ .id = rid, .collection = col_name, .type = tt, .iat = now, .exp = now + 100000 }, &key);
+        const jti = try crypto.genToken(self.app.io, a, 32);
+        return jwt.sign(a, .{ .id = rid, .collection = col_name, .type = tt, .jti = jti, .iat = now, .exp = now + 100000 }, &key);
     }
 
     fn recordVerified(self: *TestEnv, a: std.mem.Allocator, col_name: []const u8, email: []const u8) bool {
@@ -549,4 +586,83 @@ test "password reset: confirm changes the password and rotates the token" {
     try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&conf)).status);
     var conf2 = env.ctx(a, .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 400), (try confirmPasswordReset(&conf2)).status);
+}
+
+// --- F7: strict single-use tokens (independent of tokenKey rotation) ---
+
+test "F7: consumeToken classifies replay by jti presence, not by any INSERT failure" {
+    // Normal ledger: a fresh jti is recorded; an identical second redemption is a replay.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec("CREATE TABLE \"_consumedTokens\" (\"jti\" TEXT PRIMARY KEY, \"expires\" INTEGER, \"consumed\" TEXT);");
+    const claims = jwt.Claims{ .id = "u1", .collection = "users", .type = .verification, .jti = "abc123", .iat = 0, .exp = 9_999_999_999 };
+    try consumeToken(&d, claims);
+    try std.testing.expectError(error.AlreadyConsumed, consumeToken(&d, claims));
+
+    // Regression: a NON-replay INSERT failure (here a CHECK violation on a fresh jti) must
+    // PROPAGATE as a DB error, not be misreported as error.AlreadyConsumed — the old
+    // `step() catch return error.AlreadyConsumed` swallowed every failure (disk-full, I/O, …).
+    var d2 = try db.Db.openMemory();
+    defer d2.close();
+    try d2.exec("CREATE TABLE \"_consumedTokens\" (\"jti\" TEXT PRIMARY KEY CHECK(length(\"jti\") < 3), \"expires\" INTEGER, \"consumed\" TEXT);");
+    try std.testing.expectError(error.StepFailed, consumeToken(&d2, claims));
+
+    // An empty jti is rejected outright (cannot be tracked single-use).
+    const nojti = jwt.Claims{ .id = "u1", .collection = "users", .type = .verification, .jti = "", .iat = 0, .exp = 1 };
+    try std.testing.expectError(error.AlreadyConsumed, consumeToken(&d2, nojti));
+}
+
+test "F7: a verification token cannot be redeemed twice (single-use)" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "v2@x.io", "longenough");
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    const token = try env.mintTyped(a, "users", "v2@x.io", .verification);
+    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
+    // First redemption succeeds. Verification does NOT rotate tokenKey, so without the
+    // single-use ledger this token would remain replayable for its full TTL.
+    var c1 = env.ctx(a, .POST, body, &p);
+    try std.testing.expectEqual(@as(u16, 200), (try confirmVerification(&c1)).status);
+    try std.testing.expect(env.recordVerified(a, "users", "v2@x.io"));
+    // Second redemption of the very same (still-unexpired) token must fail.
+    var c2 = env.ctx(a, .POST, body, &p);
+    try std.testing.expectEqual(@as(u16, 400), (try confirmVerification(&c2)).status);
+}
+
+test "F7: a password-reset token cannot be redeemed twice (single-use)" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "r2@x.io", "oldpassword");
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    const token = try env.mintTyped(a, "users", "r2@x.io", .password_reset);
+    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
+    var c1 = env.ctx(a, .POST, body, &p);
+    try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&c1)).status);
+    // Replay rejected even though we re-send the identical valid-window token.
+    var c2 = env.ctx(a, .POST, body, &p);
+    try std.testing.expectEqual(@as(u16, 400), (try confirmPasswordReset(&c2)).status);
+}
+
+test "F7: a too-short password does not consume the reset token" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "r3@x.io", "oldpassword");
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    const token = try env.mintTyped(a, "users", "r3@x.io", .password_reset);
+    const short = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"x\"}}", .{token});
+    var bad = env.ctx(a, .POST, short, &p);
+    try std.testing.expectEqual(@as(u16, 400), (try confirmPasswordReset(&bad)).status); // too short
+    // The token survives the failed attempt and still works once.
+    const ok = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
+    var good = env.ctx(a, .POST, ok, &p);
+    try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&good)).status);
 }

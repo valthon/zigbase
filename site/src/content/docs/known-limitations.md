@@ -17,11 +17,13 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
   server** (the dev/CI default) rather than emailed — a real deployment must set SMTP. TLS
   verifies certificates by default; `ZIGBASE_SMTP_INSECURE` disables verification for
   self-signed relays only.
-- **Rate limiting is keyed on the proxy-supplied client IP.** Login / verification /
-  password-reset are rate limited, but the key comes from `X-Forwarded-For` / `X-Real-IP`, so
-  it is only trustworthy **behind a reverse proxy that sets those headers**. On direct
-  exposure (no proxy header) the limiter degrades to a per-submitted-identity key, which is
-  still spoofable.
+- **Rate limiting keys on proxy headers only when `--trust-proxy` is set.** Login /
+  verification / password-reset are rate limited. `X-Forwarded-For` / `X-Real-IP` are
+  **ignored by default** (they are spoofable on direct exposure); set `--trust-proxy` /
+  `ZIGBASE_TRUST_PROXY=true` only behind a trusted reverse proxy to honor them. Without a
+  trusted proxy the limiter keys on the submitted identity/email (not header-spoofable). The
+  limiter also fails open under memory pressure (it never becomes a self-DoS), so it is a
+  throttle, not a hard guarantee.
 
 ## Framework / hooks
 
@@ -66,8 +68,10 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
 - No `Range`/partial-content requests (no video seeking on large files served from the
   static root).
 - No directory listings; directories resolve to `index.html` or 404.
-- Path safety is lexical (`..`, backslashes, and NUL bytes are rejected); symlinks inside
-  the static root are followed — do not point them outside the root.
+- Path safety is lexical (`..`, backslashes, and NUL bytes are rejected) **and**
+  symlink-aware: a served file is canonicalized and refused if its real path escapes the
+  configured static root, so a symlink inside the root pointing outside it is not followed
+  out.
 - No on-the-fly compression; pre-compress at the CDN or reverse proxy if needed.
 - In **dir** mode (`--serve-static` or comptime `.dir`), caching is controlled by
   facil.io's `sendFile` (fixed `Cache-Control: max-age=3600`) — this value is not

@@ -463,7 +463,9 @@ pub fn main(init: std.process.Init) !void {
                 .fields = .{
                     .{ .name = "name", .type = .text, .max = 100 },
                 },
-                .rules = .{ .list = "", .view = "", .create = "", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
+                // Public profiles + open signup: "@public" is the explicit allow-all sentinel
+                // (empty "" is now LOCKED, not public).
+                .rules = .{ .list = "@public", .view = "@public", .create = "@public", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
             },
             .simulators = .{
                 .fields = .{
@@ -472,7 +474,9 @@ pub fn main(init: std.process.Init) !void {
                 },
                 // NOTE: any authed user can create a simulator (become a host) — deliberately
                 // simple for a demo; restrict with a role/claim check in a real app.
-                .rules = .{ .list = "", .view = "", .create = "@request.auth.id != \"\"", .update = "@request.auth.id = owner", .delete = "@request.auth.id = owner" },
+                // Anyone may browse the directory of simulators ("@public" list/view);
+                // create/update/delete stay owner-scoped.
+                .rules = .{ .list = "@public", .view = "@public", .create = "@request.auth.id != \"\"", .update = "@request.auth.id = owner", .delete = "@request.auth.id = owner" },
             },
             .listings = .{
                 .fields = .{
@@ -524,8 +528,10 @@ pub fn main(init: std.process.Init) !void {
                 // the booking's guest (after a confirmed session) may create one, and
                 // an author may edit/delete only their own review.
                 .rules = .{
-                    .list = "",
-                    .view = "",
+                    // Reviews are public to read ("@public"); the prepareReview hook still gates
+                    // creation. (Empty "" would now LOCK these, not make them public.)
+                    .list = "@public",
+                    .view = "@public",
                     .create = "@request.auth.id != \"\"",
                     .update = "@request.auth.id = author",
                     .delete = "@request.auth.id = author",

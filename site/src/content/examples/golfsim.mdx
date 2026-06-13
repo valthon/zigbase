@@ -153,9 +153,10 @@ through the custom `POST /api/bookings/:id/confirm` route.
 ```sh
 cd frontend && npm install && npm run build && cd ..
 zig build
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
-  ./zig-out/bin/golfsim serve --data-dir ./data
-# open http://127.0.0.1:8090/  — no --serve-static needed
+# --insecure-cookies: local dev is over plain HTTP, and auth cookies are Secure by default.
+# A strong JWT secret is auto-generated and persisted under the data dir on first run.
+./zig-out/bin/golfsim serve --insecure-cookies --data-dir ./data
+# open http://127.0.0.1:8090/  — same-origin frontend, so no --serve-static or --realtime-origins needed
 ```
 
 This demonstrates the **comptime-hardcoded** static mode: `.static_files = .{ .dir =
@@ -186,9 +187,10 @@ This example needs **Zig 0.16**, which you can get via [mise](https://mise.jdx.d
 cd frontend && npm install && npm run build && cd ..
 zig build       # produces ./zig-out/bin/golfsim
 ./zig-out/bin/golfsim superuser create --email you@example.com --password "<pw>" --data-dir ./data
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
-  ./zig-out/bin/golfsim serve --data-dir ./data
-# open http://127.0.0.1:8090/  — frontend served automatically, no --serve-static flag
+# --insecure-cookies: local dev is over plain HTTP, and auth cookies are Secure by default.
+# A strong JWT secret is auto-generated and persisted under the data dir on first run.
+./zig-out/bin/golfsim serve --insecure-cookies --data-dir ./data
+# open http://127.0.0.1:8090/  — frontend served automatically (same-origin), no --serve-static flag
 ```
 
 Register a guest, create a `published` listing, and `POST /api/collections/bookings/records`

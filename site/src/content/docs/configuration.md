@@ -24,6 +24,7 @@ So a flag overrides the matching environment variable, which overrides the defau
 
 ```text
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
+              [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
 zigbase migrate [--data-dir PATH]
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase help
@@ -45,16 +46,17 @@ Running `zigbase` with no recognised command prints usage.
 
 | Env var | Flag | Default | Purpose |
 | --- | --- | --- | --- |
-| `ZIGBASE_HTTP_HOST` | `--http-host` | `0.0.0.0` | bind address |
+| `ZIGBASE_HTTP_HOST` | `--http-host` | `127.0.0.1` | bind address (loopback by default; set `0.0.0.0` for all interfaces) |
 | `ZIGBASE_HTTP_PORT` | `--http-port` | `8090` | listen port |
 | `ZIGBASE_DATA_DIR` | `--data-dir` | `./zb_data` | data directory (holds `data.db` and `storage/`) |
 | — | `--serve-static` | `""` (off) | serve static files from DIR at the root path (default mode only) |
-| `ZIGBASE_JWT_SECRET` | — | `dev-insecure-secret-change-me` | token signing secret (set in production) |
-| `ZIGBASE_COOKIE_SECURE` | — | `false` | mark auth cookies `Secure` (enable behind HTTPS) |
+| `ZIGBASE_JWT_SECRET` | — | _auto-generated_ | token signing secret (≥32 bytes). Unset → a random secret is generated + persisted at `<data-dir>/.jwt_secret` (0600); a shorter provided value is refused |
+| `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
+| `ZIGBASE_TRUST_PROXY` | `--trust-proxy` (sets `true`) | `false` | trust `X-Forwarded-For`/`X-Real-IP` for client-IP / rate-limit keying (set only behind a trusted reverse proxy) |
 | `ZIGBASE_AUTH_TOKEN_TTL` | — | `1209600` (14 days) | auth token lifetime, seconds |
 | `ZIGBASE_VERIFICATION_TTL` | — | `604800` (7 days) | email-verification token lifetime, seconds |
 | `ZIGBASE_PASSWORD_RESET_TTL` | — | `3600` (1 hour) | password-reset token lifetime, seconds |
-| `ZIGBASE_REALTIME_ORIGINS` | — | `""` (allow any) | CSV of allowed WebSocket `Origin`s |
+| `ZIGBASE_REALTIME_ORIGINS` | `--realtime-origins` | `""` (deny cross-origin) | CSV of allowed WebSocket `Origin`s. Empty denies cross-origin browser upgrades; same-origin upgrades are always allowed |
 | `ZIGBASE_MAX_UPLOAD_SIZE` | — | `52428800` (50 MiB) | max request body size, bytes |
 | `ZIGBASE_FILE_TOKEN_TTL` | — | `120` (2 min) | file-access token lifetime, seconds |
 | `ZIGBASE_SENTRY_DSN` | — | `""` (log to stderr) | set to enable Sentry error reporting |
@@ -78,17 +80,24 @@ the configured SMTP transport. Without it (the default), they are **logged** to 
 ## Rate limiting
 
 Sensitive auth endpoints (login, verification, password-reset) are **rate limited** — see
-[API → Rate limiting](./api#rate-limiting). The limiter is keyed on the proxy-supplied
-client IP (`X-Forwarded-For` / `X-Real-IP`) with a per-identity fallback; see
+[API → Rate limiting](./api#rate-limiting). `X-Forwarded-For` / `X-Real-IP` are **ignored by
+default** (they are spoofable on direct exposure); the limiter keys on the submitted
+identity/email. Set `--trust-proxy` / `ZIGBASE_TRUST_PROXY=true` **only** behind a trusted
+reverse proxy to key on the proxy-supplied client IP; see
 [Known limitations](./known-limitations).
 
 ## Security
 
-Set `ZIGBASE_JWT_SECRET` to a strong, random value in production. The server **refuses to
-start** when the secret is left at its insecure default and `ZIGBASE_COOKIE_SECURE=true`;
-with the default secret and `cookie_secure` off, it logs a warning instead. An empty
-`ZIGBASE_REALTIME_ORIGINS` allows any WebSocket origin (fine for development, lock it down
-in production).
+ZigBase is **secure by default**. The bind is loopback (`127.0.0.1`); expose all interfaces
+deliberately with `--http-host 0.0.0.0` (front it with a firewall / reverse proxy). The JWT
+secret is per-deployment: leaving `ZIGBASE_JWT_SECRET` unset generates a strong random secret
+and persists it at `<data-dir>/.jwt_secret` (mode 0600), reused on later runs; a provided
+secret must be ≥32 bytes or the server refuses to start. Auth cookies are `Secure` by default,
+so plain-HTTP local dev needs `--insecure-cookies` (or `ZIGBASE_COOKIE_SECURE=false`) or the
+admin-UI login cookie is not stored. An empty `ZIGBASE_REALTIME_ORIGINS` **denies** cross-origin
+browser WebSocket upgrades; same-origin upgrades (the embedded admin UI, or a frontend served
+from the same binary) are always allowed, so only a separate-origin frontend needs
+`--realtime-origins`.
 
 ## See also
 

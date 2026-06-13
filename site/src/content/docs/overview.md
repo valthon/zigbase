@@ -62,8 +62,9 @@ comptime "footprint levers" you can tune.
 
 It is an **early release** (`v0.1.0`, Apache-2.0). Read the
 [known limitations](./known-limitations) before deploying — notably that SMTP must be
-configured for email delivery in production, rate limiting trusts proxy-supplied client
-IPs, comptime auto-migration is additive-only, and the scheduler is single-process.
+configured for email delivery in production, rate limiting ignores proxy-supplied client
+IPs unless `--trust-proxy` is set, comptime auto-migration is additive-only, and the
+scheduler is single-process.
 
 ## Where to go next
 

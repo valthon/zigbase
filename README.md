@@ -18,13 +18,18 @@ with comptime record hooks, custom HTTP routes, and scheduled jobs.
 mise install                                    # installs Zig 0.16.0 (pinned in mise.toml)
 zig build                                        # -> zig-out/bin/zigbase   (or: mise exec zig@0.16.0 -- zig build)
 ./zig-out/bin/zigbase superuser create --email you@example.com --password "<a strong password>" --data-dir ./zb_data
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" ./zig-out/bin/zigbase serve --data-dir ./zb_data
+# --insecure-cookies: local dev is over plain HTTP, and auth cookies are Secure by default.
+./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
 # open http://127.0.0.1:8090/_/  (admin UI) and sign in as the superuser
 curl http://127.0.0.1:8090/api/health           # {"status":"ok"}
 ```
 
-The default bind is `0.0.0.0:8090`. Your `zig` must be 0.16.0 — either activate mise
-(`eval "$(mise activate bash)"`) or prefix commands with `mise exec zig@0.16.0 --`.
+The default bind is `127.0.0.1:8090` (loopback only). To expose ZigBase on all
+interfaces, pass `--http-host 0.0.0.0` (front it with a firewall / reverse proxy).
+On first `serve` with no `ZIGBASE_JWT_SECRET`, a strong random secret is generated and
+persisted at `<data-dir>/.jwt_secret` (mode 0600), then reused on later runs. Your `zig`
+must be 0.16.0 — either activate mise (`eval "$(mise activate bash)"`) or prefix commands
+with `mise exec zig@0.16.0 --`.
 
 ## Features
 
@@ -89,6 +94,7 @@ an Astro + React frontend demonstrating a different static-files mode.
 
 ```
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
+              [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
 zigbase migrate [--data-dir PATH]
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase help
@@ -103,20 +109,23 @@ environment variables, then `serve` command-line flags (where a flag exists).
 
 | Env var | Flag | Default | Purpose |
 |---|---|---|---|
-| `ZIGBASE_HTTP_HOST` | `--http-host` | `0.0.0.0` | bind address |
+| `ZIGBASE_HTTP_HOST` | `--http-host` | `127.0.0.1` | bind address (loopback by default; set `0.0.0.0` for all interfaces) |
 | `ZIGBASE_HTTP_PORT` | `--http-port` | `8090` | listen port |
-| `ZIGBASE_DATA_DIR` | `--data-dir` | `./zb_data` | data directory (holds `data.db` and `storage/`) |
-| `ZIGBASE_JWT_SECRET` | — | `dev-insecure-secret-change-me` | token signing secret (set in production) |
-| `ZIGBASE_COOKIE_SECURE` | — | `false` | mark auth cookies `Secure` (enable behind HTTPS) |
+| `ZIGBASE_DATA_DIR` | `--data-dir` | `./zb_data` | data directory (holds `data.db`, `storage/`, and `.jwt_secret`) |
+| `ZIGBASE_JWT_SECRET` | — | _auto-generated_ | token signing secret (≥32 bytes). Unset → a random secret is generated + persisted at `<data-dir>/.jwt_secret` (0600); a shorter provided value is refused |
+| `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
+| `ZIGBASE_TRUST_PROXY` | `--trust-proxy` (sets `true`) | `false` | trust `X-Forwarded-For`/`X-Real-IP` for client-IP / rate-limit keying (set only behind a trusted reverse proxy) |
 | `ZIGBASE_AUTH_TOKEN_TTL` | — | `1209600` (14 days) | auth token lifetime, seconds |
 | `ZIGBASE_VERIFICATION_TTL` | — | `604800` (7 days) | email-verification token lifetime, seconds |
 | `ZIGBASE_PASSWORD_RESET_TTL` | — | `3600` (1 hour) | password-reset token lifetime, seconds |
-| `ZIGBASE_REALTIME_ORIGINS` | — | `""` (allow any) | CSV of allowed WebSocket `Origin`s |
+| `ZIGBASE_REALTIME_ORIGINS` | `--realtime-origins` | `""` (deny cross-origin) | CSV of allowed WebSocket `Origin`s. Empty denies cross-origin browser upgrades |
 | `ZIGBASE_MAX_UPLOAD_SIZE` | — | `52428800` (50 MiB) | max request body size, bytes |
 | `ZIGBASE_FILE_TOKEN_TTL` | — | `120` (2 min) | file-access token lifetime, seconds |
 | `ZIGBASE_SENTRY_DSN` | — | `""` (log to stderr) | set to enable Sentry error reporting |
 | `ZIGBASE_RATE_LIMIT_MAX` | — | `10` | max sensitive-auth attempts per window per client; `0` disables rate limiting |
 | `ZIGBASE_RATE_LIMIT_WINDOW` | — | `60` | rate-limit window length, seconds |
+| `ZIGBASE_OAUTH_STATE_SERVER` | — | `false` | enable server-side OAuth `state` (CSRF) store; clients must call `oauth2-init` and echo `state` on callback (PKCE still required) |
+| `ZIGBASE_OAUTH_STATE_TTL` | — | `600` (10 min) | server-side OAuth `state` lifetime, seconds |
 | `ZIGBASE_SMTP_HOST` | — | `""` (use LogMailer) | SMTP server host; set to deliver verify/reset email instead of logging |
 | `ZIGBASE_SMTP_PORT` | — | `25` | SMTP server port |
 | `ZIGBASE_SMTP_USERNAME` | — | `""` | SMTP username; non-empty enables `AUTH LOGIN` |
@@ -136,11 +145,24 @@ environment variables, then `serve` command-line flags (where a flag exists).
 
 ## Security
 
-Set `ZIGBASE_JWT_SECRET` to a strong, random value in production. The server **refuses
-to start** when the secret is left at its insecure default and `ZIGBASE_COOKIE_SECURE=true`;
-with the default secret and `cookie_secure` off, it logs a warning instead. An empty
-`ZIGBASE_REALTIME_ORIGINS` allows any WebSocket origin (fine for development, lock it down
-in production).
+ZigBase is **secure by default**:
+
+- **Bind** is loopback (`127.0.0.1`). Expose it deliberately with `--http-host 0.0.0.0`
+  behind a firewall / reverse proxy.
+- **JWT secret** is per-deployment: leaving `ZIGBASE_JWT_SECRET` unset generates a strong
+  random secret and persists it at `<data-dir>/.jwt_secret` (0600), reused on later runs.
+  A provided secret must be ≥32 bytes; anything shorter is refused. There is no shared
+  default secret. Override the env var to manage the secret yourself (e.g. a secrets store).
+- **Auth cookies** are `Secure` by default (HTTPS-only). For plain-HTTP local dev, pass
+  `--insecure-cookies` (or `ZIGBASE_COOKIE_SECURE=false`).
+- **Realtime origins**: an empty `ZIGBASE_REALTIME_ORIGINS` **denies** cross-origin browser
+  WebSocket upgrades. **Same-origin upgrades are always allowed** — the embedded admin UI and any
+  frontend served from this same binary work out of the box. A request with no `Origin` header
+  (a non-browser client) is also allowed. Set explicit origins only for a *separate-origin*
+  browser app.
+- **Rate limiting / client IP**: `X-Forwarded-For` / `X-Real-IP` are ignored unless
+  `--trust-proxy` (`ZIGBASE_TRUST_PROXY=true`) is set, so direct exposure can't be bypassed
+  by spoofing those headers. Enable it only behind a trusted reverse proxy.
 
 ## Project layout
 

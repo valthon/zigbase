@@ -4,6 +4,75 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+This round makes ZigBase **safe-by-default**: a security audit's findings were fixed and
+the access-rule and deployment defaults were hardened. **It contains breaking changes** —
+read the migration notes below before upgrading. The full audit is in
+[`docs/security-audit.md`](docs/security-audit.md).
+
+### ⚠ Breaking changes
+
+- **Access rules are now safe-by-default.** A blank rule — `null` **or** the empty string
+  `""` — now means **Locked (superusers only)**. Previously `""` meant **allow-all (public)**
+  while `null` meant locked; that inverted-from-intuition default was the single easiest way
+  to ship a collection wide open. The **only** way to make a rule public is now the explicit
+  sentinel **`"@public"`**, and ZigBase logs a prominent startup warning for every `@public`
+  rule so a wide-open collection is never silent.
+  - **How to migrate:** audit every collection's `list`/`view`/`create`/`update`/`delete`
+    rules. Any rule that was `""` *intending* "anyone" must become `"@public"`. Any rule that
+    was `""` merely as a placeholder is now correctly Locked (superuser-only) — no change
+    needed unless you relied on it being open. The admin UI rule editor is now a three-state
+    selector (**Locked / Expression / Public**) and confirms before opening a rule to the public.
+- **Secure-by-default deployment.**
+  - **Bind defaults to `127.0.0.1:8090`** (loopback); was `0.0.0.0`. Expose all interfaces
+    explicitly with `--http-host 0.0.0.0` (`ZIGBASE_HTTP_HOST`), behind a firewall / reverse proxy.
+  - **`ZIGBASE_JWT_SECRET` is auto-generated and persisted** under the data dir on first run
+    when unset. The shared `dev-insecure-secret-change-me` default is gone, and a provided
+    secret shorter than 32 bytes is refused at startup.
+  - **Auth cookies are `Secure` (HTTPS-only) by default.** For plain-HTTP local dev pass
+    `--insecure-cookies` (`ZIGBASE_COOKIE_SECURE=false`).
+  - **An empty `ZIGBASE_REALTIME_ORIGINS` now denies cross-origin browser WebSocket upgrades.**
+    Same-origin upgrades (the embedded admin UI and any frontend served from the same binary)
+    are always allowed; set `--realtime-origins` only for a *separate-origin* browser app.
+  - **The rate limiter ignores `X-Forwarded-For` / `X-Real-IP` unless `--trust-proxy`**
+    (`ZIGBASE_TRUST_PROXY=true`) is set. Direct exposure is now safe by default; enable
+    `--trust-proxy` only behind a trusted reverse proxy.
+- **`perPage` on record list queries is clamped to 500.**
+
+### Security
+
+- **SMTP/RFC5322 header injection** fixed — CR/LF/NUL rejected in mail `to`/`subject`/`from`
+  and in the SMTP command path.
+- **`email`-field validation** — rejects control characters and obviously-malformed addresses.
+- **Realtime delete authorization** — delete events are authorized against a pre-delete
+  snapshot, so owner-scoped collections no longer leak deleted record ids to other subscribers.
+- **Realtime subscribe auth** — subscribing to a non-`@public` collection now requires auth.
+- **Single-use tokens** — verification and password-reset tokens are now strictly single-use.
+- **DoS caps** — a global WebSocket connection cap and a multipart part-count cap (plus the
+  `perPage` clamp above).
+- **Static symlink escapes refused** — served files are canonicalized and must resolve within
+  the static root.
+- **Optional server-side OAuth `state`** — an opt-in CSRF `state` store
+  (`ZIGBASE_OAUTH_STATE_SERVER`); PKCE remains required in both modes.
+
+### Added
+
+- New CLI flags / env vars: `--http-host` (`ZIGBASE_HTTP_HOST`), `--insecure-cookies`
+  (`ZIGBASE_COOKIE_SECURE`), `--trust-proxy` (`ZIGBASE_TRUST_PROXY`), `--realtime-origins`
+  (`ZIGBASE_REALTIME_ORIGINS`), `ZIGBASE_OAUTH_STATE_SERVER`.
+- Admin UI: a three-state API-rule editor (**Locked / Expression / Public**) that confirms
+  before making a rule public.
+- Framework: `zigbase.JobEvent` is re-exported at the top level (alongside `RecordEvent` /
+  `RouteEvent` / `ErrorEvent`); comptime guards now give actionable compile errors for a
+  mistyped `.migrations` value or a storage/mailer plugin missing a contract method.
+
+### Fixed
+
+- Large comptime `.collections` schemas (~5+ collections) no longer fail to build with
+  "evaluation exceeded 1000 backwards branches" — the lowering raises its own eval-branch
+  quota (a downstream `@setEvalBranchQuota` could not reach it).
+
 ## [0.3.0] - 2026-06-11
 
 ### Fixed

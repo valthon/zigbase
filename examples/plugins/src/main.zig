@@ -386,7 +386,8 @@ pub fn main(init: std.process.Init) !void {
                     .{ .name = "contact_email", .type = .email },
                     .{ .name = "bio", .type = .text, .max = 500 },
                 },
-                .rules = .{ .list = "", .view = "" },
+                // Authors are publicly readable ("@public"); empty "" is now LOCKED.
+                .rules = .{ .list = "@public", .view = "@public" },
             },
             .posts = .{
                 .type = .base,
@@ -413,11 +414,12 @@ pub fn main(init: std.process.Init) !void {
                     .{ .name = "author_name", .type = .text, .max = 100 },
                     .{ .name = "approved", .type = .bool },
                 },
-                // Approved comments are publicly readable; anyone can submit.
+                // Approved comments are publicly readable; anyone can submit ("@public" create —
+                // an empty "" would now LOCK creation to superusers).
                 .rules = .{
                     .list = "approved = true",
                     .view = "approved = true",
-                    .create = "",
+                    .create = "@public",
                 },
             },
         },

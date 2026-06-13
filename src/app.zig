@@ -8,12 +8,20 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     pool: *db.Pool,
-    jwt_secret: []const u8 = "dev-insecure-secret-change-me",
-    cookie_secure: bool = false,
+    jwt_secret: []const u8 = "",
+    cookie_secure: bool = true,
     auth_token_ttl_s: i64 = 14 * 24 * 3600,
     verification_ttl_s: i64 = 7 * 24 * 3600,
     password_reset_ttl_s: i64 = 3600,
+    /// Server-side OAuth `state` CSRF protection (F11). Opt-in: when true, the backend
+    /// issues a `state` at oauth2-init and verifies+consumes it on auth-with-oauth2.
+    oauth_state_server: bool = false,
+    oauth_state_ttl_s: i64 = 600,
     realtime_allowed_origins: []const u8 = "",
+    /// When false (default), client-IP logic ignores X-Forwarded-For/X-Real-IP and
+    /// keys on the real socket peer. Only honor proxy headers when true (behind a
+    /// trusted reverse proxy). See F8.
+    trust_proxy: bool = false,
     max_upload_size: u64 = 50 << 20,
     file_token_ttl_s: i64 = 120,
     sentry_dsn: []const u8 = "", // "" = log errors to stderr; set to enable Sentry reporting

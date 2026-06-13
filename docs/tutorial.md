@@ -27,10 +27,12 @@ then start serving:
 mise install                                     # Zig 0.16.0, pinned in mise.toml
 zig build                                         # -> zig-out/bin/zigbase
 ./zig-out/bin/zigbase superuser create --email admin@example.com --password "a-strong-password" --data-dir ./zb_data
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" ./zig-out/bin/zigbase serve --data-dir ./zb_data
+# --insecure-cookies: this tutorial runs over plain HTTP, and auth cookies are Secure by default.
+./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
 ```
 
-The server listens on `http://127.0.0.1:8090`. Sanity check:
+The server listens on `http://127.0.0.1:8090` (loopback by default; a random JWT secret is
+generated and persisted at `zb_data/.jwt_secret` on first run). Sanity check:
 
 ```sh
 curl http://127.0.0.1:8090/api/health   # {"status":"ok"}
@@ -66,8 +68,8 @@ USERS_ID=$(curl -s -X POST "$BASE/api/collections" \
     "name": "users",
     "type": "auth",
     "fields": [ { "id": "f_name", "name": "name", "type": "text", "options": { "max": 100 } } ],
-    "listRule": "", "viewRule": "",
-    "createRule": "",
+    "listRule": "@public", "viewRule": "@public",
+    "createRule": "@public",
     "updateRule": "@request.auth.id = id",
     "deleteRule": "@request.auth.id = id"
   }' | jq -r .id)
@@ -88,7 +90,7 @@ SIMS_ID=$(curl -s -X POST "$BASE/api/collections" \
       { \"id\": \"f_owner\", \"name\": \"owner\", \"type\": \"relation\", \"required\": true,
         \"options\": { \"targetCollectionId\": \"$USERS_ID\", \"cascadeDelete\": true, \"maxSelect\": 1 } }
     ],
-    \"listRule\": \"\", \"viewRule\": \"\",
+    \"listRule\": \"@public\", \"viewRule\": \"@public\",
     \"createRule\": \"@request.auth.id != \\\"\\\"\",
     \"updateRule\": \"@request.auth.id = owner\",
     \"deleteRule\": \"@request.auth.id = owner\"
@@ -124,10 +126,12 @@ The field shapes used here are catalogued in [fields.md](fields.md).
 ## 2. Understand the access rules you just set
 
 Each collection's five rules (`listRule`/`viewRule`/`createRule`/`updateRule`/
-`deleteRule`) are filter expressions; `""` means public, `null` means
-superuser-only, anything else is checked per request. Highlights from above:
+`deleteRule`) are filter expressions. **Safe-by-default:** a blank rule (`null` *or* `""`)
+means **superuser-only (Locked)**; the explicit sentinel `"@public"` means **public**
+(anyone — and ZigBase logs a startup warning for each one); anything else is checked per
+request. Highlights from above:
 
-- `users`: `createRule: ""` → **open signup** (anyone may create a user). Update/
+- `users`: `createRule: "@public"` → **open signup** (anyone may create a user). Update/
   delete are self-only (`@request.auth.id = id`).
 - `simulators`/`listings`: writes are **owner-scoped**
   (`@request.auth.id = simulator.owner`), which uses **relation traversal** —

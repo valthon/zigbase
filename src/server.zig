@@ -42,6 +42,7 @@ const routes = [_]router.Route{
     .{ .method = .POST, .pattern = "/api/collections/:col/request-password-reset", .handler = auth_api.requestPasswordReset },
     .{ .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .handler = auth_api.confirmPasswordReset },
     .{ .method = .GET, .pattern = "/api/collections/:col/oauth2-providers", .handler = oauth_api.oauth2Providers },
+    .{ .method = .POST, .pattern = "/api/collections/:col/oauth2-init", .handler = oauth_api.oauth2Init },
     .{ .method = .POST, .pattern = "/api/collections/:col/auth-with-oauth2", .handler = oauth_api.authWithOAuth2 },
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
     .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
@@ -78,22 +79,43 @@ fn methodFromZap(r: zap.Request) http.Method {
     };
 }
 
-/// Best-effort client IP from reverse-proxy headers, for rate-limit keying.
-/// Prefers the first hop of `X-Forwarded-For` (the original client), then
-/// `X-Real-IP`. Returns "" when neither header is present (direct connection /
-/// no proxy); the limiter then falls back to keying on the submitted identity.
-fn clientIp(r: zap.Request) []const u8 {
-    if (r.getHeader("x-forwarded-for")) |xff| {
+/// Pure core of client-IP resolution (F8), testable without a zap.Request.
+/// `X-Forwarded-For`/`X-Real-IP` are attacker-controlled on direct exposure, so
+/// they are honored ONLY when `trust_proxy` is true. Returns "" when proxy headers
+/// are not trusted or absent; the limiter then keys on the submitted identity (still
+/// useful, and never spoofable via a forged header).
+fn clientIpFrom(trust_proxy: bool, xff: ?[]const u8, xri: ?[]const u8) []const u8 {
+    if (!trust_proxy) return "";
+    if (xff) |v| {
         // "client, proxy1, proxy2" — take the first, trimmed.
-        const first = if (std.mem.indexOfScalar(u8, xff, ',')) |c| xff[0..c] else xff;
+        const first = if (std.mem.indexOfScalar(u8, v, ',')) |c| v[0..c] else v;
         const trimmed = std.mem.trim(u8, first, " \t");
         if (trimmed.len > 0) return trimmed;
     }
-    if (r.getHeader("x-real-ip")) |xri| {
-        const trimmed = std.mem.trim(u8, xri, " \t");
+    if (xri) |v| {
+        const trimmed = std.mem.trim(u8, v, " \t");
         if (trimmed.len > 0) return trimmed;
     }
     return "";
+}
+
+/// Client IP for rate-limit keying. zap 0.10.6 exposes no socket-peer accessor on
+/// Request, so proxy headers are the only source — and they're trusted only when
+/// `trust_proxy` is set (see `clientIpFrom`).
+fn clientIp(r: zap.Request, trust_proxy: bool) []const u8 {
+    return clientIpFrom(trust_proxy, r.getHeader("x-forwarded-for"), r.getHeader("x-real-ip"));
+}
+
+test "clientIpFrom ignores X-Forwarded-For/X-Real-IP unless trust_proxy is set (F8)" {
+    // Default (untrusted): spoofable headers are ignored entirely.
+    try std.testing.expectEqualStrings("", clientIpFrom(false, "1.2.3.4", null));
+    try std.testing.expectEqualStrings("", clientIpFrom(false, "1.2.3.4, 5.6.7.8", "9.9.9.9"));
+    try std.testing.expectEqualStrings("", clientIpFrom(false, null, "9.9.9.9"));
+    // Trusted proxy: first XFF hop wins, else X-Real-IP, else "".
+    try std.testing.expectEqualStrings("1.2.3.4", clientIpFrom(true, "1.2.3.4, 5.6.7.8", "9.9.9.9"));
+    try std.testing.expectEqualStrings("9.9.9.9", clientIpFrom(true, null, "9.9.9.9"));
+    try std.testing.expectEqualStrings("1.2.3.4", clientIpFrom(true, " 1.2.3.4 ", null));
+    try std.testing.expectEqualStrings("", clientIpFrom(true, null, null));
 }
 
 fn setZapStatus(r: zap.Request, status: u16) void {
@@ -238,10 +260,10 @@ fn onRequest(r: zap.Request) !void {
     ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
     ctx.content_type = r.getHeader("content-type") orelse "";
     ctx.if_none_match = r.getHeader("if-none-match") orelse "";
-    // Best-effort client IP for rate limiting. zap (0.10.6) exposes no peer-address
-    // accessor on Request, so we trust the reverse-proxy hop headers: the FIRST hop in
-    // X-Forwarded-For (the original client), else X-Real-IP. "" when neither is present.
-    ctx.remote_ip = clientIp(r);
+    // Client IP for rate limiting (F8). Proxy hop headers (X-Forwarded-For / X-Real-IP)
+    // are spoofable on direct exposure, so they are honored ONLY when trust_proxy is set.
+    // Otherwise "" — the limiter keys on the submitted identity (never header-spoofable).
+    ctx.remote_ip = clientIp(r, self.app.trust_proxy);
     const multipart_err = try applyMultipart(&ctx);
     const resp = blk: {
         if (multipart_err) |er| break :blk er;

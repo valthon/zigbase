@@ -83,6 +83,70 @@ pub fn oauth2Providers(ctx: *http.RequestCtx) anyerror!http.Response {
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}) };
 }
 
+// ----------------------------------------------------------------------------
+// Server-side OAuth `state` (F11): optional, opt-in CSRF protection.
+// ----------------------------------------------------------------------------
+
+/// Mint + persist a random `state` for (collection, provider), valid for app.oauth_state_ttl_s.
+/// Single-use: it is deleted on the first successful callback verification.
+fn issueState(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, provider: []const u8) ![]const u8 {
+    const app = ctx.app.?;
+    const state = try crypto.genToken(app.io, ctx.allocator, 40);
+    const now = try auth_api.nowUnix(conn);
+    var st = try conn.prepare(
+        \\INSERT INTO "_oauthStates" ("state","collectionRef","provider","expires","created")
+        \\ VALUES (?1,?2,?3,?4,datetime('now'));
+    );
+    defer st.finalize();
+    try st.bindText(1, state);
+    try st.bindText(2, col_name);
+    try st.bindText(3, provider);
+    try st.bindInt(4, now + app.oauth_state_ttl_s);
+    _ = try st.step();
+    return state;
+}
+
+/// Verify + consume a server-side `state`. Returns true only if a row exists for the
+/// (collection, provider), is unexpired, and is then deleted (single-use — a reuse on a
+/// second call finds no row and returns false). Missing/mismatched/expired => false.
+fn consumeState(conn: *db.Db, col_name: []const u8, provider: []const u8, state: []const u8) !bool {
+    const now = try auth_api.nowUnix(conn);
+    var st = try conn.prepare(
+        \\DELETE FROM "_oauthStates"
+        \\ WHERE "state"=?1 AND "collectionRef"=?2 AND "provider"=?3 AND "expires" > ?4
+        \\ RETURNING "state";
+    );
+    defer st.finalize();
+    try st.bindText(1, state);
+    try st.bindText(2, col_name);
+    try st.bindText(3, provider);
+    try st.bindInt(4, now);
+    return try st.step(); // true iff a matching, unexpired row was deleted
+}
+
+/// POST /api/collections/:col/oauth2-init — issues a server-side `state` for a provider when
+/// server-side CSRF protection is enabled. Body: { "provider": "<name>" }. The client embeds
+/// the returned `state` in the provider authorization URL and echoes it back on the callback.
+/// 404 when server-side state is disabled (the client-driven flow needs no init call).
+pub fn oauth2Init(ctx: *http.RequestCtx) anyerror!http.Response {
+    const app = ctx.app.?;
+    if (!app.oauth_state_server) return ApiError.notFound().toResponse(ctx.allocator);
+    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+    const provider_name = strField(body, "provider") orelse return ApiError.badRequest("provider is required.").toResponse(ctx.allocator);
+    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
+
+    const w = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
+    const col = (try collections.get(ctx.allocator, w, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
+    if (findProviderConfig(col, provider_name) == null) return ApiError.notFound().toResponse(ctx.allocator);
+
+    const state = try issueState(ctx, w, col_name, provider_name);
+    var root: std.json.ObjectMap = .empty;
+    try root.put(ctx.allocator, "state", .{ .string = state });
+    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}) };
+}
+
 const Link = struct { collectionRef: []const u8, recordRef: []const u8 };
 
 fn findLink(alloc: std.mem.Allocator, conn: *db.Db, provider: []const u8, provider_id: []const u8) !?Link {
@@ -171,6 +235,22 @@ pub fn authWithOAuth2Impl(ctx: *http.RequestCtx, transport: oauth_client.Transpo
             return ApiError.notFound().toResponse(ctx.allocator);
     }
     if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
+
+    // Server-side CSRF (F11): when enabled, require + verify + consume the server-issued
+    // `state` BEFORE touching the provider, so a missing/mismatched/expired/reused state is
+    // rejected without burning the authorization code. Opt-in; the client-driven flow (no
+    // server state) is unchanged. PKCE (codeVerifier) is still required on every path.
+    if (app.oauth_state_server) {
+        const state = strField(body, "state") orelse return ApiError.badRequest("state is required.").toResponse(ctx.allocator);
+        const w = app.pool.acquireWriter();
+        const ok = consumeState(w, col_name, provider_name, state) catch {
+            app.pool.releaseWriter();
+            return ApiError.internal().toResponse(ctx.allocator);
+        };
+        app.pool.releaseWriter();
+        if (!ok) return (ApiError{ .status = 400, .message = "Invalid or expired state." }).toResponse(ctx.allocator);
+    }
+
     const cfg = findProviderConfig(col, provider_name) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const provider = resolveProvider(cfg) orelse return ApiError.badRequest("Provider misconfigured.").toResponse(ctx.allocator);
     if (!redirectAllowed(cfg, redirect_url)) return ApiError.badRequest("redirectUrl not allowed.").toResponse(ctx.allocator);
@@ -453,6 +533,78 @@ test "anonymous oauth create colliding email -> 409" {
     var stub = OAuthStub{ .pid = "P9", .email = "u@x.io" };
     var c = env.ctx(a, .POST, try oauthBody(a), &p);
     try std.testing.expectEqual(@as(u16, 409), (try authWithOAuth2Impl(&c, stub.transport())).status);
+}
+
+// --- F11: server-side OAuth state (opt-in CSRF) ---
+
+/// Mint a server-side state by calling oauth2Init and pulling it out of the JSON body.
+fn initState(env: *TestEnv, a: std.mem.Allocator, col: []const u8, provider: []const u8) ![]const u8 {
+    const p = [_]http.Param{.{ .key = "col", .value = col }};
+    const body = try std.fmt.allocPrint(a, "{{\"provider\":\"{s}\"}}", .{provider});
+    var c = env.ctx(a, .POST, body, &p);
+    const res = try oauth2Init(&c);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    return (try std.json.parseFromSlice(std.json.Value, a, res.body, .{})).value.object.get("state").?.string;
+}
+
+fn oauthBodyState(a: std.mem.Allocator, state: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{{\"provider\":\"google\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\",\"state\":\"{s}\"}}", .{state});
+}
+
+test "F11: oauth2-init 404 when server-side state disabled" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.seedOAuthCollection(a, "users");
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    var c = env.ctx(a, .POST, "{\"provider\":\"google\"}", &p);
+    try std.testing.expectEqual(@as(u16, 404), (try oauth2Init(&c)).status); // disabled by default
+}
+
+test "F11: server-side state — valid accepted; missing/mismatched/replayed rejected" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    env.app.oauth_state_server = true;
+    try env.seedOAuthCollection(a, "users");
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    var stub = OAuthStub{};
+
+    // Missing state when server-side enforcement is on -> 400.
+    var cmiss = env.ctx(a, .POST, try oauthBody(a), &p);
+    try std.testing.expectEqual(@as(u16, 400), (try authWithOAuth2Impl(&cmiss, stub.transport())).status);
+
+    // Mismatched (never issued) state -> 400.
+    var cbad = env.ctx(a, .POST, try oauthBodyState(a, "not-a-real-state"), &p);
+    try std.testing.expectEqual(@as(u16, 400), (try authWithOAuth2Impl(&cbad, stub.transport())).status);
+
+    // Valid issued state -> accepted (200, isNew).
+    const state = try initState(env, a, "users", "google");
+    var cok = env.ctx(a, .POST, try oauthBodyState(a, state), &p);
+    const res = try authWithOAuth2Impl(&cok, stub.transport());
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+
+    // Replaying the same (now-consumed) state -> 400.
+    var crep = env.ctx(a, .POST, try oauthBodyState(a, state), &p);
+    try std.testing.expectEqual(@as(u16, 400), (try authWithOAuth2Impl(&crep, stub.transport())).status);
+}
+
+test "F11: client-driven flow still works when server-side state is disabled" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.seedOAuthCollection(a, "users"); // oauth_state_server defaults false
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    var stub = OAuthStub{};
+    // No `state` in the body, no oauth2-init call — the documented flow is unchanged.
+    var c = env.ctx(a, .POST, try oauthBody(a), &p);
+    try std.testing.expectEqual(@as(u16, 200), (try authWithOAuth2Impl(&c, stub.transport())).status);
 }
 
 fn linkOne(env: *TestEnv, a: std.mem.Allocator, col: []const u8, rid: []const u8, provider: []const u8, pid: []const u8) !void {

@@ -161,7 +161,9 @@ pub fn main(init: std.process.Init) !void {
                 .fields = .{
                     .{ .name = "name", .type = .text, .max = 100 },
                 },
-                .rules = .{ .list = "", .view = "", .create = "", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
+                // Public profiles + open signup: list/view/create are intentionally allow-all
+                // (the explicit "@public" sentinel; an empty string is now LOCKED, not public).
+                .rules = .{ .list = "@public", .view = "@public", .create = "@public", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
             },
             .posts = .{
                 .fields = .{

@@ -139,6 +139,25 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             if (o.max) |mx| if (n > mx)
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Value is too long." });
         },
+        // Email: require a minimal, single-line address. We do NOT attempt full
+        // RFC5322 validation, but we MUST reject control characters: an email value
+        // flows into outbound SMTP (`To:`/`RCPT TO:`) where a CR/LF/NUL is a
+        // header/command-injection vector, and a record stored with such a value
+        // would inject on every later verification/reset send. Also require a single
+        // '@' with non-empty local/domain parts so obviously-bogus values are caught.
+        .email => if (v == .string and v.string.len > 0) {
+            const s = v.string;
+            var bad = false;
+            // Reject ALL ASCII control characters (incl. TAB/VT/FF) and spaces — any of
+            // them in an address is bogus and can confuse downstream header/log parsers.
+            for (s) |c| if (c < 32 or c == 127 or c == ' ') {
+                bad = true;
+                break;
+            };
+            const at = std.mem.indexOfScalar(u8, s, '@');
+            if (bad or at == null or at.? == 0 or at.? == s.len - 1 or std.mem.indexOfScalarPos(u8, s, at.? + 1, '@') != null)
+                try errs.append(alloc, .{ .field = f.name, .code = "validation_invalid_email", .message = "Invalid email address." });
+        },
         // date min/max are deliberately NOT enforced: a lexical compare is unsound
         // without date normalization (mixed "T"/"Z" vs space formats false-reject,
         // garbage like "25:99:99" false-accepts). See KNOWN_LIMITATIONS.md.
@@ -651,6 +670,38 @@ test "text min/max enforce unicode codepoint counts" {
     // "héllo" is 5 codepoints but 6 bytes: max=5 must count codepoints, not bytes
     _ = try createOne(a, &d, col, "title", .{ .string = "héllo" });
     _ = try createOne(a, &d, col, "title", .{ .string = "ab" });
+}
+
+test "email field rejects control chars (CRLF/NUL) and obviously-bogus addresses" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "contact", .options = .{ .email = .{} } }};
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "contacts", .fields = &fields });
+
+    // CRLF injection attempt (would inject a Bcc header on outbound SMTP) is rejected.
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "victim@x.io\r\nBcc: spam@evil.com" }));
+    try expectFieldCode("contact", "validation_invalid_email");
+    // A bare newline, a space, and a NUL are each rejected.
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\nx" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a b@x.io" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x00" }));
+    // Other ASCII control chars (TAB, vertical tab, form feed, DEL) are rejected too.
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a\tb@x.io" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x0b" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x7f" }));
+    // Structurally-bogus addresses are rejected.
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "no-at-sign" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "@nolocal.io" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "nodomain@" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "two@at@x.io" }));
+    // A normal address is accepted, and clearing (empty/null) stays possible.
+    _ = try createOne(a, &d, col, "contact", .{ .string = "user@example.com" });
+    _ = try createOne(a, &d, col, "contact", .{ .string = "" });
+    _ = try createOne(a, &d, col, "contact", .null);
 }
 
 test "text min does not reject an explicitly empty optional value (clearing stays possible)" {

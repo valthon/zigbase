@@ -121,8 +121,10 @@ from a fresh data directory.
 ```sh
 cd frontend && npm install && npm run build && cd ..
 zig build
-ZIGBASE_JWT_SECRET=... ./zig-out/bin/blog serve --data-dir ./data --serve-static frontend/dist
-# open http://127.0.0.1:8090/
+# --insecure-cookies: local dev is over plain HTTP, and auth cookies are Secure by default.
+# A strong JWT secret is auto-generated and persisted under the data dir on first run.
+./zig-out/bin/blog serve --insecure-cookies --data-dir ./data --serve-static frontend/dist
+# open http://127.0.0.1:8090/  — same-origin frontend, so no --realtime-origins needed
 ```
 
 This demonstrates ZigBase's **default static-files mode**: the binary serves `frontend/dist`
@@ -138,7 +140,9 @@ This example needs **Zig 0.16**, which you can get via [mise](https://mise.jdx.d
 cd frontend && npm install && npm run build && cd ..
 zig build       # produces ./zig-out/bin/blog
 ./zig-out/bin/blog superuser create --email you@example.com --password <pw> --data-dir ./data
-ZIGBASE_JWT_SECRET=... ./zig-out/bin/blog serve --data-dir ./data --serve-static frontend/dist
+# --insecure-cookies: local dev is over plain HTTP, and auth cookies are Secure by default.
+# A strong JWT secret is auto-generated and persisted under the data dir on first run.
+./zig-out/bin/blog serve --insecure-cookies --data-dir ./data --serve-static frontend/dist
 ```
 
 Then create a `posts` record without a `slug` and the hook fills it in from the `title`.

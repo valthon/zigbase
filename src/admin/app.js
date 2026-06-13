@@ -196,6 +196,8 @@ function fmt(v) {
 
 const FIELD_TYPES = ['text','email','url','editor','date','autodate','bool','number','json','select','relation','file'];
 const RULES = ['listRule','viewRule','createRule','updateRule','deleteRule'];
+// F3: the ONLY allow-all sentinel. null/"" are Locked (admins only); "@public" opens a collection.
+const PUBLIC_RULE = '@public';
 
 function blankField() { return { id: '', name: '', type: 'text', required: false, unique: false, options: {} }; }
 
@@ -206,6 +208,10 @@ function SchemaEditor({ name }) {
   const [allCols, setAllCols] = useState([]);
   const [err, setErr] = useState('');
   const [fieldErrs, setFieldErrs] = useState({});
+  // Rules whose mode was explicitly switched to "Expression" but whose value is
+  // still empty. Without this, an empty expression (v === '') derives back to
+  // Locked and the text input never appears, making it impossible to TYPE one.
+  const [exprRules, setExprRules] = useState({});
   useEffect(() => {
     API.collections().then(cs => {
       setAllCols(cs);
@@ -273,13 +279,48 @@ function SchemaEditor({ name }) {
       </div>`}
 
       ${tab === 'rules' && html`<div data-test="tab-rules-body">
-        ${RULES.map(r => html`<div class="field" key=${r}>
-          <label>${r}</label>
-          <div class="row">
-            <input style="flex:1" data-test=${'rule-'+r} placeholder='empty = public' value=${col[r] == null ? '' : col[r]} disabled=${col[r] == null} onInput=${e => setRule(r, e.target.value)}/>
-            <label class="muted"><input type="checkbox" style="width:auto" data-test=${'lock-'+r} checked=${col[r] == null} onChange=${e => setRule(r, e.target.checked ? null : '')}/> lock</label>
-          </div>
-        </div>`)}
+        ${RULES.map(r => {
+          const v = col[r];
+          // Safe-by-default semantics (F3): null OR "" => Locked (admins only); the explicit
+          // "@public" sentinel => PUBLIC (anyone); any other string => an expression checked
+          // per record. Render the three states DISTINCTLY so a wide-open rule can never be set
+          // by accident (and confirm before opening one up).
+          const isPublic = v === PUBLIC_RULE;
+          // An empty value is Locked — UNLESS the user explicitly picked
+          // Expression for this rule (so they can type one into a blank input).
+          const isLocked = (v == null || v === '') && !exprRules[r];
+          const mode = isPublic ? 'public' : (isLocked ? 'locked' : 'expr');
+          function onMode(e) {
+            const m = e.target.value;
+            if (m === 'locked') { setExprRules({ ...exprRules, [r]: false }); return setRule(r, null); }
+            if (m === 'public') {
+              if (!confirm('Make ' + r + ' PUBLIC?\n\nAnyone on the internet will be able to ' +
+                  r.replace('Rule','') + ' records in this collection, with no authentication.')) {
+                // Cancelled: force a re-render (new object ref) so the controlled <select>
+                // snaps back to the prior mode instead of staying visually stuck on "PUBLIC".
+                setExprRules({ ...exprRules });
+                return;
+              }
+              setExprRules({ ...exprRules, [r]: false });
+              return setRule(r, PUBLIC_RULE);
+            }
+            // switching to expression: keep the input visible even while empty
+            setExprRules({ ...exprRules, [r]: true });
+            return setRule(r, (typeof v === 'string' && v !== PUBLIC_RULE && v !== '') ? v : '');
+          }
+          return html`<div class="field" key=${r}>
+            <label>${r} ${isPublic ? html`<span style="color:#b00;font-weight:600" data-test=${'pubtag-'+r}>— PUBLIC (anyone)</span>`
+              : isLocked ? html`<span class="muted" data-test=${'locktag-'+r}>— Locked (admins only)</span>` : ''}</label>
+            <div class="row">
+              <select style="width:170px" data-test=${'rulemode-'+r} value=${mode} onChange=${onMode}>
+                <option value="locked">Locked (admins only)</option>
+                <option value="expr">Expression…</option>
+                <option value="public">PUBLIC — anyone</option>
+              </select>
+              ${mode === 'expr' && html`<input style="flex:1" data-test=${'rule-'+r} placeholder='e.g. @request.auth.id = owner' value=${typeof v === 'string' ? v : ''} onInput=${e => setRule(r, e.target.value)}/>`}
+            </div>
+          </div>`;
+        })}
       </div>`}
 
       ${tab === 'auth' && html`<${AuthTab} col=${col} setCol=${setCol}/>`}

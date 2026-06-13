@@ -204,18 +204,24 @@ Each collection defines five rules: **list**, **view**, **create**, **update**,
 
 | Rule value | Meaning |
 | --- | --- |
-| `null` | Locked — only a superuser may perform the operation; everyone else is denied. |
-| `""` (empty string) | Public — anyone may perform the operation. |
+| `null` | **Locked** — only a superuser may perform the operation; everyone else is denied. |
+| `""` (empty string) | **Locked** — same as `null` (safe-by-default). An empty rule is **not** public. |
+| `"@public"` | **Public** — anyone may perform the operation. This explicit sentinel is the *only* way to open a collection. |
 | a filter expression | The operation is allowed only when the expression matches (using the [filter grammar](#filter-grammar), including `@request.*` macros). |
 
 Superusers bypass all rules.
+
+> **Safe-by-default (changed):** a blank rule (`null` or `""`) is **locked to superusers**.
+> To open an operation to the public you must set the rule to exactly `"@public"`. On startup,
+> ZigBase logs a prominent warning for every `@public` rule (`collection 'X' is PUBLIC for <op>`)
+> so a wide-open collection is never silent.
 
 **Denial status codes:**
 
 - **view / update / delete** on a record that does not exist *or* does not satisfy
   the rule return **404** — this hides record existence.
 - **create** denial returns **403**.
-- A **locked** (`null`) list/view rule denies non-superusers (list returns 403; view
+- A **locked** (`null` or `""`) list/view rule denies non-superusers (list returns 403; view
   returns 404).
 
 ---
@@ -263,7 +269,7 @@ POST /api/collections/users/records
 On this create the server hashes the password (argon2id), strips the plaintext,
 mints a `tokenKey`, and **forces `verified` to `false`** (a client-supplied
 `verified` is ignored); `passwordHash`/`tokenKey` are hidden in the response. The
-auth collection needs a **public create rule** (`""`) for open signup, and the
+auth collection needs a **public create rule** (`"@public"`) for open signup, and the
 password must be at least `minPasswordLength` (default 8) — otherwise the create is
 a `400`. After signup, obtain a token via `auth-with-password` above. Full walkthrough:
 [recipes.md → User registration](recipes.md#recipe-user-registration-signup).
@@ -293,11 +299,11 @@ and `request-password-reset` — are rate limited. Over the limit, the endpoint 
 - **Config:** `ZIGBASE_RATE_LIMIT_MAX` attempts (default `10`) per
   `ZIGBASE_RATE_LIMIT_WINDOW` seconds (default `60`), per client key, per endpoint.
   Set `ZIGBASE_RATE_LIMIT_MAX=0` to disable rate limiting entirely.
-- **Keying:** the client key is the IP from `X-Forwarded-For` (first hop) or
-  `X-Real-IP`. **Deploy behind a reverse proxy that sets one of these headers** —
-  otherwise (direct exposure) the limiter falls back to keying on the submitted
-  identity/email, which is still spoofable. See
-  [KNOWN_LIMITATIONS.md → Auth & email](../KNOWN_LIMITATIONS.md).
+- **Keying:** `X-Forwarded-For` / `X-Real-IP` are **ignored by default** — they are
+  attacker-controlled on direct exposure. With `--trust-proxy` (`ZIGBASE_TRUST_PROXY=true`),
+  set **only** behind a trusted reverse proxy that rewrites them, the key is the IP from
+  `X-Forwarded-For` (first hop) or `X-Real-IP`. Otherwise the limiter keys on the submitted
+  identity/email, which is not header-spoofable. This makes direct exposure safe by default.
 
 ### OAuth2
 
@@ -308,6 +314,7 @@ authorization `code` to the server.
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/api/collections/:col/oauth2-providers` | List enabled providers (name, `authURL`, `clientId`, `scopes`). Secrets are never returned. |
+| POST | `/api/collections/:col/oauth2-init` | (Server-side state mode only) Mint a server-issued `state` for a provider. `404` when server-side state is disabled. |
 | POST | `/api/collections/:col/auth-with-oauth2` | Exchange an authorization code for a session. |
 | DELETE | `/api/collections/:col/records/:id/external-auths/:provider` | Unlink a provider from a record. |
 
@@ -328,6 +335,28 @@ authorization `code` to the server.
 
 `redirectUrl` must be in the provider's configured allowlist.
 
+#### CSRF on the OAuth flow: `state`
+
+The OAuth `state` parameter prevents login-CSRF. ZigBase supports two modes:
+
+- **Client-driven (default).** The SPA generates `state`, embeds it in the provider
+  authorization URL, and verifies the returned `state` against what it stored before
+  calling `auth-with-oauth2`. The backend does not see or check `state`. This is the
+  documented flow and is unchanged.
+- **Server-side (opt-in).** Set `ZIGBASE_OAUTH_STATE_SERVER=true` (TTL via
+  `ZIGBASE_OAUTH_STATE_TTL`, default 600s). Then:
+  1. The client calls `POST .../oauth2-init` with `{ "provider": "<name>" }` and
+     receives `{ "state": "<value>" }`.
+  2. The client embeds that `state` in the provider authorization URL.
+  3. On callback, the client adds `"state": "<value>"` to the `auth-with-oauth2` body.
+
+  The backend verifies the state exists, matches the (collection, provider), is
+  unexpired, and is **single-use** (deleted on first use). A missing, mismatched,
+  expired, or replayed `state` is rejected with `400` before the provider is contacted.
+  Use this when you can't guarantee a correct SPA. **PKCE (`codeVerifier`) is still
+  required in both modes** — server-side `state` adds CSRF protection, it does not
+  replace PKCE.
+
 ---
 
 ## Files
@@ -343,7 +372,7 @@ File-type fields hold uploaded files.
 
 File access reuses the collection's **view** rule:
 
-- Files in a **public** collection (empty view rule) serve directly.
+- Files in a **public** collection (`@public` view rule) serve directly (cacheable).
 - Files in a **protected** collection require an authenticated identity. Supply it
   via a bearer token, the auth cookie, or a short-lived **file token**:
   `POST /api/files/token` returns `{ "token": "<jwt>" }` (the caller must already be
@@ -391,7 +420,14 @@ file delivery, use [file storage](#files) instead.
 ## Realtime (WebSocket)
 
 Connect to `ws://<host>/api/realtime` (the upgrade is gated to that exact path and
-the connection Origin is validated against the server's allowlist).
+the connection Origin is validated against the server's allowlist). The allowlist is
+`ZIGBASE_REALTIME_ORIGINS` / `--realtime-origins` (CSV). It is **empty by default, which
+denies cross-origin browser upgrades** — set your app origin(s) only if your frontend is served
+from a *different* origin. **Same-origin upgrades** (the embedded admin UI, or a frontend served
+from this same binary — the Origin authority equals the request `Host`) are **always allowed**,
+so the common single-binary deployment needs no configuration. A request with **no** `Origin`
+header (a non-browser client) is allowed regardless; delivery is still gated per-record by each
+collection's `viewRule`.
 
 ### Authenticating
 
@@ -418,6 +454,16 @@ A topic is either a whole collection (`<collection>`) or a single record
 unsubscribe with `{ "type": "ack", "action": "...", "topic": "..." }`. On connect it
 sends `{ "type": "connect", "clientId": "..." }`.
 
+**Authentication is required to subscribe** to any collection whose `viewRule` is not
+`"@public"`. A socket may subscribe anonymously *only* to a public (`@public`) collection;
+for a locked, owner-scoped, or expression-gated collection you must send a successful
+`auth` frame first, otherwise `subscribe` is rejected with
+`{ "type": "error", "message": "authentication required to subscribe" }`. (Delivery is
+*also* re-authorized per record, so auth-before-subscribe is a layered, not the only, check.)
+
+The server enforces a global cap on concurrent WebSocket connections; once reached, new
+upgrades are rejected with HTTP `503`.
+
 ### Event frames
 
 When a subscribed record changes, the server pushes:
@@ -432,6 +478,9 @@ When a subscribed record changes, the server pushes:
 ```
 
 `action` is one of `create`, `update`, `delete`. For `delete`, `record` is id-only.
+Delete events are authorized per subscriber against a snapshot of the just-deleted record,
+so an owner-scoped (or otherwise gated) `viewRule` only notifies subscribers who were allowed
+to view that record — a delete on someone else's record is not leaked to other subscribers.
 
 Malformed or unknown client frames produce
 `{ "type": "error", "message": "..." }`.

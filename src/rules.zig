@@ -10,11 +10,28 @@ const joiner = @import("query/joiner.zig");
 
 pub const Decision = enum { allow, deny_locked, check };
 
-/// Pure policy: superuser -> allow; null rule -> deny_locked; "" -> allow; else -> check.
+/// The ONLY way to open a collection to everyone (allow-all). A rule must be set
+/// to exactly this sentinel string to be public; an empty string is NOT public.
+/// Safe-by-default: an unset (`null`) or blank (`""`) rule is locked to superusers.
+pub const public_sentinel = "@public";
+
+/// True if `rule` opens the collection to anyone (the `@public` sentinel).
+pub fn isPublic(rule: ?[]const u8) bool {
+    const r = rule orelse return false;
+    return std.mem.eql(u8, r, public_sentinel);
+}
+
+/// Pure policy (safe-by-default):
+///   superuser            -> allow
+///   null rule            -> deny_locked  (superuser only)
+///   "" (empty)           -> deny_locked  (locked too — NOT public)
+///   "@public" sentinel   -> allow        (the only way to open a collection)
+///   any other string     -> check        (compile + evaluate the expression per record)
 pub fn decide(rule: ?[]const u8, rctx: *const request.RequestContext) Decision {
     if (rctx.is_superuser) return .allow;
     const r = rule orelse return .deny_locked;
-    if (r.len == 0) return .allow;
+    if (r.len == 0) return .deny_locked;
+    if (std.mem.eql(u8, r, public_sentinel)) return .allow;
     return .check;
 }
 
@@ -42,13 +59,30 @@ pub fn matches(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, i
     return try st.step();
 }
 
-test "decide: superuser/allow/null/empty/expr" {
+test "decide: superuser/null/empty/@public/expr (safe-by-default)" {
     const su = request.RequestContext{ .is_superuser = true };
     const anon = request.RequestContext{};
+    // superuser bypasses every rule, including null/empty/expr.
     try std.testing.expectEqual(Decision.allow, decide(null, &su));
+    try std.testing.expectEqual(Decision.allow, decide("", &su));
+    try std.testing.expectEqual(Decision.allow, decide("title = \"x\"", &su));
+    // null -> locked (superuser only).
     try std.testing.expectEqual(Decision.deny_locked, decide(null, &anon));
-    try std.testing.expectEqual(Decision.allow, decide("", &anon));
+    // "" is now LOCKED too — no longer allow-all (the old trap).
+    try std.testing.expectEqual(Decision.deny_locked, decide("", &anon));
+    // The explicit "@public" sentinel is the only way to open a collection.
+    try std.testing.expectEqual(Decision.allow, decide(public_sentinel, &anon));
+    try std.testing.expectEqual(Decision.allow, decide("@public", &anon));
+    // any other string -> evaluate per record.
     try std.testing.expectEqual(Decision.check, decide("title = \"x\"", &anon));
+}
+
+test "isPublic: only the exact sentinel is public" {
+    try std.testing.expect(isPublic("@public"));
+    try std.testing.expect(!isPublic(null));
+    try std.testing.expect(!isPublic(""));
+    try std.testing.expect(!isPublic("title = \"x\""));
+    try std.testing.expect(!isPublic("@publicx"));
 }
 
 test "matches runs a guarded select" {
