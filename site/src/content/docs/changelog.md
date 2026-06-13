@@ -11,7 +11,7 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] - 2026-06-13
 
 This round makes ZigBase **safe-by-default**: a security audit's findings were fixed and the
 access-rule and deployment defaults were hardened. **It contains breaking changes** — read the
