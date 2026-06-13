@@ -148,8 +148,11 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
         .email => if (v == .string and v.string.len > 0) {
             const s = v.string;
             var bad = false;
-            for (s) |c| if (c == '\r' or c == '\n' or c == 0 or c == ' ') {
+            // Reject ALL ASCII control characters (incl. TAB/VT/FF) and spaces — any of
+            // them in an address is bogus and can confuse downstream header/log parsers.
+            for (s) |c| if (c < 32 or c == 127 or c == ' ') {
                 bad = true;
+                break;
             };
             const at = std.mem.indexOfScalar(u8, s, '@');
             if (bad or at == null or at.? == 0 or at.? == s.len - 1 or std.mem.indexOfScalarPos(u8, s, at.? + 1, '@') != null)
@@ -686,6 +689,10 @@ test "email field rejects control chars (CRLF/NUL) and obviously-bogus addresses
     try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\nx" }));
     try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a b@x.io" }));
     try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x00" }));
+    // Other ASCII control chars (TAB, vertical tab, form feed, DEL) are rejected too.
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a\tb@x.io" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x0b" }));
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x7f" }));
     // Structurally-bogus addresses are rejected.
     try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "no-at-sign" }));
     try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "@nolocal.io" }));

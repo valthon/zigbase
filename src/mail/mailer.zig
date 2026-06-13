@@ -175,14 +175,14 @@ pub const SmtpMailer = struct {
     /// wait for the 220 banner and EHLO; for STARTTLS the banner was already
     /// consumed on the plaintext leg and we only re-EHLO over TLS.
     fn runExchange(self: *SmtpMailer, io: std.Io, alloc: std.mem.Allocator, email: Email, conn: *Conn, comptime starttls_resumed: bool) anyerror!void {
-        // Reject CR/LF/NUL in the envelope BEFORE writing any command: `self.from`
-        // and `email.to` are interpolated into the `MAIL FROM`/`RCPT TO` command
-        // lines, so a newline would let an attacker inject arbitrary SMTP commands
-        // (extra RCPT TO, DATA, etc.). buildMessage performs the same check for the
-        // headers; doing it here too closes the on-the-wire command path.
+        // Reject control chars in the envelope BEFORE writing any command: `self.from`
+        // and `email.to` are interpolated into the `MAIL FROM`/`RCPT TO` command lines,
+        // so a newline would let an attacker inject arbitrary SMTP commands (extra
+        // RCPT TO, DATA, etc.). `email.subject` is NOT part of the envelope — it is
+        // validated in buildMessage where it goes into the headers — so it is not
+        // checked here.
         try checkHeaderField(self.from);
         try checkHeaderField(email.to);
-        try checkHeaderField(email.subject);
         if (!starttls_resumed) {
             // Greeting (implicit TLS and plaintext both see the banner here).
             try expectCode(conn.r, 220);
@@ -365,7 +365,9 @@ const TlsState = struct {
 pub const HeaderError = error{HeaderInjection};
 
 fn hasControlChar(s: []const u8) bool {
-    for (s) |c| if (c == '\r' or c == '\n' or c == 0) return true;
+    // Reject every ASCII control character (0x00–0x1F and 0x7F), not just CR/LF/NUL:
+    // TAB/VT/FF and friends can fold or mangle headers in downstream mail infrastructure.
+    for (s) |c| if (c < 32 or c == 127) return true;
     return false;
 }
 
@@ -469,6 +471,12 @@ test "buildMessage rejects CRLF header injection in to/subject/from" {
     try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
         .to = "victim@x.io\x00",
         .subject = "Hi",
+        .text_body = "body",
+    }, 0));
+    // Other ASCII control chars (TAB here) are rejected too — some mail infra folds on them.
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
+        .to = "victim@x.io",
+        .subject = "Hi\tthere",
         .text_body = "body",
     }, 0));
     // A newline in the BODY is fine (data, not a header).

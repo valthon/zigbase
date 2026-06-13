@@ -120,11 +120,12 @@ fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const 
 /// True iff `candidate` is the same path as `root` or lives strictly beneath it
 /// (a '/'-bounded prefix, so "/a/rootEVIL" is NOT considered inside "/a/root").
 fn withinRoot(root: []const u8, candidate: []const u8) bool {
-    if (!std.mem.startsWith(u8, candidate, root)) return false;
-    if (candidate.len == root.len) return true;
-    // Allow a trailing slash on either side; require a separator at the boundary.
-    const r = if (root.len > 0 and root[root.len - 1] == '/') root.len - 1 else root.len;
-    return candidate.len > r and candidate[r] == '/';
+    // Normalize a trailing slash OFF the root first, so "/srv/www/" and "/srv/www"
+    // behave identically (the prefix/boundary checks below all run against `r`).
+    const r = if (root.len > 0 and root[root.len - 1] == '/') root[0 .. root.len - 1] else root;
+    if (!std.mem.startsWith(u8, candidate, r)) return false;
+    if (candidate.len == r.len) return true; // exact same path
+    return candidate[r.len] == '/'; // boundary must be a separator (so "/a/rootEVIL" is rejected)
 }
 
 fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8) !?http.Response {
@@ -172,6 +173,21 @@ pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source) !?http.Response 
         .embedded => |files| serveEmbedded(ctx, files, rel),
         .dir => |root| serveDir(io, ctx, root, rel),
     };
+}
+
+test "withinRoot: exact path, trailing-slash root, and sibling rejection (F10)" {
+    // A file strictly beneath the root is within it.
+    try std.testing.expect(withinRoot("/srv/www", "/srv/www/index.html"));
+    // A trailing slash on the root must not change the result (regression: it used to make
+    // the exact-same-path and same-path-vs-slashed-root cases wrongly return false).
+    try std.testing.expect(withinRoot("/srv/www/", "/srv/www/index.html"));
+    try std.testing.expect(withinRoot("/srv/www", "/srv/www")); // exact same path
+    try std.testing.expect(withinRoot("/srv/www/", "/srv/www")); // same path, trailing-slash root
+    // A sibling that merely shares the root as a string prefix is NOT inside it.
+    try std.testing.expect(!withinRoot("/srv/www", "/srv/wwwEVIL/x"));
+    try std.testing.expect(!withinRoot("/srv/www/", "/srv/wwwEVIL/x"));
+    // A wholly unrelated path is rejected.
+    try std.testing.expect(!withinRoot("/srv/www", "/etc/passwd"));
 }
 
 test "sanitize: normal paths normalize to root-relative" {

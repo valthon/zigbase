@@ -296,7 +296,10 @@ function SchemaEditor({ name }) {
             if (m === 'public') {
               if (!confirm('Make ' + r + ' PUBLIC?\n\nAnyone on the internet will be able to ' +
                   r.replace('Rule','') + ' records in this collection, with no authentication.')) {
-                return; // leave the select where it was
+                // Cancelled: force a re-render (new object ref) so the controlled <select>
+                // snaps back to the prior mode instead of staying visually stuck on "PUBLIC".
+                setExprRules({ ...exprRules });
+                return;
               }
               setExprRules({ ...exprRules, [r]: false });
               return setRule(r, PUBLIC_RULE);

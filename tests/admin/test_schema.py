@@ -130,3 +130,23 @@ def test_edit_rules_expression_from_locked(page):
     page.click('[data-test=tab-rules]')
     assert page.input_value('[data-test=rulemode-listRule]') == 'expr'
     assert page.input_value('[data-test=rule-listRule]') == 'status = "published"'
+
+
+def test_rule_public_cancel_reverts_select(page):
+    # Regression: choosing "PUBLIC" then CANCELLING the confirm() must snap the controlled
+    # <select> back to the prior mode (it used to stay visually stuck on "PUBLIC" with no
+    # re-render, even though the rule was never opened up).
+    login(page)
+    api_request(page, "POST", "/api/collections", {"name": "cancels", "type": "base", "fields": [{"id": "", "name": "body", "type": "text", "options": {}}]})
+    page.goto("/_/?t=1#/collections/cancels")
+    page.wait_for_selector('[data-test=schema-editor]')
+    page.click('[data-test=tab-rules]')
+    assert page.input_value('[data-test=rulemode-viewRule]') == 'locked'  # default
+    # dismiss (cancel) the "Make ... PUBLIC?" confirm dialog
+    page.on("dialog", lambda d: d.dismiss())
+    page.select_option('[data-test=rulemode-viewRule]', 'public')
+    # the select reverts to 'locked' and no PUBLIC tag is shown; the rule stays unset (locked)
+    page.wait_for_function("document.querySelector('[data-test=rulemode-viewRule]').value === 'locked'")
+    assert page.locator('[data-test=pubtag-viewRule]').count() == 0
+    col = next(c for c in api_request(page, "GET", "/api/collections").json() if c["name"] == "cancels")
+    assert col.get("viewRule") in (None, "")  # never became "@public"

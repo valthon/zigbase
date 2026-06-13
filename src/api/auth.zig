@@ -245,11 +245,21 @@ fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid: []c
 /// by the legacy rotation path; we reject an empty jti so every single-use redemption is tracked.
 fn consumeToken(conn: *db.Db, claims: jwt.Claims) !void {
     if (claims.jti.len == 0) return error.AlreadyConsumed; // no jti => cannot guarantee single-use
+    // Classify "already consumed" by the jti's PRESENCE, checked first. consumeToken runs
+    // under the single writer lock, so this SELECT-then-INSERT is race-free. This is what
+    // lets a genuine INSERT failure below (disk-full, I/O error, etc.) PROPAGATE as an
+    // internal error instead of masquerading as error.AlreadyConsumed (a 400).
+    {
+        var sel = try conn.prepare("SELECT 1 FROM \"_consumedTokens\" WHERE \"jti\" = ?1;");
+        defer sel.finalize();
+        try sel.bindText(1, claims.jti);
+        if (try sel.step()) return error.AlreadyConsumed; // a row exists => already redeemed
+    }
     var st = try conn.prepare("INSERT INTO \"_consumedTokens\" (\"jti\",\"expires\",\"consumed\") VALUES (?1,?2,datetime('now'));");
     defer st.finalize();
     try st.bindText(1, claims.jti);
     try st.bindInt(2, claims.exp);
-    _ = st.step() catch return error.AlreadyConsumed; // UNIQUE violation => already redeemed
+    _ = try st.step(); // a real DB failure propagates (500); it is no longer mistaken for a replay
 }
 
 fn loadAuthCollection(ctx: *http.RequestCtx, conn: *db.Db) !?schema.Collection {
@@ -579,6 +589,28 @@ test "password reset: confirm changes the password and rotates the token" {
 }
 
 // --- F7: strict single-use tokens (independent of tokenKey rotation) ---
+
+test "F7: consumeToken classifies replay by jti presence, not by any INSERT failure" {
+    // Normal ledger: a fresh jti is recorded; an identical second redemption is a replay.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec("CREATE TABLE \"_consumedTokens\" (\"jti\" TEXT PRIMARY KEY, \"expires\" INTEGER, \"consumed\" TEXT);");
+    const claims = jwt.Claims{ .id = "u1", .collection = "users", .type = .verification, .jti = "abc123", .iat = 0, .exp = 9_999_999_999 };
+    try consumeToken(&d, claims);
+    try std.testing.expectError(error.AlreadyConsumed, consumeToken(&d, claims));
+
+    // Regression: a NON-replay INSERT failure (here a CHECK violation on a fresh jti) must
+    // PROPAGATE as a DB error, not be misreported as error.AlreadyConsumed — the old
+    // `step() catch return error.AlreadyConsumed` swallowed every failure (disk-full, I/O, …).
+    var d2 = try db.Db.openMemory();
+    defer d2.close();
+    try d2.exec("CREATE TABLE \"_consumedTokens\" (\"jti\" TEXT PRIMARY KEY CHECK(length(\"jti\") < 3), \"expires\" INTEGER, \"consumed\" TEXT);");
+    try std.testing.expectError(error.StepFailed, consumeToken(&d2, claims));
+
+    // An empty jti is rejected outright (cannot be tracked single-use).
+    const nojti = jwt.Claims{ .id = "u1", .collection = "users", .type = .verification, .jti = "", .iat = 0, .exp = 1 };
+    try std.testing.expectError(error.AlreadyConsumed, consumeToken(&d2, nojti));
+}
 
 test "F7: a verification token cannot be redeemed twice (single-use)" {
     var env = try TestEnv.initAuth("users");
