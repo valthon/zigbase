@@ -11,7 +11,9 @@ superuser already created:
 
 ```sh
 ./zig-out/bin/zigbase superuser create --email admin@example.com --password "a-strong-password" --data-dir ./zb_data
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" ./zig-out/bin/zigbase serve --data-dir ./zb_data
+# --insecure-cookies: local dev is over plain HTTP, and auth cookies are Secure by default.
+# A strong JWT secret is auto-generated and persisted under the data dir on first run.
+./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
 ```
 
 Reference companions: field shapes are in [fields.md](fields.md); endpoint envelopes

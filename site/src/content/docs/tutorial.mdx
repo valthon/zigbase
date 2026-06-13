@@ -34,10 +34,12 @@ start serving:
 mise install                                     # Zig 0.16.0, pinned in mise.toml
 zig build                                         # -> zig-out/bin/zigbase
 ./zig-out/bin/zigbase superuser create --email admin@example.com --password "a-strong-password" --data-dir ./zb_data
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" ./zig-out/bin/zigbase serve --data-dir ./zb_data
+# --insecure-cookies: this tutorial runs over plain HTTP, and auth cookies are Secure by default.
+./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
 ```
 
-The server listens on `http://127.0.0.1:8090`. Sanity check:
+The server listens on `http://127.0.0.1:8090` (loopback by default; a random JWT secret is
+generated and persisted at `zb_data/.jwt_secret` on first run). Sanity check:
 
 ```sh
 curl http://127.0.0.1:8090/api/health   # {"status":"ok"}
@@ -69,20 +71,20 @@ the schema editor. Create the three collections in order:
 
    ![The schema editor creating the users auth collection with a name text field](../../assets/screenshots/admin-new-collection-users.png)
 
-   Before saving, switch to the **API Rules** tab. A new collection starts with every rule
-   **locked** — the `lock` checkbox means *superuser-only* (`null`). Unchecking it enables
-   the text input: leave it **empty** for *public* (`""`), or type a filter expression.
-   For `users`: uncheck the lock on **listRule**, **viewRule**, and **createRule** and
-   leave all three empty (public — an empty `createRule` is what makes signup open), and
-   uncheck **updateRule** and **deleteRule** and type `@request.auth.id = id` into both
-   (users may only edit or delete themselves). Save.
+   Before saving, switch to the **API Rules** tab. Each rule has a three-state select:
+   **Locked** (superuser-only — the safe default for a new collection, stored as `null`),
+   **Public** (anyone — the explicit `"@public"` sentinel), or **Expression** (type a filter
+   into the text input that appears). For `users`: set **listRule**, **viewRule**, and
+   **createRule** to **Public** (`@public` — a public `createRule` is what makes signup
+   open), and set **updateRule** and **deleteRule** to **Expression** with
+   `@request.auth.id = id` in both (users may only edit or delete themselves). Save.
 
 2. **`simulators`** — type **base**, two fields: `label` (**text**, check *req*) and
    `owner` (**relation**, check *req*) — pick `users` from the relation's target dropdown.
    Note the convenience here: the UI picks relation targets **by name** and the server
    resolves the id for you; on the terminal path you have to capture and substitute
-   collection ids yourself. Rules: unlock **listRule** and **viewRule** as empty (public),
-   set **createRule** to `@request.auth.id != ""`, and set **updateRule** and
+   collection ids yourself. Rules: set **listRule** and **viewRule** to **Public** (`@public`),
+   set **createRule** to **Expression** `@request.auth.id != ""`, and set **updateRule** and
    **deleteRule** to `@request.auth.id = owner`. Save.
 
 3. **`listings`** — type **base**, five fields: `title` (**text**, *req*),
@@ -131,8 +133,8 @@ USERS_ID=$(curl -s -X POST "$BASE/api/collections" \
     "name": "users",
     "type": "auth",
     "fields": [ { "id": "f_name", "name": "name", "type": "text", "options": { "max": 100 } } ],
-    "listRule": "", "viewRule": "",
-    "createRule": "",
+    "listRule": "@public", "viewRule": "@public",
+    "createRule": "@public",
     "updateRule": "@request.auth.id = id",
     "deleteRule": "@request.auth.id = id"
   }' | jq -r .id)
@@ -153,7 +155,7 @@ SIMS_ID=$(curl -s -X POST "$BASE/api/collections" \
       { \"id\": \"f_owner\", \"name\": \"owner\", \"type\": \"relation\", \"required\": true,
         \"options\": { \"targetCollectionId\": \"$USERS_ID\", \"cascadeDelete\": true, \"maxSelect\": 1 } }
     ],
-    \"listRule\": \"\", \"viewRule\": \"\",
+    \"listRule\": \"@public\", \"viewRule\": \"@public\",
     \"createRule\": \"@request.auth.id != \\\"\\\"\",
     \"updateRule\": \"@request.auth.id = owner\",
     \"deleteRule\": \"@request.auth.id = owner\"
@@ -196,10 +198,12 @@ The field shapes used here are catalogued in [Fields](./fields).
 ## 2. Understand the access rules you just set
 
 Each collection's five rules (`listRule`/`viewRule`/`createRule`/`updateRule`/
-`deleteRule`) are filter expressions; `""` means public, `null` means superuser-only,
-anything else is checked per request. Highlights from above:
+`deleteRule`) are filter expressions. **Safe-by-default:** a blank rule (`null` *or* `""`)
+means **superuser-only (Locked)**; the explicit sentinel `"@public"` means **public**
+(anyone — and ZigBase logs a startup warning for each one); anything else is checked per
+request. Highlights from above:
 
-- `users`: `createRule: ""` → **open signup** (anyone may create a user). Update/delete
+- `users`: `createRule: "@public"` → **open signup** (anyone may create a user). Update/delete
   are self-only (`@request.auth.id = id`).
 - `simulators`/`listings`: writes are **owner-scoped** (`@request.auth.id =
   simulator.owner`), which uses **relation traversal** — following the single-value
@@ -210,9 +214,9 @@ anything else is checked per request. Highlights from above:
 <PathTabs>
   <Fragment slot="ui">
 
-This is the **API Rules** tab of `listings` as you left it — the `lock` checkbox is the
-`null` (superuser-only) state, an unlocked empty input is public, and anything you type is
-evaluated per request:
+This is the **API Rules** tab of `listings` as you left it — each rule's select chooses
+**Locked** (superuser-only, stored as `null`), **Public** (`"@public"` — anyone), or
+**Expression**, and an Expression is evaluated per request:
 
 ![The listings API Rules tab with the five owner-scoped rules filled in](../../assets/screenshots/admin-rules-listings.png)
 

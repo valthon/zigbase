@@ -39,17 +39,18 @@ Collection management is **superuser-only**, so create one before serving:
   --data-dir ./zb_data
 ```
 
-## Set a JWT secret and serve
+## Serve
 
-Set a strong, random `ZIGBASE_JWT_SECRET` (the server warns, or refuses to start behind
-HTTPS, when the secret is left at its insecure default), then start serving:
+Just start serving — on first run with no `ZIGBASE_JWT_SECRET`, a strong random secret is
+generated and persisted at `<data-dir>/.jwt_secret` (mode 0600), then reused on later runs:
 
 ```sh
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" \
-  ./zig-out/bin/zigbase serve --data-dir ./zb_data
+# --insecure-cookies: local dev is over plain HTTP, and auth cookies are Secure by default.
+./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
 ```
 
-The default bind is `0.0.0.0:8090`.
+The default bind is `127.0.0.1:8090` (loopback only); expose all interfaces with
+`--http-host 0.0.0.0` (front it with a firewall / reverse proxy).
 
 > Configure the bind host/port, data directory, token lifetimes, SMTP, rate limiting, and
 > more via environment variables or `serve` flags. The full table is in

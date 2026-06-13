@@ -96,8 +96,10 @@ This example needs **Zig 0.16**, which you can get via [mise](https://mise.jdx.d
 cd frontend && npm install && npm run build && cd ..
 zig build       # embeds frontend/dist into the binary
 ./zig-out/bin/plugins help
-./zig-out/bin/plugins serve     # provisions authors/posts + runs the migration
-# open http://127.0.0.1:8090/
+# --insecure-cookies: local dev is over plain HTTP, and auth cookies are Secure by default.
+# A strong JWT secret is auto-generated and persisted under the data dir on first run.
+./zig-out/bin/plugins serve --insecure-cookies   # provisions authors/posts + runs the migration
+# open http://127.0.0.1:8090/  — same-origin frontend, so no --realtime-origins needed
 ```
 
 ---
