@@ -87,8 +87,11 @@ cd examples/plugins
 cd frontend && npm install && npm run build && cd ..
 mise exec zig@0.16.0 -- zig build
 ./zig-out/bin/plugins help
-./zig-out/bin/plugins serve     # provisions authors/posts/comments + runs both migrations
-# open http://127.0.0.1:8090/
+# --insecure-cookies: local dev over plain HTTP (auth cookies are Secure by default).
+# A random JWT secret is generated + persisted on first run; the embedded frontend is
+# served same-origin, so realtime needs no --realtime-origins.
+./zig-out/bin/plugins serve --insecure-cookies   # provisions authors/posts/comments + runs both migrations
+# open http://127.0.0.1:8090/  (admin UI at /_/)
 ```
 
 This demonstrates the **embedded** static-files mode: the Astro frontend is
