@@ -4,6 +4,7 @@
     .fingerprint = 0xcdcf8824241ab87,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        // in-repo example uses a relative path; external consumers run: zig fetch --save git+https://github.com/valthon/zigbase
         .zigbase = .{ .path = "../.." },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },

@@ -246,9 +246,10 @@ mismatch into a precise expected-vs-found message.
 src/framework.zig:195:16: error: expected type '[]const provision.Migration', found
 'struct { comptime ... = .{ .id = "x", .up = undefined } }'
 ```
-Correct rejection, but it surfaces the **internal** `provision.Migration` rather than
-the public `zigbase.Migration` the developer wrote — minor confusion (see
-recommendation P2-b).
+Correct rejection, but it surfaced the **internal** `provision.Migration` rather than
+the public `zigbase.Migration` the developer wrote — minor confusion. **Now fixed**
+(P2-b): a dedicated comptime guard fires first with a public-named message. See
+[Prioritized recommendations → P2-b](#p2--papercuts).
 
 **Net:** the comptime guard story is *real and good*. Footguns #1 and #2 (the two that
 are only soft-guarded) are exactly the ones that can't easily be a compile error
@@ -302,78 +303,90 @@ Severity reflects DX impact on a real integrator. **[FIXED]** = done in this PR;
   covering `ev.ctx.param`, `ev.ctx.allocator`, the response-body lifetime, and the
   `ev.ctx` vs `ev.rctx` split, with a worked snippet and a link to the recipe.
 
-- **[REC] P1-b. The tutorial omits the embedding prerequisites.** `docs/tutorial.md`
-  is the README's "start here" (`README.md:171`) but walks the stock binary via curl
-  and only reveals the `App(.{...})` block at Step 7 without `zig fetch` / `build.zig`.
-  *Proposed change:* add a short "Set up the project" section before the first hook
-  step showing the `zig fetch --save git+...` command and the full `createModule` +
-  `addImport` + `link_libc` wiring (copy the verified block from `examples/blog/build.zig:7`–`14`),
-  then state that subsequent handlers go in `src/main.zig`. ~15 lines; high payoff.
+- **[FIXED] P1-b. The tutorial omits the embedding prerequisites.** Added a "4.5 Set
+  up the project (embed ZigBase)" section to `docs/tutorial.md` before the first
+  framework step: the `zig fetch --save git+...` command, the full
+  `createModule`/`addImport`/`link_libc` `build.zig` (matching
+  `examples/blog/build.zig`), and a note that subsequent handlers live in
+  `src/main.zig`.
 
-- **[REC] P1-c. Example `build.zig.zon` files contradict the fetch story.**
-  `examples/{blog,golfsim,plugins}/build.zig.zon:7` use `.zigbase = .{ .path = "../.." }`.
-  A developer copying an example into their own repo inherits a broken dep path.
-  *Proposed change:* add a one-line comment in each example's `build.zig.zon` —
-  `// in-repo example uses a relative path; external consumers run: zig fetch --save git+https://github.com/valthon/zigbase`.
-  (Left as a recommendation rather than applied, to stay clear of the parallel `src/`
-  work and keep this PR docs-focused; it's 3 one-line comments and unambiguous.)
+- **[FIXED] P1-c. Example `build.zig.zon` files contradict the fetch story.** Added the
+  clarifying comment `// in-repo example uses a relative path; external consumers run:
+  zig fetch --save git+https://github.com/valthon/zigbase` above the `.zigbase` dep in
+  all three of `examples/{blog,golfsim,plugins}/build.zig.zon`.
 
-- **[REC] P1-d. Re-export `JobEvent` at the top level.** `RecordEvent`, `RouteEvent`,
-  and `ErrorEvent` are re-exported for convenience (`root.zig:12`–`14`) but `JobEvent`
-  — needed by every cron handler — is not, forcing the longer `zigbase.events.JobEvent`.
-  *Proposed change (1 line, low risk):* add `pub const JobEvent = events.JobEvent;` to
-  `root.zig` and use it in the docs/examples. (Not applied here because a security agent
-  is editing `src/` in parallel; flagged to avoid a conflict — but this is the single
-  cheapest ergonomics win in the surface.)
+- **[FIXED] P1-d. Re-export `JobEvent` at the top level.** Added
+  `pub const JobEvent = events.JobEvent;` to `src/root.zig` and switched the
+  docs/tutorial cron examples to the shorter `zigbase.JobEvent`. The cheapest
+  ergonomics win in the surface.
 
 ### P2 — papercuts
 
-- **[REC] P2-a. No custom-storage example.** Only the mailer plugin is worked
-  (`examples/plugins`). The storage vtable is the harder one (4 methods incl.
-  `localPath`). *Proposed change:* add a minimal read-only or in-memory `Storage`
-  plugin to `examples/plugins` (or at least a doc-comment skeleton in
-  `docs/framework.md` §9 mirroring the mailer block), so an S3-backend author has a
-  template.
+- **[FIXED] P2-a. Custom-storage example.** The merged examples PR added a real
+  custom-storage plugin (`AuditStorage`, wrapping `zigbase.LocalStorage`, all four
+  vtable methods) to `examples/plugins/src/main.zig`, so the gap is satisfied by a
+  worked, compiling example. Additionally expanded `docs/framework.md` §9 with a
+  custom-`Storage` skeleton (noting the four vtable methods) and a pointer to that
+  example; no duplicate example was added.
 
-- **[REC] P2-b. Migrations bare-tuple error leaks `provision.Migration`.** The
-  type-coercion site is `framework.zig:194`–`197` (`cfg.migrations` typed as
-  `[]const provision.Migration`). *Proposed change:* add a comptime guard in the
-  `App(cfg)` key-handling block that, when `.migrations` is present and does not coerce
-  to `[]const zigbase.Migration`, emits a `@compileError` naming the *public* type and
-  the `&[_]zigbase.Migration{ ... }` fix — mirroring the bespoke route/hook guards.
-  Small, but turns a confusing internal-name error into a helpful one.
+- **[FIXED] P2-b. Migrations bare-tuple error leaks `provision.Migration`.** Added a
+  comptime guard at the `provision_migrations` decl in `src/framework.zig` (helper
+  `migrationsCoerce`) so a non-coercing `.migrations` value emits a `@compileError`
+  naming the *public* `zigbase.Migration` type and the `&[_]zigbase.Migration{ ... }`
+  fix. **Probe verified** (see below).
 
-- **[REC] P2-c. Plugin-contract guard.** A plugin type missing `create`/`interface`/
-  `deinit` fails with a generic member error at the instantiation site
-  (`framework.zig:468`–`474`). *Proposed change:* a comptime `@hasDecl` check on the
-  selected `StoragePlugin`/`MailerPlugin` types emitting a contract-specific
-  `@compileError`. Nice-to-have; the examples already template it.
+- **[FIXED] P2-c. Plugin-contract guard.** Added `assertPluginContract` in
+  `src/framework.zig`, invoked at the `StoragePlugin`/`MailerPlugin` comptime decls: a
+  plugin type missing `create`/`interface`/`deinit` now fails with a
+  contract-specific `@compileError`. **Probe verified** (see below).
 
-- **[REC] P2-d. Stale `Email` doc-comment.** `src/mail/mailer.zig:5` says "v0.1 is
-  text-only" — a version reference that will keep aging. Minor; reword to "text-only
-  for now (no `html_body`)".
+- **[FIXED] P2-d. Stale `Email` doc-comment.** `src/mail/mailer.zig:5` reworded from
+  "v0.1 is text-only" to "text-only for now (no `html_body`)" (single comment line, to
+  keep any later merge with the parallel mailer PR trivial).
 
 ### P3 — polish
 
-- **[REC] P3-a.** `KNOWN_LIMITATIONS.md` header still framed everything as "post-v0.1"
-  in body prose (partially addressed by the version fix). A pass to re-anchor the
-  caveats to the current release would help.
-- **[REC] P3-b.** Document the `ev.data` result-lifetime asymmetry (gpa-allocated, per
-  `data.zig:9`) alongside the arena footgun, so hook authors know a `findById` result
-  is *not* arena-scoped.
+- **[FIXED] P3-a.** Re-anchored the `KNOWN_LIMITATIONS.md` prose: the header now reads
+  "v0.3.0 ... tracked for future releases" and the trailing line "tracked for post-v0.1"
+  → "tracked for upcoming releases".
+- **[FIXED] P3-b.** Documented the `ev.data` result-lifetime asymmetry in
+  `docs/framework.md` §4 (the `ev.data` facade): `findById` results are gpa-allocated
+  (per `data.zig`), **not** arena-scoped, so the arena rule applies only to data written
+  *into* `ev.record`.
 
 ---
 
 ## What was verified
 
-- `mise exec zig@0.16.0 -- zig build` (repo root) — **exit 0**.
+- `mise exec zig@0.16.0 -- zig build` (repo root) — **exit 0** (after the merge of
+  `main` and all P1/P2 source changes).
+- `mise exec zig@0.16.0 -- zig build test --summary all` — **361/361 tests pass**.
 - `examples/blog` consumer build — **exit 0** (packaging/consumer story works).
-- Compile-error footguns #3–#6 — **reproduced live**, output captured above; scratch
-  edits reverted (no residual diff in `examples/blog/src/main.zig`).
+- Compile-error footguns #3–#6 — **reproduced live** (initial audit), output captured
+  above.
+- **P2-b probe** (bare-tuple `.migrations`): emitted
+  `error: '.migrations' must be a typed slice '&[_]zigbase.Migration{ ... }' (a bare
+  tuple does not coerce to []const Migration); got 'struct { ... }'` at
+  `framework.zig`. Probe reverted with Edit (no residual diff).
+- **P2-c probe** (mailer type missing `deinit`): emitted
+  `error: '.mailer' plugin type 'main.BrokenMailer' is missing the 'deinit' method; a
+  plugin must declare create(gpa, io, cfg) !Self / interface(*Self) view / deinit(*Self)
+  void` at `framework.zig`. Probe reverted with Edit (no residual diff).
 
-## Changes made in this PR
+## Changes made across this PR
 
-- `README.md:11` — version `v0.2.0` → `v0.3.0`.
-- `KNOWN_LIMITATIONS.md:3` — version `v0.1.0` → `v0.3.0`; reworded "post-v0.1".
-- `docs/framework.md` §5 — new "Reading the request (`ev.ctx`)" subsection.
-- `docs/dx-assessment.md` — this report.
+Docs/version (turn 1):
+- `README.md` — version `v0.2.0` → `v0.3.0`.
+- `KNOWN_LIMITATIONS.md` — version → `v0.3.0`; "post-v0.1" prose re-anchored.
+- `docs/framework.md` — "Reading the request (`ev.ctx`)" subsection; `ev.data`
+  result-lifetime note; `zigbase.JobEvent` shorthand; custom-`Storage` skeleton + S3
+  pointer; plugin-contract compile-error note.
+- `docs/tutorial.md` — "4.5 Set up the project" embedding section; `zigbase.JobEvent`
+  shorthand.
+
+Source (turn 2):
+- `src/root.zig` — `pub const JobEvent` re-export.
+- `src/framework.zig` — `migrationsCoerce` + `.migrations` comptime guard (P2-b);
+  `assertPluginContract` + storage/mailer contract guards (P2-c).
+- `src/mail/mailer.zig` — `Email` doc-comment reword (P2-d).
+- `examples/{blog,golfsim,plugins}/build.zig.zon` — relative-path clarifying comment.

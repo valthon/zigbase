@@ -181,6 +181,13 @@ fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
 `create`/`update`/`delete`/`list` return `error.UnknownCollection` when the
 collection name does not resolve.
 
+> **Result-lifetime asymmetry:** values *returned* by `ev.data` (e.g. the
+> `std.json.Value` from `findById`) are allocated from `ev.app.allocator` (the
+> long-lived gpa), **not** from `ev.arena`. So the arena rule applies only to data you
+> write *into* `ev.record`; a `findById` result is not arena-scoped and is fine to read
+> for the duration of the hook. Do not store one *into* `ev.record` without first
+> copying it with `ev.arena` (mixing allocators on the arena-backed JSON map is UB).
+
 > **Atomicity caveat:** a `before*` hook's `ev.data` writes are **NOT** atomic
 > with the triggering write. The triggering write opens its transaction *after*
 > the before-hook returns, so side-writes a hook issues via `ev.data` commit
@@ -308,14 +315,16 @@ Each `cron` spec needs `.name`, `.schedule`, and `.handler` (missing/wrong-typed
 .reactive                             // handler decides its own next fire
 ```
 
-**Handler signatures depend on the mode.** Cron and interval jobs use:
+**Handler signatures depend on the mode.** Cron and interval jobs use
+(`zigbase.JobEvent` is re-exported at the top level for convenience; it is the same
+type as `zigbase.events.JobEvent`):
 
 ```zig
-fn (ev: *zigbase.events.JobEvent) anyerror!void
+fn (ev: *zigbase.JobEvent) anyerror!void
 ```
 
 ```zig
-fn heartbeat(ev: *zigbase.events.JobEvent) anyerror!void {
+fn heartbeat(ev: *zigbase.JobEvent) anyerror!void {
     std.log.info("blog heartbeat job '{s}' ran", .{ev.name});
 }
 ```
@@ -323,7 +332,7 @@ fn heartbeat(ev: *zigbase.events.JobEvent) anyerror!void {
 A `.reactive` job's handler instead **returns its next schedule**:
 
 ```zig
-fn (ev: *zigbase.events.JobEvent) anyerror!zigbase.schedule.Reactive
+fn (ev: *zigbase.JobEvent) anyerror!zigbase.schedule.Reactive
 ```
 
 It returns either `.{ .after = <Interval> }` (re-run after that interval, e.g.
@@ -355,7 +364,7 @@ To offload one-off background work from a route or hook onto the worker pool:
 
 ```zig
 try ev.app.submit("reindex", reindexTask);
-// reindexTask: fn (ev: *zigbase.events.JobEvent) anyerror!void
+// reindexTask: fn (ev: *zigbase.JobEvent) anyerror!void
 ```
 
 `submit` returns `error.SchedulerUnavailable` if no scheduler is running (e.g.
@@ -516,13 +525,37 @@ zigbase.App(.{ .mailer = AuditMailer }).runCli(init);
 ```
 
 A custom storage plugin follows the same shape, returning a `zigbase.Storage`
-view from `interface()`. The `zigbase.Storage` vtable backs file storage (the
-default `zigbase.DefaultStoragePlugin` wraps `zigbase.LocalStorage`); the
+view from `interface()`. The `zigbase.Storage` vtable has **four** methods —
+`put` / `localPath` / `delete` / `deleteRecord` — so a custom backend wraps or
+replaces all four:
+
+```zig
+const MyStorage = struct {
+    backend: zigbase.LocalStorage, // or your own (S3, etc.)
+
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !MyStorage {
+        _ = io;
+        const root = try std.fmt.allocPrint(gpa, "{s}/storage", .{cfg.data_dir});
+        return .{ .backend = zigbase.LocalStorage.init(root) };
+    }
+    pub fn interface(self: *MyStorage) zigbase.Storage {
+        return self.backend.storage(); // or build a Storage{ .ctx = self, .vtable = &vt }
+    }
+    pub fn deinit(self: *MyStorage) void { _ = self; }
+};
+
+zigbase.App(.{ .storage = MyStorage }).runCli(init);
+```
+
+The default `zigbase.DefaultStoragePlugin` wraps `zigbase.LocalStorage`; the
 `zigbase.Mailer` vtable — a single `send(io, alloc, zigbase.Email)` — backs mail
 (the default `zigbase.DefaultMailerPlugin` selects `zigbase.LogMailer` or
-`zigbase.SmtpMailer` from config). See
-[`examples/plugins/`](../examples/plugins/) for the full, compiling custom-mailer
-plugin.
+`zigbase.SmtpMailer` from config). A plugin type that omits any of
+`create`/`interface`/`deinit` is a **compile error** with a contract-specific
+message. See [`examples/plugins/`](../examples/plugins/) for a full, compiling
+custom **mailer** (`AuditMailer`) *and* custom **storage** (`AuditStorage`, which
+wraps `zigbase.LocalStorage` and logs each of the four vtable calls before
+delegating).
 
 ## 10. Footprint levers (`.pools`)
 
@@ -644,8 +677,9 @@ The public surface (from `src/root.zig`):
   `events.FileEvent`, `events.LifecycleEvent`, `events.JobEvent`, ...).
 - `zigbase.schedule` — `schedule.Schedule`, `schedule.Interval`,
   `schedule.Reactive`.
-- `zigbase.RecordEvent`, `zigbase.ErrorEvent`, `zigbase.RouteEvent` —
-  re-exported directly for convenience.
+- `zigbase.RecordEvent`, `zigbase.ErrorEvent`, `zigbase.RouteEvent`,
+  `zigbase.JobEvent` — re-exported directly for convenience (the same types as
+  `zigbase.events.*`).
 - `zigbase.Migration` — the `.migrations` slice element type; `zigbase.Db` — the
   writer connection passed to a migration's `.up`.
 - `zigbase.StaticFile` — the embedded manifest entry type (path, bytes, etag); used

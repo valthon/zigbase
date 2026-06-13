@@ -42,4 +42,4 @@ ZigBase v0.3.0 is an early release. The gaps below are known and tracked for fut
 - Image thumbnails / transforms; an S3 (or other remote) storage backend — a pluggable `.storage` slot exists, but only the local-disk backend ships; `fields=` response projection; resumable/chunked uploads; realtime backfill/replay and per-event-guard load-tuning.
 
 ---
-These are tracked for post-v0.1. Contributions welcome.
+These are tracked for upcoming releases. Contributions welcome.

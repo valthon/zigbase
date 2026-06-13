@@ -2,7 +2,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const SmtpTls = config.SmtpTls;
 
-/// A single outbound email. v0.1 is text-only (no html_body) to keep the
+/// A single outbound email. Text-only for now (no `html_body`) to keep the
 /// message builder simple; add an optional `html_body` later for multipart.
 pub const Email = struct {
     to: []const u8,
