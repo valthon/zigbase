@@ -144,12 +144,14 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 // Compile per-write (patterns are small). Fail closed: a stored
                 // pattern that won't compile rejects the write rather than silently
                 // passing. schema.validate rejects bad patterns at definition time,
-                // so this is defense in depth. `alloc` is the request arena; the
-                // compiled program is freed with it.
+                // so this is defense in depth. An allocator failure (OutOfMemory) is
+                // propagated, not masqueraded as an invalid-pattern validation error.
                 if (regex.compile(alloc, pat)) |prog| {
+                    defer prog.deinit(alloc);
                     if (!regex.matches(prog, v.string))
                         try errs.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Value does not match the required pattern." });
-                } else |_| {
+                } else |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
                     try errs.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Field pattern is invalid." });
                 }
             }

@@ -283,7 +283,8 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
             .text => |o| if (o.pattern) |pat| {
                 if (regex.compile(alloc, pat)) |prog| {
                     prog.deinit(alloc);
-                } else |_| {
+                } else |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
                     try errors.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Field pattern is not a valid regular expression." });
                 }
             },
