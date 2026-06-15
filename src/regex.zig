@@ -28,11 +28,23 @@ pub const CompileError = error{ InvalidPattern, PatternTooComplex, OutOfMemory }
 // Size caps. A pattern whose compiled program or expanded repetition exceeds
 // these is rejected as `PatternTooComplex` (a DoS guard against e.g. `a{9}{9}`
 // style blowups or huge `{m,n}` bounds).
-const MAX_INSTS = 16384;
+const MAX_INSTS = 8192;
 const MAX_CLASSES = 1024;
 const MAX_NODES = 8192;
 const MAX_RANGES = 256; // ranges per class
-const MAX_SEQ = 2048; // concat pieces / alt branches at a single nesting level
+
+// Maximum recursion depth for the recursive-descent parser. Deeply nested
+// patterns like `((((…))))` recurse one parser frame per nesting level; we cap
+// the depth and reject past it with `error.PatternTooComplex` BEFORE recursing,
+// so a hostile pattern can never overflow the stack (jobs/cron run on 1 MiB
+// stacks).
+const MAX_PARSE_DEPTH = 96;
+
+// Fallback VM-scratch capacity used only by comptime-built programs (which have
+// no heap scratch). Comptime programs are author-written and fixed at build
+// time, so they are not a DoS vector; this only needs to cover realistic
+// developer patterns. Runtime programs always carry right-sized heap scratch.
+const COMPTIME_VM_CAP = 512;
 
 // ---- Character class --------------------------------------------------------
 
@@ -78,16 +90,38 @@ const Inst = union(OpTag) {
     eol,
 };
 
+/// Mutable, right-sized scratch buffers for one `matches` run. Allocated by
+/// `compile` (sized to the actual program length, not a fixed cap — C3) and
+/// freed by `deinit`. A Program is single-use within one record-write arena, so
+/// non-reentrant scratch is fine. Comptime-built programs leave this null and
+/// `matches` falls back to a small fixed stack buffer.
+const VmScratch = struct {
+    clist_pcs: []usize,
+    nlist_pcs: []usize,
+    clist_seen: []u32,
+    nlist_seen: []u32,
+    work: []usize, // explicit worklist for the iterative addThread (C2)
+};
+
 /// A compiled program: a flat instruction list plus the class table it indexes.
 /// Returned by `compile`/`compileComptime`; the runtime form owns its slices and
 /// must be released via `deinit`.
 pub const Program = struct {
     insts: []const Inst,
     classes: []const Class,
+    /// Heap VM scratch for runtime-compiled programs; null for comptime ones.
+    vm: ?VmScratch = null,
 
     pub fn deinit(self: Program, alloc: std.mem.Allocator) void {
         alloc.free(self.insts);
         alloc.free(self.classes);
+        if (self.vm) |s| {
+            alloc.free(s.clist_pcs);
+            alloc.free(s.nlist_pcs);
+            alloc.free(s.clist_seen);
+            alloc.free(s.nlist_seen);
+            alloc.free(s.work);
+        }
     }
 };
 
@@ -123,13 +157,24 @@ const Builder = struct {
     // AST storage
     nodes: [MAX_NODES]Node = undefined,
     nnodes: usize = 0,
-    // child-index pool for concat/alt
+    // Permanent child-index pool for concat/alt nodes; a node references a
+    // contiguous [kids_start, kids_end) slice of this.
     kids: [MAX_NODES]usize = undefined,
     nkids: usize = 0,
+    // Shared parse scratch for collecting one nesting level's child indices.
+    // Used with cursor discipline (see parseAlt/parseConcat): a frame records
+    // `base = scratch_len`, appends its children above the cursor while nested
+    // frames run between appends, then copies [base..scratch_len) into the
+    // permanent `kids` pool and resets `scratch_len = base`. This keeps the
+    // per-frame scratch O(1) (no large per-frame stack arrays — C1).
+    scratch: [MAX_NODES]usize = undefined,
+    scratch_len: usize = 0,
 
     // Parser cursor over the pattern
     pat: []const u8 = &.{},
     pos: usize = 0,
+    // Current recursion depth (bounded by MAX_PARSE_DEPTH).
+    depth: usize = 0,
 
     fn emit(self: *Builder, inst: Inst) CompileError!usize {
         if (self.ninsts >= MAX_INSTS) return error.PatternTooComplex;
@@ -179,82 +224,112 @@ const Builder = struct {
     //          repeat -> atom quantifier?
     //          atom -> '(' alt ')' | '[' class ']' | '.' | '^' | '$' | literal
 
+    /// Increment the recursion-depth counter, rejecting overly nested patterns
+    /// BEFORE recursing. Callers must `self.depth -= 1` on the way out.
+    fn enter(self: *Builder) CompileError!void {
+        if (self.depth >= MAX_PARSE_DEPTH) return error.PatternTooComplex;
+        self.depth += 1;
+    }
+
+    /// Append a child index to the shared parse scratch.
+    fn pushScratch(self: *Builder, idx: usize) CompileError!void {
+        if (self.scratch_len >= MAX_NODES) return error.PatternTooComplex;
+        self.scratch[self.scratch_len] = idx;
+        self.scratch_len += 1;
+    }
+
+    /// Copy scratch[base..scratch_len) into the permanent kids pool, returning
+    /// the [start, end) range, and rewind the scratch cursor to `base`.
+    fn flushScratch(self: *Builder, base: usize) CompileError!struct { start: usize, end: usize } {
+        const ks = self.nkids;
+        var i = base;
+        while (i < self.scratch_len) : (i += 1) {
+            if (self.nkids >= MAX_NODES) return error.PatternTooComplex;
+            self.kids[self.nkids] = self.scratch[i];
+            self.nkids += 1;
+        }
+        const ke = self.nkids;
+        self.scratch_len = base; // rewind shared scratch for the caller's reuse
+        return .{ .start = ks, .end = ke };
+    }
+
     fn parseAlt(self: *Builder) CompileError!usize {
+        try self.enter();
+        defer self.depth -= 1;
+
         const first = try self.parseConcat();
         if (self.peekByte() != '|') return first;
 
-        // Collect branch node indices into a local buffer first; the shared
-        // `kids` pool is appended to by nested parseConcat calls, so we cannot
-        // reserve a contiguous range until all branches are parsed.
-        var local: [MAX_SEQ]usize = undefined;
-        var nlocal: usize = 0;
-        local[nlocal] = first;
-        nlocal += 1;
+        // Collect branch node indices in the shared scratch using a cursor:
+        // record `base`, then append each branch index above it. Nested concat
+        // parses run between appends and use the scratch above the cursor.
+        const base = self.scratch_len;
+        try self.pushScratch(first);
         while (self.peekByte() == '|') {
             self.pos += 1; // consume '|'
             const branch = try self.parseConcat();
-            if (nlocal >= local.len) return error.PatternTooComplex;
-            local[nlocal] = branch;
-            nlocal += 1;
+            try self.pushScratch(branch);
         }
-        const ks = self.nkids;
-        var i: usize = 0;
-        while (i < nlocal) : (i += 1) try self.pushKid(local[i]);
-        const ke = self.nkids;
-        return self.newNode(.{ .tag = .alt, .kids_start = ks, .kids_end = ke });
-    }
-
-    fn pushKid(self: *Builder, idx: usize) CompileError!void {
-        if (self.nkids >= MAX_NODES) return error.PatternTooComplex;
-        self.kids[self.nkids] = idx;
-        self.nkids += 1;
+        const range = try self.flushScratch(base);
+        return self.newNode(.{ .tag = .alt, .kids_start = range.start, .kids_end = range.end });
     }
 
     fn parseConcat(self: *Builder) CompileError!usize {
-        // Collect pieces into a local buffer (nested parses may append to the
-        // shared `kids` pool), then reserve one contiguous range at the end.
-        var local: [MAX_SEQ]usize = undefined;
-        var nlocal: usize = 0;
+        try self.enter();
+        defer self.depth -= 1;
+
+        // Collect pieces in the shared scratch (cursor discipline as above).
+        const base = self.scratch_len;
         while (true) {
             const b = self.peekByte();
             if (b == null or b == '|' or b == ')') break;
             const piece = try self.parseRepeat();
-            if (nlocal >= local.len) return error.PatternTooComplex;
-            local[nlocal] = piece;
-            nlocal += 1;
+            try self.pushScratch(piece);
         }
-        if (nlocal == 0) {
+        const count = self.scratch_len - base;
+        if (count == 0) {
+            self.scratch_len = base;
             return self.newNode(.{ .tag = .empty });
         }
-        if (nlocal == 1) {
-            return local[0];
+        if (count == 1) {
+            const only = self.scratch[base];
+            self.scratch_len = base;
+            return only;
         }
-        const ks = self.nkids;
-        var i: usize = 0;
-        while (i < nlocal) : (i += 1) try self.pushKid(local[i]);
-        const ke = self.nkids;
-        return self.newNode(.{ .tag = .concat, .kids_start = ks, .kids_end = ke });
+        const range = try self.flushScratch(base);
+        return self.newNode(.{ .tag = .concat, .kids_start = range.start, .kids_end = range.end });
     }
 
     fn parseRepeat(self: *Builder) CompileError!usize {
         const atom = try self.parseAtom();
         const b = self.peekByte() orelse return atom;
-        switch (b) {
-            '*' => {
+        const node = switch (b) {
+            '*' => blk: {
                 self.pos += 1;
-                return self.newNode(.{ .tag = .star, .child = atom });
+                break :blk try self.newNode(.{ .tag = .star, .child = atom });
             },
-            '+' => {
+            '+' => blk: {
                 self.pos += 1;
-                return self.newNode(.{ .tag = .plus, .child = atom });
+                break :blk try self.newNode(.{ .tag = .plus, .child = atom });
             },
-            '?' => {
+            '?' => blk: {
                 self.pos += 1;
-                return self.newNode(.{ .tag = .quest, .child = atom });
+                break :blk try self.newNode(.{ .tag = .quest, .child = atom });
             },
-            '{' => return self.parseBrace(atom),
+            '{' => try self.parseBrace(atom),
             else => return atom,
+        };
+        // A quantifier immediately followed by another quantifier is rejected.
+        // We do not support stacked quantifiers (`a{2}{3}`), nor lazy/possessive
+        // modifiers (`a*?`, `a++`); all become `error.InvalidPattern` rather
+        // than silently misparsing (e.g. `a{2}{3}` -> literal `aa{3}`).
+        if (self.peekByte()) |nb| {
+            switch (nb) {
+                '*', '+', '?', '{' => return error.InvalidPattern,
+                else => {},
+            }
         }
+        return node;
     }
 
     fn parseBrace(self: *Builder, atom: usize) CompileError!usize {
@@ -593,10 +668,39 @@ pub fn compile(alloc: std.mem.Allocator, pattern: []const u8) CompileError!Progr
     b.* = .{};
     try b.build(pattern);
 
-    const insts = try alloc.dupe(Inst, b.insts[0..b.ninsts]);
+    const n = b.ninsts;
+    const insts = try alloc.dupe(Inst, b.insts[0..n]);
     errdefer alloc.free(insts);
     const classes = try alloc.dupe(Class, b.classes[0..b.nclasses]);
-    return .{ .insts = insts, .classes = classes };
+    errdefer alloc.free(classes);
+
+    // Right-sized VM scratch (C3): exactly `n` slots, not a fixed MAX_INSTS cap.
+    const clist_pcs = try alloc.alloc(usize, n);
+    errdefer alloc.free(clist_pcs);
+    const nlist_pcs = try alloc.alloc(usize, n);
+    errdefer alloc.free(nlist_pcs);
+    const clist_seen = try alloc.alloc(u32, n);
+    errdefer alloc.free(clist_seen);
+    @memset(clist_seen, 0);
+    const nlist_seen = try alloc.alloc(u32, n);
+    errdefer alloc.free(nlist_seen);
+    @memset(nlist_seen, 0);
+    // The worklist may hold pushed-but-unprocessed pcs; out-degree is <= 2, so
+    // 2*n+1 slots is a safe upper bound on concurrent stack depth.
+    const work = try alloc.alloc(usize, 2 * n + 1);
+    errdefer alloc.free(work);
+
+    return .{
+        .insts = insts,
+        .classes = classes,
+        .vm = .{
+            .clist_pcs = clist_pcs,
+            .nlist_pcs = nlist_pcs,
+            .clist_seen = clist_seen,
+            .nlist_seen = nlist_seen,
+            .work = work,
+        },
+    };
 }
 
 pub fn compileComptime(comptime pattern: []const u8) Program {
@@ -629,43 +733,102 @@ const ThreadList = struct {
 };
 
 /// Add `pc` to `list`, following epsilon transitions (jmp/split/bol/eol).
-/// `pos` is the current byte offset into the haystack (for `^`/`$`).
 /// `at_start`/`at_end` flags describe the position for anchors.
+///
+/// ITERATIVE (C2): uses the caller-supplied `work` buffer as an explicit stack
+/// instead of recursing, so a long epsilon chain (e.g. thousands of `a?`)
+/// cannot overflow the call stack. The generation-stamped visited set still
+/// guarantees each pc is enqueued at most once, so `work` is bounded by the
+/// program length and total work stays linear.
 fn addThread(
     prog: Program,
     list: *ThreadList,
-    pc: usize,
+    work: []usize,
+    start_pc: usize,
     at_start: bool,
     at_end: bool,
 ) void {
-    if (list.seen[pc] == list.gen) return;
-    list.seen[pc] = list.gen;
-    switch (prog.insts[pc]) {
-        .jmp => |target| addThread(prog, list, target, at_start, at_end),
-        .split => |targets| {
-            addThread(prog, list, targets[0], at_start, at_end);
-            addThread(prog, list, targets[1], at_start, at_end);
-        },
-        .bol => if (at_start) addThread(prog, list, pc + 1, at_start, at_end),
-        .eol => if (at_end) addThread(prog, list, pc + 1, at_start, at_end),
-        else => {
-            // char/any/class/match: a "real" thread that consumes (or matches).
-            list.pcs[list.len] = pc;
-            list.len += 1;
-        },
+    var top: usize = 0;
+    work[top] = start_pc;
+    top += 1;
+    while (top > 0) {
+        top -= 1;
+        const pc = work[top];
+        if (list.seen[pc] == list.gen) continue;
+        list.seen[pc] = list.gen;
+        switch (prog.insts[pc]) {
+            .jmp => |target| {
+                work[top] = target;
+                top += 1;
+            },
+            .split => |targets| {
+                // Push both successors; order is irrelevant to a boolean match.
+                // `work` has one slot per instruction and each pc is stamped at
+                // most once, so this never exceeds the buffer.
+                work[top] = targets[0];
+                top += 1;
+                work[top] = targets[1];
+                top += 1;
+            },
+            .bol => if (at_start) {
+                work[top] = pc + 1;
+                top += 1;
+            },
+            .eol => if (at_end) {
+                work[top] = pc + 1;
+                top += 1;
+            },
+            else => {
+                // char/any/class/match: a "real" thread that consumes (or matches).
+                list.pcs[list.len] = pc;
+                list.len += 1;
+            },
+        }
     }
 }
 
 /// Boolean, UNANCHORED (substring) match. Allocation-free, linear-time.
 pub fn matches(prog: Program, haystack: []const u8) bool {
     const n = prog.insts.len;
-    var clist_pcs: [MAX_INSTS]usize = undefined;
-    var nlist_pcs: [MAX_INSTS]usize = undefined;
-    var clist_seen: [MAX_INSTS]u32 = [_]u32{0} ** MAX_INSTS;
-    var nlist_seen: [MAX_INSTS]u32 = [_]u32{0} ** MAX_INSTS;
 
-    var clist = ThreadList{ .pcs = clist_pcs[0..n], .len = 0, .seen = clist_seen[0..n], .gen = 0 };
-    var nlist = ThreadList{ .pcs = nlist_pcs[0..n], .len = 0, .seen = nlist_seen[0..n], .gen = 0 };
+    // Scratch source: runtime programs carry right-sized heap scratch (C3);
+    // comptime programs (no heap scratch) fall back to small fixed stack
+    // buffers. Comptime programs are author-written and fixed at build time, so
+    // they are never a DoS amplifier; the fallback only needs to fit realistic
+    // developer patterns (COMPTIME_VM_CAP).
+    var fb_clist_pcs: [COMPTIME_VM_CAP]usize = undefined;
+    var fb_nlist_pcs: [COMPTIME_VM_CAP]usize = undefined;
+    var fb_clist_seen: [COMPTIME_VM_CAP]u32 = [_]u32{0} ** COMPTIME_VM_CAP;
+    var fb_nlist_seen: [COMPTIME_VM_CAP]u32 = [_]u32{0} ** COMPTIME_VM_CAP;
+    var fb_work: [2 * COMPTIME_VM_CAP + 1]usize = undefined;
+
+    var clist_pcs: []usize = undefined;
+    var nlist_pcs: []usize = undefined;
+    var clist_seen: []u32 = undefined;
+    var nlist_seen: []u32 = undefined;
+    var work: []usize = undefined;
+    if (prog.vm) |s| {
+        clist_pcs = s.clist_pcs;
+        nlist_pcs = s.nlist_pcs;
+        clist_seen = s.clist_seen;
+        nlist_seen = s.nlist_seen;
+        work = s.work;
+        // Heap `seen` may carry stamps from a previous run; reset to gen 0.
+        @memset(clist_seen, 0);
+        @memset(nlist_seen, 0);
+    } else {
+        // Comptime program exceeding the fallback cap would be a build-time
+        // authoring error; guard defensively rather than overrun the buffer.
+        if (n > COMPTIME_VM_CAP) return false;
+        clist_pcs = fb_clist_pcs[0..n];
+        nlist_pcs = fb_nlist_pcs[0..n];
+        clist_seen = fb_clist_seen[0..n];
+        nlist_seen = fb_nlist_seen[0..n];
+        work = fb_work[0 .. 2 * n + 1];
+    }
+
+    var clist = ThreadList{ .pcs = clist_pcs, .len = 0, .seen = clist_seen, .gen = 0 };
+    var nlist = ThreadList{ .pcs = nlist_pcs, .len = 0, .seen = nlist_seen, .gen = 0 };
     var cur = &clist;
     var next = &nlist;
     var generation: u32 = 0;
@@ -676,7 +839,7 @@ pub fn matches(prog: Program, haystack: []const u8) bool {
     // Seed initial generation at pos 0 with the start thread.
     generation += 1;
     cur.clear(generation);
-    addThread(prog, cur, 0, pos == 0, pos >= haystack.len);
+    addThread(prog, cur, work, 0, pos == 0, pos >= haystack.len);
 
     while (true) {
         const at_end = pos >= haystack.len;
@@ -725,12 +888,12 @@ pub fn matches(prog: Program, haystack: []const u8) bool {
                 else => false, // .match handled above
             };
             if (consumes) {
-                addThread(prog, next, pc + 1, next_at_start, next_at_end);
+                addThread(prog, next, work, pc + 1, next_at_start, next_at_end);
             }
         }
 
         // Unanchored: also seed a fresh start thread at the next position.
-        addThread(prog, next, 0, next_at_start, next_at_end);
+        addThread(prog, next, work, 0, next_at_start, next_at_end);
 
         // Swap.
         const tmp = cur;
@@ -819,4 +982,68 @@ test "compiles and matches at comptime" {
     const prog = comptime compileComptime("^\\d+$");
     try t.expect(matches(prog, "12345"));
     try t.expect(!matches(prog, "12a45"));
+}
+
+// ---- Regression tests for the DoS / mis-parse fixes ------------------------
+
+test "deeply nested groups are rejected, not crashed (C1)" {
+    // 500 nested groups: a hostile ~1 KiB pattern that would SIGSEGV an
+    // unbounded recursive-descent parser. Must reject with PatternTooComplex.
+    const depth = 500;
+    var buf: [2 * depth + 1]u8 = undefined;
+    var k: usize = 0;
+    var i: usize = 0;
+    while (i < depth) : (i += 1) {
+        buf[k] = '(';
+        k += 1;
+    }
+    buf[k] = 'a';
+    k += 1;
+    i = 0;
+    while (i < depth) : (i += 1) {
+        buf[k] = ')';
+        k += 1;
+    }
+    try t.expectError(error.PatternTooComplex, compile(t.allocator, buf[0..k]));
+}
+
+test "long epsilon chain compiles and matches without crashing (C2)" {
+    // 3000 optional atoms -> thousands of epsilon-linked split instructions.
+    // A recursive addThread would overflow the stack; the iterative one must
+    // run fine. Also exercises right-sized heap scratch (C3).
+    const reps = 3000;
+    var buf: [2 * reps]u8 = undefined;
+    var k: usize = 0;
+    var i: usize = 0;
+    while (i < reps) : (i += 1) {
+        buf[k] = 'a';
+        buf[k + 1] = '?';
+        k += 2;
+    }
+    const prog = try compile(t.allocator, buf[0..k]);
+    defer prog.deinit(t.allocator);
+    // Matches the empty input (every atom optional) and a run of a's.
+    try t.expect(matches(prog, ""));
+    try t.expect(matches(prog, "aaaaaaaaaa"));
+    // And a non-matching haystack does not crash either.
+    try t.expect(matches(prog, "zzz")); // unanchored: empty match succeeds anywhere
+}
+
+test "stacked and lazy/possessive quantifiers are rejected (I2)" {
+    try t.expectError(error.InvalidPattern, compile(t.allocator, "a{2}{3}"));
+    try t.expectError(error.InvalidPattern, compile(t.allocator, "a**"));
+    try t.expectError(error.InvalidPattern, compile(t.allocator, "a+?"));
+    try t.expectError(error.InvalidPattern, compile(t.allocator, "a*+"));
+    try t.expectError(error.InvalidPattern, compile(t.allocator, "a?{2}"));
+    try t.expectError(error.InvalidPattern, compile(t.allocator, "a*{2,3}"));
+}
+
+test "matches can be re-run on the same program (scratch reset)" {
+    // The heap `seen` buffer is reused across runs; a stale generation stamp
+    // from a prior call must not leak into the next.
+    const prog = try compile(t.allocator, "^abc$");
+    defer prog.deinit(t.allocator);
+    try t.expect(matches(prog, "abc"));
+    try t.expect(!matches(prog, "abd"));
+    try t.expect(matches(prog, "abc"));
 }
