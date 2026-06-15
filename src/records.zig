@@ -12,6 +12,8 @@ const parser = @import("query/parser.zig");
 const joiner = @import("query/joiner.zig");
 const sort = @import("query/sort.zig");
 const request = @import("request.zig");
+const regex = @import("regex.zig");
+const datetime = @import("datetime.zig");
 
 /// A compiled rule constraint enforced atomically on create/update.
 pub const Guard = struct {
@@ -138,6 +140,19 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_min", .message = "Value is too short." });
             if (o.max) |mx| if (n > mx)
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Value is too long." });
+            if (o.pattern) |pat| {
+                // Compile per-write (patterns are small). Fail closed: a stored
+                // pattern that won't compile rejects the write rather than silently
+                // passing. schema.validate rejects bad patterns at definition time,
+                // so this is defense in depth. `alloc` is the request arena; the
+                // compiled program is freed with it.
+                if (regex.compile(alloc, pat)) |prog| {
+                    if (!regex.matches(prog, v.string))
+                        try errs.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Value does not match the required pattern." });
+                } else |_| {
+                    try errs.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Field pattern is invalid." });
+                }
+            }
         },
         // Email: require a minimal, single-line address. We do NOT attempt full
         // RFC5322 validation, but we MUST reject control characters: an email value
@@ -158,9 +173,29 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             if (bad or at == null or at.? == 0 or at.? == s.len - 1 or std.mem.indexOfScalarPos(u8, s, at.? + 1, '@') != null)
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_invalid_email", .message = "Invalid email address." });
         },
-        // date min/max are deliberately NOT enforced: a lexical compare is unsound
-        // without date normalization (mixed "T"/"Z" vs space formats false-reject,
-        // garbage like "25:99:99" false-accepts). See KNOWN_LIMITATIONS.md.
+        // Date values are normalized to UTC seconds for a sound comparison across
+        // mixed formats (e.g. "2026-06-10 08:00:00" vs "2026-06-10T08:00:00Z").
+        // A non-empty value must parse (rejects garbage like "25:99:99").
+        .date => |o| if (v == .string and v.string.len > 0) {
+            const secs = datetime.parse(v.string) catch {
+                try errs.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Invalid date." });
+                return;
+            };
+            if (o.min) |mn| {
+                const b = datetime.parse(mn) catch {
+                    try errs.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Invalid date bound." });
+                    return;
+                };
+                if (secs < b) try errs.append(alloc, .{ .field = f.name, .code = "validation_min", .message = "Date is before the minimum." });
+            }
+            if (o.max) |mx| {
+                const b = datetime.parse(mx) catch {
+                    try errs.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Invalid date bound." });
+                    return;
+                };
+                if (secs > b) try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Date is after the maximum." });
+            }
+        },
         .number => |o| if (o.mode == .float) {
             const x: f64 = switch (v) {
                 .float => |fl| fl,
@@ -638,6 +673,7 @@ fn seedConstrained(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
         .{ .id = "f3", .name = "seats", .options = .{ .number = .{ .mode = .int, .min = 1, .max = 8 } } },
         .{ .id = "f4", .name = "ratio", .options = .{ .number = .{ .mode = .float, .min = 0, .max = 1 } } },
         .{ .id = "f5", .name = "when", .options = .{ .date = .{ .min = "2026-01-01 00:00:00", .max = "2026-12-31 23:59:59" } } },
+        .{ .id = "f6", .name = "slug", .options = .{ .text = .{ .pattern = "^[a-z0-9-]+$" } } },
     };
     return collections.create(a, std.testing.io, d, .{ .id = "", .name = "limits", .fields = &fields });
 }
@@ -802,20 +838,35 @@ test "float-mode number min/max (float and integer JSON values)" {
     _ = try createOne(a, &d, col, "ratio", .{ .integer = 1 });
 }
 
-test "date min/max are accepted but NOT enforced (no date normalization in the write path)" {
-    // A lexical compare is unsound without normalization: clients legitimately mix
-    // "2026-06-10 08:00:00" and "2026-06-10T08:00:00Z", which order incorrectly as
-    // bytes, and garbage like "2026-06-10 25:99:99" would still pass. Enforcement
-    // is deferred until dates are parsed/normalized (see KNOWN_LIMITATIONS.md).
+test "date values are validated and min/max enforced" {
     var d = try db.Db.openMemory();
     defer d.close();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const col = try seedConstrained(&d, a); // "when": min 2026-01-01, max 2026-12-31
-    _ = try createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }); // below min: accepted
-    _ = try createOne(a, &d, col, "when", .{ .string = "2027-01-01 00:00:00" }); // above max: accepted
-    _ = try createOne(a, &d, col, "when", .{ .string = "2026-06-10T08:00:00Z" }); // mixed format: accepted
+    // garbage is rejected
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2026-06-10 25:99:99" }));
+    try expectFieldCode("when", "validation_date");
+    // below min / above max rejected, across mixed formats
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }));
+    try expectFieldCode("when", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2027-01-01T00:00:00Z" }));
+    try expectFieldCode("when", "validation_max");
+    // an in-range value in the canonical stored form is accepted
+    _ = try createOne(a, &d, col, "when", .{ .string = "2026-06-10T08:00:00Z" });
+}
+
+test "text pattern is enforced" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "slug", .{ .string = "Has Spaces" }));
+    try expectFieldCode("slug", "validation_pattern");
+    _ = try createOne(a, &d, col, "slug", .{ .string = "ok-slug-1" });
 }
 
 test "update enforces the same constraints" {
