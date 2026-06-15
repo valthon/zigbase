@@ -51,7 +51,9 @@ test {
     _ = @import("app.zig");
     _ = @import("config.zig");
     _ = @import("ratelimit.zig");
+    _ = @import("regex.zig");
     _ = @import("cli.zig");
+    _ = @import("datetime.zig");
     _ = @import("db.zig");
     _ = @import("http.zig");
     _ = @import("router.zig");
