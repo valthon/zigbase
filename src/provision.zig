@@ -177,8 +177,12 @@ fn buildOptions(comptime col: []const u8, comptime fname: []const u8, comptime f
             .date => blk: {
                 const dmin = optStr(f, "min");
                 const dmax = optStr(f, "max");
-                if (dmin) |b| _ = datetime.parse(b) catch @compileError(where ++ ": date .min is not a valid date \"" ++ b ++ "\"");
-                if (dmax) |b| _ = datetime.parse(b) catch @compileError(where ++ ": date .max is not a valid date \"" ++ b ++ "\"");
+                const min_secs: ?i64 = if (dmin) |b| (datetime.parse(b) catch @compileError(where ++ ": date .min is not a valid date \"" ++ b ++ "\"")) else null;
+                const max_secs: ?i64 = if (dmax) |b| (datetime.parse(b) catch @compileError(where ++ ": date .max is not a valid date \"" ++ b ++ "\"")) else null;
+                // Reject an unsatisfiable range at build time: min > max can never
+                // accept any value once both bounds are enforced.
+                if (min_secs) |lo| if (max_secs) |hi| if (lo > hi)
+                    @compileError(where ++ ": date .min \"" ++ dmin.? ++ "\" is after .max \"" ++ dmax.? ++ "\"");
                 break :blk .{ .date = .{ .min = dmin, .max = dmax } };
             },
             .autodate => .{ .autodate = .{

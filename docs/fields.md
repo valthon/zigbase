@@ -166,6 +166,10 @@ with a `validation_min` / `validation_max` field error.
 Malformed or out-of-range values (e.g. `25:99:99`, `2026-02-29` in a non-leap
 year) are rejected with `400` (`validation_date`).
 
+A field declaring both `min` and `max` with `min` later than `max` is
+unsatisfiable (no value could ever pass) and is rejected when the collection is
+saved — and at build time (`@compileError`) for a comptime schema literal.
+
 Bounds are validated at collection-save time — an out-of-range or malformed
 `min`/`max` string is a `400` field error. For **comptime `.collections`
 schemas**, a malformed `min`/`max` is a `@compileError` at build time.

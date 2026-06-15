@@ -166,8 +166,9 @@ Malformed or out-of-range values (e.g. `25:99:99`, `2026-02-29` in a non-leap ye
 rejected with `400` (`validation_date`).
 
 Bounds are validated at collection-save time — a malformed `min`/`max` string is a `400`
-field error. For **comptime `.collections` schemas**, a malformed bound is a
-`@compileError` at build time.
+field error, as is an unsatisfiable range where `min` is later than `max` (no value could
+ever pass). For **comptime `.collections` schemas**, a malformed or unsatisfiable bound is
+a `@compileError` at build time.
 
 ```json
 { "name": "starts_at", "type": "date", "options": { "min": "2026-01-01 00:00:00" } }

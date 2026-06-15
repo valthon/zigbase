@@ -113,15 +113,18 @@ pub const Program = struct {
     vm: ?VmScratch = null,
 
     pub fn deinit(self: Program, alloc: std.mem.Allocator) void {
+        // Comptime-built programs (vm == null) reference static/comptime memory and
+        // own no heap allocations, so deinit is a no-op for them — calling
+        // alloc.free on those slices would be UB. Only runtime programs from
+        // `compile` (which always sets `vm`) own and free their slices.
+        const s = self.vm orelse return;
         alloc.free(self.insts);
         alloc.free(self.classes);
-        if (self.vm) |s| {
-            alloc.free(s.clist_pcs);
-            alloc.free(s.nlist_pcs);
-            alloc.free(s.clist_seen);
-            alloc.free(s.nlist_seen);
-            alloc.free(s.work);
-        }
+        alloc.free(s.clist_pcs);
+        alloc.free(s.nlist_pcs);
+        alloc.free(s.clist_seen);
+        alloc.free(s.nlist_seen);
+        alloc.free(s.work);
     }
 };
 
@@ -982,6 +985,11 @@ test "compiles and matches at comptime" {
     const prog = comptime compileComptime("^\\d+$");
     try t.expect(matches(prog, "12345"));
     try t.expect(!matches(prog, "12a45"));
+}
+test "deinit on a comptime program is a safe no-op" {
+    const prog = comptime compileComptime("^[a-z]+$");
+    prog.deinit(t.allocator); // must not free static/comptime memory or crash
+    try t.expect(matches(prog, "abc")); // still usable after the no-op deinit
 }
 
 // ---- Regression tests for the DoS / mis-parse fixes ------------------------

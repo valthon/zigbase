@@ -289,12 +289,20 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
                 }
             },
             .date => |o| {
+                var min_secs: ?i64 = null;
+                var max_secs: ?i64 = null;
                 if (o.min) |mn| {
-                    _ = datetime.parse(mn) catch try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date min is not a valid date." });
+                    if (datetime.parse(mn)) |s| min_secs = s else |_|
+                        try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date min is not a valid date." });
                 }
                 if (o.max) |mx| {
-                    _ = datetime.parse(mx) catch try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date max is not a valid date." });
+                    if (datetime.parse(mx)) |s| max_secs = s else |_|
+                        try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date max is not a valid date." });
                 }
+                // Reject an unsatisfiable range: with both bounds enforced, min > max
+                // would make every value fail, so the field could never accept input.
+                if (min_secs) |lo| if (max_secs) |hi| if (lo > hi)
+                    try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date min must not be after max." });
             },
             .select => |o| if (o.values.len == 0)
                 try errors.append(alloc, .{ .field = f.name, .code = "validation_required", .message = "select requires at least one value." }),
@@ -878,6 +886,21 @@ test "validate rejects an uncompilable pattern and an unparseable date bound" {
         if (std.mem.eql(u8, e.code, "validation_date")) saw_date = true;
     }
     try std.testing.expect(saw_pattern);
+    try std.testing.expect(saw_date);
+}
+
+test "validate rejects a date field whose min is after max" {
+    var errs: std.ArrayList(ValidationError) = .empty;
+    defer errs.deinit(std.testing.allocator);
+    const fields = [_]Field{
+        .{ .id = "f1", .name = "when", .options = .{ .date = .{ .min = "2026-12-31", .max = "2026-01-01" } } },
+    };
+    const c = Collection{ .id = "c", .name = "things", .fields = &fields };
+    try validate(std.testing.allocator, c, &errs);
+    var saw_date = false;
+    for (errs.items) |e| {
+        if (std.mem.eql(u8, e.code, "validation_date")) saw_date = true;
+    }
     try std.testing.expect(saw_date);
 }
 
