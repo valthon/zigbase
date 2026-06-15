@@ -79,11 +79,37 @@ A string column.
 | --- | --- | --- | --- |
 | `min` | integer (≥0) | unset | minimum length, counted in **unicode codepoints** |
 | `max` | integer (≥0) | unset | maximum length, counted in **unicode codepoints** |
-| `pattern` | string | unset | a regex the value must match — **accepted but not yet enforced** (see [Known limitations](./known-limitations)) |
+| `pattern` | string | unset | a regular expression the value must match (see below) |
 
 `min`/`max` violations are a `400` with a `validation_min` / `validation_max` field
 error. An explicitly empty value (`""`) on an optional field skips the `min` check so the
 field stays clearable; use `required` to forbid empty.
+
+**`pattern` is enforced on every record write** via a pure-Zig, linear-time Thompson-NFA
+matcher — no catastrophic backtracking is possible regardless of input. Matching is
+**unanchored (substring)**: the pattern must be found anywhere in the value. To require a
+full-string match, anchor with `^…$`. A violation returns `400` with a
+`validation_pattern` field error.
+
+Supported syntax:
+
+- **Literals** — any UTF-8 character matches itself.
+- **`.`** — matches any Unicode codepoint **except `\n`**.
+- **Anchors** — `^` (start of string) and `$` (end of string).
+- **Character classes** — `[abc]`, negated `[^abc]`, ranges `[a-z]`.
+- **Predefined classes** — `\d` / `\D` (digit), `\w` / `\W` (word char), `\s` / `\S`
+  (whitespace) — ASCII semantics only.
+- **Escape sequences** — `\t`, `\n`, `\r`, `\f`, `\v`, and `\`-escaped metacharacters.
+- **Alternation** — `a|b`.
+- **Groups** — `(…)` and non-capturing `(?:…)`.
+- **Quantifiers** — `*` (0+), `+` (1+), `?` (0–1), `{m}`, `{m,}`, `{m,n}`.
+
+Not supported: captures/backreferences, lazy quantifiers, `\b`, `\p{}`, or a
+case-insensitive flag.
+
+Patterns are validated when a collection is saved — a syntactically invalid pattern is a
+`400` field error. For **comptime `.collections` schemas**, a malformed `pattern` is a
+`@compileError` at build time.
 
 ```json
 { "name": "title", "type": "text", "required": true, "options": { "min": 1, "max": 200 } }
@@ -120,12 +146,28 @@ A date/time string column.
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `min` | string | unset | earliest allowed value (a date string) — **accepted but not yet enforced** |
-| `max` | string | unset | latest allowed value (a date string) — **accepted but not yet enforced** |
+| `min` | string | unset | earliest allowed value (inclusive) — **enforced on every record write** |
+| `max` | string | unset | latest allowed value (inclusive) — **enforced on every record write** |
 
-`min`/`max` are stored and round-tripped, but record validation does not apply them yet:
-enforcement needs date parsing/normalization, which the write path doesn't have (see
-[Known limitations](./known-limitations)).
+`min`/`max` are **enforced on every record write**. The write path normalizes the value
+and the bounds to a common UTC instant before comparing, so mixed input formats compare
+correctly. A violation returns `400` with a `validation_min` / `validation_max` field
+error.
+
+**Accepted date input formats:**
+
+- `YYYY-MM-DD` (date only).
+- `YYYY-MM-DD` followed by `T` or a space, then `HH:MM` or `HH:MM:SS` or
+  `HH:MM:SS.fff` (fractional seconds).
+- Any of the above followed by `Z` (UTC) or a `±HH:MM` timezone offset. A missing
+  timezone is treated as UTC.
+
+Malformed or out-of-range values (e.g. `25:99:99`, `2026-02-29` in a non-leap year) are
+rejected with `400` (`validation_date`).
+
+Bounds are validated at collection-save time — a malformed `min`/`max` string is a `400`
+field error. For **comptime `.collections` schemas**, a malformed bound is a
+`@compileError` at build time.
 
 ```json
 { "name": "starts_at", "type": "date", "options": { "min": "2026-01-01 00:00:00" } }

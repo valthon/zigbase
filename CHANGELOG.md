@@ -4,6 +4,24 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`text.pattern` is now enforced on record writes** via a pure-Zig, linear-time
+  (DoS-safe) Thompson-NFA matcher (`src/regex.zig`). Matching is unanchored (substring);
+  anchor with `^…$` for a full-string match. Supported syntax: literals, `.` (any codepoint
+  except `\n`), anchors `^`/`$`, character classes `[…]`/`[^…]`/ranges, predefined classes
+  `\d \D \w \W \s \S` (ASCII), escapes `\t \n \r \f \v` and `\`-escaped metacharacters,
+  alternation `|`, groups `(…)`/`(?:…)`, and quantifiers `* + ? {m} {m,} {m,n}`. Patterns
+  are validated when a collection is saved (a bad regex is a `400` field error), and at build
+  time (`@compileError`) for comptime schema literals.
+- **`date` field `min`/`max` are now enforced** on record writes, with date normalization
+  (`src/datetime.zig`) so mixed formats (e.g. `2026-06-10 08:00:00` vs
+  `2026-06-10T08:00:00Z`) compare correctly. Malformed or out-of-range date values are
+  rejected with `400` (`validation_date`). Bounds are validated at collection-save time
+  and at build time (`@compileError`) for comptime schema literals.
+
 ## [0.4.0] - 2026-06-13
 
 This round makes ZigBase **safe-by-default**: a security audit's findings were fixed and
@@ -110,9 +128,7 @@ read the migration notes below before upgrading. The full audit is in
   `validation_min` / `validation_max` on the offending field; text length is
   counted in unicode codepoints; number bounds are inclusive. **Note:**
   pre-existing records that violate their declared bounds will fail
-  full-record re-saves (e.g. from the admin UI drawer) until corrected. Date
-  `min`/`max` and text `pattern` remain accepted-but-unenforced — see
-  KNOWN_LIMITATIONS.md.
+  full-record re-saves (e.g. from the admin UI drawer) until corrected.
 - **Multipart input semantics:** an empty value clears an optional non-text
   field to `null` (matching JSON `null`); a single occurrence of a multi-value
   field wraps into a one-element array (repeated keys already became arrays);

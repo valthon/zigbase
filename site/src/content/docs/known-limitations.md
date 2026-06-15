@@ -39,16 +39,6 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
   **Non-additive changes (rename, drop, or type-change a field) are detected, logged, and
   skipped** — they require an explicit `.migrations` entry.
 
-## Fields
-
-- **The text field's `pattern` option is accepted but not yet enforced.** It is stored
-  and round-tripped through the schema API, but record validation does not apply it
-  (Zig's std has no regex engine and we won't hand-roll one). `min`/`max` for text and
-  number fields *are* enforced (`validation_min` / `validation_max`).
-- **The date field's `min`/`max` options are accepted but not yet enforced.** Enforcement
-  is pending date parsing/normalization in the write path — a raw lexical compare is
-  unsound when clients mix formats (`2026-06-10 08:00:00` vs `2026-06-10T08:00:00Z`).
-
 ## Scheduler
 
 - **Single-process only** — jobs run in the serving process; there is no distributed
