@@ -80,16 +80,22 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
   const makeReader = (name: string): LiveReader =>
     new CollectionService(transport, authStore, name) as unknown as LiveReader;
 
-  const realtime: RealtimeClient = {
-    subscribe: (topic, cb, subOpts) => getRealtimeService().subscribe(topic, cb, subOpts),
-    unsubscribe: (topic, cb) => getRealtimeService().unsubscribe(topic, cb),
-    collection: (name) => new LiveCollection(name, makeReader(name), getRealtimeService()),
-  };
+  // Lazily construct the realtime client wiring only on first `.realtime` access,
+  // so a REST-only app never references the realtime/live/filter-eval graph.
+  let realtimeClient: RealtimeClient | undefined;
+  const getRealtimeClient = (): RealtimeClient =>
+    (realtimeClient ??= {
+      subscribe: (topic, cb, subOpts) => getRealtimeService().subscribe(topic, cb, subOpts),
+      unsubscribe: (topic, cb) => getRealtimeService().unsubscribe(topic, cb),
+      collection: (name) => new LiveCollection(name, makeReader(name), getRealtimeService()),
+    });
 
   return {
     baseUrl: normalizedBase,
     authStore,
-    realtime,
+    get realtime() {
+      return getRealtimeClient();
+    },
     get files() {
       return (filesService ??= new FilesService(transport, normalizedBase));
     },
