@@ -49,7 +49,7 @@ describe("records (live backend)", () => {
     // --- getList with filter + sort ---
     const list = await posts.getList(1, 30, { filter: "views >= 2", sort: "-views" });
     expect(list.items.length).toBe(3);
-    expect((list.items[0] as { views: number }).views).toBe(4); // desc
+    expect(list.items[0]!.views as number).toBe(4); // desc
 
     // --- offset pagination across 2 pages ---
     const p1 = await posts.getList(1, 2, { sort: "views" });
