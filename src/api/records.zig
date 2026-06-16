@@ -346,16 +346,19 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const pg = app.pagination;
 
     // Mode selection + enable/disable gating (comptime-configured via App(.{ .pagination = ... })).
-    const has_cursor = if (qp.get("cursor")) |c| c.len > 0 else false;
+    // The PRESENCE of a `cursor` param (even empty = "first page") or a `limit` param signals
+    // cursor-mode intent — this is what the SDK's getPage() sends. A non-empty cursor TOKEN is
+    // tracked separately so the first page (empty token) skips the keyset predicate.
+    const cursor_present = qp.get("cursor") != null or qp.get("limit") != null;
+    const has_token = if (qp.get("cursor")) |c| c.len > 0 else false;
     const has_page_param = qp.get("page") != null or qp.get("perPage") != null;
-    if (has_cursor and !pg.cursor_enabled)
+    if (cursor_present and !pg.cursor_enabled)
         return ApiError.badRequest("Cursor pagination is disabled.").toResponse(ctx.allocator);
     if (has_page_param and !pg.offset_enabled)
         return ApiError.badRequest("Offset pagination is disabled; use `cursor`.").toResponse(ctx.allocator);
-    // When offset is disabled and no cursor was supplied, the FIRST page still runs in cursor mode
-    // (cursor==null) so clients get a nextCursor to walk forward. When cursor is disabled, a cursor
-    // param was already rejected above, so offset mode runs.
-    const cursor_mode = has_cursor or !pg.offset_enabled;
+    // Cursor mode when the client opted in (cursor/limit param) OR offset is disabled. A cursor
+    // param was already rejected above when cursor is disabled, so we never reach cursor mode then.
+    const cursor_mode = (cursor_present or !pg.offset_enabled) and pg.cursor_enabled;
 
     const page = parseU32(qp.get("page"), 1);
     const perPage = parseU32(qp.get("perPage"), 30);
@@ -378,7 +381,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         .perPage = perPage,
         .rule = rule_expr,
         .rctx = &rctx,
-        .cursor = if (cursor_mode) qp.get("cursor") else null,
+        .cursor = if (cursor_mode and has_token) qp.get("cursor") else null,
         .cursorMode = cursor_mode,
         .limit = limit,
         .skipTotal = skip_total,

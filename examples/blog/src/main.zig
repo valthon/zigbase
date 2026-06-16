@@ -153,6 +153,16 @@ pub fn main(init: std.process.Init) !void {
         .cron = .{
             .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
         },
+        // Pagination: keep BOTH modes enabled (offset for the admin tables, cursor for the public
+        // infinite-scroll feed). Use HMAC-SIGNED cursor tokens so a hand-crafted/tampered cursor is
+        // rejected with a clear 400 — the MAC is keyed by the server's JWT secret, no extra config.
+        // (Swap .signed for .stateless — the default, SDK-byte-compatible — or .stateful — opaque
+        // ids stored server-side with a TTL — to change the token format.)
+        .pagination = .{
+            .offset = true,
+            .cursor = true,
+            .cursor_token = .signed,
+        },
         // Provisioned at startup (additive auto-migration): an auth collection with
         // open signup, and public posts readable only when published.
         .collections = .{
