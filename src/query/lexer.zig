@@ -15,7 +15,15 @@ pub const LexError = error{ UnexpectedChar, UnterminatedString, InvalidEscape } 
 /// the real value; strings with no escapes keep the zero-copy slice into `input`.
 pub fn lex(alloc: std.mem.Allocator, input: []const u8) LexError![]Token {
     var toks: std.ArrayList(Token) = .empty;
-    errdefer toks.deinit(alloc);
+    // On error, free any owned (unescaped) string buffers before dropping the list.
+    // Owned buffers are the ones whose text does NOT point into `input`; zero-copy
+    // plain strings slice into `input` and must not be freed.
+    errdefer {
+        for (toks.items) |t| {
+            if (t.kind == .string and !pointsInto(t.text, input)) alloc.free(t.text);
+        }
+        toks.deinit(alloc);
+    }
     var i: usize = 0;
     while (i < input.len) {
         const c = input[i];
@@ -72,6 +80,14 @@ pub fn lex(alloc: std.mem.Allocator, input: []const u8) LexError![]Token {
     }
     try toks.append(alloc, .{ .kind = .eof, .text = "" });
     return toks.toOwnedSlice(alloc);
+}
+
+/// True if `slice` starts inside `parent`'s byte range — i.e. it is a zero-copy
+/// sub-slice rather than a separately allocated (unescaped) buffer.
+fn pointsInto(slice: []const u8, parent: []const u8) bool {
+    const ptr = @intFromPtr(slice.ptr);
+    const start = @intFromPtr(parent.ptr);
+    return ptr >= start and ptr < start + parent.len;
 }
 
 fn isIdentStart(c: u8) bool { return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '@'; }
@@ -185,6 +201,33 @@ test "lex rejects bad and unterminated escapes" {
     try std.testing.expectError(error.UnterminatedString, lex(a, "v = 'a\\"));
     // A bare escaped quote that then runs off the end is unterminated.
     try std.testing.expectError(error.UnterminatedString, lex(a, "v = 'a\\'"));
+}
+
+test "lex frees owned escaped-string buffers on a later error (no leak)" {
+    // Regression: the error path must free already-allocated unescaped string
+    // buffers. `'a\\b'` allocates an owned buffer, then `%` triggers UnexpectedChar.
+    // Under std.testing.allocator a leak would fail the test.
+    const a = std.testing.allocator;
+    // Zig "\\\\" is the two source bytes `\\`, which lex unescapes to a single `\`
+    // into an owned buffer; the trailing `%` then errors with the buffer live.
+    try std.testing.expectError(error.UnexpectedChar, lex(a, "'a\\\\b' %"));
+    // Two escaped strings allocated before the error — both must be freed.
+    try std.testing.expectError(error.UnexpectedChar, lex(a, "'x\\ty' = 'z\\nw' %"));
+    // A failing escape mid-stream after a prior good escaped string also stays clean.
+    try std.testing.expectError(error.InvalidEscape, lex(a, "'ok\\t' 'bad\\q'"));
+}
+
+test "lex frees owned escaped-string buffers on success (no leak)" {
+    // The successful path with multiple escaped strings must also be leak-free once
+    // the caller frees the tokens (mirrors the arena/owning caller paths).
+    const a = std.testing.allocator;
+    const toks = try lex(a, "'a\\tb' = \"c\\nd\"");
+    defer {
+        for (toks) |t| if (t.kind == .string) a.free(t.text);
+        a.free(toks);
+    }
+    try std.testing.expectEqualStrings("a\tb", toks[0].text);
+    try std.testing.expectEqualStrings("c\nd", toks[2].text);
 }
 
 test "lex an @request macro path" {
