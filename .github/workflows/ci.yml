@@ -44,3 +44,26 @@ jobs:
         run: mise exec python@3.13 -- python -m pytest tests/admin -q
       - name: Live SMTP-over-TLS (STARTTLS) delivery test
         run: mise exec python@3.13 -- python -m pytest tests/smtp -q
+
+  ts-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build zigbase binary
+        run: mise exec zig@0.16.0 -- zig build
+      - name: Install SDK deps
+        working-directory: clients/typescript
+        run: npm ci || npm install
+      - name: Typecheck
+        working-directory: clients/typescript
+        run: npm run typecheck
+      - name: Unit tests
+        working-directory: clients/typescript
+        run: npm test
+      - name: Integration tests
+        working-directory: clients/typescript
+        run: npm run test:integration
