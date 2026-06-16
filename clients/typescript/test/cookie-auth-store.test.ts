@@ -19,4 +19,18 @@ describe("CookieAuthStore", () => {
     b.loadFromCookie("other=1; somethingelse=2");
     expect(b.token).toBeNull();
   });
+
+  it("does not throw on a non-string / undefined cookie header", () => {
+    const b = new CookieAuthStore("zb_auth");
+    expect(() => b.loadFromCookie(undefined as unknown as string)).not.toThrow();
+    expect(b.token).toBeNull();
+    // Empty string is a no-op too.
+    expect(() => b.loadFromCookie("")).not.toThrow();
+    expect(b.token).toBeNull();
+    // A valid cookie still loads after the guarded calls.
+    const a = new CookieAuthStore("zb_auth");
+    a.save("x.y.z", { id: "u1" });
+    b.loadFromCookie(a.exportToCookie());
+    expect(b.token).toBe("x.y.z");
+  });
 });

@@ -120,6 +120,8 @@ export class CookieAuthStore extends BaseAuthStore {
   }
 
   loadFromCookie(cookieHeader: string): void {
+    // `req.headers.cookie` may be undefined; guard before splitting.
+    if (typeof cookieHeader !== "string" || cookieHeader.length === 0) return;
     const match = cookieHeader
       .split(";")
       .map((c) => c.trim())
