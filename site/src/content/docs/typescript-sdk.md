@@ -233,6 +233,22 @@ const url2 = zb.files.getUrl("posts", "REC123", "cover.png", { download: true })
 
 ## Realtime + live store
 
+Realtime ships behind a **dedicated entry point**, `@zigbase/client/realtime`, so a REST-only
+app never bundles the realtime / live-store / filter-eval graph. Opt in with `withRealtime`:
+
+```ts
+import { createClient } from "@zigbase/client";
+import { withRealtime } from "@zigbase/client/realtime";
+
+const zb = withRealtime(createClient(url, { WebSocket }));
+// `zb.realtime` is now available; everything else on `zb` is unchanged.
+```
+
+> **Tree-shaking.** Because the realtime graph is reachable only through
+> `@zigbase/client/realtime`, an app that imports just `createClient` and uses `.collection()`
+> drops `tokenize` / `reconnect` / `LiveList` / `analyzeFilter` entirely — roughly 13 KB
+> (minified) of code a REST-only client never pays for.
+
 ### Low-level subscriptions
 
 ```ts
@@ -384,10 +400,36 @@ try {
 }
 ```
 
-## Escape hatch — `send()`
+## Field projection — `fields`
+
+`fields` trims the server response to the listed fields and is honored on **every** read path:
+`getList` / `getOne`, the cursor engine (`getPage` / `iterate` / `getFullList`), and the live
+store (`collection().getList` / `getPage` / `getOne` seed fetches).
+
+```ts
+await posts.getFullList({ sort: "-created", fields: "id,title" });
+for await (const p of posts.iterate({ fields: "id,slug" })) { /* ... */ }
+const live = await zb.realtime.collection("posts").getList(1, 30, { fields: "id,title" });
+```
+
+## Auto-cancellation — `requestKey`
+
+Every read/mutation option bag (and `send` / `fetch`) accepts an optional `requestKey` for
+**opt-in** last-write-wins de-duplication: issuing a new request with a given key aborts any
+in-flight request sharing that key. Omitting the key disables auto-cancellation entirely (the
+default — concurrent requests never interfere). The key composes with a user-supplied `signal`
+(either one aborts the request), and an aborted request rejects with a `DOMException` whose
+`name` is `"AbortError"`.
+
+```ts
+// Typeahead: only the most recent query survives.
+const page = await posts.getList(1, 20, { filter, requestKey: "search" });
+```
+
+## Escape hatches — `send()` and raw `fetch()`
 
 `zb.send(method, path, opts?)` calls any endpoint the typed surface doesn't cover, while still
-applying the auth header, retries, and `ZigbaseError` mapping:
+applying the auth header, retries, and `ZigbaseError` mapping (returning parsed JSON):
 
 ```ts
 const stats = await zb.send<{ users: number }>("GET", "/api/custom/stats", {
@@ -396,20 +438,23 @@ const stats = await zb.send<{ users: number }>("GET", "/api/custom/stats", {
 await zb.send("POST", "/api/custom/reindex", { body: { collection: "posts" } });
 ```
 
+When you need the **raw `Response`** — binary or text bodies, response headers, or streaming —
+use `zb.fetch(method, path, opts?)`. It passes through `query` / `body` / `headers` / `signal` /
+`requestKey` and the auth header, but does **not** JSON-parse and does **not** throw on a non-2xx
+status; you receive the `Response` as-is:
+
+```ts
+const res = await zb.fetch("GET", "/api/export.csv", { query: { format: "csv" } });
+if (res.ok) {
+  const blob = await res.blob();
+  console.log(res.headers.get("content-type"));
+}
+```
+
 ## Known limitations / fast-follow
 
-- **No dedicated realtime entry point yet.** A `@zigbase/client/realtime` subpath for full
-  tree-shaking of the realtime/live/filter-eval graph is planned; today that graph is only
-  pulled in lazily on first `.realtime` access, so a REST-only app already avoids it at runtime.
-- **`fields` not honored on cursor/iterate/live.** `getList`/`getOne` accept a `fields`
-  projection, but the cursor (`getPage`/`iterate`/`getFullList`) and live-store option bags do
-  not yet pass it through.
-- **No built-in auto-cancellation / `requestKey`.** Pass an `AbortSignal` via `opts.signal` to
-  cancel in-flight requests yourself; there is no automatic last-write-wins cancellation.
 - **Both-quotes filter values throw.** A filter value containing both `'` and `"` throws until
   server PR #16 (backslash escapes) ships.
-- **No raw `Response` from `send()`.** `send()` returns parsed JSON; raw-`Response` access for
-  streaming/headers is planned.
 
 ## See also
 

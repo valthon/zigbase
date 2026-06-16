@@ -190,6 +190,18 @@ const protectedUrl = zb.files.getUrl(rec, rec.cover, { token });
 
 ## Realtime + live store
 
+Realtime lives behind a **dedicated entry point**, `@zigbase/client/realtime`. Opt in with
+`withRealtime(client)` — a REST-only app that never imports it doesn't bundle the realtime /
+live-store / filter-eval graph at all (it tree-shakes out, ~13 KB minified).
+
+```ts
+import { createClient } from "@zigbase/client";
+import { withRealtime } from "@zigbase/client/realtime";
+
+const zb = withRealtime(createClient("http://127.0.0.1:8787", { WebSocket }));
+// `zb.realtime` is now available (and the client is otherwise unchanged).
+```
+
 ### Low-level subscriptions
 
 ```ts
@@ -284,14 +296,48 @@ try {
 }
 ```
 
-## Escape hatch — `send()`
+## Field projection — `fields`
 
-Call any endpoint the typed surface doesn't cover. The auth header, retries, and error mapping
-still apply:
+`fields` trims the response to the listed fields (server-side) and is honored on **every** read
+path: `getList` / `getOne` **and** the cursor engine (`getPage` / `iterate` / `getFullList`) and
+the live store (`collection().getList` / `getPage` / `getOne` seed fetches):
+
+```ts
+await posts.getFullList({ sort: "-created", fields: "id,title" });
+for await (const p of posts.iterate({ fields: "id,slug" })) { /* ... */ }
+const live = await zb.realtime.collection("posts").getList(1, 30, { fields: "id,title" });
+```
+
+## Auto-cancellation — `requestKey`
+
+Pass `requestKey` on any read/mutation (or `send` / `fetch`) for opt-in last-write-wins
+de-duplication: issuing a new request with a key **aborts any in-flight request sharing that
+key**. Without a key, nothing is auto-cancelled. Aborted requests reject with a `DOMException`
+whose `name` is `"AbortError"`. Composes with your own `signal` (either aborts the request):
+
+```ts
+// As the user types, only the latest search survives:
+const results = await posts.getList(1, 20, { filter, requestKey: "search" });
+```
+
+## Escape hatch — `send()` and raw `fetch()`
+
+`send()` calls any endpoint the typed surface doesn't cover, returning parsed JSON; the auth
+header, retries, and `ZigbaseError` mapping still apply:
 
 ```ts
 const stats = await zb.send<{ users: number }>("GET", "/api/custom/stats", {
   query: { window: "7d" },
 });
 await zb.send("POST", "/api/custom/reindex", { body: { collection: "posts" } });
+```
+
+When you need the **raw `Response`** (binary/text bodies, custom headers, streaming), use
+`zb.fetch(method, path, opts)`. It passes through `query` / `body` / `headers` / `signal` /
+`requestKey` and the auth header, but does **not** JSON-parse and does **not** throw on non-2xx —
+you get the `Response` as-is:
+
+```ts
+const res = await zb.fetch("GET", "/api/export.csv", { query: { format: "csv" } });
+if (res.ok) console.log(res.headers.get("content-type"), await res.text());
 ```
