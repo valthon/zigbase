@@ -9,6 +9,14 @@ import {
   hasBlob,
   toFormData,
 } from "./records.js";
+import {
+  type CursorPage,
+  encodeCursor,
+  decodeCursor,
+  appendIdTiebreaker,
+  buildKeysetFilter,
+} from "./cursor.js";
+import { parseSort } from "./query.js";
 
 export interface AuthResponse {
   token: string;
@@ -190,4 +198,123 @@ export class CollectionService {
       method: "DELETE",
     });
   }
+
+  /**
+   * Keyset (cursor) pagination, synthesized client-side over the offset+filter wire.
+   * Stable under inserts; cannot random-access page N. The effective sort always carries
+   * an `id` tiebreaker whose direction follows the last user-sort term.
+   */
+  async getPage<T extends Record<string, unknown> = ZbRecord>(opts: {
+    cursor?: string;
+    limit?: number;
+    filter?: string;
+    sort?: string;
+    expand?: string;
+    withTotal?: boolean;
+    signal?: AbortSignal;
+  } = {}): Promise<CursorPage<T>> {
+    const limit = Math.min(Math.max(opts.limit ?? 30, 1), 500);
+    const effectiveSort = appendIdTiebreaker(opts.sort ?? "");
+    const terms = parseSort(effectiveSort);
+
+    let dir: "next" | "prev" = "next";
+    const userFilter = opts.filter ?? "";
+    let filterStr = userFilter;
+
+    if (opts.cursor) {
+      const state = decodeCursor(opts.cursor, effectiveSort);
+      dir = state.dir;
+      const keyset = buildKeysetFilter(effectiveSort, state.values, dir);
+      filterStr = userFilter ? `(${userFilter}) && (${keyset})` : keyset;
+    }
+
+    const res = await this.transport.send<ListResult<T>>(this.recordsBase(), {
+      method: "GET",
+      query: {
+        page: 1,
+        perPage: limit + 1,
+        filter: filterStr || undefined,
+        sort: effectiveSort,
+        expand: opts.expand,
+        skipTotal: opts.withTotal ? undefined : 1,
+      },
+      signal: opts.signal,
+    });
+
+    let rows = res.items;
+    const hasMore = rows.length > limit;
+    if (hasMore) rows = rows.slice(0, limit);
+    // "prev" pages come back in reverse order; flip to restore forward order
+    if (dir === "prev") rows = [...rows].reverse();
+
+    const boundaryValues = (row: T): unknown[] => terms.map((t) => readSortKey(row, t.field));
+    const first = rows[0];
+    const last = rows[rows.length - 1];
+
+    const nextCursor =
+      last !== undefined
+        ? encodeCursor({ v: 1, sort: effectiveSort, values: boundaryValues(last), dir: "next" })
+        : null;
+    const prevCursor =
+      first !== undefined
+        ? encodeCursor({ v: 1, sort: effectiveSort, values: boundaryValues(first), dir: "prev" })
+        : null;
+
+    return {
+      items: rows,
+      nextCursor: hasMore || dir === "prev" ? nextCursor : null,
+      prevCursor: opts.cursor ? prevCursor : null,
+      hasNext: dir === "next" ? hasMore : true,
+      hasPrev: opts.cursor ? true : false,
+      ...(opts.withTotal ? { totalItems: res.totalItems } : {}),
+    };
+  }
+
+  /** Async-iterate every matching record using the stable cursor engine. */
+  async *iterate<T extends Record<string, unknown> = ZbRecord>(opts: {
+    filter?: string;
+    sort?: string;
+    expand?: string;
+    batch?: number;
+    signal?: AbortSignal;
+  } = {}): AsyncIterableIterator<T> {
+    let cursor: string | undefined;
+    for (;;) {
+      const page: CursorPage<T> = await this.getPage<T>({
+        cursor,
+        limit: opts.batch ?? 100,
+        filter: opts.filter,
+        sort: opts.sort,
+        expand: opts.expand,
+        signal: opts.signal,
+      });
+      for (const item of page.items) yield item;
+      if (!page.hasNext || !page.nextCursor) return;
+      cursor = page.nextCursor;
+    }
+  }
+
+  /** Stable full read, re-backed by the keyset engine (safe even while rows are inserted). */
+  async getFullList<T extends Record<string, unknown> = ZbRecord>(opts: {
+    filter?: string;
+    sort?: string;
+    expand?: string;
+    batch?: number;
+    signal?: AbortSignal;
+  } = {}): Promise<T[]> {
+    const out: T[] = [];
+    for await (const item of this.iterate<T>(opts)) out.push(item);
+    return out;
+  }
+}
+
+/** Read a (possibly dotted) sort key off a record for cursor boundary encoding. */
+function readSortKey(row: Record<string, unknown>, path: string): unknown {
+  if (!path.includes(".")) return row[path];
+  let cur: unknown = row;
+  for (const seg of path.split(".")) {
+    if (cur === null || cur === undefined || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
 }
