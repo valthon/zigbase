@@ -287,6 +287,23 @@ test "SQL injection: string literal with metacharacters stays in params, never i
     try std.testing.expectEqualStrings(dangerous, c.params[0].text);
 }
 
+test "compile binds an escaped string literal's unescaped value as a param" {
+    // A value containing BOTH quote characters is only representable via backslash
+    // escaping (the SDK can no longer dodge by switching quote kinds). The compiler
+    // must bind the real, unescaped O'Brien-style value into params.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compileFilter(a, &d, posts, "title = 'O\\'Brien \\\"Jr\\\"'", &j);
+    try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
+    try std.testing.expectEqual(@as(usize, 1), c.params.len);
+    try std.testing.expectEqualStrings("O'Brien \"Jr\"", c.params[0].text);
+}
+
 test "compile a macro rule binds the auth id as a param" {
     var d = try db.Db.openMemory();
     defer d.close();

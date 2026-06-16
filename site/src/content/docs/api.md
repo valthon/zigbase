@@ -114,15 +114,22 @@ Access to each operation is governed by the collection's [access rules](#access-
 
 ### List: query parameters
 
+The list endpoint supports two pagination styles: **offset** (`page`/`perPage`) and
+**cursor** (keyset). Both can be enabled/disabled at compile time (see
+[Pagination configuration](#pagination-configuration)); by default both are on.
+
 | Param | Default | Meaning |
 | --- | --- | --- |
-| `page` | `1` | Page number (1-based). |
-| `perPage` | `30` | Items per page. |
+| `page` | `1` | Offset page number (1-based). |
+| `perPage` | `30` | Items per page (clamped to 500). |
+| `cursor` | — | Opaque keyset cursor. Its **presence** (even empty `cursor=`) selects cursor mode; an empty value is the first page. |
+| `limit` | — | Cursor-mode page size (alias of `perPage`, clamped to 500); its presence also selects cursor mode. |
+| `skipTotal` | `true` in cursor mode | Skip the `COUNT(*)` total. Set `skipTotal=false` to include `totalItems`/`totalPages`. |
 | `filter` | — | Filter expression (see [Filter grammar](#filter-grammar)). |
-| `sort` | — | Sort spec (see [sort](#sort)). |
-| `expand` | — | Relation expansion (see [expand](#expand)). |
+| `sort` | — | Sort spec (see [sort](#sort)). In cursor mode this defines the keyset order; `id` is auto-appended as a tiebreaker. |
+| `expand` | — | Relation expansion (see [expand](#expand)). Works in both modes. |
 
-The list response envelope:
+The **offset** list response envelope:
 
 ```json
 {
@@ -133,6 +140,87 @@ The list response envelope:
   "items": [ { "id": "...", "title": "..." } ]
 }
 ```
+
+### Cursor (keyset) pagination
+
+Offset pagination walks `page`/`perPage` but has two structural problems: deep offsets
+(`OFFSET 100000`) scan every skipped row, and an insert/delete on an earlier page shifts
+every later page (duplicating or skipping rows during infinite scroll). **Cursor
+pagination** fixes both: each page returns an opaque `nextCursor`/`prevCursor` that encodes
+the boundary row's sort-key values, and the next request resumes *strictly after* that
+boundary — value-based, so it's drift-resistant and cheap regardless of depth.
+
+Send `cursor=` (empty) or a `limit` to start a cursor walk, then forward `nextCursor`:
+
+```
+GET /api/collections/posts/records?sort=-created&limit=20&cursor=
+GET /api/collections/posts/records?sort=-created&limit=20&cursor=<nextCursor>
+```
+
+The **cursor** list response envelope:
+
+```json
+{
+  "page": 0,
+  "perPage": 20,
+  "nextCursor": "eyJ2Ijox...",
+  "prevCursor": null,
+  "hasNext": true,
+  "hasPrev": false,
+  "items": [ { "id": "...", "title": "..." } ]
+}
+```
+
+`totalItems`/`totalPages` are present only when `skipTotal=false`. `page` is `0` (a sentinel:
+"cursor mode"; `page` is not meaningful for keyset). Walk backward with `prevCursor`.
+
+**Rules and filters always apply** — a cursor only narrows the *window*; the collection's
+list rule and your `filter` are still AND-ed into the same query, so a cursor can never reveal
+a row a rule would hide. Cursor values are bound parameters (never interpolated into SQL).
+
+**Stale cursors fail loudly.** A cursor is bound to the `sort` and `filter` it was minted
+under. Reusing it with a different `sort` returns **400** ("Cursor does not match the requested
+sort."); a different `filter` returns **400** ("Cursor does not match the requested filter.");
+a malformed/oversized token returns **400** ("Invalid cursor.").
+
+#### Pagination configuration
+
+Both modes and the cursor **token format** are selected at compile time on `App(.{ ... })`:
+
+```zig
+zigbase.App(.{
+    .pagination = .{
+        .offset = true,             // enable page/perPage (default true)
+        .cursor = true,             // enable cursor (default true)
+        .cursor_token = .stateless, // .stateless | .signed | .stateful (default .stateless)
+    },
+});
+```
+
+- **`.offset = false`** rejects `page`/`perPage` with a 400; only cursor paging is allowed.
+- **`.cursor = false`** rejects `cursor` with a 400; only offset paging is allowed.
+- Setting **both to false** is a compile error (a list endpoint must have a pagination mode).
+
+The three cursor **token formats** trade off statelessness vs. tamper-evidence:
+
+| `cursor_token` | What the token is | Tamper-evident? | State | Notes |
+| --- | --- | --- | --- | --- |
+| `.stateless` (default) | base64url JSON payload, validated structurally + against the request's sort/filter | No (rules + parameterization provide the security) | None | CDN-friendly; byte-compatible with the SDK's client-synthesized cursors. |
+| `.signed` | the stateless payload + an HMAC-SHA256 tag keyed by the **server's JWT secret** | Yes — a tampered/hand-crafted token returns 400 ("Invalid cursor signature.") | None | No extra config; reuses the existing token secret. Not synthesizable by a client without the secret. |
+| `.stateful` | a random opaque id; the keyset payload is stored server-side in `_cursorStates` with a TTL | N/A (server holds the state) | A row per minted cursor, GC'd on expiry | Smallest token; unknown/expired id returns **410 Gone**. Not compatible with client-synthesized cursors. |
+
+For most apps the default **`.stateless`** is the right choice — security comes from access
+rules gating every row and from parameterized binding, not from signing the cursor. Choose
+`.signed` when you want tamper-evidence with no extra storage, or `.stateful` when you want the
+server to fully control cursor validity/expiry (e.g. revocable cursors) and can accept a small
+write per page.
+
+#### SDK forward-compatibility
+
+The cursor response shape (`items` + `nextCursor`/`prevCursor`/`hasNext`/`hasPrev` +
+optional `totalItems`) is exactly what the TypeScript SDK's `CursorPage` reads, so the SDK can
+forward a native `cursor` instead of synthesizing the keyset filter itself, with no SDK type
+changes. Treat the token as fully opaque and round-trip whatever the server returned.
 
 ### Filter grammar
 
@@ -157,6 +245,12 @@ grammar.
 **Operands:** field paths (identifiers, may contain `.` for relation traversal, e.g.
 `author.name`), single- or double-quoted strings, numbers, booleans (`true`/`false`), and
 `null`.
+
+**String escapes:** inside a quoted string a backslash starts an escape: `\\` → `\`,
+`\'` → `'`, `\"` → `"`, plus `\n` `\t` `\r`. This lets a value contain the same quote
+character used to delimit it (e.g. `name = 'O\'Brien'`) or even both quote characters at
+once (`name = 'both \' and \"'`). A backslash followed by any other character is rejected.
+The bound parameter receives the unescaped value.
 
 **Request macros** resolve against the current request:
 

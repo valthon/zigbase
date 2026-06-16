@@ -9,6 +9,10 @@ pub const http = @import("http.zig");
 pub const Data = @import("data.zig").Data;
 pub const events = @import("events.zig");
 pub const schedule = @import("schedule.zig");
+// Pagination: the comptime `.pagination` config types + the cursor token-format selector,
+// so a consumer can name `zigbase.CursorToken` when configuring `App(.{ .pagination = ... })`.
+pub const CursorToken = @import("pagination.zig").CursorToken;
+pub const PaginationConfig = @import("pagination.zig").Config;
 pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
 pub const RouteEvent = events.RouteEvent;
@@ -51,7 +55,9 @@ test {
     _ = @import("app.zig");
     _ = @import("config.zig");
     _ = @import("ratelimit.zig");
+    _ = @import("regex.zig");
     _ = @import("cli.zig");
+    _ = @import("datetime.zig");
     _ = @import("db.zig");
     _ = @import("http.zig");
     _ = @import("router.zig");
@@ -86,7 +92,9 @@ test {
     _ = @import("query/joiner.zig");
     _ = @import("query/compiler.zig");
     _ = @import("query/sort.zig");
+    _ = @import("query/keyset.zig");
     _ = @import("query/expand.zig");
+    _ = @import("pagination.zig");
     _ = @import("realtime/protocol.zig");
     _ = @import("realtime/connection.zig");
     _ = @import("realtime/hub.zig");

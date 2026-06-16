@@ -27,6 +27,7 @@ module into a downstream consumer package.
 | Cron job | Hourly heartbeat log (background scheduling demo) |
 | Realtime WebSocket | `PostList` subscribes to live post create/update/delete events |
 | Static-files mode | `--serve-static frontend/dist` serves the Astro build |
+| Pagination config | `.pagination = .{ .cursor_token = .signed }` — HMAC-signed cursor tokens for the post feed (offset still on) |
 
 ## Schema
 

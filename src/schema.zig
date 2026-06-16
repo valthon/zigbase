@@ -1,4 +1,6 @@
 const std = @import("std");
+const regex = @import("regex.zig");
+const datetime = @import("datetime.zig");
 
 pub const NumberMode = enum { float, int, fixed };
 
@@ -278,6 +280,30 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
                 try errors.append(alloc, .{ .field = f.name, .code = "validation_duplicate_name", .message = "Duplicate field name." });
         }
         switch (f.options) {
+            .text => |o| if (o.pattern) |pat| {
+                if (regex.compile(alloc, pat)) |prog| {
+                    prog.deinit(alloc);
+                } else |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    try errors.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Field pattern is not a valid regular expression." });
+                }
+            },
+            .date => |o| {
+                var min_secs: ?i64 = null;
+                var max_secs: ?i64 = null;
+                if (o.min) |mn| {
+                    if (datetime.parse(mn)) |s| min_secs = s else |_|
+                        try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date min is not a valid date." });
+                }
+                if (o.max) |mx| {
+                    if (datetime.parse(mx)) |s| max_secs = s else |_|
+                        try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date max is not a valid date." });
+                }
+                // Reject an unsatisfiable range: with both bounds enforced, min > max
+                // would make every value fail, so the field could never accept input.
+                if (min_secs) |lo| if (max_secs) |hi| if (lo > hi)
+                    try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date min must not be after max." });
+            },
             .select => |o| if (o.values.len == 0)
                 try errors.append(alloc, .{ .field = f.name, .code = "validation_required", .message = "select requires at least one value." }),
             .number => |o| if (o.mode == .fixed and (o.scale == null or o.scale.? < 1 or o.scale.? > 8))
@@ -842,6 +868,40 @@ test "oauth2 options round-trip through optionsToJson(false)/optionsFromJson" {
     try std.testing.expectEqualStrings("cid", back.auth.oauth2.providers[0].clientId);
     try std.testing.expectEqualStrings("v1:blob", back.auth.oauth2.providers[0].clientSecret);
     try std.testing.expectEqualStrings("https://app/cb", back.auth.oauth2.providers[0].redirectUrls[0]);
+}
+
+test "validate rejects an uncompilable pattern and an unparseable date bound" {
+    var errs: std.ArrayList(ValidationError) = .empty;
+    defer errs.deinit(std.testing.allocator);
+    const fields = [_]Field{
+        .{ .id = "f1", .name = "slug", .options = .{ .text = .{ .pattern = "(" } } },
+        .{ .id = "f2", .name = "when", .options = .{ .date = .{ .min = "nope" } } },
+    };
+    const c = Collection{ .id = "c", .name = "things", .fields = &fields };
+    try validate(std.testing.allocator, c, &errs);
+    var saw_pattern = false;
+    var saw_date = false;
+    for (errs.items) |e| {
+        if (std.mem.eql(u8, e.code, "validation_pattern")) saw_pattern = true;
+        if (std.mem.eql(u8, e.code, "validation_date")) saw_date = true;
+    }
+    try std.testing.expect(saw_pattern);
+    try std.testing.expect(saw_date);
+}
+
+test "validate rejects a date field whose min is after max" {
+    var errs: std.ArrayList(ValidationError) = .empty;
+    defer errs.deinit(std.testing.allocator);
+    const fields = [_]Field{
+        .{ .id = "f1", .name = "when", .options = .{ .date = .{ .min = "2026-12-31", .max = "2026-01-01" } } },
+    };
+    const c = Collection{ .id = "c", .name = "things", .fields = &fields };
+    try validate(std.testing.allocator, c, &errs);
+    var saw_date = false;
+    for (errs.items) |e| {
+        if (std.mem.eql(u8, e.code, "validation_date")) saw_date = true;
+    }
+    try std.testing.expect(saw_date);
 }
 
 test "optionsToJson(true) redacts clientSecret" {

@@ -21,6 +21,10 @@ pub const ApiError = struct {
     pub fn conflict(message: []const u8) ApiError {
         return .{ .status = 409, .message = message };
     }
+    /// 410 Gone — the resource existed but is no longer available (e.g. an expired cursor).
+    pub fn gone(message: []const u8) ApiError {
+        return .{ .status = 410, .message = message };
+    }
     pub fn validation(fields: []const FieldError) ApiError {
         return .{ .status = 400, .message = "Failed to validate the request.", .fields = fields };
     }

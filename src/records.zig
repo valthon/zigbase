@@ -12,6 +12,10 @@ const parser = @import("query/parser.zig");
 const joiner = @import("query/joiner.zig");
 const sort = @import("query/sort.zig");
 const request = @import("request.zig");
+const keyset = @import("query/keyset.zig");
+const pagination = @import("pagination.zig");
+const regex = @import("regex.zig");
+const datetime = @import("datetime.zig");
 
 /// A compiled rule constraint enforced atomically on create/update.
 pub const Guard = struct {
@@ -138,6 +142,21 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_min", .message = "Value is too short." });
             if (o.max) |mx| if (n > mx)
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Value is too long." });
+            if (o.pattern) |pat| {
+                // Compile per-write (patterns are small). Fail closed: a stored
+                // pattern that won't compile rejects the write rather than silently
+                // passing. schema.validate rejects bad patterns at definition time,
+                // so this is defense in depth. An allocator failure (OutOfMemory) is
+                // propagated, not masqueraded as an invalid-pattern validation error.
+                if (regex.compile(alloc, pat)) |prog| {
+                    defer prog.deinit(alloc);
+                    if (!regex.matches(prog, v.string))
+                        try errs.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Value does not match the required pattern." });
+                } else |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    try errs.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Field pattern is invalid." });
+                }
+            }
         },
         // Email: require a minimal, single-line address. We do NOT attempt full
         // RFC5322 validation, but we MUST reject control characters: an email value
@@ -158,9 +177,29 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             if (bad or at == null or at.? == 0 or at.? == s.len - 1 or std.mem.indexOfScalarPos(u8, s, at.? + 1, '@') != null)
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_invalid_email", .message = "Invalid email address." });
         },
-        // date min/max are deliberately NOT enforced: a lexical compare is unsound
-        // without date normalization (mixed "T"/"Z" vs space formats false-reject,
-        // garbage like "25:99:99" false-accepts). See KNOWN_LIMITATIONS.md.
+        // Date values are normalized to UTC seconds for a sound comparison across
+        // mixed formats (e.g. "2026-06-10 08:00:00" vs "2026-06-10T08:00:00Z").
+        // A non-empty value must parse (rejects garbage like "25:99:99").
+        .date => |o| if (v == .string and v.string.len > 0) {
+            const secs = datetime.parse(v.string) catch {
+                try errs.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Invalid date." });
+                return;
+            };
+            if (o.min) |mn| {
+                const b = datetime.parse(mn) catch {
+                    try errs.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Invalid date bound." });
+                    return;
+                };
+                if (secs < b) try errs.append(alloc, .{ .field = f.name, .code = "validation_min", .message = "Date is before the minimum." });
+            }
+            if (o.max) |mx| {
+                const b = datetime.parse(mx) catch {
+                    try errs.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Invalid date bound." });
+                    return;
+                };
+                if (secs > b) try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Date is after the maximum." });
+            }
+        },
         .number => |o| if (o.mode == .float) {
             const x: f64 = switch (v) {
                 .float => |fl| fl,
@@ -638,6 +677,7 @@ fn seedConstrained(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
         .{ .id = "f3", .name = "seats", .options = .{ .number = .{ .mode = .int, .min = 1, .max = 8 } } },
         .{ .id = "f4", .name = "ratio", .options = .{ .number = .{ .mode = .float, .min = 0, .max = 1 } } },
         .{ .id = "f5", .name = "when", .options = .{ .date = .{ .min = "2026-01-01 00:00:00", .max = "2026-12-31 23:59:59" } } },
+        .{ .id = "f6", .name = "slug", .options = .{ .text = .{ .pattern = "^[a-z0-9-]+$" } } },
     };
     return collections.create(a, std.testing.io, d, .{ .id = "", .name = "limits", .fields = &fields });
 }
@@ -802,20 +842,35 @@ test "float-mode number min/max (float and integer JSON values)" {
     _ = try createOne(a, &d, col, "ratio", .{ .integer = 1 });
 }
 
-test "date min/max are accepted but NOT enforced (no date normalization in the write path)" {
-    // A lexical compare is unsound without normalization: clients legitimately mix
-    // "2026-06-10 08:00:00" and "2026-06-10T08:00:00Z", which order incorrectly as
-    // bytes, and garbage like "2026-06-10 25:99:99" would still pass. Enforcement
-    // is deferred until dates are parsed/normalized (see KNOWN_LIMITATIONS.md).
+test "date values are validated and min/max enforced" {
     var d = try db.Db.openMemory();
     defer d.close();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const col = try seedConstrained(&d, a); // "when": min 2026-01-01, max 2026-12-31
-    _ = try createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }); // below min: accepted
-    _ = try createOne(a, &d, col, "when", .{ .string = "2027-01-01 00:00:00" }); // above max: accepted
-    _ = try createOne(a, &d, col, "when", .{ .string = "2026-06-10T08:00:00Z" }); // mixed format: accepted
+    // garbage is rejected
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2026-06-10 25:99:99" }));
+    try expectFieldCode("when", "validation_date");
+    // below min / above max rejected, across mixed formats
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }));
+    try expectFieldCode("when", "validation_min");
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2027-01-01T00:00:00Z" }));
+    try expectFieldCode("when", "validation_max");
+    // an in-range value in the canonical stored form is accepted
+    _ = try createOne(a, &d, col, "when", .{ .string = "2026-06-10T08:00:00Z" });
+}
+
+test "text pattern is enforced" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedConstrained(&d, a);
+    try std.testing.expectError(error.Validation, createOne(a, &d, col, "slug", .{ .string = "Has Spaces" }));
+    try expectFieldCode("slug", "validation_pattern");
+    _ = try createOne(a, &d, col, "slug", .{ .string = "ok-slug-1" });
 }
 
 test "update enforces the same constraints" {
@@ -1004,6 +1059,8 @@ test "delete removes the row; 404 on missing" {
     try std.testing.expect(!try delete(a, &d, col, "r1"));
 }
 
+pub const ListMode = enum { offset, cursor };
+
 pub const ListQuery = struct {
     filter: ?[]const u8 = null,
     sort: ?[]const u8 = null,
@@ -1011,8 +1068,44 @@ pub const ListQuery = struct {
     perPage: u32 = 30,
     rule: ?[]const u8 = null,
     rctx: ?*const request.RequestContext = null,
+    /// Opaque cursor token. When non-null, `list` runs in CURSOR (keyset) mode. The `page`
+    /// field is then ignored. Decode/validation failures surface as keyset.DecodeError.
+    cursor: ?[]const u8 = null,
+    /// Force CURSOR mode even when `cursor == null` (the first page of a cursor walk, or when
+    /// offset mode is disabled). Implied true whenever `cursor != null`.
+    cursorMode: bool = false,
+    /// Cursor-mode page size (alias of perPage). When non-null in cursor mode it overrides
+    /// perPage (still clamped to 500). The very first cursor page (cursor==null but mode forced
+    /// to cursor by the handler) uses perPage.
+    limit: ?u32 = null,
+    /// Cursor mode: skip the COUNT(*) total by default (true). Set false to include totalItems.
+    skipTotal: bool = true,
+    /// Which token format to mint/accept (handler threads this from the comptime app config).
+    cursorToken: pagination.CursorToken = .stateless,
+    /// HMAC secret for the SIGNED token format (the server's JWT secret).
+    signingSecret: []const u8 = "",
+    /// Entropy source for STATEFUL token ids; required only in stateful mode.
+    io: ?std.Io = null,
+    /// Writer DB for the STATEFUL store (mint/lookup write/read `_cursorStates`). When null in
+    /// stateful mode, `conn` is used (it must be a writer).
+    writer: ?*db.Db = null,
+    /// TTL (seconds) for a stateful cursor entry. Default 1 hour.
+    statefulTtlS: i64 = 3600,
 };
-pub const ListResult = struct { page: u32, perPage: u32, totalItems: i64, items: []std.json.Value };
+
+pub const ListResult = struct {
+    mode: ListMode = .offset,
+    page: u32,
+    perPage: u32,
+    /// Offset mode: always set. Cursor mode: set only when skipTotal==false, else null.
+    totalItems: ?i64,
+    items: []std.json.Value,
+    /// Cursor-mode navigation (null/false in offset mode).
+    nextCursor: ?[]const u8 = null,
+    prevCursor: ?[]const u8 = null,
+    hasNext: bool = false,
+    hasPrev: bool = false,
+};
 
 fn baseColumnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -1022,6 +1115,160 @@ fn baseColumnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
         try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"{s}\".{s}", .{ col.name, try ddl.quoteIdent(alloc, f.name) }));
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// Append the `id` tiebreaker to the resolved sort terms so the order is strictly total
+/// (keyset requires it). The tiebreaker's direction follows the LAST sort term (or DESC for the
+/// default `created DESC` sort), matching the SDK's synthesized cursors for migration parity.
+fn effectiveSortTerms(alloc: std.mem.Allocator, col: schema.Collection, base_terms: []const sort.SortTerm) ![]sort.SortTerm {
+    var out: std.ArrayList(sort.SortTerm) = .empty;
+    var last_desc = true; // default sort is created DESC -> id DESC
+    if (base_terms.len > 0) {
+        try out.appendSlice(alloc, base_terms);
+        last_desc = base_terms[base_terms.len - 1].desc;
+    } else {
+        // No client sort -> default ORDER BY created DESC.
+        try out.append(alloc, .{
+            .col_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"created\"", .{col.name}),
+            .field = null,
+            .desc = true,
+            .path = "created",
+        });
+    }
+    // Don't double-append id if the client already sorted by id last.
+    const already_id = base_terms.len > 0 and std.mem.eql(u8, base_terms[base_terms.len - 1].path, "id");
+    if (!already_id) {
+        try out.append(alloc, .{
+            .col_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"id\"", .{col.name}),
+            .field = null,
+            .desc = last_desc,
+            .path = "id",
+        });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// The PUBLIC effective-sort string the cursor token binds to (its `s` field), built from the
+/// client-facing field paths with a leading `-` for DESC — e.g. `-created,id`. This is the form
+/// the SDK can synthesize, so a client-minted stateless cursor round-trips (the SQL ORDER BY,
+/// `order_sql`, is column-qualified and unsuitable as a token binding). Stored in the token and
+/// re-validated on decode.
+fn effectiveSortString(alloc: std.mem.Allocator, terms: []const sort.SortTerm) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (terms, 0..) |t, i| {
+        if (i != 0) try out.append(alloc, ',');
+        if (t.desc) try out.append(alloc, '-');
+        try out.appendSlice(alloc, t.path);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Reject keyset boundaries that can't be read back from a record's JSON object: a relation-path
+/// sort (e.g. `author.name`, which lives under `expand`, not the row root) or a HIDDEN field
+/// (stripped from the row by `rowToObject`). Either would mint a cursor whose boundary value is
+/// silently null and corrupt the keyset window — fail loudly instead. Returns BadCursorSort so
+/// the handler can return a clear 400 BEFORE any rows are fetched.
+fn validateCursorSort(terms: []const sort.SortTerm) keyset.DecodeError!void {
+    for (terms) |t| {
+        if (std.mem.indexOfScalar(u8, t.path, '.') != null) return error.BadCursorSort;
+        if (t.field) |f| if (f.hidden) return error.BadCursorSort;
+    }
+}
+
+/// Read a single sort-key value out of a built record JSON object by the term's field path.
+/// System columns (id/created/updated) and top-level visible user fields live at the object root.
+/// Callers must `validateCursorSort` first, which rejects relation-path/hidden terms; a missing
+/// key here therefore means a genuinely NULL column value.
+fn rowSortKey(obj: std.json.Value, term: sort.SortTerm) keyset.KeysetError!std.json.Value {
+    if (obj != .object) return error.BadCursor;
+    if (std.mem.indexOfScalar(u8, term.path, '.') != null) return error.BadCursor;
+    return obj.object.get(term.path) orelse .null;
+}
+
+/// Mint a cursor token from a kept row's sort-key values, in the selected token format.
+fn mintCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col: schema.Collection, terms: []const sort.SortTerm, row: std.json.Value, forward: bool, sort_str: []const u8, filter_hash: u64) !?[]const u8 {
+    var keys = try alloc.alloc(std.json.Value, terms.len);
+    for (terms, 0..) |t, i| keys[i] = try rowSortKey(row, t);
+    const cur = keyset.Cursor{ .forward = forward, .keys = keys, .sort_str = sort_str, .filter_hash = filter_hash };
+    return switch (q.cursorToken) {
+        .stateless => try keyset.encodeStateless(alloc, cur),
+        .signed => try keyset.encodeSigned(alloc, cur, q.signingSecret),
+        .stateful => try storeStatefulCursor(alloc, q, conn, col, cur),
+    };
+}
+
+/// STATEFUL mint: persist the payload keyed by a random opaque id, return the id as the token.
+fn storeStatefulCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col: schema.Collection, cur: keyset.Cursor) ![]const u8 {
+    const w = q.writer orelse conn;
+    const io = q.io orelse return error.BadCursor;
+    const payload = try keyset.statefulPayload(alloc, cur);
+    var id_buf: [32]u8 = undefined;
+    id_gen.generate(io, &id_buf);
+    const id: []const u8 = try alloc.dupe(u8, &id_buf);
+    const now = try nowUnixDb(conn);
+    var st = try w.prepare(
+        \\INSERT INTO "_cursorStates" ("id","collectionRef","payload","expires","created")
+        \\ VALUES (?1,?2,?3,?4,datetime('now'));
+    );
+    defer st.finalize();
+    try st.bindText(1, id);
+    try st.bindText(2, col.name);
+    try st.bindText(3, payload);
+    try st.bindInt(4, now + q.statefulTtlS);
+    _ = try st.step();
+    return id;
+}
+
+/// STATEFUL decode: look the opaque id up (unexpired) in `_cursorStates` and decode its payload.
+/// Unknown/expired -> keyset.DecodeError.CursorState (the handler maps it to 410 Gone).
+fn loadStatefulCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col: schema.Collection, token: []const u8) keyset.DecodeError!keyset.Cursor {
+    // Read from the SAME connection the store writes to (`q.writer orelse conn`), so a deployment
+    // that threads a distinct writer can't INSERT on one connection and SELECT on another.
+    const c = q.writer orelse conn;
+    if (token.len == 0 or token.len > keyset.max_cursor_len) return error.BadCursor;
+    const now = nowUnixDb(c) catch return error.BadCursor;
+    var st = c.prepare(
+        \\SELECT "payload" FROM "_cursorStates"
+        \\ WHERE "id"=?1 AND "collectionRef"=?2 AND "expires" > ?3;
+    ) catch return error.BadCursor;
+    defer st.finalize();
+    st.bindText(1, token) catch return error.BadCursor;
+    st.bindText(2, col.name) catch return error.BadCursor;
+    st.bindInt(3, now) catch return error.BadCursor;
+    const found = st.step() catch return error.BadCursor;
+    if (!found) return error.CursorState;
+    const payload = try alloc.dupe(u8, st.columnText(0));
+    return keyset.decodeStatefulPayload(alloc, payload);
+}
+
+/// Decode + validate a cursor in the selected format, binding it to the request's effective sort
+/// and filter. Mismatches surface as the specific DecodeError the handler maps to 400/410.
+fn decodeCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col: schema.Collection, token: []const u8, sort_str: []const u8, filter_hash: u64) keyset.DecodeError!keyset.Cursor {
+    const cur = switch (q.cursorToken) {
+        .stateless => try keyset.decodeStateless(alloc, token),
+        .signed => try keyset.decodeSigned(alloc, token, q.signingSecret),
+        .stateful => try loadStatefulCursor(alloc, q, conn, col, token),
+    };
+    if (!std.mem.eql(u8, cur.sort_str, sort_str)) return error.CursorSort;
+    if (cur.filter_hash != filter_hash) return error.CursorFilter;
+    return cur;
+}
+
+fn nowUnixDb(conn: *db.Db) db.DbError!i64 {
+    var st = try conn.prepare("SELECT strftime('%s','now');");
+    defer st.finalize();
+    _ = try st.step();
+    return std.fmt.parseInt(i64, st.columnText(0), 10) catch 0;
+}
+
+/// GC: delete expired stateful cursor entries. Safe to call periodically (scheduler) or inline.
+pub fn gcCursorStates(w: *db.Db) db.DbError!void {
+    const now = try nowUnixDb(w);
+    var st = try w.prepare("DELETE FROM \"_cursorStates\" WHERE \"expires\" <= ?1;");
+    defer st.finalize();
+    try st.bindInt(1, now);
+    _ = try st.step();
 }
 
 pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: ListQuery) !ListResult {
@@ -1051,28 +1298,120 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         try merged.appendSlice(alloc, rc.params);
         params = try merged.toOwnedSlice(alloc);
     };
-    var order_sql: []const u8 = try std.fmt.allocPrint(alloc, "\"{s}\".\"created\" DESC", .{col.name});
-    if (q.sort) |sstr| if (sstr.len > 0) {
-        const ob = try sort.compile(alloc, &j, sstr);
-        if (ob.len > 0) order_sql = ob;
-    };
+
+    // Resolve the client sort into structured terms. Cursor mode appends an `id` tiebreaker so the
+    // order is strictly total (keyset requires it); OFFSET mode keeps its historical ORDER BY
+    // (client sort or the default `created DESC`) UNCHANGED so existing offset clients are byte-
+    // identical.
+    const base_terms = if (q.sort) |sstr| (if (sstr.len > 0) try sort.compileTerms(alloc, &j, sstr) else &.{}) else &.{};
+    const offset_order_sql: []const u8 = if (base_terms.len > 0)
+        try sort.orderByFromTerms(alloc, base_terms)
+    else
+        try std.fmt.allocPrint(alloc, "\"{s}\".\"created\" DESC", .{col.name});
+    const eff_terms = try effectiveSortTerms(alloc, col, base_terms);
+    const order_sql = try sort.orderByFromTerms(alloc, eff_terms);
+
     var joins_sql: std.ArrayList(u8) = .empty;
     for (j.joins.items) |jn| { try joins_sql.append(alloc, ' '); try joins_sql.appendSlice(alloc, jn); }
-
     const where_clause = if (where_sql.len > 0) try std.fmt.allocPrint(alloc, " WHERE {s}", .{where_sql}) else "";
+    const bcols = try baseColumnList(alloc, col);
+    const per: u32 = blk: {
+        const requested = if ((q.cursor != null or q.cursorMode) and q.limit != null) q.limit.? else q.perPage;
+        break :blk if (requested == 0) 30 else @min(requested, 500);
+    };
 
-    const count_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COUNT(*) FROM \"{s}\"{s}{s};", .{ col.name, joins_sql.items, where_clause }, 0);
-    var cst = try conn.prepare(count_sql);
-    defer cst.finalize();
-    _ = try bindParams(&cst, params, 1);
-    _ = try cst.step();
-    const total = cst.columnInt(0);
+    // ----- CURSOR (keyset) MODE -----
+    // Entered when a token is supplied OR cursorMode is forced (the first page of a walk / when
+    // offset mode is disabled). The first page (no token) has no keyset predicate, hasPrev=false.
+    if (q.cursor != null or q.cursorMode) {
+        // Reject un-mintable keyset sorts (relation-path / hidden) up front with a clear 400,
+        // before any rows are fetched, so a cursor boundary is never silently null.
+        try validateCursorSort(eff_terms);
+        // The token binds to the PUBLIC effective-sort spec (e.g. "-created,id"), not the column
+        // SQL — so an SDK that synthesizes the same spec produces a matching cursor.
+        const eff_sort_str = try effectiveSortString(alloc, eff_terms);
+        const fh = keyset.filterHash(q.filter, q.rule);
 
-    const per: u32 = if (q.perPage == 0) 30 else @min(q.perPage, 500);
+        // Decode the boundary cursor (if any). first_page = no token supplied.
+        const maybe_cur: ?keyset.Cursor = if (q.cursor) |token| try decodeCursor(alloc, q, conn, col, token, eff_sort_str, fh) else null;
+        if (maybe_cur) |cur| if (cur.keys.len != eff_terms.len) return error.BadCursor;
+        const forward = if (maybe_cur) |cur| cur.forward else true;
+
+        // Keyset predicate (only when a boundary cursor is present), AND-ed onto filter+rule.
+        var win_where: []const u8 = where_clause;
+        var ks_params: []const compiler.Param = &.{};
+        if (maybe_cur) |cur| {
+            const ks = try keyset.build(alloc, eff_terms, cur.keys, forward);
+            ks_params = ks.params;
+            win_where = if (where_sql.len > 0)
+                try std.fmt.allocPrint(alloc, " WHERE ({s}) AND {s}", .{ where_sql, ks.where_sql })
+            else
+                try std.fmt.allocPrint(alloc, " WHERE {s}", .{ks.where_sql});
+        }
+
+        // Backward travel: reverse the ORDER BY so the DB returns the rows CLOSEST to the boundary
+        // going backward; we re-reverse the page into forward order after fetch.
+        const fetch_order = if (forward) order_sql else try reversedOrderBy(alloc, eff_terms);
+
+        const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ?;", .{ bcols, col.name, joins_sql.items, win_where, fetch_order }, 0);
+        var pst = try conn.prepare(page_sql);
+        defer pst.finalize();
+        var idx = try bindParams(&pst, params, 1);
+        idx = try bindParams(&pst, ks_params, idx);
+        try pst.bindInt(idx, @as(i64, per) + 1); // fetch limit+1 to detect "has more"
+
+        var fetched: std.ArrayList(std.json.Value) = .empty;
+        while (try pst.step()) try fetched.append(alloc, try rowToObject(alloc, &pst, col));
+
+        const has_more = fetched.items.len > per;
+        var kept = fetched.items;
+        if (has_more) kept = kept[0..per];
+        // Backward page: re-reverse into forward order.
+        if (!forward) std.mem.reverse(std.json.Value, kept);
+
+        // Navigation. On the FIRST page (no token) there is no previous page. Otherwise a page
+        // reached via a forward cursor has a previous page, and one reached via a backward cursor
+        // has a next page; the extra (N+1) row reveals more in the travel direction.
+        var has_next = false;
+        var has_prev = false;
+        if (maybe_cur == null) {
+            has_next = has_more;
+            has_prev = false;
+        } else if (forward) {
+            has_next = has_more;
+            has_prev = true;
+        } else {
+            has_prev = has_more;
+            has_next = true;
+        }
+        var next_cursor: ?[]const u8 = null;
+        var prev_cursor: ?[]const u8 = null;
+        if (kept.len > 0) {
+            if (has_next) next_cursor = try mintCursor(alloc, q, conn, col, eff_terms, kept[kept.len - 1], true, eff_sort_str, fh);
+            if (has_prev) prev_cursor = try mintCursor(alloc, q, conn, col, eff_terms, kept[0], false, eff_sort_str, fh);
+        }
+
+        var total: ?i64 = null;
+        if (!q.skipTotal) total = try countTotal(alloc, conn, col, joins_sql.items, where_clause, params);
+
+        return .{
+            .mode = .cursor,
+            .page = 0,
+            .perPage = per,
+            .totalItems = total,
+            .items = kept,
+            .nextCursor = next_cursor,
+            .prevCursor = prev_cursor,
+            .hasNext = has_next,
+            .hasPrev = has_prev,
+        };
+    }
+
+    // ----- OFFSET MODE (unchanged wire behavior) -----
+    const total = try countTotal(alloc, conn, col, joins_sql.items, where_clause, params);
     const page: u32 = if (q.page == 0) 1 else q.page;
     const offset: i64 = @as(i64, (page - 1)) * @as(i64, per);
-    const bcols = try baseColumnList(alloc, col);
-    const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, order_sql }, 0);
+    const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, offset_order_sql }, 0);
     var pst = try conn.prepare(page_sql);
     defer pst.finalize();
     const after = try bindParams(&pst, params, 1);
@@ -1081,7 +1420,39 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
 
     var items: std.ArrayList(std.json.Value) = .empty;
     while (try pst.step()) try items.append(alloc, try rowToObject(alloc, &pst, col));
-    return .{ .page = page, .perPage = per, .totalItems = total, .items = try items.toOwnedSlice(alloc) };
+    const kept_items = try items.toOwnedSlice(alloc);
+    const total_pages_rows: i64 = @as(i64, (page)) * @as(i64, per);
+    return .{
+        .mode = .offset,
+        .page = page,
+        .perPage = per,
+        .totalItems = total,
+        .items = kept_items,
+        // Offset mode derives has_next/has_prev from page math so the handler can answer either.
+        .hasNext = total > total_pages_rows,
+        .hasPrev = page > 1,
+    };
+}
+
+fn countTotal(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, joins: []const u8, where_clause: []const u8, params: []const compiler.Param) !i64 {
+    const count_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COUNT(*) FROM \"{s}\"{s}{s};", .{ col.name, joins, where_clause }, 0);
+    var cst = try conn.prepare(count_sql);
+    defer cst.finalize();
+    _ = try bindParams(&cst, params, 1);
+    _ = try cst.step();
+    return cst.columnInt(0);
+}
+
+fn reversedOrderBy(alloc: std.mem.Allocator, terms: []const sort.SortTerm) ![]u8 {
+    const rev = try alloc.alloc(sort.SortTerm, terms.len);
+    // `rev` is a scratch copy (SortTerms only borrow their slices); free it after building the
+    // string so only the returned ORDER BY fragment remains allocated.
+    defer alloc.free(rev);
+    for (terms, 0..) |t, i| {
+        rev[i] = t;
+        rev[i].desc = !t.desc;
+    }
+    return sort.orderByFromTerms(alloc, rev);
 }
 
 pub fn bindParams(st: *db.Stmt, params: []const compiler.Param, start: c_int) !c_int {
@@ -1165,4 +1536,254 @@ test "list applies a rule clause AND-ed with the filter" {
     const res = try list(a, &d, col, .{ .rule = "title = \"keep\"" });
     try std.testing.expectEqual(@as(i64, 1), res.totalItems);
     try std.testing.expectEqualStrings("r1", res.items[0].object.get("id").?.string);
+}
+
+// ----- Cursor (keyset) pagination -----
+
+fn seedSeq(d: *db.Db, n: usize) !void {
+    var i: usize = 1;
+    while (i <= n) : (i += 1) {
+        const sql = try std.fmt.allocPrintSentinel(std.testing.allocator, "INSERT INTO posts (id,created,updated,title,price) VALUES ('r{d:0>3}','2026-01-{d:0>2}T00:00:00Z','t','t{d}',{d});", .{ i, i, i, i * 10 }, 0);
+        defer std.testing.allocator.free(sql);
+        try d.exec(sql);
+    }
+}
+
+test "cursor: forward walk to exhaustion has no dup/skip and ends hasNext=false" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try seedSeq(&d, 7); // r001..r007, created ascending
+    // Sort created ASC so the natural sequence is r001..r007.
+    var seen: std.ArrayList([]const u8) = .empty;
+    var cursor: ?[]const u8 = null;
+    var pages: usize = 0;
+    while (true) {
+        const res = try list(a, &d, col, .{ .sort = "created", .perPage = 3, .limit = 3, .cursor = cursor, .cursorMode = true });
+        try std.testing.expectEqual(records_list_mode_cursor, res.mode);
+        for (res.items) |it| try seen.append(a, it.object.get("id").?.string);
+        pages += 1;
+        if (!res.hasNext) {
+            try std.testing.expect(res.nextCursor == null);
+            break;
+        }
+        cursor = res.nextCursor.?;
+        try std.testing.expect(pages < 10); // guard against an infinite loop
+    }
+    try std.testing.expectEqual(@as(usize, 7), seen.items.len);
+    // Strictly increasing, no dup/skip.
+    for (seen.items, 0..) |id, i| {
+        var buf: [8]u8 = undefined;
+        const want = try std.fmt.bufPrint(&buf, "r{d:0>3}", .{i + 1});
+        try std.testing.expectEqualStrings(want, id);
+    }
+}
+
+const records_list_mode_cursor: ListMode = .cursor;
+
+test "cursor: forward then prevCursor returns the prior window in forward order" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try seedSeq(&d, 6); // r001..r006
+    // page 1 (r001,r002), page 2 (r003,r004)
+    const p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = null, .cursorMode = true });
+    try std.testing.expectEqualStrings("r001", p1.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("r002", p1.items[1].object.get("id").?.string);
+    try std.testing.expect(p1.hasNext);
+    const p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = p1.nextCursor.? });
+    try std.testing.expectEqualStrings("r003", p2.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("r004", p2.items[1].object.get("id").?.string);
+    try std.testing.expect(p2.hasPrev);
+    // Walk back from page 2: should reproduce page 1 in forward order.
+    const back = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = p2.prevCursor.? });
+    try std.testing.expectEqual(@as(usize, 2), back.items.len);
+    try std.testing.expectEqualStrings("r001", back.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("r002", back.items[1].object.get("id").?.string);
+}
+
+test "cursor: a deleted boundary row still paginates correctly (no skip)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try seedSeq(&d, 5); // r001..r005
+    const p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = null, .cursorMode = true });
+    try std.testing.expectEqualStrings("r002", p1.items[1].object.get("id").?.string);
+    // Delete the boundary row (r002) before fetching the next page.
+    try d.exec("DELETE FROM posts WHERE id='r002';");
+    const p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = p1.nextCursor.? });
+    // Keyset is value-based: the next window is still r003,r004 — no skip, no error.
+    try std.testing.expectEqualStrings("r003", p2.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("r004", p2.items[1].object.get("id").?.string);
+}
+
+test "cursor: rule clause is still AND-ed (no rule bypass)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','2026-01-01T00:00:00Z','t','keep',1),('r2','2026-01-02T00:00:00Z','t','drop',1),('r3','2026-01-03T00:00:00Z','t','keep',1);");
+    const res = try list(a, &d, col, .{ .sort = "created", .limit = 50, .rule = "title = \"keep\"", .cursor = null, .cursorMode = true });
+    try std.testing.expectEqual(@as(usize, 2), res.items.len);
+    try std.testing.expectEqualStrings("r1", res.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("r3", res.items[1].object.get("id").?.string);
+    // The minted nextCursor must also carry the same filter binding (rule), so replaying it under
+    // a different filter fails. With cursor==null no nextCursor here (only 2 rows < limit).
+    try std.testing.expect(!res.hasNext);
+}
+
+test "cursor: skipTotal default omits the count; opt-in includes it" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try seedSeq(&d, 4);
+    const cheap = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .skipTotal = true });
+    try std.testing.expect(cheap.totalItems == null);
+    const withTotal = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .skipTotal = false });
+    try std.testing.expectEqual(@as(i64, 4), withTotal.totalItems.?);
+}
+
+test "cursor: changed sort/filter between pages is rejected (BadCursor variants)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try seedSeq(&d, 4);
+    const p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = null, .cursorMode = true });
+    const tok = p1.nextCursor.?;
+    // Different sort -> CursorSort.
+    try std.testing.expectError(error.CursorSort, list(a, &d, col, .{ .sort = "-created", .limit = 2, .cursor = tok }));
+    // Different filter -> CursorFilter.
+    try std.testing.expectError(error.CursorFilter, list(a, &d, col, .{ .sort = "created", .limit = 2, .filter = "price > 0", .cursor = tok }));
+    // Garbage token -> BadCursor.
+    try std.testing.expectError(error.BadCursor, list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = "!!!garbage!!!" }));
+}
+
+test "cursor: signed token round-trips across pages and rejects tampering" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try seedSeq(&d, 4);
+    const secret = "a-32-byte-minimum-test-secret!!!!";
+    const p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .cursorToken = .signed, .signingSecret = secret });
+    const tok = p1.nextCursor.?;
+    const p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = tok, .cursorToken = .signed, .signingSecret = secret });
+    try std.testing.expectEqualStrings("r003", p2.items[0].object.get("id").?.string);
+    // Tamper a byte -> CursorSig.
+    const bad = try a.dupe(u8, tok);
+    bad[0] = if (bad[0] == 'A') 'B' else 'A';
+    try std.testing.expectError(error.CursorSig, list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = bad, .cursorToken = .signed, .signingSecret = secret }));
+}
+
+test "cursor: stateful token stores state, walks pages, and 410s on unknown id" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    try seedSeq(&d, 4);
+    const p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .cursorToken = .stateful, .io = std.testing.io, .writer = &d });
+    const tok = p1.nextCursor.?;
+    // The token is a short opaque id, not a base64 payload.
+    try std.testing.expect(tok.len <= 64);
+    const p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = tok, .cursorToken = .stateful, .io = std.testing.io, .writer = &d });
+    try std.testing.expectEqualStrings("r003", p2.items[0].object.get("id").?.string);
+    // Unknown id -> CursorState (handler maps to 410).
+    try std.testing.expectError(error.CursorState, list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = "deadbeefdeadbeefdeadbeefdeadbeef", .cursorToken = .stateful, .io = std.testing.io, .writer = &d }));
+}
+
+test "cursor: a hidden sort field is rejected (BadCursorSort), not silently null" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "secret", .hidden = true, .options = .{ .text = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &fields });
+    try d.exec("INSERT INTO notes (id,created,updated,title,secret) VALUES ('r1','t','t','a','x');");
+    // Sorting a cursor walk by the hidden field must fail loudly rather than mint a null boundary.
+    try std.testing.expectError(error.BadCursorSort, list(a, &d, col, .{ .sort = "secret", .cursorMode = true, .limit = 2 }));
+}
+
+test "cursor: a relation-path sort is rejected (BadCursorSort)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }} });
+    const pf = [_]schema.Field{.{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts2", .fields = &pf });
+    try std.testing.expectError(error.BadCursorSort, list(a, &d, posts, .{ .sort = "author.name", .cursorMode = true, .limit = 2 }));
+}
+
+test "offset mode ORDER BY is unchanged (no id tiebreaker appended)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    // Two rows with the SAME created: offset order falls back to physical/rowid order (the prior
+    // behavior), NOT an id tiebreaker — r1 then r2 as inserted.
+    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('z9','2026-01-01T00:00:00Z','t','a',1),('a1','2026-01-01T00:00:00Z','t','b',1);");
+    const res = try list(a, &d, col, .{ .sort = "created", .page = 1, .perPage = 10 });
+    try std.testing.expectEqual(records_list_mode_offset, res.mode);
+    // Insertion order preserved (id tiebreaker would have put 'a1' before 'z9').
+    try std.testing.expectEqualStrings("z9", res.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("a1", res.items[1].object.get("id").?.string);
+}
+
+const records_list_mode_offset: ListMode = .offset;
+
+test "reversedOrderBy frees its scratch slice (no leak on the testing allocator)" {
+    // Drive reversedOrderBy directly on the raw testing allocator: it allocates a `rev` scratch
+    // copy of the terms and must free it, leaving only the returned string allocated. A leaked
+    // `rev` fails this test (the testing allocator panics on teardown).
+    const a = std.testing.allocator;
+    const terms = [_]sort.SortTerm{
+        .{ .col_sql = "\"posts\".\"created\"", .field = null, .desc = true, .path = "created" },
+        .{ .col_sql = "\"posts\".\"id\"", .field = null, .desc = true, .path = "id" },
+    };
+    const ob = try reversedOrderBy(a, &terms);
+    defer a.free(ob);
+    // Reversed: DESC -> ASC for every term.
+    try std.testing.expectEqualStrings("\"posts\".\"created\" ASC, \"posts\".\"id\" ASC", ob);
+}
+
+test "gcCursorStates prunes only expired rows" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try d.exec("INSERT INTO \"_cursorStates\" (\"id\",\"collectionRef\",\"payload\",\"expires\",\"created\") VALUES ('live','posts','{}',9999999999,''),('dead','posts','{}',1,'');");
+    try gcCursorStates(&d);
+    var st = try d.prepare("SELECT COUNT(*) FROM \"_cursorStates\";");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
 }

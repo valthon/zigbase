@@ -74,12 +74,29 @@ fn init_0005(w: *db.Db) db.DbError!void {
     try w.exec("CREATE INDEX IF NOT EXISTS \"idx_oauthstate_expires\" ON \"_oauthStates\" (\"expires\");");
 }
 
+fn init_0006(w: *db.Db) db.DbError!void {
+    // Server-side keyset-cursor state store for the STATEFUL token format
+    // (App(.{ .pagination = .{ .cursor_token = .stateful } })). A minted cursor stores its
+    // opaque keyset payload here keyed by a random "id"; the client receives only the id.
+    // On use the payload is looked up (if unexpired) and decoded. "expires" is a unix-seconds
+    // TTL; a periodic GC (records.gcCursorStates) prunes expired rows, and an index on
+    // "expires" keeps that sweep cheap. Unused entirely in the stateless/signed modes.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_cursorStates" (
+        \\  "id" TEXT PRIMARY KEY, "collectionRef" TEXT NOT NULL, "payload" TEXT NOT NULL,
+        \\  "expires" INTEGER NOT NULL, "created" TEXT NOT NULL
+        \\);
+    );
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_cursorstate_expires\" ON \"_cursorStates\" (\"expires\");");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
     .{ .name = "0003_external_auths", .up = init_0003 },
     .{ .name = "0004_consumed_tokens", .up = init_0004 },
     .{ .name = "0005_oauth_states", .up = init_0005 },
+    .{ .name = "0006_cursor_states", .up = init_0006 },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {
