@@ -95,3 +95,44 @@ export class LocalAuthStore extends BaseAuthStore {
     super.clear();
   }
 }
+
+export interface CookieSerializeOptions {
+  path?: string;
+  maxAge?: number;
+  sameSite?: "strict" | "lax" | "none";
+  secure?: boolean;
+}
+
+export class CookieAuthStore extends BaseAuthStore {
+  constructor(private readonly key = "zb_auth") {
+    super();
+  }
+
+  exportToCookie(opts: CookieSerializeOptions = {}): string {
+    const value = encodeURIComponent(
+      JSON.stringify({ token: this._token, record: this._record }),
+    );
+    const parts = [`${this.key}=${value}`, `Path=${opts.path ?? "/"}`];
+    if (opts.maxAge !== undefined) parts.push(`Max-Age=${opts.maxAge}`);
+    parts.push(`SameSite=${opts.sameSite ?? "Strict"}`);
+    if (opts.secure) parts.push("Secure");
+    return parts.join("; ");
+  }
+
+  loadFromCookie(cookieHeader: string): void {
+    const match = cookieHeader
+      .split(";")
+      .map((c) => c.trim())
+      .find((c) => c.startsWith(`${this.key}=`));
+    if (!match) return;
+    try {
+      const raw = decodeURIComponent(match.slice(this.key.length + 1));
+      const parsed = JSON.parse(raw) as { token: string | null; record: AuthRecord | null };
+      this._token = parsed.token ?? null;
+      this._record = parsed.record ?? null;
+      this.emit();
+    } catch {
+      // ignore malformed cookie
+    }
+  }
+}
