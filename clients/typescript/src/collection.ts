@@ -1,5 +1,14 @@
 import type { Transport } from "./transport.js";
 import type { AuthStore, AuthRecord } from "./auth-store.js";
+import { ZigbaseError } from "./errors.js";
+import {
+  type ZbRecord,
+  type ListResult,
+  type ListOpts,
+  type RecordCrudOpts,
+  hasBlob,
+  toFormData,
+} from "./records.js";
 
 export interface AuthResponse {
   token: string;
@@ -101,6 +110,84 @@ export class CollectionService {
       method: "POST",
       body: { token, password },
       skipAuth: true,
+    });
+  }
+
+  /** `/api/collections/<name>/records` */
+  private recordsBase(): string {
+    return `${this.base()}/records`;
+  }
+
+  /** Offset pagination. `perPage` is clamped to the server max of 500. */
+  getList<T = ZbRecord>(page = 1, perPage = 30, opts: ListOpts = {}): Promise<ListResult<T>> {
+    return this.transport.send<ListResult<T>>(this.recordsBase(), {
+      method: "GET",
+      query: {
+        page,
+        perPage: Math.min(Math.max(perPage, 1), 500),
+        filter: opts.filter,
+        sort: opts.sort,
+        expand: opts.expand,
+        fields: opts.fields,
+        skipTotal: opts.skipTotal ? 1 : undefined,
+      },
+      signal: opts.signal,
+    });
+  }
+
+  getOne<T = ZbRecord>(id: string, opts: RecordCrudOpts = {}): Promise<T> {
+    return this.transport.send<T>(`${this.recordsBase()}/${encodeURIComponent(id)}`, {
+      method: "GET",
+      query: { expand: opts.expand, fields: opts.fields },
+      signal: opts.signal,
+    });
+  }
+
+  /** getList(1, 1) sugar. Throws a 404 ZigbaseError when nothing matches. */
+  async getFirstListItem<T = ZbRecord>(
+    filter: string,
+    opts: Omit<ListOpts, "filter"> = {},
+  ): Promise<T> {
+    const list = await this.getList<T>(1, 1, { ...opts, filter, skipTotal: true });
+    const first = list.items[0];
+    if (first === undefined) {
+      throw new ZigbaseError({
+        status: 404,
+        message: "No record found matching the filter.",
+        url: this.recordsBase(),
+      });
+    }
+    return first;
+  }
+
+  /** Create a record. Auto-switches to multipart when the body contains a Blob/File. */
+  create<T = ZbRecord>(body: Record<string, unknown>, opts: RecordCrudOpts = {}): Promise<T> {
+    const payload = hasBlob(body) ? toFormData(body) : body;
+    return this.transport.send<T>(this.recordsBase(), {
+      method: "POST",
+      body: payload,
+      query: { expand: opts.expand, fields: opts.fields },
+      signal: opts.signal,
+    });
+  }
+
+  update<T = ZbRecord>(
+    id: string,
+    body: Record<string, unknown>,
+    opts: RecordCrudOpts = {},
+  ): Promise<T> {
+    const payload = hasBlob(body) ? toFormData(body) : body;
+    return this.transport.send<T>(`${this.recordsBase()}/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: payload,
+      query: { expand: opts.expand, fields: opts.fields },
+      signal: opts.signal,
+    });
+  }
+
+  async delete(id: string): Promise<void> {
+    await this.transport.send<void>(`${this.recordsBase()}/${encodeURIComponent(id)}`, {
+      method: "DELETE",
     });
   }
 }
