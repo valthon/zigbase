@@ -85,7 +85,8 @@ fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
         .{ listing_id, ends_at, starts_at },
     );
     const conflicts = try ev.data.list("bookings", .{ .filter = overlap_filter, .perPage = 1 });
-    if (conflicts.totalItems > 0) return error.TimeSlotConflict;
+    // totalItems is optional (cursor mode may skip COUNT); offset mode always sets it.
+    if ((conflicts.totalItems orelse 0) > 0) return error.TimeSlotConflict;
 
     // COMPUTE price_total = hours * the listing's price_per_hour. Reject a
     // negative/absent rate rather than silently storing a bogus total.
@@ -452,6 +453,15 @@ pub fn main(init: std.process.Init) !void {
         },
         // Fires after every successful file upload (e.g. a listing photo).
         .onFileUpload = logFileUpload,
+        // Pagination: both modes on with the default STATELESS cursor tokens (no secret, CDN-
+        // friendly, byte-compatible with the SDK's client-synthesized cursors). To force every
+        // list to use keyset paging, set `.offset = false` (then `page`/`perPage` are rejected
+        // with a 400 and clients must walk via `cursor`).
+        .pagination = .{
+            .offset = true,
+            .cursor = true,
+            .cursor_token = .stateless,
+        },
         // Comptime-hardcoded static dir: the Astro frontend in frontend/dist is
         // served at the root path, no flag needed (and --serve-static is rejected).
         .static_files = .{ .dir = "frontend/dist" },

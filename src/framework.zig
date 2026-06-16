@@ -15,6 +15,7 @@ const mail = @import("mail/mailer.zig");
 const provision = @import("provision.zig");
 const schema = @import("schema.zig");
 const ratelimit = @import("ratelimit.zig");
+const pagination = @import("pagination.zig");
 
 // ============================================================================
 // Comptime plugins (storage + mailer)
@@ -127,7 +128,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -187,6 +188,10 @@ pub fn App(comptime cfg: anytype) type {
             assertPluginContract(P, "storage");
             break :blk P;
         };
+        /// Comptime pagination config resolved from `.pagination` (defaults: both modes on,
+        /// stateless tokens). `@compileError`s on an unknown sub-field or both modes disabled.
+        pub const pagination_config: pagination.Config = pagination.resolve(cfg);
+
         /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
         /// A custom type missing a contract method fails with a contract-specific message.
         pub const MailerPlugin: type = blk: {
@@ -252,6 +257,7 @@ pub fn App(comptime cfg: anytype) type {
             .job_stack_size = job_stack_size,
             .cache_kib = cache_kib,
             .static_mode = static_mode,
+            .pagination = pagination_config,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -276,6 +282,7 @@ pub const ServeOpts = struct {
     job_stack_size: usize = scheduler.default_job_stack_size,
     cache_kib: u32 = db.default_cache_kib,
     static_mode: static_files.Mode = .default,
+    pagination: pagination.Config = .{},
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -592,6 +599,12 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         if (schema_collections.len > 0) {
             try provision.applySpecs(allocator, io, w, schema_collections);
         }
+        // Stateful cursor mode accumulates rows in `_cursorStates`; sweep expired entries at
+        // startup. (Lookups already ignore expired rows, so this is purely space reclamation.)
+        // For long-lived servers, schedule `records.gcCursorStates` on a `.cron` interval too.
+        if (opts.pagination.cursor_token == .stateful) {
+            @import("records.zig").gcCursorStates(w) catch |e| std.log.warn("cursor-state GC at startup failed: {s}", .{@errorName(e)});
+        }
     }
     // Instantiate the comptime-selected storage + mailer plugins. The instances are
     // serveImpl stack vars that outlive the server (srv.listen() runs to shutdown),
@@ -648,6 +661,11 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .file_token_ttl_s = cfg.file_token_ttl_s,
         .sentry_dsn = cfg.sentry_dsn,
         .static_source = static_source,
+        .pagination = .{
+            .offset_enabled = opts.pagination.offset,
+            .cursor_enabled = opts.pagination.cursor,
+            .cursor_token = opts.pagination.cursor_token,
+        },
         .storage = &storage_iface,
         .mailer = &mailer_iface,
         .dispatch = dispatch,
@@ -858,6 +876,23 @@ test "App(.{}) has no comptime collections and no provision migrations" {
     const A = App(.{});
     try std.testing.expectEqual(@as(usize, 0), A.collections.len);
     try std.testing.expectEqual(@as(usize, 0), A.provision_migrations.len);
+}
+
+test "App(cfg) resolves the comptime pagination config (defaults + overrides)" {
+    // Stock binary: both modes on, stateless tokens.
+    const D = App(.{});
+    try std.testing.expect(D.pagination_config.offset);
+    try std.testing.expect(D.pagination_config.cursor);
+    try std.testing.expectEqual(pagination.CursorToken.stateless, D.pagination_config.cursor_token);
+
+    // Token-format selector + enable/disable.
+    const S = App(.{ .pagination = .{ .cursor_token = .signed } });
+    try std.testing.expectEqual(pagination.CursorToken.signed, S.pagination_config.cursor_token);
+
+    const C = App(.{ .pagination = .{ .offset = false, .cursor_token = .stateful } });
+    try std.testing.expect(!C.pagination_config.offset);
+    try std.testing.expect(C.pagination_config.cursor);
+    try std.testing.expectEqual(pagination.CursorToken.stateful, C.pagination_config.cursor_token);
 }
 
 test "App(cfg) static_files modes: default, disabled, dir, embedded (with coercion)" {

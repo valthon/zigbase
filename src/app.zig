@@ -1,6 +1,7 @@
 const std = @import("std");
 const db = @import("db.zig");
 const ratelimit = @import("ratelimit.zig");
+const pagination = @import("pagination.zig");
 
 /// Shared request-handling state. `io` supplies entropy for id generation;
 /// `pool` is the SQLite connection pool. Config/auth are added in later sub-projects.
@@ -32,6 +33,10 @@ pub const App = struct {
     /// Default = LogMailer (logs); set SMTP config to upgrade to SmtpMailer. null in
     /// tests/CLI where no mailer was wired (callers must fall back to logging).
     mailer: ?*const @import("mail/mailer.zig").Mailer = null,
+    /// Resolved pagination knobs (offset/cursor enablement + cursor token format), threaded from
+    /// the comptime `App(.{ .pagination = ... })` config in framework.serveImpl. Defaults match
+    /// the stock binary: both modes enabled, stateless tokens.
+    pagination: pagination.Runtime = .{},
     /// Type-erased event dispatch built by the comptime App(cfg) builder; null = no subscribers.
     dispatch: ?*const @import("events.zig").Dispatch = null,
     /// In-memory rate limiter for sensitive auth endpoints; null = disabled

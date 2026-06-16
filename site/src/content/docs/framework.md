@@ -95,6 +95,7 @@ pub fn main(init: std.process.Init) !void {
 | `storage` | Storage plugin TYPE (defaults to local-disk storage). |
 | `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
+| `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
 
 ## 4. Record hooks (`.hooks`)
 
@@ -511,6 +512,37 @@ zigbase.App(.{
 
 `.pools.jobs` is the unified job-pool lever; the legacy `.jobs = .{ .pool_size = N }` still
 works (and `.pools.jobs` takes precedence when both are set).
+
+## 10b. Pagination (`.pagination`)
+
+`.pagination` chooses, at comptime, which list-pagination modes the records list endpoint
+exposes and which **cursor token format** it mints. All fields are optional; the stock binary
+behaves as `.{ .offset = true, .cursor = true, .cursor_token = .stateless }`.
+
+```zig
+zigbase.App(.{
+    .pagination = .{
+        .offset = true,             // page/perPage offset paging (default true)
+        .cursor = true,             // cursor (keyset) paging      (default true)
+        .cursor_token = .stateless, // .stateless | .signed | .stateful (default .stateless)
+    },
+}).runCli(init);
+```
+
+- **`.offset = false`** — requests with `page`/`perPage` get a 400; clients must walk `cursor`.
+- **`.cursor = false`** — requests with `cursor` get a 400; only offset paging is allowed.
+- **Both `false`** — a `@compileError` (a list endpoint must have at least one mode).
+
+The `.cursor_token` selector (security/statefulness tradeoffs):
+
+| Value | Token | Tamper-evident | State | Use when |
+| --- | --- | --- | --- | --- |
+| `.stateless` (default) | base64url JSON payload, validated against the request's sort/filter | No (rules + parameterized binding secure it) | None | Default; CDN-friendly; SDK-byte-compatible. |
+| `.signed` | stateless payload + HMAC-SHA256 keyed by the **server JWT secret** | Yes (400 on bad MAC) | None | You want tamper-evidence with no extra storage. |
+| `.stateful` | random opaque id; payload stored in `_cursorStates` with a TTL (GC'd) | N/A | A row per cursor | You want server-controlled validity/expiry (410 on expired). |
+
+See the [API reference](api#cursor-keyset-pagination) for the request/response shape. The
+blog example uses `.cursor_token = .signed`; golfsim shows the explicit stateless default.
 
 ## 11. Errors + Sentry
 

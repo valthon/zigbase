@@ -343,32 +343,96 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         .check => rule_expr = col.listRule,
     }
     const qp = try params_mod.parse(ctx.allocator, ctx.query);
+    const pg = app.pagination;
+
+    // Mode selection + enable/disable gating (comptime-configured via App(.{ .pagination = ... })).
+    // The PRESENCE of a `cursor` param (even empty = "first page") or a `limit` param signals
+    // cursor-mode intent — this is what the SDK's getPage() sends. A non-empty cursor TOKEN is
+    // tracked separately so the first page (empty token) skips the keyset predicate.
+    const cursor_present = qp.get("cursor") != null or qp.get("limit") != null;
+    const has_token = if (qp.get("cursor")) |c| c.len > 0 else false;
+    const has_page_param = qp.get("page") != null or qp.get("perPage") != null;
+    if (cursor_present and !pg.cursor_enabled)
+        return ApiError.badRequest("Cursor pagination is disabled.").toResponse(ctx.allocator);
+    if (has_page_param and !pg.offset_enabled)
+        return ApiError.badRequest("Offset pagination is disabled; use `cursor`.").toResponse(ctx.allocator);
+    // Cursor mode when the client opted in (cursor/limit param) OR offset is disabled. A cursor
+    // param was already rejected above when cursor is disabled, so we never reach cursor mode then.
+    const cursor_mode = (cursor_present or !pg.offset_enabled) and pg.cursor_enabled;
+
     const page = parseU32(qp.get("page"), 1);
     const perPage = parseU32(qp.get("perPage"), 30);
+    const limit: ?u32 = if (qp.get("limit")) |l| (std.fmt.parseInt(u32, l, 10) catch null) else null;
+    // skipTotal default: true in cursor mode (cheap), false in offset mode (unchanged behavior).
+    const skip_total = parseBool(qp.get("skipTotal"), cursor_mode);
 
-    const result = records.list(ctx.allocator, &r, col, .{
+    // The STATEFUL token format mints/looks up cursor rows in `_cursorStates`, so it needs the
+    // writer connection — but ONLY for the records.list call. We acquire it just around that call
+    // and release it immediately after (a `errdefer` covers the error returns), so the writer lock
+    // is never held across `expand`/serialize. Other modes run entirely on the pooled reader `r`.
+    const need_writer = pg.cursor_token == .stateful and cursor_mode;
+    const writer: ?*db.Db = if (need_writer) app.pool.acquireWriter() else null;
+    var writer_held = need_writer;
+    defer if (writer_held) app.pool.releaseWriter();
+
+    const conn = writer orelse &r;
+
+    const result = records.list(ctx.allocator, conn, col, .{
         .filter = qp.get("filter"),
         .sort = qp.get("sort"),
         .page = page,
         .perPage = perPage,
         .rule = rule_expr,
         .rctx = &rctx,
-    }) catch |e| switch (e) {
+        .cursor = if (cursor_mode and has_token) qp.get("cursor") else null,
+        .cursorMode = cursor_mode,
+        .limit = limit,
+        .skipTotal = skip_total,
+        .cursorToken = pg.cursor_token,
+        .signingSecret = app.jwt_secret,
+        .io = app.io,
+        .writer = writer,
+    }) catch |e| {
+        if (writer_held) {
+            app.pool.releaseWriter();
+            writer_held = false;
+        }
+        switch (e) {
+        error.CursorState => return ApiError.gone("Cursor expired; re-fetch from the start.").toResponse(ctx.allocator),
+        error.BadCursorSort => return ApiError.badRequest("Cursor pagination requires a sortable, visible, non-relation sort field.").toResponse(ctx.allocator),
+        error.CursorSig => return ApiError.badRequest("Invalid cursor signature.").toResponse(ctx.allocator),
+        error.CursorSort => return ApiError.badRequest("Cursor does not match the requested sort.").toResponse(ctx.allocator),
+        error.CursorFilter => return ApiError.badRequest("Cursor does not match the requested filter.").toResponse(ctx.allocator),
+        error.BadCursor => return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator),
         error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep =>
             return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
         else => return e,
+        }
     };
+    // Release the writer lock immediately on success — expand/serialize below run on the reader.
+    if (writer_held) {
+        app.pool.releaseWriter();
+        writer_held = false;
+    }
 
     if (qp.get("expand")) |exp| if (exp.len > 0) {
         for (result.items) |*item| try expand_mod.expand(ctx.allocator, &r, col, item, exp, 0, &rctx);
     };
 
-    const total_pages: i64 = if (result.perPage == 0) 0 else @divTrunc(result.totalItems + @as(i64, result.perPage) - 1, @as(i64, result.perPage));
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator, "page", .{ .integer = @intCast(result.page) });
     try root.put(ctx.allocator, "perPage", .{ .integer = @intCast(result.perPage) });
-    try root.put(ctx.allocator, "totalItems", .{ .integer = result.totalItems });
-    try root.put(ctx.allocator, "totalPages", .{ .integer = total_pages });
+    if (result.totalItems) |total| {
+        const total_pages: i64 = if (result.perPage == 0) 0 else @divTrunc(total + @as(i64, result.perPage) - 1, @as(i64, result.perPage));
+        try root.put(ctx.allocator, "totalItems", .{ .integer = total });
+        try root.put(ctx.allocator, "totalPages", .{ .integer = total_pages });
+    }
+    if (result.mode == .cursor) {
+        try root.put(ctx.allocator, "nextCursor", if (result.nextCursor) |c| .{ .string = c } else .null);
+        try root.put(ctx.allocator, "prevCursor", if (result.prevCursor) |c| .{ .string = c } else .null);
+        try root.put(ctx.allocator, "hasNext", .{ .bool = result.hasNext });
+        try root.put(ctx.allocator, "hasPrev", .{ .bool = result.hasPrev });
+    }
     var arr = std.json.Array.init(ctx.allocator);
     for (result.items) |it| try arr.append(it);
     try root.put(ctx.allocator, "items", .{ .array = arr });
@@ -378,6 +442,14 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
 fn parseU32(s: ?[]const u8, default: u32) u32 {
     const v = s orelse return default;
     return std.fmt.parseInt(u32, v, 10) catch default;
+}
+
+/// Parse a query-param boolean ("true"/"1" => true, "false"/"0" => false), else `default`.
+fn parseBool(s: ?[]const u8, default: bool) bool {
+    const v = s orelse return default;
+    if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1")) return true;
+    if (std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "0")) return false;
+    return default;
 }
 
 const TestEnv = struct {
@@ -487,6 +559,117 @@ test "list handler clamps an oversized perPage to the 500 cap (F9 DoS)" {
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"perPage\":500") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"perPage\":100000") == null);
+}
+
+fn extractStr(body: []const u8, key: []const u8) ?[]const u8 {
+    const k = std.fmt.allocPrint(std.testing.allocator, "\"{s}\":\"", .{key}) catch return null;
+    defer std.testing.allocator.free(k);
+    const start = (std.mem.indexOf(u8, body, k) orelse return null) + k.len;
+    const end = std.mem.indexOfScalarPos(u8, body, start, '"') orelse return null;
+    return body[start..end];
+}
+
+test "cursor handler: forward mode returns hasNext/nextCursor and omits totalItems by default" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    inline for (.{ "a", "b", "c" }) |t| {
+        var c = ctxFor(env, a, .POST, "{\"title\":\"" ++ t ++ "\"}", &col_param);
+        _ = try create(&c);
+    }
+    // Disable offset so the first page (no cursor token) runs in cursor mode.
+    env.app.pagination = .{ .offset_enabled = false, .cursor_enabled = true, .cursor_token = .stateless };
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "limit=2", .allocator = a, .app = &env.app, .params = &col_param };
+    const res = try list(&lctx);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"hasNext\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"nextCursor\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"totalItems\"") == null); // skipTotal default
+    env.app.pagination = .{}; // restore
+}
+
+test "cursor handler: skipTotal=false includes totalItems" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    var c1 = ctxFor(env, a, .POST, "{\"title\":\"a\"}", &col_param);
+    _ = try create(&c1);
+    env.app.pagination = .{ .offset_enabled = false, .cursor_enabled = true };
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "limit=2&skipTotal=false", .allocator = a, .app = &env.app, .params = &col_param };
+    const res = try list(&lctx);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"totalItems\":1") != null);
+    env.app.pagination = .{};
+}
+
+test "cursor handler: garbage cursor -> 400; changed sort -> 400" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    inline for (.{ "a", "b", "c" }) |t| {
+        var c = ctxFor(env, a, .POST, "{\"title\":\"" ++ t ++ "\"}", &col_param);
+        _ = try create(&c);
+    }
+    // Garbage cursor.
+    var g = http.RequestCtx{ .method = .GET, .path = "/", .query = "cursor=%21%21garbage", .allocator = a, .app = &env.app, .params = &col_param };
+    try std.testing.expectEqual(@as(u16, 400), (try list(&g)).status);
+    // Get a valid cursor first, then replay it under a different sort -> 400.
+    var first = http.RequestCtx{ .method = .GET, .path = "/", .query = "sort=created&limit=1", .allocator = a, .app = &env.app, .params = &col_param };
+    env.app.pagination = .{ .offset_enabled = false, .cursor_enabled = true };
+    const fres = try list(&first);
+    const tok = extractStr(fres.body, "nextCursor").?;
+    const q2 = try std.fmt.allocPrint(a, "sort=-created&limit=1&cursor={s}", .{tok});
+    var second = http.RequestCtx{ .method = .GET, .path = "/", .query = q2, .allocator = a, .app = &env.app, .params = &col_param };
+    try std.testing.expectEqual(@as(u16, 400), (try list(&second)).status);
+    env.app.pagination = .{};
+}
+
+test "gating: cursor disabled -> cursor param 400; offset disabled -> page param 400" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    // cursor disabled: a cursor param is rejected.
+    env.app.pagination = .{ .offset_enabled = true, .cursor_enabled = false };
+    var c = http.RequestCtx{ .method = .GET, .path = "/", .query = "cursor=abc", .allocator = a, .app = &env.app, .params = &col_param };
+    const cres = try list(&c);
+    try std.testing.expectEqual(@as(u16, 400), cres.status);
+    try std.testing.expect(std.mem.indexOf(u8, cres.body, "Cursor pagination is disabled") != null);
+    // offset disabled: a page/perPage param is rejected.
+    env.app.pagination = .{ .offset_enabled = false, .cursor_enabled = true };
+    var p = http.RequestCtx{ .method = .GET, .path = "/", .query = "page=2", .allocator = a, .app = &env.app, .params = &col_param };
+    const pres = try list(&p);
+    try std.testing.expectEqual(@as(u16, 400), pres.status);
+    try std.testing.expect(std.mem.indexOf(u8, pres.body, "Offset pagination is disabled") != null);
+    env.app.pagination = .{};
+}
+
+test "offset mode response shape is unchanged (regression guard)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    var c1 = ctxFor(env, a, .POST, "{\"title\":\"a\"}", &col_param);
+    _ = try create(&c1);
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "perPage=10", .allocator = a, .app = &env.app, .params = &col_param };
+    const res = try list(&lctx);
+    // Offset envelope: page/perPage/totalItems/totalPages/items; no cursor fields.
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"totalItems\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"totalPages\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"nextCursor\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"hasNext\"") == null);
 }
 
 fn seedRuled(env: *TestEnv, name: []const u8, listR: ?[]const u8, viewR: ?[]const u8, createR: ?[]const u8) !void {

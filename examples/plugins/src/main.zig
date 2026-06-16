@@ -270,7 +270,8 @@ fn auditSweepJob(ev: *zigbase.events.JobEvent) anyerror!void {
         .filter = "status = \"published\"",
         .perPage = 1, // we only need totalItems, not all rows
     });
-    const published_count = result.totalItems;
+    // totalItems is optional (cursor mode may skip the COUNT); offset mode always sets it.
+    const published_count = result.totalItems orelse 0;
     std.log.info("[audit-sweep] published_posts={d}", .{published_count});
 
     // --- write phase: append an audit row ------------------------------------

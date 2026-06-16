@@ -40,7 +40,8 @@ fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
         "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing_id, ends_at, starts_at });
     const conflicts = try ev.data.list("bookings", .{ .filter = overlap_filter, .perPage = 1 });
-    if (conflicts.totalItems > 0) return error.TimeSlotConflict; // -> HTTP 400
+    // totalItems is optional (cursor mode may skip COUNT); offset mode always sets it.
+    if ((conflicts.totalItems orelse 0) > 0) return error.TimeSlotConflict; // -> HTTP 400
 
     // 3. Compute price_total = hours × rate (server-side, unforgeable).
     try rec.put(ev.arena, "price_total", .{ .float = hours * rate });
