@@ -210,6 +210,7 @@ export class CollectionService {
     filter?: string;
     sort?: string;
     expand?: string;
+    fields?: string;
     withTotal?: boolean;
     signal?: AbortSignal;
   } = {}): Promise<CursorPage<T>> {
@@ -236,6 +237,7 @@ export class CollectionService {
         filter: filterStr || undefined,
         sort: effectiveSort,
         expand: opts.expand,
+        fields: opts.fields,
         skipTotal: opts.withTotal ? undefined : 1,
       },
       signal: opts.signal,
@@ -275,6 +277,7 @@ export class CollectionService {
     filter?: string;
     sort?: string;
     expand?: string;
+    fields?: string;
     batch?: number;
     signal?: AbortSignal;
   } = {}): AsyncIterableIterator<T> {
@@ -286,6 +289,7 @@ export class CollectionService {
         filter: opts.filter,
         sort: opts.sort,
         expand: opts.expand,
+        fields: opts.fields,
         signal: opts.signal,
       });
       for (const item of page.items) yield item;
@@ -299,6 +303,7 @@ export class CollectionService {
     filter?: string;
     sort?: string;
     expand?: string;
+    fields?: string;
     batch?: number;
     signal?: AbortSignal;
   } = {}): Promise<T[]> {
