@@ -366,11 +366,14 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     // skipTotal default: true in cursor mode (cheap), false in offset mode (unchanged behavior).
     const skip_total = parseBool(qp.get("skipTotal"), cursor_mode);
 
-    const writer = if (pg.cursor_token == .stateful and cursor_mode) blk: {
-        // Stateful mint/lookup writes/reads `_cursorStates`; needs a writer connection.
-        break :blk app.pool.acquireWriter();
-    } else null;
-    defer if (writer != null) app.pool.releaseWriter();
+    // The STATEFUL token format mints/looks up cursor rows in `_cursorStates`, so it needs the
+    // writer connection — but ONLY for the records.list call. We acquire it just around that call
+    // and release it immediately after (a `errdefer` covers the error returns), so the writer lock
+    // is never held across `expand`/serialize. Other modes run entirely on the pooled reader `r`.
+    const need_writer = pg.cursor_token == .stateful and cursor_mode;
+    const writer: ?*db.Db = if (need_writer) app.pool.acquireWriter() else null;
+    var writer_held = need_writer;
+    defer if (writer_held) app.pool.releaseWriter();
 
     const conn = writer orelse &r;
 
@@ -389,8 +392,14 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         .signingSecret = app.jwt_secret,
         .io = app.io,
         .writer = writer,
-    }) catch |e| switch (e) {
+    }) catch |e| {
+        if (writer_held) {
+            app.pool.releaseWriter();
+            writer_held = false;
+        }
+        switch (e) {
         error.CursorState => return ApiError.gone("Cursor expired; re-fetch from the start.").toResponse(ctx.allocator),
+        error.BadCursorSort => return ApiError.badRequest("Cursor pagination requires a sortable, visible, non-relation sort field.").toResponse(ctx.allocator),
         error.CursorSig => return ApiError.badRequest("Invalid cursor signature.").toResponse(ctx.allocator),
         error.CursorSort => return ApiError.badRequest("Cursor does not match the requested sort.").toResponse(ctx.allocator),
         error.CursorFilter => return ApiError.badRequest("Cursor does not match the requested filter.").toResponse(ctx.allocator),
@@ -398,7 +407,13 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep =>
             return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
         else => return e,
+        }
     };
+    // Release the writer lock immediately on success — expand/serialize below run on the reader.
+    if (writer_held) {
+        app.pool.releaseWriter();
+        writer_held = false;
+    }
 
     if (qp.get("expand")) |exp| if (exp.len > 0) {
         for (result.items) |*item| try expand_mod.expand(ctx.allocator, &r, col, item, exp, 0, &rctx);

@@ -30,11 +30,12 @@ pub const KeysetError = error{BadCursor} || values.ValueError || std.mem.Allocat
 
 /// Distinguished cursor-decode failures, mapped to specific HTTP statuses by the handler:
 ///   BadCursor       -> 400 "Invalid cursor."
+///   BadCursorSort   -> 400 "Cursor pagination requires a sortable, visible, non-relation sort field."
 ///   CursorSig       -> 400 "Invalid cursor signature."   (signed mode, bad/absent MAC)
 ///   CursorSort      -> 400 "Cursor does not match the requested sort."
 ///   CursorFilter    -> 400 "Cursor does not match the requested filter."
 ///   CursorState     -> 410 "Cursor expired."             (stateful mode, unknown/expired id)
-pub const DecodeError = error{ BadCursor, CursorSig, CursorSort, CursorFilter, CursorState } || std.mem.Allocator.Error;
+pub const DecodeError = error{ BadCursor, BadCursorSort, CursorSig, CursorSort, CursorFilter, CursorState } || std.mem.Allocator.Error;
 
 // ===========================================================================
 // Keyset predicate generation (Step 2)

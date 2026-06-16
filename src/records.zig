@@ -1095,13 +1095,40 @@ fn effectiveSortTerms(alloc: std.mem.Allocator, col: schema.Collection, base_ter
     return out.toOwnedSlice(alloc);
 }
 
+/// The PUBLIC effective-sort string the cursor token binds to (its `s` field), built from the
+/// client-facing field paths with a leading `-` for DESC — e.g. `-created,id`. This is the form
+/// the SDK can synthesize, so a client-minted stateless cursor round-trips (the SQL ORDER BY,
+/// `order_sql`, is column-qualified and unsuitable as a token binding). Stored in the token and
+/// re-validated on decode.
+fn effectiveSortString(alloc: std.mem.Allocator, terms: []const sort.SortTerm) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (terms, 0..) |t, i| {
+        if (i != 0) try out.append(alloc, ',');
+        if (t.desc) try out.append(alloc, '-');
+        try out.appendSlice(alloc, t.path);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Reject keyset boundaries that can't be read back from a record's JSON object: a relation-path
+/// sort (e.g. `author.name`, which lives under `expand`, not the row root) or a HIDDEN field
+/// (stripped from the row by `rowToObject`). Either would mint a cursor whose boundary value is
+/// silently null and corrupt the keyset window — fail loudly instead. Returns BadCursorSort so
+/// the handler can return a clear 400 BEFORE any rows are fetched.
+fn validateCursorSort(terms: []const sort.SortTerm) keyset.DecodeError!void {
+    for (terms) |t| {
+        if (std.mem.indexOfScalar(u8, t.path, '.') != null) return error.BadCursorSort;
+        if (t.field) |f| if (f.hidden) return error.BadCursorSort;
+    }
+}
+
 /// Read a single sort-key value out of a built record JSON object by the term's field path.
-/// System columns (id/created/updated) and top-level user fields live at the object root; a
-/// relation-path term (e.g. "author.name") is not supported as a keyset boundary source here
-/// (the handler only mints cursors for root-level sort keys) and returns BadCursor.
+/// System columns (id/created/updated) and top-level visible user fields live at the object root.
+/// Callers must `validateCursorSort` first, which rejects relation-path/hidden terms; a missing
+/// key here therefore means a genuinely NULL column value.
 fn rowSortKey(obj: std.json.Value, term: sort.SortTerm) keyset.KeysetError!std.json.Value {
     if (obj != .object) return error.BadCursor;
-    // Only the bare field name is a valid root key; relation paths contain '.'.
     if (std.mem.indexOfScalar(u8, term.path, '.') != null) return error.BadCursor;
     return obj.object.get(term.path) orelse .null;
 }
@@ -1143,10 +1170,12 @@ fn storeStatefulCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col
 /// STATEFUL decode: look the opaque id up (unexpired) in `_cursorStates` and decode its payload.
 /// Unknown/expired -> keyset.DecodeError.CursorState (the handler maps it to 410 Gone).
 fn loadStatefulCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col: schema.Collection, token: []const u8) keyset.DecodeError!keyset.Cursor {
-    _ = q;
+    // Read from the SAME connection the store writes to (`q.writer orelse conn`), so a deployment
+    // that threads a distinct writer can't INSERT on one connection and SELECT on another.
+    const c = q.writer orelse conn;
     if (token.len == 0 or token.len > keyset.max_cursor_len) return error.BadCursor;
-    const now = nowUnixDb(conn) catch return error.BadCursor;
-    var st = conn.prepare(
+    const now = nowUnixDb(c) catch return error.BadCursor;
+    var st = c.prepare(
         \\SELECT "payload" FROM "_cursorStates"
         \\ WHERE "id"=?1 AND "collectionRef"=?2 AND "expires" > ?3;
     ) catch return error.BadCursor;
@@ -1217,9 +1246,15 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         params = try merged.toOwnedSlice(alloc);
     };
 
-    // Resolve the client sort into structured terms, then append the id tiebreaker so the order
-    // is strictly total (keyset requires it; harmless for offset).
+    // Resolve the client sort into structured terms. Cursor mode appends an `id` tiebreaker so the
+    // order is strictly total (keyset requires it); OFFSET mode keeps its historical ORDER BY
+    // (client sort or the default `created DESC`) UNCHANGED so existing offset clients are byte-
+    // identical.
     const base_terms = if (q.sort) |sstr| (if (sstr.len > 0) try sort.compileTerms(alloc, &j, sstr) else &.{}) else &.{};
+    const offset_order_sql: []const u8 = if (base_terms.len > 0)
+        try sort.orderByFromTerms(alloc, base_terms)
+    else
+        try std.fmt.allocPrint(alloc, "\"{s}\".\"created\" DESC", .{col.name});
     const eff_terms = try effectiveSortTerms(alloc, col, base_terms);
     const order_sql = try sort.orderByFromTerms(alloc, eff_terms);
 
@@ -1236,7 +1271,12 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // Entered when a token is supplied OR cursorMode is forced (the first page of a walk / when
     // offset mode is disabled). The first page (no token) has no keyset predicate, hasPrev=false.
     if (q.cursor != null or q.cursorMode) {
-        const eff_sort_str = order_sql; // the effective ORDER BY string is the token's `s` binding
+        // Reject un-mintable keyset sorts (relation-path / hidden) up front with a clear 400,
+        // before any rows are fetched, so a cursor boundary is never silently null.
+        try validateCursorSort(eff_terms);
+        // The token binds to the PUBLIC effective-sort spec (e.g. "-created,id"), not the column
+        // SQL — so an SDK that synthesizes the same spec produces a matching cursor.
+        const eff_sort_str = try effectiveSortString(alloc, eff_terms);
         const fh = keyset.filterHash(q.filter, q.rule);
 
         // Decode the boundary cursor (if any). first_page = no token supplied.
@@ -1318,7 +1358,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     const total = try countTotal(alloc, conn, col, joins_sql.items, where_clause, params);
     const page: u32 = if (q.page == 0) 1 else q.page;
     const offset: i64 = @as(i64, (page - 1)) * @as(i64, per);
-    const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, order_sql }, 0);
+    const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, offset_order_sql }, 0);
     var pst = try conn.prepare(page_sql);
     defer pst.finalize();
     const after = try bindParams(&pst, params, 1);
@@ -1615,6 +1655,55 @@ test "cursor: stateful token stores state, walks pages, and 410s on unknown id" 
     // Unknown id -> CursorState (handler maps to 410).
     try std.testing.expectError(error.CursorState, list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = "deadbeefdeadbeefdeadbeefdeadbeef", .cursorToken = .stateful, .io = std.testing.io, .writer = &d }));
 }
+
+test "cursor: a hidden sort field is rejected (BadCursorSort), not silently null" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "secret", .hidden = true, .options = .{ .text = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &fields });
+    try d.exec("INSERT INTO notes (id,created,updated,title,secret) VALUES ('r1','t','t','a','x');");
+    // Sorting a cursor walk by the hidden field must fail loudly rather than mint a null boundary.
+    try std.testing.expectError(error.BadCursorSort, list(a, &d, col, .{ .sort = "secret", .cursorMode = true, .limit = 2 }));
+}
+
+test "cursor: a relation-path sort is rejected (BadCursorSort)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }} });
+    const pf = [_]schema.Field{.{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts2", .fields = &pf });
+    try std.testing.expectError(error.BadCursorSort, list(a, &d, posts, .{ .sort = "author.name", .cursorMode = true, .limit = 2 }));
+}
+
+test "offset mode ORDER BY is unchanged (no id tiebreaker appended)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    // Two rows with the SAME created: offset order falls back to physical/rowid order (the prior
+    // behavior), NOT an id tiebreaker — r1 then r2 as inserted.
+    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('z9','2026-01-01T00:00:00Z','t','a',1),('a1','2026-01-01T00:00:00Z','t','b',1);");
+    const res = try list(a, &d, col, .{ .sort = "created", .page = 1, .perPage = 10 });
+    try std.testing.expectEqual(records_list_mode_offset, res.mode);
+    // Insertion order preserved (id tiebreaker would have put 'a1' before 'z9').
+    try std.testing.expectEqualStrings("z9", res.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("a1", res.items[1].object.get("id").?.string);
+}
+
+const records_list_mode_offset: ListMode = .offset;
 
 test "gcCursorStates prunes only expired rows" {
     var d = try db.Db.openMemory();
