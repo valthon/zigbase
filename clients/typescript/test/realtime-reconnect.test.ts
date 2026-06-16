@@ -98,6 +98,45 @@ describe("RealtimeService reconnect", () => {
     expect(cb2).toHaveBeenCalledTimes(1);
   });
 
+  it("recovers when the WebSocket constructor throws synchronously on first connect", async () => {
+    const good = new FakeWebSocketFactory();
+    let throwNext = true;
+    // A factory that throws synchronously on the first construction, then
+    // delegates to a real FakeWebSocket so a later attempt can succeed.
+    const FlakyWebSocket = function (this: unknown, url: string) {
+      if (throwNext) {
+        throwNext = false;
+        throw new Error("invalid URL / blocked by env policy");
+      }
+      return new good.WebSocket(url);
+    } as unknown as typeof WebSocket;
+
+    const onError = vi.fn();
+    const service = new RealtimeService({
+      baseUrl: "http://api.test",
+      authStore: new MemoryAuthStore(),
+      WebSocket: FlakyWebSocket,
+      sleep: async () => {}, // collapse backoff
+      onError,
+    });
+
+    const cb = vi.fn();
+    // First subscribe triggers a connect that throws synchronously. The service
+    // must reset `connecting` and schedule a reconnect rather than locking up.
+    const subPromise = service.subscribe("posts", cb);
+    await flush();
+
+    // The scheduled reconnect built a real socket; drive it to readiness.
+    const ws = good.last;
+    ws.emitOpen();
+    ws.emitMessage({ type: "ack", action: "subscribe", topic: "posts" });
+    await subPromise;
+
+    // Dispatch works on the recovered socket.
+    ws.emitMessage({ type: "event", topic: "posts", action: "create", record: { id: "p1" } });
+    expect(cb).toHaveBeenCalledWith({ topic: "posts", action: "create", record: { id: "p1" } });
+  });
+
   it("rejects a pending subscribe and calls onError on a server error frame", async () => {
     const onError = vi.fn();
     const factory = new FakeWebSocketFactory();

@@ -145,7 +145,20 @@ export class RealtimeService {
     this.connecting = true;
     this.opened = false;
     const url = wsUrl(this.cfg.baseUrl);
-    const ws = new this.cfg.WebSocket(url);
+    let ws: WebSocket;
+    try {
+      ws = new this.cfg.WebSocket(url);
+    } catch (e) {
+      // A synchronous constructor throw (invalid URL, env/security policy) must
+      // not leave `connecting` stuck true forever. Reset state, surface the
+      // error, and schedule a reconnect via the existing backoff path so the
+      // connection can still recover.
+      this.connecting = false;
+      this.ws = null;
+      this.cfg.onError?.(e instanceof Error ? e.message : String(e));
+      if (!this.closedByUser && this.subscriptions.size > 0) void this.reconnect();
+      return;
+    }
     this.ws = ws;
 
     ws.onopen = () => {
