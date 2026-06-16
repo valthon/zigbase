@@ -1,0 +1,80 @@
+# ---------------------------------------------------------------------------
+# TypeScript SDK release workflow (@zigbase/client) — DORMANT.
+#
+# This workflow publishes the SDK to npm and ONLY runs when a tag matching
+# `client-v*` is pushed (e.g. `client-v0.1.0`). It cannot run on a normal
+# push, pull request, schedule, or manual dispatch — the only trigger is the
+# tag filter below.
+#
+# It is intentionally inert until ALL of the following are true:
+#   (a) the npm account / org `@zigbase` exists, and
+#   (b) EITHER a `NPM_TOKEN` repo secret is configured,
+#       OR npm "trusted publishing" (OIDC) is set up for this workflow.
+#
+# Do NOT push any `client-v*` tag until (a) and (b) are done — otherwise the
+# `npm publish` step will simply fail (no account / no auth). No `client-v*`
+# tag exists yet, so this file currently does nothing.
+#
+# SDK versioning is DECOUPLED from the ZigBase server: the server uses `vX`
+# tags; the SDK uses `client-v*` tags. See clients/typescript/RELEASING.md.
+#
+# OIDC note: if you configure npm trusted publishing (OIDC) for this workflow,
+# you can DELETE the `NODE_AUTH_TOKEN` env line below — the `id-token: write`
+# permission and `--provenance` flag are all that publishing needs. The token
+# is only required for classic token-based auth.
+# ---------------------------------------------------------------------------
+name: Release SDK
+
+on:
+  push:
+    tags:
+      - "client-v*"
+
+permissions:
+  contents: read
+  id-token: write # npm provenance / OIDC trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        working-directory: clients/typescript
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: clients/typescript
+        run: npm run typecheck
+
+      - name: Test
+        working-directory: clients/typescript
+        run: npm test
+
+      - name: Build
+        working-directory: clients/typescript
+        run: npm run build
+
+      - name: Assert package.json version matches the tag
+        working-directory: clients/typescript
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          expected="${tag#client-v}"
+          actual="$(node -p "require('./package.json').version")"
+          echo "tag=$tag expected=$expected package.json=$actual"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::Tag ($tag => $expected) does not match package.json version ($actual)."
+            exit 1
+          fi
+
+      - name: Publish to npm
+        working-directory: clients/typescript
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
