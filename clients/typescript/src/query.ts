@@ -1,24 +1,23 @@
 /**
  * Quote a string as a ZigBase filter literal.
  *
- * The server lexer (src/query/lexer.zig) scans a quoted string RAW to the next
- * matching quote with NO backslash unescaping, so the client must NOT escape:
- * escaping backslashes/newlines/control chars would corrupt the value, and
- * escaping the quote char would be read literally. Instead we pick a quote char
- * that does not appear in the value:
- *   - no single quote  -> wrap in '…'
- *   - else no double quote -> wrap in "…" (so O'Brien works)
- *   - else (both)      -> throw (the grammar can't represent it)
- * Because the chosen quote char never appears in the value, the literal cannot
- * be broken out of — this is the injection-safety property.
+ * The server lexer (src/query/lexer.zig) unescapes backslash sequences inside a
+ * quoted string: `\\`->`\`, `\'`->`'`, `\"`->`"`, `\n`->newline, `\t`->tab,
+ * `\r`->CR. We therefore ALWAYS single-quote and escape the bytes that would
+ * otherwise terminate or corrupt the literal: backslash, single quote, and the
+ * three control chars. Every other byte (including a double quote) is left
+ * literal. Because the closing single quote can only appear escaped, the literal
+ * can never be broken out of — this is the injection-safety property, and any
+ * value is now representable (no both-quotes limitation).
  */
 function quoteString(s: string): string {
-  if (!s.includes("'")) return `'${s}'`;
-  if (!s.includes('"')) return `"${s}"`;
-  const preview = s.length > 40 ? `${s.slice(0, 40)}…` : s;
-  throw new Error(
-    `filter value cannot contain both single and double quote characters: ${preview}`,
-  );
+  const escaped = s
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, "\\n")
+    .replace(/\t/g, "\\t")
+    .replace(/\r/g, "\\r");
+  return `'${escaped}'`;
 }
 
 /** Serialize a single interpolated value into a safe filter operand. */
