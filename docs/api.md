@@ -247,6 +247,12 @@ share one grammar.
 e.g. `author.name`), single- or double-quoted strings, numbers, booleans
 (`true`/`false`), and `null`.
 
+**String escapes:** inside a quoted string a backslash starts an escape:
+`\\` → `\`, `\'` → `'`, `\"` → `"`, plus `\n` `\t` `\r`. This lets a value contain
+the same quote character used to delimit it (e.g. `name = 'O\'Brien'`) or even both
+quote characters at once (`name = 'both \' and \"'`). A backslash followed by any
+other character is rejected. The bound parameter receives the unescaped value.
+
 **Request macros** resolve against the current request:
 
 | Macro | Value |

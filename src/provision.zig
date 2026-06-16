@@ -18,6 +18,8 @@ const schema = @import("schema.zig");
 const collections = @import("collections.zig");
 const db = @import("db.zig");
 const rules = @import("rules.zig");
+const regex = @import("regex.zig");
+const datetime = @import("datetime.zig");
 
 /// F3 startup lint: log a prominent warning for every `@public` (allow-all) rule on `col`, so a
 /// wide-open collection is never silent. Called once per collection during provisioning.
@@ -160,18 +162,29 @@ fn buildOptions(comptime col: []const u8, comptime fname: []const u8, comptime f
         const F = @TypeOf(f);
         const where = "field '" ++ fname ++ "' in collection '" ++ col ++ "'";
         return switch (ftype) {
-            .text => .{ .text = .{
-                .min = optU32(f, "min"),
-                .max = optU32(f, "max"),
-                .pattern = optStr(f, "pattern"),
-            } },
+            .text => blk: {
+                const pat = optStr(f, "pattern");
+                if (pat) |p| _ = regex.compileComptime(p); // @compileError on a bad pattern
+                break :blk .{ .text = .{
+                    .min = optU32(f, "min"),
+                    .max = optU32(f, "max"),
+                    .pattern = pat,
+                } };
+            },
             .email => .{ .email = .{} },
             .url => .{ .url = .{} },
             .editor => .{ .editor = .{} },
-            .date => .{ .date = .{
-                .min = optStr(f, "min"),
-                .max = optStr(f, "max"),
-            } },
+            .date => blk: {
+                const dmin = optStr(f, "min");
+                const dmax = optStr(f, "max");
+                const min_secs: ?i64 = if (dmin) |b| (datetime.parse(b) catch @compileError(where ++ ": date .min is not a valid date \"" ++ b ++ "\"")) else null;
+                const max_secs: ?i64 = if (dmax) |b| (datetime.parse(b) catch @compileError(where ++ ": date .max is not a valid date \"" ++ b ++ "\"")) else null;
+                // Reject an unsatisfiable range at build time: min > max can never
+                // accept any value once both bounds are enforced.
+                if (min_secs) |lo| if (max_secs) |hi| if (lo > hi)
+                    @compileError(where ++ ": date .min \"" ++ dmin.? ++ "\" is after .max \"" ++ dmax.? ++ "\"");
+                break :blk .{ .date = .{ .min = dmin, .max = dmax } };
+            },
             .autodate => .{ .autodate = .{
                 .onCreate = if (@hasField(F, "onCreate")) f.onCreate else true,
                 .onUpdate = if (@hasField(F, "onUpdate")) f.onUpdate else false,
@@ -812,6 +825,18 @@ test "applySpecs rejects an unknown relation target" {
     const lf = [_]schema.Field{.{ .id = "f_o", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "ghosts", .maxSelect = 1 } } }};
     const specs = [_]schema.Collection{.{ .id = "", .name = "listings", .fields = &lf }};
     try std.testing.expectError(error.UnknownRelationTarget, applySpecs(a, std.testing.io, &d, &specs));
+}
+
+test "buildOptions accepts a valid comptime pattern and date bounds" {
+    const cols = comptime buildCollections(.{
+        .events = .{
+            .fields = .{
+                .{ .name = "slug", .type = .text, .pattern = "^[a-z-]+$" },
+                .{ .name = "happens", .type = .date, .min = "2026-01-01", .max = "2026-12-31 23:59:59" },
+            },
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 1), cols.len);
 }
 
 test "runMigrations runs each explicit migration once (idempotent)" {

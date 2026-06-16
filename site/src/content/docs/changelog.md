@@ -11,6 +11,23 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`text.pattern` is now enforced on record writes** via a pure-Zig, linear-time (DoS-safe)
+  Thompson-NFA matcher. Matching is unanchored (substring); anchor with `^…$` for a
+  full-string match. Supported syntax: literals, `.` (any codepoint except `\n`), anchors
+  `^`/`$`, character classes `[…]`/`[^…]`/ranges, predefined classes `\d \D \w \W \s \S`
+  (ASCII), escapes `\t \n \r \f \v` and `\`-escaped metacharacters, alternation `|`, groups
+  `(…)`/`(?:…)`, and quantifiers `* + ? {m} {m,} {m,n}`. Patterns are validated when a
+  collection is saved (a bad regex is a `400` field error), and at build time (`@compileError`)
+  for comptime schema literals.
+- **`date` field `min`/`max` are now enforced** on record writes, with date normalization so
+  mixed formats compare correctly. Malformed or out-of-range date values are rejected with `400`
+  (`validation_date`). Bounds are validated at collection-save time and at build time
+  (`@compileError`) for comptime schema literals.
+
 ## [0.4.0] - 2026-06-13
 
 This round makes ZigBase **safe-by-default**: a security audit's findings were fixed and the
@@ -108,8 +125,7 @@ migration notes below before upgrading.
 - **`min`/`max` on text and number fields are now enforced** on record writes
   (`validation_min` / `validation_max`; text length in unicode codepoints; bounds
   inclusive). Pre-existing records that violate their declared bounds will fail
-  full-record re-saves until corrected. Date `min`/`max` and text `pattern` remain
-  accepted-but-unenforced — see [Known limitations](./known-limitations).
+  full-record re-saves until corrected.
 - **Multipart input semantics:** an empty value clears an optional non-text field to
   `null`; a single occurrence of a multi-value field wraps into a one-element array;
   repeated non-file keys are preserved as arrays instead of being dropped.

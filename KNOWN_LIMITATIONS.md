@@ -10,8 +10,6 @@ ZigBase v0.4.0 is an early release. The gaps below are known and tracked for fut
 - **`before`-hook `ev.data` writes are not transactional** with the triggering record write. Before-hooks run *before* the database transaction begins and use the app allocator, so use them to read, validate, and mutate `ev.record` — not for atomic side-writes. (Mutate the record via `ev.arena`.)
 
 ## Schema / migrations
-- **The text field's `pattern` option is accepted but not yet enforced.** It is stored and round-tripped through the schema API, but record validation does not apply it (Zig's std has no regex engine and we won't hand-roll one). `min`/`max` for text and number fields *are* enforced.
-- **The date field's `min`/`max` options are accepted but not yet enforced.** Enforcement is pending date parsing/normalization in the write path — a raw lexical compare is unsound when clients mix formats (`2026-06-10 08:00:00` vs `2026-06-10T08:00:00Z`) and would still accept garbage like `25:99:99`.
 - **Comptime auto-migration is additive-only.** Startup provisioning of a comptime `.collections` schema creates missing collections and adds new fields, preserving data. **Non-additive changes (rename, drop, or type-change a field) are detected, logged, and skipped** — they require an explicit `.migrations` entry.
 
 ## Scheduler

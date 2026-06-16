@@ -102,8 +102,7 @@ addresses with no `@`. This is the *root enabler* of F1 (a record persisted with
 re-injects on every later verification/reset send) and a general data-integrity problem.
 
 **Fix.** Reject control chars (`\r`, `\n`, NUL) and spaces, and require a single `@` with
-non-empty local and domain parts. This is intentionally *minimal* (not full RFC5322 — Zig's std
-has no regex, mirroring the `text.pattern` non-enforcement noted in `KNOWN_LIMITATIONS.md`), but
+non-empty local and domain parts. This is intentionally *minimal* (not full RFC5322), but
 it closes the injection class and the obviously-bogus cases. Clearing (empty/`null`) still works.
 Regression test: `email field rejects control chars (CRLF/NUL) and obviously-bogus addresses`.
 
@@ -421,7 +420,11 @@ The framework invites custom rules, hooks, routes, and plugins. The sharp edges:
    rule-respecting variant (`Data.listAs(ctx, …)`) so the safe path is the easy path.
 6. **Email/URL field "validation" is minimal.** Integrators may assume `email`/`url` fields are
    format-validated. After F2, `email` rejects control chars and the gross-bogus cases, but it is
-   not full RFC validation, and `url`/`text.pattern` are still unenforced (KNOWN_LIMITATIONS).
+   not full RFC validation. `text.pattern` is now enforced on every record write via an
+   in-repo Thompson-NFA matcher (`src/regex.zig`) that is linear-time and DoS-safe (no
+   catastrophic backtracking). `date` field `min`/`max` bounds are now enforced with date
+   normalization (`src/datetime.zig`) so mixed formats compare correctly and garbage values
+   are rejected. `url` validation remains minimal.
    *Guardrail:* document the exact guarantees.
 
 ---
