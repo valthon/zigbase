@@ -40,6 +40,8 @@ with `mise exec zig@0.16.0 --`.
 - **OAuth2** — Authorization-Code + PKCE provider login and account linking. → [docs/api.md](docs/api.md)
 - **Realtime** — subscribe to record changes over WebSocket. → [docs/api.md](docs/api.md)
 - **Files** — local file storage with serving and short-lived file-access tokens. → [docs/api.md](docs/api.md)
+- **TypeScript SDK** — official zero-dependency client (`@zigbase/client`): auth, records,
+  offset + cursor pagination, files, realtime + live store. → [docs/typescript-sdk.md](docs/typescript-sdk.md)
 - **Static files** — serve a frontend from the same binary: `--serve-static <dir>` at runtime, or pin/embed it at comptime. → [docs/framework.md](docs/framework.md)
 - **Admin UI** — embedded single-page app served at `/_/`. → [docs/api.md](docs/api.md)
 - **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema (with additive auto-migration), and pluggable storage/mailer backends. → [docs/framework.md](docs/framework.md)
@@ -195,6 +197,7 @@ examples/
 - [docs/recipes.md](docs/recipes.md) — task recipes: ship a frontend in the binary, schema provisioning (curl), signup, owner/relation access rules, hooks, custom routes, DB access in cron
 - [docs/api.md](docs/api.md) — HTTP API reference (collections, records, query, rules, auth, oauth2, realtime, files, static files, admin)
 - [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs, static-file modes
+- [docs/typescript-sdk.md](docs/typescript-sdk.md) — the official `@zigbase/client` TypeScript SDK: auth, records, offset + cursor pagination, files, realtime + live store
 - [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — current caveats
 - [CHANGELOG.md](CHANGELOG.md) — release history
 
