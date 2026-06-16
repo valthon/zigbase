@@ -1,5 +1,18 @@
 import type { ZbRecord } from "../realtime.js";
 
+/** Reserved fields owned by the wrapper; never patched from a server payload. */
+const RESERVED_KEYS = new Set(["id", "version", "deleted"]);
+/** Keys that could reassign the prototype / mutate intrinsics — always dropped. */
+const POLLUTING_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function isReservedKey(key: string): boolean {
+  return RESERVED_KEYS.has(key);
+}
+
+function isSafePatchKey(key: string): boolean {
+  return !RESERVED_KEYS.has(key) && !POLLUTING_KEYS.has(key);
+}
+
 /** Framework-agnostic observable contract (matches the spec). */
 export interface Observable<T> {
   subscribe(cb: () => void): () => void;
@@ -52,11 +65,18 @@ export class LiveRecord<T extends ZbRecord = ZbRecord> implements Observable<T> 
   patch(next: T): void {
     // Mutate the SAME backing object so external `.get()` references stay live.
     const target = this.backing as Record<string, unknown>;
+    // Only copy safe own enumerable string keys. Reserved fields (id/version/
+    // deleted) are owned by the wrapper, and __proto__/constructor/prototype are
+    // skipped to prevent prototype pollution from a hostile server payload.
+    const safeKeys = Object.keys(next).filter(isSafePatchKey);
+    const safeSet = new Set(safeKeys);
     for (const k of Object.keys(target)) {
-      if (!(k in next)) delete target[k];
+      if (!safeSet.has(k) && !isReservedKey(k)) delete target[k];
     }
-    Object.assign(target, next);
-    this.defineAccessors(Object.keys(next));
+    for (const k of safeKeys) {
+      target[k] = (next as Record<string, unknown>)[k];
+    }
+    this.defineAccessors(safeKeys);
     this.bump();
   }
 

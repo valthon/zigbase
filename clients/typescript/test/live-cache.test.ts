@@ -52,6 +52,30 @@ describe("RecordCache + LiveRecord", () => {
     expect(cache.has("p1")).toBe(false);
   });
 
+  it("patch skips reserved keys and does not prototype-pollute", () => {
+    const cache = new RecordCache();
+    const live = cache.retain({ id: "p1", title: "First", version: 0 });
+    const v0 = live.version;
+
+    // A hostile/server payload (correct id, but trying to clobber reserved
+    // fields and reassign the prototype via __proto__).
+    const evil = JSON.parse(
+      '{"id":"p1","version":999,"deleted":true,"__proto__":{"polluted":true},"title":"Edited"}',
+    );
+    cache.applyUpdate(evil);
+
+    // Only safe fields applied.
+    expect(live.get().title).toBe("Edited");
+    // Reserved fields untouched.
+    expect(live.id).toBe("p1");
+    expect(live.deleted).toBe(false);
+    expect(live.version).toBe(v0 + 1); // bumped by the cache, not the payload's 999
+    // No prototype pollution on the live record or plain objects.
+    expect((live as unknown as { polluted?: boolean }).polluted).toBeUndefined();
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
+    expect(Object.getPrototypeOf(live.get())).toBe(Object.prototype);
+  });
+
   it("unsubscribing a record observer stops further notifications", () => {
     const cache = new RecordCache();
     const live = cache.retain({ id: "p1", n: 0 });
