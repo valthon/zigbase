@@ -217,14 +217,19 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
                     return;
                 },
             }
-            // subscription keys/filters + sub_args must persist across frames -> durable allocator
+            // subscription keys/filters + sub_args must persist across frames -> durable allocator.
+            // m.topic is parsed from the per-message buffer and is freed once onMessage returns, so
+            // dupe it durably and use that copy for BOTH the facil.io subscription args and the
+            // sub_ids key. Keying sub_ids off the ephemeral m.topic was a use-after-free: a later
+            // unsubscribe's fetchRemove() would compare against freed memory and crash the worker.
+            const channel = da.dupe(u8, m.topic) catch return;
             lc.conn.addSub(da, m.topic, m.filter) catch return;
             const args = da.create(WS.SubscribeArgs) catch return;
-            args.* = .{ .channel = m.topic, .on_message = onChannelMessage, .context = lc };
+            args.* = .{ .channel = channel, .on_message = onChannelMessage, .context = lc };
             const sub_id = WS.subscribe(handle, args) catch 0;
             lc.sub_args.append(da, args) catch {};
             // track topic -> facil.io subscription id so unsubscribe can really cancel it
-            if (sub_id != 0) lc.sub_ids.put(da, args.channel, sub_id) catch {};
+            if (sub_id != 0) lc.sub_ids.put(da, channel, sub_id) catch {};
             WS.write(handle, try protocol.ackFrame(fa, "subscribe", m.topic), true) catch {};
         },
         .unsubscribe => |m| {
