@@ -71,7 +71,10 @@ export class LiveRecord<T extends ZbRecord = ZbRecord> implements Observable<T> 
     const safeKeys = Object.keys(next).filter(isSafePatchKey);
     const safeSet = new Set(safeKeys);
     for (const k of Object.keys(target)) {
-      if (!safeSet.has(k) && !isReservedKey(k)) delete target[k];
+      if (!safeSet.has(k) && !isReservedKey(k)) {
+        delete target[k];
+        this.removeAccessor(k);
+      }
     }
     for (const k of safeKeys) {
       target[k] = (next as Record<string, unknown>)[k];
@@ -97,6 +100,15 @@ export class LiveRecord<T extends ZbRecord = ZbRecord> implements Observable<T> 
         get: () => (this.backing as Record<string, unknown>)[key],
       });
     }
+  }
+
+  /** Remove a previously-defined accessor when its backing key is dropped. */
+  private removeAccessor(key: string): void {
+    if (!this.proxied.has(key)) return;
+    // Guard reserved/polluting names defensively, though proxied never holds them.
+    if (isReservedKey(key) || !isSafePatchKey(key)) return;
+    this.proxied.delete(key);
+    delete (this as Record<string, unknown>)[key];
   }
 
   private bump(): void {

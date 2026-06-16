@@ -76,6 +76,24 @@ describe("RecordCache + LiveRecord", () => {
     expect(Object.getPrototypeOf(live.get())).toBe(Object.prototype);
   });
 
+  it("patch removes accessors and proxied entries for keys dropped from the payload", () => {
+    const cache = new RecordCache();
+    const live = cache.retain({ id: "p1", title: "First", subtitle: "Sub" });
+    expect(Object.keys(live)).toContain("subtitle");
+    expect((live as unknown as { subtitle?: string }).subtitle).toBe("Sub");
+
+    // Update omits subtitle -> it should disappear entirely.
+    cache.applyUpdate({ id: "p1", title: "First" });
+    expect(Object.keys(live)).not.toContain("subtitle");
+    expect((live as unknown as { subtitle?: string }).subtitle).toBeUndefined();
+    expect("subtitle" in live).toBe(false);
+
+    // Re-adding it later works.
+    cache.applyUpdate({ id: "p1", title: "First", subtitle: "Back" });
+    expect(Object.keys(live)).toContain("subtitle");
+    expect((live as unknown as { subtitle?: string }).subtitle).toBe("Back");
+  });
+
   it("unsubscribing a record observer stops further notifications", () => {
     const cache = new RecordCache();
     const live = cache.retain({ id: "p1", n: 0 });
