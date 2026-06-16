@@ -1,0 +1,65 @@
+import { describe, it, expect, vi } from "vitest";
+import { RecordCache } from "../src/live/cache.js";
+
+describe("RecordCache + LiveRecord", () => {
+  it("returns the SAME wrapped object for a given id across lookups", () => {
+    const cache = new RecordCache();
+    const a = cache.retain({ id: "p1", title: "First" });
+    const b = cache.get("p1");
+    expect(b).toBe(a);
+    expect(a.get().title).toBe("First");
+    // The wrapper "looks like" the record it wraps.
+    expect((a as unknown as { title: string }).title).toBe("First");
+    expect(a.id).toBe("p1");
+  });
+
+  it("patches fields in place, bumps version, and notifies on update", () => {
+    const cache = new RecordCache();
+    const live = cache.retain({ id: "p1", title: "First", views: 1 });
+    const cb = vi.fn();
+    live.subscribe(cb);
+    const v0 = live.version;
+
+    cache.applyUpdate({ id: "p1", title: "Edited", views: 2 });
+
+    expect(live.get().title).toBe("Edited");
+    expect((live as unknown as { views: number }).views).toBe(2);
+    expect(live.version).toBe(v0 + 1);
+    expect(cb).toHaveBeenCalledTimes(1);
+    // Identity is stable through the patch.
+    expect(cache.get("p1")).toBe(live);
+  });
+
+  it("flags a record deleted on a delete event and notifies", () => {
+    const cache = new RecordCache();
+    const live = cache.retain({ id: "p1", title: "First" });
+    const cb = vi.fn();
+    live.subscribe(cb);
+    cache.applyDelete("p1");
+    expect(live.deleted).toBe(true);
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it("ref-counts: a record is evicted only when the last referer releases it", () => {
+    const cache = new RecordCache();
+    const a1 = cache.retain({ id: "p1", title: "First" }); // refcount 1
+    const a2 = cache.retain({ id: "p1", title: "First" }); // refcount 2 (same object)
+    expect(a2).toBe(a1);
+
+    cache.release("p1"); // -> 1
+    expect(cache.has("p1")).toBe(true);
+    cache.release("p1"); // -> 0, evicted
+    expect(cache.has("p1")).toBe(false);
+  });
+
+  it("unsubscribing a record observer stops further notifications", () => {
+    const cache = new RecordCache();
+    const live = cache.retain({ id: "p1", n: 0 });
+    const cb = vi.fn();
+    const off = live.subscribe(cb);
+    cache.applyUpdate({ id: "p1", n: 1 });
+    off();
+    cache.applyUpdate({ id: "p1", n: 2 });
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+});
