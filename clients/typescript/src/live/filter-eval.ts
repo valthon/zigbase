@@ -224,13 +224,13 @@ function compare(actual: unknown, op: CompareOp, expected: Literal): boolean {
 }
 
 export function evaluateFilter(record: Record<string, unknown>, node: FilterNode): boolean {
+  if (node.kind === "compare") {
+    return compare(resolvePath(record, node.path), node.op, node.value);
+  }
   if (node.kind === "and") {
     return evaluateFilter(record, node.left) && evaluateFilter(record, node.right);
   }
-  if (node.kind === "or") {
-    return evaluateFilter(record, node.left) || evaluateFilter(record, node.right);
-  }
-  return compare(resolvePath(record, node.path), node.op, node.value);
+  return evaluateFilter(record, node.left) || evaluateFilter(record, node.right);
 }
 
 // ---- analysis (tiered-correctness classification) --------------------------
@@ -265,13 +265,13 @@ export function analyzeFilter(node: FilterNode | undefined): FilterAnalysis {
   };
 
   const walk = (n: FilterNode): void => {
-    if (n.kind === "and" || n.kind === "or") {
-      walk(n.left);
-      walk(n.right);
+    if (n.kind === "compare") {
+      classify(n.path);
+      if (n.valuePath) classify(n.valuePath);
       return;
     }
-    classify(n.path);
-    if (n.valuePath) classify(n.valuePath);
+    walk(n.left);
+    walk(n.right);
   };
   walk(node);
 

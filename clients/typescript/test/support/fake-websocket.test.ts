@@ -4,7 +4,9 @@ import { FakeWebSocket, FakeWebSocketFactory } from "./fake-websocket.js";
 describe("FakeWebSocket", () => {
   it("records the URL and exposes the latest instance via the factory", () => {
     const factory = new FakeWebSocketFactory();
-    const ws = new factory.WebSocket("ws://api.test/api/realtime") as FakeWebSocket;
+    const ws = new factory.WebSocket(
+      "ws://api.test/api/realtime",
+    ) as unknown as FakeWebSocket;
     expect(ws.url).toBe("ws://api.test/api/realtime");
     expect(factory.last).toBe(ws);
     expect(factory.instances).toHaveLength(1);

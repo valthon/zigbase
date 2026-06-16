@@ -29,3 +29,15 @@ export {
 export type { CursorPage, CursorState } from "./cursor.js";
 export { FilesService } from "./files.js";
 export type { FileRecordRef, FileUrlOptions } from "./files.js";
+
+// --- Plan 3: realtime + live store ---
+export { RealtimeService } from "./realtime.js";
+// Note: ZbRecord is already re-exported above from ./records.js (structurally identical).
+export type { RealtimeEvent, RealtimeCallback, RealtimeAction } from "./realtime.js";
+export { LiveCollection, LiveList } from "./live/live-collection.js";
+export type { LiveReader, LiveSubscriber, LiveListOpts } from "./live/live-collection.js";
+export { LiveRecord, RecordCache } from "./live/cache.js";
+export type { Observable } from "./live/cache.js";
+export { parseFilter, evaluateFilter, analyzeFilter } from "./live/filter-eval.js";
+export type { FilterNode, FilterAnalysis } from "./live/filter-eval.js";
+export type { RealtimeClient } from "./client.js";
