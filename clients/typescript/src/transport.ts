@@ -97,35 +97,51 @@ export class Transport {
     return { signal: controller.signal, cleanup };
   }
 
+  /** Build the per-attempt headers + body (auth, lang, content-type, JSON/FormData). */
+  private buildRequestInit(opts: RequestOptions, signal: AbortSignal | undefined): RequestInit {
+    const isForm = typeof FormData !== "undefined" && opts.body instanceof FormData;
+    const headers = new Headers(opts.headers);
+    if (!opts.skipAuth && this.cfg.authStore.token) {
+      headers.set("Authorization", `Bearer ${this.cfg.authStore.token}`);
+    }
+    if (this.cfg.lang) headers.set("Accept-Language", this.cfg.lang);
+
+    let body: BodyInit | undefined;
+    if (opts.body !== undefined && opts.method && opts.method !== "GET") {
+      if (isForm) {
+        body = opts.body as FormData;
+      } else {
+        headers.set("Content-Type", "application/json");
+        body = JSON.stringify(opts.body);
+      }
+    }
+    return { method: opts.method ?? "GET", headers, body, signal };
+  }
+
+  /**
+   * Raw escape hatch — performs the request and returns the `Response` WITHOUT
+   * JSON-parsing or error-mapping it. Auth header, `query`/`body`/`headers`/`signal`
+   * and opt-in `requestKey` de-duplication all apply; non-2xx responses are returned
+   * as-is (no throw) and there is no auto-refresh/429-retry. Use for binary/text
+   * bodies, custom headers, or streaming.
+   */
+  async raw(path: string, opts: RequestOptions = {}): Promise<Response> {
+    const { signal, cleanup } = this.resolveSignal(opts);
+    try {
+      const url = this.buildUrl(path, opts.query);
+      return await this.cfg.fetch(url, this.buildRequestInit(opts, signal));
+    } finally {
+      cleanup();
+    }
+  }
+
   private async exchange<T>(path: string, opts: RequestOptions, signal: AbortSignal | undefined): Promise<T> {
     const url = this.buildUrl(path, opts.query);
-    const isForm = typeof FormData !== "undefined" && opts.body instanceof FormData;
     let didRefresh = false;
     let attempt = 0;
 
     for (;;) {
-      const headers = new Headers(opts.headers);
-      if (!opts.skipAuth && this.cfg.authStore.token) {
-        headers.set("Authorization", `Bearer ${this.cfg.authStore.token}`);
-      }
-      if (this.cfg.lang) headers.set("Accept-Language", this.cfg.lang);
-
-      let body: BodyInit | undefined;
-      if (opts.body !== undefined && opts.method && opts.method !== "GET") {
-        if (isForm) {
-          body = opts.body as FormData;
-        } else {
-          headers.set("Content-Type", "application/json");
-          body = JSON.stringify(opts.body);
-        }
-      }
-
-      const res = await this.cfg.fetch(url, {
-        method: opts.method ?? "GET",
-        headers,
-        body,
-        signal,
-      });
+      const res = await this.cfg.fetch(url, this.buildRequestInit(opts, signal));
 
       if (res.ok) {
         if (res.status === 204) return undefined as T;

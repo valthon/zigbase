@@ -30,6 +30,13 @@ export interface Client {
   readonly files: FilesService;
   collection(name: string): CollectionService;
   send<T>(method: string, path: string, opts?: SendOptions): Promise<T>;
+  /**
+   * Raw escape hatch — returns the underlying `Response` WITHOUT JSON-parsing it.
+   * Use for binary/text bodies, custom headers, or streaming. The auth header,
+   * `query`/`body`/`headers`/`signal`/`requestKey` all apply; non-2xx responses are
+   * returned as-is (no throw), and there is no auto-refresh/429-retry on this path.
+   */
+  fetch(method: string, path: string, opts?: SendOptions): Promise<Response>;
 }
 
 export function createClient(baseUrl: string, opts: ClientOptions = {}): Client {
@@ -80,6 +87,9 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
     },
     send<T>(method: string, path: string, sendOpts?: SendOptions) {
       return transport.send<T>(path, { method, ...sendOpts });
+    },
+    fetch(method: string, path: string, sendOpts?: SendOptions) {
+      return transport.raw(path, { method, ...sendOpts });
     },
   };
 
