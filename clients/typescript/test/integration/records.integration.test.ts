@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { startServer, superuserToken, createCollection, type TestServer } from "./harness.js";
 import { createClient } from "../../src/index.js";
+import { filter } from "../../src/query.js";
 
 let server: TestServer;
 
@@ -93,5 +94,22 @@ describe("records (live backend)", () => {
     // --- delete ---
     await posts.delete(created[0]!);
     await expect(posts.getOne(created[0]!)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("round-trips a value containing a single quote through the filter tag", async () => {
+    const zb = createClient(server.url);
+    const posts = zb.collection("posts");
+
+    // A value with an embedded single quote must reach the server intact and
+    // match exactly. The filter tag emits it double-quoted (O'Brien -> "O'Brien");
+    // this proves client quoting and the server lexer agree.
+    const target = await posts.create({ title: "O'Brien", views: 100 });
+    await posts.create({ title: "Smith", views: 101 });
+
+    const list = await posts.getList(1, 30, {
+      filter: filter`title = ${"O'Brien"}`,
+    });
+    expect(list.items.map((r) => r.id)).toEqual([target.id]);
+    expect(list.items[0]!.title).toBe("O'Brien");
   });
 });

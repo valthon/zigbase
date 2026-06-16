@@ -1,33 +1,24 @@
-/** Escape a JS string into a single-quoted filter literal per the ZigBase grammar. */
+/**
+ * Quote a string as a ZigBase filter literal.
+ *
+ * The server lexer (src/query/lexer.zig) scans a quoted string RAW to the next
+ * matching quote with NO backslash unescaping, so the client must NOT escape:
+ * escaping backslashes/newlines/control chars would corrupt the value, and
+ * escaping the quote char would be read literally. Instead we pick a quote char
+ * that does not appear in the value:
+ *   - no single quote  -> wrap in '…'
+ *   - else no double quote -> wrap in "…" (so O'Brien works)
+ *   - else (both)      -> throw (the grammar can't represent it)
+ * Because the chosen quote char never appears in the value, the literal cannot
+ * be broken out of — this is the injection-safety property.
+ */
 function quoteString(s: string): string {
-  let out = "'";
-  for (const ch of s) {
-    switch (ch) {
-      case "\\":
-        out += "\\\\";
-        break;
-      case "'":
-        out += "\\'";
-        break;
-      case "\n":
-        out += "\\n";
-        break;
-      case "\r":
-        out += "\\r";
-        break;
-      case "\t":
-        out += "\\t";
-        break;
-      default:
-        // other C0 control chars -> \u00XX
-        if (ch.charCodeAt(0) < 0x20) {
-          out += "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0");
-        } else {
-          out += ch;
-        }
-    }
-  }
-  return out + "'";
+  if (!s.includes("'")) return `'${s}'`;
+  if (!s.includes('"')) return `"${s}"`;
+  const preview = s.length > 40 ? `${s.slice(0, 40)}…` : s;
+  throw new Error(
+    `filter value cannot contain both single and double quote characters: ${preview}`,
+  );
 }
 
 /** Serialize a single interpolated value into a safe filter operand. */
