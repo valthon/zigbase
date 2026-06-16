@@ -22,13 +22,38 @@
   "files": ["dist"],
   "scripts": {
     "build": "tsup",
+    "prepack": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": { "node": ">=18" },
-  "license": "SEE LICENSE IN ../../LICENSE",
+  "license": "Apache-2.0",
+  "author": "David J Parrott <valthon@nothlav.net>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/valthon/zigbase.git",
+    "directory": "clients/typescript"
+  },
+  "homepage": "https://github.com/valthon/zigbase/tree/main/clients/typescript#readme",
+  "bugs": {
+    "url": "https://github.com/valthon/zigbase/issues"
+  },
+  "keywords": [
+    "zigbase",
+    "backend",
+    "baas",
+    "sdk",
+    "client",
+    "realtime",
+    "websocket",
+    "typescript",
+    "pocketbase-alternative"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "tsup": "^8.0.0",
