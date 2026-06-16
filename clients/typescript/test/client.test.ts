@@ -28,6 +28,6 @@ describe("createClient", () => {
   it("returns a CollectionService from collection()", () => {
     const zb = createClient("http://api.test", { fetch: (async () => new Response()) as unknown as typeof fetch });
     const posts = zb.collection("posts");
-    expect(posts.name).toBe("posts");
+    expect(typeof posts.authWithPassword).toBe("function");
   });
 });

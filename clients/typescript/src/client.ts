@@ -9,6 +9,8 @@ export interface ClientOptions {
   WebSocket?: typeof WebSocket;
   lang?: string;
   maxRetries?: number;
+  /** Collection used for automatic token refresh on 401 (e.g. "users"). */
+  authCollection?: string;
 }
 
 export interface Client {
@@ -24,13 +26,19 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
   const fetchImpl = opts.fetch ?? globalThis.fetch;
   if (!fetchImpl) throw new Error("No fetch implementation available; pass options.fetch");
 
-  const transport = new Transport({
+  let transport!: Transport;
+  transport = new Transport({
     baseUrl: normalizedBase,
     authStore,
     fetch: fetchImpl,
     autoRefresh: opts.autoRefresh ?? false,
     maxRetries: opts.maxRetries ?? 3,
     lang: opts.lang,
+    refresh: opts.authCollection
+      ? async () => {
+          await new CollectionService(transport, authStore, opts.authCollection!).authRefresh();
+        }
+      : undefined,
   });
 
   return {
@@ -39,7 +47,11 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
     collection(name: string) {
       return new CollectionService(transport, authStore, name);
     },
-    send<T>(method, path, sendOpts) {
+    send<T>(
+      method: string,
+      path: string,
+      sendOpts?: { query?: Record<string, string | number | boolean | undefined>; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal },
+    ) {
       return transport.send<T>(path, { method, ...sendOpts });
     },
   };
