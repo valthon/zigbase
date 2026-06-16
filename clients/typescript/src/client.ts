@@ -2,9 +2,7 @@ import { Transport } from "./transport.js";
 import { MemoryAuthStore, type AuthStore } from "./auth-store.js";
 import { CollectionService } from "./collection.js";
 import { FilesService } from "./files.js";
-import { RealtimeService } from "./realtime.js";
-import type { RealtimeEvent } from "./realtime.js";
-import { LiveCollection, type LiveReader, type LiveSubscriber } from "./live/live-collection.js";
+import { INTERNALS, type ClientInternals, type InternalReader } from "./internal.js";
 
 export interface ClientOptions {
   authStore?: AuthStore;
@@ -17,23 +15,19 @@ export interface ClientOptions {
   authCollection?: string;
 }
 
-export interface RealtimeClient extends LiveSubscriber {
-  subscribe(
-    topic: string,
-    cb: (e: RealtimeEvent) => void,
-    opts?: { filter?: string },
-  ): Promise<() => void>;
-  unsubscribe(topic: string, cb?: (e: RealtimeEvent) => void): void;
-  collection(name: string): LiveCollection;
+export interface SendOptions {
+  query?: Record<string, string | number | boolean | undefined>;
+  body?: unknown;
+  headers?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 export interface Client {
   readonly baseUrl: string;
   readonly authStore: AuthStore;
   readonly files: FilesService;
-  readonly realtime: RealtimeClient;
   collection(name: string): CollectionService;
-  send<T>(method: string, path: string, opts?: { query?: Record<string, string | number | boolean | undefined>; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal }): Promise<T>;
+  send<T>(method: string, path: string, opts?: SendOptions): Promise<T>;
 }
 
 export function createClient(baseUrl: string, opts: ClientOptions = {}): Client {
@@ -61,53 +55,40 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
 
   const wsImpl = opts.WebSocket ?? (globalThis.WebSocket as typeof WebSocket | undefined);
 
-  let realtimeService: RealtimeService | null = null;
-  const getRealtimeService = (): RealtimeService => {
-    if (!realtimeService) {
-      if (!wsImpl) {
-        throw new Error("No WebSocket implementation available; pass options.WebSocket");
-      }
-      realtimeService = new RealtimeService({
-        baseUrl: normalizedBase,
-        authStore,
-        WebSocket: wsImpl,
-      });
-    }
-    return realtimeService;
+  // The reader the live store wraps is the Plan 2 RecordService per collection.
+  const makeReader = (name: string): InternalReader =>
+    new CollectionService(transport, authStore, name) as unknown as InternalReader;
+
+  const internals: ClientInternals = {
+    transport,
+    authStore,
+    baseUrl: normalizedBase,
+    WebSocket: wsImpl,
+    makeReader,
   };
 
-  // The reader the live store wraps is the Plan 2 RecordService per collection.
-  const makeReader = (name: string): LiveReader =>
-    new CollectionService(transport, authStore, name) as unknown as LiveReader;
-
-  // Lazily construct the realtime client wiring only on first `.realtime` access,
-  // so a REST-only app never references the realtime/live/filter-eval graph.
-  let realtimeClient: RealtimeClient | undefined;
-  const getRealtimeClient = (): RealtimeClient =>
-    (realtimeClient ??= {
-      subscribe: (topic, cb, subOpts) => getRealtimeService().subscribe(topic, cb, subOpts),
-      unsubscribe: (topic, cb) => getRealtimeService().unsubscribe(topic, cb),
-      collection: (name) => new LiveCollection(name, makeReader(name), getRealtimeService()),
-    });
-
-  return {
+  const client: Client = {
     baseUrl: normalizedBase,
     authStore,
-    get realtime() {
-      return getRealtimeClient();
-    },
     get files() {
       return (filesService ??= new FilesService(transport, normalizedBase));
     },
     collection(name: string) {
       return new CollectionService(transport, authStore, name);
     },
-    send<T>(
-      method: string,
-      path: string,
-      sendOpts?: { query?: Record<string, string | number | boolean | undefined>; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal },
-    ) {
+    send<T>(method: string, path: string, sendOpts?: SendOptions) {
       return transport.send<T>(path, { method, ...sendOpts });
     },
   };
+
+  // Stash internals under a non-enumerable symbol so `@zigbase/client/realtime`
+  // can bolt realtime on without the base entry importing the realtime graph.
+  Object.defineProperty(client, INTERNALS, {
+    value: internals,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+
+  return client;
 }

@@ -12,6 +12,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./realtime": {
+      "types": "./dist/realtime-entry.d.ts",
+      "import": "./dist/realtime-entry.js",
+      "require": "./dist/realtime-entry.cjs"
     }
   },
   "files": ["dist"],

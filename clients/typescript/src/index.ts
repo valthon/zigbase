@@ -1,7 +1,7 @@
 export const VERSION = "0.1.0";
 
 export { createClient } from "./client.js";
-export type { Client, ClientOptions } from "./client.js";
+export type { Client, ClientOptions, SendOptions } from "./client.js";
 export { CollectionService } from "./collection.js";
 export {
   BaseAuthStore,
@@ -31,19 +31,8 @@ export { FilesService } from "./files.js";
 export type { FileRecordRef, FileUrlOptions } from "./files.js";
 
 // --- Plan 3: realtime + live store ---
-export { RealtimeService } from "./realtime.js";
+// The realtime / live-store / filter-eval graph lives behind the dedicated
+// `@zigbase/client/realtime` subpath (see ./realtime-entry.ts) so a REST-only
+// app never bundles it. Import { withRealtime } from "@zigbase/client/realtime".
+//
 // Note: ZbRecord is already re-exported above from ./records.js (structurally identical).
-export type { RealtimeEvent, RealtimeCallback, RealtimeAction } from "./realtime.js";
-export { LiveCollection, LiveList } from "./live/live-collection.js";
-export type {
-  LiveReader,
-  LiveSubscriber,
-  LiveListOpts,
-  LiveListMode,
-  CloseableLiveRecord,
-} from "./live/live-collection.js";
-export { LiveRecord, RecordCache } from "./live/cache.js";
-export type { Observable } from "./live/cache.js";
-export { parseFilter, evaluateFilter, analyzeFilter } from "./live/filter-eval.js";
-export type { FilterNode, FilterAnalysis } from "./live/filter-eval.js";
-export type { RealtimeClient } from "./client.js";

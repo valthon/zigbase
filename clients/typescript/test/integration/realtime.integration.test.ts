@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { startServer, superuserToken, createCollection, type TestServer } from "./harness.js";
 import { createClient } from "../../src/index.js";
+import { withRealtime } from "../../src/realtime-entry.js";
 
 let server: TestServer;
 let suToken: string;
@@ -69,7 +70,7 @@ function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
 
 describe("realtime (live backend)", () => {
   it("delivers a create event to a low-level subscriber", async () => {
-    const zb = createClient(server.url);
+    const zb = withRealtime(createClient(server.url));
     const events: unknown[] = [];
     const unsub = await zb.realtime.subscribe("feed", (e) => events.push(e));
 
@@ -84,7 +85,7 @@ describe("realtime (live backend)", () => {
 
   it("keeps a LiveList in sync: insert, in-place patch, remove", async () => {
     const seedA = await createRecord({ title: "A", rank: 10 });
-    const zb = createClient(server.url);
+    const zb = withRealtime(createClient(server.url));
     const live = zb.realtime.collection("feed");
     const list = await live.getList(1, 50, { sort: "rank" });
     let notified = 0;
