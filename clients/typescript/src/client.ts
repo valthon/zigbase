@@ -1,6 +1,7 @@
 import { Transport } from "./transport.js";
 import { MemoryAuthStore, type AuthStore } from "./auth-store.js";
 import { CollectionService } from "./collection.js";
+import { FilesService } from "./files.js";
 
 export interface ClientOptions {
   authStore?: AuthStore;
@@ -16,6 +17,7 @@ export interface ClientOptions {
 export interface Client {
   readonly baseUrl: string;
   readonly authStore: AuthStore;
+  readonly files: FilesService;
   collection(name: string): CollectionService;
   send<T>(method: string, path: string, opts?: { query?: Record<string, string | number | boolean | undefined>; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal }): Promise<T>;
 }
@@ -41,9 +43,14 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
       : undefined,
   });
 
+  let filesService: FilesService | undefined;
+
   return {
     baseUrl: normalizedBase,
     authStore,
+    get files() {
+      return (filesService ??= new FilesService(transport, normalizedBase));
+    },
     collection(name: string) {
       return new CollectionService(transport, authStore, name);
     },
