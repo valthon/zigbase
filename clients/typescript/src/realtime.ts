@@ -90,18 +90,38 @@ export class RealtimeService {
   }
 
   unsubscribe(topic: string, cb?: RealtimeCallback, filter?: string): void {
-    const key = subKey(topic, filter);
-    const sub = this.subscriptions.get(key);
-    if (!sub) return;
-    if (cb) sub.callbacks.delete(cb);
-    else sub.callbacks.clear();
+    // When a specific filter is given, target that exact (topic, filter) sub.
+    // When it's omitted (the public `unsubscribe(topic, cb)` path), remove `cb`
+    // from EVERY subscription variant for the topic regardless of filter — a
+    // filtered subscription's subKey would never match `subKey(topic, undefined)`,
+    // so keying alone would silently leak it.
+    const targets: Subscription[] =
+      filter !== undefined
+        ? ([this.subscriptions.get(subKey(topic, filter))].filter(Boolean) as Subscription[])
+        : [...this.subscriptions.values()].filter((s) => s.topic === topic);
 
-    if (sub.callbacks.size === 0) {
-      this.subscriptions.delete(key);
-      if (this.opened && this.ws) {
-        this.send({ action: "unsubscribe", topic });
+    let removedSub = false;
+    for (const sub of targets) {
+      if (cb) sub.callbacks.delete(cb);
+      else sub.callbacks.clear();
+
+      if (sub.callbacks.size === 0) {
+        this.subscriptions.delete(subKey(sub.topic, sub.filter));
+        removedSub = true;
       }
     }
+
+    // Send a single unsubscribe frame once the topic has no live variants left.
+    if (removedSub && this.opened && this.ws && !this.hasTopic(topic)) {
+      this.send({ action: "unsubscribe", topic });
+    }
+  }
+
+  private hasTopic(topic: string): boolean {
+    for (const sub of this.subscriptions.values()) {
+      if (sub.topic === topic) return true;
+    }
+    return false;
   }
 
   /** Tear down the socket and stop reconnecting. */

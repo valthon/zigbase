@@ -70,6 +70,24 @@ describe("RealtimeService.subscribe", () => {
     await subPromise;
   });
 
+  it("unsubscribe(topic, cb) removes a FILTERED subscription (no filter arg needed)", async () => {
+    const { service, factory } = makeService();
+    const cb = vi.fn();
+    const subPromise = service.subscribe("posts", cb, { filter: "status = 'published'" });
+    const ws = factory.last;
+    ws.emitOpen();
+    ws.emitMessage({ type: "ack", action: "subscribe", topic: "posts" });
+    await subPromise;
+
+    // Public path passes only (topic, cb) — it must still find and drop the
+    // filtered subscription so delivery stops and an unsubscribe frame is sent.
+    service.unsubscribe("posts", cb);
+
+    ws.emitMessage({ type: "event", topic: "posts", action: "update", record: { id: "p1" } });
+    expect(cb).not.toHaveBeenCalled();
+    expect(ws.sentFrames).toContainEqual({ action: "unsubscribe", topic: "posts" });
+  });
+
   it("reuses one WS subscription frame for two callbacks on the same (topic, filter)", async () => {
     const { service, factory } = makeService();
     const cb1 = vi.fn();
