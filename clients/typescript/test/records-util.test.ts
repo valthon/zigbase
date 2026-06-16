@@ -44,4 +44,9 @@ describe("records util", () => {
     const fd = toFormData({ note: null });
     expect(fd.get("note")).toBe("");
   });
+
+  it("toFormData serializes a Date as a plain ISO string (not JSON-quoted)", () => {
+    const fd = toFormData({ when: new Date("2026-01-02T03:04:05.000Z") });
+    expect(fd.get("when")).toBe("2026-01-02T03:04:05.000Z");
+  });
 });

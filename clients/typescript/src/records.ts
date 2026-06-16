@@ -55,6 +55,7 @@ export function hasBlob(body: unknown): boolean {
  * Build a FormData payload from a plain object:
  * - undefined values are skipped, null becomes "".
  * - Blob/File values (and arrays thereof) are appended as files (repeated for arrays).
+ * - Date values become a plain ISO string (matching the `filter` tag).
  * - scalars are stringified; nested plain objects/arrays are JSON-encoded.
  */
 export function toFormData(body: Record<string, unknown>): FormData {
@@ -69,9 +70,12 @@ export function toFormData(body: Record<string, unknown>): FormData {
       for (const item of value) {
         if (isBlobLike(item)) fd.append(key, item);
         else if (item === null || item === undefined) continue;
+        else if (item instanceof Date) fd.append(key, item.toISOString());
         else if (typeof item === "object") fd.append(key, JSON.stringify(item));
         else fd.append(key, String(item));
       }
+    } else if (value instanceof Date) {
+      fd.append(key, value.toISOString());
     } else if (typeof value === "object") {
       fd.append(key, JSON.stringify(value));
     } else {
