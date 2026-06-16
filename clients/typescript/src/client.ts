@@ -20,6 +20,8 @@ export interface SendOptions {
   body?: unknown;
   headers?: Record<string, string>;
   signal?: AbortSignal;
+  /** Opt-in de-duplication key; a new request aborts any in-flight one with the same key. */
+  requestKey?: string;
 }
 
 export interface Client {

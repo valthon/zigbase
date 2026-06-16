@@ -140,6 +140,7 @@ export class CollectionService {
         skipTotal: opts.skipTotal ? 1 : undefined,
       },
       signal: opts.signal,
+      requestKey: opts.requestKey,
     });
   }
 
@@ -148,6 +149,7 @@ export class CollectionService {
       method: "GET",
       query: { expand: opts.expand, fields: opts.fields },
       signal: opts.signal,
+      requestKey: opts.requestKey,
     });
   }
 
@@ -176,6 +178,7 @@ export class CollectionService {
       body: payload,
       query: { expand: opts.expand, fields: opts.fields },
       signal: opts.signal,
+      requestKey: opts.requestKey,
     });
   }
 
@@ -190,6 +193,7 @@ export class CollectionService {
       body: payload,
       query: { expand: opts.expand, fields: opts.fields },
       signal: opts.signal,
+      requestKey: opts.requestKey,
     });
   }
 
@@ -213,6 +217,7 @@ export class CollectionService {
     fields?: string;
     withTotal?: boolean;
     signal?: AbortSignal;
+    requestKey?: string;
   } = {}): Promise<CursorPage<T>> {
     const limit = Math.min(Math.max(opts.limit ?? 30, 1), 500);
     const effectiveSort = appendIdTiebreaker(opts.sort ?? "");
@@ -241,6 +246,7 @@ export class CollectionService {
         skipTotal: opts.withTotal ? undefined : 1,
       },
       signal: opts.signal,
+      requestKey: opts.requestKey,
     });
 
     let rows = res.items;
@@ -280,6 +286,7 @@ export class CollectionService {
     fields?: string;
     batch?: number;
     signal?: AbortSignal;
+    requestKey?: string;
   } = {}): AsyncIterableIterator<T> {
     let cursor: string | undefined;
     for (;;) {
@@ -291,6 +298,7 @@ export class CollectionService {
         expand: opts.expand,
         fields: opts.fields,
         signal: opts.signal,
+        requestKey: opts.requestKey,
       });
       for (const item of page.items) yield item;
       if (!page.hasNext || !page.nextCursor) return;
@@ -306,6 +314,7 @@ export class CollectionService {
     fields?: string;
     batch?: number;
     signal?: AbortSignal;
+    requestKey?: string;
   } = {}): Promise<T[]> {
     const out: T[] = [];
     for await (const item of this.iterate<T>(opts)) out.push(item);

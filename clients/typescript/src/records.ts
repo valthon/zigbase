@@ -21,6 +21,8 @@ export interface ListOpts {
   fields?: string;
   skipTotal?: boolean;
   signal?: AbortSignal;
+  /** Opt-in de-duplication key; a new request aborts any in-flight one with the same key. */
+  requestKey?: string;
 }
 
 /** Options accepted by single-record reads/writes. */
@@ -28,6 +30,8 @@ export interface RecordCrudOpts {
   expand?: string;
   fields?: string;
   signal?: AbortSignal;
+  /** Opt-in de-duplication key; a new request aborts any in-flight one with the same key. */
+  requestKey?: string;
 }
 
 function isBlobLike(v: unknown): v is Blob {

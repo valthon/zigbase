@@ -10,6 +10,12 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   signal?: AbortSignal;
   skipAuth?: boolean;
+  /**
+   * Opt-in de-duplication key. When set, any in-flight request sharing the same key
+   * is aborted before this one is issued (PocketBase-style last-write-wins). The aborted
+   * request rejects with a DOMException whose `name` is `"AbortError"`.
+   */
+  requestKey?: string;
 }
 
 export interface TransportConfig {
@@ -26,6 +32,9 @@ export interface TransportConfig {
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class Transport {
+  /** In-flight controllers keyed by `requestKey`, for opt-in auto-cancellation. */
+  private readonly inflight = new Map<string, AbortController>();
+
   constructor(private readonly cfg: TransportConfig) {}
 
   buildUrl(path: string, query?: Record<string, QueryValue>): string {
@@ -44,6 +53,51 @@ export class Transport {
   }
 
   async send<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+    const { signal, cleanup } = this.resolveSignal(opts);
+    try {
+      return await this.exchange<T>(path, opts, signal);
+    } finally {
+      cleanup();
+    }
+  }
+
+  /**
+   * Resolve the effective AbortSignal for a request, wiring opt-in `requestKey`
+   * de-duplication: a new keyed request aborts any in-flight one with the same key.
+   * The returned signal is also aborted by the caller's own `opts.signal`.
+   */
+  private resolveSignal(opts: RequestOptions): { signal: AbortSignal | undefined; cleanup: () => void } {
+    if (opts.requestKey === undefined) {
+      return { signal: opts.signal, cleanup: () => {} };
+    }
+    const key = opts.requestKey;
+    // Abort any prior in-flight request sharing this key (last write wins).
+    this.inflight.get(key)?.abort();
+
+    const controller = new AbortController();
+    this.inflight.set(key, controller);
+
+    // Compose the caller's signal: if it fires, abort this controller too.
+    const userSignal = opts.signal;
+    let onUserAbort: (() => void) | undefined;
+    if (userSignal) {
+      if (userSignal.aborted) controller.abort(userSignal.reason);
+      else {
+        onUserAbort = () => controller.abort(userSignal.reason);
+        userSignal.addEventListener("abort", onUserAbort, { once: true });
+      }
+    }
+
+    const cleanup = () => {
+      if (onUserAbort && userSignal) userSignal.removeEventListener("abort", onUserAbort);
+      // Only clear the map slot if it still points at THIS controller (a newer
+      // keyed request may have replaced it).
+      if (this.inflight.get(key) === controller) this.inflight.delete(key);
+    };
+    return { signal: controller.signal, cleanup };
+  }
+
+  private async exchange<T>(path: string, opts: RequestOptions, signal: AbortSignal | undefined): Promise<T> {
     const url = this.buildUrl(path, opts.query);
     const isForm = typeof FormData !== "undefined" && opts.body instanceof FormData;
     let didRefresh = false;
@@ -70,7 +124,7 @@ export class Transport {
         method: opts.method ?? "GET",
         headers,
         body,
-        signal: opts.signal,
+        signal,
       });
 
       if (res.ok) {
