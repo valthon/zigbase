@@ -76,12 +76,13 @@ function normalizeSort(terms: SortTerm[]): string {
 /**
  * Append `id` as a final tiebreaker term. The id term's direction follows the LAST
  * user-sort term's direction (so synthesized cursors match a future native server cursor).
- * Idempotent when `id` is already the final term; defaults to `id` asc for empty input.
+ * Idempotent when `id` already appears ANYWHERE in the sort — since `id` is unique, any
+ * such sort is already deterministic. Defaults to `id` asc for empty input.
  */
 export function appendIdTiebreaker(sort: string): string {
   const terms = parseSort(sort);
+  if (terms.some((t) => t.field === "id")) return normalizeSort(terms);
   const last = terms[terms.length - 1];
-  if (last && last.field === "id") return normalizeSort(terms);
   const dir: SortTerm["dir"] = last ? last.dir : "asc";
   terms.push({ field: "id", dir });
   return normalizeSort(terms);

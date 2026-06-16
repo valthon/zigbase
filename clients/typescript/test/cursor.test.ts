@@ -57,6 +57,15 @@ describe("appendIdTiebreaker", () => {
     expect(appendIdTiebreaker("id")).toBe("id");
   });
 
+  it("does not append a duplicate when id appears anywhere in the sort", () => {
+    // id is unique, so any sort containing it is already deterministic.
+    expect(appendIdTiebreaker("id,created")).toBe("id,created");
+    expect(appendIdTiebreaker("created,id")).toBe("created,id");
+    expect(appendIdTiebreaker("-id,created")).toBe("-id,created");
+    expect(appendIdTiebreaker("created")).toBe("created,id");
+    expect(appendIdTiebreaker("-created")).toBe("-created,-id");
+  });
+
   it("defaults to id ascending for an empty sort", () => {
     expect(appendIdTiebreaker("")).toBe("id");
   });
