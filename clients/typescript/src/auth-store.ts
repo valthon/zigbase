@@ -57,3 +57,41 @@ export class BaseAuthStore implements AuthStore {
 }
 
 export class MemoryAuthStore extends BaseAuthStore {}
+
+interface StorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+export class LocalAuthStore extends BaseAuthStore {
+  constructor(
+    private readonly key = "zb_auth",
+    private readonly storage: StorageLike | undefined = globalThis.localStorage,
+  ) {
+    super();
+    this.rehydrate();
+  }
+
+  private rehydrate(): void {
+    const raw = this.storage?.getItem(this.key);
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as { token: string; record: AuthRecord };
+      this._token = parsed.token ?? null;
+      this._record = parsed.record ?? null;
+    } catch {
+      // ignore corrupt storage
+    }
+  }
+
+  override save(token: string, record: AuthRecord): void {
+    this.storage?.setItem(this.key, JSON.stringify({ token, record }));
+    super.save(token, record);
+  }
+
+  override clear(): void {
+    this.storage?.removeItem(this.key);
+    super.clear();
+  }
+}
