@@ -8,6 +8,9 @@ export interface CompareNode {
   path: string[];
   op: CompareOp;
   value: Literal;
+  /** A field-path right-hand operand (e.g. `@request.auth.id = owner`), if any.
+   * When present, `value` is unused and membership is NOT locally evaluable. */
+  valuePath?: string[];
 }
 
 export interface LogicNode {
@@ -165,9 +168,22 @@ class Parser {
     if (field.t !== "field") throw new Error("expected a field path");
     const op = this.next();
     if (op.t !== "op") throw new Error("expected a comparison operator");
-    const lit = this.next();
-    if (lit.t !== "lit") throw new Error("expected a literal value");
-    return { kind: "compare", path: field.v.split("."), op: op.v, value: lit.v };
+    const rhs = this.next();
+    if (rhs.t === "lit") {
+      return { kind: "compare", path: field.v.split("."), op: op.v, value: rhs.v };
+    }
+    if (rhs.t === "field") {
+      // Field-to-field comparison (e.g. macros like `@request.auth.id = owner`).
+      // Not locally evaluable; carry the RHS path so analyzeFilter can classify it.
+      return {
+        kind: "compare",
+        path: field.v.split("."),
+        op: op.v,
+        value: null,
+        valuePath: rhs.v.split("."),
+      };
+    }
+    throw new Error("expected a literal value or field path");
   }
 }
 
@@ -215,4 +231,53 @@ export function evaluateFilter(record: Record<string, unknown>, node: FilterNode
     return evaluateFilter(record, node.left) || evaluateFilter(record, node.right);
   }
   return compare(resolvePath(record, node.path), node.op, node.value);
+}
+
+// ---- analysis (tiered-correctness classification) --------------------------
+
+export interface FilterAnalysis {
+  /** True when membership can be decided precisely from a record's own scalar fields. */
+  locallyEvaluable: boolean;
+  referencesRelations: boolean;
+  referencesMacros: boolean;
+}
+
+function isMacroPath(path: string[]): boolean {
+  // @request.*, @collection.*, and any @-prefixed macro the client can't resolve.
+  return path[0]?.startsWith("@") ?? false;
+}
+
+function isRelationPath(path: string[]): boolean {
+  // A dotted path beyond a single own field reads through a relation/expand.
+  return path.length > 1;
+}
+
+export function analyzeFilter(node: FilterNode | undefined): FilterAnalysis {
+  if (!node) {
+    return { locallyEvaluable: true, referencesRelations: false, referencesMacros: false };
+  }
+  let referencesRelations = false;
+  let referencesMacros = false;
+
+  const classify = (path: string[]): void => {
+    if (isMacroPath(path)) referencesMacros = true;
+    else if (isRelationPath(path)) referencesRelations = true;
+  };
+
+  const walk = (n: FilterNode): void => {
+    if (n.kind === "and" || n.kind === "or") {
+      walk(n.left);
+      walk(n.right);
+      return;
+    }
+    classify(n.path);
+    if (n.valuePath) classify(n.valuePath);
+  };
+  walk(node);
+
+  return {
+    locallyEvaluable: !referencesRelations && !referencesMacros,
+    referencesRelations,
+    referencesMacros,
+  };
 }
