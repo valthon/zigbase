@@ -8,9 +8,12 @@ describe("public exports (Plan 2)", () => {
     expect(typeof zb.compareBySort).toBe("function");
   });
 
-  it("re-exports the cursor helpers", () => {
-    expect(typeof zb.encodeCursor).toBe("function");
-    expect(typeof zb.decodeCursor).toBe("function");
+  it("no longer exports client-side cursor synthesis helpers", () => {
+    // Native server cursors replaced client synthesis; these are intentionally gone.
+    expect((zb as Record<string, unknown>).encodeCursor).toBeUndefined();
+    expect((zb as Record<string, unknown>).decodeCursor).toBeUndefined();
+    expect((zb as Record<string, unknown>).buildKeysetFilter).toBeUndefined();
+    expect((zb as Record<string, unknown>).appendIdTiebreaker).toBeUndefined();
   });
 
   it("re-exports FilesService", () => {

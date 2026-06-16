@@ -119,21 +119,21 @@ await posts.delete(created.id);
 ### Safe filters
 
 Use the `filter` tagged template to interpolate user input without injection risk. Strings are
-quoted (the tag picks `'…'`, or `"…"` when the value contains a single quote, so `O'Brien`
-works), numbers/booleans inline, and `Date` becomes an ISO string:
+always single-quoted and escaped against the server lexer (`'`, `\`, and newline/tab/CR are
+backslash-escaped), numbers/booleans inline, and `Date` becomes an ISO string. Any string is
+representable — including values containing both `'` and `"`:
 
 ```ts
 import { filter } from "@zigbase/client";
 
-const q = userInput; // even "' || 1=1 --" is safely quoted
+const q = userInput; // even `' || 1=1 --` or `he said "hi" to O'Brien` is safely quoted
 await posts.getList<Post>(1, 30, {
   filter: filter`status = ${"published"} && author ~ ${q}`,
 });
 ```
 
-> **One limitation:** a value containing **both** a single and a double quote throws (the
-> server's filter grammar can't yet represent it). This is lifted once server PR #16 —
-> backslash escapes — ships.
+> **Injection safety.** The closing quote can only appear escaped, so an interpolated value
+> can never break out of its literal — user input is always an inert single token.
 
 ## Pagination — offset + cursor
 
@@ -160,11 +160,10 @@ const all = await posts.getFullList<Post>({ filter: "status = 'published'" });
 
 **Which one?** Use **offset** (`getList`) when you need jump-to-page-N or a total count. Use
 **cursor** (`getPage` / `iterate` / `getFullList`) for stable feeds and infinite scroll where
-deep offsets get slow. The cursor engine auto-appends an `id` tiebreaker (its direction follows
-your last sort term) and emits opaque base64url tokens.
-
-> Cursor pagination is currently synthesized client-side over the offset+filter API. The public
-> surface is shaped so a future native server cursor can drop in without code changes on your side.
+deep offsets get slow. Cursor pagination is **native server-side keyset**: the server mints an
+**opaque** `nextCursor`/`prevCursor` token that the client just forwards back — there is no
+client-side keyset predicate or `id` tiebreaker to reason about. Totals are skipped by default
+(cheap); pass `withTotal: true` to a `getPage` call to include `totalItems`.
 
 ## File uploads & URLs
 

@@ -165,8 +165,9 @@ const draft = await posts.getFirstListItem<Post>("status = 'draft'");
 ### Safe filters
 
 Build filter strings without injection using the `filter` tagged template. Interpolated values
-are quoted against the grammar: the tag picks `'…'`, or `"…"` when the value already contains a
-single quote (so `O'Brien` works), numbers/booleans inline, and `Date` becomes an ISO string.
+are always single-quoted and escaped against the server lexer (`'`, `\`, and newline/tab/CR are
+backslash-escaped), numbers/booleans inline, and `Date` becomes an ISO string. Any string is
+representable, including values that mix both quote characters.
 
 ```ts
 import { filter } from "@zigbase/client";
@@ -175,11 +176,14 @@ const q = userInput;
 const f = filter`status = ${"published"} && author ~ ${q}`;
 // => status = 'published' && author ~ '…'
 const list = await posts.getList<Post>(1, 30, { filter: f });
+
+// Mixed quotes are fine — single-quote the value and escape only the single quotes:
+filter`title = ${`he said "hi" to O'Brien`}`;
+// => title = 'he said "hi" to O\'Brien'
 ```
 
-> **Limitation:** a value containing **both** a single and a double quote throws — the server's
-> filter grammar can't yet represent it. This is lifted once server PR #16 (backslash escapes)
-> ships.
+> **Injection safety.** The closing single quote can only appear escaped, so an interpolated
+> value can never break out of its literal — even `' || 1=1 --` becomes one inert token.
 
 ## Pagination — offset + cursor
 
@@ -206,12 +210,15 @@ const all = await posts.getFullList<Post>({ filter: "status = 'published'" });
 **Which one to use?** Reach for **offset** (`getList`) when you need jump-to-page-N navigation
 or an exact total count. Reach for **cursor** (`getPage` / `iterate` / `getFullList`) for stable
 feeds and infinite scroll: it is stable under concurrent inserts and avoids the cost of deep
-offsets. The cursor engine always carries an `id` tiebreaker (its direction follows your last
-sort term), so paging is deterministic; cursors are opaque base64url tokens.
+offsets.
 
-> The cursor engine is synthesized client-side over the offset+filter wire today. The public
-> surface is shaped so a future native server cursor can replace the synthesis without any code
-> change on your side.
+Cursor pagination is **native server-side keyset pagination**. The server mints an **opaque**
+token (its internal format — stateless, signed, or stateful — is chosen server-side); the client
+treats `nextCursor`/`prevCursor` as opaque strings and simply forwards whatever the server
+returned on the next `getPage` call. There is no client-side keyset predicate or `id` tiebreaker —
+the server owns determinism. By default the server **skips the total count** in cursor mode (it's
+the expensive part); pass `withTotal: true` to a `getPage` to include `totalItems`. `getPage`
+sends `limit` (defaulting to 30) — sending it with no `cursor` requests the first page.
 
 ## Files
 
@@ -450,11 +457,6 @@ if (res.ok) {
   console.log(res.headers.get("content-type"));
 }
 ```
-
-## Known limitations / fast-follow
-
-- **Both-quotes filter values throw.** A filter value containing both `'` and `"` throws until
-  server PR #16 (backslash escapes) ships.
 
 ## See also
 

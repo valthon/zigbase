@@ -59,20 +59,30 @@ describe("records (live backend)", () => {
     expect(p2.items.length).toBe(2);
     expect(p1.totalItems).toBe(5);
 
-    // --- cursor getPage forward across 2 pages ---
-    const c1 = await posts.getPage({ limit: 2, sort: "views" });
-    expect(c1.items.length).toBe(2);
-    expect(c1.hasNext).toBe(true);
-    const c2 = await posts.getPage({ limit: 2, sort: "views", cursor: c1.nextCursor! });
-    expect(c2.items.length).toBe(2);
-    // forward progress: no overlap with page 1
-    const p1ids = new Set(c1.items.map((i) => i.id));
-    for (const rec of c2.items) expect(p1ids.has(rec.id)).toBe(false);
+    // --- native cursor getPage: page through the whole collection with -created ---
+    // The server mints opaque tokens; we just follow nextCursor across pages and
+    // assert full coverage with no overlap.
+    const seenIds: string[] = [];
+    let cpage = await posts.getPage({ limit: 2, sort: "-created" });
+    expect(cpage.items.length).toBe(2);
+    expect(cpage.hasNext).toBe(true);
+    expect(cpage.nextCursor).not.toBeNull();
+    for (;;) {
+      for (const rec of cpage.items) seenIds.push(rec.id as string);
+      if (!cpage.hasNext || !cpage.nextCursor) break;
+      cpage = await posts.getPage({ limit: 2, sort: "-created", cursor: cpage.nextCursor });
+    }
+    // Coverage + no overlap: every record seen exactly once.
+    expect(seenIds.length).toBe(5);
+    expect(new Set(seenIds).size).toBe(5);
 
-    // --- iterate counts every record ---
-    let count = 0;
-    for await (const _ of posts.iterate({ sort: "views", batch: 2 })) count += 1;
-    expect(count).toBe(5);
+    // --- iterate yields every record exactly once ---
+    const iterated: string[] = [];
+    for await (const rec of posts.iterate({ sort: "views", batch: 2 })) {
+      iterated.push(rec.id as string);
+    }
+    expect(iterated.length).toBe(5);
+    expect(new Set(iterated).size).toBe(5);
 
     // --- multipart create with a small Blob, then files.getUrl GETs 200 ---
     const blob = new Blob(["hello-file"], { type: "text/plain" });
@@ -101,8 +111,8 @@ describe("records (live backend)", () => {
     const posts = zb.collection("posts");
 
     // A value with an embedded single quote must reach the server intact and
-    // match exactly. The filter tag emits it double-quoted (O'Brien -> "O'Brien");
-    // this proves client quoting and the server lexer agree.
+    // match exactly. The filter tag single-quotes and escapes it (O'Brien -> 'O\'Brien');
+    // this proves client quoting and the merged server lexer's escapes agree.
     const target = await posts.create({ title: "O'Brien", views: 100 });
     await posts.create({ title: "Smith", views: 101 });
 
@@ -111,5 +121,23 @@ describe("records (live backend)", () => {
     });
     expect(list.items.map((r) => r.id)).toEqual([target.id]);
     expect(list.items[0]!.title).toBe("O'Brien");
+  });
+
+  it("round-trips a value containing BOTH quote chars (proves client+server escapes agree)", async () => {
+    const zb = createClient(server.url);
+    const posts = zb.collection("posts");
+
+    // The both-quotes case used to be unrepresentable; the merged lexer's backslash
+    // escapes make it work. The tag emits 'he said "hi" to O\'Brien' — single-quoted,
+    // single quote escaped, double quotes literal — and the server must match exactly.
+    const tricky = `he said "hi" to O'Brien`;
+    const target = await posts.create({ title: tricky, views: 200 });
+    await posts.create({ title: `he said "bye"`, views: 201 });
+
+    const list = await posts.getList(1, 30, {
+      filter: filter`title = ${tricky}`,
+    });
+    expect(list.items.map((r) => r.id)).toEqual([target.id]);
+    expect(list.items[0]!.title).toBe(tricky);
   });
 });

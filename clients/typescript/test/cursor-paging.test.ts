@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
 import { createClient } from "../src/index.js";
-import { decodeCursor } from "../src/cursor.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -14,122 +13,117 @@ function qp(url: string): URLSearchParams {
   return new URL(url).searchParams;
 }
 
-describe("cursor pagination", () => {
-  it("getPage fetches limit+1, trims the extra, sets hasNext, and round-trips nextCursor", async () => {
+describe("native cursor pagination", () => {
+  it("getPage sends limit (no cursor on the first page) and returns the server fields", async () => {
     const fetchMock = vi.fn(async (url: string) => {
       const p = qp(url);
-      expect(p.get("page")).toBe("1");
-      expect(p.get("perPage")).toBe("3"); // limit(2) + 1
-      expect(p.get("sort")).toBe("-created,-id"); // id tiebreaker follows last term (desc)
-      // 3 rows returned -> there IS a next page
+      expect(p.get("limit")).toBe("2");
+      expect(p.get("cursor")).toBeNull(); // first page omits the token
+      expect(p.get("skipTotal")).toBeNull(); // default: server skips totals
+      expect(p.get("sort")).toBe("-created"); // forwarded verbatim, no id tiebreaker
+      expect(p.get("page")).toBeNull(); // cursor mode, not offset
+      expect(p.get("perPage")).toBeNull();
       return jsonResponse({
         page: 1,
-        perPage: 3,
-        totalItems: 0,
-        totalPages: 0,
+        perPage: 2,
         items: [
           { id: "r1", created: 30 },
           { id: "r2", created: 20 },
-          { id: "r3", created: 10 },
         ],
+        nextCursor: "TOKEN_NEXT",
+        prevCursor: null,
+        hasNext: true,
+        hasPrev: false,
       });
     }) as unknown as typeof fetch;
 
     const zb = createClient("http://api.test", { fetch: fetchMock });
     const page = await zb.collection("posts").getPage({ limit: 2, sort: "-created" });
 
-    expect(page.items.map((i) => i.id)).toEqual(["r1", "r2"]); // extra row trimmed
+    expect(page.items.map((i) => i.id)).toEqual(["r1", "r2"]);
+    expect(page.nextCursor).toBe("TOKEN_NEXT"); // server token forwarded verbatim
+    expect(page.prevCursor).toBeNull();
     expect(page.hasNext).toBe(true);
     expect(page.hasPrev).toBe(false);
-    expect(page.nextCursor).not.toBeNull();
-
-    // nextCursor encodes the LAST returned row's [created, id] under the effective sort
-    const state = decodeCursor(page.nextCursor!, "-created,-id");
-    expect(state.values).toEqual([20, "r2"]);
-    expect(state.dir).toBe("next");
+    expect(page.totalItems).toBeUndefined();
   });
 
-  it("getPage on the next page applies the keyset predicate AND-ed with the user filter", async () => {
-    let seenFilter: string | null = null;
-    let call = 0;
+  it("getPage forwards the opaque cursor token on a subsequent page", async () => {
+    let seenCursor: string | null = null;
     const fetchMock = vi.fn(async (url: string) => {
-      call += 1;
-      seenFilter = qp(url).get("filter");
-      if (call === 1) {
-        // page 1: user filter only, return limit+1 rows so a cursor is produced
-        return jsonResponse({
-          page: 1, perPage: 6, totalItems: 0, totalPages: 0,
-          items: [
-            { id: "r1", created: 30 }, { id: "r2", created: 20 },
-            { id: "r3", created: 10 }, { id: "r4", created: 8 },
-            { id: "r5", created: 6 }, { id: "r6", created: 4 },
-          ],
-        });
-      }
-      // page 2: short batch -> no further next
+      seenCursor = qp(url).get("cursor");
       return jsonResponse({
-        page: 1, perPage: 6, totalItems: 0, totalPages: 0,
-        items: [{ id: "r7", created: 2 }],
+        page: 1, perPage: 2,
+        items: [{ id: "r3", created: 10 }],
+        nextCursor: null, prevCursor: "PREV_TOK", hasNext: false, hasPrev: true,
       });
     }) as unknown as typeof fetch;
 
     const zb = createClient("http://api.test", { fetch: fetchMock });
-    const first = await zb.collection("posts").getPage({
-      limit: 5, sort: "-created", filter: "status = 'published'",
+    const page = await zb.collection("posts").getPage({
+      limit: 2, sort: "-created", cursor: "OPAQUE_TOKEN_FROM_SERVER",
     });
-    expect(seenFilter).toBe("status = 'published'");
-
-    const second = await zb.collection("posts").getPage({
-      limit: 5, sort: "-created", filter: "status = 'published'", cursor: first.nextCursor!,
-    });
-    // filter must be (user) && (keyset); boundary row is r5/created=6 (last of trimmed page 1)
-    expect(seenFilter).toContain("status = 'published'");
-    expect(seenFilter).toContain("&&");
-    expect(seenFilter).toMatch(/\(created < 6\)/);
-    expect(seenFilter).toContain("id < 'r5'");
-    expect(second.hasNext).toBe(false);
-    expect(second.hasPrev).toBe(true);
+    // The token is sent back exactly as the server minted it (no decode/re-encode).
+    expect(seenCursor).toBe("OPAQUE_TOKEN_FROM_SERVER");
+    expect(page.hasNext).toBe(false);
+    expect(page.hasPrev).toBe(true);
+    expect(page.prevCursor).toBe("PREV_TOK");
   });
 
-  it("getPage requests the count only when withTotal is set", async () => {
+  it("an empty cursor string is treated as the first page (token omitted)", async () => {
     const fetchMock = vi.fn(async (url: string) => {
-      const p = qp(url);
-      // withTotal omits skipTotal; otherwise skipTotal=1 is sent
-      expect(p.get("skipTotal")).toBeNull();
-      return jsonResponse({ page: 1, perPage: 3, totalItems: 42, totalPages: 14, items: [{ id: "a", created: 1 }] });
+      expect(qp(url).get("cursor")).toBeNull();
+      return jsonResponse({ page: 1, perPage: 2, items: [], nextCursor: null, prevCursor: null, hasNext: false, hasPrev: false });
+    }) as unknown as typeof fetch;
+    const zb = createClient("http://api.test", { fetch: fetchMock });
+    await zb.collection("posts").getPage({ limit: 2, cursor: "" });
+  });
+
+  it("withTotal sends skipTotal=false and surfaces totalItems", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      expect(qp(url).get("skipTotal")).toBe("false");
+      return jsonResponse({
+        page: 1, perPage: 2, totalItems: 42, totalPages: 21,
+        items: [{ id: "a", created: 1 }],
+        nextCursor: "N", prevCursor: null, hasNext: true, hasPrev: false,
+      });
     }) as unknown as typeof fetch;
     const zb = createClient("http://api.test", { fetch: fetchMock });
     const page = await zb.collection("posts").getPage({ limit: 2, sort: "-created", withTotal: true });
     expect(page.totalItems).toBe(42);
   });
 
-  it("getPage without withTotal sends skipTotal=1", async () => {
+  it("getPage defaults limit to 30 when omitted", async () => {
     const fetchMock = vi.fn(async (url: string) => {
-      expect(qp(url).get("skipTotal")).toBe("1");
-      return jsonResponse({ page: 1, perPage: 3, totalItems: 0, totalPages: 0, items: [{ id: "a", created: 1 }] });
+      expect(qp(url).get("limit")).toBe("30");
+      return jsonResponse({ page: 1, perPage: 30, items: [], nextCursor: null, prevCursor: null, hasNext: false, hasPrev: false });
     }) as unknown as typeof fetch;
     const zb = createClient("http://api.test", { fetch: fetchMock });
-    const page = await zb.collection("posts").getPage({ limit: 2, sort: "-created" });
-    expect(page.totalItems).toBeUndefined();
+    await zb.collection("posts").getPage();
   });
 
-  it("iterate yields every record across batches and stops on a short batch", async () => {
-    const batches = [
-      [
-        { id: "r1", created: 30 },
-        { id: "r2", created: 20 },
-        { id: "r3", created: 10 }, // sentinel -> hasNext
-      ],
-      [
-        { id: "r3b", created: 9 },
-        { id: "r4", created: 5 }, // short -> last batch
-      ],
+  it("iterate follows nextCursor until hasNext is false", async () => {
+    const pages = [
+      {
+        items: [{ id: "r1", created: 30 }, { id: "r2", created: 20 }],
+        nextCursor: "TOK1", prevCursor: null, hasNext: true, hasPrev: false,
+      },
+      {
+        items: [{ id: "r3", created: 10 }, { id: "r4", created: 5 }],
+        nextCursor: "TOK2", prevCursor: "P", hasNext: true, hasPrev: true,
+      },
+      {
+        items: [{ id: "r5", created: 1 }],
+        nextCursor: null, prevCursor: "P2", hasNext: false, hasPrev: true,
+      },
     ];
+    const seenCursors: (string | null)[] = [];
     let call = 0;
-    const fetchMock = vi.fn(async () => {
-      const body = batches[call] ?? [];
+    const fetchMock = vi.fn(async (url: string) => {
+      seenCursors.push(qp(url).get("cursor"));
+      const body = pages[call]!;
       call += 1;
-      return jsonResponse({ page: 1, perPage: 3, totalItems: 0, totalPages: 0, items: body });
+      return jsonResponse({ page: 1, perPage: 2, ...body });
     }) as unknown as typeof fetch;
 
     const zb = createClient("http://api.test", { fetch: fetchMock });
@@ -137,8 +131,25 @@ describe("cursor pagination", () => {
     for await (const rec of zb.collection("posts").iterate({ sort: "-created", batch: 2 })) {
       seen.push(rec.id as string);
     }
-    // batch=2 -> fetch 3 each time; first batch trims sentinel -> r1,r2 ; second -> r3b,r4
-    expect(seen).toEqual(["r1", "r2", "r3b", "r4"]);
-    expect(call).toBe(2);
+    expect(seen).toEqual(["r1", "r2", "r3", "r4", "r5"]);
+    // first page: no cursor; then it forwards the server's tokens in order.
+    expect(seenCursors).toEqual([null, "TOK1", "TOK2"]);
+    expect(call).toBe(3);
+  });
+
+  it("getFullList accumulates every record across cursor pages", async () => {
+    const pages = [
+      { items: [{ id: "a" }, { id: "b" }], nextCursor: "T", prevCursor: null, hasNext: true, hasPrev: false },
+      { items: [{ id: "c" }], nextCursor: null, prevCursor: "P", hasNext: false, hasPrev: true },
+    ];
+    let call = 0;
+    const fetchMock = vi.fn(async () => {
+      const body = pages[call]!;
+      call += 1;
+      return jsonResponse({ page: 1, perPage: 2, ...body });
+    }) as unknown as typeof fetch;
+    const zb = createClient("http://api.test", { fetch: fetchMock });
+    const all = await zb.collection("posts").getFullList({ sort: "-created", batch: 2 });
+    expect(all.map((r) => r.id)).toEqual(["a", "b", "c"]);
   });
 });

@@ -32,9 +32,12 @@ describe("fields passthrough on cursor + live read paths", () => {
     let call = 0;
     const fetchMock = vi.fn(async (url: string) => {
       seen.push(qp(url).get("fields") ?? "");
-      const items = call === 0 ? [{ id: "r1", created: 3 }, { id: "r2", created: 2 }, { id: "r3", created: 1 }] : [{ id: "r4", created: 0 }];
+      // First page advertises a next cursor; second page ends the iteration.
+      const body = call === 0
+        ? { items: [{ id: "r1" }, { id: "r2" }], nextCursor: "TOK", prevCursor: null, hasNext: true, hasPrev: false }
+        : { items: [{ id: "r3" }], nextCursor: null, prevCursor: "P", hasNext: false, hasPrev: true };
       call += 1;
-      return jsonResponse({ page: 1, perPage: 3, totalItems: 0, totalPages: 0, items });
+      return jsonResponse({ page: 1, perPage: 2, ...body });
     }) as unknown as typeof fetch;
 
     const zb = createClient("http://api.test", { fetch: fetchMock });
