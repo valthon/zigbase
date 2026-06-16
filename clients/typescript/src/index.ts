@@ -35,7 +35,13 @@ export { RealtimeService } from "./realtime.js";
 // Note: ZbRecord is already re-exported above from ./records.js (structurally identical).
 export type { RealtimeEvent, RealtimeCallback, RealtimeAction } from "./realtime.js";
 export { LiveCollection, LiveList } from "./live/live-collection.js";
-export type { LiveReader, LiveSubscriber, LiveListOpts } from "./live/live-collection.js";
+export type {
+  LiveReader,
+  LiveSubscriber,
+  LiveListOpts,
+  LiveListMode,
+  CloseableLiveRecord,
+} from "./live/live-collection.js";
 export { LiveRecord, RecordCache } from "./live/cache.js";
 export type { Observable } from "./live/cache.js";
 export { parseFilter, evaluateFilter, analyzeFilter } from "./live/filter-eval.js";
