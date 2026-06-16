@@ -1444,7 +1444,10 @@ fn countTotal(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, jo
 }
 
 fn reversedOrderBy(alloc: std.mem.Allocator, terms: []const sort.SortTerm) ![]u8 {
-    var rev = try alloc.alloc(sort.SortTerm, terms.len);
+    const rev = try alloc.alloc(sort.SortTerm, terms.len);
+    // `rev` is a scratch copy (SortTerms only borrow their slices); free it after building the
+    // string so only the returned ORDER BY fragment remains allocated.
+    defer alloc.free(rev);
     for (terms, 0..) |t, i| {
         rev[i] = t;
         rev[i].desc = !t.desc;
@@ -1757,6 +1760,21 @@ test "offset mode ORDER BY is unchanged (no id tiebreaker appended)" {
 }
 
 const records_list_mode_offset: ListMode = .offset;
+
+test "reversedOrderBy frees its scratch slice (no leak on the testing allocator)" {
+    // Drive reversedOrderBy directly on the raw testing allocator: it allocates a `rev` scratch
+    // copy of the terms and must free it, leaving only the returned string allocated. A leaked
+    // `rev` fails this test (the testing allocator panics on teardown).
+    const a = std.testing.allocator;
+    const terms = [_]sort.SortTerm{
+        .{ .col_sql = "\"posts\".\"created\"", .field = null, .desc = true, .path = "created" },
+        .{ .col_sql = "\"posts\".\"id\"", .field = null, .desc = true, .path = "id" },
+    };
+    const ob = try reversedOrderBy(a, &terms);
+    defer a.free(ob);
+    // Reversed: DESC -> ASC for every term.
+    try std.testing.expectEqualStrings("\"posts\".\"created\" ASC, \"posts\".\"id\" ASC", ob);
+}
 
 test "gcCursorStates prunes only expired rows" {
     var d = try db.Db.openMemory();

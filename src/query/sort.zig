@@ -39,6 +39,9 @@ pub fn compileTerms(alloc: std.mem.Allocator, j: *joiner.Joiner, spec: []const u
 /// (without the "ORDER BY" keywords), resolving relation paths via `j`. Empty -> "".
 pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, spec: []const u8) SortError![]u8 {
     const terms = try compileTerms(alloc, j, spec);
+    // The SortTerm structs only borrow `col_sql`/`path` (owned by the joiner / input spec), so the
+    // slice itself is the only thing compile() owns here — free it after building the string.
+    defer alloc.free(terms);
     return orderByFromTerms(alloc, terms);
 }
 
@@ -71,6 +74,32 @@ test "sort compiles direction and relation paths" {
     var j = joiner.Joiner.init(a, &d, posts);
     const ob = try compile(a, &j, "-created,author.name");
     try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, j1.\"name\" ASC", ob);
+}
+
+test "compile() frees its intermediate terms slice (no leak on the testing allocator)" {
+    const db = @import("../db.zig");
+    const migrations = @import("../migrations.zig");
+    const collections = @import("../collections.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    // Use an ARENA only for the schema-setup churn (collections.create), but drive compile()
+    // itself on the raw testing allocator so a leaked `terms` slice fails the test.
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    const sa = setup.allocator();
+    try migrations.run(&d);
+    const pf = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
+    };
+    const posts = try collections.create(sa, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+
+    const a = std.testing.allocator;
+    var j = joiner.Joiner.init(sa, &d, posts); // joiner allocations live in the arena
+    const ob = try compile(a, &j, "-created,price"); // returned string owned by `a`
+    defer a.free(ob);
+    try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, \"posts\".\"price\" ASC", ob);
+    // Test teardown: std.testing.allocator panics if compile() leaked the `terms` slice.
 }
 
 test "compileTerms surfaces resolved col_sql, direction, and field per term" {
