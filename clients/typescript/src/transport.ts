@@ -90,12 +90,15 @@ export class Transport {
         }
       }
 
-      // 429 backoff.
+      // 429 backoff. Exponential, but capped so a high attempt count can't
+      // request an absurd multi-minute sleep. A numeric Retry-After is honored
+      // verbatim (the server's explicit instruction wins).
       if (res.status === 429 && attempt < this.cfg.maxRetries) {
+        const maxDelayMs = 30_000;
         const retryAfter = Number(res.headers.get("Retry-After"));
         const delay = Number.isFinite(retryAfter) && retryAfter > 0
           ? retryAfter * 1000
-          : 2 ** attempt * 200;
+          : Math.min(maxDelayMs, 2 ** attempt * 200);
         attempt += 1;
         await (this.cfg.sleep ?? defaultSleep)(delay);
         continue;

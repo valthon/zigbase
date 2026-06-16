@@ -30,6 +30,32 @@ describe("Transport retries", () => {
     expect(calls).toBe(3);
   });
 
+  it("caps the exponential 429 backoff at the max delay", async () => {
+    const delays: number[] = [];
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      // Always 429 until the last allowed attempt, so we capture a high attempt
+      // count whose uncapped delay (2**attempt * 200) would exceed the cap.
+      if (calls <= 20) return jsonResponse({ code: 429, message: "slow down" }, 429);
+      return jsonResponse({ ok: true });
+    }) as unknown as typeof fetch;
+    const t = new Transport({
+      baseUrl: "http://api.test",
+      authStore: new MemoryAuthStore(),
+      fetch: fetchMock,
+      autoRefresh: false,
+      maxRetries: 20,
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+    });
+    await t.send<{ ok: boolean }>("/api/x");
+    // 2**10*200 = 204800 ms uncapped; every requested delay must be <= 30s.
+    expect(Math.max(...delays)).toBeLessThanOrEqual(30_000);
+    expect(delays.some((d) => d === 30_000)).toBe(true);
+  });
+
   it("performs a one-shot refresh on 401 then retries", async () => {
     const store = new MemoryAuthStore();
     store.save("old.tok.tok", { id: "u1" });
