@@ -191,6 +191,52 @@ const token = await zb.files.getToken();
 const protectedUrl = zb.files.getUrl(rec, rec.cover, { token });
 ```
 
+## Typed client — `@zigbase/client/typed`
+
+`@zigbase/client/typed` is the **generic typed core** that a generated `zbase.gen.ts` file
+instantiates into a fully type-safe, schema-aware client. The generator is coming in SP2.1b;
+for now, the hand-authored fixture `test/fixtures/blog.gen.ts` serves as the reference pattern
+for what the generator will emit.
+
+The subpath exports runtime factories (`makeRecordService`, `makeTypedRealtime`,
+`makeTypedFiles`) and the `where`-DSL compiler + fluent builder. A generated client imports
+from this subpath, declares concrete record types and per-field metadata, then builds a
+`BlogClient`-style wrapper that exposes an ergonomic typed surface:
+
+```ts
+// In a consumer repo (generated file):
+import { createClient as baseCreateClient } from "@zigbase/client";
+import { withRealtime } from "@zigbase/client/realtime";
+import {
+  makeRecordService,
+  makeTypedRealtime,
+  makeTypedFiles,
+  type CollectionMeta,
+  type WithExpand,
+} from "@zigbase/client/typed";
+
+// Hand-declare (or let the generator emit) per-collection metadata:
+const postsMeta: CollectionMeta = {
+  name: "posts",
+  fields: { title: { type: "text" }, status: { type: "select" } /* … */ },
+  fileFields: ["cover"],
+  expandable: ["author", "tags"],
+  isAuth: false,
+};
+
+// Build the typed service (compiles `where` → SP1 filter strings):
+const base = withRealtime(baseCreateClient(url));
+const posts = makeRecordService(base, postsMeta) as unknown as PostsService;
+
+// The generated interface narrows every call:
+const page = await posts.getList({ where: { status: "published" }, sort: "-created" });
+// page.items[0]?.title — typed string
+```
+
+Until the Zig generator lands (SP2.1b), see `test/fixtures/blog.gen.ts` for the full worked
+example of what a generated client looks like, including expand-narrowed `getOne`, typed `create`/
+`update` payloads, fluent filter builder, and realtime/files surfaces.
+
 ## Realtime + live store
 
 Realtime lives behind a **dedicated entry point**, `@zigbase/client/realtime`. Opt in with
