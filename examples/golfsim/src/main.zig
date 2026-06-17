@@ -431,8 +431,7 @@ fn epochSeconds(ts: []const u8) !i64 {
 // ---------------------------------------------------------------------------
 // App wiring
 // ---------------------------------------------------------------------------
-pub fn main(init: std.process.Init) !void {
-    return zigbase.App(.{
+pub const App = zigbase.App(.{
         .hooks = .{
             .bookings = .{ .beforeCreate = prepareBooking },
             .reviews = .{ .beforeCreate = prepareReview },
@@ -548,5 +547,8 @@ pub fn main(init: std.process.Init) !void {
                 },
             },
         },
-    }).runCli(init);
+});
+
+pub fn main(init: std.process.Init) !void {
+    return App.runCli(init);
 }
