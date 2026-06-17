@@ -77,6 +77,15 @@ async function createUnknownField() {
 
 assertType<PostCreate>({ title: "Hi" });
 
+async function createRejectsId() {
+  // @ts-expect-error id is not a PostCreate field (excess property)
+  await zb.db.posts.create({ title: "Hi", id: "override" });
+}
+
+async function getListPaging() {
+  await zb.db.posts.getList({ page: 1, limit: 5, where: { status: "published" } });
+}
+
 // --- fluent: enum operand rejection ----------------------------------------
 
 function fluentOk() {
@@ -133,7 +142,8 @@ async function getFullListTyped() {
 export const _typeTests = [
   expandOne, expandTags, noExpand, expandList,
   whereOk, whereBadOperand, whereBadEnum, whereUnknownField,
-  createOk, createMissingRequired, createUnknownField,
+  createOk, createMissingRequired, createUnknownField, createRejectsId,
+  getListPaging,
   fluentOk, fluentUnknownField, fluentBadEnum, filesOk, filesBadField, pageTyped,
   iterateTyped, getFullListTyped,
 ];
