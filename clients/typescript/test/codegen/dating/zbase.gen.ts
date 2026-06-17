@@ -320,10 +320,25 @@ export interface SubscriptionFields {
 // ---- Concrete service interfaces ----
 
 export interface ProfilesService {
-  getOne(id: string, opts?: { fields?: string }): Promise<Profile>;
-  getList(opts?: { where?: ProfileWhere; sort?: string; page?: number; limit?: number }): Promise<ListResult<Profile>>;
-  getFirstListItem(opts?: { where?: ProfileWhere }): Promise<Profile>;
-  getPage(opts?: { where?: ProfileWhere; limit?: number; cursor?: string }): Promise<CursorPage<Profile>>;
+  getOne(id: string, opts?: { fields?: string; signal?: AbortSignal }): Promise<Profile>;
+  getList(opts?: {
+    where?: ProfileWhere;
+    sort?: string;
+    page?: number;
+    limit?: number;
+    fields?: string;
+    signal?: AbortSignal;
+  }): Promise<ListResult<Profile>>;
+  getFirstListItem(opts?: { where?: ProfileWhere; sort?: string }): Promise<Profile>;
+  getPage(opts?: {
+    where?: ProfileWhere;
+    sort?: string;
+    limit?: number;
+    cursor?: string;
+    withTotal?: boolean;
+  }): Promise<CursorPage<Profile>>;
+  iterate(opts?: { where?: ProfileWhere; sort?: string }): AsyncIterableIterator<Profile>;
+  getFullList(opts?: { where?: ProfileWhere; sort?: string }): Promise<Profile[]>;
   create(
     data: ProfileCreate,
     opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
@@ -342,10 +357,25 @@ export interface ProfilesService {
   fileUrl(record: Profile, field: ProfileFileField, opts?: FileUrlOptions): string;
 }
 export interface TagsService {
-  getOne(id: string, opts?: { fields?: string }): Promise<Tag>;
-  getList(opts?: { where?: TagWhere; sort?: string; page?: number; limit?: number }): Promise<ListResult<Tag>>;
-  getFirstListItem(opts?: { where?: TagWhere }): Promise<Tag>;
-  getPage(opts?: { where?: TagWhere; limit?: number; cursor?: string }): Promise<CursorPage<Tag>>;
+  getOne(id: string, opts?: { fields?: string; signal?: AbortSignal }): Promise<Tag>;
+  getList(opts?: {
+    where?: TagWhere;
+    sort?: string;
+    page?: number;
+    limit?: number;
+    fields?: string;
+    signal?: AbortSignal;
+  }): Promise<ListResult<Tag>>;
+  getFirstListItem(opts?: { where?: TagWhere; sort?: string }): Promise<Tag>;
+  getPage(opts?: {
+    where?: TagWhere;
+    sort?: string;
+    limit?: number;
+    cursor?: string;
+    withTotal?: boolean;
+  }): Promise<CursorPage<Tag>>;
+  iterate(opts?: { where?: TagWhere; sort?: string }): AsyncIterableIterator<Tag>;
+  getFullList(opts?: { where?: TagWhere; sort?: string }): Promise<Tag[]>;
   create(
     data: TagCreate,
     opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
@@ -573,7 +603,7 @@ export const profilesMeta: CollectionMeta = {
     name: { type: "text" },
     bio: { type: "editor" },
     website: { type: "url" },
-    age: { type: "number" },
+    age: { type: "number", mode: "int" },
     gender: { type: "select" },
     avatar: { type: "file" },
     created: { type: "autodate" },
@@ -660,7 +690,7 @@ export const subscriptionsMeta: CollectionMeta = {
     id: { type: "text" },
     profile: { type: "relation" },
     plan: { type: "select" },
-    price: { type: "number" },
+    price: { type: "number", mode: "fixed", scale: 2 },
     renewsAt: { type: "date" },
     active: { type: "bool" },
     metadata: { type: "json" },

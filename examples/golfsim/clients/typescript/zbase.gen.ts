@@ -238,10 +238,25 @@ export interface ReviewFields {
 // ---- Concrete service interfaces ----
 
 export interface UsersService {
-  getOne(id: string, opts?: { fields?: string }): Promise<User>;
-  getList(opts?: { where?: UserWhere; sort?: string; page?: number; limit?: number }): Promise<ListResult<User>>;
-  getFirstListItem(opts?: { where?: UserWhere }): Promise<User>;
-  getPage(opts?: { where?: UserWhere; limit?: number; cursor?: string }): Promise<CursorPage<User>>;
+  getOne(id: string, opts?: { fields?: string; signal?: AbortSignal }): Promise<User>;
+  getList(opts?: {
+    where?: UserWhere;
+    sort?: string;
+    page?: number;
+    limit?: number;
+    fields?: string;
+    signal?: AbortSignal;
+  }): Promise<ListResult<User>>;
+  getFirstListItem(opts?: { where?: UserWhere; sort?: string }): Promise<User>;
+  getPage(opts?: {
+    where?: UserWhere;
+    sort?: string;
+    limit?: number;
+    cursor?: string;
+    withTotal?: boolean;
+  }): Promise<CursorPage<User>>;
+  iterate(opts?: { where?: UserWhere; sort?: string }): AsyncIterableIterator<User>;
+  getFullList(opts?: { where?: UserWhere; sort?: string }): Promise<User[]>;
   create(
     data: UserCreate,
     opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
@@ -488,7 +503,7 @@ export const reviewsMeta: CollectionMeta = {
     id: { type: "text" },
     booking: { type: "relation" },
     author: { type: "relation" },
-    rating: { type: "number" },
+    rating: { type: "number", mode: "int" },
     body: { type: "text" },
     created: { type: "autodate" },
     updated: { type: "autodate" },

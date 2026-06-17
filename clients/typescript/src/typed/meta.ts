@@ -13,10 +13,14 @@ export type FieldType =
   | "file"
   | "json";
 
-/** Per-field runtime metadata. `multi` marks `maxSelect > 1` (select/relation/file). */
+/** Per-field runtime metadata. `multi` marks `maxSelect > 1` (select/relation/file).
+ *  `mode`/`scale` carry int/fixed number-mode so writes can be coerced to the
+ *  decimal-string wire form the server requires (float fields omit `mode`). */
 export interface FieldMeta {
   type: FieldType;
   multi?: boolean;
+  mode?: "int" | "fixed";
+  scale?: number;
 }
 
 /**

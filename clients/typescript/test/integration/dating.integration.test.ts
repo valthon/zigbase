@@ -64,11 +64,10 @@ describe("dating client (live dating-server)", () => {
     expect(remaining.items.length).toBe(1);
 
     // native cursor: walk the 2 tags one per page.
-    // tags (relation-less) getPage doesn't type sort in the current generated contract — default order suffices here.
-    const page1 = await zb.db.tags.getPage({ limit: 1 });
+    const page1 = await zb.db.tags.getPage({ sort: "-created", limit: 1 });
     expect(page1.items.length).toBe(1);
     expect(page1.hasNext).toBe(true);
-    const page2 = await zb.db.tags.getPage({ limit: 1, cursor: page1.nextCursor! });
+    const page2 = await zb.db.tags.getPage({ sort: "-created", limit: 1, cursor: page1.nextCursor! });
     expect(page2.items[0]!.id).not.toBe(page1.items[0]!.id);
   });
 

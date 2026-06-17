@@ -186,6 +186,69 @@ describe("makeRecordService", () => {
     expect(collected).toEqual(items);
   });
 
+  it("coerces int/fixed number fields to decimal strings on create, leaving floats as numbers", async () => {
+    // meta with one int-mode, one fixed-mode (scale 2), and one float field.
+    const numMeta: CollectionMeta = {
+      name: "things",
+      fields: {
+        count: { type: "number", mode: "int" },
+        price: { type: "number", mode: "fixed", scale: 2 },
+        weight: { type: "number" },
+      },
+      fileFields: [],
+      expandable: [],
+      isAuth: false,
+    };
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numMeta);
+    await svc.create({ count: 5, price: 40, weight: 3.14 });
+    const body = inner.create.mock.calls[0]![0];
+    expect(body.count).toBe("5");
+    expect(body.price).toBe("40.00");
+    expect(body.weight).toBe(3.14);
+    expect(typeof body.count).toBe("string");
+    expect(typeof body.price).toBe("string");
+    expect(typeof body.weight).toBe("number");
+  });
+
+  it("coerces int/fixed number fields on update too", async () => {
+    const numMeta: CollectionMeta = {
+      name: "things",
+      fields: {
+        count: { type: "number", mode: "int" },
+        price: { type: "number", mode: "fixed", scale: 2 },
+      },
+      fileFields: [],
+      expandable: [],
+      isAuth: false,
+    };
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numMeta);
+    await svc.update("t1", { count: 7, price: 1.5 });
+    const id = inner.update.mock.calls[0]![0];
+    const body = inner.update.mock.calls[0]![1];
+    expect(id).toBe("t1");
+    expect(body.count).toBe("7");
+    expect(body.price).toBe("1.50");
+  });
+
+  it("leaves data untouched (same reference) when no number-mode field is present in payload", async () => {
+    const numMeta: CollectionMeta = {
+      name: "things",
+      fields: { count: { type: "number", mode: "int" }, label: { type: "text" } },
+      fileFields: [],
+      expandable: [],
+      isAuth: false,
+    };
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numMeta);
+    const payload = { label: "hi" };
+    await svc.create(payload);
+    const body = inner.create.mock.calls[0]![0];
+    // No mode-bearing key present as a number, so the original object passes through.
+    expect(body).toBe(payload);
+  });
+
   it("filter(fn) builds an SP1 string via the fluent builder", () => {
     const { client } = mockClient();
     const svc = makeRecordService(client, postsMeta);

@@ -377,10 +377,25 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
         , .{ exp, rec, rel, wn, try ident.createName(alloc, c.name), try ident.updateName(alloc, c.name), fld });
     } else {
         try putf(alloc, w,
-            \\  getOne(id: string, opts?: {{ fields?: string }}): Promise<{0s}>;
-            \\  getList(opts?: {{ where?: {1s}; sort?: string; page?: number; limit?: number }}): Promise<ListResult<{0s}>>;
-            \\  getFirstListItem(opts?: {{ where?: {1s} }}): Promise<{0s}>;
-            \\  getPage(opts?: {{ where?: {1s}; limit?: number; cursor?: string }}): Promise<CursorPage<{0s}>>;
+            \\  getOne(id: string, opts?: {{ fields?: string; signal?: AbortSignal }}): Promise<{0s}>;
+            \\  getList(opts?: {{
+            \\    where?: {1s};
+            \\    sort?: string;
+            \\    page?: number;
+            \\    limit?: number;
+            \\    fields?: string;
+            \\    signal?: AbortSignal;
+            \\  }}): Promise<ListResult<{0s}>>;
+            \\  getFirstListItem(opts?: {{ where?: {1s}; sort?: string }}): Promise<{0s}>;
+            \\  getPage(opts?: {{
+            \\    where?: {1s};
+            \\    sort?: string;
+            \\    limit?: number;
+            \\    cursor?: string;
+            \\    withTotal?: boolean;
+            \\  }}): Promise<CursorPage<{0s}>>;
+            \\  iterate(opts?: {{ where?: {1s}; sort?: string }}): AsyncIterableIterator<{0s}>;
+            \\  getFullList(opts?: {{ where?: {1s}; sort?: string }}): Promise<{0s}[]>;
             \\  create(
             \\    data: {2s},
             \\    opts?: {{ fields?: string; signal?: AbortSignal; requestKey?: string }},
@@ -446,11 +461,14 @@ pub fn emitMeta(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     try metaFields.append(alloc, .{ .id = "_updated", .name = "updated", .options = .{ .autodate = .{} } });
     for (metaFields.items) |f| {
         const tag = @tagName(std.meta.activeTag(f.options));
-        if (f.isMultiValue()) {
-            try putf(alloc, w, "    {s}: {{ type: \"{s}\", multi: true }},\n", .{ f.name, tag });
-        } else {
-            try putf(alloc, w, "    {s}: {{ type: \"{s}\" }},\n", .{ f.name, tag });
-        }
+        try putf(alloc, w, "    {s}: {{ type: \"{s}\"", .{ f.name, tag });
+        if (f.isMultiValue()) try put(alloc, w, ", multi: true");
+        if (f.options == .number) switch (f.options.number.mode) {
+            .int => try put(alloc, w, ", mode: \"int\""),
+            .fixed => try putf(alloc, w, ", mode: \"fixed\", scale: {d}", .{f.options.number.scale orelse 0}),
+            .float => {},
+        };
+        try put(alloc, w, " },\n");
     }
     try put(alloc, w, "  },\n  fileFields: [");
     var first = true;
