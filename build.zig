@@ -90,6 +90,27 @@ pub fn build(b: *std.Build) void {
     check_run.addArgs(&.{ "--out", "clients/typescript/test/codegen/dating/zbase.gen.ts", "--api-prefix", "/api", "--check" });
     const check_step = b.step("gen-dating-client-check", "Fail if the dating client snapshot is stale");
     check_step.dependOn(&check_run.step);
+
+    // --- gen-test: golden snapshot byte-exact test (Task 8) -------------------
+    // Builds gen_test_root.zig as a test binary with both zigbase_mod (for
+    // gen_client.generate) and dating_app_mod (for App.collections) injected.
+    // gen_test_root.zig is the module root — it does NOT share files with zigbase_mod,
+    // avoiding the Zig 0.16 "file in two modules" constraint.
+    // NOTE: this step re-runs generate() to compare against the committed snapshot.
+    // Run `zig build gen-dating-client` first if the snapshot does not yet exist.
+    const gen_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/codegen/gen_test_root.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    gen_test_mod.addImport("zigbase", zigbase_mod);
+    gen_test_mod.addImport("app", dating_app_mod);
+    const gen_test_exe = b.addTest(.{ .root_module = gen_test_mod });
+    const run_gen_test = b.addRunArtifact(gen_test_exe);
+    const gen_test_step = b.step("gen-test", "Run the golden byte-exact snapshot test for the dating client");
+    gen_test_step.dependOn(&run_gen_test.step);
+    // Wire into the main test_step so `zig build test` also runs the golden assertion.
+    test_step.dependOn(&run_gen_test.step);
 }
 
 // ---------------------------------------------------------------------------

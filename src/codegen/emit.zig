@@ -513,28 +513,33 @@ pub fn emitTypedFiles(alloc: std.mem.Allocator, w: *W, cols: []const schema.Coll
     }
     try put(alloc, w, "}\n");
 
-    // Step 3: makeFilesSurface(typedFiles) — factory closure that reads
-    // `record[field]` and calls `typedFiles.fileUrl(...)`.
-    try put(alloc, w, "\nfunction makeFilesSurface(typedFiles: ReturnType<typeof makeTypedFiles>): TypedFiles {\n  return {\n");
+    // Step 3: makeFilesSurface(typedFiles) — single `url` dispatch via a
+    // field-name → collection-name lookup table.  A per-overload impl would
+    // produce duplicate `url` keys in the object literal (TS2300), so we emit
+    // one consolidated method and cast the object to TypedFiles.
+    try put(alloc, w, "\nfunction makeFilesSurface(typedFiles: ReturnType<typeof makeTypedFiles>): TypedFiles {\n");
+    try put(alloc, w, "  const _colMap: Record<string, string> = {\n");
     for (cols) |c| {
-        var any = false;
-        for (c.fields) |f| if (tt.kindOf(f) == .file_name) {
-            any = true;
-        };
-        if (!any) continue;
-        try putf(alloc, w,
-            \\    url(record, field, opts) {{
-            \\      const filename = (record as unknown as Record<string, string>)[field] ?? "";
-            \\      return typedFiles.fileUrl(
-            \\        {{ id: (record as {{ id: string }}).id, collectionName: "{s}" }},
-            \\        filename,
-            \\        opts,
-            \\      );
-            \\    }},
-            \\
-        , .{c.name});
+        for (c.fields) |f| {
+            if (tt.kindOf(f) != .file_name) continue;
+            try putf(alloc, w, "    {s}: \"{s}\",\n", .{ f.name, c.name });
+        }
     }
-    try put(alloc, w, "  };\n}\n");
+    try put(alloc, w,
+        \\  };
+        \\  return {
+        \\    url(record, field, opts) {
+        \\      const filename = (record as unknown as Record<string, string>)[field as string] ?? "";
+        \\      return typedFiles.fileUrl(
+        \\        { id: (record as { id: string }).id, collectionName: _colMap[field as string] ?? "" },
+        \\        filename,
+        \\        opts,
+        \\      );
+        \\    },
+        \\  } as TypedFiles;
+        \\}
+        \\
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -776,8 +781,10 @@ test "emitTypedFiles emits FileField union + TypedFiles interface + makeFilesSur
     // 2. TypedFiles interface with url overload
     try std.testing.expect(contains(out, "export interface TypedFiles {"));
     try std.testing.expect(contains(out, "url(record: Post, field: PostFileField, opts?: FileUrlOptions): string;"));
-    // 3. makeFilesSurface function + record[field] filename lookup
+    // 3. makeFilesSurface function + field→collection map + single dispatch url
     try std.testing.expect(contains(out, "function makeFilesSurface("));
-    try std.testing.expect(contains(out, "record as unknown as Record<string, string>)[field]"));
-    try std.testing.expect(contains(out, "collectionName: \"posts\""));
+    try std.testing.expect(contains(out, "const _colMap: Record<string, string> ="));
+    try std.testing.expect(contains(out, "cover: \"posts\""));
+    try std.testing.expect(contains(out, "record as unknown as Record<string, string>)[field as string]"));
+    try std.testing.expect(contains(out, "_colMap[field as string]"));
 }
