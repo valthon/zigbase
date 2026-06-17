@@ -4,11 +4,9 @@
 // In a consumer repo this file imports from "@zigbase/client" and
 // "@zigbase/client/typed". In this in-repo snapshot we import from the
 // package source so it typechecks against the working tree without a built dist.
-import { createClient as baseCreateClient, type Client } from "../../../src/index.js";
-import { withRealtime, type RealtimeEnabledClient } from "../../../src/realtime-entry.js";
-import type { ListResult } from "../../../src/records.js";
-import type { CursorPage } from "../../../src/cursor.js";
-import type { FilesService, FileUrlOptions } from "../../../src/files.js";
+import { createClient as baseCreateClient, type Client } from "@zigbase/client";
+import { withRealtime, type RealtimeEnabledClient } from "@zigbase/client/realtime";
+import type { ListResult, CursorPage, FilesService, FileUrlOptions } from "@zigbase/client";
 import {
   makeRecordService,
   makeTypedRealtime,
@@ -23,7 +21,7 @@ import {
   type TypedFieldExpr,
   type RelationResolver,
   type RawTypedRealtime,
-} from "../../../src/typed/index.js";
+} from "@zigbase/client/typed";
 
 // ---- Records ----
 

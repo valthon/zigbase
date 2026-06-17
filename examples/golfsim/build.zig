@@ -27,9 +27,9 @@ pub fn build(b: *std.Build) void {
     app_mod.addImport("zigbase", zigbase.module("zigbase"));
 
     const out = "clients/typescript/zbase.gen.ts";
-    const gen = zigbase_build.genClientStep(b, zigbase, app_mod, .{ .out = out, .api_prefix = "/api", .in_repo = true });
+    const gen = zigbase_build.genClientStep(b, zigbase, app_mod, .{ .out = out, .api_prefix = "/api" });
     b.step("gen-client", "Generate the golfsim typed TS client").dependOn(&gen.step);
 
-    const check = zigbase_build.genClientStep(b, zigbase, app_mod, .{ .out = out, .api_prefix = "/api", .check = true, .in_repo = true });
+    const check = zigbase_build.genClientStep(b, zigbase, app_mod, .{ .out = out, .api_prefix = "/api", .check = true });
     b.step("gen-client-check", "Fail if the golfsim client snapshot is stale").dependOn(&check.step);
 }
