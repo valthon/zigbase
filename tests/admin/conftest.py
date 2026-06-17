@@ -63,17 +63,20 @@ def save_collection_and_wait(page):
     caller continues. Only use this on the SUCCESS path — on a validation error
     the app stays on the editor and never reloads.
     """
-    # Capture the post-save reload as a first-class navigation: expect_navigation
-    # arms a waiter BEFORE the click fires, so we can't miss the location.assign()
-    # that save() schedules, and it resolves only once that navigation has
-    # actually committed to the `?saved=<ts>` URL. This guarantees the reload is
-    # no longer in flight when we return — a later page.goto() can't collide with
-    # it (which is what produced the net::ERR_ABORTED flake).
+    # Click Save, then synchronize on the post-save reload via wait_for_url.
+    # wait_for_url resolves once the URL has committed to `?saved=<ts>` — and if
+    # the reload already landed before this call runs, it resolves immediately
+    # (it checks the current URL), so we can't miss the location.assign() that
+    # save() schedules. After save the app stays on the `?saved=` URL (no
+    # away-navigation), so there's no transient-URL hazard. This guarantees the
+    # reload is no longer in flight when we return — a later page.goto() can't
+    # collide with it (which is what produced the net::ERR_ABORTED flake).
+    # (wait_for_url over the deprecated, racy expect_navigation per Playwright.)
     # Match the URL with a regex, not a glob: Playwright's URL glob treats `?` as
     # a single-char wildcard, so a literal `/_/?saved=` query never matches a glob
     # pattern. A regex on `saved=` is unambiguous.
-    with page.expect_navigation(url=re.compile(r"[?&]saved="), wait_until="commit"):
-        page.click('[data-test=save-collection]')
+    page.click('[data-test=save-collection]')
+    page.wait_for_url(re.compile(r"[?&]saved="), wait_until="commit")
     # The reload has committed (the old in-flight navigation is done). Now wait
     # for the freshly-loaded document to finish loading + go network-idle
     # (collections fetch + render) before handing control back, so the caller's
