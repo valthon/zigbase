@@ -77,72 +77,63 @@ pub const Config = struct {
         };
     }
 
-    /// Pure loader: applies overrides from a getter (env in prod, a stub in tests).
-    pub fn load(getter: *const fn ([]const u8) ?[]const u8) !Config {
+    /// Pure loader: applies overrides from a getter, which is any value with a
+    /// `get(key) ?[]const u8` method (env in prod via `EnvGetter`, a stub in tests).
+    pub fn load(getter: anytype) !Config {
         var cfg = Config{};
-        if (getter("ZIGBASE_HTTP_HOST")) |v| cfg.http_host = v;
-        if (getter("ZIGBASE_HTTP_PORT")) |v| cfg.http_port = try std.fmt.parseInt(u16, v, 10);
-        if (getter("ZIGBASE_DATA_DIR")) |v| cfg.data_dir = v;
-        if (getter("ZIGBASE_JWT_SECRET")) |v| cfg.jwt_secret = v;
-        if (getter("ZIGBASE_COOKIE_SECURE")) |v| cfg.cookie_secure = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
-        if (getter("ZIGBASE_AUTH_TOKEN_TTL")) |v| cfg.auth_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
-        if (getter("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try std.fmt.parseInt(i64, v, 10);
-        if (getter("ZIGBASE_PASSWORD_RESET_TTL")) |v| cfg.password_reset_ttl_s = try std.fmt.parseInt(i64, v, 10);
-        if (getter("ZIGBASE_REALTIME_ORIGINS")) |v| cfg.realtime_allowed_origins = v;
-        if (getter("ZIGBASE_TRUST_PROXY")) |v| cfg.trust_proxy = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
-        if (getter("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
-        if (getter("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
-        if (getter("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
-        if (getter("ZIGBASE_RATE_LIMIT_MAX")) |v| cfg.rate_limit_max = try std.fmt.parseInt(u32, v, 10);
-        if (getter("ZIGBASE_RATE_LIMIT_WINDOW")) |v| cfg.rate_limit_window_s = try std.fmt.parseInt(i64, v, 10);
-        if (getter("ZIGBASE_OAUTH_STATE_SERVER")) |v| cfg.oauth_state_server = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
-        if (getter("ZIGBASE_OAUTH_STATE_TTL")) |v| cfg.oauth_state_ttl_s = try std.fmt.parseInt(i64, v, 10);
-        if (getter("ZIGBASE_SMTP_HOST")) |v| cfg.smtp_host = v;
-        if (getter("ZIGBASE_SMTP_PORT")) |v| cfg.smtp_port = try std.fmt.parseInt(u16, v, 10);
-        if (getter("ZIGBASE_SMTP_USERNAME")) |v| cfg.smtp_username = v;
-        if (getter("ZIGBASE_SMTP_PASSWORD")) |v| cfg.smtp_password = v;
-        if (getter("ZIGBASE_SMTP_FROM")) |v| cfg.smtp_from = v;
-        if (getter("ZIGBASE_SMTP_TLS")) |v| {
+        if (getter.get("ZIGBASE_HTTP_HOST")) |v| cfg.http_host = v;
+        if (getter.get("ZIGBASE_HTTP_PORT")) |v| cfg.http_port = try std.fmt.parseInt(u16, v, 10);
+        if (getter.get("ZIGBASE_DATA_DIR")) |v| cfg.data_dir = v;
+        if (getter.get("ZIGBASE_JWT_SECRET")) |v| cfg.jwt_secret = v;
+        if (getter.get("ZIGBASE_COOKIE_SECURE")) |v| cfg.cookie_secure = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        if (getter.get("ZIGBASE_AUTH_TOKEN_TTL")) |v| cfg.auth_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter.get("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter.get("ZIGBASE_PASSWORD_RESET_TTL")) |v| cfg.password_reset_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter.get("ZIGBASE_REALTIME_ORIGINS")) |v| cfg.realtime_allowed_origins = v;
+        if (getter.get("ZIGBASE_TRUST_PROXY")) |v| cfg.trust_proxy = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        if (getter.get("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
+        if (getter.get("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter.get("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
+        if (getter.get("ZIGBASE_RATE_LIMIT_MAX")) |v| cfg.rate_limit_max = try std.fmt.parseInt(u32, v, 10);
+        if (getter.get("ZIGBASE_RATE_LIMIT_WINDOW")) |v| cfg.rate_limit_window_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter.get("ZIGBASE_OAUTH_STATE_SERVER")) |v| cfg.oauth_state_server = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        if (getter.get("ZIGBASE_OAUTH_STATE_TTL")) |v| cfg.oauth_state_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter.get("ZIGBASE_SMTP_HOST")) |v| cfg.smtp_host = v;
+        if (getter.get("ZIGBASE_SMTP_PORT")) |v| cfg.smtp_port = try std.fmt.parseInt(u16, v, 10);
+        if (getter.get("ZIGBASE_SMTP_USERNAME")) |v| cfg.smtp_username = v;
+        if (getter.get("ZIGBASE_SMTP_PASSWORD")) |v| cfg.smtp_password = v;
+        if (getter.get("ZIGBASE_SMTP_FROM")) |v| cfg.smtp_from = v;
+        if (getter.get("ZIGBASE_SMTP_TLS")) |v| {
             if (std.mem.eql(u8, v, "none")) cfg.smtp_tls = .none
             else if (std.mem.eql(u8, v, "starttls")) cfg.smtp_tls = .starttls
             else if (std.mem.eql(u8, v, "implicit")) cfg.smtp_tls = .implicit
             else if (std.mem.eql(u8, v, "auto")) cfg.smtp_tls = .auto
             else return error.InvalidSmtpTls;
         }
-        if (getter("ZIGBASE_SMTP_INSECURE")) |v|
+        if (getter.get("ZIGBASE_SMTP_INSECURE")) |v|
             cfg.smtp_insecure_skip_verify = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
         return cfg;
     }
 };
 
-/// Process environment, bound once at CLI startup from `std.process.Init`.
-/// Lets `envGetter` read env through Zig 0.16's pure-Zig `std.process.Environ.Map`
-/// instead of `std.c.getenv`, so this module carries no *direct* libc dependency.
-/// (The server still links libc transitively via facil.io; this only drops the
-/// direct use — see the generator's matching change in src/codegen/gen_client.zig.)
-var process_environ: ?*const std.process.Environ.Map = null;
-
-/// Bind the process environment for `envGetter`. Called once at CLI startup with
-/// `init.environ_map` (see framework.runCliImpl). Idempotent.
-pub fn bindEnviron(map: *const std.process.Environ.Map) void {
-    process_environ = map;
-}
-
-/// Real env getter for production use. Reads from the environment bound via
-/// `bindEnviron` using pure-Zig `Environ.Map.get`. Returns null (so defaults
-/// apply) if the environment was never bound.
-pub fn envGetter(key: []const u8) ?[]const u8 {
-    const env = process_environ orelse return null;
-    return env.get(key);
-}
+/// Production env getter: reads the process environment via Zig 0.16's pure-Zig
+/// `std.process.Environ.Map` (no libc). Built in framework.loadCfg from
+/// `init.environ_map` and passed to `Config.load`. Test code passes its own
+/// stub getter with the same `get(self, key) ?[]const u8` shape.
+pub const EnvGetter = struct {
+    environ: *const std.process.Environ.Map,
+    pub fn get(self: EnvGetter, key: []const u8) ?[]const u8 {
+        return self.environ.get(key);
+    }
+};
 
 test "defaults apply when getter returns null" {
     const G = struct {
-        fn get(_: []const u8) ?[]const u8 {
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
             return null;
         }
     };
-    const cfg = try Config.load(&G.get);
+    const cfg = try Config.load(G{});
     try std.testing.expectEqual(@as(u16, 8090), cfg.http_port);
     // Secure-by-default: loopback bind, no operator secret yet, secure cookies, no trusted proxy.
     try std.testing.expectEqualStrings("127.0.0.1", cfg.http_host);
@@ -153,49 +144,49 @@ test "defaults apply when getter returns null" {
 
 test "env overrides are applied and parsed" {
     const G = struct {
-        fn get(key: []const u8) ?[]const u8 {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
             if (std.mem.eql(u8, key, "ZIGBASE_HTTP_PORT")) return "9123";
             if (std.mem.eql(u8, key, "ZIGBASE_DATA_DIR")) return "/var/zb";
             return null;
         }
     };
-    const cfg = try Config.load(&G.get);
+    const cfg = try Config.load(G{});
     try std.testing.expectEqual(@as(u16, 9123), cfg.http_port);
     try std.testing.expectEqualStrings("/var/zb", cfg.data_dir);
 }
 
 test "auth defaults and overrides" {
     const G0 = struct {
-        fn get(_: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
     };
-    const d = try Config.load(&G0.get);
+    const d = try Config.load(G0{});
     try std.testing.expectEqual(true, d.cookie_secure); // secure-by-default
     try std.testing.expectEqual(@as(i64, 14 * 24 * 3600), d.auth_token_ttl_s);
 
     const G1 = struct {
-        fn get(key: []const u8) ?[]const u8 {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
             if (std.mem.eql(u8, key, "ZIGBASE_COOKIE_SECURE")) return "false";
             if (std.mem.eql(u8, key, "ZIGBASE_AUTH_TOKEN_TTL")) return "3600";
             return null;
         }
     };
-    const c = try Config.load(&G1.get);
+    const c = try Config.load(G1{});
     try std.testing.expectEqual(false, c.cookie_secure); // opt-out for plain-HTTP local dev
     try std.testing.expectEqual(@as(i64, 3600), c.auth_token_ttl_s);
 }
 
 test "trust_proxy defaults off, opt-in via env" {
     const G0 = struct {
-        fn get(_: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
     };
-    try std.testing.expectEqual(false, (try Config.load(&G0.get)).trust_proxy);
+    try std.testing.expectEqual(false, (try Config.load(G0{})).trust_proxy);
     const G1 = struct {
-        fn get(key: []const u8) ?[]const u8 {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
             if (std.mem.eql(u8, key, "ZIGBASE_TRUST_PROXY")) return "true";
             return null;
         }
     };
-    try std.testing.expectEqual(true, (try Config.load(&G1.get)).trust_proxy);
+    try std.testing.expectEqual(true, (try Config.load(G1{})).trust_proxy);
 }
 
 test "smtp_tls auto inference from port" {
@@ -212,55 +203,55 @@ test "smtp_tls auto inference from port" {
 
 test "smtp tls env overrides" {
     const G = struct {
-        fn get(key: []const u8) ?[]const u8 {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
             if (std.mem.eql(u8, key, "ZIGBASE_SMTP_TLS")) return "starttls";
             if (std.mem.eql(u8, key, "ZIGBASE_SMTP_INSECURE")) return "true";
             return null;
         }
     };
-    const cfg = try Config.load(&G.get);
+    const cfg = try Config.load(G{});
     try std.testing.expectEqual(SmtpTls.starttls, cfg.smtp_tls);
     try std.testing.expectEqual(true, cfg.smtp_insecure_skip_verify);
 
     // Default: auto + verify on.
     const G0 = struct {
-        fn get(_: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
     };
-    const d = try Config.load(&G0.get);
+    const d = try Config.load(G0{});
     try std.testing.expectEqual(SmtpTls.auto, d.smtp_tls);
     try std.testing.expectEqual(false, d.smtp_insecure_skip_verify);
 }
 
 test "rate limit defaults and overrides" {
     const G0 = struct {
-        fn get(_: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
     };
-    const d = try Config.load(&G0.get);
+    const d = try Config.load(G0{});
     try std.testing.expectEqual(@as(u32, 10), d.rate_limit_max);
     try std.testing.expectEqual(@as(i64, 60), d.rate_limit_window_s);
 
     const G1 = struct {
-        fn get(key: []const u8) ?[]const u8 {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
             if (std.mem.eql(u8, key, "ZIGBASE_RATE_LIMIT_MAX")) return "0";
             if (std.mem.eql(u8, key, "ZIGBASE_RATE_LIMIT_WINDOW")) return "120";
             return null;
         }
     };
-    const c = try Config.load(&G1.get);
+    const c = try Config.load(G1{});
     try std.testing.expectEqual(@as(u32, 0), c.rate_limit_max);
     try std.testing.expectEqual(@as(i64, 120), c.rate_limit_window_s);
 }
 
 test "realtime origins default empty, overridable" {
     const G0 = struct {
-        fn get(_: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
     };
-    try std.testing.expectEqualStrings("", (try Config.load(&G0.get)).realtime_allowed_origins);
+    try std.testing.expectEqualStrings("", (try Config.load(G0{})).realtime_allowed_origins);
     const G1 = struct {
-        fn get(key: []const u8) ?[]const u8 {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
             if (std.mem.eql(u8, key, "ZIGBASE_REALTIME_ORIGINS")) return "https://app.example";
             return null;
         }
     };
-    try std.testing.expectEqualStrings("https://app.example", (try Config.load(&G1.get)).realtime_allowed_origins);
+    try std.testing.expectEqualStrings("https://app.example", (try Config.load(G1{})).realtime_allowed_origins);
 }

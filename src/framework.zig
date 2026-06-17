@@ -290,10 +290,6 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     const allocator = init.gpa;
     const arena = init.arena.allocator();
 
-    // Bind the process environment so config.envGetter reads env via Environ.Map
-    // (pure-Zig) instead of libc. Every subcommand below loads config through it.
-    config.bindEnviron(init.environ_map);
-
     const argv = try init.minimal.args.toSlice(arena);
     // cli.parse wants []const []const u8; argv is []const [:0]const u8. Copy
     // the (sentinel-bearing) slices into plain []const u8 views.
@@ -314,11 +310,11 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .superuser_create => printSuperuserUsage(),
         },
         .serve => |sa| {
-            const cfg = try loadCfg(sa);
+            const cfg = try loadCfg(init.environ_map, sa);
             try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts);
         },
-        .migrate => |sa| try migrateImpl(allocator, init.io, sa),
-        .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, sa),
+        .migrate => |sa| try migrateImpl(allocator, init.io, init.environ_map, sa),
+        .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
     }
 }
 
@@ -487,8 +483,8 @@ fn printSuperuserUsage() void {
     , .{});
 }
 
-fn loadCfg(sa: cli.ServeArgs) !config.Config {
-    var cfg = try config.Config.load(&config.envGetter);
+fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.Config {
+    var cfg = try config.Config.load(config.EnvGetter{ .environ = environ });
     if (sa.http_host) |v| cfg.http_host = v;
     if (sa.http_port) |v| cfg.http_port = v;
     if (sa.data_dir) |v| cfg.data_dir = v;
@@ -507,8 +503,8 @@ fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, option
     return db.Pool.initOpts(allocator, io, db_path, options);
 }
 
-fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.ServeArgs) !void {
-    const cfg = try loadCfg(sa);
+fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !void {
+    const cfg = try loadCfg(environ, sa);
     var pool = try openPool(allocator, io, cfg, .{});
     defer pool.deinit();
     const w = pool.acquireWriter();
@@ -703,7 +699,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     try srv.listen();
 }
 
-fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.SuperuserArgs) !void {
+fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.SuperuserArgs) !void {
     const email = sa.email orelse {
         std.log.err("--email is required", .{});
         return;
@@ -716,7 +712,7 @@ fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, sa: cli.Superus
         std.log.err("password must be at least 8 characters", .{});
         return;
     }
-    const cfg = try loadCfg(.{ .data_dir = sa.data_dir });
+    const cfg = try loadCfg(environ, .{ .data_dir = sa.data_dir });
     var pool = try openPool(allocator, io, cfg, .{});
     defer pool.deinit();
     const w = pool.acquireWriter();
