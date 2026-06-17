@@ -122,10 +122,15 @@ describe("typed blog client (live backend)", () => {
     });
     expect(byAuthor.items.length).toBe(2);
 
-    // native cursor getPage.
-    const page = await zb.db.posts.getPage({ limit: 1, sort: "-created" });
-    expect(page.items.length).toBe(1);
-    expect(typeof page.hasNext).toBe("boolean");
+    // native cursor getPage — two-page keyset walk (seed has exactly 2 posts).
+    const page1 = await zb.db.posts.getPage({ limit: 1, sort: "-created" });
+    expect(page1.items.length).toBe(1);
+    expect(page1.hasNext).toBe(true);
+    expect(typeof page1.nextCursor).toBe("string");
+    const page2 = await zb.db.posts.getPage({ limit: 1, sort: "-created", cursor: page1.nextCursor! });
+    expect(page2.items.length).toBe(1);
+    expect(page2.items[0]!.id).not.toBe(page1.items[0]!.id); // no overlap between pages
+    expect(page2.hasNext).toBe(false); // exactly 2 posts seeded
 
     // fluent filter -> filter string the server accepts.
     const f = zb.db.posts.filter((b) => b.price.gte(5));
