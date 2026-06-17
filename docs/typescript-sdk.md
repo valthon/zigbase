@@ -252,9 +252,9 @@ The subpath exports runtime factories and type utilities:
 | `makeTypedFiles` | factory | Build a typed file-URL helper. |
 | `makeFilterBuilder` | factory | Build a fluent filter builder (a `Proxy` over field names). |
 | `compileWhere` | function | Compile a `where`-DSL object into an SP1 filter string. |
-| `compileIn` | function | Compile an `in`-list into a disjunction of `id = '…'` terms. |
+| `compileIn` | function | Compile an `in`-list into a disjunction of `<field> = <value>` clauses (OR-joined). |
 | `OP_MAP` | object | Operator-to-filter-operator mapping (e.g. `eq` → `=`). |
-| `fieldMeta` | helper | Construct a `FieldMeta` object (convenience). |
+| `fieldMeta` | helper | Look up a `FieldMeta` by name from a `CollectionMeta` (`fieldMeta(meta, name): FieldMeta \| undefined`). |
 | `Expr`, `FieldExpr` | classes | Fluent filter expression nodes. |
 | `CollectionMeta`, `FieldMeta`, `FieldType` | types | Runtime metadata descriptors. |
 | `WithExpand` | type | Narrow a record type to include one or more expanded relations. |

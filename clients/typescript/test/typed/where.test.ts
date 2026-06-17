@@ -28,6 +28,19 @@ const postsMeta: CollectionMeta = {
   // compiler reads (see Step 3 `relationMeta`).
 };
 
+const itemsMeta: CollectionMeta = {
+  name: "items",
+  fields: {
+    active: { type: "bool" },
+    created: { type: "date" },
+  },
+  fileFields: [],
+  expandable: [],
+  isAuth: false,
+};
+
+const compileItems = (w: unknown) => compileWhere(w, itemsMeta);
+
 const compile = (w: unknown) =>
   compileWhere(w, postsMeta, (col, field) =>
     col === "posts" && field === "author" ? usersMeta : undefined,
@@ -142,6 +155,22 @@ describe("compileWhere", () => {
     // Nested field object at depth 0 is treated as id-operators and throws because
     // 'name' is not a recognized operator key.
     expect(() => compileNoDepth({ author: { name: { like: "A" } } })).toThrow();
+  });
+});
+
+describe("bool and date neq/in ops", () => {
+  it("bool neq compiles to != true", () => {
+    expect(compileItems({ active: { neq: true } })).toBe("active != true");
+  });
+
+  it("date neq compiles to != with quoted string", () => {
+    expect(compileItems({ created: { neq: "2026-01-01" } })).toBe("created != '2026-01-01'");
+  });
+
+  it("date in expands to OR-joined equality clauses", () => {
+    expect(compileItems({ created: { in: ["2026-01-01", "2026-02-01"] } })).toBe(
+      "(created = '2026-01-01' || created = '2026-02-01')",
+    );
   });
 });
 

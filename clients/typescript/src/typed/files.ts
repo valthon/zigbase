@@ -1,8 +1,10 @@
 import type { FilesService, FileRecordRef, FileUrlOptions } from "../files.js";
 
 /**
- * Broad runtime shape of the typed files helper. The generated file casts this
- * so `filename` is typed to the record's collection file fields.
+ * Broad runtime shape of the typed files helper. This low-level interface
+ * takes the stored filename directly (e.g. `record['cover']`); the generated
+ * concrete wrapper is what types the field name and does the `record[field]`
+ * lookup before calling this.
  */
 export interface RawTypedFiles {
   /**

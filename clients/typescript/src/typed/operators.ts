@@ -29,15 +29,18 @@ export interface NumberOps {
 /** Boolean fields: `bool`. */
 export interface BoolOps {
   eq?: boolean;
+  neq?: boolean;
 }
 
 /** Date / autodate fields (ISO-8601 strings or `Date`). */
 export interface DateOps {
   eq?: string | Date;
+  neq?: string | Date;
   gt?: string | Date;
   gte?: string | Date;
   lt?: string | Date;
   lte?: string | Date;
+  in?: (string | Date)[];
 }
 
 /** Single-select fields. `T` is the value union (e.g. `'draft' | 'published'`). */

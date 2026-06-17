@@ -124,7 +124,7 @@ export function makeRecordService(
         throw new ZigbaseError({
           status: 404,
           message: "No record found.",
-          url: `(${meta.name})`,
+          url: `/api/collections/${meta.name}/records`,
         });
       }
       return first;
