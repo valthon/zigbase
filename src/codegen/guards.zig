@@ -3,6 +3,7 @@
 const std = @import("std");
 const schema = @import("../schema.zig");
 const ident = @import("identifiers.zig");
+const ts_type = @import("ts_type.zig");
 
 pub const GuardError = error{ OperatorNameClash, InvalidIdentifier, NameCollision, OutOfMemory };
 
@@ -75,9 +76,10 @@ pub fn checkIdentifiers(alloc: std.mem.Allocator, cols: []const schema.Collectio
                 return GuardError.InvalidIdentifier;
             }
         }
-        // Register each top-level generated NAME (record/where/create/update/
-        // relations/expand/fields/service). Select-union names are scoped per-field
-        // and registered too (they are exported types).
+        // Register each generated name that the codegen emits at module scope.
+        // This covers the 9 per-collection type/const names plus every select-union
+        // type name (one per select field, e.g. PostStatus), all of which are
+        // exported and must be mutually unique and not reserved.
         try registerName(alloc, &seen, try ident.recordName(alloc, c.name), c.name, report);
         try registerName(alloc, &seen, try ident.whereName(alloc, c.name), c.name, report);
         try registerName(alloc, &seen, try ident.createName(alloc, c.name), c.name, report);
@@ -87,6 +89,13 @@ pub fn checkIdentifiers(alloc: std.mem.Allocator, cols: []const schema.Collectio
         try registerName(alloc, &seen, try ident.fieldsName(alloc, c.name), c.name, report);
         try registerName(alloc, &seen, try ident.serviceName(alloc, c.name), c.name, report);
         try registerName(alloc, &seen, try ident.realtimeAliasName(alloc, c.name), c.name, report);
+        // Register select-union names (e.g. PostStatus for posts.status).
+        for (c.fields) |f| {
+            if (f.fieldType() != .select) continue;
+            const union_name = try ts_type.selectUnionName(alloc, c.name, f.name);
+            const owner_ctx = try std.fmt.allocPrint(alloc, "{s} (field '{s}')", .{ c.name, f.name });
+            try registerName(alloc, &seen, union_name, owner_ctx, report);
+        }
     }
 }
 
@@ -164,4 +173,75 @@ test "identifier guard passes for the blog shape" {
     };
     var report = GuardReport{ .message = "" };
     try checkIdentifiers(a, &cols, &report);
+}
+
+test "identifier guard passes for blog shape with select fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // posts.status -> "PostStatus"; posts.visibility -> "PostVisibility"
+    // Neither collides with any other generated name.
+    const post_fields = [_]schema.Field{
+        .{ .id = "f1", .name = "status", .options = .{ .select = .{ .values = &.{ "draft", "published" } } } },
+        .{ .id = "f2", .name = "visibility", .options = .{ .select = .{ .values = &.{ "public", "private" } } } },
+    };
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "users", .type = .auth, .fields = &.{} },
+        .{ .id = "", .name = "posts", .fields = &post_fields },
+        .{ .id = "", .name = "tags", .fields = &.{} },
+    };
+    var report = GuardReport{ .message = "" };
+    try checkIdentifiers(a, &cols, &report);
+}
+
+test "identifier guard fires when select-union name collides with another generated type name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Collection "postStatuss" (plural) yields recordName "PostStatus".
+    // Collection "posts" with a field "status" also yields selectUnionName "PostStatus".
+    // -> NameCollision.
+    const post_fields = [_]schema.Field{
+        .{ .id = "f1", .name = "status", .options = .{ .select = .{ .values = &.{ "draft", "published" } } } },
+    };
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "posts", .fields = &post_fields },
+        .{ .id = "", .name = "postStatuss", .fields = &.{} }, // recordName -> "PostStatus" = collision
+    };
+    var report = GuardReport{ .message = "" };
+    try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
+    try std.testing.expect(std.mem.indexOf(u8, report.message, "PostStatus") != null);
+}
+
+test "identifier guard fires when select-union name collides with a reserved name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Collection "expressions" -> recordName "Expression".
+    // Field "rs" on that collection -> selectUnionName "ExpressionRs"? No, let's make
+    // one that actually hits a reserved name: collection "exprs", field "s" ->
+    // selectUnionName "ExprS". Not reserved. Better: collection "posts",
+    // field "listResult" -> selectUnionName "PostListResult". Not reserved.
+    // Cleanest: collection "exprs", field "s" won't hit. Use collection name that
+    // gives a record name such that <Record><FieldPascal> == reserved name.
+    // reserved: "Expr". We need <Record><FieldPascal> == "Expr".
+    // That means e.g. collection "exs" (recordName "Ex") + field "pr" (pascal "Pr") -> "ExPr". No.
+    // Or collection "es" (recordName "E") + field "xpr" -> "Expr". Yes!
+    // (recordName("es") strips trailing 's' -> "E"; pascal("xpr") -> "Xpr" -> "EXpr"? No.)
+    // Simpler: collection "exprs" (recordName "Expr") is the reserved word itself.
+    // But that fires on registerName for the record name, not the union name.
+    // Let's try: reserved name "ListResult". Need record+field pascal == "ListResult".
+    // collection "listResults" -> recordName("listResults") = "ListResult" already fires.
+    // Instead target "StringOps": collection "strings" -> recordName "String",
+    // field "ops" -> pascal "Ops" -> selectUnionName "StringOps" == reserved.
+    const string_fields = [_]schema.Field{
+        .{ .id = "f1", .name = "ops", .options = .{ .select = .{ .values = &.{ "a", "b" } } } },
+    };
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "strings", .fields = &string_fields }, // "StringOps" hits reserved list
+    };
+    var report = GuardReport{ .message = "" };
+    try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
+    try std.testing.expect(std.mem.indexOf(u8, report.message, "StringOps") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.message, "strings") != null);
 }

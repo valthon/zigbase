@@ -22,14 +22,6 @@ pub fn pascal(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// Lower-case the first char of a name (for `<name>Meta` consts).
-fn camelFirst(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
-    if (s.len == 0) return alloc.dupe(u8, s);
-    const out = try alloc.dupe(u8, s);
-    out[0] = std.ascii.toLower(out[0]);
-    return out;
-}
-
 /// The record type name: PascalCase(collection), trailing 's' stripped (simple
 /// singularization matching blog.gen.ts: users->User, posts->Post, tags->Tag).
 pub fn recordName(alloc: std.mem.Allocator, col_name: []const u8) ![]const u8 {
