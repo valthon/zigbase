@@ -1,4 +1,4 @@
-from conftest import login, api_request
+from conftest import login, api_request, save_collection_and_wait
 
 def test_configure_oauth_provider_and_secret_redacted(page):
     login(page)
@@ -11,7 +11,10 @@ def test_configure_oauth_provider_and_secret_redacted(page):
     page.fill('[data-test=oauth-clientid]', 'my-client-id')
     page.fill('[data-test=oauth-secret]', 'my-secret')
     page.fill('[data-test=oauth-redirects]', 'https://app/cb')
-    page.click('[data-test=save-collection]')
+    # Save, then wait for the app's full-document post-save reload to COMPLETE
+    # before navigating — otherwise our goto below races the in-flight reload
+    # and Playwright aborts it (net::ERR_ABORTED). See save_collection_and_wait.
+    save_collection_and_wait(page)
     page.wait_for_selector('[data-test=nav-members]', timeout=8000)
     # reload the editor: clientId persists, secret comes back redacted (empty input value)
     page.goto("/_/?t=2#/collections/members")
