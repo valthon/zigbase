@@ -59,8 +59,9 @@ pub fn build(b: *std.Build) void {
     });
     dating_app_mod.addImport("zigbase", zigbase_mod);
 
-    // B1: exe must link_libc because mainWithCollections uses std.c.getenv.
-    // In Zig 0.16, link_libc is set on the module, not via exe.linkLibC().
+    // The generator itself needs no libc: mainWithCollections reads env via
+    // init.environ_map (pure-Zig). It still links libc transitively through
+    // zigbase_mod (facil.io C deps), so we don't set link_libc here.
     //
     // Module design (Zig 0.16 "file in one module" constraint):
     // gen_client.zig uses relative @imports (../schema.zig, emit.zig, etc.) which
@@ -72,7 +73,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/codegen/gen_main.zig"),
         .target = b.graph.host,
         .optimize = .Debug,
-        .link_libc = true,
     });
     gen_mod.addImport("zigbase", zigbase_mod);
     gen_mod.addImport("app", dating_app_mod);
@@ -148,8 +148,9 @@ fn genClientStepInner(
     app_mod: *std.Build.Module,
     opts: GenOpts,
 ) *std.Build.Step.Run {
-    // B1: exe must link_libc because mainWithCollections uses std.c.getenv.
-    // In Zig 0.16, link_libc is set on the module, not via exe.linkLibC().
+    // The generator itself needs no libc: mainWithCollections reads env via
+    // init.environ_map (pure-Zig). It still links libc transitively through
+    // zigbase_mod (facil.io C deps), so we don't set link_libc here.
     //
     // Module design (Zig 0.16 "file in one module" constraint):
     // gen_client.zig uses relative @imports (../schema.zig, emit.zig, etc.) which
@@ -162,7 +163,6 @@ fn genClientStepInner(
         .root_source_file = zigbase_builder.path("src/codegen/gen_main.zig"),
         .target = b.graph.host,
         .optimize = .Debug,
-        .link_libc = true,
     });
     gen_mod.addImport("zigbase", zigbase_mod);
     gen_mod.addImport("app", app_mod);

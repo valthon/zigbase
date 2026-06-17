@@ -263,8 +263,9 @@ fn authCollectionName(cols: []const schema.Collection) []const u8 {
 /// Entry point: Zig 0.16 `pub fn main(init: std.process.Init) !void`.
 /// Threads `init.io` (for file operations) and uses `init.gpa` for a local arena,
 /// reads argv from `init.minimal.args.toSlice(arena)` (yields `[]const [:0]const u8`).
-/// Uses `std.c.getenv` for the ZBASE_INREPO env flag — requires link_libc = true
-/// in the exe module (see Task 7 build wiring).
+/// Reads the ZBASE_INREPO env flag via `init.environ_map` (Zig 0.16's pure-Zig env
+/// access through `std.process.Environ.Map` — no `std.c.getenv`, so this code adds no
+/// libc dependency of its own).
 ///
 /// NOTE (Task 7): In Zig 0.16, a file can only belong to one module. gen_client.zig
 /// uses relative imports (@import("../schema.zig") etc.) which claim those files for
@@ -289,9 +290,9 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
         return error.MissingOut;
     };
 
-    // ZBASE_INREPO: use std.c.getenv (libc-backed; exe must link_libc = true in Task 7).
-    // Non-null return value means the var is set (value may be empty string — that's fine).
-    const in_repo = std.c.getenv("ZBASE_INREPO") != null;
+    // ZBASE_INREPO: read via init.environ_map (Zig 0.16 pure-Zig env access; no libc).
+    // contains() means the var is set (value may be empty string — that's fine).
+    const in_repo = init.environ_map.contains("ZBASE_INREPO");
     const client_name = "ZbClient";
 
     const text = generate(a, cols, in_repo, authCollectionName(cols), client_name) catch |e| {
