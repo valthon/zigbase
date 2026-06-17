@@ -47,6 +47,12 @@ export async function startGolfsim(): Promise<GolfServer> {
   // is resolved relative to the server's working directory.
   const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
   const url = `http://127.0.0.1:${port}`;
-  await waitForHealth(url);
+  try {
+    await waitForHealth(url);
+  } catch (err) {
+    proc.kill("SIGKILL");
+    try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    throw err;
+  }
   return { url, stop() { proc.kill("SIGTERM"); try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } } };
 }
