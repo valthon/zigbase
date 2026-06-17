@@ -8,7 +8,9 @@ import { fileURLToPath } from "node:url";
 // root (the dir containing build.zig / zig-out) is four levels up.
 const HERE = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const REPO_ROOT = resolve(HERE, "../../../..");
-const BIN = join(REPO_ROOT, "zig-out", "bin", "zigbase");
+// CI supplies a prebuilt binary via ZIGBASE_TEST_BINARY; otherwise use the
+// zig-out path produced by ensureBuilt()'s `zig build`.
+const BIN = process.env.ZIGBASE_TEST_BINARY ?? join(REPO_ROOT, "zig-out", "bin", "zigbase");
 
 export interface TestServer {
   url: string;
@@ -19,6 +21,12 @@ export interface TestServer {
 let built = false;
 function ensureBuilt(): void {
   if (built) return;
+  // A prebuilt binary supplied via ZIGBASE_TEST_BINARY (e.g. a CI artifact)
+  // skips the build entirely — no Zig toolchain needed in that job.
+  if (process.env.ZIGBASE_TEST_BINARY) {
+    built = true;
+    return;
+  }
   // The binary MUST be built with zig 0.16.0; plain `zig` on PATH may be older.
   const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], {
     cwd: REPO_ROOT,
