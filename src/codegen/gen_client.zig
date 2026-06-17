@@ -234,7 +234,16 @@ fn authCollectionName(cols: []const schema.Collection) []const u8 {
 /// reads argv from `init.minimal.args.toSlice(arena)` (yields `[]const [:0]const u8`).
 /// Uses `std.c.getenv` for the ZBASE_INREPO env flag — requires link_libc = true
 /// in the exe module (see Task 7 build wiring).
-pub fn main(init: std.process.Init) !void {
+///
+/// NOTE (Task 7): In Zig 0.16, a file can only belong to one module. gen_client.zig
+/// uses relative imports (@import("../schema.zig") etc.) which claim those files for
+/// THIS module. If gen_client.zig is used as the exe module root AND zigbase is in
+/// the dependency graph (via the `app` module), those files would be double-claimed.
+/// The solution: use gen_main.zig as the exe root (which imports "zigbase" and "app"
+/// as named modules) and call mainWithCollections() here. This keeps gen_client.zig
+/// as a self-contained library file usable by the zigbase test suite WITHOUT being
+/// a module root.
+pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collection) !void {
     const io = init.io;
     // Use an arena for all temporary allocations during the generator run.
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
@@ -248,9 +257,6 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("gen_client: --out <path> is required", .{});
         return error.MissingOut;
     };
-
-    const app = @import("app");
-    const cols = app.App.collections;
 
     // ZBASE_INREPO: use std.c.getenv (libc-backed; exe must link_libc = true in Task 7).
     // Non-null return value means the var is set (value may be empty string — that's fine).
@@ -287,6 +293,14 @@ pub fn main(init: std.process.Init) !void {
     // Zig 0.16 file-write: std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes })
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = text });
     std.log.info("gen_client: wrote {s} ({d} bytes)", .{ out_path, text.len });
+}
+
+/// Legacy entry point kept for back-compat; reads @import("app").App.collections.
+/// Prefer mainWithCollections when building as a separate module to avoid
+/// the Zig 0.16 "file exists in multiple modules" error (see note above).
+pub fn main(init: std.process.Init) !void {
+    const app = @import("app");
+    return mainWithCollections(init, app.App.collections);
 }
 
 // ---------------------------------------------------------------------------

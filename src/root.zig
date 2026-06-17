@@ -53,6 +53,8 @@ pub const codegen = struct {
     pub const identifiers = @import("codegen/identifiers.zig");
     pub const guards = @import("codegen/guards.zig");
     pub const emit = @import("codegen/emit.zig");
+    /// The generator core + mainWithCollections entry-point used by gen_main.zig.
+    pub const gen_client = @import("codegen/gen_client.zig");
 };
 
 // ---- Test discovery --------------------------------------------------------

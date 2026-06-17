@@ -48,6 +48,113 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
+
+    // --- codegen: generate the dating fixture's typed client -------------------
+    // This is the Plan-1 Definition of Done for Task 7. Uses b.path(...) directly
+    // (no b.dependency) since the dating fixture lives in this repo.
+    const dating_app_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/dating/schema.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dating_app_mod.addImport("zigbase", zigbase_mod);
+
+    // B1: exe must link_libc because mainWithCollections uses std.c.getenv.
+    // In Zig 0.16, link_libc is set on the module, not via exe.linkLibC().
+    //
+    // Module design (Zig 0.16 "file in one module" constraint):
+    // gen_client.zig uses relative @imports (../schema.zig, emit.zig, etc.) which
+    // claim those files for whichever module it belongs to. Since zigbase_mod already
+    // owns those files, gen_client.zig cannot be the exe module root when zigbase is
+    // in scope. Instead we use gen_main.zig as the root — it imports "zigbase" and
+    // "app" as named modules, delegating to zigbase.codegen.gen_client.mainWithCollections.
+    const gen_mod = b.createModule(.{
+        .root_source_file = b.path("src/codegen/gen_main.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    gen_mod.addImport("zigbase", zigbase_mod);
+    gen_mod.addImport("app", dating_app_mod);
+    const gen_exe = b.addExecutable(.{ .name = "zbase-gen-client", .root_module = gen_mod });
+
+    const gen_run = b.addRunArtifact(gen_exe);
+    gen_run.setEnvironmentVariable("ZBASE_INREPO", "1");
+    gen_run.addArgs(&.{ "--out", "clients/typescript/test/codegen/dating/zbase.gen.ts", "--api-prefix", "/api" });
+    const gen_step = b.step("gen-dating-client", "Generate the dating fixture's typed TS client");
+    gen_step.dependOn(&gen_run.step);
+
+    // staleness guard: same exe with --check
+    const check_run = b.addRunArtifact(gen_exe);
+    check_run.setEnvironmentVariable("ZBASE_INREPO", "1");
+    check_run.addArgs(&.{ "--out", "clients/typescript/test/codegen/dating/zbase.gen.ts", "--api-prefix", "/api", "--check" });
+    const check_step = b.step("gen-dating-client-check", "Fail if the dating client snapshot is stale");
+    check_step.dependOn(&check_run.step);
+}
+
+// ---------------------------------------------------------------------------
+// Codegen helpers
+// ---------------------------------------------------------------------------
+
+pub const GenOpts = struct {
+    out: []const u8,
+    api_prefix: []const u8 = "/api",
+    check: bool = false,
+    in_repo: bool = false,
+};
+
+/// Build the pure-Zig client generator with `app_mod` (a module exposing
+/// `pub const App = zigbase.App(.{...})`) + zigbase imported, and return the Run
+/// step that emits `opts.out`. Consumers wire `zig build gen-client` to this.
+/// NOTE (I5): the `zigbase_dep.builder.path(...)` resolution for external consumers
+/// is Plan-2 / unverified. Plan 1's DoD is on the repo-local gen-dating-client step.
+pub fn genClientStep(
+    b: *std.Build,
+    zigbase_dep: *std.Build.Dependency,
+    app_mod: *std.Build.Module,
+    opts: GenOpts,
+) *std.Build.Step.Run {
+    const zigbase_mod = zigbase_dep.module("zigbase");
+    // Plan-2: verify dependency source resolution — zigbase_dep.builder.path(...)
+    // resolves the generator source from the dependency's own source tree.
+    return genClientStepInner(b, zigbase_mod, zigbase_dep.builder, app_mod, opts);
+}
+
+fn genClientStepInner(
+    b: *std.Build,
+    zigbase_mod: *std.Build.Module,
+    zigbase_builder: *std.Build,
+    app_mod: *std.Build.Module,
+    opts: GenOpts,
+) *std.Build.Step.Run {
+    // B1: exe must link_libc because mainWithCollections uses std.c.getenv.
+    // In Zig 0.16, link_libc is set on the module, not via exe.linkLibC().
+    //
+    // Module design (Zig 0.16 "file in one module" constraint):
+    // gen_client.zig uses relative @imports (../schema.zig, emit.zig, etc.) which
+    // claim those files for whichever module it belongs to. Since zigbase_mod already
+    // owns those files, gen_client.zig cannot be the exe module root when zigbase is
+    // in scope. Instead we use gen_main.zig as the root — it imports "zigbase" and
+    // "app" as named modules, delegating to zigbase.codegen.gen_client.mainWithCollections.
+    // Plan-2 / unverified for external consumers — see I5 note above.
+    const gen_mod = b.createModule(.{
+        .root_source_file = zigbase_builder.path("src/codegen/gen_main.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    gen_mod.addImport("zigbase", zigbase_mod);
+    gen_mod.addImport("app", app_mod);
+
+    const gen_exe = b.addExecutable(.{ .name = "zbase-gen-client", .root_module = gen_mod });
+    const run = b.addRunArtifact(gen_exe);
+    run.addArg("--out");
+    run.addArg(opts.out);
+    run.addArg("--api-prefix");
+    run.addArg(opts.api_prefix);
+    if (opts.check) run.addArg("--check");
+    if (opts.in_repo) run.setEnvironmentVariable("ZBASE_INREPO", "1");
+    return run;
 }
 
 /// Embed every file under `dir_rel` (relative to the consumer's build root) into
