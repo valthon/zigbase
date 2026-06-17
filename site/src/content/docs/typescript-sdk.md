@@ -242,6 +242,72 @@ const protectedUrl = zb.files.getUrl(record, record.cover, { token });
 const url2 = zb.files.getUrl("posts", "REC123", "cover.png", { download: true });
 ```
 
+## Typed client — `@zigbase/client/typed`
+
+`@zigbase/client/typed` is the **generic typed core** that a generated `zbase.gen.ts` file
+instantiates into a fully type-safe, schema-aware client. The generator (coming in SP2.1b)
+will read your ZigBase schema and emit a thin declarative wrapper; until then, the
+hand-authored fixture at `clients/typescript/test/fixtures/blog.gen.ts` shows the exact
+pattern the generator will reproduce.
+
+The subpath exports runtime factories and type utilities:
+
+| Export | Kind | Purpose |
+| --- | --- | --- |
+| `makeRecordService` | factory | Build a typed CRUD service over SP1's `CollectionService`. |
+| `makeTypedRealtime` | factory | Build a typed realtime/live surface. |
+| `makeTypedFiles` | factory | Build a typed file-URL helper. |
+| `makeFilterBuilder` | factory | Build a fluent filter builder (a `Proxy` over field names). |
+| `compileWhere` | function | Compile a `where`-DSL object into an SP1 filter string. |
+| `compileIn` | function | Compile an `in`-list into a disjunction of `id = '…'` terms. |
+| `OP_MAP` | object | Operator-to-filter-operator mapping (e.g. `eq` → `=`). |
+| `fieldMeta` | helper | Construct a `FieldMeta` object (convenience). |
+| `Expr`, `FieldExpr` | classes | Fluent filter expression nodes. |
+| `CollectionMeta`, `FieldMeta`, `FieldType` | types | Runtime metadata descriptors. |
+| `WithExpand` | type | Narrow a record type to include one or more expanded relations. |
+| `StringOps`, `NumberOps`, `BoolOps`, `DateOps`, `EnumOps`, `RelOps` | types | Operator-object types for generated `*Where` interfaces. |
+| `TypedFieldExpr` | type | Per-field operand type for the fluent builder. |
+
+A generated (or hand-authored) consumer file imports from `@zigbase/client/typed`, declares
+concrete record types and metadata, then assembles a typed client:
+
+```ts
+import { createClient as baseCreateClient } from "@zigbase/client";
+import { withRealtime } from "@zigbase/client/realtime";
+import {
+  makeRecordService,
+  makeTypedRealtime,
+  makeTypedFiles,
+  type CollectionMeta,
+  type WithExpand,
+} from "@zigbase/client/typed";
+
+// Declare per-collection metadata (the generator emits this from your schema):
+const postsMeta: CollectionMeta = {
+  name: "posts",
+  fields: { title: { type: "text" }, status: { type: "select" } /* … */ },
+  fileFields: ["cover"],
+  expandable: ["author", "tags"],
+  isAuth: false,
+};
+
+// Build the typed service — compiles `where` → SP1 filter strings under the hood:
+const base = withRealtime(baseCreateClient("http://127.0.0.1:8090"));
+const posts = makeRecordService(base, postsMeta) as unknown as PostsService;
+
+// Every call is narrowed by the generated concrete interface:
+const page = await posts.getList({ where: { status: "published" }, sort: "-created" });
+// page.items[0]?.title — typed string
+
+// Expand-narrowed getOne (PostRelations = { author: User; tags: Tag[] }):
+const post = await posts.getOne("REC123", { expand: ["author"] });
+// post.expand?.author — User (not unknown)
+```
+
+The `@zigbase/client/typed` subpath tree-shakes independently of `@zigbase/client/realtime` —
+importing just the typed core adds only the where-compiler and factory code, not the
+realtime / live-store graph.
+
 ## Realtime + live store
 
 Realtime ships behind a **dedicated entry point**, `@zigbase/client/realtime`, so a REST-only
