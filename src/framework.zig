@@ -290,6 +290,10 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     const allocator = init.gpa;
     const arena = init.arena.allocator();
 
+    // Bind the process environment so config.envGetter reads env via Environ.Map
+    // (pure-Zig) instead of libc. Every subcommand below loads config through it.
+    config.bindEnviron(init.environ_map);
+
     const argv = try init.minimal.args.toSlice(arena);
     // cli.parse wants []const []const u8; argv is []const [:0]const u8. Copy
     // the (sentinel-bearing) slices into plain []const u8 views.

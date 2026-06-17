@@ -115,17 +115,25 @@ pub const Config = struct {
     }
 };
 
-/// Real env getter for production use.
-/// Uses std.c.getenv (POSIX libc) which takes a null-terminated key.
-/// std.posix.getenv does not exist in Zig 0.16.0; std.c.getenv is the correct path.
+/// Process environment, bound once at CLI startup from `std.process.Init`.
+/// Lets `envGetter` read env through Zig 0.16's pure-Zig `std.process.Environ.Map`
+/// instead of `std.c.getenv`, so this module carries no *direct* libc dependency.
+/// (The server still links libc transitively via facil.io; this only drops the
+/// direct use — see the generator's matching change in src/codegen/gen_client.zig.)
+var process_environ: ?*const std.process.Environ.Map = null;
+
+/// Bind the process environment for `envGetter`. Called once at CLI startup with
+/// `init.environ_map` (see framework.runCliImpl). Idempotent.
+pub fn bindEnviron(map: *const std.process.Environ.Map) void {
+    process_environ = map;
+}
+
+/// Real env getter for production use. Reads from the environment bound via
+/// `bindEnviron` using pure-Zig `Environ.Map.get`. Returns null (so defaults
+/// apply) if the environment was never bound.
 pub fn envGetter(key: []const u8) ?[]const u8 {
-    var buf: [256]u8 = undefined;
-    if (key.len >= buf.len) return null;
-    @memcpy(buf[0..key.len], key);
-    buf[key.len] = 0;
-    const z: [:0]const u8 = buf[0..key.len :0];
-    const result = std.c.getenv(z.ptr) orelse return null;
-    return std.mem.span(result);
+    const env = process_environ orelse return null;
+    return env.get(key);
 }
 
 test "defaults apply when getter returns null" {
