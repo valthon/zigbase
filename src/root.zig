@@ -125,4 +125,5 @@ test {
     _ = @import("codegen/identifiers.zig");
     _ = @import("codegen/guards.zig");
     _ = @import("codegen/emit.zig");
+    _ = @import("codegen/gen_client.zig");
 }
