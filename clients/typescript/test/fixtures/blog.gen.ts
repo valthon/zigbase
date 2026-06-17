@@ -5,7 +5,7 @@
 // "@zigbase/client/typed". In this in-repo fixture we import from the package
 // source so it typechecks against the working tree without a built dist.
 import { createClient as baseCreateClient, type Client } from "../../src/index.js";
-import { withRealtime, type RealtimeEnabledClient, type LiveList } from "../../src/realtime-entry.js";
+import { withRealtime, type RealtimeEnabledClient } from "../../src/realtime-entry.js";
 import type { ListResult } from "../../src/records.js";
 import type { CursorPage } from "../../src/cursor.js";
 import type { FileUrlOptions } from "../../src/files.js";
@@ -23,6 +23,7 @@ import {
   type FieldExpr,
   type TypedFieldExpr,
   type RelationResolver,
+  type RawTypedRealtime,
 } from "../../src/typed/index.js";
 
 // ---- Records --------------------------------------------------------------
@@ -265,23 +266,9 @@ export interface TypedFiles {
 
 // ---- Typed realtime surface -----------------------------------------------
 
-// Standalone concrete interface — mirrors PostsService (which does NOT extend
-// RawTypedService either). The loosely-typed `makeTypedRealtime` runtime is bound
-// to it via the `as unknown as PostsRealtime` cast in createClient. `Post` lacks
-// the `[key: string]: unknown` index signature that RawTypedRealtime's
-// RealtimeEvent.record (ZbRecord) requires, so an `extends` clause cannot hold;
-// the cast pattern is what carries the narrowing soundly.
-export interface PostsRealtime {
-  subscribe(
-    cb: (e: { topic: string; action: "create" | "update" | "delete"; record: Post }) => void,
-    opts?: { where?: PostWhere },
-  ): Promise<() => void>;
-  unsubscribe(
-    cb?: (e: { topic: string; action: "create" | "update" | "delete"; record: Post }) => void,
-  ): void;
-  /** Live list of posts, typed. SP1's LiveList.items holds LiveRecord wrapping Post. */
-  getList(opts?: { where?: PostWhere; sort?: string; expand?: string[] }): Promise<LiveList>;
-}
+// The realtime surface varies only by record type + where type, so the typed
+// core's generic covers it directly — no bespoke per-collection interface.
+export type PostsRealtime = RawTypedRealtime<Post, PostWhere>;
 
 // ---- createClient ---------------------------------------------------------
 
@@ -333,7 +320,7 @@ export function createClient(url: string, opts: BlogClientOptions = {}): BlogCli
       tags: makeRecordService(base, tagsMeta) as unknown as TagsService,
     },
     realtime: {
-      posts: makeTypedRealtime(base.realtime, postsMeta, relationResolver) as unknown as PostsRealtime,
+      posts: makeTypedRealtime<Post, PostWhere>(base.realtime, postsMeta, relationResolver),
     },
     files: {
       url(record, field, opts2) {
