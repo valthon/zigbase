@@ -839,6 +839,115 @@ test "buildOptions accepts a valid comptime pattern and date bounds" {
     try std.testing.expectEqual(@as(usize, 1), cols.len);
 }
 
+test "buildCollections lowers the dating-app fixture schema (every field type + capability)" {
+    // SP2.1b Task 6: prove buildCollections accepts the full dating-app literal with every
+    // field type and option combination. This acts as the comptime guard for fixtures/dating/schema.zig.
+    const cols = comptime buildCollections(.{
+        .profiles = .{
+            .type = .auth,
+            .fields = .{
+                .{ .name = "name", .type = .text },
+                .{ .name = "bio", .type = .editor },
+                .{ .name = "website", .type = .url },
+                .{ .name = "age", .type = .number, .mode = .int },
+                .{ .name = "gender", .type = .select, .values = .{ "female", "male", "nonbinary", "other" } },
+                .{ .name = "avatar", .type = .file },
+            },
+        },
+        .tags = .{
+            .fields = .{
+                .{ .name = "label", .type = .text, .required = true, .unique = true },
+            },
+        },
+        .photos = .{
+            .fields = .{
+                .{ .name = "owner", .type = .relation, .target = "profiles" },
+                .{ .name = "image", .type = .file },
+                .{ .name = "visibility", .type = .select, .values = .{ "public", "private" } },
+                .{ .name = "caption", .type = .text },
+                .{ .name = "tags", .type = .relation, .target = "tags", .maxSelect = 20 },
+            },
+        },
+        .messages = .{
+            .fields = .{
+                .{ .name = "from", .type = .relation, .target = "profiles" },
+                .{ .name = "to", .type = .relation, .target = "profiles" },
+                .{ .name = "body", .type = .text, .required = true },
+                .{ .name = "sentAt", .type = .autodate, .onCreate = true },
+                .{ .name = "read", .type = .@"bool" },
+            },
+        },
+        .winks = .{
+            .fields = .{
+                .{ .name = "from", .type = .relation, .target = "profiles" },
+                .{ .name = "to", .type = .relation, .target = "profiles" },
+                .{ .name = "createdAt", .type = .autodate, .onCreate = true },
+            },
+        },
+        .subscriptions = .{
+            .fields = .{
+                .{ .name = "profile", .type = .relation, .target = "profiles" },
+                .{ .name = "plan", .type = .select, .values = .{ "free", "plus", "premium" } },
+                .{ .name = "price", .type = .number, .mode = .fixed, .scale = 2 },
+                .{ .name = "renewsAt", .type = .date, .min = "2020-01-01", .max = "2099-12-31" },
+                .{ .name = "active", .type = .@"bool" },
+                .{ .name = "metadata", .type = .json },
+            },
+        },
+    });
+
+    // 6 collections
+    try std.testing.expectEqual(@as(usize, 6), cols.len);
+
+    // Verify collection names (topo order may differ; find by scan)
+    const findCol = struct {
+        fn find(cs: []const schema.Collection, n: []const u8) ?schema.Collection {
+            for (cs) |c| if (std.mem.eql(u8, c.name, n)) return c;
+            return null;
+        }
+    }.find;
+
+    const profiles = findCol(cols, "profiles").?;
+    try std.testing.expectEqual(schema.CollectionType.auth, profiles.type);
+    try std.testing.expectEqual(@as(usize, 6), profiles.fields.len);
+    // auth collection: verify field types
+    try std.testing.expectEqual(schema.FieldType.text, profiles.fields[0].fieldType());
+    try std.testing.expectEqual(schema.FieldType.editor, profiles.fields[1].fieldType());
+    try std.testing.expectEqual(schema.FieldType.url, profiles.fields[2].fieldType());
+    try std.testing.expectEqual(schema.NumberMode.int, profiles.fields[3].options.number.mode);
+    try std.testing.expectEqual(@as(usize, 4), profiles.fields[4].options.select.values.len);
+    try std.testing.expectEqual(schema.FieldType.file, profiles.fields[5].fieldType());
+
+    const tags = findCol(cols, "tags").?;
+    try std.testing.expectEqual(@as(usize, 1), tags.fields.len);
+    try std.testing.expect(tags.fields[0].unique);
+
+    const photos = findCol(cols, "photos").?;
+    try std.testing.expectEqual(@as(usize, 5), photos.fields.len);
+    // photos.tags is a multi-relation (maxSelect = 20)
+    try std.testing.expectEqual(@as(u32, 20), photos.fields[4].options.relation.maxSelect);
+
+    const messages = findCol(cols, "messages").?;
+    try std.testing.expectEqual(@as(usize, 5), messages.fields.len);
+    // two relations to the same target
+    try std.testing.expectEqualStrings("profiles", messages.fields[0].options.relation.targetCollectionId);
+    try std.testing.expectEqualStrings("profiles", messages.fields[1].options.relation.targetCollectionId);
+    try std.testing.expectEqual(schema.FieldType.autodate, messages.fields[3].fieldType());
+    try std.testing.expect(messages.fields[3].options.autodate.onCreate);
+    try std.testing.expectEqual(schema.FieldType.@"bool", messages.fields[4].fieldType());
+
+    const winks = findCol(cols, "winks").?;
+    try std.testing.expectEqual(@as(usize, 3), winks.fields.len);
+
+    const subscriptions = findCol(cols, "subscriptions").?;
+    try std.testing.expectEqual(@as(usize, 6), subscriptions.fields.len);
+    try std.testing.expectEqual(schema.NumberMode.fixed, subscriptions.fields[2].options.number.mode);
+    try std.testing.expectEqual(@as(?u8, 2), subscriptions.fields[2].options.number.scale);
+    try std.testing.expectEqualStrings("2020-01-01", subscriptions.fields[3].options.date.min.?);
+    try std.testing.expectEqualStrings("2099-12-31", subscriptions.fields[3].options.date.max.?);
+    try std.testing.expectEqual(schema.FieldType.json, subscriptions.fields[5].fieldType());
+}
+
 test "runMigrations runs each explicit migration once (idempotent)" {
     var d = try db.Db.openMemory();
     defer d.close();
