@@ -91,11 +91,12 @@ export async function createCollection(
   server: TestServer,
   token: string,
   definition: Record<string, unknown>,
-): Promise<void> {
+): Promise<Record<string, unknown>> {
   const res = await fetch(`${server.url}/api/collections`, {
     method: "POST",
     headers: { "content-type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify(definition),
   });
   if (!res.ok) throw new Error(`create collection failed: ${res.status} ${await res.text()}`);
+  return (await res.json()) as Record<string, unknown>;
 }
