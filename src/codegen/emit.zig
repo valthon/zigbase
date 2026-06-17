@@ -5,11 +5,14 @@ const schema = @import("../schema.zig");
 const tt = @import("ts_type.zig");
 const ident = @import("identifiers.zig");
 
+/// Growable byte buffer backing every emit helper.
 const W = std.ArrayList(u8);
 
 fn put(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
     try w.appendSlice(alloc, s);
 }
+/// Format helper — callers must pass an arena allocator; the helper allocs a
+/// temporary string from it and copies the bytes into `w`.
 fn putf(alloc: std.mem.Allocator, w: *W, comptime fmt: []const u8, args: anytype) !void {
     const s = try std.fmt.allocPrint(alloc, fmt, args);
     try w.appendSlice(alloc, s);
@@ -22,6 +25,16 @@ fn isReadOnlySystem(name: []const u8) bool {
     return std.mem.eql(u8, name, "id") or
         std.mem.eql(u8, name, "created") or
         std.mem.eql(u8, name, "updated");
+}
+
+/// Returns true for the three visible auth fields that emitWhere / emitFields
+/// synthesize at the top for .auth collections.  Guards against double-emission
+/// when a caller passes a collection whose .fields already contain these names
+/// (e.g. after injectAuthFields).
+fn isAuthSynthesized(name: []const u8) bool {
+    return std.mem.eql(u8, name, "email") or
+        std.mem.eql(u8, name, "username") or
+        std.mem.eql(u8, name, "verified");
 }
 
 /// The visible synthesized auth fields for an auth collection record.
@@ -144,8 +157,12 @@ pub fn emitWhere(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collectio
     // User-declared fields.  We do NOT apply isReadOnlySystem here: c.fields contains
     // only user-declared fields; schema validation prevents real id/created/updated
     // clashes, and unit-test fixtures may declare a `created` autodate (filterable).
+    // For auth collections we skip any field already synthesized above (email /
+    // username / verified) so that callers who pass injectAuthFields output do not
+    // produce duplicate lines.
     for (c.fields) |f| {
         if (f.hidden) continue;
+        if (c.type == .auth and isAuthSynthesized(f.name)) continue;
         switch (tt.kindOf(f)) {
             .file_name => continue, // file fields omitted from where
             .string => try putf(alloc, w, "  {s}?: StringOps | string;\n", .{f.name}),
@@ -229,8 +246,12 @@ pub fn emitFields(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     // User-declared fields.  No isReadOnlySystem filter here for same reason as
     // emitWhere: user fields don't include system fields; schema validation guards
     // against naming conflicts.
+    // For auth collections we skip fields already synthesized above (email /
+    // username / verified) to avoid double-emission when the caller passes
+    // injectAuthFields output.
     for (c.fields) |f| {
         if (f.hidden or tt.kindOf(f) == .file_name) continue;
+        if (c.type == .auth and isAuthSynthesized(f.name)) continue;
         const base = try tt.tsBaseTypeOf(alloc, c.name, f);
         try putf(alloc, w, "  {s}: TypedFieldExpr<{s}>;\n", .{ f.name, base });
     }
@@ -654,6 +675,90 @@ test "emitRealtimeAlias matches the generic alias" {
     var w: std.ArrayList(u8) = .empty;
     try emitRealtimeAlias(a, &w, blogPosts());
     try std.testing.expect(contains(w.items, "export type PostsRealtime = RawTypedRealtime<Post, PostWhere>;"));
+}
+
+fn countOccurrences(hay: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, pos, needle)) |idx| {
+        count += 1;
+        pos = idx + needle.len;
+    }
+    return count;
+}
+
+// Construct an auth collection whose .fields slice ALREADY contains email /
+// username / verified (as injectAuthFields would produce).  Both emitWhere and
+// emitFields must emit each of those names exactly once.
+test "emitWhere / emitFields dedup injected auth fields — each appears exactly once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Simulate injectAuthFields output: the three visible auth fields prepended,
+    // plus an ordinary user field.
+    const injected_fields = [_]schema.Field{
+        .{ .id = "_email", .name = "email", .options = .{ .email = .{} } },
+        .{ .id = "_username", .name = "username", .options = .{ .text = .{} } },
+        .{ .id = "_verified", .name = "verified", .options = .{ .@"bool" = .{} } },
+        .{ .id = "f1", .name = "bio", .options = .{ .text = .{} } },
+    };
+    const injected_auth = schema.Collection{
+        .id = "uc",
+        .name = "users",
+        .type = .auth,
+        .fields = &injected_fields,
+    };
+
+    // --- emitWhere ---
+    {
+        const cols = [_]schema.Collection{injected_auth};
+        var w: std.ArrayList(u8) = .empty;
+        try emitWhere(a, &w, &cols, injected_auth);
+        const out = w.items;
+        // Each auth synthesized field must appear exactly once.
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "email?"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "username?"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "verified?"));
+        // The regular user field is still present.
+        try std.testing.expect(contains(out, "bio?: StringOps | string;"));
+    }
+
+    // --- emitFields ---
+    {
+        var w: std.ArrayList(u8) = .empty;
+        try emitFields(a, &w, injected_auth);
+        const out = w.items;
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "email:"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "username:"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "verified:"));
+        try std.testing.expect(contains(out, "bio: TypedFieldExpr<string>;"));
+    }
+
+    // --- non-injected auth collection still emits all three exactly once ---
+    const clean_auth = schema.Collection{
+        .id = "uc2",
+        .name = "members",
+        .type = .auth,
+        .fields = &.{},
+    };
+    {
+        const cols = [_]schema.Collection{clean_auth};
+        var w: std.ArrayList(u8) = .empty;
+        try emitWhere(a, &w, &cols, clean_auth);
+        const out = w.items;
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "email?"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "username?"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "verified?"));
+    }
+    {
+        var w: std.ArrayList(u8) = .empty;
+        try emitFields(a, &w, clean_auth);
+        const out = w.items;
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "email:"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "username:"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "verified:"));
+    }
 }
 
 test "emitTypedFiles emits FileField union + TypedFiles interface + makeFilesSurface" {
