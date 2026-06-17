@@ -149,7 +149,7 @@ fn emitClientFactory(alloc: std.mem.Allocator, w: *W, cols: []const schema.Colle
         const mc = try ident.metaConst(alloc, c.name);
         const svc = try ident.serviceName(alloc, c.name);
         const resolver = if (emit_hasRelations(c)) ", relationResolver" else "";
-        const file_fields = emit_hasFileFields(c);
+        const file_fields = emit_hasSingleFileFields(c);
         if (c.type == .auth and file_fields) {
             // Auth collection WITH file fields: Object.assign with both authWithPassword + fileUrl.
             try w.appendSlice(alloc, try std.fmt.allocPrint(alloc,
@@ -219,9 +219,13 @@ fn emit_hasRelations(c: schema.Collection) bool {
     return false;
 }
 
-fn emit_hasFileFields(c: schema.Collection) bool {
+/// Mirror of emit.zig's hasSingleFileFields: the per-collection fileUrl graft is
+/// only valid for single-value file fields (a multi-value file field is string[]
+/// on the record and can't be passed as a single filename). Collections whose only
+/// file fields are multi-value fall through to the plain makeRecordService path.
+fn emit_hasSingleFileFields(c: schema.Collection) bool {
     const tt = @import("ts_type.zig");
-    for (c.fields) |f| if (tt.kindOf(f) == .file_name) return true;
+    for (c.fields) |f| if (tt.kindOf(f) == .file_name and !f.isMultiValue()) return true;
     return false;
 }
 

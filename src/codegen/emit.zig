@@ -17,6 +17,23 @@ fn putf(alloc: std.mem.Allocator, w: *W, comptime fmt: []const u8, args: anytype
     const s = try std.fmt.allocPrint(alloc, fmt, args);
     try w.appendSlice(alloc, s);
 }
+/// Emit `s` as a TS double-quoted string literal (quotes included), escaping the
+/// characters that would otherwise produce invalid TypeScript. Used for emitting
+/// user-controlled values (e.g. select values, which the schema only validates as
+/// non-empty); field/collection names go through the identifier guard instead and
+/// don't need escaping.
+fn putTsString(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
+    try w.append(alloc, '"');
+    for (s) |ch| switch (ch) {
+        '\\' => try w.appendSlice(alloc, "\\\\"),
+        '"' => try w.appendSlice(alloc, "\\\""),
+        '\n' => try w.appendSlice(alloc, "\\n"),
+        '\r' => try w.appendSlice(alloc, "\\r"),
+        '\t' => try w.appendSlice(alloc, "\\t"),
+        else => try w.append(alloc, ch),
+    };
+    try w.append(alloc, '"');
+}
 
 /// Returns true for the synthesized read-only system field names that are NOT
 /// user-declared fields: id, created, updated.  Used in emitRecord / emitMeta
@@ -56,9 +73,13 @@ fn userFieldExists(c: schema.Collection, name: []const u8) bool {
     return false;
 }
 
-/// Returns true if the collection has at least one file field.
-fn hasFileFields(c: schema.Collection) bool {
-    for (c.fields) |f| if (tt.kindOf(f) == .file_name) return true;
+/// Returns true if the collection has at least one SINGLE-value file field.
+/// The per-collection `fileUrl(record, field)` convenience (and its `<Rec>FileField`
+/// union) only handles single-value file fields — a multi-value file field is
+/// `string[]` on the record, which can't be passed as a single filename. Multi-value
+/// file URLs go through the base `zb.files.getUrl(record, filename)` surface instead.
+fn hasSingleFileFields(c: schema.Collection) bool {
+    for (c.fields) |f| if (tt.kindOf(f) == .file_name and !f.isMultiValue()) return true;
     return false;
 }
 
@@ -100,7 +121,7 @@ pub fn emitSelectUnions(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !
         try putf(alloc, w, "export type {s} = ", .{uname});
         for (f.options.select.values, 0..) |v, i| {
             if (i != 0) try put(alloc, w, " | ");
-            try putf(alloc, w, "\"{s}\"", .{v});
+            try putTsString(alloc, w, v);
         }
         try put(alloc, w, ";\n");
     }
@@ -383,7 +404,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\
         , .{rec});
     }
-    if (hasFileFields(c)) {
+    if (hasSingleFileFields(c)) {
         const ff = try ident.recordName(alloc, c.name);
         try putf(alloc, w,
             \\  fileUrl(record: {0s}, field: {0s}FileField, opts?: FileUrlOptions): string;
@@ -531,31 +552,20 @@ pub fn emitTypedFiles(alloc: std.mem.Allocator, w: *W, cols: []const schema.Coll
     // These type the `field` parameter of the per-collection `fileUrl` method on
     // each concrete *Service interface.
     for (cols) |c| {
-        if (!hasFileFields(c)) continue;
+        // Only single-value file fields get a FileField union: the per-collection
+        // fileUrl convenience can't address a multi-value (string[]) file field.
+        if (!hasSingleFileFields(c)) continue;
         const rec = try ident.recordName(alloc, c.name);
         try putf(alloc, w, "export type {s}FileField = ", .{rec});
         var first = true;
         for (c.fields) |f| {
-            if (tt.kindOf(f) != .file_name) continue;
+            if (tt.kindOf(f) != .file_name or f.isMultiValue()) continue;
             if (!first) try put(alloc, w, " | ");
             first = false;
             try putf(alloc, w, "\"{s}\"", .{f.name});
         }
         try put(alloc, w, ";\n");
     }
-}
-
-// ---------------------------------------------------------------------------
-// Client factory (full body implemented in Task 5; stub with correct signature)
-// ---------------------------------------------------------------------------
-
-pub fn emitClientFactory(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, client_name: []const u8, auth_collection: []const u8) !void {
-    _ = alloc;
-    _ = w;
-    _ = cols;
-    _ = client_name;
-    _ = auth_collection;
-    // Full body emitted in Task 5 (gen_client.zig / main()).
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +615,24 @@ test "emitSelectUnions matches PostStatus" {
     var w: std.ArrayList(u8) = .empty;
     try emitSelectUnions(a, &w, blogPosts());
     try std.testing.expect(contains(w.items, "export type PostStatus = \"draft\" | \"published\";"));
+}
+
+test "emitSelectUnions escapes special chars in select values" {
+    // Fix 1: select values are arbitrary []const u8 (schema only checks non-emptiness),
+    // so a value containing `"` or `\` must be escaped to stay valid TypeScript.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]schema.Field{
+        .{ .id = "s", .name = "kind", .options = .{ .select = .{ .values = &.{ "a\"b", "c\\d" }, .maxSelect = 1 } } },
+    };
+    const col = schema.Collection{ .id = "", .name = "things", .fields = &fields };
+    var w: std.ArrayList(u8) = .empty;
+    try emitSelectUnions(a, &w, col);
+    const out = w.items;
+    // Escaped forms present.
+    try std.testing.expect(contains(out, "\"a\\\"b\""));
+    try std.testing.expect(contains(out, "\"c\\\\d\""));
 }
 
 test "emitCreate matches PostCreate (required first, file -> File | Blob)" {
@@ -683,6 +711,58 @@ test "emitService (no files) does NOT include fileUrl" {
     var w: std.ArrayList(u8) = .empty;
     try emitService(a, &w, no_file_col);
     try std.testing.expect(!contains(w.items, "fileUrl"));
+}
+
+test "emitService + emitTypedFiles restrict FileField/fileUrl to single-value file fields" {
+    // Fix 2: a collection with a single-value AND a multi-value file field must
+    // expose only the single-value one in <Rec>FileField, and still get fileUrl.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]schema.Field{
+        .{ .id = "av", .name = "avatar", .options = .{ .file = .{ .maxSelect = 1 } } }, // single
+        .{ .id = "ph", .name = "photos", .options = .{ .file = .{ .maxSelect = 5 } } }, // multi
+    };
+    const col = schema.Collection{ .id = "", .name = "members", .fields = &fields };
+    // (a) FileField union lists ONLY the single-value field.
+    {
+        const cols = [_]schema.Collection{col};
+        var w: std.ArrayList(u8) = .empty;
+        try emitTypedFiles(a, &w, &cols);
+        const out = w.items;
+        try std.testing.expect(contains(out, "export type MemberFileField = \"avatar\";"));
+        try std.testing.expect(!contains(out, "photos"));
+    }
+    // fileUrl IS emitted (single-value file field present).
+    {
+        var w: std.ArrayList(u8) = .empty;
+        try emitService(a, &w, col);
+        try std.testing.expect(contains(w.items, "fileUrl(record: Member, field: MemberFileField, opts?: FileUrlOptions): string;"));
+    }
+}
+
+test "emitService + emitTypedFiles skip FileField/fileUrl for multi-value-only file fields" {
+    // Fix 2: a collection whose ONLY file field is multi-value gets NO FileField
+    // union and NO fileUrl method (the record field is string[], not a filename).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]schema.Field{
+        .{ .id = "ph", .name = "photos", .options = .{ .file = .{ .maxSelect = 5 } } }, // multi only
+    };
+    const col = schema.Collection{ .id = "", .name = "galleries", .fields = &fields };
+    {
+        const cols = [_]schema.Collection{col};
+        var w: std.ArrayList(u8) = .empty;
+        try emitTypedFiles(a, &w, &cols);
+        try std.testing.expect(!contains(w.items, "GalleryFileField"));
+        try std.testing.expect(w.items.len == 0);
+    }
+    {
+        var w: std.ArrayList(u8) = .empty;
+        try emitService(a, &w, col);
+        try std.testing.expect(!contains(w.items, "fileUrl"));
+    }
 }
 
 test "emitMeta matches postsMeta" {
@@ -816,7 +896,8 @@ test "emitWhere / emitFields dedup injected auth fields — each appears exactly
 test "emitTypedFiles emits only FileField unions (no global TypedFiles / makeFilesSurface)" {
     // Fix A: emitTypedFiles now only emits per-collection FileField unions.
     // The global TypedFiles interface and makeFilesSurface have been removed;
-    // fileUrl is grafted per-collection in emitService + emitClientFactory.
+    // fileUrl is grafted per-collection in emitService + gen_client.zig's
+    // emitClientFactory.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

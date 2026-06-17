@@ -96,7 +96,24 @@ pub fn checkIdentifiers(alloc: std.mem.Allocator, cols: []const schema.Collectio
             const owner_ctx = try std.fmt.allocPrint(alloc, "{s} (field '{s}')", .{ c.name, f.name });
             try registerName(alloc, &seen, union_name, owner_ctx, report);
         }
+        // Register the per-collection metadata const (e.g. `postsMeta`), emitted at
+        // module scope by emitMeta for EVERY collection.
+        try registerName(alloc, &seen, try ident.metaConst(alloc, c.name), c.name, report);
+        // Register the `<Rec>FileField` union, emitted by emitTypedFiles only for
+        // collections with at least one SINGLE-value file field (mirror that gate
+        // exactly so we don't register a name that isn't emitted).
+        if (hasSingleFileFields(c)) {
+            const file_union = try std.fmt.allocPrint(alloc, "{s}FileField", .{try ident.recordName(alloc, c.name)});
+            try registerName(alloc, &seen, file_union, c.name, report);
+        }
     }
+}
+
+/// Mirror of emit.zig's hasSingleFileFields: a collection emits a `<Rec>FileField`
+/// union iff it has at least one single-value file field.
+fn hasSingleFileFields(c: schema.Collection) bool {
+    for (c.fields) |f| if (ts_type.kindOf(f) == .file_name and !f.isMultiValue()) return true;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +228,41 @@ test "identifier guard fires when select-union name collides with another genera
     var report = GuardReport{ .message = "" };
     try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
     try std.testing.expect(std.mem.indexOf(u8, report.message, "PostStatus") != null);
+}
+
+test "identifier guard fires when a <Rec>FileField union collides with another generated name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // "members" has a single-value file field -> emits union "MemberFileField".
+    // "memberFileFields" -> recordName strips trailing 's' -> "MemberFileField".
+    // -> NameCollision (only caught now that the union name is registered).
+    const member_fields = [_]schema.Field{
+        .{ .id = "av", .name = "avatar", .options = .{ .file = .{ .maxSelect = 1 } } },
+    };
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "members", .fields = &member_fields },
+        .{ .id = "", .name = "memberFileFields", .fields = &.{} }, // recordName -> "MemberFileField"
+    };
+    var report = GuardReport{ .message = "" };
+    try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
+    try std.testing.expect(std.mem.indexOf(u8, report.message, "MemberFileField") != null);
+}
+
+test "identifier guard fires when a <collection>Meta const collides with another generated name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // "Profile" -> metaConst "ProfileMeta".
+    // "profileMetas" -> recordName strips trailing 's' -> "ProfileMeta".
+    // -> NameCollision (only caught now that the meta const name is registered).
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "Profile", .fields = &.{} }, // metaConst -> "ProfileMeta"
+        .{ .id = "", .name = "profileMetas", .fields = &.{} }, // recordName -> "ProfileMeta"
+    };
+    var report = GuardReport{ .message = "" };
+    try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
+    try std.testing.expect(std.mem.indexOf(u8, report.message, "ProfileMeta") != null);
 }
 
 test "identifier guard fires when select-union name collides with a reserved name" {
