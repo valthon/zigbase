@@ -58,4 +58,24 @@ describe("makeTypedRealtime", () => {
       expect.objectContaining({ filter: "status = 'a'", sort: "-created" }),
     );
   });
+
+  it("getList with no options passes a clean empty object (no undefined keys)", async () => {
+    const { rt, collectionObj } = mockRealtime();
+    const typed = makeTypedRealtime(rt as never, postsMeta);
+    await typed.getList();
+    expect(rt.collection).toHaveBeenCalledWith("posts");
+    const call = collectionObj.getList.mock.calls[0] as unknown as [number, number, Record<string, unknown>];
+    const opts = call[2];
+    // No undefined-valued keys should be present
+    expect(Object.keys(opts).filter((k) => opts[k] === undefined)).toHaveLength(0);
+    expect(opts).toEqual({});
+  });
+
+  it("unsubscribe delegates to SP1 rt.unsubscribe with the collection name", () => {
+    const { rt } = mockRealtime();
+    const typed = makeTypedRealtime(rt as never, postsMeta);
+    const cb = vi.fn();
+    typed.unsubscribe(cb);
+    expect(rt.unsubscribe).toHaveBeenCalledWith("posts", cb);
+  });
 });

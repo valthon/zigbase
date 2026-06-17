@@ -53,13 +53,17 @@ export function makeTypedRealtime(
       const filter = filterOf(opts?.where);
       const expand =
         opts?.expand && opts.expand.length > 0 ? opts.expand.join(",") : undefined;
+      const listOpts: { filter?: string; sort?: string; expand?: string } = {};
+      if (filter !== undefined) listOpts.filter = filter;
+      if (opts?.sort !== undefined) listOpts.sort = opts.sort;
+      if (expand !== undefined) listOpts.expand = expand;
       return (rt.collection(meta.name) as unknown as {
         getList(
           page: number,
           perPage: number,
           opts?: { filter?: string; sort?: string; expand?: string },
         ): Promise<unknown>;
-      }).getList(1, perPage, { filter, sort: opts?.sort, expand });
+      }).getList(1, perPage, listOpts);
     },
   };
 }
