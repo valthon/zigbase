@@ -93,6 +93,37 @@ describe("makeRecordService", () => {
     expect(inner.delete).toHaveBeenCalledWith("p1");
   });
 
+  it("create forwards expand string[] as a comma-joined string to inner.create", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, postsMeta);
+    await svc.create({ title: "Hi" }, { expand: ["author", "tags"] });
+    expect(inner.create).toHaveBeenCalledWith(
+      { title: "Hi" },
+      expect.objectContaining({ expand: "author,tags" }),
+    );
+  });
+
+  it("update forwards expand string[] as a comma-joined string to inner.update", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, postsMeta);
+    await svc.update("p1", { title: "Yo" }, { expand: ["author"] });
+    expect(inner.update).toHaveBeenCalledWith(
+      "p1",
+      { title: "Yo" },
+      expect.objectContaining({ expand: "author" }),
+    );
+  });
+
+  it("create forwards requestKey and fields to inner.create", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, postsMeta);
+    await svc.create({ title: "Hi" }, { requestKey: "ck-1", fields: "id,title" });
+    expect(inner.create).toHaveBeenCalledWith(
+      { title: "Hi" },
+      expect.objectContaining({ requestKey: "ck-1", fields: "id,title" }),
+    );
+  });
+
   it("getFirstListItem with `where` delegates to inner.getFirstListItem with compiled filter", async () => {
     const { client, inner } = mockClient();
     const svc = makeRecordService(client, postsMeta);

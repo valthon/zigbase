@@ -50,4 +50,25 @@ describe("makeFilterBuilder", () => {
   it("throws on an unknown field", () => {
     expect(() => b.nope!.eq("x")).toThrow();
   });
+
+  it("accessing a Symbol property returns without throwing (runtime inspection safety)", () => {
+    // JS runtime inspection accesses Symbol.toStringTag, Symbol.toPrimitive, etc.
+    // These should NOT throw — they fall through Reflect.get which returns undefined.
+    const sym = Symbol.toStringTag;
+    expect(() => (b as unknown as Record<symbol, unknown>)[sym]).not.toThrow();
+    expect((b as unknown as Record<symbol, unknown>)[sym]).toBeUndefined();
+  });
+
+  it("`then` property returns undefined (prevents thenable trap in async contexts)", () => {
+    // If a FilterBuilder is accidentally returned from an async fn / awaited,
+    // Promise.resolve() checks for a `.then` method. Returning `undefined` makes
+    // the builder a non-thenable, preventing infinite resolution loops.
+    const result = (b as unknown as Record<string, unknown>)["then"];
+    expect(result).toBeUndefined();
+  });
+
+  it("known fields still work after robustness guard is in place", () => {
+    expect(b.status!.eq("published").toString()).toBe("status = 'published'");
+    expect(b.author!.eq("u1").toString()).toBe("author = 'u1'");
+  });
 });

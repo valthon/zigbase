@@ -97,10 +97,20 @@ export type FilterRoot = Record<string, FieldExpr>;
 
 export function makeFilterBuilder(meta: CollectionMeta): FilterRoot {
   return new Proxy({} as FilterRoot, {
-    get(_target, prop): FieldExpr {
-      if (typeof prop !== "string") {
-        throw new Error(`filter builder: non-string field access`);
-      }
+    get(target, prop, receiver): unknown {
+      // Symbol access (e.g. Symbol.toStringTag, Symbol.toPrimitive) — fall through
+      // to the real target so runtime inspection / util.inspect work without throwing.
+      if (typeof prop !== "string") return Reflect.get(target, prop, receiver);
+      // Prevent accidental thenable/coercion traps: returning `undefined` tells
+      // Promise.resolve() and JSON.stringify that this is not a promise / has no
+      // custom serialisation.
+      if (
+        prop === "then" ||
+        prop === "toJSON" ||
+        prop === "toString" ||
+        prop === "valueOf"
+      )
+        return undefined;
       if (!fieldMeta(meta, prop)) {
         throw new Error(`filter builder: unknown field "${prop}" on ${meta.name}`);
       }

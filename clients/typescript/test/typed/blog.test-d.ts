@@ -138,6 +138,47 @@ async function getFullListTyped() {
   expectTypeOf(items).toEqualTypeOf<Post[]>();
 }
 
+// --- realtime: getList expand accepts string[] (Fix 3) -----------------------
+
+// getList should accept expand as string[] (consistent with TypedLiveListOptions
+// and other typed surfaces). Previously the interface declared `expand?: string`.
+async function realtimeGetListExpandArray() {
+  // This must compile: expand is string[], not string.
+  await zb.realtime.posts.getList({ expand: ["author"] });
+}
+
+async function realtimeGetListExpandArrayMulti() {
+  await zb.realtime.posts.getList({ expand: ["author", "tags"] });
+}
+
+// --- create/update with opts (Fix 4) -----------------------------------------
+
+// create and update should accept an opts bag with expand/fields/signal/requestKey.
+async function createWithExpandOpts() {
+  const post = await zb.db.posts.create(
+    { title: "Hi", status: "draft" },
+    { expand: ["author"] },
+  );
+  // expand: ['author'] should narrow the return type
+  expectTypeOf(post.expand.author).toEqualTypeOf<User>();
+}
+
+async function updateWithExpandOpts() {
+  const post = await zb.db.posts.update(
+    "p1",
+    { title: "Updated" },
+    { expand: ["tags"] },
+  );
+  expectTypeOf(post.expand.tags).toEqualTypeOf<Tag[]>();
+}
+
+async function createNoOpts() {
+  const post = await zb.db.posts.create({ title: "Hi" });
+  // no expand -> expand property is not accessible
+  // @ts-expect-error author was not expanded
+  post.expand.author;
+}
+
 // Reference the fns so they aren't flagged unused by the type checker.
 export const _typeTests = [
   expandOne, expandTags, noExpand, expandList,
@@ -146,4 +187,6 @@ export const _typeTests = [
   getListPaging,
   fluentOk, fluentUnknownField, fluentBadEnum, filesOk, filesBadField, pageTyped,
   iterateTyped, getFullListTyped,
+  realtimeGetListExpandArray, realtimeGetListExpandArrayMulti,
+  createWithExpandOpts, updateWithExpandOpts, createNoOpts,
 ];

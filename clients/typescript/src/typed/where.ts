@@ -75,12 +75,16 @@ function looksLikeOps(obj: Record<string, unknown>): boolean {
 }
 
 function compileNode(
-  where: Record<string, unknown>,
+  where: unknown,
   meta: CollectionMeta,
   resolve: RelationResolver,
   prefix: string,
   depth: number,
 ): string {
+  // Guard: non-object elements in AND/OR arrays (null, undefined, primitives) are
+  // silently ignored — they contribute an empty string which joinClauses drops.
+  if (!isPlainObject(where)) return "";
+
   const clauses: string[] = [];
 
   for (const [key, value] of Object.entries(where)) {

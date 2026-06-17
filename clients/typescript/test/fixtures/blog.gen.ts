@@ -166,8 +166,15 @@ export interface PostsService {
   }): Promise<CursorPage<Post>>;
   iterate(opts?: { where?: PostWhere; sort?: string }): AsyncIterableIterator<Post>;
   getFullList(opts?: { where?: PostWhere; sort?: string }): Promise<Post[]>;
-  create(data: PostCreate): Promise<Post>;
-  update(id: string, data: PostUpdate): Promise<Post>;
+  create<K extends PostExpand = never>(
+    data: PostCreate,
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+  ): Promise<WithExpand<Post, PostRelations, K>>;
+  update<K extends PostExpand = never>(
+    id: string,
+    data: PostUpdate,
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+  ): Promise<WithExpand<Post, PostRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: PostFields) => Expr): string;
 }
@@ -186,8 +193,15 @@ export interface UsersService {
     limit?: number;
     cursor?: string;
   }): Promise<CursorPage<User>>;
-  create(data: UserCreate): Promise<User>;
-  update(id: string, data: UserUpdate): Promise<User>;
+  create(
+    data: UserCreate,
+    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
+  ): Promise<User>;
+  update(
+    id: string,
+    data: UserUpdate,
+    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
+  ): Promise<User>;
   delete(id: string): Promise<void>;
   filter(fn: (f: UserFields) => Expr): string;
   authWithPassword(
@@ -200,8 +214,15 @@ export interface TagsService {
   getOne(id: string): Promise<Tag>;
   getList(opts?: { where?: TagWhere; sort?: string; page?: number; limit?: number }): Promise<ListResult<Tag>>;
   getPage(opts?: { where?: TagWhere; limit?: number; cursor?: string }): Promise<CursorPage<Tag>>;
-  create(data: TagCreate): Promise<Tag>;
-  update(id: string, data: TagUpdate): Promise<Tag>;
+  create(
+    data: TagCreate,
+    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
+  ): Promise<Tag>;
+  update(
+    id: string,
+    data: TagUpdate,
+    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
+  ): Promise<Tag>;
   delete(id: string): Promise<void>;
   filter(fn: (f: TagFields) => Expr): string;
 }

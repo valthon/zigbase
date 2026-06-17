@@ -46,7 +46,7 @@ export interface RawTypedRealtime<Rec extends { id: string } = ZbRecord, Where =
     opts?: { where?: Where },
   ): Promise<() => void>;
   unsubscribe(cb?: (e: TypedRealtimeEvent<Rec>) => void): void;
-  getList(opts?: { where?: Where; sort?: string; expand?: string }): Promise<LiveList>;
+  getList(opts?: { where?: Where; sort?: string; expand?: string[] }): Promise<LiveList>;
 }
 
 export function makeTypedRealtime<Rec extends { id: string } = ZbRecord, Where = unknown>(

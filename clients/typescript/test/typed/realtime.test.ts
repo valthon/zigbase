@@ -78,4 +78,35 @@ describe("makeTypedRealtime", () => {
     typed.unsubscribe(cb);
     expect(rt.unsubscribe).toHaveBeenCalledWith("posts", cb);
   });
+
+  it("getList with expand string[] joins to a comma string before passing to SP1", async () => {
+    const { rt, collectionObj } = mockRealtime();
+    const typed = makeTypedRealtime(rt as never, postsMeta);
+    await typed.getList({ expand: ["author", "tags"] });
+    expect(collectionObj.getList).toHaveBeenCalledWith(
+      1,
+      30,
+      expect.objectContaining({ expand: "author,tags" }),
+    );
+  });
+
+  it("getList with single-element expand string[] passes a bare string (no trailing comma)", async () => {
+    const { rt, collectionObj } = mockRealtime();
+    const typed = makeTypedRealtime(rt as never, postsMeta);
+    await typed.getList({ expand: ["author"] });
+    expect(collectionObj.getList).toHaveBeenCalledWith(
+      1,
+      30,
+      expect.objectContaining({ expand: "author" }),
+    );
+  });
+
+  it("getList with empty expand string[] omits expand from opts", async () => {
+    const { rt, collectionObj } = mockRealtime();
+    const typed = makeTypedRealtime(rt as never, postsMeta);
+    await typed.getList({ expand: [] });
+    const call = collectionObj.getList.mock.calls[0] as unknown as [number, number, Record<string, unknown>];
+    const opts = call[2];
+    expect(opts).not.toHaveProperty("expand");
+  });
 });

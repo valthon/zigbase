@@ -106,6 +106,26 @@ describe("compileWhere", () => {
     );
   });
 
+  it("AND array containing null does not throw; null element contributes empty string (dropped)", () => {
+    // compileNode must guard against non-object elements in AND/OR arrays.
+    // A null/undefined element should return "" and be dropped from the clause join.
+    expect(
+      () => compile({ AND: [{ status: "a" }, null as unknown as object] }),
+    ).not.toThrow();
+    expect(compile({ AND: [{ status: "a" }, null as unknown as object] })).toBe(
+      "status = 'a'",
+    );
+  });
+
+  it("OR array containing undefined does not throw; undefined element is dropped", () => {
+    expect(
+      () => compile({ OR: [{ status: "a" }, undefined as unknown as object] }),
+    ).not.toThrow();
+    expect(compile({ OR: [{ status: "a" }, undefined as unknown as object] })).toBe(
+      "status = 'a'",
+    );
+  });
+
   it("maxDepth: 0 prevents nested where from recursing (falls through to id-operator)", () => {
     // With maxDepth=0 the depth budget is exhausted before any nesting can happen.
     // { author: { name: { like: 'A' } } } — at depth 0, the object is treated as
