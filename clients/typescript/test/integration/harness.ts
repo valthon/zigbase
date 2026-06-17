@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 const HERE = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const REPO_ROOT = resolve(HERE, "../../../..");
 const BIN = join(REPO_ROOT, "zig-out", "bin", "zigbase");
+/** Absolute path to the dating fixture compiled as a server (Task 2: `zig build dating-server`). */
+export const DATING_BIN = join(REPO_ROOT, "zig-out", "bin", "dating-server");
 
 export interface TestServer {
   url: string;
@@ -20,7 +22,7 @@ let built = false;
 function ensureBuilt(): void {
   if (built) return;
   // The binary MUST be built with zig 0.16.0; plain `zig` on PATH may be older.
-  const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], {
+  const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build", "dating-server"], {
     cwd: REPO_ROOT,
     stdio: "inherit",
   });
@@ -42,22 +44,33 @@ async function waitForHealth(url: string, timeoutMs = 20_000): Promise<void> {
   }
 }
 
-export async function startServer(): Promise<TestServer> {
+/**
+ * Spawn an already-built zigbase app binary (schema baked in), seed a superuser,
+ * and wait for health. `bin` may be an absolute path (e.g. DATING_BIN) or a bare
+ * name resolved under zig-out/bin/.
+ */
+export async function startAppServer(opts: {
+  bin: string;
+  seedSuperuser?: { email: string; password: string };
+}): Promise<TestServer> {
   ensureBuilt();
+  const bin = opts.bin.includes("/") ? opts.bin : join(REPO_ROOT, "zig-out", "bin", opts.bin);
   const dataDir = mkdtempSync(join(tmpdir(), "zb-it-"));
   const port = 20000 + Math.floor(Math.random() * 20000);
-  const email = "admin@test.local";
-  const password = "test-password-123";
+  const { email, password } = opts.seedSuperuser ?? {
+    email: "admin@test.local",
+    password: "test-password-123",
+  };
 
   const su = spawnSync(
-    BIN,
+    bin,
     ["superuser", "create", "--email", email, "--password", password, "--data-dir", dataDir],
     { stdio: "inherit" },
   );
   if (su.status !== 0) throw new Error("superuser create failed");
 
   const proc: ChildProcess = spawn(
-    BIN,
+    bin,
     ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"],
     { stdio: "inherit" },
   );
@@ -73,6 +86,14 @@ export async function startServer(): Promise<TestServer> {
       try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
     },
   };
+}
+
+/** Backward-compatible: spawn the generic zigbase binary (runtime-created collections). */
+export async function startServer(): Promise<TestServer> {
+  // Ensure the generic binary is built too (the existing tests create collections at runtime).
+  const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], { cwd: REPO_ROOT, stdio: "inherit" });
+  if (r.status !== 0) throw new Error("zig build failed");
+  return startAppServer({ bin: BIN });
 }
 
 /** Authenticate as the superuser and return the bearer token. */
