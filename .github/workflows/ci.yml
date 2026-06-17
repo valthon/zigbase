@@ -80,6 +80,13 @@ jobs:
       - uses: jdx/mise-action@v4
       - name: Build zigbase binary
         run: mise exec zig@0.16.0 -- zig build
+      - name: Build dating-server (e2e fixture binary)
+        run: mise exec zig@0.16.0 -- zig build dating-server
+      - name: Dating client snapshot is fresh
+        run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
+      - name: Golfsim client snapshot is fresh
+        working-directory: examples/golfsim
+        run: mise exec zig@0.16.0 -- zig build gen-client-check
       - name: Cache npm downloads
         uses: actions/cache@v4
         with:
@@ -98,3 +105,9 @@ jobs:
       - name: Integration tests
         working-directory: clients/typescript
         run: mise exec node@24 -- npm run test:integration
+      - name: Build @zigbase/client (golfsim consumes the built package)
+        working-directory: clients/typescript
+        run: mise exec node@24 -- npm run build
+      - name: Golfsim e2e
+        working-directory: examples/golfsim
+        run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:e2e
