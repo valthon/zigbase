@@ -1,7 +1,11 @@
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-  entry: ["src/index.ts", "src/realtime-entry.ts"],
+  entry: {
+    index: "src/index.ts",
+    "realtime-entry": "src/realtime-entry.ts",
+    typed: "src/typed/index.ts",
+  },
   format: ["esm", "cjs"],
   dts: true,
   clean: true,

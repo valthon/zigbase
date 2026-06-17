@@ -17,6 +17,11 @@
       "types": "./dist/realtime-entry.d.ts",
       "import": "./dist/realtime-entry.js",
       "require": "./dist/realtime-entry.cjs"
+    },
+    "./typed": {
+      "types": "./dist/typed.d.ts",
+      "import": "./dist/typed.js",
+      "require": "./dist/typed.cjs"
     }
   },
   "files": ["dist"],
