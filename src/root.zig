@@ -47,6 +47,16 @@ pub const Migration = @import("provision.zig").Migration;
 // build.zig embedStaticDir) and of `.static_files = .{ .embedded = ... }`.
 pub const StaticFile = @import("static_files.zig").StaticFile;
 
+// ---- Code-generation modules (pure-Zig TS client generator) ---------------
+pub const codegen = struct {
+    pub const ts_type = @import("codegen/ts_type.zig");
+    pub const identifiers = @import("codegen/identifiers.zig");
+    pub const guards = @import("codegen/guards.zig");
+    pub const emit = @import("codegen/emit.zig");
+    /// The generator core + mainWithCollections entry-point used by gen_main.zig.
+    pub const gen_client = @import("codegen/gen_client.zig");
+};
+
 // ---- Test discovery --------------------------------------------------------
 // The unit-test runner is rooted at THIS module. Reference every internal file
 // so its `test {}` blocks are analyzed and run (matches pre-restructure behavior
@@ -113,4 +123,9 @@ test {
     _ = @import("schedule.zig");
     _ = @import("scheduler.zig");
     _ = @import("mail/mailer.zig");
+    _ = @import("codegen/ts_type.zig");
+    _ = @import("codegen/identifiers.zig");
+    _ = @import("codegen/guards.zig");
+    _ = @import("codegen/emit.zig");
+    _ = @import("codegen/gen_client.zig");
 }
