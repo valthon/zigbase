@@ -30,6 +30,8 @@ function mockClient() {
     getOne: vi.fn(async (id: string) => ({ id })),
     getFirstListItem: vi.fn(async () => ({ id: "p1" })),
     getPage: vi.fn(async () => ({ items: [] as Record<string, unknown>[], nextCursor: null, prevCursor: null, hasNext: false, hasPrev: false })),
+    iterate: vi.fn(async function* () { /* empty */ } as () => AsyncIterableIterator<Record<string, unknown>>),
+    getFullList: vi.fn(async () => [] as Record<string, unknown>[]),
     create: vi.fn(async (body: Record<string, unknown>) => ({ id: "new", ...body })),
     update: vi.fn(async (id: string, body: Record<string, unknown>) => ({ id, ...body })),
     delete: vi.fn(async () => undefined),
@@ -115,26 +117,42 @@ describe("makeRecordService", () => {
     expect(result).toEqual({ id: "p1" });
   });
 
-  it("iterate and getFullList forward compiled where filter", async () => {
+  it("getFirstListItem without `where` throws ZigbaseError 404 when getList returns empty", async () => {
     const { client, inner } = mockClient();
     const svc = makeRecordService(client, postsMeta);
-    inner.getPage
-      .mockResolvedValueOnce({ items: [{ id: "p1" } as Record<string, unknown>], nextCursor: null, prevCursor: null, hasNext: false, hasPrev: false });
-    await svc.getFullList({ where: { status: "published" } });
-    expect(inner.getPage).toHaveBeenCalledWith(
-      expect.objectContaining({ filter: "status = 'published'" }),
-    );
+    // Default mock already returns { items: [] }
+    await expect(svc.getFirstListItem()).rejects.toMatchObject({ status: 404 });
+    expect(inner.getList).toHaveBeenCalledWith(1, 1, expect.objectContaining({}));
   });
 
-  it("iterate forwards compiled where filter", async () => {
+  it("getFullList delegates to inner.getFullList with compiled where filter", async () => {
     const { client, inner } = mockClient();
     const svc = makeRecordService(client, postsMeta);
-    inner.getPage
-      .mockResolvedValueOnce({ items: [], nextCursor: null, prevCursor: null, hasNext: false, hasPrev: false });
-    for await (const _ of svc.iterate({ where: { status: "draft" } })) { /* drain */ }
-    expect(inner.getPage).toHaveBeenCalledWith(
+    inner.getFullList.mockResolvedValueOnce([{ id: "p1" } as Record<string, unknown>]);
+    const result = await svc.getFullList({ where: { status: "published" } });
+    expect(inner.getFullList).toHaveBeenCalledWith(
+      expect.objectContaining({ filter: "status = 'published'" }),
+    );
+    expect(inner.getPage).not.toHaveBeenCalled();
+    expect(result).toEqual([{ id: "p1" }]);
+  });
+
+  it("iterate delegates to inner.iterate with compiled where filter", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, postsMeta);
+    const items = [{ id: "p1" } as Record<string, unknown>];
+    inner.iterate.mockImplementationOnce(async function* () {
+      for (const item of items) yield item;
+    } as () => AsyncIterableIterator<Record<string, unknown>>);
+    const collected: unknown[] = [];
+    for await (const item of svc.iterate({ where: { status: "draft" } })) {
+      collected.push(item);
+    }
+    expect(inner.iterate).toHaveBeenCalledWith(
       expect.objectContaining({ filter: "status = 'draft'" }),
     );
+    expect(inner.getPage).not.toHaveBeenCalled();
+    expect(collected).toEqual(items);
   });
 
   it("filter(fn) builds an SP1 string via the fluent builder", () => {
@@ -151,5 +169,45 @@ describe("makeRecordService", () => {
     const call = inner.getList.mock.calls[0];
     const [, , opts] = call as ListArgs;
     expect(opts?.filter).toBeUndefined();
+  });
+
+  // Fix 2: requestKey threading tests
+  it("threads requestKey through to inner.getList", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, postsMeta);
+    await svc.getList({ where: { status: "published" }, requestKey: "my-key" });
+    const call = inner.getList.mock.calls[0];
+    const [, , opts] = call as ListArgs;
+    expect(opts).toMatchObject({ requestKey: "my-key" });
+  });
+
+  it("threads requestKey through to inner.getPage", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, postsMeta);
+    await svc.getPage({ where: { status: "a" }, requestKey: "page-key" });
+    expect(inner.getPage).toHaveBeenCalledWith(
+      expect.objectContaining({ requestKey: "page-key" }),
+    );
+  });
+
+  it("threads requestKey through to inner.iterate", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, postsMeta);
+    inner.iterate.mockImplementationOnce(async function* () {
+      /* empty */
+    } as () => AsyncIterableIterator<Record<string, unknown>>);
+    for await (const _ of svc.iterate({ requestKey: "iter-key" })) { /* drain */ }
+    expect(inner.iterate).toHaveBeenCalledWith(
+      expect.objectContaining({ requestKey: "iter-key" }),
+    );
+  });
+
+  it("threads requestKey through to inner.getFullList", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, postsMeta);
+    await svc.getFullList({ requestKey: "full-key" });
+    expect(inner.getFullList).toHaveBeenCalledWith(
+      expect.objectContaining({ requestKey: "full-key" }),
+    );
   });
 });

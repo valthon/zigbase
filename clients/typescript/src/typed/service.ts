@@ -16,12 +16,14 @@ export interface TypedListOptions {
   limit?: number;
   fields?: string;
   signal?: AbortSignal;
+  requestKey?: string;
 }
 
 export interface TypedReadOptions {
   expand?: string[];
   fields?: string;
   signal?: AbortSignal;
+  requestKey?: string;
 }
 
 export interface TypedPageOptions {
@@ -32,6 +34,7 @@ export interface TypedPageOptions {
   cursor?: string;
   withTotal?: boolean;
   signal?: AbortSignal;
+  requestKey?: string;
 }
 
 /**
@@ -79,6 +82,7 @@ export function makeRecordService(
     expand: expandList(opts?.expand),
     fields: opts?.fields,
     signal: opts?.signal,
+    requestKey: opts?.requestKey,
   });
 
   const listOpts = (opts?: TypedListOptions) => ({
@@ -87,6 +91,7 @@ export function makeRecordService(
     expand: expandList(opts?.expand),
     fields: opts?.fields,
     signal: opts?.signal,
+    requestKey: opts?.requestKey,
   });
 
   return {
@@ -103,6 +108,7 @@ export function makeRecordService(
         expand: expandList(opts?.expand),
         fields: opts?.fields,
         signal: opts?.signal,
+        requestKey: opts?.requestKey,
       };
       if (filter !== undefined) {
         // A where clause is present: delegate to SP1's getFirstListItem which
@@ -132,38 +138,28 @@ export function makeRecordService(
         cursor: opts?.cursor,
         withTotal: opts?.withTotal,
         signal: opts?.signal,
+        requestKey: opts?.requestKey,
       });
     },
-    async *iterate(opts) {
-      const pageOpts = {
+    iterate(opts) {
+      return inner.iterate({
         filter: whereToFilter(opts?.where),
         sort: opts?.sort,
         expand: expandList(opts?.expand),
         fields: opts?.fields,
         signal: opts?.signal,
-      };
-      let page = await inner.getPage({ ...pageOpts, limit: 100 });
-      for (;;) {
-        for (const item of page.items) yield item as ZbRecord;
-        if (!page.hasNext || !page.nextCursor) return;
-        page = await inner.getPage({ ...pageOpts, limit: 100, cursor: page.nextCursor });
-      }
+        requestKey: opts?.requestKey,
+      });
     },
-    async getFullList(opts) {
-      const pageOpts = {
+    getFullList(opts) {
+      return inner.getFullList({
         filter: whereToFilter(opts?.where),
         sort: opts?.sort,
         expand: expandList(opts?.expand),
         fields: opts?.fields,
         signal: opts?.signal,
-      };
-      const out: ZbRecord[] = [];
-      let page = await inner.getPage({ ...pageOpts, limit: 100 });
-      for (;;) {
-        for (const item of page.items) out.push(item as ZbRecord);
-        if (!page.hasNext || !page.nextCursor) return out;
-        page = await inner.getPage({ ...pageOpts, limit: 100, cursor: page.nextCursor });
-      }
+        requestKey: opts?.requestKey,
+      });
     },
     create(data, opts) {
       return inner.create(data, readOpts(opts));
