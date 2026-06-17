@@ -43,6 +43,20 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zigbase");
     run_step.dependOn(&run_cmd.step);
 
+    // --- dating-server: the dating fixture compiled as a runnable server ----------
+    // Plan 2: the e2e harness spawns THIS binary so client and server share the exact
+    // comptime schema the dating client was generated from. Links libc (facil.io C deps).
+    const dating_srv_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/dating/schema.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    dating_srv_mod.addImport("zigbase", zigbase_mod);
+    const dating_srv_exe = b.addExecutable(.{ .name = "dating-server", .root_module = dating_srv_mod });
+    const dating_srv_step = b.step("dating-server", "Build the dating fixture as a runnable server");
+    dating_srv_step.dependOn(&b.addInstallArtifact(dating_srv_exe, .{}).step);
+
     // Unit tests run against the library module (where all internal test{} live).
     const tests = b.addTest(.{ .root_module = zigbase_mod });
     const run_tests = b.addRunArtifact(tests);
