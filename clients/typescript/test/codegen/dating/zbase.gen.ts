@@ -8,11 +8,10 @@ import { createClient as baseCreateClient, type Client } from "../../../src/inde
 import { withRealtime, type RealtimeEnabledClient } from "../../../src/realtime-entry.js";
 import type { ListResult } from "../../../src/records.js";
 import type { CursorPage } from "../../../src/cursor.js";
-import type { FileUrlOptions } from "../../../src/files.js";
+import type { FilesService, FileUrlOptions } from "../../../src/files.js";
 import {
   makeRecordService,
   makeTypedRealtime,
-  makeTypedFiles,
   type CollectionMeta,
   type WithExpand,
   type StringOps,
@@ -158,11 +157,17 @@ export interface ProfileWhere {
   website?: StringOps | string;
   age?: NumberOps | number;
   gender?: EnumOps<ProfileGender> | ProfileGender;
+  id?: StringOps | string;
+  created?: StringOps | string;
+  updated?: StringOps | string;
   AND?: ProfileWhere[];
   OR?: ProfileWhere[];
 }
 export interface TagWhere {
   label?: StringOps | string;
+  id?: StringOps | string;
+  created?: StringOps | string;
+  updated?: StringOps | string;
   AND?: TagWhere[];
   OR?: TagWhere[];
 }
@@ -171,6 +176,9 @@ export interface PhotoWhere {
   visibility?: EnumOps<PhotoVisibility> | PhotoVisibility;
   caption?: StringOps | string;
   tags?: string | RelOps;
+  id?: StringOps | string;
+  created?: StringOps | string;
+  updated?: StringOps | string;
   AND?: PhotoWhere[];
   OR?: PhotoWhere[];
 }
@@ -180,6 +188,9 @@ export interface MessageWhere {
   body?: StringOps | string;
   sentAt?: StringOps | string;
   read?: boolean;
+  id?: StringOps | string;
+  created?: StringOps | string;
+  updated?: StringOps | string;
   AND?: MessageWhere[];
   OR?: MessageWhere[];
 }
@@ -187,6 +198,9 @@ export interface WinkWhere {
   from?: string | RelOps | ProfileWhere;
   to?: string | RelOps | ProfileWhere;
   createdAt?: StringOps | string;
+  id?: StringOps | string;
+  created?: StringOps | string;
+  updated?: StringOps | string;
   AND?: WinkWhere[];
   OR?: WinkWhere[];
 }
@@ -197,6 +211,9 @@ export interface SubscriptionWhere {
   renewsAt?: StringOps | string;
   active?: boolean;
   metadata?: unknown;
+  id?: StringOps | string;
+  created?: StringOps | string;
+  updated?: StringOps | string;
   AND?: SubscriptionWhere[];
   OR?: SubscriptionWhere[];
 }
@@ -223,15 +240,24 @@ export interface ProfileFields {
   website: TypedFieldExpr<string>;
   age: TypedFieldExpr<number>;
   gender: TypedFieldExpr<ProfileGender>;
+  id: TypedFieldExpr<string>;
+  created: TypedFieldExpr<string>;
+  updated: TypedFieldExpr<string>;
 }
 export interface TagFields {
   label: TypedFieldExpr<string>;
+  id: TypedFieldExpr<string>;
+  created: TypedFieldExpr<string>;
+  updated: TypedFieldExpr<string>;
 }
 export interface PhotoFields {
   owner: TypedFieldExpr<string>;
   visibility: TypedFieldExpr<PhotoVisibility>;
   caption: TypedFieldExpr<string>;
   tags: TypedFieldExpr<string>;
+  id: TypedFieldExpr<string>;
+  created: TypedFieldExpr<string>;
+  updated: TypedFieldExpr<string>;
 }
 export interface MessageFields {
   from: TypedFieldExpr<string>;
@@ -239,11 +265,17 @@ export interface MessageFields {
   body: TypedFieldExpr<string>;
   sentAt: TypedFieldExpr<string>;
   read: TypedFieldExpr<boolean>;
+  id: TypedFieldExpr<string>;
+  created: TypedFieldExpr<string>;
+  updated: TypedFieldExpr<string>;
 }
 export interface WinkFields {
   from: TypedFieldExpr<string>;
   to: TypedFieldExpr<string>;
   createdAt: TypedFieldExpr<string>;
+  id: TypedFieldExpr<string>;
+  created: TypedFieldExpr<string>;
+  updated: TypedFieldExpr<string>;
 }
 export interface SubscriptionFields {
   profile: TypedFieldExpr<string>;
@@ -252,6 +284,9 @@ export interface SubscriptionFields {
   renewsAt: TypedFieldExpr<string>;
   active: TypedFieldExpr<boolean>;
   metadata: TypedFieldExpr<unknown>;
+  id: TypedFieldExpr<string>;
+  created: TypedFieldExpr<string>;
+  updated: TypedFieldExpr<string>;
 }
 
 // ---- Concrete service interfaces ----
@@ -276,6 +311,7 @@ export interface ProfilesService {
     identity: string,
     password: string,
   ): Promise<{ token: string; record: Profile }>;
+  fileUrl(record: Profile, field: ProfileFileField, opts?: FileUrlOptions): string;
 }
 export interface TagsService {
   getOne(id: string, opts?: { fields?: string }): Promise<Tag>;
@@ -333,6 +369,7 @@ export interface PhotosService {
   ): Promise<WithExpand<Photo, PhotoRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: PhotoFields) => Expr): string;
+  fileUrl(record: Photo, field: PhotoFileField, opts?: FileUrlOptions): string;
 }
 export interface MessagesService {
   getOne<K extends MessageExpand = never>(
@@ -460,6 +497,7 @@ export interface SubscriptionsService {
 export const profilesMeta: CollectionMeta = {
   name: "profiles",
   fields: {
+    id: { type: "text" },
     email: { type: "email" },
     username: { type: "text" },
     verified: { type: "bool" },
@@ -479,6 +517,7 @@ export const profilesMeta: CollectionMeta = {
 export const tagsMeta: CollectionMeta = {
   name: "tags",
   fields: {
+    id: { type: "text" },
     label: { type: "text" },
     created: { type: "autodate" },
     updated: { type: "autodate" },
@@ -490,6 +529,7 @@ export const tagsMeta: CollectionMeta = {
 export const photosMeta: CollectionMeta = {
   name: "photos",
   fields: {
+    id: { type: "text" },
     owner: { type: "relation" },
     image: { type: "file" },
     visibility: { type: "select" },
@@ -505,6 +545,7 @@ export const photosMeta: CollectionMeta = {
 export const messagesMeta: CollectionMeta = {
   name: "messages",
   fields: {
+    id: { type: "text" },
     from: { type: "relation" },
     to: { type: "relation" },
     body: { type: "text" },
@@ -520,6 +561,7 @@ export const messagesMeta: CollectionMeta = {
 export const winksMeta: CollectionMeta = {
   name: "winks",
   fields: {
+    id: { type: "text" },
     from: { type: "relation" },
     to: { type: "relation" },
     createdAt: { type: "autodate" },
@@ -533,6 +575,7 @@ export const winksMeta: CollectionMeta = {
 export const subscriptionsMeta: CollectionMeta = {
   name: "subscriptions",
   fields: {
+    id: { type: "text" },
     profile: { type: "relation" },
     plan: { type: "select" },
     price: { type: "number" },
@@ -562,28 +605,6 @@ const relationResolver: RelationResolver = (collection, field) => {
 export type ProfileFileField = "avatar";
 export type PhotoFileField = "image";
 
-export interface TypedFiles {
-  url(record: Profile, field: ProfileFileField, opts?: FileUrlOptions): string;
-  url(record: Photo, field: PhotoFileField, opts?: FileUrlOptions): string;
-}
-
-function makeFilesSurface(typedFiles: ReturnType<typeof makeTypedFiles>): TypedFiles {
-  const _colMap: Record<string, string> = {
-    avatar: "profiles",
-    image: "photos",
-  };
-  return {
-    url(record, field, opts) {
-      const filename = (record as unknown as Record<string, string>)[field as string] ?? "";
-      return typedFiles.fileUrl(
-        { id: (record as { id: string }).id, collectionName: _colMap[field as string] ?? "" },
-        filename,
-        opts,
-      );
-    },
-  } as TypedFiles;
-}
-
 // ---- Typed realtime surface ----
 
 export type ProfilesRealtime = RawTypedRealtime<Profile, ProfileWhere>;
@@ -612,7 +633,7 @@ export interface ZbClient {
     winks: WinksRealtime;
     subscriptions: SubscriptionsRealtime;
   };
-  files: TypedFiles;
+  files: FilesService;
   authStore: Client["authStore"];
   send: Client["send"];
   fetch: Client["fetch"];
@@ -631,8 +652,6 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
     }),
   );
 
-  const typedFiles = makeTypedFiles(base.files);
-
   return {
     db: {
       profiles: Object.assign(
@@ -640,10 +659,18 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
         {
           authWithPassword: (identity: string, password: string) =>
             base.collection("profiles").authWithPassword(identity, password),
+          fileUrl: (record: any, field: any, opts: any) =>
+            base.files.getUrl({ id: record.id, collectionName: "profiles" }, (record as Record<string, string>)[field] ?? "", opts),
         },
       ) as unknown as ProfilesService,
       tags: makeRecordService(base, tagsMeta) as unknown as TagsService,
-      photos: makeRecordService(base, photosMeta, relationResolver) as unknown as PhotosService,
+      photos: Object.assign(
+        makeRecordService(base, photosMeta, relationResolver) as unknown as PhotosService,
+        {
+          fileUrl: (record: any, field: any, opts: any) =>
+            base.files.getUrl({ id: record.id, collectionName: "photos" }, (record as Record<string, string>)[field] ?? "", opts),
+        },
+      ) as unknown as PhotosService,
       messages: makeRecordService(base, messagesMeta, relationResolver) as unknown as MessagesService,
       winks: makeRecordService(base, winksMeta, relationResolver) as unknown as WinksService,
       subscriptions: makeRecordService(base, subscriptionsMeta, relationResolver) as unknown as SubscriptionsService,
@@ -656,7 +683,7 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       winks: makeTypedRealtime<Wink, WinkWhere>(base.realtime, winksMeta, relationResolver),
       subscriptions: makeTypedRealtime<Subscription, SubscriptionWhere>(base.realtime, subscriptionsMeta, relationResolver),
     },
-    files: makeFilesSurface(typedFiles),
+    files: base.files,
     authStore: base.authStore,
     send: base.send.bind(base),
     fetch: base.fetch.bind(base),

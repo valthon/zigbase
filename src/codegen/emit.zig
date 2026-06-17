@@ -37,6 +37,31 @@ fn isAuthSynthesized(name: []const u8) bool {
         std.mem.eql(u8, name, "verified");
 }
 
+/// Returns true for the system fields that emitWhere / emitFields synthesize
+/// after user-declared fields.  Guards against double-emission when a user
+/// field is named id, created, or updated (unusual but possible).
+fn isSystemFieldName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "id") or
+        std.mem.eql(u8, name, "created") or
+        std.mem.eql(u8, name, "updated");
+}
+
+/// Returns true if any non-hidden user field in c.fields has the given name.
+/// Used to decide whether to skip synthesizing a system field that the user
+/// already declared (dedup logic for emitWhere / emitFields).
+fn userFieldExists(c: schema.Collection, name: []const u8) bool {
+    for (c.fields) |f| {
+        if (!f.hidden and std.mem.eql(u8, f.name, name)) return true;
+    }
+    return false;
+}
+
+/// Returns true if the collection has at least one file field.
+fn hasFileFields(c: schema.Collection) bool {
+    for (c.fields) |f| if (tt.kindOf(f) == .file_name) return true;
+    return false;
+}
+
 /// The visible synthesized auth fields for an auth collection record.
 /// Always emits email + username + verified (B3: unconditional synthesis —
 /// buildCollections does not propagate identityFields at comptime, so we cannot
@@ -160,9 +185,12 @@ pub fn emitWhere(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collectio
     // For auth collections we skip any field already synthesized above (email /
     // username / verified) so that callers who pass injectAuthFields output do not
     // produce duplicate lines.
+    // We also skip user fields named id/created/updated since we synthesize those
+    // system fields explicitly below (isSystemFieldName dedup).
     for (c.fields) |f| {
         if (f.hidden) continue;
         if (c.type == .auth and isAuthSynthesized(f.name)) continue;
+        if (isSystemFieldName(f.name)) continue; // synthesized below as system fields
         switch (tt.kindOf(f)) {
             .file_name => continue, // file fields omitted from where
             .string => try putf(alloc, w, "  {s}?: StringOps | string;\n", .{f.name}),
@@ -184,6 +212,12 @@ pub fn emitWhere(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collectio
             },
         }
     }
+    // Synthesize system fields id/created/updated (always filterable).
+    // These are unconditionally appended; the loop above already skips any
+    // user-declared field with the same name so there is no duplication.
+    try put(alloc, w, "  id?: StringOps | string;\n");
+    try put(alloc, w, "  created?: StringOps | string;\n");
+    try put(alloc, w, "  updated?: StringOps | string;\n");
     try putf(alloc, w, "  AND?: {s}[];\n  OR?: {s}[];\n}}\n", .{ wn, wn });
 }
 
@@ -249,12 +283,20 @@ pub fn emitFields(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     // For auth collections we skip fields already synthesized above (email /
     // username / verified) to avoid double-emission when the caller passes
     // injectAuthFields output.
+    // We also skip user fields named id/created/updated since we synthesize those
+    // system fields explicitly below (isSystemFieldName dedup).
     for (c.fields) |f| {
         if (f.hidden or tt.kindOf(f) == .file_name) continue;
         if (c.type == .auth and isAuthSynthesized(f.name)) continue;
+        if (isSystemFieldName(f.name)) continue; // synthesized below as system fields
         const base = try tt.tsBaseTypeOf(alloc, c.name, f);
         try putf(alloc, w, "  {s}: TypedFieldExpr<{s}>;\n", .{ f.name, base });
     }
+    // Synthesize system fields id/created/updated (always filterable via fluent builder).
+    // The loop above already skips any user-declared field with the same name.
+    try put(alloc, w, "  id: TypedFieldExpr<string>;\n");
+    try put(alloc, w, "  created: TypedFieldExpr<string>;\n");
+    try put(alloc, w, "  updated: TypedFieldExpr<string>;\n");
     try put(alloc, w, "}\n");
 }
 
@@ -341,6 +383,13 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\
         , .{rec});
     }
+    if (hasFileFields(c)) {
+        const ff = try ident.recordName(alloc, c.name);
+        try putf(alloc, w,
+            \\  fileUrl(record: {0s}, field: {0s}FileField, opts?: FileUrlOptions): string;
+            \\
+        , .{ff});
+    }
     try put(alloc, w, "}\n");
 }
 
@@ -362,10 +411,11 @@ pub fn emitRealtimeAlias(alloc: std.mem.Allocator, w: *W, c: schema.Collection) 
 pub fn emitMeta(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const mc = try ident.metaConst(alloc, c.name);
     try putf(alloc, w, "export const {s}: CollectionMeta = {{\n  name: \"{s}\",\n  fields: {{\n", .{ mc, c.name });
-    // meta.fields = auth visible (email+username+verified, unconditional) +
+    // meta.fields = id (always first) + auth visible (email+username+verified, unconditional) +
     //               user fields (non-hidden, non-read-only-system) +
     //               created + updated (always appended).
     var metaFields: std.ArrayList(schema.Field) = .empty;
+    try metaFields.append(alloc, .{ .id = "_id", .name = "id", .options = .{ .text = .{} } });
     if (c.type == .auth) try appendVisibleAuthFields(alloc, &metaFields);
     for (c.fields) |f| {
         if (f.hidden or isReadOnlySystem(f.name)) continue;
@@ -411,11 +461,10 @@ pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool) !void {
             \\import { withRealtime, type RealtimeEnabledClient } from "../../../src/realtime-entry.js";
             \\import type { ListResult } from "../../../src/records.js";
             \\import type { CursorPage } from "../../../src/cursor.js";
-            \\import type { FileUrlOptions } from "../../../src/files.js";
+            \\import type { FilesService, FileUrlOptions } from "../../../src/files.js";
             \\import {
             \\  makeRecordService,
             \\  makeTypedRealtime,
-            \\  makeTypedFiles,
             \\  type CollectionMeta,
             \\  type WithExpand,
             \\  type StringOps,
@@ -434,11 +483,10 @@ pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool) !void {
         try put(alloc, w,
             \\import { createClient as baseCreateClient, type Client } from "@zigbase/client";
             \\import { withRealtime, type RealtimeEnabledClient } from "@zigbase/client/realtime";
-            \\import type { ListResult, CursorPage, FileUrlOptions } from "@zigbase/client";
+            \\import type { ListResult, CursorPage, FilesService, FileUrlOptions } from "@zigbase/client";
             \\import {
             \\  makeRecordService,
             \\  makeTypedRealtime,
-            \\  makeTypedFiles,
             \\  type CollectionMeta,
             \\  type WithExpand,
             \\  type StringOps,
@@ -479,13 +527,11 @@ pub fn emitRelationResolver(alloc: std.mem.Allocator, w: *W, cols: []const schem
 // ---------------------------------------------------------------------------
 
 pub fn emitTypedFiles(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection) !void {
-    // Step 1: Per-collection file-field unions (e.g. `export type PostFileField = "cover";`).
+    // Per-collection file-field unions (e.g. `export type PostFileField = "cover";`).
+    // These type the `field` parameter of the per-collection `fileUrl` method on
+    // each concrete *Service interface.
     for (cols) |c| {
-        var any = false;
-        for (c.fields) |f| if (tt.kindOf(f) == .file_name) {
-            any = true;
-        };
-        if (!any) continue;
+        if (!hasFileFields(c)) continue;
         const rec = try ident.recordName(alloc, c.name);
         try putf(alloc, w, "export type {s}FileField = ", .{rec});
         var first = true;
@@ -497,49 +543,6 @@ pub fn emitTypedFiles(alloc: std.mem.Allocator, w: *W, cols: []const schema.Coll
         }
         try put(alloc, w, ";\n");
     }
-
-    // Step 2: TypedFiles interface — one `url` overload per file-bearing collection.
-    try put(alloc, w, "\nexport interface TypedFiles {\n");
-    for (cols) |c| {
-        var any = false;
-        for (c.fields) |f| if (tt.kindOf(f) == .file_name) {
-            any = true;
-        };
-        if (!any) continue;
-        const rec = try ident.recordName(alloc, c.name);
-        try putf(alloc, w,
-            "  url(record: {0s}, field: {0s}FileField, opts?: FileUrlOptions): string;\n",
-            .{rec});
-    }
-    try put(alloc, w, "}\n");
-
-    // Step 3: makeFilesSurface(typedFiles) — single `url` dispatch via a
-    // field-name → collection-name lookup table.  A per-overload impl would
-    // produce duplicate `url` keys in the object literal (TS2300), so we emit
-    // one consolidated method and cast the object to TypedFiles.
-    try put(alloc, w, "\nfunction makeFilesSurface(typedFiles: ReturnType<typeof makeTypedFiles>): TypedFiles {\n");
-    try put(alloc, w, "  const _colMap: Record<string, string> = {\n");
-    for (cols) |c| {
-        for (c.fields) |f| {
-            if (tt.kindOf(f) != .file_name) continue;
-            try putf(alloc, w, "    {s}: \"{s}\",\n", .{ f.name, c.name });
-        }
-    }
-    try put(alloc, w,
-        \\  };
-        \\  return {
-        \\    url(record, field, opts) {
-        \\      const filename = (record as unknown as Record<string, string>)[field as string] ?? "";
-        \\      return typedFiles.fileUrl(
-        \\        { id: (record as { id: string }).id, collectionName: _colMap[field as string] ?? "" },
-        \\        filename,
-        \\        opts,
-        \\      );
-        \\    },
-        \\  } as TypedFiles;
-        \\}
-        \\
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +624,7 @@ test "emitCreate matches PostCreate (required first, file -> File | Blob)" {
     try std.testing.expect(!contains(out, "created")); // read-only excluded
 }
 
-test "emitWhere matches PostWhere (nested relation, multi id-only, file omitted)" {
+test "emitWhere matches PostWhere (nested relation, multi id-only, file omitted, system fields synthesized)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -637,7 +640,15 @@ test "emitWhere matches PostWhere (nested relation, multi id-only, file omitted)
     try std.testing.expect(contains(out, "price?: NumberOps | number;"));
     try std.testing.expect(contains(out, "author?: string | RelOps | UserWhere;"));
     try std.testing.expect(contains(out, "tags?: string | RelOps;"));
+    // System fields synthesized (user-declared `created` in blogPosts() is skipped from
+    // the user loop to avoid duplication; only one `created?` line appears).
+    try std.testing.expect(contains(out, "id?: StringOps | string;"));
     try std.testing.expect(contains(out, "created?: StringOps | string;"));
+    try std.testing.expect(contains(out, "updated?: StringOps | string;"));
+    // Each system field appears exactly once (no duplication from user `created` field).
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "id?"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "created?"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "updated?"));
     try std.testing.expect(contains(out, "AND?: PostWhere[];"));
     try std.testing.expect(contains(out, "OR?: PostWhere[];"));
     try std.testing.expect(!contains(out, "cover")); // file omitted from where
@@ -656,6 +667,22 @@ test "emitService (expandable) has the getOne<K extends PostExpand = never> shap
     try std.testing.expect(contains(out, "getPage(opts?: {"));
     try std.testing.expect(contains(out, "Promise<CursorPage<Post>>"));
     try std.testing.expect(contains(out, "filter(fn: (f: PostFields) => Expr): string;"));
+    // Fix A: file-bearing collections gain a per-collection fileUrl method.
+    try std.testing.expect(contains(out, "fileUrl(record: Post, field: PostFileField, opts?: FileUrlOptions): string;"));
+}
+
+test "emitService (no files) does NOT include fileUrl" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const no_file_col = schema.Collection{
+        .id = "",
+        .name = "tags",
+        .fields = &.{.{ .id = "a", .name = "label", .required = true, .options = .{ .text = .{} } }},
+    };
+    var w: std.ArrayList(u8) = .empty;
+    try emitService(a, &w, no_file_col);
+    try std.testing.expect(!contains(w.items, "fileUrl"));
 }
 
 test "emitMeta matches postsMeta" {
@@ -667,10 +694,14 @@ test "emitMeta matches postsMeta" {
     const out = w.items;
     try std.testing.expect(contains(out, "export const postsMeta: CollectionMeta = {"));
     try std.testing.expect(contains(out, "name: \"posts\","));
+    // Fix B: id is now always first in meta.fields so compileWhere recognises it.
+    try std.testing.expect(contains(out, "id: { type: \"text\" },"));
     try std.testing.expect(contains(out, "tags: { type: \"relation\", multi: true },"));
     try std.testing.expect(contains(out, "fileFields: [\"cover\"],"));
     try std.testing.expect(contains(out, "expandable: [\"author\", \"tags\"],"));
     try std.testing.expect(contains(out, "isAuth: false,"));
+    // id appears exactly once (no duplication).
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "id: { type:"));
 }
 
 test "emitRealtimeAlias matches the generic alias" {
@@ -727,6 +758,10 @@ test "emitWhere / emitFields dedup injected auth fields — each appears exactly
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "verified?"));
         // The regular user field is still present.
         try std.testing.expect(contains(out, "bio?: StringOps | string;"));
+        // Fix B: system fields synthesized once.
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "id?"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "created?"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "updated?"));
     }
 
     // --- emitFields ---
@@ -738,6 +773,10 @@ test "emitWhere / emitFields dedup injected auth fields — each appears exactly
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "username:"));
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "verified:"));
         try std.testing.expect(contains(out, "bio: TypedFieldExpr<string>;"));
+        // Fix B: system fields always synthesized.
+        try std.testing.expect(contains(out, "id: TypedFieldExpr<string>;"));
+        try std.testing.expect(contains(out, "created: TypedFieldExpr<string>;"));
+        try std.testing.expect(contains(out, "updated: TypedFieldExpr<string>;"));
     }
 
     // --- non-injected auth collection still emits all three exactly once ---
@@ -755,6 +794,10 @@ test "emitWhere / emitFields dedup injected auth fields — each appears exactly
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "email?"));
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "username?"));
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "verified?"));
+        // Fix B: system fields synthesized once.
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "id?"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "created?"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "updated?"));
     }
     {
         var w: std.ArrayList(u8) = .empty;
@@ -763,12 +806,17 @@ test "emitWhere / emitFields dedup injected auth fields — each appears exactly
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "email:"));
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "username:"));
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "verified:"));
+        // Fix B: system fields synthesized once.
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "id:"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "created:"));
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "updated:"));
     }
 }
 
-test "emitTypedFiles emits FileField union + TypedFiles interface + makeFilesSurface" {
-    // B2: emitTypedFiles must emit all three pieces so emitClientFactory's
-    // `files: makeFilesSurface(typedFiles)` and the `TypedFiles` type resolve.
+test "emitTypedFiles emits only FileField unions (no global TypedFiles / makeFilesSurface)" {
+    // Fix A: emitTypedFiles now only emits per-collection FileField unions.
+    // The global TypedFiles interface and makeFilesSurface have been removed;
+    // fileUrl is grafted per-collection in emitService + emitClientFactory.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -776,15 +824,27 @@ test "emitTypedFiles emits FileField union + TypedFiles interface + makeFilesSur
     var w: std.ArrayList(u8) = .empty;
     try emitTypedFiles(a, &w, &cols);
     const out = w.items;
-    // 1. file-field union
+    // Per-collection file-field union is still emitted.
     try std.testing.expect(contains(out, "export type PostFileField = \"cover\";"));
-    // 2. TypedFiles interface with url overload
-    try std.testing.expect(contains(out, "export interface TypedFiles {"));
-    try std.testing.expect(contains(out, "url(record: Post, field: PostFileField, opts?: FileUrlOptions): string;"));
-    // 3. makeFilesSurface function + field→collection map + single dispatch url
-    try std.testing.expect(contains(out, "function makeFilesSurface("));
-    try std.testing.expect(contains(out, "const _colMap: Record<string, string> ="));
-    try std.testing.expect(contains(out, "cover: \"posts\""));
-    try std.testing.expect(contains(out, "record as unknown as Record<string, string>)[field as string]"));
-    try std.testing.expect(contains(out, "_colMap[field as string]"));
+    // Global TypedFiles interface and dispatch helper are GONE.
+    try std.testing.expect(!contains(out, "export interface TypedFiles"));
+    try std.testing.expect(!contains(out, "makeFilesSurface"));
+    try std.testing.expect(!contains(out, "_colMap"));
+}
+
+test "emitTypedFiles skips collections without file fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tags_col = schema.Collection{
+        .id = "",
+        .name = "tags",
+        .fields = &.{.{ .id = "a", .name = "label", .options = .{ .text = .{} } }},
+    };
+    const cols = [_]schema.Collection{tags_col};
+    var w: std.ArrayList(u8) = .empty;
+    try emitTypedFiles(a, &w, &cols);
+    // No FileField union for a collection with no file fields.
+    try std.testing.expect(!contains(w.items, "TagFileField"));
+    try std.testing.expect(w.items.len == 0);
 }

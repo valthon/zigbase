@@ -114,7 +114,7 @@ fn emitClientFactory(alloc: std.mem.Allocator, w: *W, cols: []const schema.Colle
     for (cols) |c| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: {s};\n", .{ c.name, try ident.realtimeAliasName(alloc, c.name) }));
     try w.appendSlice(alloc,
         \\  };
-        \\  files: TypedFiles;
+        \\  files: FilesService;
         \\  authStore: Client["authStore"];
         \\  send: Client["send"];
         \\  fetch: Client["fetch"];
@@ -141,8 +141,6 @@ fn emitClientFactory(alloc: std.mem.Allocator, w: *W, cols: []const schema.Colle
         \\    }}),
         \\  );
         \\
-        \\  const typedFiles = makeTypedFiles(base.files);
-        \\
         \\  return {{
         \\    db: {{
         \\
@@ -151,13 +149,40 @@ fn emitClientFactory(alloc: std.mem.Allocator, w: *W, cols: []const schema.Colle
         const mc = try ident.metaConst(alloc, c.name);
         const svc = try ident.serviceName(alloc, c.name);
         const resolver = if (emit_hasRelations(c)) ", relationResolver" else "";
-        if (c.type == .auth) {
+        const file_fields = emit_hasFileFields(c);
+        if (c.type == .auth and file_fields) {
+            // Auth collection WITH file fields: Object.assign with both authWithPassword + fileUrl.
             try w.appendSlice(alloc, try std.fmt.allocPrint(alloc,
                 \\      {0s}: Object.assign(
                 \\        makeRecordService(base, {1s}{2s}) as unknown as {3s},
                 \\        {{
                 \\          authWithPassword: (identity: string, password: string) =>
                 \\            base.collection("{0s}").authWithPassword(identity, password),
+                \\          fileUrl: (record: any, field: any, opts: any) =>
+                \\            base.files.getUrl({{ id: record.id, collectionName: "{0s}" }}, (record as Record<string, string>)[field] ?? "", opts),
+                \\        }},
+                \\      ) as unknown as {3s},
+                \\
+            , .{ c.name, mc, resolver, svc }));
+        } else if (c.type == .auth) {
+            try w.appendSlice(alloc, try std.fmt.allocPrint(alloc,
+                \\      {0s}: Object.assign(
+                \\        makeRecordService(base, {1s}{2s}) as unknown as {3s},
+                \\        {{
+                \\          authWithPassword: (identity: string, password: string) =>
+                \\            base.collection("{0s}").authWithPassword(identity, password),
+                \\        }},
+                \\      ) as unknown as {3s},
+                \\
+            , .{ c.name, mc, resolver, svc }));
+        } else if (file_fields) {
+            // Non-auth collection WITH file fields: Object.assign to graft fileUrl.
+            try w.appendSlice(alloc, try std.fmt.allocPrint(alloc,
+                \\      {0s}: Object.assign(
+                \\        makeRecordService(base, {1s}{2s}) as unknown as {3s},
+                \\        {{
+                \\          fileUrl: (record: any, field: any, opts: any) =>
+                \\            base.files.getUrl({{ id: record.id, collectionName: "{0s}" }}, (record as Record<string, string>)[field] ?? "", opts),
                 \\        }},
                 \\      ) as unknown as {3s},
                 \\
@@ -178,7 +203,7 @@ fn emitClientFactory(alloc: std.mem.Allocator, w: *W, cols: []const schema.Colle
             "      {0s}: makeTypedRealtime<{1s}, {2s}>(base.realtime, {3s}{4s}),\n",
             .{ c.name, rec, wn, mc, resolver }));
     }
-    try w.appendSlice(alloc, "    },\n    files: makeFilesSurface(typedFiles),\n");
+    try w.appendSlice(alloc, "    },\n    files: base.files,\n");
     try w.appendSlice(alloc,
         \\    authStore: base.authStore,
         \\    send: base.send.bind(base),
@@ -191,6 +216,12 @@ fn emitClientFactory(alloc: std.mem.Allocator, w: *W, cols: []const schema.Colle
 
 fn emit_hasRelations(c: schema.Collection) bool {
     for (c.fields) |f| if (f.options == .relation) return true;
+    return false;
+}
+
+fn emit_hasFileFields(c: schema.Collection) bool {
+    const tt = @import("ts_type.zig");
+    for (c.fields) |f| if (tt.kindOf(f) == .file_name) return true;
     return false;
 }
 
