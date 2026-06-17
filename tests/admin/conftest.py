@@ -1,5 +1,6 @@
 import os, re, socket, subprocess, tempfile, time, shutil, pathlib, pytest
 from playwright.sync_api import sync_playwright
+from _bin import resolve_binary
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
@@ -9,8 +10,7 @@ def _free_port():
 
 @pytest.fixture(scope="session")
 def binary():
-    subprocess.run(ZIG + ["build"], cwd=REPO, check=True)
-    return str(REPO / "zig-out" / "bin" / "zigbase")
+    return resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
 
 @pytest.fixture()
 def server(binary):
