@@ -9,7 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      # mise-action@v4 caches the installed toolchain (~/.local/share/mise) by
+      # default and authenticates tool downloads with the automatic GITHUB_TOKEN.
+      - uses: jdx/mise-action@v4
       - name: Build
         run: mise exec zig@0.16.0 -- zig build
       - name: Unit tests
@@ -18,11 +20,16 @@ jobs:
         run: cd examples/blog && mise exec zig@0.16.0 -- zig build
       - name: Build golfsim example consumer (realistic app)
         run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build
-      - uses: actions/setup-node@v4
+      # npm's global download cache (~/.npm), reused across runs; node itself
+      # comes from mise (node@24, the version pinned in mise.toml).
+      - name: Cache npm downloads
+        uses: actions/cache@v4
         with:
-          node-version: 22
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
       - name: Build plugins example frontend (embedded assets)
-        run: cd examples/plugins/frontend && npm ci --no-audit --no-fund && npm run build
+        run: cd examples/plugins/frontend && mise exec node@24 -- npm ci --no-audit --no-fund && mise exec node@24 -- npm run build
       - name: Build plugins example consumer (advanced framework surface)
         run: cd examples/plugins && mise exec zig@0.16.0 -- zig build
 
@@ -30,16 +37,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-      - uses: actions/setup-node@v4
+      - uses: jdx/mise-action@v4
+      - name: Cache npm downloads
+        uses: actions/cache@v4
         with:
-          node-version: 22
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
       - name: Build plugins example frontend (embedded assets, used by static-files tests)
-        run: cd examples/plugins/frontend && npm ci --no-audit --no-fund && npm run build
-      - name: Install Playwright + Chromium + aiosmtpd
+        run: cd examples/plugins/frontend && mise exec node@24 -- npm ci --no-audit --no-fund && mise exec node@24 -- npm run build
+      # Resolve the installed Playwright version so the browser cache key tracks it.
+      - name: Install Python test deps + resolve Playwright version
+        id: pw
         run: |
           mise exec python@3.13 -- python -m pip install --quiet pytest playwright aiosmtpd
-          mise exec python@3.13 -- python -m playwright install --with-deps chromium
+          echo "version=$(mise exec python@3.13 -- python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
+      # The harness launches a bare, headless chromium.launch() with no channel,
+      # so only the (smaller) chromium-headless-shell build is needed (--only-shell).
+      - name: Cache Playwright browser (chromium headless shell)
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.pw.outputs.version }}-chromium-shell
+      - name: Install Chromium headless shell + OS deps (cache miss)
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: mise exec python@3.13 -- python -m playwright install --with-deps --only-shell chromium
+      # OS deps live outside ~/.cache/ms-playwright and are not cacheable, so they
+      # must be (re)installed even when the browser binary is restored from cache.
+      - name: Install Playwright OS deps (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: mise exec python@3.13 -- python -m playwright install-deps chromium
       - name: Headless browser tests
         run: mise exec python@3.13 -- python -m pytest tests/admin -q
       - name: Live SMTP-over-TLS (STARTTLS) delivery test
@@ -49,21 +77,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
+      - uses: jdx/mise-action@v4
       - name: Build zigbase binary
         run: mise exec zig@0.16.0 -- zig build
+      - name: Cache npm downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
       - name: Install SDK deps
         working-directory: clients/typescript
-        run: npm ci || npm install
+        run: mise exec node@24 -- npm ci || mise exec node@24 -- npm install
       - name: Typecheck
         working-directory: clients/typescript
-        run: npm run typecheck
+        run: mise exec node@24 -- npm run typecheck
       - name: Unit tests
         working-directory: clients/typescript
-        run: npm test
+        run: mise exec node@24 -- npm test
       - name: Integration tests
         working-directory: clients/typescript
-        run: npm run test:integration
+        run: mise exec node@24 -- npm run test:integration
