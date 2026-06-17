@@ -232,6 +232,50 @@ RAII helpers in routes: `ev.writer()` (write) / `try ev.reader()` (read-only).
 
 ---
 
+## Generated TypeScript client
+
+`examples/golfsim` ships a **generated, fully type-safe TypeScript client** at
+`clients/typescript/zbase.gen.ts`. The file is committed to the repo; `zig build
+gen-client` regenerates it from the schema, and the CI staleness gate (`zig build
+gen-client-check`) fails if the committed snapshot is out of date.
+
+The prerequisite for code generation is that `src/main.zig` exposes `pub const App`
+at module scope — the generator reads the schema directly from the comptime `App`
+declaration:
+
+```zig
+// src/main.zig
+pub const App = zigbase.App(.{
+    .collections = .{ ... },
+    // ... hooks, routes, jobs ...
+});
+
+pub fn main(init: std.process.Init) !void {
+    return App.runCli(init);
+}
+```
+
+### Commands
+
+```bash
+# Regenerate the typed client from the schema:
+zig build gen-client
+
+# CI staleness gate — fails if the committed zbase.gen.ts is stale:
+zig build gen-client-check
+
+# Build @zigbase/client, then typecheck + run the full e2e suite against a live
+# golfsim binary:
+cd ../../clients/typescript && npm run build && cd ../../examples/golfsim
+npm install && npm run typecheck && npm run test:e2e
+```
+
+The e2e suite (`test/`) drives the generated typed client (`clients/typescript/zbase.gen.ts`)
+against a live `golfsim` binary — covering CRUD, filtering, auth, and realtime with
+full TypeScript type-checking via `vitest`.
+
+---
+
 ## Building and running
 
 ```sh
