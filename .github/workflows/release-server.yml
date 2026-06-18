@@ -1,0 +1,108 @@
+# Release @zigbase/server (platform matrix + meta) and @zigbase/typegen.
+# DORMANT until: (a) the @zigbase npm org exists, AND (b) per-package OIDC
+# "trusted publishers" are configured on npmjs.com (which requires each package
+# to have been published once already — do the FIRST publish manually with
+# clients/typescript/npm/publish.mjs; see clients/typescript/npm/RELEASING.md).
+#
+# Triggers:
+#   server-vX.Y.Z  -> build the 4-target matrix, publish the 4 platform packages + @zigbase/server
+#   typegen-vX.Y.Z -> publish @zigbase/typegen
+name: Release Server
+
+on:
+  push:
+    tags:
+      - "server-v*"
+      - "typegen-v*"
+
+permissions:
+  contents: read
+  id-token: write # OIDC trusted publishing + provenance
+
+jobs:
+  build-binaries:
+    if: startsWith(github.ref_name, 'server-v')
+    strategy:
+      matrix:
+        include:
+          - key: linux-x64
+            zig: x86_64-linux-musl
+            runner: ubuntu-latest
+          - key: linux-arm64
+            zig: aarch64-linux-musl
+            runner: ubuntu-latest
+          - key: darwin-x64
+            zig: x86_64-macos
+            runner: macos-latest
+          - key: darwin-arm64
+            zig: aarch64-macos
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v4
+      - name: Build dist-server (${{ matrix.zig }})
+        run: mise exec zig@0.16.0 -- zig build dist-server -Dtarget=${{ matrix.zig }} -Doptimize=ReleaseFast -Dcpu=baseline
+      - name: Stage binary
+        run: |
+          mkdir -p staged
+          cp zig-out/bin/zigbase-dist "staged/zigbase"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zigbase-${{ matrix.key }}
+          path: staged/zigbase
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-server:
+    if: startsWith(github.ref_name, 'server-v')
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+      - name: Assert @zigbase/server version matches the tag
+        run: |
+          tag="${GITHUB_REF_NAME}"; expected="${tag#server-v}"
+          actual="$(node -p "require('./clients/typescript/npm/server/package.json').version")"
+          echo "tag=$tag expected=$expected pkg=$actual"
+          [ "$expected" = "$actual" ] || { echo "::error::tag $tag != @zigbase/server version $actual"; exit 1; }
+      - name: Download platform binaries into package dirs
+        run: |
+          for k in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            mkdir -p "clients/typescript/npm/server-$k"
+          done
+          # download-artifact below places each into its package dir
+      - uses: actions/download-artifact@v4
+        with: { name: zigbase-linux-x64, path: clients/typescript/npm/server-linux-x64 }
+      - uses: actions/download-artifact@v4
+        with: { name: zigbase-linux-arm64, path: clients/typescript/npm/server-linux-arm64 }
+      - uses: actions/download-artifact@v4
+        with: { name: zigbase-darwin-x64, path: clients/typescript/npm/server-darwin-x64 }
+      - uses: actions/download-artifact@v4
+        with: { name: zigbase-darwin-arm64, path: clients/typescript/npm/server-darwin-arm64 }
+      - name: chmod binaries
+        run: chmod +x clients/typescript/npm/server-*/zigbase
+      - name: Publish server packages (platform → meta) with provenance
+        run: node clients/typescript/npm/publish.mjs --skip-build --provenance --what server
+
+  publish-typegen:
+    if: startsWith(github.ref_name, 'typegen-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+      - name: Assert @zigbase/typegen version matches the tag
+        run: |
+          tag="${GITHUB_REF_NAME}"; expected="${tag#typegen-v}"
+          actual="$(node -p "require('./clients/typescript/npm/typegen/package.json').version")"
+          echo "tag=$tag expected=$expected pkg=$actual"
+          [ "$expected" = "$actual" ] || { echo "::error::tag $tag != @zigbase/typegen version $actual"; exit 1; }
+      - name: Publish @zigbase/typegen with provenance
+        run: node clients/typescript/npm/publish.mjs --skip-build --provenance --what typegen
