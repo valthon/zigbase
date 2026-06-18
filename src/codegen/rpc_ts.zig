@@ -61,16 +61,27 @@ pub fn tsForType(comptime T: type) []const u8 {
     };
 }
 
+/// The seen-map type used to deduplicate named TS declarations across routes.
+/// Key = short TS name, value = full @typeName of the first type that claimed it.
+pub const SeenMap = std.StringHashMap([]const u8);
+
 /// Append `export interface`/`export type` declarations for every named struct/enum
 /// reachable from T, dependencies first, deduplicated by tsName.
 ///
 /// Returns `error.RpcTypeNameCollision` if two DISTINCT Zig types share the same
 /// short TS name (tsName), which would produce an ambiguous generated client.
+///
+/// Uses a fresh per-call SeenMap — single-type callers and tests are unaffected.
 pub fn renderNamedDecls(comptime T: type, w: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
-    // Key = short TS name, value = full @typeName of the first type that claimed it.
-    var seen = std.StringHashMap([]const u8).init(alloc);
+    var seen = SeenMap.init(alloc);
     defer seen.deinit();
     try renderNamedDeclsInner(T, w, alloc, &seen);
+}
+
+/// Like `renderNamedDecls` but shares an externally-owned SeenMap across multiple
+/// calls so that a type referenced by several routes is emitted only ONCE.
+pub fn renderNamedDeclsShared(comptime T: type, w: *std.ArrayList(u8), alloc: std.mem.Allocator, seen: *SeenMap) !void {
+    return renderNamedDeclsInner(T, w, alloc, seen);
 }
 
 fn renderNamedDeclsInner(comptime T: type, w: *std.ArrayList(u8), alloc: std.mem.Allocator, seen: *std.StringHashMap([]const u8)) !void {

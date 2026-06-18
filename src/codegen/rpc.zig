@@ -89,14 +89,18 @@ pub fn render(comptime routes: []const RouteMeta, alloc: std.mem.Allocator) !Sec
         factory.deinit(alloc);
     }
 
+    // One shared seen-map so a type used by multiple routes is declared only once.
+    var seen = rpc_ts.SeenMap.init(alloc);
+    defer seen.deinit();
+
     inline for (routes) |r| {
         const has_params = comptime pathParams(r.path).len > 0;
         const has_input = r.Input != void;
         const out_ts = comptime rpc_ts.tsForType(r.Output);
 
         // 1) named decls for Input (if struct/enum) and Output (if struct/enum)
-        try rpc_ts.renderNamedDecls(r.Input, &decls, alloc);
-        try rpc_ts.renderNamedDecls(r.Output, &decls, alloc);
+        try rpc_ts.renderNamedDeclsShared(r.Input, &decls, alloc, &seen);
+        try rpc_ts.renderNamedDeclsShared(r.Output, &decls, alloc, &seen);
 
         // 2) interface member: name(<params,><input,> opts?): Promise<Out>;
         try iface.appendSlice(alloc, "    ");
@@ -149,11 +153,12 @@ pub fn render(comptime routes: []const RouteMeta, alloc: std.mem.Allocator) !Sec
         try factory.appendSlice(alloc, "      },\n");
     }
 
-    return .{
-        .decls = try decls.toOwnedSlice(alloc),
-        .iface_member = try iface.toOwnedSlice(alloc),
-        .factory_member = try factory.toOwnedSlice(alloc),
-    };
+    const decls_s = try decls.toOwnedSlice(alloc);
+    errdefer alloc.free(decls_s);
+    const iface_s = try iface.toOwnedSlice(alloc);
+    errdefer alloc.free(iface_s);
+    const factory_s = try factory.toOwnedSlice(alloc);
+    return .{ .decls = decls_s, .iface_member = iface_s, .factory_member = factory_s };
 }
 
 // ---------------------------------------------------------------------------
@@ -197,4 +202,59 @@ test "render emits interface member, factory method, and named decls" {
     try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "`/api/bookings/${encodeURIComponent(String(params.id))}/confirm`") != null);
     try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "return base.send(\"POST\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "query: input as Record<string, string | number | boolean | undefined>") != null);
+}
+
+// Struct shared by two routes to verify cross-route dedup.
+const SharedOut = struct { ok: bool };
+// Struct for the params+input coverage route.
+const UpdateIn = struct { value: []const u8 };
+
+test "render deduplicates named decls across routes sharing the same type" {
+    const cross_routes = [_]events.RouteMeta{
+        .{ .method = .POST, .path = "/api/a/confirm", .name = "aConfirm", .auth = .public, .Input = void, .Output = SharedOut },
+        .{ .method = .POST, .path = "/api/b/confirm", .name = "bConfirm", .auth = .public, .Input = void, .Output = SharedOut },
+    };
+    const a = std.testing.allocator;
+    const sec = try render(&cross_routes, a);
+    defer a.free(sec.decls);
+    defer a.free(sec.iface_member);
+    defer a.free(sec.factory_member);
+
+    // SharedOut must appear exactly once — not duplicated.
+    const needle = "export interface SharedOut {";
+    const first = std.mem.indexOf(u8, sec.decls, needle);
+    try std.testing.expect(first != null);
+    const last = std.mem.lastIndexOf(u8, sec.decls, needle);
+    try std.testing.expectEqual(first, last);
+}
+
+test "render handles params+non-void input and no-params+void input call shapes" {
+    const SomeStruct = struct { label: []const u8 };
+    const mixed_routes = [_]events.RouteMeta{
+        // params + non-void input (most complex case)
+        .{ .method = .POST, .path = "/api/a/:x/b/:y", .name = "abUpdate", .auth = .public, .Input = UpdateIn, .Output = SomeStruct },
+        // no params + void input
+        .{ .method = .GET, .path = "/api/ping", .name = "ping", .auth = .public, .Input = void, .Output = void },
+    };
+    const a = std.testing.allocator;
+    const sec = try render(&mixed_routes, a);
+    defer a.free(sec.decls);
+    defer a.free(sec.iface_member);
+    defer a.free(sec.factory_member);
+
+    // params + input: both appear in the signature
+    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member,
+        "abUpdate(params: { x: string; y: string }, input: UpdateIn, opts?: SendOptions): Promise<SomeStruct>;") != null);
+    // factory interpolates both params
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member,
+        "${encodeURIComponent(String(params.x))}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member,
+        "${encodeURIComponent(String(params.y))}") != null);
+
+    // no-params + void input: bare opts only
+    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member,
+        "ping(opts?: SendOptions): Promise<void>;") != null);
+    // factory calls send with bare opts (no body/query object)
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member,
+        "return base.send(\"GET\", `/api/ping`, opts);") != null);
 }
