@@ -61,6 +61,32 @@ pub fn sortByName(cols: []schema.Collection) void {
     std.mem.sort(schema.Collection, cols, {}, lessByName);
 }
 
+/// Replace each relation field's UUID targetCollectionId with the collection
+/// name, so the emitter's name-based collectionExists() logic works identically
+/// across the data-dir and HTTP acquisition paths. Operates source-agnostically
+/// on `[]schema.Collection` + a caller-supplied id→name map.
+pub fn resolveRelationTargets(alloc: std.mem.Allocator, cols: []schema.Collection, id_to_name: *const std.StringHashMap([]const u8)) !void {
+    for (cols) |*c| {
+        const fields = try alloc.alloc(schema.Field, c.fields.len);
+        for (c.fields, 0..) |f, i| {
+            fields[i] = f;
+            switch (f.options) {
+                .relation => |r| {
+                    if (id_to_name.get(r.targetCollectionId)) |name| {
+                        var nr = r;
+                        nr.targetCollectionId = name;
+                        fields[i].options = .{ .relation = nr };
+                    }
+                    // If not found in the map, the id is already a name (e.g. in
+                    // comptime-only tests that call buildCollection directly).
+                },
+                else => {},
+            }
+        }
+        c.fields = fields;
+    }
+}
+
 test "buildCollection: base collection keeps user fields and parses types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

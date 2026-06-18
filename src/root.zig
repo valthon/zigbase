@@ -65,6 +65,8 @@ pub const codegen = struct {
     pub const acquire = @import("codegen/acquire.zig");
     /// Data-dir acquisition adapter: reads _collections from an open db handle or a data dir path.
     pub const acquire_datadir = @import("codegen/acquire_datadir.zig");
+    /// HTTP acquisition adapter: superuser auth → GET /api/collections → parse.
+    pub const acquire_http = @import("codegen/acquire_http.zig");
     /// CLI orchestrator: acquire → generate → write/check (data-dir + runtime equivalence).
     pub const typegen_cli = @import("codegen/typegen_cli.zig");
 };
@@ -144,6 +146,7 @@ test {
     _ = @import("codegen/rpc.zig");
     _ = @import("codegen/acquire.zig");
     _ = @import("codegen/acquire_datadir.zig");
+    _ = @import("codegen/acquire_http.zig");
     _ = @import("codegen/typegen_cli.zig");
     _ = @import("route_types.zig");
 }

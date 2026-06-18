@@ -7,6 +7,7 @@ const events = @import("../events.zig");
 const gen_client = @import("gen_client.zig");
 const acquire = @import("acquire.zig");
 const acquire_datadir = @import("acquire_datadir.zig");
+const acquire_http = @import("acquire_http.zig");
 
 pub const Options = struct {
     data_dir: ?[]const u8 = null,
@@ -74,10 +75,15 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, opts: Options) !void {
 }
 
 fn acquireHttp(alloc: std.mem.Allocator, io: std.Io, opts: Options) ![]schema.Collection {
-    _ = alloc;
-    _ = io;
-    _ = opts;
-    return error.UrlSourceNotYetImplemented; // replaced in Task 4
+    const email = opts.admin_email orelse {
+        std.log.err("typegen: --url requires --admin-email", .{});
+        return error.MissingAdminEmail;
+    };
+    const password = opts.admin_password orelse {
+        std.log.err("typegen: --url requires --admin-password", .{});
+        return error.MissingAdminPassword;
+    };
+    return acquire_http.acquire(alloc, io, opts.url.?, email, password);
 }
 
 test "equivalence: data-dir runtime path reproduces the comptime collection surface" {

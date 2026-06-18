@@ -21,31 +21,6 @@ fn buildIdNameMap(alloc: std.mem.Allocator, w: *db.Db) !std.StringHashMap([]cons
     return map;
 }
 
-/// Replace each relation field's UUID targetCollectionId with the collection
-/// name, so the emitter's name-based collectionExists() logic matches the
-/// comptime path (which stores names, not ids, in targetCollectionId).
-fn resolveRelationIds(alloc: std.mem.Allocator, cols: []schema.Collection, id_to_name: *const std.StringHashMap([]const u8)) !void {
-    for (cols) |*c| {
-        const fields = try alloc.alloc(schema.Field, c.fields.len);
-        for (c.fields, 0..) |f, i| {
-            fields[i] = f;
-            switch (f.options) {
-                .relation => |r| {
-                    if (id_to_name.get(r.targetCollectionId)) |name| {
-                        var nr = r;
-                        nr.targetCollectionId = name;
-                        fields[i].options = .{ .relation = nr };
-                    }
-                    // If not found in the map, the id is already a name (e.g. in
-                    // comptime-only tests that call buildCollection directly).
-                },
-                else => {},
-            }
-        }
-        c.fields = fields;
-    }
-}
-
 /// Read all user (non-system) collections from an open db handle's
 /// `_collections` table, name-sorted. The schema/indexes/options columns are
 /// JSON text the engine wrote via fieldsToJson/indexesToJson/optionsToJson, so
@@ -76,7 +51,7 @@ pub fn acquireFromDb(alloc: std.mem.Allocator, w: *db.Db) ![]schema.Collection {
     const cols = try list.toOwnedSlice(alloc);
     // Resolve UUID targetCollectionIds → names so the emitter's collectionExists()
     // (which checks by name) works identically to the comptime path.
-    try resolveRelationIds(alloc, cols, &id_to_name);
+    try acquire_core.resolveRelationTargets(alloc, cols, &id_to_name);
     acquire_core.sortByName(cols); // ORDER BY name already sorts, but keep adapters symmetric.
     return cols;
 }
