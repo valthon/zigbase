@@ -99,6 +99,9 @@ export function makeRecordService(
   // `number` for ergonomics, so coerce here on write. Only touches keys present
   // in `data` whose value is a JS number and whose field meta carries a mode.
   function coerceWrite(data: Record<string, unknown>): Record<string, unknown> {
+    // Defensive: a non-object payload (null/undefined) has no fields to coerce —
+    // pass it through untouched and let the underlying client handle/reject it.
+    if (data == null || typeof data !== "object") return data;
     let out: Record<string, unknown> | undefined;
     for (const [k, fm] of Object.entries(meta.fields)) {
       if (!fm.mode) continue;
