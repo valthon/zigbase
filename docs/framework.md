@@ -285,8 +285,11 @@ hold it no longer than necessary.
 For routes that carry a structured input or output, ZigBase supports **typed routes** declared with a `Req(Input)` / `Output` handler signature instead of the raw `RouteEvent` form. A typed route handler looks like:
 
 ```zig
-// Input and Output are Zig types in the bounded Zig→TS subset
-// (bool, int/float, []const u8, and structs thereof — no slices of non-scalar, no optionals of structs).
+// Input and Output are Zig types in the bounded Zig→TS subset: bool, int/float,
+// []const u8 (string), enums (→ string-literal union), std.json.Value (→ unknown),
+// optionals ?T, slices []T, and nested structs — applied recursively, so ?Struct
+// and []Struct are allowed. Anything else is a comptime error. (Caveat: a GET/DELETE
+// query Input must be a flat struct of scalars/enums/strings/optionals-of-those.)
 fn handler(req: *zigbase.Req(InputType)) zigbase.RouteError!OutputType {
     const id = req.param("id");   // ?[]const u8 — a :param from the path
     const input = req.input;      // InputType — parsed request body (POST/PUT/PATCH) or query (GET/DELETE)
