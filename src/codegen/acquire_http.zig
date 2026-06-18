@@ -32,8 +32,8 @@ pub fn parseCollections(alloc: std.mem.Allocator, json_bytes: []const u8) ![]sch
         if (obj.get("system")) |sv| {
             if (sv == .bool and sv.bool) continue;
         }
-        const name = (objStr(obj, "name")) orelse return error.InvalidSchema;
-        const type_str = objStr(obj, "type") orelse "base";
+        const name = try alloc.dupe(u8, (objStr(obj, "name")) orelse return error.InvalidSchema);
+        const type_str = try alloc.dupe(u8, objStr(obj, "type") orelse "base");
         const schema_json = try valueToJson(alloc, obj.get("schema"));
         const indexes_json = try valueToJson(alloc, obj.get("indexes"));
         const options_json = try valueToJson(alloc, obj.get("options"));
@@ -73,7 +73,12 @@ pub fn acquire(alloc: std.mem.Allocator, io: std.Io, origin: []const u8, email: 
 
     // 1) superuser auth-with-password -> token
     const auth_url = try std.fmt.allocPrint(alloc, "{s}/api/collections/_superusers/auth-with-password", .{origin});
-    const auth_body = try std.fmt.allocPrint(alloc, "{{\"identity\":\"{s}\",\"password\":\"{s}\"}}", .{ email, password });
+    const auth_body = blk: {
+        var obj = std.json.ObjectMap.init(alloc);
+        try obj.put("identity", std.json.Value{ .string = email });
+        try obj.put("password", std.json.Value{ .string = password });
+        break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
+    };
     const auth_resp = try doFetch(alloc, &client, .POST, auth_url, &.{.{ .name = "content-type", .value = "application/json" }}, auth_body);
     if (auth_resp.status != 200) {
         std.log.err("typegen: superuser auth failed (HTTP {d})", .{auth_resp.status});
@@ -97,13 +102,16 @@ const Resp = struct { status: u16, body: []const u8 };
 fn doFetch(alloc: std.mem.Allocator, client: *std.http.Client, method: std.http.Method, url: []const u8, headers: []const std.http.Header, body: ?[]const u8) !Resp {
     const buf = try alloc.alloc(u8, 8 << 20); // 8 MiB cap for a schema dump
     var fw = std.Io.Writer.fixed(buf);
-    const res = try client.fetch(.{
+    const res = client.fetch(.{
         .location = .{ .url = url },
         .method = method,
         .payload = body,
         .extra_headers = headers,
         .response_writer = &fw,
-    });
+    }) catch |e| switch (e) {
+        error.WriteFailed => return error.ResponseTooLarge,
+        else => return e,
+    };
     return .{ .status = @intFromEnum(res.status), .body = fw.buffered() };
 }
 
