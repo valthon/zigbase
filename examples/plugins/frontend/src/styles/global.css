@@ -48,7 +48,6 @@ body::after {
     transparent 2px,
     transparent 4px
   );
-  mix-blend-mode: screen;
 }
 
 main {

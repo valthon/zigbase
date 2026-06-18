@@ -69,7 +69,7 @@ function BookingCard({ booking, onReload }: { booking: Booking; onReload: () => 
       <p className="muted">
         <span className="num">{new Date(booking.starts_at).toLocaleString()}</span> →{' '}
         <span className="num">{new Date(booking.ends_at).toLocaleString()}</span>
-        {' '}· <span className="price">${booking.price_total.toFixed(2)}</span> · <strong>{booking.status}</strong>
+        {' '}· <span className="price">${booking.price_total?.toFixed(2) ?? '0.00'}</span> · <strong>{booking.status}</strong>
       </p>
       <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
         {/* Cancel: available for pending or confirmed bookings */}
