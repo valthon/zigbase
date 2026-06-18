@@ -41,12 +41,14 @@ function rpcMessagesSearch() {
 function rpcWinksStatus() {
   const p4: Promise<void> = zb.rpc.winksStatus();
   void p4;
+  expectTypeOf(p4).toEqualTypeOf<Promise<void>>();
 }
 
 // winksRaw: no input arg, unknown output
 function rpcWinksRaw() {
   const p5: Promise<unknown> = zb.rpc.winksRaw();
   void p5;
+  expectTypeOf(p5).toEqualTypeOf<Promise<unknown>>();
 }
 
 // --- negatives ---
