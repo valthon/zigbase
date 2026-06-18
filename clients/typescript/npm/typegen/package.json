@@ -1,0 +1,12 @@
+{
+  "name": "@zigbase/typegen",
+  "version": "0.1.0",
+  "description": "Generate a typed TypeScript client from a running ZigBase instance's schema — no Zig toolchain required.",
+  "bin": { "zigbase-typegen": "bin/typegen.js" },
+  "files": ["bin", "README.md"],
+  "engines": { "node": ">=18" },
+  "publishConfig": { "access": "public" },
+  "dependencies": { "@zigbase/server": "^0.4.0" },
+  "repository": { "type": "git", "url": "https://github.com/valthon/zigbase" },
+  "license": "MIT"
+}

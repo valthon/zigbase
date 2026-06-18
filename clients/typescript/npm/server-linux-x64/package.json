@@ -1,0 +1,11 @@
+{
+  "name": "@zigbase/server-linux-x64",
+  "version": "0.4.0",
+  "description": "ZigBase server prebuilt binary for linux-x64.",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["zigbase", "README.md"],
+  "publishConfig": { "access": "public" },
+  "repository": { "type": "git", "url": "https://github.com/valthon/zigbase" },
+  "license": "MIT"
+}
