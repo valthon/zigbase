@@ -5,6 +5,7 @@
 //! main() is the only function that touches @import("zigbase")/@import("app") and IO.
 const std = @import("std");
 const schema = @import("../schema.zig");
+const events = @import("../events.zig");
 const emit = @import("emit.zig");
 const guards = @import("guards.zig");
 const ident = @import("identifiers.zig");
@@ -50,10 +51,21 @@ fn section(alloc: std.mem.Allocator, w: *W, title: []const u8) !void {
 pub fn generate(
     alloc: std.mem.Allocator,
     cols: []const schema.Collection,
+    comptime routes: []const events.RouteMeta,
     in_repo: bool,
     auth_collection: []const u8,
     client_name: []const u8,
+    api_prefix: []const u8,
 ) ![]const u8 {
+    // Validate that every route path starts with the given api_prefix.
+    // Must use `inline for` because RouteMeta contains `Input: type` (comptime-only field).
+    inline for (routes) |r| {
+        if (!std.mem.startsWith(u8, r.path, api_prefix)) {
+            std.log.err("gen_client: route '{s}' does not start with --api-prefix '{s}'; the framework route prefix and the generator prefix disagree.", .{ r.path, api_prefix });
+            return error.RoutePrefixMismatch;
+        }
+    }
+
     var report = guards.GuardReport{ .message = "" };
     try guards.checkOperatorNames(alloc, cols, &report);
     try guards.checkIdentifiers(alloc, cols, &report);
@@ -108,27 +120,58 @@ pub fn generate(
     try section(alloc, &w, "Typed realtime surface");
     for (cols) |c| try emit.emitRealtimeAlias(alloc, &w, c);
     try section(alloc, &w, "createClient");
-    try emitClientFactory(alloc, &w, cols, client_name, auth_collection);
+    const rpc_section = try @import("rpc.zig").render(routes, alloc);
+    // rpc_section slices are owned by the arena (alloc), freed on arena deinit.
+    try emitClientFactory(alloc, &w, cols, client_name, auth_collection, rpc_section, routes.len);
 
     return w.toOwnedSlice(alloc);
 }
 
 /// The createClient + client-interface block (mirrors blog.gen.ts createClient).
-fn emitClientFactory(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, client_name: []const u8, auth_collection: []const u8) !void {
+fn emitClientFactory(
+    alloc: std.mem.Allocator,
+    w: *W,
+    cols: []const schema.Collection,
+    client_name: []const u8,
+    auth_collection: []const u8,
+    rpc_section: @import("rpc.zig").Section,
+    routes_len: usize,
+) !void {
+    // Emit named RPC Input/Output decls before the client interface (only when routes exist).
+    if (routes_len > 0) {
+        try w.appendSlice(alloc, rpc_section.decls);
+    }
     // BlogClient-style interface
     try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "export interface {s} {{\n  db: {{\n", .{client_name}));
     for (cols) |c| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: {s};\n", .{ c.name, try ident.serviceName(alloc, c.name) }));
     try w.appendSlice(alloc, "  };\n  realtime: {\n");
     for (cols) |c| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: {s};\n", .{ c.name, try ident.realtimeAliasName(alloc, c.name) }));
-    try w.appendSlice(alloc,
-        \\  };
-        \\  files: FilesService;
-        \\  authStore: Client["authStore"];
-        \\  send: Client["send"];
-        \\  fetch: Client["fetch"];
-        \\}
-        \\
-    );
+    if (routes_len > 0) {
+        try w.appendSlice(alloc,
+            \\  };
+            \\  files: FilesService;
+        );
+        try w.appendSlice(alloc, "\n  rpc: {\n");
+        try w.appendSlice(alloc, rpc_section.iface_member);
+        try w.appendSlice(alloc,
+            \\  };
+            \\  authStore: Client["authStore"];
+            \\  send: Client["send"];
+            \\  fetch: Client["fetch"];
+            \\}
+            \\
+        );
+    } else {
+        try w.appendSlice(alloc,
+            \\  };
+            \\  files: FilesService;
+            \\  authStore: Client["authStore"];
+            \\  send: Client["send"];
+            \\  fetch: Client["fetch"];
+            \\}
+            \\
+        );
+    }
     // options interface
     try w.appendSlice(alloc, try std.fmt.allocPrint(alloc,
         \\export interface {s}Options {{
@@ -211,7 +254,14 @@ fn emitClientFactory(alloc: std.mem.Allocator, w: *W, cols: []const schema.Colle
             "      {0s}: makeTypedRealtime<{1s}, {2s}>(base.realtime, {3s}{4s}),\n",
             .{ c.name, rec, wn, mc, resolver }));
     }
-    try w.appendSlice(alloc, "    },\n    files: base.files,\n");
+    if (routes_len > 0) {
+        try w.appendSlice(alloc, "    },\n    files: base.files,\n");
+        try w.appendSlice(alloc, "    rpc: {\n");
+        try w.appendSlice(alloc, rpc_section.factory_member);
+        try w.appendSlice(alloc, "    },\n");
+    } else {
+        try w.appendSlice(alloc, "    },\n    files: base.files,\n");
+    }
     try w.appendSlice(alloc,
         \\    authStore: base.authStore,
         \\    send: base.send.bind(base),
@@ -287,7 +337,7 @@ fn authCollectionName(cols: []const schema.Collection) []const u8 {
 /// as named modules) and call mainWithCollections() here. This keeps gen_client.zig
 /// as a self-contained library file usable by the zigbase test suite WITHOUT being
 /// a module root.
-pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collection) !void {
+pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collection, comptime routes: []const events.RouteMeta) !void {
     const io = init.io;
     // Use an arena for all temporary allocations during the generator run.
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
@@ -307,7 +357,7 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
     const in_repo = init.environ_map.contains("ZBASE_INREPO");
     const client_name = "ZbClient";
 
-    const text = generate(a, cols, in_repo, authCollectionName(cols), client_name) catch |e| {
+    const text = generate(a, cols, routes, in_repo, authCollectionName(cols), client_name, args.api_prefix) catch |e| {
         // guard messages are printed via the report; re-run path for the message:
         var report = guards.GuardReport{ .message = "" };
         guards.checkOperatorNames(a, cols, &report) catch {};
@@ -344,7 +394,7 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
 /// the Zig 0.16 "file exists in multiple modules" error (see note above).
 pub fn main(init: std.process.Init) !void {
     const app = @import("app");
-    return mainWithCollections(init, app.App.collections);
+    return mainWithCollections(init, app.App.collections, app.App.routes);
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +423,7 @@ test "generate emits a parseable file with the expected top-level constructs" {
     defer arena.deinit();
     const a = arena.allocator();
     const cols = try miniBlog(a);
-    const out = try generate(a, cols, true, "users", "BlogClient");
+    const out = try generate(a, cols, &.{}, true, "users", "BlogClient", "/api");
     try std.testing.expect(std.mem.startsWith(u8, out, "// generated by zigbase — do not edit\n// schema-hash: "));
     inline for (.{
         "export interface Post {",        "export type PostStatus =",
@@ -406,7 +456,7 @@ test "--check diff: stale buffer differs from fresh output" {
     defer arena.deinit();
     const a = arena.allocator();
     const cols = try miniBlog(a);
-    const fresh = try generate(a, cols, true, "users", "BlogClient");
+    const fresh = try generate(a, cols, &.{}, true, "users", "BlogClient", "/api");
     const stale = try std.fmt.allocPrint(a, "{s}\n// drift\n", .{fresh});
     try std.testing.expect(!std.mem.eql(u8, fresh, stale)); // --check would exit non-zero
     try std.testing.expect(std.mem.eql(u8, fresh, fresh));   // --check would exit zero
@@ -422,5 +472,5 @@ test "guards run inside generate: operator-named relation target errors" {
         .{ .id = "", .name = "tags", .fields = tag_f },
         .{ .id = "", .name = "posts", .fields = post_f },
     });
-    try std.testing.expectError(guards.GuardError.OperatorNameClash, generate(a, cols, true, "", "ZbClient"));
+    try std.testing.expectError(guards.GuardError.OperatorNameClash, generate(a, cols, &.{}, true, "", "ZbClient", "/api"));
 }
