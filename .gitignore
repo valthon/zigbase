@@ -23,3 +23,4 @@ site/.astro
 
 clients/typescript/npm/server-*/zigbase
 clients/typescript/npm/*/node_modules
+clients/typescript/test/codegen/dating/zbase.runtime.live.gen.ts
