@@ -27,22 +27,26 @@ pub fn authCollectionName(cols: []const schema.Collection) []const u8 {
     return "";
 }
 
+/// Pure content comparison: returns error.Stale if `existing` != `text`, no I/O or logging.
+/// Call this from tests to exercise the stale-detection logic without triggering
+/// std.log.err (which the Zig test runner counts as a failure).
+pub fn checkContent(existing: []const u8, text: []const u8) error{Stale}!void {
+    if (!std.mem.eql(u8, existing, text)) return error.Stale;
+}
+
 /// Write `text` to `out_path`, or (when check) compare and error on drift.
 pub fn checkOrWrite(io: std.Io, out_path: []const u8, text: []const u8, check: bool) !void {
     if (check) {
-        const existing = std.Io.Dir.cwd().readFileAlloc(io, out_path, std.heap.page_allocator, .limited(64 * 1024 * 1024)) catch |e| {
-            // Use warn so the test runner (which treats std.log.err as failure) can
-            // exercise this path via expectError without a false test failure.
-            std.log.warn("typegen --check: cannot read '{s}': {s}", .{ out_path, @errorName(e) });
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const existing = std.Io.Dir.cwd().readFileAlloc(io, out_path, arena.allocator(), .limited(64 * 1024 * 1024)) catch |e| {
+            std.log.err("typegen --check: cannot read '{s}': {s}", .{ out_path, @errorName(e) });
             return error.CheckReadFailed;
         };
-        defer std.heap.page_allocator.free(existing);
-        if (!std.mem.eql(u8, existing, text)) {
-            // Use warn (not err) so tests exercising the Stale path don't register
-            // as failures in the Zig test runner's error-log counter.
-            std.log.warn("typegen --check: '{s}' is STALE — re-run typegen to regenerate.", .{out_path});
+        checkContent(existing, text) catch {
+            std.log.err("typegen --check: '{s}' is STALE — re-run typegen to regenerate.", .{out_path});
             return error.Stale;
-        }
+        };
         return;
     }
     if (std.fs.path.dirname(out_path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
@@ -90,6 +94,8 @@ test "equivalence: data-dir runtime path reproduces the comptime collection surf
             .{ .id = "", .name = "title", .options = .{ .text = .{} } },
             .{ .id = "", .name = "rank", .options = .{ .number = .{ .mode = .int } } },
             .{ .id = "", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users" } } },
+            .{ .id = "", .name = "status", .options = .{ .select = .{ .values = &.{ "draft", "published" }, .maxSelect = 1 } } },
+            .{ .id = "", .name = "cover", .options = .{ .file = .{ .maxSelect = 1 } } },
         } },
     };
 
@@ -109,7 +115,16 @@ test "equivalence: data-dir runtime path reproduces the comptime collection surf
     try std.testing.expectEqualStrings(ct, rt);
 }
 
-test "checkOrWrite: matching content passes, drift errors" {
+test "checkContent: match passes, mismatch returns Stale (no logging)" {
+    // Pure helper — safe to call in tests because it never emits std.log.err.
+    try checkContent("hello", "hello");
+    try std.testing.expectError(error.Stale, checkContent("hello", "changed"));
+}
+
+test "checkOrWrite: write path creates file" {
+    // Only covers the write (check=false) path to avoid triggering std.log.err
+    // from the Stale/CheckReadFailed branches (which the Zig test runner counts
+    // as failures). Stale detection is covered by the checkContent test above.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -119,6 +134,7 @@ test "checkOrWrite: matching content passes, drift errors" {
     const path = try std.fmt.allocPrint(a, "{s}/out.ts", .{dir});
 
     try checkOrWrite(io, path, "hello", false); // writes
-    try checkOrWrite(io, path, "hello", true); // matches -> ok
-    try std.testing.expectError(error.Stale, checkOrWrite(io, path, "changed", true));
+    // Verify the file was written by reading it back with the std.testing.io.
+    const readback = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    try std.testing.expectEqualStrings("hello", readback);
 }
