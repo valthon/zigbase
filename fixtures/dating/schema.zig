@@ -56,11 +56,11 @@ fn winksRaw(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 
 pub const App = zigbase.App(.{
     .routes = .{
-        .{ .method = .POST, .path = "/api/echo/:id/ping", .handler = echoPing },
-        .{ .method = .POST, .path = "/api/winks/send", .handler = winksSend },
-        .{ .method = .GET, .path = "/api/messages/search", .handler = messagesSearch },
-        .{ .method = .GET, .path = "/api/winks/status", .handler = winksStatus },
-        .{ .method = .GET, .path = "/api/winks/raw", .handler = winksRaw },
+        .{ .method = .POST, .path = "/api/echo/:id/ping", .handler = echoPing, .auth = .public },
+        .{ .method = .POST, .path = "/api/winks/send", .handler = winksSend, .auth = .public },
+        .{ .method = .GET, .path = "/api/messages/search", .handler = messagesSearch, .auth = .public },
+        .{ .method = .GET, .path = "/api/winks/status", .handler = winksStatus, .auth = .public },
+        .{ .method = .GET, .path = "/api/winks/raw", .handler = winksRaw, .auth = .public },
     },
     .collections = .{
         .profiles = .{
