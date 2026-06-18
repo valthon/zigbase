@@ -191,6 +191,19 @@ const token = await zb.files.getToken();
 const protectedUrl = zb.files.getUrl(rec, rec.cover, { token });
 ```
 
+## Runtime introspection — `typegen` for black-box backends
+
+If you consume a ZigBase backend as a **black box** — no Zig source, no `build.zig` — use the
+`typegen` subcommand built into the server binary to generate the same typed client. Run
+`myserver typegen --data-dir ./zb_data --out src/zbase.gen.ts` (offline, reads a provisioned
+data directory) or supply `--url` / `--admin-email` / `--admin-password` to introspect a live
+instance. The generated `db` / realtime / files surface is identical to the comptime generator's
+output, with one difference: `rpc.*` is not emitted (custom routes are not introspectable at
+runtime). If you need typed RPC, have the Zig source, and use the comptime generator instead.
+The subcommand requires the server binary to be built with `.enable_typegen = true`. See
+[Runtime introspection (`zigbase typegen`)](../../docs/typescript-sdk.md#runtime-introspection-zigbase-typegen)
+in the TypeScript SDK docs for the full flag reference and CI staleness-gate recipe.
+
 ## Typed client — `@zigbase/client/typed`
 
 `@zigbase/client/typed` is the **generic typed core** that a generated `zbase.gen.ts` file

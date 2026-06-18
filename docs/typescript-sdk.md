@@ -304,6 +304,60 @@ The `@zigbase/client/typed` subpath tree-shakes independently of `@zigbase/clien
 importing just the typed core adds only the where-compiler and factory code, not the
 realtime / live-store graph.
 
+## Runtime introspection (`zigbase typegen`)
+
+The `typegen` subcommand generates the same typed TypeScript client as the comptime generator,
+but from a **running instance's actual schema** rather than from the Zig source. It is aimed at
+teams that consume a ZigBase backend as a black box — no Zig source, no `build.zig` wiring, and
+no custom routes. If you **have** the Zig source, prefer the comptime generator (`zig build
+gen-client`) because it also emits a typed `rpc.*` surface for custom routes; the runtime
+generator does **not** emit `rpc.*` (routes are not introspectable at runtime).
+
+The `typegen` subcommand exists **only** in binaries built with `.enable_typegen = true` in the
+`App(.{ … })` literal (default `false`, so production builds carry no codegen overhead). See the
+[framework docs](framework.md#the-apptypegen-gate-enable_typegen) for how to enable it.
+
+### Schema sources (exactly one required)
+
+| Flag | Behavior |
+| --- | --- |
+| `--data-dir <path>` | **Offline.** Reads the server's data directory directly — no auth, no running server required. The directory must already have been provisioned by a prior `serve` run; a freshly-created or empty data directory has no collections to read. |
+| `--url <origin> --admin-email <e> --admin-password <p>` | **Live.** Calls `GET /api/collections` on the running instance using superuser credentials. |
+
+### Additional flags
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--out <file>` | *(required)* | Path to write the generated TypeScript file. |
+| `--api-prefix <p>` | `/api` | API path prefix used in the generated client. |
+| `--client-name <name>` | `ZbClient` | Name of the generated client class/factory. |
+| `--check` | — | Staleness gate: exits non-zero if the out file is out of date without writing it. |
+
+### Output
+
+The generator emits the typed `db` / realtime / files surface — the same collection-level
+typed client as the comptime generator — but **without** `rpc.*`. Custom routes are not
+visible at runtime.
+
+### Examples
+
+```bash
+# Offline — reads an already-provisioned data directory (no server needed):
+myserver typegen --data-dir ./zb_data --out src/zbase.gen.ts
+
+# Live — against a running instance (superuser credentials required):
+myserver typegen --url https://api.example.com --admin-email admin@x.io --admin-password '…' --out src/zbase.gen.ts
+```
+
+### Staleness gate (CI)
+
+`--check` exits non-zero if `--out` does not match what `typegen` would generate. Use it in
+CI to enforce that the committed generated file stays in sync with the live schema:
+
+```bash
+myserver typegen --data-dir ./zb_data --out src/zbase.gen.ts --check
+```
+
 ## Typed RPC — `zb.rpc.*`
 
 When a generated `zbase.gen.ts` declares typed routes (registered via the Zig server's `.routes` config), the generated client exposes them under `zb.rpc.<name>(params?, input?, opts?)`:
