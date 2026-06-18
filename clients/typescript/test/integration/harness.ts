@@ -24,6 +24,7 @@ export const DATING_BIN =
 export interface TestServer {
   url: string;
   superuser: { email: string; password: string };
+  dataDir: string;
   stop(): void;
 }
 
@@ -106,6 +107,7 @@ export async function startAppServer(opts: {
   return {
     url,
     superuser: { email, password },
+    dataDir,
     stop() {
       proc.kill("SIGTERM");
       try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }

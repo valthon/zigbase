@@ -41,6 +41,8 @@ jobs:
         run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
       - name: Build dating-server (e2e fixture binary)
         run: mise exec zig@0.16.0 -- zig build dating-server -Dcpu=baseline
+      - name: Build dist-server (typegen-enabled distribution binary smoke build)
+        run: mise exec zig@0.16.0 -- zig build dist-server -Dcpu=baseline
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
