@@ -1,0 +1,124 @@
+const std = @import("std");
+const schema = @import("../schema.zig");
+const db = @import("../db.zig");
+const migrations = @import("../migrations.zig");
+const provision = @import("../provision.zig");
+const events = @import("../events.zig");
+const gen_client = @import("gen_client.zig");
+const acquire = @import("acquire.zig");
+const acquire_datadir = @import("acquire_datadir.zig");
+
+pub const Options = struct {
+    data_dir: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    out: []const u8,
+    api_prefix: []const u8 = "/api",
+    client_name: []const u8 = "ZbClient",
+    check: bool = false,
+    in_repo: bool = false,
+    admin_email: ?[]const u8 = null,
+    admin_password: ?[]const u8 = null,
+};
+
+/// First auth collection's name (mirrors gen_client's private helper; computed
+/// inline so gen_client stays untouched).
+pub fn authCollectionName(cols: []const schema.Collection) []const u8 {
+    for (cols) |c| if (c.type == .auth) return c.name;
+    return "";
+}
+
+/// Write `text` to `out_path`, or (when check) compare and error on drift.
+pub fn checkOrWrite(io: std.Io, out_path: []const u8, text: []const u8, check: bool) !void {
+    if (check) {
+        const existing = std.Io.Dir.cwd().readFileAlloc(io, out_path, std.heap.page_allocator, .limited(64 * 1024 * 1024)) catch |e| {
+            // Use warn so the test runner (which treats std.log.err as failure) can
+            // exercise this path via expectError without a false test failure.
+            std.log.warn("typegen --check: cannot read '{s}': {s}", .{ out_path, @errorName(e) });
+            return error.CheckReadFailed;
+        };
+        defer std.heap.page_allocator.free(existing);
+        if (!std.mem.eql(u8, existing, text)) {
+            // Use warn (not err) so tests exercising the Stale path don't register
+            // as failures in the Zig test runner's error-log counter.
+            std.log.warn("typegen --check: '{s}' is STALE — re-run typegen to regenerate.", .{out_path});
+            return error.Stale;
+        }
+        return;
+    }
+    if (std.fs.path.dirname(out_path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = text });
+    std.log.info("typegen: wrote {s} ({d} bytes)", .{ out_path, text.len });
+}
+
+/// Orchestrate: acquire collections from the selected source, generate the
+/// client, then write or check.
+pub fn run(alloc: std.mem.Allocator, io: std.Io, opts: Options) !void {
+    if ((opts.data_dir == null) == (opts.url == null)) {
+        std.log.err("typegen: pass exactly one of --data-dir or --url", .{});
+        return error.BadSource;
+    }
+    const cols = if (opts.data_dir) |dir|
+        try acquire_datadir.acquire(alloc, dir)
+    else
+        try acquireHttp(alloc, io, opts); // implemented in Task 4
+
+    const text = gen_client.generate(alloc, cols, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix) catch |e| {
+        std.log.err("typegen: code generation failed: {s}", .{@errorName(e)});
+        return e;
+    };
+    try checkOrWrite(io, opts.out, text, opts.check);
+}
+
+fn acquireHttp(alloc: std.mem.Allocator, io: std.Io, opts: Options) ![]schema.Collection {
+    _ = alloc;
+    _ = io;
+    _ = opts;
+    return error.UrlSourceNotYetImplemented; // replaced in Task 4
+}
+
+test "equivalence: data-dir runtime path reproduces the comptime collection surface" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A representative app: auth + base + relation + number-mode + select + file.
+    const specs = [_]schema.Collection{
+        .{ .id = "", .name = "users", .type = .auth, .fields = &.{
+            .{ .id = "", .name = "displayName", .options = .{ .text = .{} } },
+        } },
+        .{ .id = "", .name = "posts", .fields = &.{
+            .{ .id = "", .name = "title", .options = .{ .text = .{} } },
+            .{ .id = "", .name = "rank", .options = .{ .number = .{ .mode = .int } } },
+            .{ .id = "", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users" } } },
+        } },
+    };
+
+    // Runtime path: provision -> read back -> sort.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try provision.applySpecs(a, std.testing.io, &d, &specs);
+    const rt_cols = try acquire_datadir.acquireFromDb(a, &d);
+
+    // Comptime baseline: the same user-field specs, name-sorted.
+    const ct_cols = try a.dupe(schema.Collection, &specs);
+    acquire.sortByName(ct_cols);
+
+    const rt = try gen_client.generate(a, rt_cols, &.{}, true, authCollectionName(rt_cols), "ZbClient", "/api");
+    const ct = try gen_client.generate(a, ct_cols, &.{}, true, authCollectionName(ct_cols), "ZbClient", "/api");
+    try std.testing.expectEqualStrings(ct, rt);
+}
+
+test "checkOrWrite: matching content passes, drift errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const dir = try std.fmt.allocPrint(a, "zig-cache/typegen-test-{d}", .{std.testing.random_seed});
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    const path = try std.fmt.allocPrint(a, "{s}/out.ts", .{dir});
+
+    try checkOrWrite(io, path, "hello", false); // writes
+    try checkOrWrite(io, path, "hello", true); // matches -> ok
+    try std.testing.expectError(error.Stale, checkOrWrite(io, path, "changed", true));
+}

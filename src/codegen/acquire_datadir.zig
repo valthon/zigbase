@@ -5,11 +5,57 @@ const migrations = @import("../migrations.zig");
 const provision = @import("../provision.zig");
 const acquire_core = @import("acquire.zig");
 
+/// Build an id → name map for ALL collections (user + system) so that relation
+/// fields stored with UUID targetCollectionId can be resolved back to names.
+/// The emitter's collectionExists() checks by name, so without this resolve step
+/// the runtime path would differ from the comptime path (which stores names).
+fn buildIdNameMap(alloc: std.mem.Allocator, w: *db.Db) !std.StringHashMap([]const u8) {
+    var map = std.StringHashMap([]const u8).init(alloc);
+    var st = try w.prepare("SELECT id, name FROM \"_collections\";");
+    defer st.finalize();
+    while (try st.step()) {
+        const id = try alloc.dupe(u8, st.columnText(0));
+        const name = try alloc.dupe(u8, st.columnText(1));
+        try map.put(id, name);
+    }
+    return map;
+}
+
+/// Replace each relation field's UUID targetCollectionId with the collection
+/// name, so the emitter's name-based collectionExists() logic matches the
+/// comptime path (which stores names, not ids, in targetCollectionId).
+fn resolveRelationIds(alloc: std.mem.Allocator, cols: []schema.Collection, id_to_name: *const std.StringHashMap([]const u8)) !void {
+    for (cols) |*c| {
+        const fields = try alloc.alloc(schema.Field, c.fields.len);
+        for (c.fields, 0..) |f, i| {
+            fields[i] = f;
+            switch (f.options) {
+                .relation => |r| {
+                    if (id_to_name.get(r.targetCollectionId)) |name| {
+                        var nr = r;
+                        nr.targetCollectionId = name;
+                        fields[i].options = .{ .relation = nr };
+                    }
+                    // If not found in the map, the id is already a name (e.g. in
+                    // comptime-only tests that call buildCollection directly).
+                },
+                else => {},
+            }
+        }
+        c.fields = fields;
+    }
+}
+
 /// Read all user (non-system) collections from an open db handle's
 /// `_collections` table, name-sorted. The schema/indexes/options columns are
 /// JSON text the engine wrote via fieldsToJson/indexesToJson/optionsToJson, so
 /// they parse back through acquire_core.buildCollection.
 pub fn acquireFromDb(alloc: std.mem.Allocator, w: *db.Db) ![]schema.Collection {
+    // Build id→name map FIRST so we can resolve relation targetCollectionIds.
+    // Provisioning stores UUIDs; the emitter and comptime path use names.
+    var id_to_name = try buildIdNameMap(alloc, w);
+    defer id_to_name.deinit();
+
     var st = try w.prepare(
         \\SELECT name, type, schema, indexes, options
         \\ FROM "_collections" WHERE system = 0 ORDER BY name;
@@ -28,6 +74,9 @@ pub fn acquireFromDb(alloc: std.mem.Allocator, w: *db.Db) ![]schema.Collection {
         try list.append(alloc, try acquire_core.buildCollection(alloc, row));
     }
     const cols = try list.toOwnedSlice(alloc);
+    // Resolve UUID targetCollectionIds → names so the emitter's collectionExists()
+    // (which checks by name) works identically to the comptime path.
+    try resolveRelationIds(alloc, cols, &id_to_name);
     acquire_core.sortByName(cols); // ORDER BY name already sorts, but keep adapters symmetric.
     return cols;
 }
