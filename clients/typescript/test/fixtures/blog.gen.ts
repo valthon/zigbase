@@ -141,7 +141,7 @@ export interface TagFields {
 export interface PostsService {
   getOne<K extends PostExpand = never>(
     id: string,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
   ): Promise<WithExpand<Post, PostRelations, K>>;
   getList<K extends PostExpand = never>(opts?: {
     where?: PostWhere;
@@ -151,11 +151,15 @@ export interface PostsService {
     limit?: number;
     fields?: string;
     signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<ListResult<WithExpand<Post, PostRelations, K>>>;
   getFirstListItem<K extends PostExpand = never>(opts?: {
     where?: PostWhere;
     sort?: string;
     expand?: K[];
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<WithExpand<Post, PostRelations, K>>;
   getPage(opts?: {
     where?: PostWhere;
@@ -163,9 +167,23 @@ export interface PostsService {
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<CursorPage<Post>>;
-  iterate(opts?: { where?: PostWhere; sort?: string }): AsyncIterableIterator<Post>;
-  getFullList(opts?: { where?: PostWhere; sort?: string }): Promise<Post[]>;
+  iterate(opts?: {
+    where?: PostWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): AsyncIterableIterator<Post>;
+  getFullList(opts?: {
+    where?: PostWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<Post[]>;
   create<K extends PostExpand = never>(
     data: PostCreate,
     opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
@@ -180,7 +198,7 @@ export interface PostsService {
 }
 
 export interface UsersService {
-  getOne(id: string, opts?: { fields?: string; signal?: AbortSignal }): Promise<User>;
+  getOne(id: string, opts?: { fields?: string; signal?: AbortSignal; requestKey?: string }): Promise<User>;
   getList(opts?: {
     where?: UserWhere;
     sort?: string;
@@ -188,17 +206,38 @@ export interface UsersService {
     limit?: number;
     fields?: string;
     signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<ListResult<User>>;
-  getFirstListItem(opts?: { where?: UserWhere; sort?: string }): Promise<User>;
+  getFirstListItem(opts?: {
+    where?: UserWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<User>;
   getPage(opts?: {
     where?: UserWhere;
     sort?: string;
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<CursorPage<User>>;
-  iterate(opts?: { where?: UserWhere; sort?: string }): AsyncIterableIterator<User>;
-  getFullList(opts?: { where?: UserWhere; sort?: string }): Promise<User[]>;
+  iterate(opts?: {
+    where?: UserWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): AsyncIterableIterator<User>;
+  getFullList(opts?: {
+    where?: UserWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<User[]>;
   create(
     data: UserCreate,
     opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },

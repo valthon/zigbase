@@ -320,7 +320,7 @@ export interface SubscriptionFields {
 // ---- Concrete service interfaces ----
 
 export interface ProfilesService {
-  getOne(id: string, opts?: { fields?: string; signal?: AbortSignal }): Promise<Profile>;
+  getOne(id: string, opts?: { fields?: string; signal?: AbortSignal; requestKey?: string }): Promise<Profile>;
   getList(opts?: {
     where?: ProfileWhere;
     sort?: string;
@@ -328,17 +328,38 @@ export interface ProfilesService {
     limit?: number;
     fields?: string;
     signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<ListResult<Profile>>;
-  getFirstListItem(opts?: { where?: ProfileWhere; sort?: string }): Promise<Profile>;
+  getFirstListItem(opts?: {
+    where?: ProfileWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<Profile>;
   getPage(opts?: {
     where?: ProfileWhere;
     sort?: string;
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<CursorPage<Profile>>;
-  iterate(opts?: { where?: ProfileWhere; sort?: string }): AsyncIterableIterator<Profile>;
-  getFullList(opts?: { where?: ProfileWhere; sort?: string }): Promise<Profile[]>;
+  iterate(opts?: {
+    where?: ProfileWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): AsyncIterableIterator<Profile>;
+  getFullList(opts?: {
+    where?: ProfileWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<Profile[]>;
   create(
     data: ProfileCreate,
     opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
@@ -357,7 +378,7 @@ export interface ProfilesService {
   fileUrl(record: Profile, field: ProfileFileField, opts?: FileUrlOptions): string;
 }
 export interface TagsService {
-  getOne(id: string, opts?: { fields?: string; signal?: AbortSignal }): Promise<Tag>;
+  getOne(id: string, opts?: { fields?: string; signal?: AbortSignal; requestKey?: string }): Promise<Tag>;
   getList(opts?: {
     where?: TagWhere;
     sort?: string;
@@ -365,17 +386,38 @@ export interface TagsService {
     limit?: number;
     fields?: string;
     signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<ListResult<Tag>>;
-  getFirstListItem(opts?: { where?: TagWhere; sort?: string }): Promise<Tag>;
+  getFirstListItem(opts?: {
+    where?: TagWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<Tag>;
   getPage(opts?: {
     where?: TagWhere;
     sort?: string;
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<CursorPage<Tag>>;
-  iterate(opts?: { where?: TagWhere; sort?: string }): AsyncIterableIterator<Tag>;
-  getFullList(opts?: { where?: TagWhere; sort?: string }): Promise<Tag[]>;
+  iterate(opts?: {
+    where?: TagWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): AsyncIterableIterator<Tag>;
+  getFullList(opts?: {
+    where?: TagWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<Tag[]>;
   create(
     data: TagCreate,
     opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
@@ -391,7 +433,7 @@ export interface TagsService {
 export interface PhotosService {
   getOne<K extends PhotoExpand = never>(
     id: string,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
   ): Promise<WithExpand<Photo, PhotoRelations, K>>;
   getList<K extends PhotoExpand = never>(opts?: {
     where?: PhotoWhere;
@@ -401,11 +443,15 @@ export interface PhotosService {
     limit?: number;
     fields?: string;
     signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<ListResult<WithExpand<Photo, PhotoRelations, K>>>;
   getFirstListItem<K extends PhotoExpand = never>(opts?: {
     where?: PhotoWhere;
     sort?: string;
     expand?: K[];
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<WithExpand<Photo, PhotoRelations, K>>;
   getPage(opts?: {
     where?: PhotoWhere;
@@ -413,9 +459,23 @@ export interface PhotosService {
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<CursorPage<Photo>>;
-  iterate(opts?: { where?: PhotoWhere; sort?: string }): AsyncIterableIterator<Photo>;
-  getFullList(opts?: { where?: PhotoWhere; sort?: string }): Promise<Photo[]>;
+  iterate(opts?: {
+    where?: PhotoWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): AsyncIterableIterator<Photo>;
+  getFullList(opts?: {
+    where?: PhotoWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<Photo[]>;
   create<K extends PhotoExpand = never>(
     data: PhotoCreate,
     opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
@@ -432,7 +492,7 @@ export interface PhotosService {
 export interface PrivatePhotosService {
   getOne<K extends PrivatePhotoExpand = never>(
     id: string,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
   ): Promise<WithExpand<PrivatePhoto, PrivatePhotoRelations, K>>;
   getList<K extends PrivatePhotoExpand = never>(opts?: {
     where?: PrivatePhotoWhere;
@@ -442,11 +502,15 @@ export interface PrivatePhotosService {
     limit?: number;
     fields?: string;
     signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<ListResult<WithExpand<PrivatePhoto, PrivatePhotoRelations, K>>>;
   getFirstListItem<K extends PrivatePhotoExpand = never>(opts?: {
     where?: PrivatePhotoWhere;
     sort?: string;
     expand?: K[];
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<WithExpand<PrivatePhoto, PrivatePhotoRelations, K>>;
   getPage(opts?: {
     where?: PrivatePhotoWhere;
@@ -454,9 +518,23 @@ export interface PrivatePhotosService {
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<CursorPage<PrivatePhoto>>;
-  iterate(opts?: { where?: PrivatePhotoWhere; sort?: string }): AsyncIterableIterator<PrivatePhoto>;
-  getFullList(opts?: { where?: PrivatePhotoWhere; sort?: string }): Promise<PrivatePhoto[]>;
+  iterate(opts?: {
+    where?: PrivatePhotoWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): AsyncIterableIterator<PrivatePhoto>;
+  getFullList(opts?: {
+    where?: PrivatePhotoWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<PrivatePhoto[]>;
   create<K extends PrivatePhotoExpand = never>(
     data: PrivatePhotoCreate,
     opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
@@ -473,7 +551,7 @@ export interface PrivatePhotosService {
 export interface MessagesService {
   getOne<K extends MessageExpand = never>(
     id: string,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
   ): Promise<WithExpand<Message, MessageRelations, K>>;
   getList<K extends MessageExpand = never>(opts?: {
     where?: MessageWhere;
@@ -483,11 +561,15 @@ export interface MessagesService {
     limit?: number;
     fields?: string;
     signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<ListResult<WithExpand<Message, MessageRelations, K>>>;
   getFirstListItem<K extends MessageExpand = never>(opts?: {
     where?: MessageWhere;
     sort?: string;
     expand?: K[];
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<WithExpand<Message, MessageRelations, K>>;
   getPage(opts?: {
     where?: MessageWhere;
@@ -495,9 +577,23 @@ export interface MessagesService {
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<CursorPage<Message>>;
-  iterate(opts?: { where?: MessageWhere; sort?: string }): AsyncIterableIterator<Message>;
-  getFullList(opts?: { where?: MessageWhere; sort?: string }): Promise<Message[]>;
+  iterate(opts?: {
+    where?: MessageWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): AsyncIterableIterator<Message>;
+  getFullList(opts?: {
+    where?: MessageWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<Message[]>;
   create<K extends MessageExpand = never>(
     data: MessageCreate,
     opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
@@ -513,7 +609,7 @@ export interface MessagesService {
 export interface WinksService {
   getOne<K extends WinkExpand = never>(
     id: string,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
   ): Promise<WithExpand<Wink, WinkRelations, K>>;
   getList<K extends WinkExpand = never>(opts?: {
     where?: WinkWhere;
@@ -523,11 +619,15 @@ export interface WinksService {
     limit?: number;
     fields?: string;
     signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<ListResult<WithExpand<Wink, WinkRelations, K>>>;
   getFirstListItem<K extends WinkExpand = never>(opts?: {
     where?: WinkWhere;
     sort?: string;
     expand?: K[];
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<WithExpand<Wink, WinkRelations, K>>;
   getPage(opts?: {
     where?: WinkWhere;
@@ -535,9 +635,23 @@ export interface WinksService {
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<CursorPage<Wink>>;
-  iterate(opts?: { where?: WinkWhere; sort?: string }): AsyncIterableIterator<Wink>;
-  getFullList(opts?: { where?: WinkWhere; sort?: string }): Promise<Wink[]>;
+  iterate(opts?: {
+    where?: WinkWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): AsyncIterableIterator<Wink>;
+  getFullList(opts?: {
+    where?: WinkWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<Wink[]>;
   create<K extends WinkExpand = never>(
     data: WinkCreate,
     opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
@@ -553,7 +667,7 @@ export interface WinksService {
 export interface SubscriptionsService {
   getOne<K extends SubscriptionExpand = never>(
     id: string,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
   ): Promise<WithExpand<Subscription, SubscriptionRelations, K>>;
   getList<K extends SubscriptionExpand = never>(opts?: {
     where?: SubscriptionWhere;
@@ -563,11 +677,15 @@ export interface SubscriptionsService {
     limit?: number;
     fields?: string;
     signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<ListResult<WithExpand<Subscription, SubscriptionRelations, K>>>;
   getFirstListItem<K extends SubscriptionExpand = never>(opts?: {
     where?: SubscriptionWhere;
     sort?: string;
     expand?: K[];
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<WithExpand<Subscription, SubscriptionRelations, K>>;
   getPage(opts?: {
     where?: SubscriptionWhere;
@@ -575,9 +693,23 @@ export interface SubscriptionsService {
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
+    signal?: AbortSignal;
+    requestKey?: string;
   }): Promise<CursorPage<Subscription>>;
-  iterate(opts?: { where?: SubscriptionWhere; sort?: string }): AsyncIterableIterator<Subscription>;
-  getFullList(opts?: { where?: SubscriptionWhere; sort?: string }): Promise<Subscription[]>;
+  iterate(opts?: {
+    where?: SubscriptionWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): AsyncIterableIterator<Subscription>;
+  getFullList(opts?: {
+    where?: SubscriptionWhere;
+    sort?: string;
+    fields?: string;
+    signal?: AbortSignal;
+    requestKey?: string;
+  }): Promise<Subscription[]>;
   create<K extends SubscriptionExpand = never>(
     data: SubscriptionCreate,
     opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },

@@ -122,6 +122,35 @@ function relationLessReadMethods() {
   void zb.db.subscriptions.getFullList({ sort: "created" });
 }
 
+// --- read-method option surface (fields / signal / requestKey) --------------
+async function readOptionSurface() {
+  const ac = new AbortController();
+  // Rich (relation-bearing) service: Photos. requestKey + signal forwarded by
+  // every read method; fields forwarded by all EXCEPT getPage (the typed
+  // getPage wrapper drops `fields`).
+  await zb.db.photos.getOne("x", { fields: "id", signal: ac.signal, requestKey: "k" });
+  await zb.db.photos.getList({ fields: "id", signal: ac.signal, requestKey: "k" });
+  await zb.db.photos.getFirstListItem({ fields: "id", signal: ac.signal, requestKey: "k" });
+  await zb.db.photos.getPage({ signal: ac.signal, requestKey: "k" });
+  void zb.db.photos.iterate({ fields: "id", signal: ac.signal, requestKey: "k" });
+  await zb.db.photos.getFullList({ fields: "id", signal: ac.signal, requestKey: "k" });
+
+  // Relation-less service: Profiles. Same surface (minus expand).
+  await zb.db.profiles.getOne("x", { fields: "id", signal: ac.signal, requestKey: "k" });
+  await zb.db.profiles.getList({ fields: "id", signal: ac.signal, requestKey: "k" });
+  await zb.db.profiles.getFirstListItem({ fields: "id", signal: ac.signal, requestKey: "k" });
+  await zb.db.profiles.getPage({ signal: ac.signal, requestKey: "k" });
+  void zb.db.profiles.iterate({ fields: "id", signal: ac.signal, requestKey: "k" });
+  await zb.db.profiles.getFullList({ fields: "id", signal: ac.signal, requestKey: "k" });
+
+  // getPage drops `fields` — the typed wrapper never forwards it, so the
+  // generated surface must NOT type it (rich + relation-less branches).
+  // @ts-expect-error getPage does not accept `fields`
+  await zb.db.photos.getPage({ fields: "id" });
+  // @ts-expect-error getPage does not accept `fields`
+  await zb.db.profiles.getPage({ fields: "id" });
+}
+
 // --- per-collection fileUrl typing (single-value only) ----------------------
 function fileUrlTyping() {
   const profile = {} as Profile;
@@ -139,5 +168,5 @@ export const _typeTests = [
   whereOk, whereBadOperand, whereBadEnum, whereUnknownField,
   createOk, fileTyping, createMissingRequired, createRejectsUnknown, updateOmitsPassword,
   fluentOk, fluentBadEnum, fluentUnknownField,
-  serviceShapes, relationLessReadMethods, fileUrlTyping,
+  serviceShapes, relationLessReadMethods, readOptionSurface, fileUrlTyping,
 ];

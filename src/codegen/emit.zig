@@ -337,7 +337,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
         try putf(alloc, w,
             \\  getOne<K extends {0s} = never>(
             \\    id: string,
-            \\    opts?: {{ expand?: K[]; fields?: string; signal?: AbortSignal }},
+            \\    opts?: {{ expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string }},
             \\  ): Promise<WithExpand<{1s}, {2s}, K>>;
             \\  getList<K extends {0s} = never>(opts?: {{
             \\    where?: {3s};
@@ -347,11 +347,15 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\    limit?: number;
             \\    fields?: string;
             \\    signal?: AbortSignal;
+            \\    requestKey?: string;
             \\  }}): Promise<ListResult<WithExpand<{1s}, {2s}, K>>>;
             \\  getFirstListItem<K extends {0s} = never>(opts?: {{
             \\    where?: {3s};
             \\    sort?: string;
             \\    expand?: K[];
+            \\    fields?: string;
+            \\    signal?: AbortSignal;
+            \\    requestKey?: string;
             \\  }}): Promise<WithExpand<{1s}, {2s}, K>>;
             \\  getPage(opts?: {{
             \\    where?: {3s};
@@ -359,9 +363,23 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\    limit?: number;
             \\    cursor?: string;
             \\    withTotal?: boolean;
+            \\    signal?: AbortSignal;
+            \\    requestKey?: string;
             \\  }}): Promise<CursorPage<{1s}>>;
-            \\  iterate(opts?: {{ where?: {3s}; sort?: string }}): AsyncIterableIterator<{1s}>;
-            \\  getFullList(opts?: {{ where?: {3s}; sort?: string }}): Promise<{1s}[]>;
+            \\  iterate(opts?: {{
+            \\    where?: {3s};
+            \\    sort?: string;
+            \\    fields?: string;
+            \\    signal?: AbortSignal;
+            \\    requestKey?: string;
+            \\  }}): AsyncIterableIterator<{1s}>;
+            \\  getFullList(opts?: {{
+            \\    where?: {3s};
+            \\    sort?: string;
+            \\    fields?: string;
+            \\    signal?: AbortSignal;
+            \\    requestKey?: string;
+            \\  }}): Promise<{1s}[]>;
             \\  create<K extends {0s} = never>(
             \\    data: {4s},
             \\    opts?: {{ expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string }},
@@ -377,7 +395,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
         , .{ exp, rec, rel, wn, try ident.createName(alloc, c.name), try ident.updateName(alloc, c.name), fld });
     } else {
         try putf(alloc, w,
-            \\  getOne(id: string, opts?: {{ fields?: string; signal?: AbortSignal }}): Promise<{0s}>;
+            \\  getOne(id: string, opts?: {{ fields?: string; signal?: AbortSignal; requestKey?: string }}): Promise<{0s}>;
             \\  getList(opts?: {{
             \\    where?: {1s};
             \\    sort?: string;
@@ -385,17 +403,38 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\    limit?: number;
             \\    fields?: string;
             \\    signal?: AbortSignal;
+            \\    requestKey?: string;
             \\  }}): Promise<ListResult<{0s}>>;
-            \\  getFirstListItem(opts?: {{ where?: {1s}; sort?: string }}): Promise<{0s}>;
+            \\  getFirstListItem(opts?: {{
+            \\    where?: {1s};
+            \\    sort?: string;
+            \\    fields?: string;
+            \\    signal?: AbortSignal;
+            \\    requestKey?: string;
+            \\  }}): Promise<{0s}>;
             \\  getPage(opts?: {{
             \\    where?: {1s};
             \\    sort?: string;
             \\    limit?: number;
             \\    cursor?: string;
             \\    withTotal?: boolean;
+            \\    signal?: AbortSignal;
+            \\    requestKey?: string;
             \\  }}): Promise<CursorPage<{0s}>>;
-            \\  iterate(opts?: {{ where?: {1s}; sort?: string }}): AsyncIterableIterator<{0s}>;
-            \\  getFullList(opts?: {{ where?: {1s}; sort?: string }}): Promise<{0s}[]>;
+            \\  iterate(opts?: {{
+            \\    where?: {1s};
+            \\    sort?: string;
+            \\    fields?: string;
+            \\    signal?: AbortSignal;
+            \\    requestKey?: string;
+            \\  }}): AsyncIterableIterator<{0s}>;
+            \\  getFullList(opts?: {{
+            \\    where?: {1s};
+            \\    sort?: string;
+            \\    fields?: string;
+            \\    signal?: AbortSignal;
+            \\    requestKey?: string;
+            \\  }}): Promise<{0s}[]>;
             \\  create(
             \\    data: {2s},
             \\    opts?: {{ fields?: string; signal?: AbortSignal; requestKey?: string }},
