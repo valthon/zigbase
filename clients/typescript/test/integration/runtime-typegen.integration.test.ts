@@ -58,8 +58,12 @@ describe("runtime typegen — live round-trip (dating-server)", () => {
 
   it("the runtime-generated client works live: auth, CRUD, expand, realtime, int-coercion", async () => {
     runTypegen(["--data-dir", server.dataDir]);
-    // NOTE: this relative path must match LIVE_OUT; keep them in sync if LIVE_OUT changes.
-    const mod = await import("../codegen/dating/zbase.runtime.live.gen.ts");
+    // The client is generated at runtime (gitignored, absent at typecheck time).
+    // Import via a `string`-typed specifier so tsc does NOT try to resolve the
+    // not-yet-existent module; vitest resolves it relative to this file at runtime.
+    // Must match LIVE_OUT.
+    const liveSpec: string = "../codegen/dating/zbase.runtime.live.gen.ts";
+    const mod = await import(liveSpec);
     const zb = mod.createClient(server.url, { WebSocket: globalThis.WebSocket });
 
     // Auth as superuser by obtaining a token via direct fetch, then storing on the client.
@@ -96,7 +100,7 @@ describe("runtime typegen — live round-trip (dating-server)", () => {
 
     // realtime round-trip
     const events: string[] = [];
-    const off = await zb.realtime.photos.subscribe((e) => {
+    const off = await zb.realtime.photos.subscribe((e: { action: string; record: { id: string } }) => {
       events.push(`${e.action}:${e.record.id}`);
     });
     await zb.db.photos.update(photo.id, { caption: "ridge-3" });
