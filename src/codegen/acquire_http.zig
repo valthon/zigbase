@@ -74,9 +74,9 @@ pub fn acquire(alloc: std.mem.Allocator, io: std.Io, origin: []const u8, email: 
     // 1) superuser auth-with-password -> token
     const auth_url = try std.fmt.allocPrint(alloc, "{s}/api/collections/_superusers/auth-with-password", .{origin});
     const auth_body = blk: {
-        var obj = std.json.ObjectMap.init(alloc);
-        try obj.put("identity", std.json.Value{ .string = email });
-        try obj.put("password", std.json.Value{ .string = password });
+        var obj: std.json.ObjectMap = .empty;
+        try obj.put(alloc, "identity", std.json.Value{ .string = email });
+        try obj.put(alloc, "password", std.json.Value{ .string = password });
         break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
     };
     const auth_resp = try doFetch(alloc, &client, .POST, auth_url, &.{.{ .name = "content-type", .value = "application/json" }}, auth_body);

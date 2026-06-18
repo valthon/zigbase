@@ -17,8 +17,19 @@ pub const SuperuserArgs = struct {
     password: ?[]const u8 = null,
 };
 
+pub const TypegenArgs = struct {
+    data_dir: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    out: ?[]const u8 = null,
+    api_prefix: []const u8 = "/api",
+    client_name: []const u8 = "ZbClient",
+    admin_email: ?[]const u8 = null,
+    admin_password: ?[]const u8 = null,
+    check: bool = false,
+};
+
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, migrate, superuser_create };
+pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -26,6 +37,7 @@ pub const Command = union(enum) {
     serve: ServeArgs,
     migrate: ServeArgs,
     superuser_create: SuperuserArgs,
+    typegen: TypegenArgs,
 };
 
 /// True when an arg is a help flag (`--help` or `-h`).
@@ -86,6 +98,46 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             } else return ParseError.UnknownFlag;
         }
         return .{ .superuser_create = sa };
+    }
+    if (std.mem.eql(u8, args[0], "typegen")) {
+        var ta = TypegenArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) return .{ .help = .typegen };
+            if (std.mem.eql(u8, a, "--data-dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ta.data_dir = args[i];
+            } else if (std.mem.eql(u8, a, "--url")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ta.url = args[i];
+            } else if (std.mem.eql(u8, a, "--out")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ta.out = args[i];
+            } else if (std.mem.eql(u8, a, "--api-prefix")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ta.api_prefix = args[i];
+            } else if (std.mem.eql(u8, a, "--client-name")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ta.client_name = args[i];
+            } else if (std.mem.eql(u8, a, "--admin-email")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ta.admin_email = args[i];
+            } else if (std.mem.eql(u8, a, "--admin-password")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ta.admin_password = args[i];
+            } else if (std.mem.eql(u8, a, "--check")) {
+                ta.check = true;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .typegen = ta };
     }
     if (!std.mem.eql(u8, args[0], "serve")) return ParseError.UnknownCommand;
 
@@ -193,4 +245,26 @@ test "--serve-static is an unknown flag when disabled at comptime" {
 
 test "--serve-static without a value errors" {
     try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--serve-static" }, .{}));
+}
+
+test "parse typegen: data-dir + out + flags" {
+    const args = [_][]const u8{ "typegen", "--data-dir", "./zb_data", "--out", "c.ts", "--client-name", "Api", "--check" };
+    const cmd = try parse(&args, .{ .serve_static = true });
+    try std.testing.expect(cmd == .typegen);
+    try std.testing.expectEqualStrings("./zb_data", cmd.typegen.data_dir.?);
+    try std.testing.expectEqualStrings("c.ts", cmd.typegen.out.?);
+    try std.testing.expectEqualStrings("Api", cmd.typegen.client_name);
+    try std.testing.expect(cmd.typegen.check);
+}
+
+test "parse typegen: url + admin creds" {
+    const args = [_][]const u8{ "typegen", "--url", "http://x", "--admin-email", "a@b.c", "--admin-password", "pw", "--out", "c.ts" };
+    const cmd = try parse(&args, .{ .serve_static = true });
+    try std.testing.expectEqualStrings("http://x", cmd.typegen.url.?);
+    try std.testing.expectEqualStrings("a@b.c", cmd.typegen.admin_email.?);
+}
+
+test "parse typegen: missing flag value errors" {
+    const args = [_][]const u8{ "typegen", "--out" };
+    try std.testing.expectError(ParseError.MissingValue, parse(&args, .{ .serve_static = true }));
 }
