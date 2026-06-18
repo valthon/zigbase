@@ -29,6 +29,7 @@ import urllib.request
 
 import pytest
 from aiosmtpd.controller import Controller
+from _bin import resolve_binary
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
@@ -47,10 +48,7 @@ def _free_port():
 
 @pytest.fixture(scope="session")
 def binary():
-    subprocess.run(ZIG + ["build"], cwd=REPO, check=True)
-    path = REPO / "zig-out" / "bin" / "zigbase"
-    assert path.exists(), "zigbase binary missing after build"
-    return str(path)
+    return resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
 
 
 def _make_self_signed_cert(certdir):
