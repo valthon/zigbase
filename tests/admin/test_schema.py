@@ -1,4 +1,4 @@
-from conftest import login, api_request
+from conftest import login, api_request, save_collection_and_wait
 
 def test_create_collection_with_fields_via_ui(page):
     login(page)
@@ -8,8 +8,8 @@ def test_create_collection_with_fields_via_ui(page):
     page.fill('[data-test=col-name]', 'tasks')
     page.click('[data-test=add-field]')
     page.fill('[data-test=field-name]', 'title')  # first (only) field row
-    page.click('[data-test=save-collection]')
     # after save it navigates to the records view + reloads; the sidebar should list 'tasks'
+    save_collection_and_wait(page)
     page.wait_for_selector('[data-test=nav-tasks]', timeout=8000)
 
 def test_number_fixed_scale_roundtrip(page):
@@ -23,7 +23,7 @@ def test_number_fixed_scale_roundtrip(page):
     page.select_option('[data-test=field-type]', 'number')
     page.select_option('[data-test=opt-mode]', 'fixed')
     page.fill('[data-test=opt-scale]', '2')
-    page.click('[data-test=save-collection]')
+    save_collection_and_wait(page)
     page.wait_for_selector('[data-test=nav-prices]', timeout=8000)
     page.wait_for_selector('[data-test=records-view]', timeout=8000)
     # the saved schema carries mode=fixed + scale=2
@@ -37,7 +37,7 @@ def test_number_fixed_scale_roundtrip(page):
     assert page.input_value('[data-test=opt-scale]') == '2'
     # switching mode away from fixed drops scale from the saved options
     page.select_option('[data-test=opt-mode]', 'float')
-    page.click('[data-test=save-collection]')
+    save_collection_and_wait(page)
     page.wait_for_selector('[data-test=records-view]', timeout=8000)
     col = next(c for c in api_request(page, "GET", "/api/collections").json() if c["name"] == "prices")
     fld = next(f for f in col["schema"] if f["name"] == "amount")
@@ -92,10 +92,11 @@ def test_edit_rules_lock_toggle(page):
     # viewRule was "@public" -> the rule-mode select reads "public"; toggle it to Locked
     assert page.input_value('[data-test=rulemode-viewRule]') == 'public'
     page.select_option('[data-test=rulemode-viewRule]', 'locked')  # -> sets the rule to "" (no confirm)
-    page.click('[data-test=save-collection]')
-    page.wait_for_selector('[data-test=nav-notes]', timeout=8000)
     # save navigates to the records view and reloads the page to refresh the sidebar;
-    # wait for that post-save reload to settle before navigating back to the editor.
+    # wait for that post-save reload to COMPLETE before navigating back to the editor,
+    # so our goto below doesn't race (and get aborted by) the in-flight reload.
+    save_collection_and_wait(page)
+    page.wait_for_selector('[data-test=nav-notes]', timeout=8000)
     page.wait_for_selector('[data-test=records-view]', timeout=8000)
     # reload editor: viewRule should now be Locked (persisted null/"" -> mode "locked")
     page.goto("/_/?t=2#/collections/notes")
@@ -122,7 +123,8 @@ def test_edit_rules_expression_from_locked(page):
     assert page.input_value('[data-test=rulemode-listRule]') == 'expr'
     page.wait_for_selector('[data-test=rule-listRule]', timeout=8000)
     page.fill('[data-test=rule-listRule]', 'status = "published"')
-    page.click('[data-test=save-collection]')
+    # wait for the post-save reload to COMPLETE before navigating back to the editor
+    save_collection_and_wait(page)
     page.wait_for_selector('[data-test=records-view]', timeout=8000)
     # reload editor: the expression persisted and reads back as Expression mode
     page.goto("/_/?t=2#/collections/memos")

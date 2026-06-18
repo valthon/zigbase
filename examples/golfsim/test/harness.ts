@@ -6,7 +6,9 @@ import { fileURLToPath } from "node:url";
 
 const HERE = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const EXAMPLE_ROOT = resolve(HERE, ".."); // examples/golfsim
-const BIN = join(EXAMPLE_ROOT, "zig-out", "bin", "golfsim");
+// CI supplies a prebuilt binary via ZIGBASE_TEST_GOLFSIM_BINARY (no Zig toolchain
+// in that job); otherwise use the zig-out path produced by `zig build` below.
+const BIN = process.env.ZIGBASE_TEST_GOLFSIM_BINARY || join(EXAMPLE_ROOT, "zig-out", "bin", "golfsim");
 const FRONTEND_ROOT = join(EXAMPLE_ROOT, "frontend");
 const FRONTEND_DIST = join(FRONTEND_ROOT, "dist", "index.html");
 
@@ -36,8 +38,14 @@ async function waitForHealth(url: string, timeoutMs = 20_000): Promise<void> {
 }
 
 export async function startGolfsim(): Promise<GolfServer> {
-  const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
-  if (b.status !== 0) throw new Error("golfsim build failed");
+  // A prebuilt binary supplied via ZIGBASE_TEST_GOLFSIM_BINARY skips the zig build
+  // entirely — no Zig toolchain needed in that job.
+  if (!process.env.ZIGBASE_TEST_GOLFSIM_BINARY) {
+    const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
+    if (b.status !== 0) throw new Error("golfsim build failed");
+  }
+  // The Astro frontend is built unconditionally: the binary serves frontend/dist
+  // at runtime regardless of how the binary itself was produced.
   ensureFrontend();
   const dataDir = mkdtempSync(join(tmpdir(), "golf-it-"));
   const port = 20000 + Math.floor(Math.random() * 20000);

@@ -1,4 +1,5 @@
 import json, socket, subprocess, time, urllib.request, os, signal, tempfile, pathlib
+from _bin import resolve_binary
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 BLOG = REPO / "examples" / "blog"
@@ -7,9 +8,7 @@ def _free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
 def test_server_runs_and_shuts_down_with_a_job_registered():
-    subprocess.run(["mise", "exec", "zig@0.16.0", "--", "zig", "build"], cwd=BLOG, check=True)
-    blog = BLOG / "zig-out" / "bin" / "blog"
-    assert blog.exists()
+    blog = resolve_binary("ZIGBASE_TEST_BLOG_BINARY", BLOG, "blog")
     with tempfile.TemporaryDirectory() as data:
         port = _free_port()
         proc = subprocess.Popen(

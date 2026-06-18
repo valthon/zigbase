@@ -1,6 +1,7 @@
 import socket, subprocess, tempfile, time, os, pathlib, shutil, urllib.request, urllib.error
 
 import pytest
+from _bin import resolve_binary, resolve_plugins_binary
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
@@ -39,8 +40,7 @@ def _hdr(msg, name):
 
 
 def test_serve_static_runtime_mode():
-    subprocess.run(ZIG + ["build"], cwd=REPO, check=True)
-    binary = REPO / "zig-out" / "bin" / "zigbase"
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
     with tempfile.TemporaryDirectory() as static, tempfile.TemporaryDirectory() as data:
         pub = pathlib.Path(static)
         (pub / "index.html").write_text("<h1>hello static</h1>")
@@ -99,8 +99,7 @@ def test_serve_static_runtime_mode():
 
 
 def test_serve_static_missing_dir_is_fatal():
-    subprocess.run(ZIG + ["build"], cwd=REPO, check=True)
-    binary = REPO / "zig-out" / "bin" / "zigbase"
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
     with tempfile.TemporaryDirectory() as data:
         port = _free_port()
         proc = subprocess.Popen(
@@ -112,15 +111,9 @@ def test_serve_static_missing_dir_is_fatal():
 
 
 def test_embedded_static_in_plugins_example():
-    if shutil.which("npm") is None:
-        pytest.skip("npm not available; cannot build the plugins frontend")
-    plugins = REPO / "examples" / "plugins"
-    fe = plugins / "frontend"
-    if not (fe / "dist" / "index.html").exists():
-        subprocess.run(["npm", "install", "--no-audit", "--no-fund"], cwd=fe, check=True)
-        subprocess.run(["npm", "run", "build"], cwd=fe, check=True)
-    subprocess.run(ZIG + ["build"], cwd=plugins, check=True)
-    binary = plugins / "zig-out" / "bin" / "plugins"
+    binary = resolve_plugins_binary()
+    if binary is None:
+        pytest.skip("npm not available and no prebuilt plugins binary; cannot build the plugins frontend")
     with tempfile.TemporaryDirectory() as data:
         port = _free_port()
         proc = subprocess.Popen(

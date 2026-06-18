@@ -8,9 +8,18 @@ import { fileURLToPath } from "node:url";
 // root (the dir containing build.zig / zig-out) is four levels up.
 const HERE = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const REPO_ROOT = resolve(HERE, "../../../..");
-const BIN = join(REPO_ROOT, "zig-out", "bin", "zigbase");
-/** Absolute path to the dating fixture compiled as a server (Task 2: `zig build dating-server`). */
-export const DATING_BIN = join(REPO_ROOT, "zig-out", "bin", "dating-server");
+// CI supplies a prebuilt binary via ZIGBASE_TEST_BINARY; otherwise use the
+// zig-out path produced by ensureBuilt()'s `zig build`. `||` (not `??`) so an
+// empty-string override also falls back, matching ensureBuilt()'s truthy guard
+// below and avoiding a spawn of "".
+const BIN = process.env.ZIGBASE_TEST_BINARY || join(REPO_ROOT, "zig-out", "bin", "zigbase");
+/**
+ * Absolute path to the dating fixture compiled as a server (Task 2: `zig build dating-server`).
+ * CI supplies a prebuilt one via ZIGBASE_TEST_DATING_BINARY; otherwise it is the
+ * zig-out path produced by ensureBuilt()'s `zig build dating-server`.
+ */
+export const DATING_BIN =
+  process.env.ZIGBASE_TEST_DATING_BINARY || join(REPO_ROOT, "zig-out", "bin", "dating-server");
 
 export interface TestServer {
   url: string;
@@ -21,12 +30,22 @@ export interface TestServer {
 let built = false;
 function ensureBuilt(): void {
   if (built) return;
-  // The binary MUST be built with zig 0.16.0; plain `zig` on PATH may be older.
-  const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build", "dating-server"], {
-    cwd: REPO_ROOT,
-    stdio: "inherit",
-  });
-  if (r.status !== 0) throw new Error("zig build failed");
+  // Prebuilt binaries supplied via ZIGBASE_TEST_BINARY + ZIGBASE_TEST_DATING_BINARY
+  // (e.g. CI artifacts) skip the toolchain entirely — no Zig needed in that job.
+  if (process.env.ZIGBASE_TEST_BINARY && process.env.ZIGBASE_TEST_DATING_BINARY) {
+    built = true;
+    return;
+  }
+  // The binaries MUST be built with zig 0.16.0; plain `zig` on PATH may be older.
+  // Build both the generic binary (runtime-created collections) and the
+  // dating-server fixture (schema baked in) so every integration test can spawn.
+  for (const steps of [["build"], ["build", "dating-server"]]) {
+    const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", ...steps], {
+      cwd: REPO_ROOT,
+      stdio: "inherit",
+    });
+    if (r.status !== 0) throw new Error(`zig ${steps.join(" ")} failed`);
+  }
   built = true;
 }
 
@@ -96,9 +115,7 @@ export async function startAppServer(opts: {
 
 /** Backward-compatible: spawn the generic zigbase binary (runtime-created collections). */
 export async function startServer(): Promise<TestServer> {
-  // Ensure the generic binary is built too (the existing tests create collections at runtime).
-  const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], { cwd: REPO_ROOT, stdio: "inherit" });
-  if (r.status !== 0) throw new Error("zig build failed");
+  // ensureBuilt() (invoked by startAppServer) builds the generic binary too.
   return startAppServer({ bin: BIN });
 }
 

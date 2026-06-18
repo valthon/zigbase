@@ -5,55 +5,97 @@ on:
   pull_request:
 
 jobs:
-  zig:
+  build:
     runs-on: ubuntu-latest
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
     steps:
       - uses: actions/checkout@v4
-      # mise-action@v4 caches the installed toolchain (~/.local/share/mise) by
-      # default and authenticates tool downloads with the automatic GITHUB_TOKEN.
       - uses: jdx/mise-action@v4
-      - name: Build
+      # Shared, persisted zig global cache: the vendored SQLite amalgamation
+      # compiles once and is reused across main/blog/plugins and across runs.
+      - name: Cache zig global cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+      - name: Cache npm downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+      - name: Build plugins example frontend (embedded into the plugins binary)
+        run: cd examples/plugins/frontend && mise exec node@24 -- npm ci --no-audit --no-fund && mise exec node@24 -- npm run build
+      - name: Build main zigbase binary
         run: mise exec zig@0.16.0 -- zig build
-      - name: Unit tests
-        run: mise exec zig@0.16.0 -- zig build test --summary all
-      - name: Build example consumer (dependency-graph proof)
+      - name: Build blog example consumer (dependency-graph proof)
         run: cd examples/blog && mise exec zig@0.16.0 -- zig build
       - name: Build golfsim example consumer (realistic app)
         run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build
-      # npm's global download cache (~/.npm), reused across runs; node itself
-      # comes from mise (node@24, the version pinned in mise.toml).
-      - name: Cache npm downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: npm-${{ runner.os }}-
-      - name: Build plugins example frontend (embedded assets)
-        run: cd examples/plugins/frontend && mise exec node@24 -- npm ci --no-audit --no-fund && mise exec node@24 -- npm run build
+      - name: Build dating-server (e2e fixture binary)
+        run: mise exec zig@0.16.0 -- zig build dating-server
+      - name: Dating client snapshot is fresh
+        run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
+      - name: Golfsim client snapshot is fresh
+        working-directory: examples/golfsim
+        run: mise exec zig@0.16.0 -- zig build gen-client-check
       - name: Build plugins example consumer (advanced framework surface)
         run: cd examples/plugins && mise exec zig@0.16.0 -- zig build
+      - name: Upload prebuilt binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: zigbase-binaries
+          path: |
+            zig-out/bin/zigbase
+            zig-out/bin/dating-server
+            examples/blog/zig-out/bin/blog
+            examples/golfsim/zig-out/bin/golfsim
+            examples/plugins/zig-out/bin/plugins
+          if-no-files-found: error
+          retention-days: 1
 
-  browser:
+  unit:
     runs-on: ubuntu-latest
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v4
-      - name: Cache npm downloads
+      - name: Cache zig global cache
         uses: actions/cache@v4
         with:
-          path: ~/.npm
-          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: npm-${{ runner.os }}-
-      - name: Build plugins example frontend (embedded assets, used by static-files tests)
-        run: cd examples/plugins/frontend && mise exec node@24 -- npm ci --no-audit --no-fund && mise exec node@24 -- npm run build
-      # Resolve the installed Playwright version so the browser cache key tracks it.
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+      - name: Unit tests
+        run: mise exec zig@0.16.0 -- zig build test --summary all
+
+  browser:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v4
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: zigbase-binaries
+          path: artifacts
+      - name: Export prebuilt binary paths
+        run: |
+          chmod +x artifacts/zig-out/bin/zigbase \
+                   artifacts/examples/blog/zig-out/bin/blog \
+                   artifacts/examples/plugins/zig-out/bin/plugins
+          echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_BLOG_BINARY=$GITHUB_WORKSPACE/artifacts/examples/blog/zig-out/bin/blog" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
       - name: Install Python test deps + resolve Playwright version
         id: pw
         run: |
           mise exec python@3.13 -- python -m pip install --quiet pytest playwright aiosmtpd
           echo "version=$(mise exec python@3.13 -- python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
-      # The harness launches a bare, headless chromium.launch() with no channel,
-      # so only the (smaller) chromium-headless-shell build is needed (--only-shell).
       - name: Cache Playwright browser (chromium headless shell)
         id: pw-cache
         uses: actions/cache@v4
@@ -63,8 +105,6 @@ jobs:
       - name: Install Chromium headless shell + OS deps (cache miss)
         if: steps.pw-cache.outputs.cache-hit != 'true'
         run: mise exec python@3.13 -- python -m playwright install --with-deps --only-shell chromium
-      # OS deps live outside ~/.cache/ms-playwright and are not cacheable, so they
-      # must be (re)installed even when the browser binary is restored from cache.
       - name: Install Playwright OS deps (cache hit)
         if: steps.pw-cache.outputs.cache-hit == 'true'
         run: mise exec python@3.13 -- python -m playwright install-deps chromium
@@ -75,18 +115,23 @@ jobs:
 
   ts-sdk:
     runs-on: ubuntu-latest
+    needs: build
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v4
-      - name: Build zigbase binary
-        run: mise exec zig@0.16.0 -- zig build
-      - name: Build dating-server (e2e fixture binary)
-        run: mise exec zig@0.16.0 -- zig build dating-server
-      - name: Dating client snapshot is fresh
-        run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
-      - name: Golfsim client snapshot is fresh
-        working-directory: examples/golfsim
-        run: mise exec zig@0.16.0 -- zig build gen-client-check
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: zigbase-binaries
+          path: artifacts
+      - name: Export prebuilt binary path
+        run: |
+          chmod +x artifacts/zig-out/bin/zigbase \
+                   artifacts/zig-out/bin/dating-server \
+                   artifacts/examples/golfsim/zig-out/bin/golfsim
+          echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_DATING_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/dating-server" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_GOLFSIM_BINARY=$GITHUB_WORKSPACE/artifacts/examples/golfsim/zig-out/bin/golfsim" >> "$GITHUB_ENV"
       - name: Cache npm downloads
         uses: actions/cache@v4
         with:
