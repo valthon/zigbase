@@ -63,6 +63,8 @@ pub const codegen = struct {
     pub const rpc = @import("codegen/rpc.zig");
     /// Source-agnostic schema acquisition core: RawRow → Collection, auth-strip, name-sort.
     pub const acquire = @import("codegen/acquire.zig");
+    /// Data-dir acquisition adapter: reads _collections from an open db handle or a data dir path.
+    pub const acquire_datadir = @import("codegen/acquire_datadir.zig");
 };
 
 // ---- Test discovery --------------------------------------------------------
@@ -139,5 +141,6 @@ test {
     _ = @import("codegen/rpc_ts.zig");
     _ = @import("codegen/rpc.zig");
     _ = @import("codegen/acquire.zig");
+    _ = @import("codegen/acquire_datadir.zig");
     _ = @import("route_types.zig");
 }
