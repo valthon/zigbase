@@ -311,7 +311,7 @@ The generated TypeScript method signature mirrors the route shape:
 - Output is the TypeScript equivalent of the Zig return type; `std.json.Value` maps to `unknown`.
 - `.auth` defaults to `.superuser` when omitted — typed routes are locked to superusers unless explicitly set.
 
-See the [TypeScript SDK docs](typescript-sdk.md#typed-rpc--zbrc) and `examples/golfsim/` for the full worked example.
+See the [TypeScript SDK docs](typescript-sdk.md#typed-rpc--zbrpc) and `examples/golfsim/` for the full worked example.
 
 ## 6. Auth / file / lifecycle events
 

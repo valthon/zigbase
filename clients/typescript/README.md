@@ -250,14 +250,14 @@ When a generated `zbase.gen.ts` declares typed routes (via the Zig server's `.ro
 **golfsim example** — the golfsim app declares four typed routes, and `zig build gen-client` emits:
 
 ```ts
-import { createClient } from "./clients/typescript/zbase.gen.js";
+import { createClient, type Booking } from "./clients/typescript/zbase.gen.js";
 
 const zb = createClient(url, { WebSocket: globalThis.WebSocket });
 await zb.db.users.authWithPassword("host@golf.app", "pass");
 
 // POST /api/bookings/:id/confirm — params object; output is unknown (std.json.Value)
 const booking = { id: "BOOKING_ID" };
-const confirmed = await zb.rpc.bookingsConfirm({ id: booking.id }) as { status: string };
+const confirmed = await zb.rpc.bookingsConfirm({ id: booking.id }) as Booking;
 console.log(confirmed.status); // "confirmed"
 
 // GET /api/golfsim/health — no params; typed output (HealthOut)
