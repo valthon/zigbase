@@ -67,6 +67,30 @@ pub fn metaConst(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
     return std.fmt.allocPrint(alloc, "{s}Meta", .{c});
 }
 
+/// Derive a camelCase RPC method name from a route path: strip the api-prefix, drop
+/// `:param` segments, and camel-join the remaining segments. First segment lowercase,
+/// subsequent segments PascalCased: "/api/bookings/:id/confirm" -> "bookingsConfirm".
+pub fn routeMethodName(alloc: std.mem.Allocator, path: []const u8, api_prefix: []const u8) ![]const u8 {
+    var rest = path;
+    if (std.mem.startsWith(u8, rest, api_prefix)) rest = rest[api_prefix.len..];
+    var out: std.ArrayList(u8) = .empty;
+    var first = true;
+    var it = std.mem.tokenizeScalar(u8, rest, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or seg[0] == ':') continue; // skip path params
+        if (first) {
+            // first segment: lowercase as-is (camelCase start).
+            try out.appendSlice(alloc, seg);
+            first = false;
+        } else {
+            const p = try pascal(alloc, seg);
+            defer alloc.free(p);
+            try out.appendSlice(alloc, p);
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 /// TS identifier rule — reuse the engine's identifier validity (letter-start,
 /// then letters/digits/underscore). Sufficient for collection/field names, which
 /// also constrain the derived PascalCase type names.
@@ -144,4 +168,19 @@ test "recordName singularizes and pascal-cases" {
     try std.testing.expectEqualStrings("Post", try recordName(a, "posts"));
     try std.testing.expectEqualStrings("User", try recordName(a, "users"));
     try std.testing.expectEqualStrings("BlogPost", try recordName(a, "blog_posts"));
+}
+
+test "routeMethodName camel-joins non-param segments" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { path: []const u8, want: []const u8 }{
+        .{ .path = "/api/bookings/:id/confirm", .want = "bookingsConfirm" },
+        .{ .path = "/api/listings/:id/availability", .want = "listingsAvailability" },
+        .{ .path = "/api/golfsim/health", .want = "golfsimHealth" },
+        .{ .path = "/api/ping", .want = "ping" },
+    };
+    inline for (cases) |c| {
+        const got = try routeMethodName(a, c.path, "/api");
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
 }
