@@ -755,10 +755,10 @@ test "App(cfg) builds a record dispatcher only when hooks are present" {
 }
 
 test "App(cfg) assembles custom routes onto dispatch" {
+    const route_types = @import("route_types.zig");
     const H = struct {
-        fn h(ev: *@import("events.zig").RouteEvent) anyerror!@import("http.zig").Response {
-            _ = ev;
-            return .{ .status = 200, .body = "ok" };
+        fn h(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
         }
     };
     const A = App(.{ .routes = .{ .{ .method = .GET, .path = "/api/x", .handler = H.h, .auth = .public } } });
