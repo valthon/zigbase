@@ -113,145 +113,147 @@ fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
 // ---------------------------------------------------------------------------
 // 2. Custom business route: POST /api/bookings/:id/confirm  (auth required).
 //
-//    Signature: fn(*zigbase.RouteEvent) anyerror!zigbase.http.Response.
-//    This route verifies the caller is the listing's owner via a multi-hop
-//    traversal: booking -> listing -> simulator -> owner. Responds 403 when the
-//    caller does not own the listing, 404 when the booking does not exist.
+//    Signature (SP2.2a typed): fn(*zigbase.Req(void)) zigbase.RouteError!std.json.Value.
+//    `Input` is `void` (the `:id` is a path param read via `req.param`); `Output`
+//    is `std.json.Value` (the booking is a dynamic record — `unknown` on the
+//    client). This route verifies the caller is the listing's owner via a
+//    multi-hop traversal: booking -> listing -> simulator -> owner. Returns
+//    `error.Forbidden` (403) when the caller does not own the listing,
+//    `error.NotFound` (404) when the booking does not exist. The thunk serializes
+//    the returned record to a 200 JSON body (identical wire behavior).
 // ---------------------------------------------------------------------------
-fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const not_found: zigbase.http.Response = .{ .status = 404, .body = "{\"message\":\"Booking not found.\"}" };
-    const forbidden: zigbase.http.Response = .{ .status = 403, .body = "{\"message\":\"Forbidden.\"}" };
-
-    const id = ev.ctx.param("id") orelse
-        return .{ .status = 400, .body = "{\"message\":\"Missing booking id.\"}" };
+fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
+    const id = req.param("id") orelse return req.fail(400, "Missing booking id.");
     // Validate the id before it touches any query (defense-in-depth + consistency).
-    if (!isSafeId(id)) return .{ .status = 400, .body = "{\"message\":\"Invalid booking id.\"}" };
+    if (!isSafeId(id)) return req.fail(400, "Invalid booking id.");
 
     // The caller's auth id (empty string when unauthenticated — the .authed
     // constraint already rejects anonymous callers, but we guard defensively).
-    const caller_id = ev.rctx.resolveMacro("@request.auth.id") orelse "";
+    const caller_id = req.auth_id;
+
+    const app: *zigbase.Runtime = @ptrCast(@alignCast(req.app.?));
 
     // Build a connection-bound Data facade on the pooled writer.
-    const conn = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = conn, .io = ev.app.io };
+    const conn = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
+    const data = zigbase.Data{ .app = app, .conn = conn, .io = app.io };
 
     // Load the booking; 404 when it does not exist (or the collection is absent).
-    const existing = (try data.findById("bookings", id)) orelse return not_found;
-    if (existing != .object) return not_found;
+    const existing = (data.findById("bookings", id) catch return error.RouteFailed) orelse return error.NotFound;
+    if (existing != .object) return error.NotFound;
 
     // Multi-hop owner check: booking.listing -> listings record -> simulator ->
     // simulators record -> owner.  Any missing hop is treated as not-found rather
     // than exposing the partial state.
-    const listing_id = switch (existing.object.get("listing") orelse return not_found) {
+    const listing_id = switch (existing.object.get("listing") orelse return error.NotFound) {
         .string => |s| s,
-        else => return not_found,
+        else => return error.NotFound,
     };
-    const listing = (try data.findById("listings", listing_id)) orelse return not_found;
-    if (listing != .object) return not_found;
+    const listing = (data.findById("listings", listing_id) catch return error.RouteFailed) orelse return error.NotFound;
+    if (listing != .object) return error.NotFound;
 
-    const simulator_id = switch (listing.object.get("simulator") orelse return not_found) {
+    const simulator_id = switch (listing.object.get("simulator") orelse return error.NotFound) {
         .string => |s| s,
-        else => return not_found,
+        else => return error.NotFound,
     };
-    const simulator = (try data.findById("simulators", simulator_id)) orelse return not_found;
-    if (simulator != .object) return not_found;
+    const simulator = (data.findById("simulators", simulator_id) catch return error.RouteFailed) orelse return error.NotFound;
+    if (simulator != .object) return error.NotFound;
 
-    const owner_id = switch (simulator.object.get("owner") orelse return not_found) {
+    const owner_id = switch (simulator.object.get("owner") orelse return error.NotFound) {
         .string => |s| s,
-        else => return not_found,
+        else => return error.NotFound,
     };
 
     // 403 when the caller is not the simulator's owner.
-    if (!std.mem.eql(u8, owner_id, caller_id)) return forbidden;
+    if (!std.mem.eql(u8, owner_id, caller_id)) return error.Forbidden;
 
     // Flip status -> confirmed via a partial update (only the provided field is
     // written). Build the patch in the request arena.
     var patch: std.json.ObjectMap = .empty;
-    try patch.put(ev.ctx.allocator, "status", .{ .string = "confirmed" });
-    const updated = (try data.update("bookings", id, .{ .object = patch })) orelse return not_found;
+    patch.put(req.arena.?, "status", .{ .string = "confirmed" }) catch return error.RouteFailed;
+    const updated = (data.update("bookings", id, .{ .object = patch }) catch return error.RouteFailed) orelse return error.NotFound;
 
-    // Serialize the updated record as the 200 body (arena-allocated).
-    const body = try std.json.Stringify.valueAlloc(ev.ctx.allocator, updated, .{});
-    return .{ .status = 200, .body = body };
+    // Return the updated record; the thunk serializes it as the 200 body.
+    return updated;
 }
 
 // ---------------------------------------------------------------------------
 // 3. Custom route: POST /api/bookings/:id/cancel  (auth required).
 //
-//    Lets a guest cancel their own booking. Returns 403 when called by anyone
-//    other than the booking's guest, 404 when the booking does not exist.
-//    Uses `ev.writer()` (RAII) because it performs a write (update).
+//    Lets a guest cancel their own booking. Returns `error.Forbidden` (403) when
+//    called by anyone other than the booking's guest, `error.NotFound` (404) when
+//    the booking does not exist. Acquires the pooled writer directly (this path
+//    performs a write/update). Typed signature mirrors `confirmBooking`.
 // ---------------------------------------------------------------------------
-fn cancelBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const not_found: zigbase.http.Response = .{ .status = 404, .body = "{\"message\":\"Booking not found.\"}" };
-    const forbidden: zigbase.http.Response = .{ .status = 403, .body = "{\"message\":\"Forbidden.\"}" };
+fn cancelBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
+    const id = req.param("id") orelse return req.fail(400, "Missing booking id.");
+    if (!isSafeId(id)) return req.fail(400, "Invalid booking id.");
 
-    const id = ev.ctx.param("id") orelse
-        return .{ .status = 400, .body = "{\"message\":\"Missing booking id.\"}" };
-    if (!isSafeId(id)) return .{ .status = 400, .body = "{\"message\":\"Invalid booking id.\"}" };
+    const caller_id = req.auth_id;
 
-    const caller_id = ev.rctx.resolveMacro("@request.auth.id") orelse "";
+    const app: *zigbase.Runtime = @ptrCast(@alignCast(req.app.?));
 
-    var w = ev.writer();
-    defer w.deinit();
+    const conn = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
+    const data = zigbase.Data{ .app = app, .conn = conn, .io = app.io };
 
     // Load the booking to verify ownership before mutating.
-    const existing = (try w.data().findById("bookings", id)) orelse return not_found;
-    if (existing != .object) return not_found;
+    const existing = (data.findById("bookings", id) catch return error.RouteFailed) orelse return error.NotFound;
+    if (existing != .object) return error.NotFound;
 
     // Verify the caller is the booking's guest.
-    const guest_id = switch (existing.object.get("guest") orelse return forbidden) {
+    const guest_id = switch (existing.object.get("guest") orelse return error.Forbidden) {
         .string => |s| s,
-        else => return forbidden,
+        else => return error.Forbidden,
     };
-    if (!std.mem.eql(u8, guest_id, caller_id)) return forbidden;
+    if (!std.mem.eql(u8, guest_id, caller_id)) return error.Forbidden;
 
     // Update status -> "cancelled".
     var patch: std.json.ObjectMap = .empty;
-    try patch.put(ev.ctx.allocator, "status", .{ .string = "cancelled" });
-    const updated = (try w.data().update("bookings", id, .{ .object = patch })) orelse return not_found;
+    patch.put(req.arena.?, "status", .{ .string = "cancelled" }) catch return error.RouteFailed;
+    const updated = (data.update("bookings", id, .{ .object = patch }) catch return error.RouteFailed) orelse return error.NotFound;
 
-    const body = try std.json.Stringify.valueAlloc(ev.ctx.allocator, updated, .{});
-    return .{ .status = 200, .body = body };
+    // Return the updated record; the thunk serializes it as the 200 body.
+    return updated;
 }
 
 // ---------------------------------------------------------------------------
 // 4. Custom route: GET /api/listings/:id/availability  (auth required).
 //
 //    Returns all non-cancelled bookings for the listing so the frontend can
-//    render an availability calendar. Uses `ev.reader()` (RAII) since this is
-//    a read-only path.
+//    render an availability calendar. Acquires a pooled READER directly (this is
+//    a read-only path). Output is `std.json.Value` so the exact `{"items":[...]}`
+//    body is preserved byte-for-byte (including an empty `{"items":[]}`).
 // ---------------------------------------------------------------------------
-fn listingAvailability(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const id = ev.ctx.param("id") orelse
-        return .{ .status = 400, .body = "{\"message\":\"Missing listing id.\"}" };
+fn listingAvailability(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
+    const id = req.param("id") orelse return req.fail(400, "Missing listing id.");
     // The id is interpolated into the filter below — validate it first so a
     // crafted id cannot inject filter syntax.
-    if (!isSafeId(id)) return .{ .status = 400, .body = "{\"message\":\"Invalid listing id.\"}" };
+    if (!isSafeId(id)) return req.fail(400, "Invalid listing id.");
 
-    var r = try ev.reader();
-    defer r.deinit();
+    const app: *zigbase.Runtime = @ptrCast(@alignCast(req.app.?));
 
-    const filter = try std.fmt.allocPrint(
-        ev.ctx.allocator,
+    // Acquire a pooled, read-only connection and build a reader-bound Data facade.
+    // `acquireReader` returns the connection by value; keep it in a local so its
+    // address is stable for `releaseReader(&conn)` and the Data facade.
+    var conn = app.pool.acquireReader() catch return error.RouteFailed;
+    defer app.pool.releaseReader(&conn);
+    const data = zigbase.Data{ .app = app, .conn = &conn, .io = app.io };
+
+    const filter = std.fmt.allocPrint(
+        req.arena.?,
         "listing = \"{s}\" && status != \"cancelled\"",
         .{id},
-    );
-    const result = try r.data().list("bookings", .{ .filter = filter, .perPage = 200 });
+    ) catch return error.RouteFailed;
+    const result = data.list("bookings", .{ .filter = filter, .perPage = 200 }) catch return error.RouteFailed;
 
-    // Build the items JSON array manually from the list result.
-    var items_buf: std.ArrayList(u8) = .empty;
-    defer items_buf.deinit(ev.ctx.allocator);
-    try items_buf.appendSlice(ev.ctx.allocator, "[");
-    for (result.items, 0..) |item, i| {
-        if (i > 0) try items_buf.appendSlice(ev.ctx.allocator, ",");
-        const s = try std.json.Stringify.valueAlloc(ev.ctx.allocator, item, .{});
-        try items_buf.appendSlice(ev.ctx.allocator, s);
-    }
-    try items_buf.appendSlice(ev.ctx.allocator, "]");
-    const body = try std.fmt.allocPrint(ev.ctx.allocator, "{{\"items\":{s}}}", .{items_buf.items});
-    return .{ .status = 200, .body = body };
+    // Build the `{"items":[...]}` wrapper as a JSON Value; the thunk serializes it
+    // to the 200 body (identical wire shape, including an empty array).
+    var arr = std.json.Array.init(req.arena.?);
+    for (result.items) |item| arr.append(item) catch return error.RouteFailed;
+    var obj: std.json.ObjectMap = .empty;
+    obj.put(req.arena.?, "items", .{ .array = arr }) catch return error.RouteFailed;
+    return .{ .object = obj };
 }
 
 // ---------------------------------------------------------------------------
@@ -296,10 +298,14 @@ fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
 
 // ---------------------------------------------------------------------------
 // 6. Public smoke route: GET /api/golfsim/health.
+//
+//    A typed struct output (the client gets a typed health shape). The thunk
+//    serializes it to `{"status":"ok","app":"golfsim"}` (200) — identical body.
 // ---------------------------------------------------------------------------
-fn health(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    _ = ev;
-    return .{ .status = 200, .body = "{\"status\":\"ok\",\"app\":\"golfsim\"}" };
+const HealthOut = struct { status: []const u8, app: []const u8 };
+fn health(req: *zigbase.Req(void)) zigbase.RouteError!HealthOut {
+    _ = req;
+    return .{ .status = "ok", .app = "golfsim" };
 }
 
 // ---------------------------------------------------------------------------
