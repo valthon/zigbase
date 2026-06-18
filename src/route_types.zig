@@ -56,6 +56,31 @@ pub fn Req(comptime InputT: type) type {
     };
 }
 
+/// Extract `Input` from a handler type `fn(*Req(Input)) RouteError!Output`.
+/// Reflects the first parameter (`*Req(Input)`) and reads its `pub const Input`.
+/// `@compileError` if the handler doesn't take a single `*Req(...)`.
+pub fn HandlerInput(comptime H: type) type {
+    const info = @typeInfo(H);
+    if (info != .@"fn") @compileError("route handler must be a function");
+    const fn_info = info.@"fn";
+    if (fn_info.params.len != 1) @compileError("route handler must take exactly one *Req(Input) parameter");
+    const ptr_t = fn_info.params[0].type orelse @compileError("route handler parameter type is unknown");
+    const ptr_info = @typeInfo(ptr_t);
+    if (ptr_info != .pointer) @compileError("route handler parameter must be *Req(Input)");
+    const ReqT = ptr_info.pointer.child;
+    if (!@hasDecl(ReqT, "Input")) @compileError("route handler parameter must be *Req(Input) (missing Req.Input)");
+    return ReqT.Input;
+}
+
+/// Extract `Output` from a handler type `fn(...) RouteError!Output` (the error-union payload).
+pub fn HandlerOutput(comptime H: type) type {
+    const info = @typeInfo(H);
+    const ret = info.@"fn".return_type orelse @compileError("route handler return type is unknown");
+    const ret_info = @typeInfo(ret);
+    if (ret_info != .error_union) @compileError("route handler must return RouteError!Output");
+    return ret_info.error_union.payload;
+}
+
 const testing = std.testing;
 
 test "Req carries typed input + records a custom failure" {
@@ -81,4 +106,26 @@ test "statusForError maps named errors" {
     try testing.expectEqual(@as(u16, 403), statusForError(RouteError.Forbidden));
     try testing.expectEqual(@as(u16, 404), statusForError(RouteError.NotFound));
     try testing.expectEqual(@as(u16, 400), statusForError(RouteError.BadRequest));
+}
+
+test "reflect Input/Output from a handler type" {
+    const In = struct { a: u32 };
+    const Out = struct { ok: bool };
+    const H = struct {
+        fn h(req: *Req(In)) RouteError!Out {
+            _ = req;
+            return .{ .ok = true };
+        }
+    }.h;
+    try testing.expect(HandlerInput(@TypeOf(H)) == In);
+    try testing.expect(HandlerOutput(@TypeOf(H)) == Out);
+
+    // void input/output handler.
+    const HV = struct {
+        fn h(req: *Req(void)) RouteError!void {
+            _ = req;
+        }
+    }.h;
+    try testing.expect(HandlerInput(@TypeOf(HV)) == void);
+    try testing.expect(HandlerOutput(@TypeOf(HV)) == void);
 }
