@@ -532,15 +532,16 @@ pub fn emitMeta(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
 // Imports
 // ---------------------------------------------------------------------------
 
-pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool) !void {
+pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool, has_rpc: bool) !void {
+    const send_opts = if (has_rpc) ", type SendOptions" else "";
     if (in_repo) {
-        try put(alloc, w,
-            \\import { createClient as baseCreateClient, type Client } from "../../../src/index.js";
-            \\import { withRealtime, type RealtimeEnabledClient } from "../../../src/realtime-entry.js";
-            \\import type { ListResult } from "../../../src/records.js";
-            \\import type { CursorPage } from "../../../src/cursor.js";
-            \\import type { FilesService, FileUrlOptions } from "../../../src/files.js";
-            \\import {
+        const imports = try std.fmt.allocPrint(alloc,
+            \\import {{ createClient as baseCreateClient, type Client{s} }} from "../../../src/index.js";
+            \\import {{ withRealtime, type RealtimeEnabledClient }} from "../../../src/realtime-entry.js";
+            \\import type {{ ListResult }} from "../../../src/records.js";
+            \\import type {{ CursorPage }} from "../../../src/cursor.js";
+            \\import type {{ FilesService, FileUrlOptions }} from "../../../src/files.js";
+            \\import {{
             \\  makeRecordService,
             \\  makeTypedRealtime,
             \\  type CollectionMeta,
@@ -554,15 +555,17 @@ pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool) !void {
             \\  type TypedFieldExpr,
             \\  type RelationResolver,
             \\  type RawTypedRealtime,
-            \\} from "../../../src/typed/index.js";
+            \\}} from "../../../src/typed/index.js";
             \\
-        );
+        , .{send_opts});
+        defer alloc.free(imports);
+        try w.appendSlice(alloc, imports);
     } else {
-        try put(alloc, w,
-            \\import { createClient as baseCreateClient, type Client } from "@zigbase/client";
-            \\import { withRealtime, type RealtimeEnabledClient } from "@zigbase/client/realtime";
-            \\import type { ListResult, CursorPage, FilesService, FileUrlOptions } from "@zigbase/client";
-            \\import {
+        const imports = try std.fmt.allocPrint(alloc,
+            \\import {{ createClient as baseCreateClient, type Client{s} }} from "@zigbase/client";
+            \\import {{ withRealtime, type RealtimeEnabledClient }} from "@zigbase/client/realtime";
+            \\import type {{ ListResult, CursorPage, FilesService, FileUrlOptions }} from "@zigbase/client";
+            \\import {{
             \\  makeRecordService,
             \\  makeTypedRealtime,
             \\  type CollectionMeta,
@@ -576,9 +579,11 @@ pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool) !void {
             \\  type TypedFieldExpr,
             \\  type RelationResolver,
             \\  type RawTypedRealtime,
-            \\} from "@zigbase/client/typed";
+            \\}} from "@zigbase/client/typed";
             \\
-        );
+        , .{send_opts});
+        defer alloc.free(imports);
+        try w.appendSlice(alloc, imports);
     }
 }
 

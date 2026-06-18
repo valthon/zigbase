@@ -241,9 +241,11 @@ pub const RouteMeta = struct {
 /// Comptime path→method-name (mirrors codegen `identifiers.routeMethodName`) with an
 /// optional `.name` override. Strips the "/api" prefix + ":param" segments, camel-joins
 /// the rest. Comptime-friendly (no allocator) for the framework-side collision check.
-fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const u8) []const u8 {
+/// Separators ('_', '-') within a segment are stripped and the following char is
+/// uppercased, matching codegen `pascal()` semantics (drift-guard test enforces parity).
+pub fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const u8) []const u8 {
     if (override) |n| return n;
-    comptime {
+    return comptime blk: {
         var rest: []const u8 = path;
         const prefix = "/api";
         if (std.mem.startsWith(u8, rest, prefix)) rest = rest[prefix.len..];
@@ -252,17 +254,27 @@ fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const u8) 
         var it = std.mem.tokenizeScalar(u8, rest, '/');
         while (it.next()) |seg| {
             if (seg.len == 0 or seg[0] == ':') continue;
-            if (first) {
-                name = seg;
-                first = false;
-            } else {
-                var s: []const u8 = &[_]u8{std.ascii.toUpper(seg[0])};
-                s = s ++ seg[1..];
-                name = name ++ s;
+            // PascalCase the segment, stripping '_'/'-' separators (matches
+            // codegen identifiers.pascal); first segment keeps its leading
+            // char lowercase to yield camelCase overall.
+            var piece: []const u8 = "";
+            var upper_next = false;
+            var seg_first = true;
+            for (seg) |ch| {
+                if (ch == '_' or ch == '-') { upper_next = true; continue; }
+                // Lowercase the first emitted char to match routeMethodName's camelCase (first char always lowercase).
+                const c = if (first and seg_first) std.ascii.toLower(ch)
+                          else if (upper_next or (!first and seg_first)) std.ascii.toUpper(ch)
+                          else ch;
+                piece = piece ++ &[_]u8{c};
+                upper_next = false;
+                seg_first = false;
             }
+            name = name ++ piece;
+            first = false;
         }
-        return name;
-    }
+        break :blk name;
+    };
 }
 
 /// Reflect a comptime tuple of typed route specs into `[]const RouteMeta`. Per spec,
@@ -309,8 +321,19 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
     // Representability + duplicate-name guards, all at comptime.
     comptime {
         for (meta, 0..) |m, i| {
+            if (m.name.len == 0)
+                @compileError("route '" ++ m.path ++ "' derives an empty method name; add an explicit .name to the route spec");
             route_types.assertRepresentable(m.Input, m.name);
             route_types.assertRepresentable(m.Output, m.name);
+            // GET/DELETE routes communicate their Input via a query string.
+            // If the Input is representable but not query-parseable (e.g. contains a
+            // non-string slice or a nested struct), the server's `parseQuery` cannot
+            // decode it and every call would get a misleading 400 at runtime. Catch it
+            // at build time instead.
+            if (m.method == .GET or m.method == .DELETE) {
+                if (!route_types.isQueryParseable(m.Input))
+                    @compileError("route '" ++ m.name ++ "': GET/DELETE Input must be encodable as a query string (scalars/enums/strings/optionals only); got a type with a non-query field. Use POST/PUT/PATCH for a JSON body, or simplify the Input.");
+            }
             for (meta[0..i]) |prev| {
                 if (std.mem.eql(u8, prev.name, m.name))
                     @compileError("duplicate route method name '" ++ m.name ++ "' (paths '" ++ prev.path ++ "' and '" ++ m.path ++ "') — add a distinct .name");

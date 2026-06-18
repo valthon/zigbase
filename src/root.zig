@@ -57,6 +57,10 @@ pub const codegen = struct {
     pub const emit = @import("codegen/emit.zig");
     /// The generator core + mainWithCollections entry-point used by gen_main.zig.
     pub const gen_client = @import("codegen/gen_client.zig");
+    /// Comptime Zig-type → TypeScript emitter for route I/O types (SP2.2b).
+    pub const rpc_ts = @import("codegen/rpc_ts.zig");
+    /// RPC section renderer: assembles the three TS fragments from a []const RouteMeta (SP2.2b).
+    pub const rpc = @import("codegen/rpc.zig");
 };
 
 // ---- Test discovery --------------------------------------------------------
@@ -130,5 +134,7 @@ test {
     _ = @import("codegen/guards.zig");
     _ = @import("codegen/emit.zig");
     _ = @import("codegen/gen_client.zig");
+    _ = @import("codegen/rpc_ts.zig");
+    _ = @import("codegen/rpc.zig");
     _ = @import("route_types.zig");
 }

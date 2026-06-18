@@ -3,7 +3,7 @@
 //
 // This client imports its runtime and types from the "@zigbase/client"
 // and "@zigbase/client/typed" packages.
-import { createClient as baseCreateClient, type Client } from "@zigbase/client";
+import { createClient as baseCreateClient, type Client, type SendOptions } from "@zigbase/client";
 import { withRealtime, type RealtimeEnabledClient } from "@zigbase/client/realtime";
 import type { ListResult, CursorPage, FilesService, FileUrlOptions } from "@zigbase/client";
 import {
@@ -627,6 +627,10 @@ export type ReviewsRealtime = RawTypedRealtime<Review, ReviewWhere>;
 
 // ---- createClient ----
 
+export interface HealthOut {
+  status: string;
+  app: string;
+}
 export interface ZbClient {
   db: {
     users: UsersService;
@@ -643,6 +647,12 @@ export interface ZbClient {
     reviews: ReviewsRealtime;
   };
   files: FilesService;
+  rpc: {
+    bookingsConfirm(params: { id: string }, opts?: SendOptions): Promise<unknown>;
+    bookingsCancel(params: { id: string }, opts?: SendOptions): Promise<unknown>;
+    listingsAvailability(params: { id: string }, opts?: SendOptions): Promise<unknown>;
+    golfsimHealth(opts?: SendOptions): Promise<HealthOut>;
+  };
   authStore: Client["authStore"];
   send: Client["send"];
   fetch: Client["fetch"];
@@ -683,6 +693,20 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       reviews: makeTypedRealtime<Review, ReviewWhere>(base.realtime, reviewsMeta, relationResolver),
     },
     files: base.files,
+    rpc: {
+      bookingsConfirm(params, opts) {
+        return base.send("POST", `/api/bookings/${encodeURIComponent(String(params.id))}/confirm`, opts);
+      },
+      bookingsCancel(params, opts) {
+        return base.send("POST", `/api/bookings/${encodeURIComponent(String(params.id))}/cancel`, opts);
+      },
+      listingsAvailability(params, opts) {
+        return base.send("GET", `/api/listings/${encodeURIComponent(String(params.id))}/availability`, opts);
+      },
+      golfsimHealth(opts) {
+        return base.send("GET", `/api/golfsim/health`, opts);
+      },
+    },
     authStore: base.authStore,
     send: base.send.bind(base),
     fetch: base.fetch.bind(base),

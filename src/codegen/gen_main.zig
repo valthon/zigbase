@@ -16,5 +16,5 @@ const zigbase = @import("zigbase");
 const app = @import("app");
 
 pub fn main(init: std.process.Init) !void {
-    return zigbase.codegen.gen_client.mainWithCollections(init, app.App.collections);
+    return zigbase.codegen.gen_client.mainWithCollections(init, app.App.collections, app.App.routes);
 }

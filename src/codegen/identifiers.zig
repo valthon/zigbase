@@ -68,8 +68,16 @@ pub fn metaConst(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
 }
 
 /// Derive a camelCase RPC method name from a route path: strip the api-prefix, drop
-/// `:param` segments, and camel-join the remaining segments. First segment lowercase,
-/// subsequent segments PascalCased: "/api/bookings/:id/confirm" -> "bookingsConfirm".
+/// `:param` segments, and camel-join the remaining segments. First segment camelCased
+/// (leading char lowercase, separators stripped with following char uppercased);
+/// subsequent segments PascalCased: "/api/bookings/:id/confirm" -> "bookingsConfirm",
+/// "/api/user-profile/list-items" -> "userProfileListItems".
+///
+/// NOTE: this function is NOT on the code-generation path — the generator consumes
+/// `events.RouteMeta.name` (populated at comptime by `events.comptimeRouteName`).
+/// It is retained as the reference implementation that the drift-guard test
+/// (`routeMethodName matches the framework's comptimeRouteName`) pins
+/// `comptimeRouteName` against. Do not delete it.
 pub fn routeMethodName(alloc: std.mem.Allocator, path: []const u8, api_prefix: []const u8) ![]const u8 {
     var rest = path;
     if (std.mem.startsWith(u8, rest, api_prefix)) rest = rest[api_prefix.len..];
@@ -79,8 +87,21 @@ pub fn routeMethodName(alloc: std.mem.Allocator, path: []const u8, api_prefix: [
     while (it.next()) |seg| {
         if (seg.len == 0 or seg[0] == ':') continue; // skip path params
         if (first) {
-            // first segment: lowercase as-is (camelCase start).
-            try out.appendSlice(alloc, seg);
+            // first segment: camelCase (leading char lowercase, strip separators).
+            var seg_first = true;
+            var upper_next = false;
+            for (seg) |ch| {
+                if (ch == '_' or ch == '-') { upper_next = true; continue; }
+                if (upper_next) {
+                    try out.append(alloc, std.ascii.toUpper(ch));
+                    upper_next = false;
+                } else if (seg_first) {
+                    try out.append(alloc, std.ascii.toLower(ch));
+                } else {
+                    try out.append(alloc, ch);
+                }
+                seg_first = false;
+            }
             first = false;
         } else {
             const p = try pascal(alloc, seg);
@@ -182,5 +203,24 @@ test "routeMethodName camel-joins non-param segments" {
         const got = try routeMethodName(a, c.path, "/api");
         defer a.free(got);
         try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
+test "routeMethodName matches the framework's comptimeRouteName" {
+    const events = @import("../events.zig");
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "/api/bookings/:id/confirm",
+        "/api/listings/:id/availability",
+        "/api/golfsim/health",
+        "/api/ping",
+        "/api/user-profile/list-items", // separator case: both must strip '-'
+        "/api/Bookings/confirm", // uppercase-initial first segment: both must lowercase first char
+        "/health",
+    };
+    inline for (cases) |path| {
+        const got = try routeMethodName(a, path, "/api");
+        defer a.free(got);
+        try std.testing.expectEqualStrings(events.comptimeRouteName(path, null), got);
     }
 }

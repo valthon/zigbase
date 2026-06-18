@@ -237,6 +237,45 @@ Until the Zig generator lands (SP2.1b), see `test/fixtures/blog.gen.ts` for the 
 example of what a generated client looks like, including expand-narrowed `getOne`, typed `create`/
 `update` payloads, fluent filter builder, and realtime/files surfaces.
 
+## Typed RPC — `zb.rpc.*`
+
+When a generated `zbase.gen.ts` declares typed routes (via the Zig server's `.routes` config), the generated client exposes them under `zb.rpc.<name>(params?, input?, opts?)`:
+
+- **`params` object** is present IFF the route path contains `:param` segments (e.g. `{ id: string }`).
+- **`input` argument** is present IFF the route's `Input` type is non-void (POST/PUT/PATCH bodies).
+- GET/DELETE routes pass non-params arguments as **query string**; POST/PUT/PATCH routes pass them as the **request body**.
+- Throws a `ZigbaseError` on non-2xx — same as the rest of the client.
+- The last optional `opts` argument accepts `SendOptions` (signal, requestKey, headers).
+
+**golfsim example** — the golfsim app declares four typed routes, and `zig build gen-client` emits:
+
+```ts
+import { createClient, type Booking } from "./clients/typescript/zbase.gen.js";
+
+const zb = createClient(url, { WebSocket: globalThis.WebSocket });
+await zb.db.users.authWithPassword("host@golf.app", "pass");
+
+// POST /api/bookings/:id/confirm — params object; output is unknown (std.json.Value)
+const booking = { id: "BOOKING_ID" };
+const confirmed = await zb.rpc.bookingsConfirm({ id: booking.id }) as Booking;
+console.log(confirmed.status); // "confirmed"
+
+// GET /api/golfsim/health — no params; typed output (HealthOut)
+const health = await zb.rpc.golfsimHealth();
+console.log(health.status); // "ok"
+```
+
+The four golfsim RPC methods and their signatures:
+
+| Method | Generated signature |
+| --- | --- |
+| `bookingsConfirm` | `(params: { id: string }, opts?: SendOptions) => Promise<unknown>` |
+| `bookingsCancel` | `(params: { id: string }, opts?: SendOptions) => Promise<unknown>` |
+| `listingsAvailability` | `(params: { id: string }, opts?: SendOptions) => Promise<unknown>` |
+| `golfsimHealth` | `(opts?: SendOptions) => Promise<HealthOut>` |
+
+`unknown` outputs correspond to Zig `std.json.Value` return types — cast to your concrete interface for type-safe access.
+
 ## Realtime + live store
 
 Realtime lives behind a **dedicated entry point**, `@zigbase/client/realtime`. Opt in with

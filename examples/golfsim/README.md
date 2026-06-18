@@ -274,6 +274,26 @@ The e2e suite (`test/`) drives the generated typed client (`clients/typescript/z
 against a live `golfsim` binary — covering CRUD, filtering, auth, and realtime with
 full TypeScript type-checking via `vitest`.
 
+### Using `zb.rpc.*`
+
+The generated client exposes typed methods for each custom route under `zb.rpc.*`:
+
+```ts
+// bookingsConfirm: POST /api/bookings/:id/confirm → unknown (cast for type-safe access)
+const confirmed = await zb.rpc.bookingsConfirm({ id: booking.id }) as Booking;
+
+// bookingsCancel: POST /api/bookings/:id/cancel
+await zb.rpc.bookingsCancel({ id: booking.id });
+
+// listingsAvailability: GET /api/listings/:id/availability
+const avail = await zb.rpc.listingsAvailability({ id: listing.id });
+
+// golfsimHealth: GET /api/golfsim/health → typed HealthOut { status: string; app: string }
+const health = await zb.rpc.golfsimHealth();
+```
+
+`unknown` outputs correspond to `std.json.Value` in Zig — cast to your concrete type for field access. The e2e test (`test/golfsim.e2e.test.ts`) exercises `bookingsConfirm` live through this surface.
+
 ---
 
 ## Building and running

@@ -311,6 +311,44 @@ The `@zigbase/client/typed` subpath tree-shakes independently of `@zigbase/clien
 importing just the typed core adds only the where-compiler and factory code, not the
 realtime / live-store graph.
 
+## Typed RPC — `zb.rpc.*`
+
+When a generated `zbase.gen.ts` declares typed routes (registered via the Zig server's `.routes` config), the generated client exposes them under `zb.rpc.<name>(params?, input?, opts?)`:
+
+- **`params` object** is present IFF the route path contains `:param` segments (e.g. `{ id: string }`).
+- **`input` argument** is present IFF the route's `Input` type is non-void (POST/PUT/PATCH bodies).
+- GET/DELETE routes pass non-param fields as **query string** parameters; POST/PUT/PATCH routes serialize them as the **request body**.
+- Throws a `ZigbaseError` on non-2xx — the same throw/parse behavior as `zb.send` and the typed collection methods.
+- An optional final `opts` argument accepts `SendOptions` (`signal`, `requestKey`, custom headers).
+
+The `rpc` namespace sits alongside `db`, `realtime`, and `files` on the generated client — it is only present when the Zig app declares at least one typed route.
+
+**golfsim example** — the golfsim server declares four typed routes; `zig build gen-client` (from `examples/golfsim/`) emits the following `rpc` interface:
+
+```ts
+// examples/golfsim/clients/typescript/zbase.gen.ts (excerpt)
+rpc: {
+  bookingsConfirm(params: { id: string }, opts?: SendOptions): Promise<unknown>;
+  bookingsCancel(params: { id: string }, opts?: SendOptions): Promise<unknown>;
+  listingsAvailability(params: { id: string }, opts?: SendOptions): Promise<unknown>;
+  golfsimHealth(opts?: SendOptions): Promise<HealthOut>;
+}
+```
+
+Usage in the golfsim e2e test:
+
+```ts
+// bookingsConfirm: POST /api/bookings/:id/confirm — params object; output is unknown
+const confirmed = await zb.rpc.bookingsConfirm({ id: booking.id }) as Booking;
+expect(confirmed.status).toBe("confirmed");
+
+// golfsimHealth: GET /api/golfsim/health — no params; typed HealthOut output
+const health = await zb.rpc.golfsimHealth();
+// health.status === "ok"
+```
+
+`unknown` outputs correspond to Zig `std.json.Value` return types — cast to a concrete interface for type-safe field access.
+
 ## Realtime + live store
 
 Realtime ships behind a **dedicated entry point**, `@zigbase/client/realtime`, so a REST-only
