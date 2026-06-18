@@ -146,4 +146,4 @@ The npm packaging itself is validated by `npm publish --dry-run` / `npm pack` in
 
 ## 10. Decomposition (for the plan)
 
-Cohesive single spec; the plan will break into ~tasks: (a) `src/main_dist.zig` + `dist-server` build target + host smoke build in CI; (b) `npm/` package scaffolding (server meta launcher + `binaryPath()`, the four platform package templates, the typegen wrapper) + wrapper smoke test; (c) the release workflow (OIDC, matrix, dependency-ordered publish, version assertion); (d) `npm/publish.mjs` bootstrap script; (e) the live round-trip e2e + `startAppServer` `dataDir` change; (f) docs.
+Cohesive single spec; the plan will break into ~tasks: (a) `src/main_dist.zig` + `dist-server` build target + host smoke build in CI; (b) `clients/typescript/npm/` package scaffolding (server meta launcher + `binaryPath()`, the four platform package templates, the typegen wrapper) + wrapper smoke test; (c) the release workflow (OIDC, matrix, dependency-ordered publish, version assertion); (d) `clients/typescript/npm/publish.mjs` bootstrap script; (e) the live round-trip e2e + `startAppServer` `dataDir` change; (f) docs.
