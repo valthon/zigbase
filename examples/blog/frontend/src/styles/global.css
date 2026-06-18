@@ -1,22 +1,314 @@
+/* ============================================================
+   ZigBase Blog — 1998 GeoCities / MySpace revival edition
+   Best viewed in Netscape Navigator at 800x600. No CDNs, no
+   external images: every texture is pure CSS. Crank the volume.
+   ============================================================ */
+
 :root {
-  --bg: #101216;
-  --fg: #e8eaf0;
-  --muted: #9aa3b2;
-  --accent: #f7a41d;
-  --card: #1a1d24;
-  font-family: system-ui, -apple-system, sans-serif;
+  --neon-pink: #ff00cc;
+  --neon-cyan: #00ffff;
+  --neon-green: #00ff66;
+  --neon-yellow: #ffff00;
+  --hot-blue: #0000ff;
+  --visited: #cc00ff;
+  --ink: #000033;
+  --paper: #ffffcc;
 }
+
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--fg); line-height: 1.6; }
-main { max-width: 720px; margin: 0 auto; padding: 2rem 1rem; }
-a { color: var(--accent); text-decoration: none; }
-a:hover { text-decoration: underline; }
-header.site { border-bottom: 1px solid #2a2e38; }
-header.site nav { max-width: 720px; margin: 0 auto; padding: 1rem; display: flex; gap: 1.25rem; align-items: baseline; }
-header.site .brand { font-weight: 700; font-size: 1.1rem; color: var(--fg); }
-.card { background: var(--card); border: 1px solid #2a2e38; border-radius: 8px; padding: 1rem 1.25rem; margin: 0.75rem 0; }
-.muted { color: var(--muted); font-size: 0.9rem; }
-input, textarea { width: 100%; padding: 0.5rem; margin: 0.25rem 0 0.75rem; background: #0c0e12; color: var(--fg); border: 1px solid #2a2e38; border-radius: 6px; font: inherit; }
-button { background: var(--accent); color: #101216; border: 0; border-radius: 6px; padding: 0.5rem 1rem; font-weight: 600; cursor: pointer; }
-button:disabled { opacity: 0.5; cursor: default; }
-.error { color: #ff6b6b; }
+
+html {
+  /* Starfield + tiled checker: layered radial "stars" over a
+     repeating diagonal gradient. All CSS, zero image files. */
+  background-color: #000022;
+  background-image:
+    radial-gradient(1.5px 1.5px at 20px 30px, #fff, transparent),
+    radial-gradient(1.5px 1.5px at 90px 70px, #fff, transparent),
+    radial-gradient(2px 2px at 140px 20px, #9bf, transparent),
+    radial-gradient(1px 1px at 50px 120px, #fff, transparent),
+    radial-gradient(2px 2px at 180px 100px, #ff9, transparent),
+    radial-gradient(1.5px 1.5px at 110px 160px, #fff, transparent),
+    repeating-linear-gradient(45deg, #000033 0, #000033 18px, #001 18px, #001 36px);
+  background-size: 200px 200px, 200px 200px, 200px 200px, 200px 200px, 200px 200px, 200px 200px, auto;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  line-height: 1.55;
+  font-family: "Times New Roman", Times, serif;
+  font-size: 17px;
+}
+
+/* ---- Links: classic blue, hot-pink hover, purple visited ---- */
+a { color: var(--hot-blue); text-decoration: underline; font-weight: bold; }
+a:visited { color: var(--visited); }
+a:hover { color: var(--neon-pink); background: var(--neon-yellow); }
+
+code, pre, .meta, .muted {
+  font-family: "Courier New", Courier, monospace;
+}
+
+h1, h2, h3 {
+  font-family: "Comic Sans MS", "Comic Sans", cursive;
+  margin: 0.4em 0;
+}
+
+h1 {
+  font-size: 2.1rem;
+  color: var(--neon-yellow);
+  text-shadow: 3px 3px 0 var(--neon-pink), 5px 5px 0 var(--hot-blue);
+  letter-spacing: 1px;
+}
+h2 { color: var(--hot-blue); }
+
+/* ============================================================
+   Header / nav — garish animated gradient bar
+   ============================================================ */
+header.site {
+  border-bottom: 6px ridge var(--neon-yellow);
+  background: linear-gradient(90deg,
+    #ff0000, #ff8800, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000);
+  background-size: 400% 400%;
+  animation: rainbow-slide 6s linear infinite;
+}
+@keyframes rainbow-slide {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 400% 50%; }
+}
+header.site nav {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0.75rem 1rem;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+header.site nav a {
+  background: #000;
+  color: var(--neon-cyan);
+  padding: 0.3rem 0.7rem;
+  border: 3px outset #999;
+  text-decoration: none;
+  font-family: "Comic Sans MS", "Comic Sans", cursive;
+}
+header.site nav a:hover {
+  background: var(--neon-pink);
+  color: #fff;
+  border-style: inset;
+}
+header.site .brand {
+  font-weight: 900;
+  font-size: 1.3rem;
+  color: var(--neon-yellow) !important;
+  text-shadow: 2px 2px 0 #000;
+}
+
+/* ---- Scrolling marquee banner ---- */
+.marquee-bar {
+  background: #000;
+  color: var(--neon-green);
+  font-family: "Comic Sans MS", "Comic Sans", cursive;
+  font-weight: bold;
+  border-bottom: 4px groove var(--neon-cyan);
+  padding: 3px 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+/* CSS fallback scroll (used if a <marquee>-class element is present) */
+.marquee-css span {
+  display: inline-block;
+  padding-left: 100%;
+  animation: marquee-scroll 16s linear infinite;
+}
+@keyframes marquee-scroll {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-100%); }
+}
+
+/* ============================================================
+   Main column — a "table" page on a tiled backdrop
+   ============================================================ */
+main {
+  max-width: 760px;
+  margin: 1.25rem auto;
+  padding: 1.25rem;
+  background: var(--paper);
+  border: 6px ridge var(--neon-pink);
+  box-shadow: 10px 10px 0 rgba(0,0,0,0.7);
+}
+
+p { margin: 0.6em 0; }
+
+code {
+  background: #000;
+  color: var(--neon-green);
+  padding: 1px 4px;
+  border: 1px solid var(--neon-green);
+}
+
+/* ============================================================
+   Cards — beveled "table" boxes with hard shadows
+   ============================================================ */
+.card {
+  background: #fff;
+  border: 5px outset #c0c0c0;
+  padding: 0.9rem 1.1rem;
+  margin: 1rem 0;
+  box-shadow: 6px 6px 0 rgba(0,0,0,0.55);
+  background-image: repeating-linear-gradient(
+    0deg, transparent, transparent 22px, #f3e0ff 22px, #f3e0ff 23px);
+}
+.card h2 { margin-top: 0; }
+article.card { position: relative; }
+article.card::before {
+  content: "★ NEW! ★";
+  position: absolute;
+  top: -12px;
+  right: 10px;
+  background: var(--neon-pink);
+  color: var(--neon-yellow);
+  font-family: "Comic Sans MS", "Comic Sans", cursive;
+  font-size: 0.7rem;
+  padding: 2px 6px;
+  border: 2px ridge var(--neon-yellow);
+  transform: rotate(6deg);
+}
+
+/* ---- Standalone post view ---- */
+main > article {
+  background: #fff;
+  border: 5px groove var(--neon-cyan);
+  padding: 1rem 1.25rem;
+  box-shadow: 6px 6px 0 rgba(0,0,0,0.55);
+}
+
+.muted {
+  color: #006600;
+  font-size: 0.85rem;
+  font-family: "Courier New", Courier, monospace;
+}
+
+.error {
+  color: #fff;
+  background: #cc0000;
+  border: 3px ridge #ff0;
+  padding: 0.4rem 0.6rem;
+  font-weight: bold;
+  font-family: "Comic Sans MS", "Comic Sans", cursive;
+}
+
+/* ============================================================
+   Forms / buttons — chunky beveled controls
+   ============================================================ */
+input, textarea {
+  width: 100%;
+  padding: 0.45rem;
+  margin: 0.25rem 0 0.75rem;
+  background: #ffffe0;
+  color: #000;
+  border: 3px inset #999;
+  font-family: "Courier New", Courier, monospace;
+  font-size: 1rem;
+}
+input:focus, textarea:focus {
+  outline: 3px dashed var(--neon-pink);
+  background: #fff;
+}
+
+button {
+  background: linear-gradient(180deg, #ff66ff, #cc00cc);
+  color: #fff;
+  border: 4px outset #ff99ff;
+  padding: 0.5rem 1.1rem;
+  font-family: "Comic Sans MS", "Comic Sans", cursive;
+  font-weight: bold;
+  font-size: 1rem;
+  cursor: pointer;
+  text-shadow: 1px 1px 0 #000;
+}
+button:hover { background: linear-gradient(180deg, #00ffff, #00aaaa); border-color: #aef; }
+button:active { border-style: inset; }
+button:disabled { opacity: 0.5; cursor: not-allowed; border-style: ridge; }
+button.muted {
+  background: #ccc;
+  color: #000;
+  border: 3px outset #999;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  text-shadow: none;
+}
+
+/* ============================================================
+   Decorative widgets: hit counter, badges, web-ring footer
+   ============================================================ */
+.hit-counter {
+  display: inline-block;
+  background: #000;
+  color: #00ff00;
+  font-family: "Courier New", Courier, monospace;
+  font-weight: bold;
+  font-size: 1.1rem;
+  letter-spacing: 3px;
+  padding: 4px 8px;
+  border: 3px inset #444;
+}
+.visitor-line {
+  text-align: center;
+  font-family: "Comic Sans MS", "Comic Sans", cursive;
+  margin: 0.5rem 0 1rem;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  justify-content: center;
+  margin: 1rem 0;
+}
+.badge {
+  font-family: "Courier New", Courier, monospace;
+  font-size: 0.7rem;
+  font-weight: bold;
+  padding: 4px 8px;
+  border: 3px outset #888;
+  text-align: center;
+  line-height: 1.2;
+}
+.badge.construction {
+  background: repeating-linear-gradient(45deg, #ffcc00 0 12px, #000 12px 24px);
+  color: #fff;
+  text-shadow: 1px 1px 0 #000, -1px -1px 0 #000;
+}
+.badge.netscape { background: #000; color: #00ff66; }
+.badge.html { background: #fff; color: #00f; }
+.badge.made { background: var(--neon-pink); color: var(--neon-yellow); }
+
+/* ---- blinking "Under Construction" effect ---- */
+.blink { animation: blink 1s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }
+
+footer.webring {
+  margin: 1.5rem auto 2rem;
+  max-width: 760px;
+  text-align: center;
+  color: var(--neon-cyan);
+  font-family: "Comic Sans MS", "Comic Sans", cursive;
+}
+footer.webring .ring {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: #000;
+  border: 4px ridge var(--neon-pink);
+  padding: 0.5rem 0.9rem;
+  margin-top: 0.5rem;
+}
+footer.webring .ring a { color: var(--neon-cyan); }
+footer.webring .sig {
+  margin-top: 0.6rem;
+  font-size: 0.8rem;
+  color: var(--neon-green);
+  font-family: "Courier New", Courier, monospace;
+}

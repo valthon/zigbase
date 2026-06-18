@@ -12,11 +12,30 @@ const { title = 'ZigBase Blog' } = Astro.props;
   <body>
     <header class="site">
       <nav>
-        <a class="brand" href="/">ZigBase Blog</a>
-        <a href="/write">Write</a>
-        <a href="/_/" data-astro-reload>Admin</a>
+        <a class="brand" href="/">~*~ ZigBase Blog ~*~</a>
+        <a href="/write">✍ Write</a>
+        <a href="/_/" data-astro-reload>⚙ Admin</a>
       </nav>
     </header>
+
+    <div class="marquee-bar">
+      <marquee scrollamount="6" behavior="scroll" direction="left">
+        ✨ WELCOME TO MY ZIGBASE HOMEPAGE ✨ &nbsp;•&nbsp; SIGN MY GUESTBOOK!
+        &nbsp;•&nbsp; BEST VIEWED IN NETSCAPE NAVIGATOR 4.0
+        &nbsp;•&nbsp; THIS SITE IS POWERED BY A SINGLE ZIG BINARY 🦎
+        &nbsp;•&nbsp; DON'T FORGET TO BOOKMARK!! ✨
+      </marquee>
+    </div>
+
     <main><slot /></main>
+
+    <footer class="webring">
+      <div class="ring">
+        <a href="/">« Prev</a>
+        <span>🌐 The ZigBase Web Ring 🌐</span>
+        <a href="/">Next »</a>
+      </div>
+      <div class="sig">© 1998 · handcrafted in Notepad · 100% Zig powered</div>
+    </footer>
   </body>
 </html>
