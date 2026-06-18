@@ -63,20 +63,33 @@ pub fn tsForType(comptime T: type) []const u8 {
 
 /// Append `export interface`/`export type` declarations for every named struct/enum
 /// reachable from T, dependencies first, deduplicated by tsName.
+///
+/// Returns `error.RpcTypeNameCollision` if two DISTINCT Zig types share the same
+/// short TS name (tsName), which would produce an ambiguous generated client.
 pub fn renderNamedDecls(comptime T: type, w: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
-    var seen = std.StringHashMap(void).init(alloc);
+    // Key = short TS name, value = full @typeName of the first type that claimed it.
+    var seen = std.StringHashMap([]const u8).init(alloc);
     defer seen.deinit();
     try renderNamedDeclsInner(T, w, alloc, &seen);
 }
 
-fn renderNamedDeclsInner(comptime T: type, w: *std.ArrayList(u8), alloc: std.mem.Allocator, seen: *std.StringHashMap(void)) !void {
+fn renderNamedDeclsInner(comptime T: type, w: *std.ArrayList(u8), alloc: std.mem.Allocator, seen: *std.StringHashMap([]const u8)) !void {
     switch (@typeInfo(T)) {
         .optional => |o| try renderNamedDeclsInner(o.child, w, alloc, seen),
         .pointer => |p| if (p.size == .slice and p.child != u8) try renderNamedDeclsInner(p.child, w, alloc, seen),
         .@"enum" => |e| {
             const nm = tsName(T);
-            if (seen.contains(nm)) return;
-            try seen.put(nm, {});
+            const full = @typeName(T);
+            if (seen.get(nm)) |stored_full| {
+                if (std.mem.eql(u8, stored_full, full)) return; // same type, already emitted
+                std.log.warn(
+                    "rpc: two distinct route types share the TS name '{s}': '{s}' vs '{s}'. " ++
+                        "Rename one so the generated client has a unique interface.",
+                    .{ nm, stored_full, full },
+                );
+                return error.RpcTypeNameCollision;
+            }
+            try seen.put(nm, full);
             try w.appendSlice(alloc, "export type ");
             try w.appendSlice(alloc, nm);
             try w.appendSlice(alloc, " = ");
@@ -90,8 +103,17 @@ fn renderNamedDeclsInner(comptime T: type, w: *std.ArrayList(u8), alloc: std.mem
         },
         .@"struct" => |s| {
             const nm = tsName(T);
-            if (seen.contains(nm)) return;
-            try seen.put(nm, {}); // mark before recursing so cycles terminate
+            const full = @typeName(T);
+            if (seen.get(nm)) |stored_full| {
+                if (std.mem.eql(u8, stored_full, full)) return; // same type, already emitted
+                std.log.warn(
+                    "rpc: two distinct route types share the TS name '{s}': '{s}' vs '{s}'. " ++
+                        "Rename one so the generated client has a unique interface.",
+                    .{ nm, stored_full, full },
+                );
+                return error.RpcTypeNameCollision;
+            }
+            try seen.put(nm, full); // mark before recursing so cycles still terminate
             // emit dependencies first
             inline for (s.fields) |f| try renderNamedDeclsInner(f.type, w, alloc, seen);
             // now emit this struct's interface
@@ -166,4 +188,14 @@ test "isRepresentable rejects unsupported" {
     try std.testing.expect(isRepresentable(Outer));
     try std.testing.expect(!isRepresentable(union(enum) { a: i32, b: bool }));
     try std.testing.expect(!isRepresentable(*i32)); // bare single-item pointer (non-slice)
+}
+
+test "renderNamedDecls rejects two distinct types sharing a TS name" {
+    const NsA = struct { const Status = struct { a: i32 }; };
+    const NsB = struct { const Status = struct { b: bool }; };
+    const Container = struct { x: NsA.Status, y: NsB.Status };
+    const a = std.testing.allocator;
+    var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
+    try std.testing.expectError(error.RpcTypeNameCollision, renderNamedDecls(Container, &w, a));
 }
