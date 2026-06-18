@@ -95,7 +95,7 @@ error.**
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
 
-## 3b. The `typegen` gate (`.enable_typegen`) {#the-apptypegen-gate-enable_typegen}
+## 3b. The `typegen` gate (`.enable_typegen`)
 
 Setting `.enable_typegen = true` in the `App(.{ … })` literal gates in the `typegen`
 subcommand, which generates a typed TypeScript client from the server's live schema (runtime

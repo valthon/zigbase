@@ -314,7 +314,7 @@ realtime / live-store graph.
 ## Runtime introspection (`zigbase typegen`)
 
 The `typegen` subcommand generates the same typed TypeScript client as the comptime generator,
-but from a **running instance's actual schema** rather than from the Zig source. It is aimed at
+but from the **server's actual schema (offline via its data directory, or live over HTTP)** rather than from the Zig source. It is aimed at
 teams that consume a ZigBase backend as a black box — no Zig source, no `build.zig` wiring, and
 no custom routes. If you **have** the Zig source, prefer the comptime generator (`zig build
 gen-client`) because it also emits a typed `rpc.*` surface for custom routes; the runtime
