@@ -57,6 +57,19 @@ pub fn build(b: *std.Build) void {
     const dating_srv_step = b.step("dating-server", "Build the dating fixture as a runnable server");
     dating_srv_step.dependOn(&b.addInstallArtifact(dating_srv_exe, .{}).step);
 
+    // dist-server: the engine with `enable_typegen = true` — the binary the
+    // @zigbase/server npm packages ship. Cross-compile via `-Dtarget=…`.
+    const dist_mod = b.createModule(.{
+        .root_source_file = b.path("src/main_dist.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    dist_mod.addImport("zigbase", zigbase_mod);
+    const dist_exe = b.addExecutable(.{ .name = "zigbase-dist", .root_module = dist_mod });
+    const dist_step = b.step("dist-server", "Build the typegen-enabled engine binary for distribution");
+    dist_step.dependOn(&b.addInstallArtifact(dist_exe, .{}).step);
+
     // Unit tests run against the library module (where all internal test{} live).
     const tests = b.addTest(.{ .root_module = zigbase_mod });
     const run_tests = b.addRunArtifact(tests);
