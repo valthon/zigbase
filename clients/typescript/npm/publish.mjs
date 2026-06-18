@@ -16,6 +16,9 @@ const SKIP_BUILD = args.has("--skip-build");
 const PROVENANCE = args.has("--provenance");
 const whatIdx = process.argv.indexOf("--what");
 const WHAT = whatIdx >= 0 ? process.argv[whatIdx + 1] : "all";
+if (whatIdx >= 0 && !["server", "typegen", "all"].includes(WHAT)) {
+  throw new Error("--what must be one of: server, typegen, all");
+}
 
 const TARGETS = [
   { key: "linux-x64", zig: "x86_64-linux-musl" },
@@ -31,7 +34,7 @@ function pkgName(dir) {
   return JSON.parse(readFileSync(join(HERE, dir, "package.json"), "utf8")).name;
 }
 function alreadyPublished(name, version) {
-  const r = spawnSync("npm", ["view", `${name}@${version}`, "version"], { encoding: "utf8" });
+  const r = spawnSync("npm", ["view", `${name}@${version}`, "version"], { encoding: "utf8", timeout: 10_000 });
   return r.status === 0 && r.stdout.trim() === version;
 }
 function publishDir(dir) {
