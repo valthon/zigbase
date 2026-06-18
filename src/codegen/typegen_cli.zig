@@ -3,7 +3,6 @@ const schema = @import("../schema.zig");
 const db = @import("../db.zig");
 const migrations = @import("../migrations.zig");
 const provision = @import("../provision.zig");
-const events = @import("../events.zig");
 const gen_client = @import("gen_client.zig");
 const acquire = @import("acquire.zig");
 const acquire_datadir = @import("acquire_datadir.zig");
