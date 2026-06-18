@@ -323,6 +323,15 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
         for (meta, 0..) |m, i| {
             route_types.assertRepresentable(m.Input, m.name);
             route_types.assertRepresentable(m.Output, m.name);
+            // GET/DELETE routes communicate their Input via a query string.
+            // If the Input is representable but not query-parseable (e.g. contains a
+            // non-string slice or a nested struct), the server's `parseQuery` cannot
+            // decode it and every call would get a misleading 400 at runtime. Catch it
+            // at build time instead.
+            if (m.method == .GET or m.method == .DELETE) {
+                if (!route_types.isQueryParseable(m.Input))
+                    @compileError("route '" ++ m.name ++ "': GET/DELETE Input must be encodable as a query string (scalars/enums/strings/optionals only); got a type with a non-query field. Use POST/PUT/PATCH for a JSON body, or simplify the Input.");
+            }
             for (meta[0..i]) |prev| {
                 if (std.mem.eql(u8, prev.name, m.name))
                     @compileError("duplicate route method name '" ++ m.name ++ "' (paths '" ++ prev.path ++ "' and '" ++ m.path ++ "') — add a distinct .name");

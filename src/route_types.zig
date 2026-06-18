@@ -252,8 +252,9 @@ fn findQueryValue(query: []const u8, name: []const u8) ?[]const u8 {
 /// True iff `T` can be parsed from a flat query string by `coerceQueryField`.
 /// Used by `makeThunk` as a comptime guard to avoid instantiating `parseQuery`
 /// for complex struct types (e.g. POST-body inputs with nested slices/structs)
-/// that will never appear on the GET code path at runtime.
-fn isQueryParseable(comptime T: type) bool {
+/// that will never appear on the GET code path at runtime. Also used by
+/// `buildRoutes` (events.zig) to enforce the GET/DELETE contract at app-build time.
+pub fn isQueryParseable(comptime T: type) bool {
     if (T == void) return true;
     if (T == []const u8) return true;
     const info = @typeInfo(T);
@@ -403,6 +404,37 @@ test "makeThunk: parses input, serializes output (200)" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"confirmed\":true") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"bk1\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"guests\":2") != null);
+}
+
+test "coerceQueryField: enum field parses valid variant, rejects unknown, optional works" {
+    const SortEnum = enum { newest, oldest };
+    const QueryWithEnum = struct { sort: SortEnum, maybe: ?SortEnum };
+
+    const a = testing.allocator;
+
+    // Valid variant: "newest" -> .newest
+    const q1 = try parseQuery(QueryWithEnum, a, "sort=newest&maybe=oldest");
+    try testing.expectEqual(SortEnum.newest, q1.sort);
+    try testing.expectEqual(SortEnum.oldest, q1.maybe.?);
+
+    // Optional absent -> null
+    const q2 = try parseQuery(QueryWithEnum, a, "sort=oldest");
+    try testing.expectEqual(SortEnum.oldest, q2.sort);
+    try testing.expect(q2.maybe == null);
+
+    // Unknown variant -> error.BadRequest
+    try testing.expectError(error.BadRequest, parseQuery(QueryWithEnum, a, "sort=unknown_variant"));
+}
+
+test "isQueryParseable: struct with non-string slice returns false" {
+    const Bad = struct { tags: []const []const u8 };
+    try testing.expect(!isQueryParseable(Bad));
+
+    const AlsoBad = struct { ids: []const u32 };
+    try testing.expect(!isQueryParseable(AlsoBad));
+
+    const Good = struct { q: []const u8, limit: i32, kind: enum { a, b }, flag: ?bool };
+    try testing.expect(isQueryParseable(Good));
 }
 
 test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
