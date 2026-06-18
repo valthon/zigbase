@@ -271,20 +271,18 @@ fn isQueryScalar(comptime F: type) bool {
 /// A top-level struct is accepted ONLY if every field is a query scalar (int,
 /// float, bool, enum, `[]const u8`, or optional-of-those). Nested structs and
 /// non-string slices are rejected — `parseQuery` only handles flat inputs.
+/// Only `void` and flat structs of scalars are accepted; bare scalars, optionals,
+/// and non-struct types are rejected so handlers must use a wrapping struct.
 pub fn isQueryParseable(comptime T: type) bool {
     if (T == void) return true;
-    if (T == []const u8) return true;
-    const info = @typeInfo(T);
-    return switch (info) {
-        .int, .float, .bool, .@"enum" => true,
-        .optional => |o| isQueryParseable(o.child),
+    return switch (@typeInfo(T)) {
         .@"struct" => |s| blk: {
             inline for (s.fields) |f| {
                 if (!isQueryScalar(f.type)) break :blk false;
             }
             break :blk true;
         },
-        else => false, // non-string slices, bare pointers, unions, etc.
+        else => false,
     };
 }
 
@@ -464,6 +462,13 @@ test "isQueryParseable: nested struct returns false; mixed flat struct returns t
     // All query-scalar fields: must be accepted.
     const K = enum { a, b };
     try testing.expect(isQueryParseable(struct { q: []const u8, n: i32, k: K, opt: ?i32 }));
+
+    // Bare scalars and optionals are NOT parseable (only void and flat structs are).
+    try testing.expect(!isQueryParseable(i32));
+    try testing.expect(!isQueryParseable(?i32));
+
+    // void is still parseable.
+    try testing.expect(isQueryParseable(void));
 }
 
 test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
