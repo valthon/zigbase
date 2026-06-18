@@ -328,7 +328,8 @@ The `typegen` subcommand exists **only** in binaries built with `.enable_typegen
 `npx @zigbase/typegen --data-dir ./zb_data --out src/zbase.gen.ts` (or `--url <origin>
 --admin-email <e> --admin-password <p>` for the live mode). It bundles the codegen engine
 through `@zigbase/server`, which ships prebuilt platform binaries for Linux and macOS. Install
-`@zigbase/client` separately; the generated file imports it at runtime.
+`@zigbase/client` separately; the generated file imports it (and its `/typed` subpath export,
+which is included in the same package) at runtime.
 
 ### Schema sources (exactly one required)
 

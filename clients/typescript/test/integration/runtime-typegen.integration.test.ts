@@ -5,6 +5,19 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startAppServer, DATING_BIN, superuserToken, type TestServer } from "./harness.js";
 
+/** Poll until cond() is true or timeoutMs elapses (no fixed sleeps). */
+function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (cond()) return resolve();
+      if (Date.now() > deadline) return reject(new Error("timeout waiting for condition"));
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+}
+
 const HERE = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const GOLDEN = resolve(HERE, "../codegen/dating/zbase.runtime.gen.ts");
 // Generate into a gitignored sibling of the golden so its `../../../src` imports resolve.
@@ -45,6 +58,7 @@ describe("runtime typegen — live round-trip (dating-server)", () => {
 
   it("the runtime-generated client works live: auth, CRUD, expand, realtime, int-coercion", async () => {
     runTypegen(["--data-dir", server.dataDir]);
+    // NOTE: this relative path must match LIVE_OUT; keep them in sync if LIVE_OUT changes.
     const mod = await import("../codegen/dating/zbase.runtime.live.gen.ts");
     const zb = mod.createClient(server.url, { WebSocket: globalThis.WebSocket });
 
@@ -86,7 +100,7 @@ describe("runtime typegen — live round-trip (dating-server)", () => {
       events.push(`${e.action}:${e.record.id}`);
     });
     await zb.db.photos.update(photo.id, { caption: "ridge-3" });
-    await new Promise((r) => setTimeout(r, 500));
+    await waitFor(() => events.some((s) => s.startsWith("update:")), 5000);
     off();
     expect(events.some((s) => s.startsWith("update:"))).toBe(true);
   });

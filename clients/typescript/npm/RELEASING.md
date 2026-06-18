@@ -30,11 +30,11 @@ enforces this order automatically:
 2. For the **first publish**, npm OIDC trusted publishing cannot be used because
    it requires the package to already exist on the registry. Bootstrap manually
    (see below). Afterwards, configure a trusted publisher for each package on
-   [npmjs.com](https://npmjs.com) and delete the `NPM_TOKEN` secret.
+   [npmjs.com](https://npmjs.com).
 
 ## Normal releases — OIDC (after the bootstrap publish)
 
-Push a tag to trigger the `release-npm.yml` workflow:
+Push a tag to trigger the `release-server.yml` workflow:
 
 - **Server packages:** push a `server-vX.Y.Z` tag (e.g. `server-v0.4.1`).
   The workflow cross-builds all four platform binaries and publishes all five
@@ -45,9 +45,11 @@ Push a tag to trigger the `release-npm.yml` workflow:
 The workflow uses `node clients/typescript/npm/publish.mjs --skip-build
 --provenance [--what server|typegen]` — the same script as the manual path.
 
-Until the trusted publisher is configured on npmjs.com, the workflow needs
-a `NPM_TOKEN` repository secret (an automation token with publish rights for
-the `@zigbase` org).
+The workflow publishes **exclusively via OIDC trusted publishing** (`--provenance`,
+`id-token: write` permission, no token). OIDC requires each package to already exist on the
+registry, which is why the first publish is done manually (see below). After the first publish,
+configure a per-package trusted publisher on npmjs.com for the `release-server.yml` workflow,
+and all subsequent tag pushes will publish without any npm token.
 
 ## First bootstrap publish (manual)
 

@@ -7,6 +7,6 @@
   "engines": { "node": ">=18" },
   "publishConfig": { "access": "public" },
   "dependencies": { "@zigbase/server": "^0.4.0" },
-  "repository": { "type": "git", "url": "https://github.com/valthon/zigbase" },
+  "repository": { "type": "git", "url": "git+https://github.com/valthon/zigbase.git" },
   "license": "MIT"
 }

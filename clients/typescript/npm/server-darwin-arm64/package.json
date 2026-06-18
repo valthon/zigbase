@@ -6,6 +6,6 @@
   "cpu": ["arm64"],
   "files": ["zigbase", "README.md"],
   "publishConfig": { "access": "public" },
-  "repository": { "type": "git", "url": "https://github.com/valthon/zigbase" },
+  "repository": { "type": "git", "url": "git+https://github.com/valthon/zigbase.git" },
   "license": "MIT"
 }

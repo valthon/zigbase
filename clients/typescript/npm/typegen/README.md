@@ -42,11 +42,14 @@ if you have the Zig source.
 
 ## Dependencies
 
-The generated file imports `@zigbase/client` and `@zigbase/client/typed`. Install them separately:
+The generated file imports `@zigbase/client` and its `/typed` subpath export. Both are included
+in a single package — one install covers everything:
 
 ```sh
 npm install @zigbase/client
 ```
+
+`@zigbase/client/typed` is a subpath export of `@zigbase/client`; no separate install is needed.
 
 No Zig toolchain is needed — `@zigbase/typegen` bundles the codegen engine through
 `@zigbase/server`, which ships prebuilt platform binaries.
