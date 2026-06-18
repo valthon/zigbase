@@ -81,6 +81,58 @@ pub fn HandlerOutput(comptime H: type) type {
     return ret_info.error_union.payload;
 }
 
+/// True iff `T` maps into the pragmatic Zig→TS subset (recursive over struct fields,
+/// optionals, and slices). `std.json.Value` is the `unknown` escape hatch.
+pub fn isRepresentable(comptime T: type) bool {
+    if (T == void) return true;
+    if (T == std.json.Value) return true;
+    const info = @typeInfo(T);
+    return switch (info) {
+        .int, .float, .bool => true,
+        .@"enum" => true, // string-literal union of the tag names
+        .optional => |o| isRepresentable(o.child),
+        .pointer => |p| blk: {
+            // Only slices are allowed: `[]const u8` is string, `[]T` is T[].
+            if (p.size != .slice) break :blk false;
+            if (p.child == u8) break :blk true; // string
+            break :blk isRepresentable(p.child);
+        },
+        .@"struct" => |s| blk: {
+            inline for (s.fields) |f| {
+                if (!isRepresentable(f.type)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false, // unions, fn, opaque, comptime-only, etc.
+    };
+}
+
+/// Comptime guard: `@compileError` (naming the route + the field path) when `T` (a route's
+/// Input or Output) isn't representable. Walks to report the FIRST offending field path.
+pub fn assertRepresentable(comptime T: type, comptime route_name: []const u8) void {
+    assertRepresentableField(T, route_name, "");
+}
+
+fn assertRepresentableField(comptime T: type, comptime route_name: []const u8, comptime path: []const u8) void {
+    if (T == void or T == std.json.Value) return;
+    const info = @typeInfo(T);
+    switch (info) {
+        .int, .float, .bool, .@"enum" => {},
+        .optional => |o| assertRepresentableField(o.child, route_name, path),
+        .pointer => |p| {
+            if (p.size != .slice)
+                @compileError("route '" ++ route_name ++ "' field '" ++ path ++ "': type " ++ @typeName(T) ++ " is not representable (only slices/strings allowed, not bare pointers)");
+            if (p.child != u8) assertRepresentableField(p.child, route_name, path ++ "[]");
+        },
+        .@"struct" => |s| {
+            inline for (s.fields) |f| {
+                assertRepresentableField(f.type, route_name, if (path.len == 0) f.name else path ++ "." ++ f.name);
+            }
+        },
+        else => @compileError("route '" ++ route_name ++ "' field '" ++ path ++ "': type " ++ @typeName(T) ++ " is not representable in the bounded Zig→TS subset"),
+    }
+}
+
 const testing = std.testing;
 
 test "Req carries typed input + records a custom failure" {
@@ -128,4 +180,27 @@ test "reflect Input/Output from a handler type" {
     }.h;
     try testing.expect(HandlerInput(@TypeOf(HV)) == void);
     try testing.expect(HandlerOutput(@TypeOf(HV)) == void);
+}
+
+test "isRepresentable accepts the bounded subset" {
+    try testing.expect(isRepresentable(void));
+    try testing.expect(isRepresentable(u32));
+    try testing.expect(isRepresentable(f64));
+    try testing.expect(isRepresentable(bool));
+    try testing.expect(isRepresentable([]const u8)); // string
+    try testing.expect(isRepresentable(?[]const u8)); // nullable string
+    try testing.expect(isRepresentable([]const u32)); // number[]
+    try testing.expect(isRepresentable(std.json.Value)); // unknown escape hatch
+    const En = enum { a, b };
+    try testing.expect(isRepresentable(En));
+    const Nested = struct { x: u8, tags: []const []const u8, label: ?[]const u8, kind: En };
+    try testing.expect(isRepresentable(Nested));
+}
+
+test "isRepresentable rejects unsupported types" {
+    try testing.expect(!isRepresentable(*u8)); // bare pointer (non-slice)
+    const U = union(enum) { a: u8, b: u16 };
+    try testing.expect(!isRepresentable(U)); // tagged union (rich tier; not in pragmatic core)
+    const WithFn = struct { f: *const fn () void };
+    try testing.expect(!isRepresentable(WithFn));
 }
