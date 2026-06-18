@@ -232,6 +232,15 @@ pub fn App(comptime cfg: anytype) type {
         else
             &.{};
 
+        /// Comptime-reflected route metadata from `.routes` (empty when absent).
+        /// Mirrors `App.collections`; consumed by the SP2.2b TS client generator to
+        /// emit typed fetch wrappers. Each entry carries the derived camelCase name,
+        /// method, path, auth level, and the handler's Input/Output types.
+        pub const routes: []const events.RouteMeta = if (@hasField(@TypeOf(cfg), "routes"))
+            events.routeMeta(cfg.routes)
+        else
+            &.{};
+
         /// Explicit migrations (the escape hatch for non-additive changes), run in
         /// order before provisioning and recorded once in `_migrations`. Empty by default.
         ///
@@ -755,10 +764,10 @@ test "App(cfg) builds a record dispatcher only when hooks are present" {
 }
 
 test "App(cfg) assembles custom routes onto dispatch" {
+    const route_types = @import("route_types.zig");
     const H = struct {
-        fn h(ev: *@import("events.zig").RouteEvent) anyerror!@import("http.zig").Response {
-            _ = ev;
-            return .{ .status = 200, .body = "ok" };
+        fn h(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
         }
     };
     const A = App(.{ .routes = .{ .{ .method = .GET, .path = "/api/x", .handler = H.h, .auth = .public } } });
@@ -912,4 +921,23 @@ test "App(cfg) static_files modes: default, disabled, dir, embedded (with coerci
     try std.testing.expectEqual(@as(usize, 1), E.static_mode.embedded.len);
     try std.testing.expectEqualStrings("index.html", E.static_mode.embedded[0].path);
     try std.testing.expectEqualStrings("\"abc\"", E.static_mode.embedded[0].etag);
+}
+
+test "App exposes route metadata for codegen" {
+    const route_types = @import("route_types.zig");
+    const In = struct { n: u32 };
+    const TestApp = App(.{
+        .routes = .{
+            .{
+                .method = .POST, .path = "/api/widgets/:id/poke",
+                .auth = .authed,
+                .handler = struct {
+                    fn h(req: *route_types.Req(In)) route_types.RouteError!void { _ = req; }
+                }.h,
+            },
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 1), TestApp.routes.len);
+    try std.testing.expectEqualStrings("widgetsPoke", TestApp.routes[0].name);
+    try std.testing.expect(TestApp.routes[0].Input == In);
 }

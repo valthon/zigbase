@@ -98,9 +98,12 @@ fn postsBeforeCreate(ev: *zigbase.RecordEvent) anyerror!void {
 }
 
 /// GET /api/blog/ping — a public custom route returning a small JSON body.
-fn ping(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    _ = ev;
-    return .{ .status = 200, .body = "{\"pong\":true}" };
+/// Typed (SP2.2a): `void` input, a typed `{pong: true}` output; the thunk
+/// serializes it to `{"pong":true}` (200) — identical wire body.
+const PingOut = struct { pong: bool };
+fn ping(req: *zigbase.Req(void)) zigbase.RouteError!PingOut {
+    _ = req;
+    return .{ .pong = true };
 }
 
 /// True iff `s` is a non-empty slug of only [A-Za-z0-9-]. We validate the path
@@ -116,20 +119,27 @@ fn isSafeSlug(s: []const u8) bool {
 }
 
 /// GET /api/blog/posts/:slug — return a single published post by slug.
-fn getPostBySlug(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const slug = ev.ctx.param("slug") orelse return .{ .status = 404, .body = "{\"message\":\"not found\"}" };
+/// Typed (SP2.2a): `void` input, `std.json.Value` output (the post is a dynamic
+/// record — `unknown` on the client). 404 when the slug is missing or no
+/// published post matches; 400 on an unsafe slug. The thunk serializes the
+/// returned record to a 200 JSON body (identical wire behavior).
+fn getPostBySlug(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
+    const slug = req.param("slug") orelse return req.fail(404, "not found");
     // Reject anything that isn't a clean slug before it reaches the filter.
-    if (!isSafeSlug(slug)) return .{ .status = 400, .body = "{\"message\":\"invalid slug\"}" };
-    var r = try ev.reader();
-    defer r.deinit();
-    const data = r.data();
-    const result = try data.list("posts", .{
-        .filter = try std.fmt.allocPrint(ev.ctx.allocator, "slug = '{s}' && status = 'published'", .{slug}),
-        .perPage = 1,
-    });
-    if (result.items.len == 0) return .{ .status = 404, .body = "{\"message\":\"not found\"}" };
-    const json = try std.json.Stringify.valueAlloc(ev.ctx.allocator, result.items[0], .{});
-    return .{ .status = 200, .body = json };
+    if (!isSafeSlug(slug)) return req.fail(400, "invalid slug");
+
+    const app: *zigbase.Runtime = @ptrCast(@alignCast(req.app.?));
+
+    // Acquire a pooled, read-only connection; keep `conn` local so its address is
+    // stable for `releaseReader(&conn)` and the Data facade.
+    var conn = app.pool.acquireReader() catch return error.RouteFailed;
+    defer app.pool.releaseReader(&conn);
+    const data = zigbase.Data{ .app = app, .conn = &conn, .io = app.io };
+
+    const filter = std.fmt.allocPrint(req.arena.?, "slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
+    const result = data.list("posts", .{ .filter = filter, .perPage = 1 }) catch return error.RouteFailed;
+    if (result.items.len == 0) return error.NotFound;
+    return result.items[0];
 }
 
 /// An interval job: logs a heartbeat (demonstrates background scheduling).

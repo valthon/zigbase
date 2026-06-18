@@ -28,21 +28,26 @@ jobs:
           restore-keys: npm-${{ runner.os }}-
       - name: Build plugins example frontend (embedded into the plugins binary)
         run: cd examples/plugins/frontend && mise exec node@24 -- npm ci --no-audit --no-fund && mise exec node@24 -- npm run build
+      # Shared binaries are built once here and run on OTHER jobs' runners, so they
+      # must target a portable CPU — zig's default is -mcpu=native, which can emit
+      # instructions a different runner lacks (→ SIGILL on startup). -Dcpu=baseline
+      # keeps them runnable on any x86_64 runner. (gen-*-check below run the generator
+      # on THIS runner, so they don't need it.)
       - name: Build main zigbase binary
-        run: mise exec zig@0.16.0 -- zig build
+        run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline
       - name: Build blog example consumer (dependency-graph proof)
-        run: cd examples/blog && mise exec zig@0.16.0 -- zig build
+        run: cd examples/blog && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
       - name: Build golfsim example consumer (realistic app)
-        run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build
+        run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
       - name: Build dating-server (e2e fixture binary)
-        run: mise exec zig@0.16.0 -- zig build dating-server
+        run: mise exec zig@0.16.0 -- zig build dating-server -Dcpu=baseline
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Golfsim client snapshot is fresh
         working-directory: examples/golfsim
         run: mise exec zig@0.16.0 -- zig build gen-client-check
       - name: Build plugins example consumer (advanced framework surface)
-        run: cd examples/plugins && mise exec zig@0.16.0 -- zig build
+        run: cd examples/plugins && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
       - name: Upload prebuilt binaries
         uses: actions/upload-artifact@v4
         with:

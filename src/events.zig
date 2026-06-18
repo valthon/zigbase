@@ -9,6 +9,7 @@ const http = @import("http.zig");
 const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
 const schema = @import("schema.zig");
+const route_types = @import("route_types.zig");
 
 // ---------------------------------------------------------------------------
 // RAII DB-access handles for the events that carry only `app` (RouteEvent,
@@ -209,26 +210,113 @@ pub const JobEvent = struct {
 pub const JobTask = *const fn (ev: *JobEvent) anyerror!void;
 
 /// `@compileError` on any route spec missing a required field (`.method`/`.path`/
-/// `.handler`) or with a wrong-typed handler, mirroring `validateHooks`. `.auth` is
-/// optional (defaults to `.superuser`) so it is intentionally not required here.
+/// `.handler`), mirroring `validateHooks`. `.auth` and `.name` are optional (auth
+/// defaults to `.superuser`; name defaults to the path-derived name) so they are
+/// intentionally not required here. The handler is the TYPED form
+/// (`fn(*route_types.Req(In)) route_types.RouteError!Out`); its shape is validated by
+/// `route_types.HandlerInput`/`HandlerOutput`'s own `@compileError`s when `routeMeta`
+/// reflects it — so no raw-Response coercion check is performed here.
 fn validateRouteSpecs(comptime specs: anytype) void {
     inline for (std.meta.fields(@TypeOf(specs))) |f| {
         const s = @field(specs, f.name);
         if (!@hasField(@TypeOf(s), "method")) @compileError("route spec is missing '.method' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "path")) @compileError("route spec is missing '.path' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "handler")) @compileError("route spec is missing '.handler' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
-        // Assert the handler coerces to RouteHandler so a wrong-typed handler fails loudly too.
-        const _h: RouteHandler = s.handler;
-        _ = _h;
     }
 }
 
-/// Assemble a comptime tuple of route specs into a runtime route table. Each spec is
-/// `.{ .method, .path, .handler, .auth = .public|.authed|.superuser }`; `.auth` defaults
-/// to `.superuser` (safe default) when omitted.
+/// Comptime route metadata for a typed route spec: the derived method name plus the
+/// reflected Input/Output types (the bounded Zig→TS subset surfaces). Consumed by the
+/// framework's comptime route assembly (collision + representability checks) and by the
+/// codegen generator (SP2.2b) to emit the TS RPC surface.
+pub const RouteMeta = struct {
+    method: http.Method,
+    path: []const u8,
+    name: []const u8,
+    auth: AuthLevel,
+    Input: type,
+    Output: type,
+};
+
+/// Comptime path→method-name (mirrors codegen `identifiers.routeMethodName`) with an
+/// optional `.name` override. Strips the "/api" prefix + ":param" segments, camel-joins
+/// the rest. Comptime-friendly (no allocator) for the framework-side collision check.
+fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const u8) []const u8 {
+    if (override) |n| return n;
+    comptime {
+        var rest: []const u8 = path;
+        const prefix = "/api";
+        if (std.mem.startsWith(u8, rest, prefix)) rest = rest[prefix.len..];
+        var name: []const u8 = "";
+        var first = true;
+        var it = std.mem.tokenizeScalar(u8, rest, '/');
+        while (it.next()) |seg| {
+            if (seg.len == 0 or seg[0] == ':') continue;
+            if (first) {
+                name = seg;
+                first = false;
+            } else {
+                var s: []const u8 = &[_]u8{std.ascii.toUpper(seg[0])};
+                s = s ++ seg[1..];
+                name = name ++ s;
+            }
+        }
+        return name;
+    }
+}
+
+/// Reflect a comptime tuple of typed route specs into `[]const RouteMeta`. Per spec,
+/// reads `.method`/`.path`/`.auth` (auth defaults to `.superuser`), derives the method
+/// name (`.name` override or `comptimeRouteName`), and reflects the handler's Input/Output
+/// via `route_types.HandlerInput`/`HandlerOutput` (which `@compileError` on a wrong-shaped
+/// handler). The `Holder`-const pattern gives the table static lifetime so the `[]const`
+/// slice is returnable.
+pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
+    const fields = std.meta.fields(@TypeOf(specs));
+    const Holder = struct {
+        const table: [fields.len]RouteMeta = blk: {
+            var t: [fields.len]RouteMeta = undefined;
+            for (fields, 0..) |f, i| {
+                const s = @field(specs, f.name);
+                const H = @TypeOf(s.handler);
+                const override: ?[]const u8 = if (@hasField(@TypeOf(s), "name")) s.name else null;
+                t[i] = .{
+                    .method = s.method,
+                    .path = s.path,
+                    .name = comptimeRouteName(s.path, override),
+                    .auth = if (@hasField(@TypeOf(s), "auth")) s.auth else .superuser,
+                    .Input = route_types.HandlerInput(H),
+                    .Output = route_types.HandlerOutput(H),
+                };
+            }
+            break :blk t;
+        };
+    };
+    return &Holder.table;
+}
+
+/// Assemble a comptime tuple of TYPED route specs into a runtime route table. Each spec is
+/// `.{ .method, .path, .handler, .auth = .public|.authed|.superuser, .name = "..." }`;
+/// `.auth` defaults to `.superuser` (safe default) and `.name` defaults to the path-derived
+/// name when omitted. The handler is `fn(*route_types.Req(In)) route_types.RouteError!Out`;
+/// it is wrapped in `route_types.makeThunk` so the stored `.handler` is a RouteHandler.
+/// Comptime-validates each route's Input/Output representability and `@compileError`s on a
+/// duplicate derived method name.
 pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
     comptime validateRouteSpecs(specs);
     const fields = std.meta.fields(@TypeOf(specs));
+    const meta = comptime routeMeta(specs);
+    // Representability + duplicate-name guards, all at comptime.
+    comptime {
+        for (meta, 0..) |m, i| {
+            route_types.assertRepresentable(m.Input, m.name);
+            route_types.assertRepresentable(m.Output, m.name);
+            for (meta[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name, m.name))
+                    @compileError("duplicate route method name '" ++ m.name ++ "' (paths '" ++ prev.path ++ "' and '" ++ m.path ++ "') — add a distinct .name");
+            }
+        }
+    }
     // A struct-namespace const has static lifetime, so &Holder.table is a valid []const returnable at runtime (a plain comptime local is not).
     const Holder = struct {
         const table: [fields.len]RuntimeRoute = blk: {
@@ -236,7 +324,7 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
             for (fields, 0..) |f, i| {
                 const s = @field(specs, f.name);
                 const auth: AuthLevel = if (@hasField(@TypeOf(s), "auth")) s.auth else .superuser;
-                t[i] = .{ .method = s.method, .pattern = s.path, .handler = s.handler, .auth = auth };
+                t[i] = .{ .method = s.method, .pattern = s.path, .handler = route_types.makeThunk(s.handler), .auth = auth };
             }
             break :blk t;
         };
@@ -453,13 +541,11 @@ test "only the matching phase's handler runs" {
 
 test "buildRoutes assembles a runtime route table preserving order, method, pattern, auth" {
     const H = struct {
-        fn a(ev: *RouteEvent) anyerror!http.Response {
-            _ = ev;
-            return .{ .status = 200, .body = "a" };
+        fn a(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
         }
-        fn b(ev: *RouteEvent) anyerror!http.Response {
-            _ = ev;
-            return .{ .status = 200, .body = "b" };
+        fn b(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
         }
     };
     const table = buildRoutes(.{
@@ -474,11 +560,38 @@ test "buildRoutes assembles a runtime route table preserving order, method, patt
     try std.testing.expect(table[1].auth == .superuser);
 }
 
+test "buildRoutes builds thunks + metadata with derived names" {
+    const In = struct { n: u32 };
+    const Out = struct { doubled: u32 };
+    const Specs = struct {
+        fn confirm(req: *route_types.Req(In)) route_types.RouteError!Out {
+            return .{ .doubled = req.input.n * 2 };
+        }
+        fn health(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
+        }
+    };
+    const specs = .{
+        .{ .method = http.Method.POST, .path = "/api/items/:id/confirm", .handler = Specs.confirm, .auth = AuthLevel.authed },
+        .{ .method = http.Method.GET, .path = "/api/health", .handler = Specs.health },
+    };
+    const routes = buildRoutes(specs);
+    try std.testing.expectEqual(@as(usize, 2), routes.len);
+    try std.testing.expectEqual(http.Method.POST, routes[0].method);
+
+    const meta = comptime routeMeta(specs);
+    try std.testing.expectEqualStrings("itemsConfirm", meta[0].name);
+    try std.testing.expectEqualStrings("health", meta[1].name);
+    try std.testing.expectEqual(AuthLevel.authed, meta[0].auth);
+    try std.testing.expect(meta[0].Input == In);
+    try std.testing.expect(meta[0].Output == Out);
+    try std.testing.expect(meta[1].Input == void);
+}
+
 test "buildRoutes defaults auth to .superuser when omitted" {
     const H = struct {
-        fn a(ev: *RouteEvent) anyerror!http.Response {
-            _ = ev;
-            return .{ .status = 200, .body = "a" };
+        fn a(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
         }
     };
     const table = buildRoutes(.{
