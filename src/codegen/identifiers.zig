@@ -209,6 +209,7 @@ test "routeMethodName matches the framework's comptimeRouteName" {
         "/api/golfsim/health",
         "/api/ping",
         "/api/user-profile/list-items", // separator case: both must strip '-'
+        "/api/Bookings/confirm", // uppercase-initial first segment: both must lowercase first char
         "/health",
     };
     inline for (cases) |path| {

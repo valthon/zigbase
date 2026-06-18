@@ -262,7 +262,9 @@ pub fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const 
             var seg_first = true;
             for (seg) |ch| {
                 if (ch == '_' or ch == '-') { upper_next = true; continue; }
-                const c = if (upper_next or (!first and seg_first)) std.ascii.toUpper(ch)
+                // Lowercase the first emitted char to match routeMethodName's camelCase (first char always lowercase).
+                const c = if (first and seg_first) std.ascii.toLower(ch)
+                          else if (upper_next or (!first and seg_first)) std.ascii.toUpper(ch)
                           else ch;
                 piece = piece ++ &[_]u8{c};
                 upper_next = false;
