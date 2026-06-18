@@ -113,12 +113,32 @@ export function makeRecordService(
     return out ?? data;
   }
 
+  // Inverse of coerceWrite: int/fixed fields arrive from the server as decimal
+  // strings; the typed surface types them `number`, so coerce back on read.
+  // Top-level fields only (symmetric with coerceWrite); expanded relation records
+  // belong to other collections/metas and are out of scope here.
+  function coerceRead<T>(rec: T): T {
+    if (rec == null || typeof rec !== "object") return rec;
+    let out: Record<string, unknown> | undefined;
+    for (const [k, fm] of Object.entries(meta.fields)) {
+      if (!fm.mode) continue;
+      const v = (rec as Record<string, unknown>)[k];
+      if (typeof v !== "string" || v === "") continue;
+      const n = Number(v);
+      if (Number.isNaN(n)) continue;
+      out ??= { ...(rec as Record<string, unknown>) };
+      out[k] = n;
+    }
+    return (out ?? rec) as T;
+  }
+
   return {
-    getList(opts) {
-      return inner.getList(opts?.page ?? 1, opts?.limit ?? 30, listOpts(opts));
+    async getList(opts) {
+      const res = await inner.getList(opts?.page ?? 1, opts?.limit ?? 30, listOpts(opts));
+      return { ...res, items: res.items.map(coerceRead) };
     },
     getOne(id, opts) {
-      return inner.getOne(id, readOpts(opts));
+      return inner.getOne(id, readOpts(opts)).then(coerceRead);
     },
     async getFirstListItem(opts) {
       const filter = whereToFilter(opts?.where);
@@ -132,7 +152,7 @@ export function makeRecordService(
       if (filter !== undefined) {
         // A where clause is present: delegate to SP1's getFirstListItem which
         // applies the filter server-side and throws a 404 ZigbaseError when empty.
-        return inner.getFirstListItem(filter, listOpts2);
+        return coerceRead(await inner.getFirstListItem(filter, listOpts2));
       }
       // No where: avoid passing an empty string to the server (which may match all
       // or behave differently per server). Use getList(1,1) instead and surface
@@ -146,10 +166,10 @@ export function makeRecordService(
           url: `/api/collections/${meta.name}/records`,
         });
       }
-      return first;
+      return coerceRead(first);
     },
-    getPage(opts) {
-      return inner.getPage({
+    async getPage(opts) {
+      const page = await inner.getPage({
         filter: whereToFilter(opts?.where),
         sort: opts?.sort,
         expand: expandList(opts?.expand),
@@ -159,9 +179,10 @@ export function makeRecordService(
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
+      return { ...page, items: page.items.map(coerceRead) };
     },
     iterate(opts) {
-      return inner.iterate({
+      const innerIter = inner.iterate({
         filter: whereToFilter(opts?.where),
         sort: opts?.sort,
         expand: expandList(opts?.expand),
@@ -169,9 +190,14 @@ export function makeRecordService(
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
+      return (async function* () {
+        for await (const item of innerIter) {
+          yield coerceRead(item);
+        }
+      })();
     },
-    getFullList(opts) {
-      return inner.getFullList({
+    async getFullList(opts) {
+      const list = await inner.getFullList({
         filter: whereToFilter(opts?.where),
         sort: opts?.sort,
         expand: expandList(opts?.expand),
@@ -179,12 +205,13 @@ export function makeRecordService(
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
+      return list.map(coerceRead);
     },
-    create(data, opts) {
-      return inner.create(coerceWrite(data as Record<string, unknown>), readOpts(opts));
+    async create(data, opts) {
+      return coerceRead(await inner.create(coerceWrite(data as Record<string, unknown>), readOpts(opts)));
     },
-    update(id, data, opts) {
-      return inner.update(id, coerceWrite(data as Record<string, unknown>), readOpts(opts));
+    async update(id, data, opts) {
+      return coerceRead(await inner.update(id, coerceWrite(data as Record<string, unknown>), readOpts(opts)));
     },
     delete(id) {
       return inner.delete(id);

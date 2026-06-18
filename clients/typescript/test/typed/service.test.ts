@@ -304,4 +304,161 @@ describe("makeRecordService", () => {
       expect.objectContaining({ requestKey: "full-key" }),
     );
   });
+
+  // --- coerceRead tests (int/fixed fields coerced back to numbers on read) ---
+
+  const numReadMeta: CollectionMeta = {
+    name: "things",
+    fields: {
+      count: { type: "number", mode: "int" },
+      price: { type: "number", mode: "fixed", scale: 2 },
+      label: { type: "text" },
+      weight: { type: "number" }, // no mode: not coerced
+    },
+    fileFields: [],
+    expandable: [],
+    isAuth: false,
+  };
+
+  it("coerceRead: int field returned as string by server is coerced to number on getOne", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.getOne.mockResolvedValueOnce({ id: "t1", count: "29", label: "hello" } as unknown as { id: string });
+    const rec = await svc.getOne("t1");
+    expect(rec.count).toBe(29);
+    expect(typeof rec.count).toBe("number");
+    // non-mode text field is untouched
+    expect(rec.label).toBe("hello");
+  });
+
+  it("coerceRead: fixed field returned as string by server is coerced to number on getOne", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.getOne.mockResolvedValueOnce({ id: "t1", count: "10", price: "3.14" } as unknown as { id: string });
+    const rec = await svc.getOne("t1");
+    expect(rec.price).toBe(3.14);
+    expect(typeof rec.price).toBe("number");
+  });
+
+  it("coerceRead: int field returned as string by server is coerced to number on getList items", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.getList.mockResolvedValueOnce({
+      page: 1, perPage: 30, totalItems: 1, totalPages: 1,
+      items: [{ id: "t1", count: "42", label: "x" } as Record<string, unknown>],
+    });
+    const res = await svc.getList();
+    expect(res.items[0]!.count).toBe(42);
+    expect(typeof res.items[0]!.count).toBe("number");
+    expect(res.items[0]!.label).toBe("x");
+  });
+
+  it("coerceRead: create returns int field coerced to number", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    // inner.create echoes back the body with the string-coerced value (simulating server response)
+    inner.create.mockResolvedValueOnce({ id: "new", count: "5", price: "40.00" } as unknown as { id: string });
+    const rec = await svc.create({ count: 5, price: 40 });
+    expect(rec.count).toBe(5);
+    expect(typeof rec.count).toBe("number");
+    expect(rec.price).toBe(40);
+    expect(typeof rec.price).toBe("number");
+  });
+
+  it("coerceRead: null/absent optional mode field is not coerced to 0", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.getOne.mockResolvedValueOnce({ id: "t1", count: null, price: undefined } as unknown as { id: string });
+    const rec = await svc.getOne("t1");
+    expect(rec.count).toBeNull();
+    // undefined field stays absent (not 0 or NaN)
+    expect(rec.price).toBeUndefined();
+  });
+
+  it("coerceRead: no-mode field (weight) returned as number is left as-is", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.getOne.mockResolvedValueOnce({ id: "t1", count: "1", weight: 3.14 } as unknown as { id: string });
+    const rec = await svc.getOne("t1");
+    expect(rec.weight).toBe(3.14);
+    expect(typeof rec.weight).toBe("number");
+  });
+
+  it("coerceRead: value already a number in mode field is left as-is", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.getOne.mockResolvedValueOnce({ id: "t1", count: 99 } as unknown as { id: string });
+    const rec = await svc.getOne("t1");
+    expect(rec.count).toBe(99);
+    expect(typeof rec.count).toBe("number");
+  });
+
+  it("coerceRead: update returns int field coerced to number", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.update.mockResolvedValueOnce({ id: "t1", count: "7" } as unknown as { id: string });
+    const rec = await svc.update("t1", { count: 7 });
+    expect(rec.count).toBe(7);
+    expect(typeof rec.count).toBe("number");
+  });
+
+  it("coerceRead: getFirstListItem (with where) coerces int fields", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.getFirstListItem.mockResolvedValueOnce({ id: "t1", count: "3" } as unknown as { id: string });
+    const rec = await svc.getFirstListItem({ where: { count: 3 } });
+    expect(rec.count).toBe(3);
+    expect(typeof rec.count).toBe("number");
+  });
+
+  it("coerceRead: getFirstListItem (without where) coerces int fields via getList path", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.getList.mockResolvedValueOnce({
+      page: 1, perPage: 1, totalItems: 1, totalPages: 1,
+      items: [{ id: "t1", count: "8" } as Record<string, unknown>],
+    });
+    const rec = await svc.getFirstListItem({});
+    expect(rec.count).toBe(8);
+    expect(typeof rec.count).toBe("number");
+  });
+
+  it("coerceRead: getPage items have int fields coerced to numbers", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.getPage.mockResolvedValueOnce({
+      items: [{ id: "t1", count: "15" } as Record<string, unknown>],
+      nextCursor: null, prevCursor: null, hasNext: false, hasPrev: false,
+    });
+    const page = await svc.getPage();
+    expect(page.items[0]!.count).toBe(15);
+    expect(typeof page.items[0]!.count).toBe("number");
+  });
+
+  it("coerceRead: getFullList items have int fields coerced to numbers", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.getFullList.mockResolvedValueOnce([
+      { id: "t1", count: "100" } as Record<string, unknown>,
+      { id: "t2", count: "200" } as Record<string, unknown>,
+    ]);
+    const list = await svc.getFullList();
+    expect(list[0]!.count).toBe(100);
+    expect(list[1]!.count).toBe(200);
+  });
+
+  it("coerceRead: iterate yields items with int fields coerced to numbers", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, numReadMeta);
+    inner.iterate.mockImplementationOnce(async function* () {
+      yield { id: "t1", count: "55" } as Record<string, unknown>;
+      yield { id: "t2", count: "66" } as Record<string, unknown>;
+    } as () => AsyncIterableIterator<Record<string, unknown>>);
+    const collected: unknown[] = [];
+    for await (const item of svc.iterate()) {
+      collected.push(item);
+    }
+    expect((collected[0] as Record<string, unknown>).count).toBe(55);
+    expect((collected[1] as Record<string, unknown>).count).toBe(66);
+  });
 });

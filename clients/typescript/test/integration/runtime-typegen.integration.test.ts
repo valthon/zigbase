@@ -72,7 +72,7 @@ describe("runtime typegen — live round-trip (dating-server)", () => {
 
     // Create a profile record (auth collection).
     // age is typed number/.int — int coercion on write converts it to a decimal string
-    // for the server; the server echoes it back as a string ("29") per ZigBase convention.
+    // for the server; the typed client coerces it back to a number on read.
     const profile = await zb.db.profiles.create({
       email: "live@d.app",
       password: "pw-12345678",
@@ -81,7 +81,7 @@ describe("runtime typegen — live round-trip (dating-server)", () => {
       age: 29, // exercises int-coercion path on write
     });
     expect(profile.id.length).toBeGreaterThan(0); // profile was created
-    expect(Number(profile.age)).toBe(29); // coerced int round-trips correctly as a number
+    expect(profile.age).toBe(29); // typed client coerces int/fixed reads back to numbers
 
     const tag = await zb.db.tags.create({ label: "trail" });
     const photo = await zb.db.photos.create({ owner: profile.id, caption: "ridge", tags: [tag.id] });
