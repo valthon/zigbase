@@ -321,6 +321,8 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
     // Representability + duplicate-name guards, all at comptime.
     comptime {
         for (meta, 0..) |m, i| {
+            if (m.name.len == 0)
+                @compileError("route '" ++ m.path ++ "' derives an empty method name; add an explicit .name to the route spec");
             route_types.assertRepresentable(m.Input, m.name);
             route_types.assertRepresentable(m.Output, m.name);
             // GET/DELETE routes communicate their Input via a query string.

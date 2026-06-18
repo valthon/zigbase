@@ -249,11 +249,28 @@ fn findQueryValue(query: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// True iff `T` is a query-string scalar: int, float, bool, enum, `[]const u8`,
+/// or an optional wrapping one of those. Does NOT accept structs or non-string
+/// slices — those are not coercible by `coerceQueryField`.
+fn isQueryScalar(comptime F: type) bool {
+    if (F == []const u8) return true;
+    const info = @typeInfo(F);
+    return switch (info) {
+        .int, .float, .bool, .@"enum" => true,
+        .optional => |o| isQueryScalar(o.child),
+        else => false, // struct, non-string slice, pointer, union, etc.
+    };
+}
+
 /// True iff `T` can be parsed from a flat query string by `coerceQueryField`.
 /// Used by `makeThunk` as a comptime guard to avoid instantiating `parseQuery`
 /// for complex struct types (e.g. POST-body inputs with nested slices/structs)
 /// that will never appear on the GET code path at runtime. Also used by
 /// `buildRoutes` (events.zig) to enforce the GET/DELETE contract at app-build time.
+///
+/// A top-level struct is accepted ONLY if every field is a query scalar (int,
+/// float, bool, enum, `[]const u8`, or optional-of-those). Nested structs and
+/// non-string slices are rejected — `parseQuery` only handles flat inputs.
 pub fn isQueryParseable(comptime T: type) bool {
     if (T == void) return true;
     if (T == []const u8) return true;
@@ -263,11 +280,11 @@ pub fn isQueryParseable(comptime T: type) bool {
         .optional => |o| isQueryParseable(o.child),
         .@"struct" => |s| blk: {
             inline for (s.fields) |f| {
-                if (!isQueryParseable(f.type)) break :blk false;
+                if (!isQueryScalar(f.type)) break :blk false;
             }
             break :blk true;
         },
-        else => false, // slices-of-slices, bare pointers, nested structs, unions, etc.
+        else => false, // non-string slices, bare pointers, unions, etc.
     };
 }
 
@@ -435,6 +452,18 @@ test "isQueryParseable: struct with non-string slice returns false" {
 
     const Good = struct { q: []const u8, limit: i32, kind: enum { a, b }, flag: ?bool };
     try testing.expect(isQueryParseable(Good));
+}
+
+test "isQueryParseable: nested struct returns false; mixed flat struct returns true" {
+    // Nested struct field: must be rejected even if the inner struct is all scalars.
+    try testing.expect(!isQueryParseable(struct { inner: struct { a: i32 } }));
+
+    // Non-string slice: must be rejected.
+    try testing.expect(!isQueryParseable(struct { tags: []const []const u8 }));
+
+    // All query-scalar fields: must be accepted.
+    const K = enum { a, b };
+    try testing.expect(isQueryParseable(struct { q: []const u8, n: i32, k: K, opt: ?i32 }));
 }
 
 test "makeThunk: RouteError -> status; req.fail -> custom status+message" {

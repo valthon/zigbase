@@ -72,6 +72,12 @@ pub fn metaConst(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
 /// (leading char lowercase, separators stripped with following char uppercased);
 /// subsequent segments PascalCased: "/api/bookings/:id/confirm" -> "bookingsConfirm",
 /// "/api/user-profile/list-items" -> "userProfileListItems".
+///
+/// NOTE: this function is NOT on the code-generation path — the generator consumes
+/// `events.RouteMeta.name` (populated at comptime by `events.comptimeRouteName`).
+/// It is retained as the reference implementation that the drift-guard test
+/// (`routeMethodName matches the framework's comptimeRouteName`) pins
+/// `comptimeRouteName` against. Do not delete it.
 pub fn routeMethodName(alloc: std.mem.Allocator, path: []const u8, api_prefix: []const u8) ![]const u8 {
     var rest = path;
     if (std.mem.startsWith(u8, rest, api_prefix)) rest = rest[api_prefix.len..];
