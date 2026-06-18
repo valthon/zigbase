@@ -43,6 +43,8 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build dating-server -Dcpu=baseline
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
+      - name: Dating runtime client snapshot is fresh
+        run: mise exec zig@0.16.0 -- zig build gen-dating-runtime-client-check
       - name: Golfsim client snapshot is fresh
         working-directory: examples/golfsim
         run: mise exec zig@0.16.0 -- zig build gen-client-check

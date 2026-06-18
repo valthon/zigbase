@@ -61,6 +61,14 @@ pub const codegen = struct {
     pub const rpc_ts = @import("codegen/rpc_ts.zig");
     /// RPC section renderer: assembles the three TS fragments from a []const RouteMeta (SP2.2b).
     pub const rpc = @import("codegen/rpc.zig");
+    /// Source-agnostic schema acquisition core: RawRow → Collection, auth-strip, name-sort.
+    pub const acquire = @import("codegen/acquire.zig");
+    /// Data-dir acquisition adapter: reads _collections from an open db handle or a data dir path.
+    pub const acquire_datadir = @import("codegen/acquire_datadir.zig");
+    /// HTTP acquisition adapter: superuser auth → GET /api/collections → parse.
+    pub const acquire_http = @import("codegen/acquire_http.zig");
+    /// CLI orchestrator: acquire → generate → write/check (data-dir + runtime equivalence).
+    pub const typegen_cli = @import("codegen/typegen_cli.zig");
 };
 
 // ---- Test discovery --------------------------------------------------------
@@ -136,5 +144,9 @@ test {
     _ = @import("codegen/gen_client.zig");
     _ = @import("codegen/rpc_ts.zig");
     _ = @import("codegen/rpc.zig");
+    _ = @import("codegen/acquire.zig");
+    _ = @import("codegen/acquire_datadir.zig");
+    _ = @import("codegen/acquire_http.zig");
+    _ = @import("codegen/typegen_cli.zig");
     _ = @import("route_types.zig");
 }

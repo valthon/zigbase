@@ -96,6 +96,41 @@ pub fn main(init: std.process.Init) !void {
 | `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
+| `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
+
+## 3b. The `typegen` gate (`.enable_typegen`) {#the-apptypegen-gate-enable_typegen}
+
+Setting `.enable_typegen = true` in the `App(.{ … })` literal gates in the `typegen`
+subcommand, which generates a typed TypeScript client from the server's live schema (runtime
+introspection). It is `false` by default so that production binaries carry no codegen code or
+dependencies.
+
+```zig
+// client-generation build target — NOT your production binary
+zigbase.App(.{
+    .collections = .{ /* … */ },
+    .enable_typegen = true,
+}).runCli(init);
+```
+
+Invoke the subcommand against a provisioned data directory (no server required) or against a
+running instance:
+
+```bash
+# Offline — reads an already-provisioned data directory:
+./myserver-gen typegen --data-dir ./zb_data --out src/zbase.gen.ts
+
+# Live — against a running instance (superuser credentials required):
+./myserver-gen typegen --url https://api.example.com --admin-email admin@x.io --admin-password '…' --out src/zbase.gen.ts
+```
+
+The generated output is the typed `db` / realtime / files surface. Because custom routes are
+not introspectable at runtime, `rpc.*` is **not** emitted — use the comptime generator (`zig
+build gen-client`) if you need typed RPC. See the [TypeScript SDK docs](./typescript-sdk#runtime-introspection-zigbase-typegen)
+for flags and a CI staleness-gate recipe.
+
+> **Recommendation:** keep `enable_typegen = false` in your main application binary and true
+> only in a dedicated client-generation build step or a separate `build.zig` target.
 
 ## 4. Record hooks (`.hooks`)
 

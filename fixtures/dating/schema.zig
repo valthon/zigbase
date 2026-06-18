@@ -55,6 +55,7 @@ fn winksRaw(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 }
 
 pub const App = zigbase.App(.{
+    .enable_typegen = true,
     .routes = .{
         .{ .method = .POST, .path = "/api/echo/:id/ping", .handler = echoPing, .auth = .public },
         .{ .method = .POST, .path = "/api/winks/send", .handler = winksSend, .auth = .public },

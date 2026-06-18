@@ -128,7 +128,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -167,6 +167,10 @@ pub fn App(comptime cfg: anytype) type {
         /// Comptime warm-reader-pool cap (the `.pools.readers` lever). Defaults to 16,
         /// the historical hardcoded value; shrink it to reduce the connection footprint.
         pub const reader_pool_size: usize = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "readers")) cfg.pools.readers else 16;
+
+        /// Whether to compile the `typegen` CLI subcommand into the binary.
+        /// Off by default so production builds carry no codegen weight.
+        pub const enable_typegen: bool = if (@hasField(@TypeOf(cfg), "enable_typegen")) cfg.enable_typegen else false;
 
         /// Per-thread stack size (bytes) for the scheduler/job-pool/submit threads
         /// (the `.pools.stack_size` lever). Defaults to `scheduler.default_job_stack_size`
@@ -267,6 +271,7 @@ pub fn App(comptime cfg: anytype) type {
             .cache_kib = cache_kib,
             .static_mode = static_mode,
             .pagination = pagination_config,
+            .enable_typegen = enable_typegen,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -292,6 +297,9 @@ pub const ServeOpts = struct {
     cache_kib: u32 = db.default_cache_kib,
     static_mode: static_files.Mode = .default,
     pagination: pagination.Config = .{},
+    /// When true, compiles the `typegen` CLI subcommand into the binary.
+    /// Off by default so production builds carry no codegen.
+    enable_typegen: bool = false,
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -317,6 +325,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .serve => printServeUsage(std.meta.activeTag(opts.static_mode) == .default),
             .migrate => printMigrateUsage(),
             .superuser_create => printSuperuserUsage(),
+            .typegen => printTypegenUsage(),
         },
         .serve => |sa| {
             const cfg = try loadCfg(init.environ_map, sa);
@@ -324,6 +333,32 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         },
         .migrate => |sa| try migrateImpl(allocator, init.io, init.environ_map, sa),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
+        .typegen => |ta| {
+            if (opts.enable_typegen) {
+                const tgen = @import("codegen/typegen_cli.zig");
+                var arena_state = std.heap.ArenaAllocator.init(init.gpa);
+                defer arena_state.deinit();
+                const a = arena_state.allocator();
+                const out = ta.out orelse {
+                    std.log.err("typegen: --out <path> is required", .{});
+                    return error.MissingOut;
+                };
+                try tgen.run(a, init.io, .{
+                    .data_dir = ta.data_dir,
+                    .url = ta.url,
+                    .out = out,
+                    .api_prefix = ta.api_prefix,
+                    .client_name = ta.client_name,
+                    .check = ta.check,
+                    .in_repo = init.environ_map.contains("ZBASE_INREPO"),
+                    .admin_email = ta.admin_email,
+                    .admin_password = ta.admin_password,
+                });
+            } else {
+                std.log.err("typegen: this binary was not built with .enable_typegen = true", .{});
+                return;
+            }
+        },
     }
 }
 
@@ -748,6 +783,17 @@ fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const
         return;
     };
     std.log.info("superuser created: {s}", .{email});
+}
+
+fn printTypegenUsage() void {
+    std.debug.print(
+        \\Usage: <app> typegen (--data-dir <path> | --url <origin>) --out <file>
+        \\                     [--api-prefix <prefix>] [--client-name <name>] [--check]
+        \\                     [--admin-email <e> --admin-password <p>]   (with --url)
+        \\
+        \\Generates a typed TypeScript client from a running instance's schema.
+        \\
+    , .{});
 }
 
 test "App(cfg) builds a record dispatcher only when hooks are present" {
