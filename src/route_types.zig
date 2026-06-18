@@ -25,6 +25,20 @@ pub fn statusForError(e: RouteError) u16 {
     };
 }
 
+/// Human-readable message for a `RouteError` when no custom `req.fail` message was recorded.
+/// `RouteFailed` without a recorded failure means the handler returned it directly (no message);
+/// surface a generic 500-style string — the status is already 500 via `statusForError`.
+pub fn messageForError(e: RouteError) []const u8 {
+    return switch (e) {
+        error.BadRequest => "Bad request.",
+        error.Unauthorized => "Not authenticated.",
+        error.Forbidden => "Forbidden.",
+        error.NotFound => "Not found.",
+        error.Conflict => "Conflict.",
+        error.RouteFailed => "Internal error.",
+    };
+}
+
 /// The typed request handed to a route handler. `Input` is the parsed body/query;
 /// `params` are path params; `auth_id` is the caller's id ("" when anonymous).
 /// `app`/`io` give DB access (same handles as RouteEvent today). `failure` is set by `fail`.
@@ -67,6 +81,7 @@ pub fn HandlerInput(comptime H: type) type {
     const ptr_t = fn_info.params[0].type orelse @compileError("route handler parameter type is unknown");
     const ptr_info = @typeInfo(ptr_t);
     if (ptr_info != .pointer) @compileError("route handler parameter must be *Req(Input)");
+    if (ptr_info.pointer.size != .one) @compileError("route handler parameter must be a single-item pointer *Req(Input)");
     const ReqT = ptr_info.pointer.child;
     if (!@hasDecl(ReqT, "Input")) @compileError("route handler parameter must be *Req(Input) (missing Req.Input)");
     return ReqT.Input;
@@ -74,6 +89,7 @@ pub fn HandlerInput(comptime H: type) type {
 
 /// Extract `Output` from a handler type `fn(...) RouteError!Output` (the error-union payload).
 pub fn HandlerOutput(comptime H: type) type {
+    if (@typeInfo(H) != .@"fn") @compileError("route handler must be a function");
     const info = @typeInfo(H);
     const ret = info.@"fn".return_type orelse @compileError("route handler return type is unknown");
     const ret_info = @typeInfo(ret);
@@ -84,8 +100,10 @@ pub fn HandlerOutput(comptime H: type) type {
 /// Extract the error set from a handler type `fn(...) E!Output`.
 /// Used by `makeThunk` to enforce that the error set is exactly `RouteError`.
 pub fn HandlerErrorSet(comptime H: type) type {
+    if (@typeInfo(H) != .@"fn") @compileError("route handler must be a function");
     const info = @typeInfo(H);
     const ret = info.@"fn".return_type orelse @compileError("route handler return type is unknown");
+    if (@typeInfo(ret) != .error_union) @compileError("route handler must return RouteError!Output");
     return @typeInfo(ret).error_union.error_set;
 }
 
@@ -178,7 +196,7 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
                 if (req.failure) |f|
                     return jsonError(a, f.status, f.message);
                 const re: RouteError = @errorCast(e);
-                return jsonError(a, statusForError(re), @errorName(re));
+                return jsonError(a, statusForError(re), messageForError(re));
             };
             // 4. Serialize output (204 for void, else 200 JSON).
             if (Out == void) return .{ .status = 204, .body = "" };
@@ -230,11 +248,10 @@ fn findQueryValue(query: []const u8, name: []const u8) ?[]const u8 {
 /// float -> parseFloat, bool -> "true"/"1". Missing required value -> error.BadRequest.
 /// Optionals: a missing value becomes null.
 fn coerceQueryField(comptime F: type, a: std.mem.Allocator, raw: ?[]const u8) !F {
-    _ = a;
     const info = @typeInfo(F);
     if (info == .optional) {
         const r = raw orelse return null;
-        return try coerceQueryField(info.optional.child, undefined, r);
+        return try coerceQueryField(info.optional.child, a, r);
     }
     const r = raw orelse return error.BadRequest;
     if (F == []const u8) return r;
