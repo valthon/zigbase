@@ -81,6 +81,14 @@ pub fn HandlerOutput(comptime H: type) type {
     return ret_info.error_union.payload;
 }
 
+/// Extract the error set from a handler type `fn(...) E!Output`.
+/// Used by `makeThunk` to enforce that the error set is exactly `RouteError`.
+pub fn HandlerErrorSet(comptime H: type) type {
+    const info = @typeInfo(H);
+    const ret = info.@"fn".return_type orelse @compileError("route handler return type is unknown");
+    return @typeInfo(ret).error_union.error_set;
+}
+
 /// True iff `T` maps into the pragmatic Zig→TS subset (recursive over struct fields,
 /// optionals, and slices). `std.json.Value` is the `unknown` escape hatch.
 pub fn isRepresentable(comptime T: type) bool {
@@ -140,6 +148,8 @@ fn assertRepresentableField(comptime T: type, comptime route_name: []const u8, c
 /// cycle (events.zig imports route_types for Req/RouteError).
 pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
     const H = @TypeOf(handler);
+    if (HandlerErrorSet(H) != RouteError)
+        @compileError("route handler must return RouteError!Output, found a different error set: " ++ @typeName(HandlerErrorSet(H)));
     const In = HandlerInput(H);
     const Out = HandlerOutput(H);
     const events = @import("events.zig");
@@ -185,7 +195,8 @@ fn badRequest(a: std.mem.Allocator, msg: []const u8) @import("http.zig").Respons
 }
 
 /// Build `{"message": <json-escaped message>}` at `status`. Uses `std.json.fmt` with the
-/// `{f}` format spec (Zig 0.16: the bare `{}` spec mis-formats the JSON formatter struct).
+/// `{f}` format spec (Zig 0.16: `std.json.fmt` returns a value with a `format` method;
+/// `{f}` invokes that method to emit properly JSON-escaped output).
 fn jsonError(a: std.mem.Allocator, status: u16, message: []const u8) !@import("http.zig").Response {
     const body = try std.fmt.allocPrint(a, "{{\"message\":{f}}}", .{std.json.fmt(message, .{})});
     return .{ .status = status, .body = body };
@@ -195,6 +206,8 @@ fn jsonError(a: std.mem.Allocator, status: u16, message: []const u8) !@import("h
 /// Covers GET/DELETE routes whose Input is flat; golfsim's GET routes use `Req(void)`,
 /// so today this is exercised only by its own unit test.
 fn parseQuery(comptime T: type, a: std.mem.Allocator, query: []const u8) !T {
+    if (@typeInfo(T) != .@"struct")
+        @compileError("GET/DELETE route Input must be a struct (typed query input lands in SP2.2b): " ++ @typeName(T));
     var result: T = undefined;
     inline for (@typeInfo(T).@"struct".fields) |f| {
         const raw = findQueryValue(query, f.name);
@@ -229,7 +242,7 @@ fn coerceQueryField(comptime F: type, a: std.mem.Allocator, raw: ?[]const u8) !F
         .int => std.fmt.parseInt(F, r, 10) catch error.BadRequest,
         .float => std.fmt.parseFloat(F, r) catch error.BadRequest,
         .bool => std.mem.eql(u8, r, "true") or std.mem.eql(u8, r, "1"),
-        else => error.BadRequest,
+        else => @compileError("GET/DELETE query field type not yet supported (SP2.2b): " ++ @typeName(F)),
     };
 }
 
@@ -280,6 +293,15 @@ test "reflect Input/Output from a handler type" {
     }.h;
     try testing.expect(HandlerInput(@TypeOf(HV)) == void);
     try testing.expect(HandlerOutput(@TypeOf(HV)) == void);
+}
+
+test "HandlerErrorSet returns RouteError for a normal handler" {
+    const h = struct {
+        fn run(req: *Req(void)) RouteError!void {
+            _ = req;
+        }
+    }.run;
+    try testing.expect(HandlerErrorSet(@TypeOf(h)) == RouteError);
 }
 
 test "isRepresentable accepts the bounded subset" {
