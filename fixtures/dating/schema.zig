@@ -5,7 +5,49 @@
 const std = @import("std");
 const zigbase = @import("zigbase");
 
+// ---------------------------------------------------------------------------
+// Route types + handlers for the RPC golden-test coverage.
+// All handlers are pure (no DB access) so the fixture compiles and runs
+// trivially as the live dating-server binary.
+// ---------------------------------------------------------------------------
+
+const Color = enum { red, green, blue };
+const SendWinkIn = struct {
+    note: []const u8,
+    color: Color,
+    sticker: ?[]const u8,
+    tags: []const []const u8,
+};
+const SendWinkOut = struct { ok: bool, note: []const u8 };
+const SearchOut = struct { count: i64 };
+
+// void input + path param + struct output (POST)
+fn echoPing(req: *zigbase.Req(void)) zigbase.RouteError!SendWinkOut {
+    return .{ .ok = true, .note = req.param("id") orelse "" };
+}
+// POST body input (nested enum/optional/array) + struct output
+fn winksSend(req: *zigbase.Req(SendWinkIn)) zigbase.RouteError!SendWinkOut {
+    if (req.input.note.len == 0) return req.fail(400, "note required");
+    return .{ .ok = true, .note = req.input.note };
+}
+// GET query input (flat scalars) + struct output
+const SearchIn = struct { q: []const u8, limit: i32 };
+fn messagesSearch(req: *zigbase.Req(SearchIn)) zigbase.RouteError!SearchOut {
+    return .{ .count = req.input.limit };
+}
+// void input + void output (GET) — exercises Promise<void>
+fn winksStatus(req: *zigbase.Req(void)) zigbase.RouteError!void {
+    _ = req;
+    return;
+}
+
 pub const App = zigbase.App(.{
+    .routes = .{
+        .{ .method = .POST, .path = "/api/echo/:id/ping", .handler = echoPing },
+        .{ .method = .POST, .path = "/api/winks/send", .handler = winksSend },
+        .{ .method = .GET, .path = "/api/messages/search", .handler = messagesSearch },
+        .{ .method = .GET, .path = "/api/winks/status", .handler = winksStatus },
+    },
     .collections = .{
         .profiles = .{
             .type = .auth,

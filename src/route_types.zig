@@ -177,10 +177,15 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
         fn run(ev: *events.RouteEvent) anyerror!http.Response {
             const a = ev.ctx.allocator;
             // 1. Parse input (void -> skip; GET/DELETE -> query; else JSON body).
+            // The GET query branch is gated behind a comptime `isQueryParseable(In)`
+            // so that complex POST-body types (with nested slices, enums, optional
+            // structs) don't instantiate `parseQuery` and hit its @compileError paths.
             const input: In = if (In == void) {} else blk: {
-                if (ev.ctx.method == .GET or ev.ctx.method == .DELETE) {
-                    break :blk parseQuery(In, a, ev.ctx.query) catch
-                        return badRequest(a, "Invalid query parameters.");
+                if (comptime isQueryParseable(In)) {
+                    if (ev.ctx.method == .GET or ev.ctx.method == .DELETE) {
+                        break :blk parseQuery(In, a, ev.ctx.query) catch
+                            return badRequest(a, "Invalid query parameters.");
+                    }
                 }
                 if (ev.ctx.body.len == 0) return badRequest(a, "Missing request body.");
                 break :blk (std.json.parseFromSlice(In, a, ev.ctx.body, .{ .ignore_unknown_fields = true }) catch
@@ -244,9 +249,30 @@ fn findQueryValue(query: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// True iff `T` can be parsed from a flat query string by `coerceQueryField`.
+/// Used by `makeThunk` as a comptime guard to avoid instantiating `parseQuery`
+/// for complex struct types (e.g. POST-body inputs with nested slices/structs)
+/// that will never appear on the GET code path at runtime.
+fn isQueryParseable(comptime T: type) bool {
+    if (T == void) return true;
+    if (T == []const u8) return true;
+    const info = @typeInfo(T);
+    return switch (info) {
+        .int, .float, .bool, .@"enum" => true,
+        .optional => |o| isQueryParseable(o.child),
+        .@"struct" => |s| blk: {
+            inline for (s.fields) |f| {
+                if (!isQueryParseable(f.type)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false, // slices-of-slices, bare pointers, nested structs, unions, etc.
+    };
+}
+
 /// Coerce a raw query value into a field type: string -> the slice, int -> parseInt,
-/// float -> parseFloat, bool -> "true"/"1". Missing required value -> error.BadRequest.
-/// Optionals: a missing value becomes null.
+/// float -> parseFloat, bool -> "true"/"1", enum -> tag name match.
+/// Missing required value -> error.BadRequest. Optionals: a missing value becomes null.
 fn coerceQueryField(comptime F: type, a: std.mem.Allocator, raw: ?[]const u8) !F {
     const info = @typeInfo(F);
     if (info == .optional) {
@@ -259,7 +285,8 @@ fn coerceQueryField(comptime F: type, a: std.mem.Allocator, raw: ?[]const u8) !F
         .int => std.fmt.parseInt(F, r, 10) catch error.BadRequest,
         .float => std.fmt.parseFloat(F, r) catch error.BadRequest,
         .bool => std.mem.eql(u8, r, "true") or std.mem.eql(u8, r, "1"),
-        else => @compileError("GET/DELETE query field type not yet supported (SP2.2b): " ++ @typeName(F)),
+        .@"enum" => std.meta.stringToEnum(F, r) orelse error.BadRequest,
+        else => @compileError("GET/DELETE query field type not yet supported: " ++ @typeName(F)),
     };
 }
 
