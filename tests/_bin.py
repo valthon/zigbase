@@ -21,10 +21,17 @@ def _zig_build(package_dir: pathlib.Path, bin_name: str) -> str:
 
 
 def resolve_binary(env_var: str, package_dir: pathlib.Path, bin_name: str) -> str:
-    """Return the prebuilt binary named by $env_var if it exists, else build it."""
+    """Return the prebuilt binary named by $env_var if it exists, else build it.
+
+    A set-but-missing override is a misconfiguration (e.g. a missing CI
+    artifact); raise rather than silently rebuild, which would mask the problem
+    and require a Zig toolchain the lean test jobs do not install.
+    """
     override = os.environ.get(env_var)
-    if override and pathlib.Path(override).exists():
-        return override
+    if override:
+        if pathlib.Path(override).exists():
+            return override
+        raise FileNotFoundError(f"{env_var}={override} does not exist")
     return _zig_build(package_dir, bin_name)
 
 
@@ -33,11 +40,15 @@ def resolve_plugins_binary():
 
     Returns the $ZIGBASE_TEST_PLUGINS_BINARY override if it exists; otherwise
     builds the frontend (needs npm) and the binary, returning its path. Returns
-    None when npm is unavailable so the caller can pytest.skip().
+    None when no override is set and npm is unavailable so the caller can
+    pytest.skip(). A set-but-missing override raises instead — silently skipping
+    in CI would hide a missing artifact as a passing (skipped) test.
     """
     override = os.environ.get("ZIGBASE_TEST_PLUGINS_BINARY")
-    if override and pathlib.Path(override).exists():
-        return override
+    if override:
+        if pathlib.Path(override).exists():
+            return override
+        raise FileNotFoundError(f"ZIGBASE_TEST_PLUGINS_BINARY={override} does not exist")
     if shutil.which("npm") is None:
         return None
     plugins = REPO / "examples" / "plugins"

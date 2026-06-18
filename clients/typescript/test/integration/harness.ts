@@ -9,8 +9,10 @@ import { fileURLToPath } from "node:url";
 const HERE = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const REPO_ROOT = resolve(HERE, "../../../..");
 // CI supplies a prebuilt binary via ZIGBASE_TEST_BINARY; otherwise use the
-// zig-out path produced by ensureBuilt()'s `zig build`.
-const BIN = process.env.ZIGBASE_TEST_BINARY ?? join(REPO_ROOT, "zig-out", "bin", "zigbase");
+// zig-out path produced by ensureBuilt()'s `zig build`. `||` (not `??`) so an
+// empty-string override also falls back, matching ensureBuilt()'s truthy guard
+// below and avoiding a spawn of "".
+const BIN = process.env.ZIGBASE_TEST_BINARY || join(REPO_ROOT, "zig-out", "bin", "zigbase");
 
 export interface TestServer {
   url: string;
