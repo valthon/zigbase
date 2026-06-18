@@ -105,6 +105,31 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("gen-dating-client-check", "Fail if the dating client snapshot is stale");
     check_step.dependOn(&check_run.step);
 
+    // --- runtime-introspection golden: provision the dating app in-memory, read
+    // it back via the data-dir adapter, and generate. Needs libc/sqlite (provision).
+    const gen_rt_mod = b.createModule(.{
+        .root_source_file = b.path("src/codegen/gen_runtime_main.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    gen_rt_mod.addImport("zigbase", zigbase_mod);
+    gen_rt_mod.addImport("app", dating_app_mod);
+    const gen_rt_exe = b.addExecutable(.{ .name = "zbase-gen-runtime-client", .root_module = gen_rt_mod });
+
+    const rt_out = "clients/typescript/test/codegen/dating/zbase.runtime.gen.ts";
+    const gen_rt_run = b.addRunArtifact(gen_rt_exe);
+    gen_rt_run.setEnvironmentVariable("ZBASE_INREPO", "1");
+    gen_rt_run.addArgs(&.{ "--out", rt_out, "--api-prefix", "/api" });
+    const gen_rt_step = b.step("gen-dating-runtime-client", "Generate the dating runtime-introspection client golden");
+    gen_rt_step.dependOn(&gen_rt_run.step);
+
+    const rt_check_run = b.addRunArtifact(gen_rt_exe);
+    rt_check_run.setEnvironmentVariable("ZBASE_INREPO", "1");
+    rt_check_run.addArgs(&.{ "--out", rt_out, "--api-prefix", "/api", "--check" });
+    const rt_check_step = b.step("gen-dating-runtime-client-check", "Fail if the dating runtime client golden is stale");
+    rt_check_step.dependOn(&rt_check_run.step);
+
     // --- gen-test: golden snapshot byte-exact test (Task 8) -------------------
     // Builds gen_test_root.zig as a test binary with both zigbase_mod (for
     // gen_client.generate) and dating_app_mod (for App.collections) injected.

@@ -9,6 +9,26 @@ const acquire = @import("acquire.zig");
 const acquire_datadir = @import("acquire_datadir.zig");
 const acquire_http = @import("acquire_http.zig");
 
+/// Provision `cols` into a fresh in-memory db, acquire them back through the
+/// runtime data-dir adapter, and generate the typed TS client.
+/// Intended for build-time generator tools that need the full runtime path
+/// without touching a real data directory.
+pub fn provisionAndGenerate(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cols: []const schema.Collection,
+    in_repo: bool,
+    client_name: []const u8,
+    api_prefix: []const u8,
+) ![]const u8 {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try provision.applySpecs(alloc, io, &d, cols);
+    const rt = try acquire_datadir.acquireFromDb(alloc, &d);
+    return gen_client.generate(alloc, rt, &.{}, in_repo, authCollectionName(rt), client_name, api_prefix);
+}
+
 pub const Options = struct {
     data_dir: ?[]const u8 = null,
     url: ?[]const u8 = null,
