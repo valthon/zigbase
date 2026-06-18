@@ -245,6 +245,39 @@ const rec = try r.data().findById("posts", id);
 `findById` / `create` / `update` / `delete` / `list`). **Always `defer <handle>.deinit()`**
 — the writer is a single shared connection, so hold it no longer than necessary.
 
+### Typed routes and the generated `rpc` surface
+
+For routes that carry a structured input or output, ZigBase supports **typed routes** declared with a `Req(Input)` / `Output` handler signature instead of the raw `RouteEvent` form. A typed route handler looks like:
+
+```zig
+// Input and Output are Zig types in the bounded Zig→TS subset
+// (bool, int/float, []const u8, and structs thereof — no slices of non-scalar, no optionals of structs).
+fn handler(req: *zigbase.Req(InputType)) zigbase.RouteError!OutputType {
+    const id = req.param("id");   // ?[]const u8 — a :param from the path
+    const input = req.input;      // InputType — parsed request body (POST/PUT/PATCH) or query (GET/DELETE)
+    // ...
+    return OutputType{ ... };
+    // or: return req.fail(404, "not found");   // → RouteError propagated as HTTP 404
+}
+```
+
+Register typed routes in `.routes` identically to untyped ones (`.method`, `.path`, `.handler`, optional `.auth` defaulting to `.superuser`). The generator (`zig build gen-client`) reads the comptime `App` declaration and emits a `zb.rpc.*` method for each typed route — named by camel-joining the path segments (`:param` segments omitted):
+
+| Path | Method | Generated name |
+| --- | --- | --- |
+| `/api/bookings/:id/confirm` | POST | `bookingsConfirm` |
+| `/api/bookings/:id/cancel` | POST | `bookingsCancel` |
+| `/api/listings/:id/availability` | GET | `listingsAvailability` |
+| `/api/golfsim/health` | GET | `golfsimHealth` |
+
+The generated TypeScript method signature mirrors the route shape:
+- **`params` object** (e.g. `{ id: string }`) when the path has `:param` segments.
+- **`input` argument** when the Zig `Input` type is non-void (POST/PUT/PATCH routes serialize as the request body; GET/DELETE routes pass as query parameters).
+- Output is the TypeScript equivalent of the Zig return type; `std.json.Value` maps to `unknown`.
+- `.auth` defaults to `.superuser` when omitted — typed routes are locked to superusers unless explicitly set.
+
+See the [TypeScript SDK docs](./typescript-sdk#typed-rpc--zbrc) and `examples/golfsim/` for the full worked example.
+
 ## 6. Auth / file / lifecycle events
 
 One handler each, registered by the matching config key:

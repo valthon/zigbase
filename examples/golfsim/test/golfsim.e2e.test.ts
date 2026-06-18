@@ -51,7 +51,9 @@ describe("golfsim generated client (live golfsim server)", () => {
     // The review gate (prepareReview) only allows reviewing a CONFIRMED booking,
     // and confirmation is an owner-only action (POST /api/bookings/:id/confirm).
     // So the host (listing owner) confirms the guest's booking first.
-    const confirmed = await zb.send<Booking>("POST", `/api/bookings/${booking.id}/confirm`);
+    // bookingsConfirm has void input + an :id path param → params object only.
+    // Output is std.json.Value → unknown, so narrow to Booking for the assertion.
+    const confirmed = await zb.rpc.bookingsConfirm({ id: booking.id }) as Booking;
     expect(confirmed.status).toBe("confirmed");
 
     const review = await guest.db.reviews.create({ booking: booking.id, author: guestUser.id, rating: 5, body: "great" });
