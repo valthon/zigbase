@@ -4,7 +4,7 @@
 // In a consumer repo this file imports from "@zigbase/client" and
 // "@zigbase/client/typed". In this in-repo snapshot we import from the
 // package source so it typechecks against the working tree without a built dist.
-import { createClient as baseCreateClient, type Client } from "../../../src/index.js";
+import { createClient as baseCreateClient, type Client, type SendOptions } from "../../../src/index.js";
 import { withRealtime, type RealtimeEnabledClient } from "../../../src/realtime-entry.js";
 import type { ListResult } from "../../../src/records.js";
 import type { CursorPage } from "../../../src/cursor.js";
@@ -863,6 +863,26 @@ export type SubscriptionsRealtime = RawTypedRealtime<Subscription, SubscriptionW
 
 // ---- createClient ----
 
+export interface SendWinkOut {
+  ok: boolean;
+  note: string;
+}
+export type Color = "red" | "green" | "blue";
+export interface SendWinkIn {
+  note: string;
+  color: Color;
+  sticker: string | null;
+  tags: string[];
+}
+export type SearchSort = "newest" | "oldest";
+export interface SearchIn {
+  q: string;
+  limit: number;
+  sort: SearchSort;
+}
+export interface SearchOut {
+  count: number;
+}
 export interface ZbClient {
   db: {
     profiles: ProfilesService;
@@ -883,6 +903,13 @@ export interface ZbClient {
     subscriptions: SubscriptionsRealtime;
   };
   files: FilesService;
+  rpc: {
+    echoPing(params: { id: string }, opts?: SendOptions): Promise<SendWinkOut>;
+    winksSend(input: SendWinkIn, opts?: SendOptions): Promise<SendWinkOut>;
+    messagesSearch(input: SearchIn, opts?: SendOptions): Promise<SearchOut>;
+    winksStatus(opts?: SendOptions): Promise<void>;
+    winksRaw(opts?: SendOptions): Promise<unknown>;
+  };
   authStore: Client["authStore"];
   send: Client["send"];
   fetch: Client["fetch"];
@@ -941,6 +968,23 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       subscriptions: makeTypedRealtime<Subscription, SubscriptionWhere>(base.realtime, subscriptionsMeta, relationResolver),
     },
     files: base.files,
+    rpc: {
+      echoPing(params, opts) {
+        return base.send("POST", `/api/echo/${encodeURIComponent(String(params.id))}/ping`, opts);
+      },
+      winksSend(input, opts) {
+        return base.send("POST", `/api/winks/send`, { body: input, ...opts });
+      },
+      messagesSearch(input, opts) {
+        return base.send("GET", `/api/messages/search`, { query: input as unknown as Record<string, string | number | boolean | undefined>, ...opts });
+      },
+      winksStatus(opts) {
+        return base.send("GET", `/api/winks/status`, opts);
+      },
+      winksRaw(opts) {
+        return base.send("GET", `/api/winks/raw`, opts);
+      },
+    },
     authStore: base.authStore,
     send: base.send.bind(base),
     fetch: base.fetch.bind(base),

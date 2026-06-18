@@ -146,7 +146,7 @@ pub fn render(comptime routes: []const RouteMeta, alloc: std.mem.Allocator) !Sec
         if (has_input and comptime isBodyMethod(r.method)) {
             try factory.appendSlice(alloc, "{ body: input, ...opts });\n");
         } else if (has_input) {
-            try factory.appendSlice(alloc, "{ query: input as Record<string, string | number | boolean | undefined>, ...opts });\n");
+            try factory.appendSlice(alloc, "{ query: input as unknown as Record<string, string | number | boolean | undefined>, ...opts });\n");
         } else {
             try factory.appendSlice(alloc, "opts);\n");
         }
@@ -201,7 +201,7 @@ test "render emits interface member, factory method, and named decls" {
     try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "bookingsConfirm(params, opts) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "`/api/bookings/${encodeURIComponent(String(params.id))}/confirm`") != null);
     try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "return base.send(\"POST\",") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "query: input as Record<string, string | number | boolean | undefined>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "query: input as unknown as Record<string, string | number | boolean | undefined>") != null);
 }
 
 // Struct shared by two routes to verify cross-route dedup.
