@@ -27,7 +27,7 @@ function AvailabilityPanel({ listing }: { listing: Listing }) {
     <div style={{ marginBottom: '0.5rem' }}>
       <button
         onClick={toggle}
-        style={{ background: 'transparent', color: 'var(--accent)', border: '1px solid var(--accent)', padding: '0.25rem 0.75rem', fontSize: '0.85rem' }}
+        style={{ background: 'transparent', color: 'var(--grass)', border: '1px solid var(--grass)', padding: '0.25rem 0.75rem', fontSize: '0.85rem' }}
       >
         {open ? 'Hide availability' : 'Check availability'}
       </button>
@@ -90,7 +90,7 @@ function PhotoGallery({ listing, canUpload, onUploaded }: {
               key={name}
               src={photoUrl(listing.id, name)}
               alt={listing.title}
-              style={{ width: 96, height: 72, objectFit: 'cover', borderRadius: 6, border: '1px solid #2a2e38' }}
+              style={{ width: 96, height: 72, objectFit: 'cover', borderRadius: 3, border: '1px solid var(--hairline)' }}
             />
           ))}
         </div>
@@ -183,7 +183,8 @@ export default function ListingsBrowser() {
         <article className="card" key={l.id}>
           <h2>{l.title}</h2>
           <p className="muted">
-            {l.expand?.simulator?.label ?? 'simulator'} · ${l.price_per_hour}/hour
+            {l.expand?.simulator?.label ?? 'simulator'} ·{' '}
+            <span className="price">${l.price_per_hour}</span>/hour
           </p>
           {/* Photos — always shown; upload only for authed users */}
           <PhotoGallery listing={l} canUpload={authed} onUploaded={updateListing} />

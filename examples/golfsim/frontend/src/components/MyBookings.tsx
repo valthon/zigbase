@@ -67,15 +67,16 @@ function BookingCard({ booking, onReload }: { booking: Booking; onReload: () => 
     <article className="card">
       <h2>{booking.expand?.listing?.title ?? booking.listing}</h2>
       <p className="muted">
-        {new Date(booking.starts_at).toLocaleString()} → {new Date(booking.ends_at).toLocaleString()}
-        {' '}· ${booking.price_total.toFixed(2)} · <strong>{booking.status}</strong>
+        <span className="num">{new Date(booking.starts_at).toLocaleString()}</span> →{' '}
+        <span className="num">{new Date(booking.ends_at).toLocaleString()}</span>
+        {' '}· <span className="price">${booking.price_total?.toFixed(2) ?? '0.00'}</span> · <strong>{booking.status}</strong>
       </p>
       <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
         {/* Cancel: available for pending or confirmed bookings */}
         {(booking.status === 'pending' || booking.status === 'confirmed') && (
           <button
             onClick={cancel}
-            style={{ background: '#c0392b' }}
+            style={{ background: 'var(--danger)', borderColor: 'var(--danger)' }}
           >
             Cancel booking
           </button>
@@ -132,7 +133,7 @@ export default function MyBookings() {
   return (
     <>
       {realtimeBadge && (
-        <p style={{ color: 'var(--accent)', fontSize: '0.85rem', marginBottom: '0.5rem' }}>
+        <p style={{ color: 'var(--grass)', fontSize: '0.85rem', marginBottom: '0.5rem', fontWeight: 600 }}>
           ↻ Booking updated via realtime
         </p>
       )}

@@ -1,22 +1,194 @@
+/* ---------------------------------------------------------------------------
+   GolfSim — "golf ethos" theme: pastels + precision geometry.
+   Calm country-club palette, hairline rules, graph-paper grid, grass-green
+   CTAs, scorecard-style tabular numerals. System fonts only (offline-safe).
+   --------------------------------------------------------------------------- */
 :root {
-  --bg: #101216;
-  --fg: #e8eaf0;
-  --muted: #9aa3b2;
-  --accent: #f7a41d;
-  --card: #1a1d24;
-  font-family: system-ui, -apple-system, sans-serif;
+  /* Surfaces */
+  --bg: #f4f1e8;          /* warm cream / off-white */
+  --grid: #e3decd;        /* faint graph-paper line */
+  --card: #fbfaf5;        /* near-white panel */
+  --sky: #d9e8f2;         /* soft sky blue */
+  --sand: #e9dcc3;        /* warm sand */
+
+  /* Ink */
+  --fg: #2b3a2e;          /* deep fairway green-charcoal */
+  --muted: #6f7a6c;       /* sage grey */
+  --hairline: #c9c4b4;    /* 1px precision rule */
+
+  /* Action */
+  --grass: #2f8f4e;       /* grass-green CTA */
+  --grass-dark: #267540;  /* hover/active */
+  --on-grass: #ffffff;    /* white text on grass (passes contrast) */
+  --link: #2f6f8f;        /* restrained sky-blue link */
+  --danger: #b23a2e;      /* muted clay red */
+
+  /* Type */
+  --sans: system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --serif: Georgia, "Times New Roman", Times, serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+
+  font-family: var(--sans);
+  color-scheme: light;
 }
+
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--fg); line-height: 1.6; }
-main { max-width: 720px; margin: 0 auto; padding: 2rem 1rem; }
-a { color: var(--accent); text-decoration: none; }
-a:hover { text-decoration: underline; }
-header.site { border-bottom: 1px solid #2a2e38; }
-header.site nav { max-width: 720px; margin: 0 auto; padding: 1rem; display: flex; gap: 1.25rem; align-items: baseline; }
-header.site .brand { font-weight: 700; font-size: 1.1rem; color: var(--fg); }
-.card { background: var(--card); border: 1px solid #2a2e38; border-radius: 8px; padding: 1rem 1.25rem; margin: 0.75rem 0; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  color: var(--fg);
+  line-height: 1.65;
+  background-color: var(--bg);
+  /* Subtle graph-paper grid — CSS-drawn, no images. */
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 28px 28px;
+  background-position: -1px -1px;
+}
+
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 2.5rem 1.25rem 4rem;
+}
+
+/* Tabular numerals everywhere numbers matter (scorecard / launch-monitor). */
+.num, code, time, td, .price, .yardage {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* Typography ------------------------------------------------------------- */
+h1, h2, h3 {
+  font-family: var(--serif);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1.25;
+  color: var(--fg);
+}
+h1 {
+  font-size: 2rem;
+  margin: 0 0 0.5rem;
+  border-bottom: 1px solid var(--hairline);
+  padding-bottom: 0.5rem;
+}
+h2 { font-size: 1.25rem; margin: 0 0 0.4rem; }
+h3 { font-size: 1.05rem; }
+
+p { margin: 0.5rem 0; }
+
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 2px; }
+
+code {
+  background: var(--sky);
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  padding: 0.05rem 0.35rem;
+  font-family: var(--mono);
+  font-size: 0.85em;
+}
+
+/* Header / nav ----------------------------------------------------------- */
+header.site {
+  background: var(--card);
+  border-bottom: 1px solid var(--hairline);
+  box-shadow: 0 1px 0 rgba(43, 58, 46, 0.03);
+}
+header.site nav {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0.9rem 1.25rem;
+  display: flex;
+  gap: 1.5rem;
+  align-items: baseline;
+}
+header.site .brand {
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: 1.2rem;
+  letter-spacing: 0.02em;
+  color: var(--fg);
+  padding-left: 1.4rem;
+  position: relative;
+}
+/* CSS-drawn golf-ball brand mark (no image). */
+header.site .brand::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.32em;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 30% 30%, #ffffff 0%, #eef0ea 60%, #d6d8d0 100%);
+  border: 1px solid var(--hairline);
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.02);
+}
+header.site nav a:not(.brand) {
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+header.site nav a:not(.brand):hover { color: var(--fg); }
+
+/* Cards ------------------------------------------------------------------ */
+.card {
+  background: var(--card);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  padding: 1.25rem 1.4rem;
+  margin: 1rem 0;
+  /* Hairline accent rail evoking a scorecard column. */
+  border-left: 3px solid var(--grass);
+  box-shadow: 0 1px 2px rgba(43, 58, 46, 0.04);
+}
+.card h2 { margin-top: 0; }
+
+/* Text helpers ----------------------------------------------------------- */
 .muted { color: var(--muted); font-size: 0.9rem; }
-input, textarea { width: 100%; padding: 0.5rem; margin: 0.25rem 0 0.75rem; background: #0c0e12; color: var(--fg); border: 1px solid #2a2e38; border-radius: 6px; font: inherit; }
-button { background: var(--accent); color: #101216; border: 0; border-radius: 6px; padding: 0.5rem 1rem; font-weight: 600; cursor: pointer; }
-button:disabled { opacity: 0.5; cursor: default; }
-.error { color: #ff6b6b; }
+.error {
+  color: var(--danger);
+  font-size: 0.9rem;
+  border-left: 3px solid var(--danger);
+  padding-left: 0.6rem;
+  margin: 0.5rem 0;
+}
+
+/* Forms ------------------------------------------------------------------ */
+input, textarea, select {
+  width: 100%;
+  padding: 0.55rem 0.65rem;
+  margin: 0.25rem 0 0.85rem;
+  background: #ffffff;
+  color: var(--fg);
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  font: inherit;
+}
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--grass);
+  box-shadow: 0 0 0 2px rgba(47, 143, 78, 0.15);
+}
+input[type="datetime-local"], input[type="file"] {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Buttons — grass-green primary CTA. ------------------------------------- */
+button {
+  background: var(--grass);
+  color: var(--on-grass);
+  border: 1px solid var(--grass-dark);
+  border-radius: 3px;
+  padding: 0.5rem 1.1rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+button:hover:not(:disabled) { background: var(--grass-dark); }
+button:disabled { opacity: 0.45; cursor: default; }

@@ -86,7 +86,10 @@ fn computeReadingTime(ev: *zigbase.RecordEvent) anyerror!void {
         }
     }
     const minutes = if (word_count == 0) 1 else @max(1, (word_count + 199) / 200);
-    try ev.record.object.put(ev.arena, "reading_time", .{ .integer = @intCast(minutes) });
+    // int/fixed-mode number fields take a decimal STRING on the wire (see docs/fields.md
+    // and src/values.zig bindValue) — a raw JSON integer fails type validation.
+    const rt = try std.fmt.allocPrint(ev.arena, "{d}", .{minutes});
+    try ev.record.object.put(ev.arena, "reading_time", .{ .string = rt });
 }
 
 /// before_create chain for posts: slugify -> setAuthor -> computeReadingTime.
