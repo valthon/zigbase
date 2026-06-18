@@ -94,6 +94,25 @@ export function makeRecordService(
     requestKey: opts?.requestKey,
   });
 
+  // Int/fixed number fields travel to the server as DECIMAL STRINGS (it scales
+  // them to integers for full i64 precision); the typed surface types them as
+  // `number` for ergonomics, so coerce here on write. Only touches keys present
+  // in `data` whose value is a JS number and whose field meta carries a mode.
+  function coerceWrite(data: Record<string, unknown>): Record<string, unknown> {
+    // Defensive: a non-object payload (null/undefined) has no fields to coerce —
+    // pass it through untouched and let the underlying client handle/reject it.
+    if (data == null || typeof data !== "object") return data;
+    let out: Record<string, unknown> | undefined;
+    for (const [k, fm] of Object.entries(meta.fields)) {
+      if (!fm.mode) continue;
+      const v = (data as Record<string, unknown>)[k];
+      if (typeof v !== "number") continue;
+      out ??= { ...data };
+      out[k] = v.toFixed(fm.mode === "fixed" ? (fm.scale ?? 0) : 0);
+    }
+    return out ?? data;
+  }
+
   return {
     getList(opts) {
       return inner.getList(opts?.page ?? 1, opts?.limit ?? 30, listOpts(opts));
@@ -162,10 +181,10 @@ export function makeRecordService(
       });
     },
     create(data, opts) {
-      return inner.create(data, readOpts(opts));
+      return inner.create(coerceWrite(data as Record<string, unknown>), readOpts(opts));
     },
     update(id, data, opts) {
-      return inner.update(id, data, readOpts(opts));
+      return inner.update(id, coerceWrite(data as Record<string, unknown>), readOpts(opts));
     },
     delete(id) {
       return inner.delete(id);

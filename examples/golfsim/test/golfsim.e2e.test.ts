@@ -54,11 +54,7 @@ describe("golfsim generated client (live golfsim server)", () => {
     const confirmed = await zb.send<Booking>("POST", `/api/bookings/${booking.id}/confirm`);
     expect(confirmed.status).toBe("confirmed");
 
-    // `rating` is an int-mode number; the server's wire contract for int/fixed-mode
-    // numbers is the decimal STRING form (a bare JSON number is rejected as
-    // validation_type, and reads come back as a string too). The generated client
-    // types `rating` as `number`, so send the string form via a cast.
-    const review = await guest.db.reviews.create({ booking: booking.id, author: guestUser.id, rating: "5" as unknown as number, body: "great" });
+    const review = await guest.db.reviews.create({ booking: booking.id, author: guestUser.id, rating: 5, body: "great" });
     const reviews = await anon.db.reviews.getList({ where: { rating: { gte: 4 } } });
     expect(reviews.items.some((r) => r.id === review.id)).toBe(true);
   });

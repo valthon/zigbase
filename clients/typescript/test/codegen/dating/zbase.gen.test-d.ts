@@ -107,6 +107,21 @@ function serviceShapes() {
   expectTypeOf(zb.realtime.photos.subscribe).toBeFunction();
 }
 
+// --- relation-less collections expose the full read surface -----------------
+function relationLessReadMethods() {
+  // tags / subscriptions are relation-less; they must still expose iterate,
+  // getFullList, and accept `sort`/`withTotal` on the page methods (these were
+  // wrongly gated on hasRelations before the fix).
+  expectTypeOf(zb.db.tags.iterate).toBeFunction();
+  expectTypeOf(zb.db.tags.getFullList).toBeFunction();
+  expectTypeOf(zb.db.subscriptions.iterate).toBeFunction();
+  expectTypeOf(zb.db.subscriptions.getFullList).toBeFunction();
+  // sort + withTotal typecheck on a relation-less getPage.
+  void zb.db.tags.getPage({ sort: "-created", withTotal: true });
+  // getFullList accepts a `sort` option on a relation-less collection.
+  void zb.db.subscriptions.getFullList({ sort: "created" });
+}
+
 // --- per-collection fileUrl typing (single-value only) ----------------------
 function fileUrlTyping() {
   const profile = {} as Profile;
@@ -124,5 +139,5 @@ export const _typeTests = [
   whereOk, whereBadOperand, whereBadEnum, whereUnknownField,
   createOk, fileTyping, createMissingRequired, createRejectsUnknown, updateOmitsPassword,
   fluentOk, fluentBadEnum, fluentUnknownField,
-  serviceShapes, fileUrlTyping,
+  serviceShapes, relationLessReadMethods, fileUrlTyping,
 ];
