@@ -317,6 +317,12 @@ The `typegen` subcommand exists **only** in binaries built with `.enable_typegen
 `App(.{ … })` literal (default `false`, so production builds carry no codegen overhead). See the
 [framework docs](framework.md#3b-the-typegen-gate-enable_typegen) for how to enable it.
 
+**No Zig toolchain needed.** The generator is also available as an npm package —
+`npx @zigbase/typegen --data-dir ./zb_data --out src/zbase.gen.ts` (or `--url <origin>
+--admin-email <e> --admin-password <p>` for the live mode). It bundles the codegen engine
+through `@zigbase/server`, which ships prebuilt platform binaries for Linux and macOS. Install
+`@zigbase/client` separately; the generated file imports it at runtime.
+
 ### Schema sources (exactly one required)
 
 | Flag | Behavior |
