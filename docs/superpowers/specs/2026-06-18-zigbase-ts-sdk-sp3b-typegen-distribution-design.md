@@ -50,16 +50,17 @@ The platform split lives at the **server** level, not typegen. Typegen is a thin
 `bin/typegen.js`: `#!/usr/bin/env node`; `const bin = require('@zigbase/server').binaryPath();` then `execFileSync(bin, ['typegen', ...process.argv.slice(2)], { stdio: 'inherit' })`, propagating the exit code. ~15 lines, no platform logic.
 
 ### 2.3 Monorepo layout
-A new top-level `npm/` directory holds the committed package templates (package.json, launchers, READMEs); CI / the bootstrap script inject binaries into copies before publish:
+The distribution packages nest under `clients/typescript/npm/` (the existing `@zigbase/client` package stays at the `clients/typescript/` root, unchanged). Nesting under `clients/typescript/` leaves room for future `clients/<lang>/` siblings. The committed templates (package.json, launchers, READMEs) live here; CI / the bootstrap script inject binaries into copies before publish:
 ```
-npm/server/                 package.json (meta, optionalDependencies), bin/zigbase.js, index.js, README.md
-npm/server-linux-x64/       package.json (os/cpu, files:["zigbase"]), README.md   (binary injected)
-npm/server-linux-arm64/     "
-npm/server-darwin-x64/      "
-npm/server-darwin-arm64/    "
-npm/typegen/                package.json (depends @zigbase/server), bin/typegen.js, README.md
-npm/publish.mjs             bootstrap/fallback manual publish script
-npm/RELEASING.md            release runbook (OIDC + manual bootstrap)
+clients/typescript/                      @zigbase/client — the base SDK (unchanged)
+clients/typescript/npm/server/           package.json (meta, optionalDependencies), bin/zigbase.js, index.js, README.md
+clients/typescript/npm/server-linux-x64/    package.json (os/cpu, files:["zigbase"]), README.md   (binary injected)
+clients/typescript/npm/server-linux-arm64/  "
+clients/typescript/npm/server-darwin-x64/   "
+clients/typescript/npm/server-darwin-arm64/ "
+clients/typescript/npm/typegen/          package.json (depends @zigbase/server), bin/typegen.js, README.md
+clients/typescript/npm/publish.mjs       bootstrap/fallback manual publish script
+clients/typescript/npm/RELEASING.md      release runbook (OIDC + manual bootstrap)
 ```
 
 ## 3. The Distributed Binary
@@ -94,7 +95,7 @@ Each builds via `mise exec zig@0.16.0 -- zig build dist-server -Dtarget=… -Dop
 - Build the 4-target matrix → inject each binary into its `@zigbase/server-<platform>` package copy → publish the four platform packages, then the `@zigbase/server` meta, then (on a `typegen-v*` tag) `@zigbase/typegen`. Dependency order matters (a meta/wrapper referencing an unpublished version would fail).
 - Tag-suffix ↔ package-version assertion, mirroring `release-sdk.yml`'s check.
 
-### 5.2 Manual bootstrap/fallback (`npm/publish.mjs`)
+### 5.2 Manual bootstrap/fallback (`clients/typescript/npm/publish.mjs`)
 Trusted publishing cannot be configured until a package already exists, so the **first** publish of each package is manual. A Node script the user runs locally after `npm login`:
 - `--dry-run` (default off): run `npm publish --dry-run` for every package, publish nothing.
 - `--skip-build`: use binaries already present (e.g. downloaded CI artifacts) instead of building.
@@ -131,9 +132,9 @@ The npm packaging itself is validated by `npm publish --dry-run` / `npm pack` in
 
 ## 8. Docs
 
-- `npm/typegen/README.md` (published) — install, `npx @zigbase/typegen` usage, both source modes, the no-rpc note, that the generated client needs `@zigbase/client`.
-- `npm/server/README.md` (published) — `npx @zigbase/server serve …`, the platform matrix, that it's the typegen-enabled official build.
-- `npm/RELEASING.md` — the OIDC + manual-bootstrap runbook, tag conventions, the first-publish ordering.
+- `clients/typescript/npm/typegen/README.md` (published) — install, `npx @zigbase/typegen` usage, both source modes, the no-rpc note, that the generated client needs `@zigbase/client`.
+- `clients/typescript/npm/server/README.md` (published) — `npx @zigbase/server serve …`, the platform matrix, that it's the typegen-enabled official build.
+- `clients/typescript/npm/RELEASING.md` — the OIDC + manual-bootstrap runbook, tag conventions, the first-publish ordering.
 - `docs/typescript-sdk.md` ↔ `site/` mirror — add: the runtime generator is installable via `npx @zigbase/typegen` (no Zig toolchain), alongside the existing data-dir/url docs.
 
 ## 9. Scope Boundaries
