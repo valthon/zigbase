@@ -27,11 +27,18 @@ const TARGETS = [
   { key: "darwin-arm64", zig: "aarch64-macos" },
 ];
 
+const pkgCache = new Map();
+function readPkg(dir) {
+  if (!pkgCache.has(dir)) {
+    pkgCache.set(dir, JSON.parse(readFileSync(join(HERE, dir, "package.json"), "utf8")));
+  }
+  return pkgCache.get(dir);
+}
 function pkgVersion(dir) {
-  return JSON.parse(readFileSync(join(HERE, dir, "package.json"), "utf8")).version;
+  return readPkg(dir).version;
 }
 function pkgName(dir) {
-  return JSON.parse(readFileSync(join(HERE, dir, "package.json"), "utf8")).name;
+  return readPkg(dir).name;
 }
 function alreadyPublished(name, version) {
   const r = spawnSync("npm", ["view", `${name}@${version}`, "version"], { encoding: "utf8", timeout: 10_000 });

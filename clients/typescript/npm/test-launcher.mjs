@@ -24,23 +24,18 @@ mkdirSync(platformPkg, { recursive: true });
 copyFileSync(join(REPO_ROOT, "zig-out/bin/zigbase-dist"), join(platformPkg, "zigbase"));
 
 // 3) node_modules wiring so require.resolve('@zigbase/server-<key>/zigbase') works:
-//    create node_modules symlinks under server/ pointing at the sibling packages.
-const serverNodeModules = join(HERE, "server", "node_modules", "@zigbase");
-mkdirSync(serverNodeModules, { recursive: true });
+//    create node_modules symlinks under server/ + typegen/ pointing at the sibling packages.
+function linkPkg(modulesDir, linkName, targetDir) {
+  mkdirSync(modulesDir, { recursive: true });
+  const link = join(modulesDir, linkName);
+  try { rmSync(link, { recursive: true, force: true }); } catch {}
+  symlinkSync(targetDir, link, "dir");
+}
 const name = `server-${key}`;
-{
-  const link = join(serverNodeModules, name);
-  try { rmSync(link, { recursive: true, force: true }); } catch {}
-  symlinkSync(join(HERE, name), link, "dir");
-}
-// And @zigbase/server resolvable from typegen.
-const typegenNodeModules = join(HERE, "typegen", "node_modules", "@zigbase");
-mkdirSync(typegenNodeModules, { recursive: true });
-{
-  const link = join(typegenNodeModules, "server");
-  try { rmSync(link, { recursive: true, force: true }); } catch {}
-  symlinkSync(join(HERE, "server"), link, "dir");
-}
+// @zigbase/server-<key> resolvable from @zigbase/server.
+linkPkg(join(HERE, "server", "node_modules", "@zigbase"), name, join(HERE, name));
+// @zigbase/server resolvable from @zigbase/typegen.
+linkPkg(join(HERE, "typegen", "node_modules", "@zigbase"), "server", join(HERE, "server"));
 
 // 4) Run the wrapper with `--help`-style invocation; the engine's `typegen`
 //    with no --out prints a usage/error and exits non-zero, but proves the
