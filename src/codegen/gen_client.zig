@@ -88,7 +88,7 @@ pub fn generate(
             \\
         );
     }
-    try emit.emitImports(alloc, &w, in_repo);
+    try emit.emitImports(alloc, &w, in_repo, routes.len > 0);
 
     try section(alloc, &w, "Records");
     for (cols) |c| try emit.emitSelectUnions(alloc, &w, c);
