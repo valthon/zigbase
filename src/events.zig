@@ -241,9 +241,11 @@ pub const RouteMeta = struct {
 /// Comptime path→method-name (mirrors codegen `identifiers.routeMethodName`) with an
 /// optional `.name` override. Strips the "/api" prefix + ":param" segments, camel-joins
 /// the rest. Comptime-friendly (no allocator) for the framework-side collision check.
-fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const u8) []const u8 {
+/// Separators ('_', '-') within a segment are stripped and the following char is
+/// uppercased, matching codegen `pascal()` semantics (drift-guard test enforces parity).
+pub fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const u8) []const u8 {
     if (override) |n| return n;
-    comptime {
+    return comptime blk: {
         var rest: []const u8 = path;
         const prefix = "/api";
         if (std.mem.startsWith(u8, rest, prefix)) rest = rest[prefix.len..];
@@ -252,17 +254,25 @@ fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const u8) 
         var it = std.mem.tokenizeScalar(u8, rest, '/');
         while (it.next()) |seg| {
             if (seg.len == 0 or seg[0] == ':') continue;
-            if (first) {
-                name = seg;
-                first = false;
-            } else {
-                var s: []const u8 = &[_]u8{std.ascii.toUpper(seg[0])};
-                s = s ++ seg[1..];
-                name = name ++ s;
+            // PascalCase the segment, stripping '_'/'-' separators (matches
+            // codegen identifiers.pascal); first segment keeps its leading
+            // char lowercase to yield camelCase overall.
+            var piece: []const u8 = "";
+            var upper_next = false;
+            var seg_first = true;
+            for (seg) |ch| {
+                if (ch == '_' or ch == '-') { upper_next = true; continue; }
+                const c = if (upper_next or (!first and seg_first)) std.ascii.toUpper(ch)
+                          else ch;
+                piece = piece ++ &[_]u8{c};
+                upper_next = false;
+                seg_first = false;
             }
+            name = name ++ piece;
+            first = false;
         }
-        return name;
-    }
+        break :blk name;
+    };
 }
 
 /// Reflect a comptime tuple of typed route specs into `[]const RouteMeta`. Per spec,
