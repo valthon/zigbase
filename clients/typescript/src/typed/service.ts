@@ -94,17 +94,20 @@ export function makeRecordService(
     requestKey: opts?.requestKey,
   });
 
-  // Int/fixed number fields travel to the server as DECIMAL STRINGS (it scales
-  // them to integers for full i64 precision); the typed surface types them as
-  // `number` for ergonomics, so coerce here on write. Only touches keys present
-  // in `data` whose value is a JS number and whose field meta carries a mode.
+  // Int/fixed number fields travel to/from the server as DECIMAL STRINGS (it
+  // scales them to integers for full i64 precision); the typed surface types
+  // them `number` for ergonomics, so coerce on write and read. `meta.fields` is
+  // static for the service, so the coercible (mode-carrying) field list is
+  // computed once here rather than re-filtered per record.
+  const coercibleFields = Object.entries(meta.fields).filter(([, fm]) => fm.mode);
+
+  // Coerce on write: only keys present in `data` whose value is a JS number.
   function coerceWrite(data: Record<string, unknown>): Record<string, unknown> {
     // Defensive: a non-object payload (null/undefined) has no fields to coerce —
     // pass it through untouched and let the underlying client handle/reject it.
     if (data == null || typeof data !== "object") return data;
     let out: Record<string, unknown> | undefined;
-    for (const [k, fm] of Object.entries(meta.fields)) {
-      if (!fm.mode) continue;
+    for (const [k, fm] of coercibleFields) {
       const v = (data as Record<string, unknown>)[k];
       if (typeof v !== "number") continue;
       out ??= { ...data };
@@ -113,12 +116,31 @@ export function makeRecordService(
     return out ?? data;
   }
 
+  // Inverse of coerceWrite: int/fixed fields arrive from the server as decimal
+  // strings; the typed surface types them `number`, so coerce back on read.
+  // Top-level fields only (symmetric with coerceWrite); expanded relation records
+  // belong to other collections/metas and are out of scope here.
+  function coerceRead<T>(rec: T): T {
+    if (rec == null || typeof rec !== "object") return rec;
+    let out: Record<string, unknown> | undefined;
+    for (const [k] of coercibleFields) {
+      const v = (rec as Record<string, unknown>)[k];
+      if (typeof v !== "string" || v === "") continue;
+      const n = Number(v);
+      if (Number.isNaN(n)) continue;
+      out ??= { ...(rec as Record<string, unknown>) };
+      out[k] = n;
+    }
+    return (out ?? rec) as T;
+  }
+
   return {
-    getList(opts) {
-      return inner.getList(opts?.page ?? 1, opts?.limit ?? 30, listOpts(opts));
+    async getList(opts) {
+      const res = await inner.getList(opts?.page ?? 1, opts?.limit ?? 30, listOpts(opts));
+      return { ...res, items: res.items.map(coerceRead) };
     },
     getOne(id, opts) {
-      return inner.getOne(id, readOpts(opts));
+      return inner.getOne(id, readOpts(opts)).then(coerceRead);
     },
     async getFirstListItem(opts) {
       const filter = whereToFilter(opts?.where);
@@ -132,7 +154,7 @@ export function makeRecordService(
       if (filter !== undefined) {
         // A where clause is present: delegate to SP1's getFirstListItem which
         // applies the filter server-side and throws a 404 ZigbaseError when empty.
-        return inner.getFirstListItem(filter, listOpts2);
+        return coerceRead(await inner.getFirstListItem(filter, listOpts2));
       }
       // No where: avoid passing an empty string to the server (which may match all
       // or behave differently per server). Use getList(1,1) instead and surface
@@ -146,10 +168,10 @@ export function makeRecordService(
           url: `/api/collections/${meta.name}/records`,
         });
       }
-      return first;
+      return coerceRead(first);
     },
-    getPage(opts) {
-      return inner.getPage({
+    async getPage(opts) {
+      const page = await inner.getPage({
         filter: whereToFilter(opts?.where),
         sort: opts?.sort,
         expand: expandList(opts?.expand),
@@ -159,9 +181,10 @@ export function makeRecordService(
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
+      return { ...page, items: page.items.map(coerceRead) };
     },
     iterate(opts) {
-      return inner.iterate({
+      const innerIter = inner.iterate({
         filter: whereToFilter(opts?.where),
         sort: opts?.sort,
         expand: expandList(opts?.expand),
@@ -169,9 +192,14 @@ export function makeRecordService(
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
+      return (async function* () {
+        for await (const item of innerIter) {
+          yield coerceRead(item);
+        }
+      })();
     },
-    getFullList(opts) {
-      return inner.getFullList({
+    async getFullList(opts) {
+      const list = await inner.getFullList({
         filter: whereToFilter(opts?.where),
         sort: opts?.sort,
         expand: expandList(opts?.expand),
@@ -179,12 +207,13 @@ export function makeRecordService(
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
+      return list.map(coerceRead);
     },
-    create(data, opts) {
-      return inner.create(coerceWrite(data as Record<string, unknown>), readOpts(opts));
+    async create(data, opts) {
+      return coerceRead(await inner.create(coerceWrite(data as Record<string, unknown>), readOpts(opts)));
     },
-    update(id, data, opts) {
-      return inner.update(id, coerceWrite(data as Record<string, unknown>), readOpts(opts));
+    async update(id, data, opts) {
+      return coerceRead(await inner.update(id, coerceWrite(data as Record<string, unknown>), readOpts(opts)));
     },
     delete(id) {
       return inner.delete(id);

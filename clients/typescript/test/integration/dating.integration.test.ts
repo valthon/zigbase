@@ -30,6 +30,7 @@ async function authedProfile(email: string) {
     password: "member-pass-1",
     passwordConfirm: "member-pass-1",
     name: email.split("@")[0]!,
+    age: 25, // int-mode field: server stores as decimal string; typed client coerces back to number
   });
   await zb.db.profiles.authWithPassword(email, "member-pass-1");
   return { zb, profile };
@@ -38,6 +39,8 @@ async function authedProfile(email: string) {
 describe("dating client (live dating-server)", () => {
   it("CRUD + nested-relation filter + expand (single & multi) + native cursor", async () => {
     const { zb, profile } = await authedProfile("crud@d.app");
+    // age is an int-mode field — the typed client must coerce server's decimal string back to number.
+    expect(typeof profile.age).toBe("number");
     const t1 = await zb.db.tags.create({ label: "hiking" });
     const t2 = await zb.db.tags.create({ label: "coffee" });
 
