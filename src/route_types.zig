@@ -133,6 +133,106 @@ fn assertRepresentableField(comptime T: type, comptime route_name: []const u8, c
     }
 }
 
+/// Wrap a typed handler `fn(*Req(I)) RouteError!O` into a RouteHandler thunk
+/// (`fn(*RouteEvent) anyerror!http.Response`). Comptime-specialized per handler.
+/// `events`/`http` are imported lazily inside the function bodies so the rest of
+/// route_types.zig (Req/RouteError/reflection) stays free of the framework import
+/// cycle (events.zig imports route_types for Req/RouteError).
+pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
+    const H = @TypeOf(handler);
+    const In = HandlerInput(H);
+    const Out = HandlerOutput(H);
+    const events = @import("events.zig");
+    const http = @import("http.zig");
+
+    const Thunk = struct {
+        fn run(ev: *events.RouteEvent) anyerror!http.Response {
+            const a = ev.ctx.allocator;
+            // 1. Parse input (void -> skip; GET/DELETE -> query; else JSON body).
+            const input: In = if (In == void) {} else blk: {
+                if (ev.ctx.method == .GET or ev.ctx.method == .DELETE) {
+                    break :blk parseQuery(In, a, ev.ctx.query) catch
+                        return badRequest(a, "Invalid query parameters.");
+                }
+                if (ev.ctx.body.len == 0) return badRequest(a, "Missing request body.");
+                break :blk (std.json.parseFromSlice(In, a, ev.ctx.body, .{ .ignore_unknown_fields = true }) catch
+                    return badRequest(a, "Invalid JSON body.")).value;
+            };
+            // 2. Build Req. Map RouteEvent params (http.Param) onto route_types.Param.
+            var params = try a.alloc(Param, ev.ctx.params.len);
+            for (ev.ctx.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
+            const auth_id = ev.rctx.resolveMacro("@request.auth.id") orelse "";
+            var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .app = ev.app, .arena = a };
+            // 3. Call handler; map errors -> status+message.
+            const out: Out = handler(&req) catch |e| {
+                if (req.failure) |f|
+                    return jsonError(a, f.status, f.message);
+                const re: RouteError = @errorCast(e);
+                return jsonError(a, statusForError(re), @errorName(re));
+            };
+            // 4. Serialize output (204 for void, else 200 JSON).
+            if (Out == void) return .{ .status = 204, .body = "" };
+            const body = try std.json.Stringify.valueAlloc(a, out, .{});
+            return .{ .status = 200, .body = body };
+        }
+    };
+    return Thunk.run;
+}
+
+/// 400 with a JSON `{"message": ...}` body; falls back to a static body if alloc fails.
+fn badRequest(a: std.mem.Allocator, msg: []const u8) @import("http.zig").Response {
+    return jsonError(a, 400, msg) catch .{ .status = 400, .body = "{\"message\":\"Bad request.\"}" };
+}
+
+/// Build `{"message": <json-escaped message>}` at `status`. Uses `std.json.fmt` with the
+/// `{f}` format spec (Zig 0.16: the bare `{}` spec mis-formats the JSON formatter struct).
+fn jsonError(a: std.mem.Allocator, status: u16, message: []const u8) !@import("http.zig").Response {
+    const body = try std.fmt.allocPrint(a, "{{\"message\":{f}}}", .{std.json.fmt(message, .{})});
+    return .{ .status = status, .body = body };
+}
+
+/// Minimal query (`a=1&b=hi`) parser into a flat struct of string/int/bool fields.
+/// Covers GET/DELETE routes whose Input is flat; golfsim's GET routes use `Req(void)`,
+/// so today this is exercised only by its own unit test.
+fn parseQuery(comptime T: type, a: std.mem.Allocator, query: []const u8) !T {
+    var result: T = undefined;
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        const raw = findQueryValue(query, f.name);
+        @field(result, f.name) = try coerceQueryField(f.type, a, raw);
+    }
+    return result;
+}
+
+/// Look up `name`'s value in an `&`-joined `key=value` query string; null if absent.
+fn findQueryValue(query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+/// Coerce a raw query value into a field type: string -> the slice, int -> parseInt,
+/// float -> parseFloat, bool -> "true"/"1". Missing required value -> error.BadRequest.
+/// Optionals: a missing value becomes null.
+fn coerceQueryField(comptime F: type, a: std.mem.Allocator, raw: ?[]const u8) !F {
+    _ = a;
+    const info = @typeInfo(F);
+    if (info == .optional) {
+        const r = raw orelse return null;
+        return try coerceQueryField(info.optional.child, undefined, r);
+    }
+    const r = raw orelse return error.BadRequest;
+    if (F == []const u8) return r;
+    return switch (info) {
+        .int => std.fmt.parseInt(F, r, 10) catch error.BadRequest,
+        .float => std.fmt.parseFloat(F, r) catch error.BadRequest,
+        .bool => std.mem.eql(u8, r, "true") or std.mem.eql(u8, r, "1"),
+        else => error.BadRequest,
+    };
+}
+
 const testing = std.testing;
 
 test "Req carries typed input + records a custom failure" {
@@ -203,4 +303,57 @@ test "isRepresentable rejects unsupported types" {
     try testing.expect(!isRepresentable(U)); // tagged union (rich tier; not in pragmatic core)
     const WithFn = struct { f: *const fn () void };
     try testing.expect(!isRepresentable(WithFn));
+}
+
+test "makeThunk: parses input, serializes output (200)" {
+    const http = @import("http.zig");
+    const events = @import("events.zig");
+    const In = struct { guests: u32 };
+    const Out = struct { id: []const u8, guests: u32, confirmed: bool };
+    const H = struct {
+        // Handlers may only fail with RouteError, so assert by reflecting parsed
+        // input/params into the Output and asserting on the serialized body below.
+        fn h(req: *Req(In)) RouteError!Out {
+            const id = req.param("id") orelse return req.fail(400, "missing id param");
+            return .{ .id = id, .guests = req.input.guests, .confirmed = true };
+        }
+    }.h;
+    const thunk = makeThunk(H);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var params = [_]http.Param{.{ .key = "id", .value = "bk1" }};
+    var ctx = http.RequestCtx{
+        .method = .POST,
+        .path = "/api/bookings/bk1/confirm",
+        .body = "{\"guests\":2}",
+        .allocator = arena.allocator(),
+        .params = &params,
+    };
+    const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
+    var ev = events.RouteEvent{ .app = undefined, .ctx = &ctx, .rctx = rctx };
+    const resp = try thunk(&ev);
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"confirmed\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"bk1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"guests\":2") != null);
+}
+
+test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
+    const http = @import("http.zig");
+    const events = @import("events.zig");
+    const H = struct {
+        fn h(req: *Req(void)) RouteError!void {
+            return req.fail(404, "Booking not found");
+        }
+    }.h;
+    const thunk = makeThunk(H);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = arena.allocator() };
+    const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
+    var ev = events.RouteEvent{ .app = undefined, .ctx = &ctx, .rctx = rctx };
+    const resp = try thunk(&ev);
+    try testing.expectEqual(@as(u16, 404), resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "Booking not found") != null);
 }

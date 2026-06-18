@@ -128,4 +128,5 @@ test {
     _ = @import("codegen/guards.zig");
     _ = @import("codegen/emit.zig");
     _ = @import("codegen/gen_client.zig");
+    _ = @import("route_types.zig");
 }
