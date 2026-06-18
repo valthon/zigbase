@@ -34,6 +34,13 @@ jobs:
         run: cd examples/blog && mise exec zig@0.16.0 -- zig build
       - name: Build golfsim example consumer (realistic app)
         run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build
+      - name: Build dating-server (e2e fixture binary)
+        run: mise exec zig@0.16.0 -- zig build dating-server
+      - name: Dating client snapshot is fresh
+        run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
+      - name: Golfsim client snapshot is fresh
+        working-directory: examples/golfsim
+        run: mise exec zig@0.16.0 -- zig build gen-client-check
       - name: Build plugins example consumer (advanced framework surface)
         run: cd examples/plugins && mise exec zig@0.16.0 -- zig build
       - name: Upload prebuilt binaries
@@ -42,7 +49,9 @@ jobs:
           name: zigbase-binaries
           path: |
             zig-out/bin/zigbase
+            zig-out/bin/dating-server
             examples/blog/zig-out/bin/blog
+            examples/golfsim/zig-out/bin/golfsim
             examples/plugins/zig-out/bin/plugins
           if-no-files-found: error
           retention-days: 1
@@ -117,8 +126,12 @@ jobs:
           path: artifacts
       - name: Export prebuilt binary path
         run: |
-          chmod +x artifacts/zig-out/bin/zigbase
+          chmod +x artifacts/zig-out/bin/zigbase \
+                   artifacts/zig-out/bin/dating-server \
+                   artifacts/examples/golfsim/zig-out/bin/golfsim
           echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_DATING_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/dating-server" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_GOLFSIM_BINARY=$GITHUB_WORKSPACE/artifacts/examples/golfsim/zig-out/bin/golfsim" >> "$GITHUB_ENV"
       - name: Cache npm downloads
         uses: actions/cache@v4
         with:
@@ -137,3 +150,9 @@ jobs:
       - name: Integration tests
         working-directory: clients/typescript
         run: mise exec node@24 -- npm run test:integration
+      - name: Build @zigbase/client (golfsim consumes the built package)
+        working-directory: clients/typescript
+        run: mise exec node@24 -- npm run build
+      - name: Golfsim e2e
+        working-directory: examples/golfsim
+        run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:e2e

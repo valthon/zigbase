@@ -178,6 +178,29 @@ curl -s http://127.0.0.1:8090/api/golfsim/health
 # -> {"status":"ok","app":"golfsim"}
 ```
 
+## Generated TypeScript client
+
+`golfsim` ships a **generated, fully type-safe TypeScript client** at
+`clients/typescript/zbase.gen.ts`. The prerequisite is that `src/main.zig` exposes
+`pub const App` at module scope — the generator reads the schema directly from the
+comptime `App` declaration. Regenerate with `zig build gen-client`; the CI staleness
+gate (`zig build gen-client-check`) fails if the committed snapshot is out of date.
+
+```bash
+# Regenerate the typed client from the schema:
+zig build gen-client
+
+# CI staleness gate — fails if the committed zbase.gen.ts is stale:
+zig build gen-client-check
+
+# Build @zigbase/client, then typecheck + run the full e2e suite:
+cd ../../clients/typescript && npm run build && cd ../../examples/golfsim
+npm install && npm run typecheck && npm run test:e2e
+```
+
+The e2e suite drives the generated typed client against a live `golfsim` binary —
+covering CRUD, filtering, auth, and realtime with full TypeScript type-checking.
+
 ## Building and running
 
 This example needs **Zig 0.16**, which you can get via [mise](https://mise.jdx.dev)

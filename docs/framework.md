@@ -634,7 +634,8 @@ Three buildable examples form a ladder:
 [`examples/blog/`](../examples/blog/) is the basic packaging proof (hooks + route +
 cron job + Astro/React frontend served via `--serve-static`),
 [`examples/golfsim/`](../examples/golfsim/) is a realistic app (hooks, routes, cron,
-and a comptime-hardcoded `.dir` static mode), and
+a comptime-hardcoded `.dir` static mode, and a **generated TypeScript typed client** at
+`clients/typescript/zbase.gen.ts` — regenerate with `zig build gen-client`), and
 [`examples/plugins/`](../examples/plugins/) is the advanced framework-feature
 reference (custom mailer plugin + `.collections` schema + typed `.migrations` +
 `.pools` levers + fully embedded static assets via `embedStaticDir`).

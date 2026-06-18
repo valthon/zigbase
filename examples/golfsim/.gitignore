@@ -5,3 +5,4 @@ frontend/.astro/
 zig-out/
 zb_data/
 *.db
+package-lock.json

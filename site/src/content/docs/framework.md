@@ -560,8 +560,10 @@ never propagates.
 
 Three buildable examples form a ladder: the [blog example](../examples/blog) is the basic
 packaging proof (hooks + route + cron + Astro/React frontend served via `--serve-static`),
-the [golfsim example](../examples/golfsim) is a realistic app (hooks, routes, cron, and a
-comptime-hardcoded `.dir` static mode), and the [plugins example](../examples/plugins) is
+the [golfsim example](../examples/golfsim) is a realistic app (hooks, routes, cron, a
+comptime-hardcoded `.dir` static mode, and a **generated TypeScript typed client** at
+`clients/typescript/zbase.gen.ts` — regenerate with `zig build gen-client`), and the
+[plugins example](../examples/plugins) is
 the advanced framework-feature reference (custom mailer plugin + `.collections` schema +
 typed `.migrations` + `.pools` levers + fully embedded static assets via `embedStaticDir`).
 

@@ -13,6 +13,13 @@ const REPO_ROOT = resolve(HERE, "../../../..");
 // empty-string override also falls back, matching ensureBuilt()'s truthy guard
 // below and avoiding a spawn of "".
 const BIN = process.env.ZIGBASE_TEST_BINARY || join(REPO_ROOT, "zig-out", "bin", "zigbase");
+/**
+ * Absolute path to the dating fixture compiled as a server (Task 2: `zig build dating-server`).
+ * CI supplies a prebuilt one via ZIGBASE_TEST_DATING_BINARY; otherwise it is the
+ * zig-out path produced by ensureBuilt()'s `zig build dating-server`.
+ */
+export const DATING_BIN =
+  process.env.ZIGBASE_TEST_DATING_BINARY || join(REPO_ROOT, "zig-out", "bin", "dating-server");
 
 export interface TestServer {
   url: string;
@@ -23,18 +30,22 @@ export interface TestServer {
 let built = false;
 function ensureBuilt(): void {
   if (built) return;
-  // A prebuilt binary supplied via ZIGBASE_TEST_BINARY (e.g. a CI artifact)
-  // skips the build entirely — no Zig toolchain needed in that job.
-  if (process.env.ZIGBASE_TEST_BINARY) {
+  // Prebuilt binaries supplied via ZIGBASE_TEST_BINARY + ZIGBASE_TEST_DATING_BINARY
+  // (e.g. CI artifacts) skip the toolchain entirely — no Zig needed in that job.
+  if (process.env.ZIGBASE_TEST_BINARY && process.env.ZIGBASE_TEST_DATING_BINARY) {
     built = true;
     return;
   }
-  // The binary MUST be built with zig 0.16.0; plain `zig` on PATH may be older.
-  const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], {
-    cwd: REPO_ROOT,
-    stdio: "inherit",
-  });
-  if (r.status !== 0) throw new Error("zig build failed");
+  // The binaries MUST be built with zig 0.16.0; plain `zig` on PATH may be older.
+  // Build both the generic binary (runtime-created collections) and the
+  // dating-server fixture (schema baked in) so every integration test can spawn.
+  for (const steps of [["build"], ["build", "dating-server"]]) {
+    const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", ...steps], {
+      cwd: REPO_ROOT,
+      stdio: "inherit",
+    });
+    if (r.status !== 0) throw new Error(`zig ${steps.join(" ")} failed`);
+  }
   built = true;
 }
 
@@ -52,28 +63,45 @@ async function waitForHealth(url: string, timeoutMs = 20_000): Promise<void> {
   }
 }
 
-export async function startServer(): Promise<TestServer> {
+/**
+ * Spawn an already-built zigbase app binary (schema baked in), seed a superuser,
+ * and wait for health. `bin` may be an absolute path (e.g. DATING_BIN) or a bare
+ * name resolved under zig-out/bin/.
+ */
+export async function startAppServer(opts: {
+  bin: string;
+  seedSuperuser?: { email: string; password: string };
+}): Promise<TestServer> {
   ensureBuilt();
+  const bin = opts.bin.includes("/") ? opts.bin : join(REPO_ROOT, "zig-out", "bin", opts.bin);
   const dataDir = mkdtempSync(join(tmpdir(), "zb-it-"));
   const port = 20000 + Math.floor(Math.random() * 20000);
-  const email = "admin@test.local";
-  const password = "test-password-123";
+  const { email, password } = opts.seedSuperuser ?? {
+    email: "admin@test.local",
+    password: "test-password-123",
+  };
 
   const su = spawnSync(
-    BIN,
+    bin,
     ["superuser", "create", "--email", email, "--password", password, "--data-dir", dataDir],
     { stdio: "inherit" },
   );
   if (su.status !== 0) throw new Error("superuser create failed");
 
   const proc: ChildProcess = spawn(
-    BIN,
+    bin,
     ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"],
     { stdio: "inherit" },
   );
 
   const url = `http://127.0.0.1:${port}`;
-  await waitForHealth(url);
+  try {
+    await waitForHealth(url);
+  } catch (err) {
+    proc.kill("SIGKILL");
+    try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    throw err;
+  }
 
   return {
     url,
@@ -83,6 +111,12 @@ export async function startServer(): Promise<TestServer> {
       try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
     },
   };
+}
+
+/** Backward-compatible: spawn the generic zigbase binary (runtime-created collections). */
+export async function startServer(): Promise<TestServer> {
+  // ensureBuilt() (invoked by startAppServer) builds the generic binary too.
+  return startAppServer({ bin: BIN });
 }
 
 /** Authenticate as the superuser and return the bearer token. */

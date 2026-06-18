@@ -245,10 +245,13 @@ const url2 = zb.files.getUrl("posts", "REC123", "cover.png", { download: true })
 ## Typed client — `@zigbase/client/typed`
 
 `@zigbase/client/typed` is the **generic typed core** that a generated `zbase.gen.ts` file
-instantiates into a fully type-safe, schema-aware client. The generator (coming in SP2.1b)
-will read your ZigBase schema and emit a thin declarative wrapper; until then, the
-hand-authored fixture at `clients/typescript/test/fixtures/blog.gen.ts` shows the exact
-pattern the generator will reproduce.
+instantiates into a fully type-safe, schema-aware client. The generator reads your ZigBase
+schema (via the `pub const App` export in your `main.zig`) and emits a thin declarative
+wrapper. The `examples/golfsim` example ships a live generated client at
+`examples/golfsim/clients/typescript/zbase.gen.ts` — regenerate it with `zig build
+gen-client` from the `examples/golfsim/` directory. The SDK's own coverage fixture is
+`fixtures/dating/schema.zig`, validated by a type-level `*.test-d.ts` suite and a live e2e
+against a `dating-server` binary.
 
 The subpath exports runtime factories and type utilities:
 

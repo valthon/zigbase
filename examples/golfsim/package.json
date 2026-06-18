@@ -1,0 +1,17 @@
+{
+  "name": "@zigbase-examples/golfsim",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "vitest run"
+  },
+  "dependencies": {
+    "@zigbase/client": "file:../../clients/typescript"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "vitest": "^1.6.0",
+    "typescript": "^5.4.0"
+  }
+}
