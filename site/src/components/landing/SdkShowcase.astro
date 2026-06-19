@@ -1,6 +1,9 @@
 ---
 import { Code } from 'astro:components';
 
+// BASE_URL is '/zigbase' (no trailing slash) — normalise to trailing slash.
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
 const tiers = [
   {
     title: 'Base — dynamic',
@@ -63,7 +66,7 @@ const res = await zb.rpc.bookingsConfirm({ id });`,
     </div>
 
     <p class="sdk__more">
-      <a href="/zigbase/docs/typescript-sdk">Read the TypeScript SDK docs →</a>
+      <a href={base + 'docs/typescript-sdk'}>Read the TypeScript SDK docs →</a>
     </p>
   </div>
 </section>
