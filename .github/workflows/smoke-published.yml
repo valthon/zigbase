@@ -1,0 +1,207 @@
+# Smoke test for the LIVE @zigbase npm packages.
+#
+# Why this exists
+# ---------------
+# Our normal CI (ci.yml) builds and tests the SDK against LOCAL source and
+# locally-built server binaries. That cannot catch a broken *publish*: a bad
+# release where a package installs from the registry but is fundamentally
+# unusable on a real machine. The classic failure is a broken
+# optionalDependencies chain for `@zigbase/typegen` -> `@zigbase/server` ->
+# `@zigbase/server-<platform>`: the CLI installs, but at runtime
+# `require.resolve('@zigbase/server-<key>/zigbase')` throws MODULE_NOT_FOUND /
+# "package is not installed", so the platform binary never execs.
+#
+# This workflow installs the published packages from the LIVE npm registry on
+# each supported platform and actually RUNS them, asserting that the platform
+# binary resolved and executed (not a module-resolution error) and that the
+# base client + its subpath exports load.
+#
+# Why schedule-only (no push / pull_request)
+# ------------------------------------------
+# It depends on the live npm registry and on already-published artifacts, so it
+# is inherently network-dependent and decoupled from any given commit. Gating
+# PR CI on it would make normal development red on transient registry hiccups or
+# whenever HEAD is ahead of the last release. It runs on a daily cron and can be
+# kicked off manually via the Actions tab.
+name: "Smoke: published packages"
+
+on:
+  schedule:
+    # Daily at 06:17 UTC. Off-the-hour to avoid the cron stampede.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+# A scheduled run that is already in flight need not be duplicated by a manual
+# dispatch; keep the newest.
+concurrency:
+  group: smoke-published-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: "Smoke: ${{ matrix.label }}"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      # Report every platform's result even if one is broken.
+      fail-fast: false
+      matrix:
+        include:
+          # Each runner maps to one of the four published platform binaries:
+          #   @zigbase/server-linux-x64    @zigbase/server-linux-arm64
+          #   @zigbase/server-darwin-x64   @zigbase/server-darwin-arm64
+          - label: linux-x64
+            runner: ubuntu-latest
+            platform_pkg: "@zigbase/server-linux-x64"
+          - label: linux-arm64
+            # ubuntu-24.04-arm is the GA GitHub-hosted Arm64 Linux runner.
+            runner: ubuntu-24.04-arm
+            platform_pkg: "@zigbase/server-linux-arm64"
+          - label: darwin-arm64
+            # macos-14 (and macos-latest) are Apple Silicon (arm64).
+            runner: macos-14
+            platform_pkg: "@zigbase/server-darwin-arm64"
+          - label: darwin-x64
+            # macos-15-intel is the current x86_64 (Intel) GitHub-hosted runner.
+            # (The old macos-13 Intel image was fully retired on 2025-12-04.)
+            # macos-15-intel is the LAST Intel macOS image GitHub will offer and
+            # is slated to be retired around Aug 2027; revisit darwin-x64
+            # coverage before then. See actions/runner-images#13045.
+            runner: macos-15-intel
+            platform_pkg: "@zigbase/server-darwin-x64"
+    steps:
+      - name: Set up Node 24 (npm 11.x)
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Tool versions
+        run: |
+          echo "platform: $(node -p 'process.platform + \"-\" + process.arch')"
+          echo "node: $(node --version)"
+          echo "npm:  $(npm --version)"
+          echo "expected platform package: ${{ matrix.platform_pkg }}"
+
+      # --- @zigbase/typegen: prove the platform binary resolves AND runs ------
+      #
+      # Run the published CLI with NO valid schema source. A WORKING publish
+      # execs the bundled Zig binary, which prints a friendly engine usage error
+      # ("typegen: --out <path> is required"). A BROKEN publish fails earlier in
+      # the CJS launcher with a module-resolution error and never reaches the
+      # engine. We assert on the engine string to distinguish the two.
+      - name: Smoke @zigbase/typegen@latest (platform binary resolves + execs)
+        shell: bash
+        env:
+          # The exact friendly-engine substring observed from the live binary.
+          # Emitted by the Zig engine itself (NOT node's resolver), so its
+          # presence proves: optionalDependency installed -> require.resolve
+          # succeeded -> binary execed.
+          EXPECT: "typegen: --out"
+        run: |
+          set -uo pipefail
+          work="$(mktemp -d)"
+          cd "$work"
+
+          attempt=0
+          max=3
+          out=""
+          status=1
+          while [ "$attempt" -lt "$max" ]; do
+            attempt=$((attempt + 1))
+            echo "::group::typegen attempt ${attempt}/${max}"
+            # Capture combined stdout+stderr; npx --yes installs from the live
+            # registry. No valid source args -> friendly engine error, exit 1.
+            out="$(npx --yes @zigbase/typegen@latest 2>&1)" && status=0 || status=$?
+            echo "$out"
+            echo "::endgroup::"
+
+            if printf '%s' "$out" | grep -qF "$EXPECT"; then
+              echo "PASS: engine ran and emitted the expected usage error."
+              echo "$out" >/dev/null
+              exit 0
+            fi
+
+            # If the binary ran but printed something unexpected, retrying will
+            # not help; only retry on signals of a transient install/network
+            # failure. Be conservative: retry unless we clearly saw the engine.
+            echo "Expected substring not found yet (attempt ${attempt})."
+            if [ "$attempt" -lt "$max" ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+
+          echo "::error::@zigbase/typegen smoke FAILED on ${{ matrix.label }}."
+          echo "Expected output to contain: '${EXPECT}'"
+          echo "This usually means the published optionalDependencies chain is"
+          echo "broken: '${{ matrix.platform_pkg }}' did not install or"
+          echo "require.resolve('${{ matrix.platform_pkg }}/zigbase') failed, so"
+          echo "the platform binary never execed (look for MODULE_NOT_FOUND or"
+          echo "'package is not installed' above)."
+          echo "----- last captured output (exit ${status}) -----"
+          printf '%s\n' "$out"
+          exit 1
+
+      # --- @zigbase/client: install + verify export surface ------------------
+      - name: Smoke @zigbase/client@latest (install + subpath exports)
+        shell: bash
+        run: |
+          set -uo pipefail
+          work="$(mktemp -d)"
+          cd "$work"
+          npm init -y >/dev/null
+
+          # Retry the install on transient registry failures.
+          attempt=0
+          max=3
+          ok=0
+          while [ "$attempt" -lt "$max" ]; do
+            attempt=$((attempt + 1))
+            echo "::group::npm i @zigbase/client@latest attempt ${attempt}/${max}"
+            if npm i @zigbase/client@latest; then
+              ok=1
+              echo "::endgroup::"
+              break
+            fi
+            echo "::endgroup::"
+            echo "install attempt ${attempt} failed."
+            if [ "$attempt" -lt "$max" ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Failed to install @zigbase/client@latest after ${max} attempts on ${{ matrix.label }}."
+            exit 1
+          fi
+
+          # ESM import check: named export + both subpaths must load.
+          cat > check.mjs <<'EOF'
+          import { createClient } from '@zigbase/client';
+          import * as typed from '@zigbase/client/typed';
+          import * as realtime from '@zigbase/client/realtime';
+
+          const fail = (msg) => { console.error('FAIL:', msg); process.exit(1); };
+
+          if (typeof createClient !== 'function') {
+            fail("'createClient' is not a named function export of @zigbase/client");
+          }
+          if (typeof typed !== 'object' || typed === null) {
+            fail("subpath '@zigbase/client/typed' did not resolve to a module");
+          }
+          if (typeof realtime !== 'object' || realtime === null) {
+            fail("subpath '@zigbase/client/realtime' did not resolve to a module");
+          }
+
+          console.log('PASS: createClient is a', typeof createClient, 'export');
+          console.log('PASS: @zigbase/client/typed loaded ->', Object.keys(typed).join(',') || '(module, no named exports)');
+          console.log('PASS: @zigbase/client/realtime loaded ->', Object.keys(realtime).join(',') || '(module, no named exports)');
+          EOF
+
+          if ! node check.mjs; then
+            echo "::error::@zigbase/client export surface check FAILED on ${{ matrix.label }}."
+            echo "The package installed but createClient and/or the typed/realtime"
+            echo "subpath exports did not resolve as expected."
+            exit 1
+          fi
