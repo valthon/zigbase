@@ -1,13 +1,13 @@
 ---
 title: Known limitations
-description: Current caveats in ZigBase v0.1.0 — auth/email, framework hooks, schema migrations, fields, the scheduler, platform/UI gaps, and deferred work.
+description: Current caveats in ZigBase — auth/email, framework hooks, schema migrations, fields, the scheduler, platform/UI gaps, and deferred work.
 order: 3
 group: reference
 ---
 
 # Known limitations
 
-ZigBase v0.1.0 is an early release. The gaps below are known and tracked for post-v0.1.
+ZigBase is an early release. The gaps below are known and tracked for future releases.
 
 ## Auth & email
 
@@ -83,4 +83,4 @@ ZigBase v0.1.0 is an early release. The gaps below are known and tracked for pos
 
 ---
 
-These are tracked for post-v0.1. Contributions welcome.
+These are tracked for future releases. Contributions welcome.

@@ -12,7 +12,7 @@ For the full guide (framework bindings, security notes, known limitations) see
 npm install @zigbase/client
 ```
 
-Published: `@zigbase/client@0.1.0`. Three tiers — the base dynamic client (this package),
+Published on npm as `@zigbase/client`. Three tiers — the base dynamic client (this package),
 the comptime-generated typed client (`zig build gen-client`), and runtime introspection
 (`npx @zigbase/typegen`). See the [TypeScript SDK docs](../../docs/typescript-sdk.md).
 
