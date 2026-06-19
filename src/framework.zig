@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const static_files = @import("static_files.zig");
 const app_mod = @import("app.zig");
 const events = @import("events.zig");
@@ -315,18 +317,19 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
 
     const cmd = cli.parse(args[1..], .{ .serve_static = std.meta.activeTag(opts.static_mode) == .default }) catch |err| {
         std.log.err("argument error: {s}", .{@errorName(err)});
-        printUsage(std.meta.activeTag(opts.static_mode) == .default);
+        printUsage(init.io, std.Io.File.stderr(), std.meta.activeTag(opts.static_mode) == .default);
         return;
     };
 
     switch (cmd) {
         .help => |topic| switch (topic) {
-            .top => printUsage(std.meta.activeTag(opts.static_mode) == .default),
-            .serve => printServeUsage(std.meta.activeTag(opts.static_mode) == .default),
-            .migrate => printMigrateUsage(),
-            .superuser_create => printSuperuserUsage(),
-            .typegen => printTypegenUsage(),
+            .top => printUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default),
+            .serve => printServeUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default),
+            .migrate => printMigrateUsage(init.io, std.Io.File.stdout()),
+            .superuser_create => printSuperuserUsage(init.io, std.Io.File.stdout()),
+            .typegen => printTypegenUsage(init.io, std.Io.File.stdout()),
         },
+        .version => printVersion(init.io, std.Io.File.stdout()),
         .serve => |sa| {
             const cfg = try loadCfg(init.environ_map, sa);
             try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts);
@@ -362,13 +365,23 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     }
 }
 
-/// Print the comprehensive top-level usage guide to stderr. We use std.debug.print
+/// Emit `fmt` (with `args`) to `file` via a stack buffer, flushing after. Used by
+/// the print* helpers so help/version go to stdout and argument errors go to stderr,
+/// all without log-level/metadata prefixes that would clutter multi-section screens.
+fn emit(io: std.Io, file: std.Io.File, comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(io, &buf);
+    w.interface.print(fmt, args) catch {};
+    w.interface.flush() catch {};
+}
+
+/// Print the comprehensive top-level usage guide to stdout. We use emit()
 /// (not std.log.info) so each line is emitted cleanly without log-level/metadata
 /// prefixes, which keeps a multi-section help screen readable.
 /// `show_serve_static` mirrors the parser gate: --serve-static is only listed in
 /// the default comptime mode (in .disabled/.dir/.embedded it's an unknown flag).
-fn printUsage(show_serve_static: bool) void {
-    std.debug.print(
+fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool) void {
+    emit(io, file,
         \\zigbase — a single-binary backend (REST + WebSocket + admin UI)
         \\Docs & source: https://github.com/valthon/zigbase
         \\
@@ -380,6 +393,7 @@ fn printUsage(show_serve_static: bool) void {
         \\  migrate             Apply database migrations, then exit.
         \\  superuser create    Create an admin (superuser) account.
         \\  help                Show this help. Also: --help, -h, or no arguments.
+        \\  version             Print version + build provenance. Also: --version, -V.
         \\
         \\  Per-command help is available via `zigbase <command> --help`, e.g.
         \\  `zigbase serve --help` or `zigbase superuser create --help`.
@@ -397,12 +411,12 @@ fn printUsage(show_serve_static: bool) void {
         \\                      browser upgrades. [env ZIGBASE_REALTIME_ORIGINS]
         \\
     , .{});
-    if (show_serve_static) std.debug.print(
+    if (show_serve_static) emit(io, file,
         \\  --serve-static DIR  Serve static files from DIR at the root path (serve only;
         \\                      available unless the app hardcodes static files at comptime).
         \\
     , .{});
-    std.debug.print(
+    emit(io, file,
         \\
         \\ENVIRONMENT VARIABLES:
         \\  ZIGBASE_JWT_SECRET        Token-signing secret (>= 32 bytes). When UNSET, a strong
@@ -449,8 +463,28 @@ fn printUsage(show_serve_static: bool) void {
     , .{});
 }
 
-fn printServeUsage(show_serve_static: bool) void {
-    std.debug.print(
+/// Print build provenance (for `--version`) to stdout. emit() keeps it prefix-free.
+fn printVersion(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase {s}
+        \\commit:  {s}
+        \\build:   {s}
+        \\target:  {s}-{s}-{s}
+        \\zig:     {s}
+        \\
+    , .{
+        build_options.version,
+        build_options.commit,
+        @tagName(builtin.mode),
+        @tagName(builtin.target.cpu.arch),
+        @tagName(builtin.target.os.tag),
+        @tagName(builtin.target.abi),
+        builtin.zig_version_string,
+    });
+}
+
+fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool) void {
+    emit(io, file,
         \\zigbase serve — start the HTTP server (REST API + WebSocket + admin UI at /_/).
         \\
         \\USAGE:
@@ -467,12 +501,12 @@ fn printServeUsage(show_serve_static: bool) void {
         \\  --realtime-origins CSV  Allowed WebSocket Origins; empty denies cross-origin upgrades.
         \\
     , .{if (show_serve_static) " [--serve-static DIR]" else ""});
-    if (show_serve_static) std.debug.print(
+    if (show_serve_static) emit(io, file,
         \\  --serve-static DIR  Serve static files from DIR at the root path (anything
         \\                      not matching /api/, /_/, or custom routes). [default: off]
         \\
     , .{});
-    std.debug.print(
+    emit(io, file,
         \\KEY ENVIRONMENT VARIABLES:
         \\  ZIGBASE_JWT_SECRET      Token-signing secret (>= 32 bytes). When unset, a random secret
         \\                         is generated + persisted at <data-dir>/.jwt_secret (0600) on first run.
@@ -487,8 +521,8 @@ fn printServeUsage(show_serve_static: bool) void {
     , .{});
 }
 
-fn printMigrateUsage() void {
-    std.debug.print(
+fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
         \\zigbase migrate — apply pending database migrations, then exit.
         \\
         \\USAGE:
@@ -506,8 +540,8 @@ fn printMigrateUsage() void {
     , .{});
 }
 
-fn printSuperuserUsage() void {
-    std.debug.print(
+fn printSuperuserUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
         \\zigbase superuser create — create an admin (superuser) account.
         \\
         \\USAGE:
@@ -785,8 +819,8 @@ fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const
     std.log.info("superuser created: {s}", .{email});
 }
 
-fn printTypegenUsage() void {
-    std.debug.print(
+fn printTypegenUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
         \\Usage: <app> typegen (--data-dir <path> | --url <origin>) --out <file>
         \\                     [--api-prefix <prefix>] [--client-name <name>] [--check]
         \\                     [--admin-email <e> --admin-password <p>]   (with --url)

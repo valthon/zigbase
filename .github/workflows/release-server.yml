@@ -41,12 +41,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
-      - name: Build dist-server (${{ matrix.zig }})
-        run: mise exec zig@0.16.0 -- zig build dist-server -Dtarget=${{ matrix.zig }} -Doptimize=ReleaseFast -Dcpu=baseline
+      - name: Build zigbase (${{ matrix.zig }})
+        run: mise exec zig@0.16.0 -- zig build -Dtarget=${{ matrix.zig }} -Doptimize=ReleaseSafe -Dcpu=baseline
       - name: Stage binary
         run: |
           mkdir -p staged
-          cp zig-out/bin/zigbase-dist "staged/zigbase"
+          cp zig-out/bin/zigbase "staged/zigbase"
       - uses: actions/upload-artifact@v7
         with:
           name: zigbase-${{ matrix.key }}

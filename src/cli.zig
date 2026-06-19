@@ -34,6 +34,8 @@ pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen };
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
     help: HelpTopic,
+    /// `version`/`--version`/`-V` -> print build provenance and exit.
+    version: void,
     serve: ServeArgs,
     migrate: ServeArgs,
     superuser_create: SuperuserArgs,
@@ -58,6 +60,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
     if (args.len == 0) return .{ .help = .top };
     if (std.mem.eql(u8, args[0], "help") or isHelpFlag(args[0]))
         return .{ .help = .top };
+    if (std.mem.eql(u8, args[0], "version") or
+        std.mem.eql(u8, args[0], "--version") or
+        std.mem.eql(u8, args[0], "-V"))
+        return .{ .version = {} };
     if (std.mem.eql(u8, args[0], "migrate")) {
         var sa = ServeArgs{};
         var i: usize = 1;
@@ -267,4 +273,10 @@ test "parse typegen: url + admin creds" {
 test "parse typegen: missing flag value errors" {
     const args = [_][]const u8{ "typegen", "--out" };
     try std.testing.expectError(ParseError.MissingValue, parse(&args, .{ .serve_static = true }));
+}
+
+test "version / --version / -V -> version command" {
+    try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"version"}, .{})));
+    try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"--version"}, .{})));
+    try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"-V"}, .{})));
 }

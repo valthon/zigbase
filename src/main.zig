@@ -1,7 +1,10 @@
 const std = @import("std");
 const zigbase = @import("zigbase");
 
-/// The shipped binary is the framework with no extensions registered.
+/// The shipped binary: the framework with the `typegen` subcommand compiled in.
+/// One binary serves both the GitHub release tarballs and the @zigbase/server
+/// npm packages. `enable_typegen` stays a framework option for embedders who
+/// want it off.
 pub fn main(init: std.process.Init) !void {
-    return zigbase.App(.{}).runCli(init);
+    return zigbase.App(.{ .enable_typegen = true }).runCli(init);
 }

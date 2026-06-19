@@ -63,11 +63,12 @@ if (WHAT !== "typegen") {
   for (const t of TARGETS) {
     const dest = join(HERE, `server-${t.key}`, "zigbase");
     if (!SKIP_BUILD) {
-      console.log(`building dist-server for ${t.zig}`);
-      const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build", "dist-server",
-        `-Dtarget=${t.zig}`, "-Doptimize=ReleaseFast", "-Dcpu=baseline"], { cwd: REPO_ROOT, stdio: "inherit" });
+      console.log(`building zigbase for ${t.zig}`);
+      const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build",
+        `-Dtarget=${t.zig}`, "-Doptimize=ReleaseSafe", "-Dcpu=baseline"], { cwd: REPO_ROOT, stdio: "inherit" });
+      if (b.error) throw b.error;
       if (b.status !== 0) throw new Error(`build failed for ${t.zig}`);
-      copyFileSync(join(REPO_ROOT, "zig-out/bin/zigbase-dist"), dest);
+      copyFileSync(join(REPO_ROOT, "zig-out/bin/zigbase"), dest);
     }
     if (!existsSync(dest)) throw new Error(`missing binary for ${t.key}: ${dest} (build it or drop it in)`);
   }

@@ -1,4 +1,4 @@
-// Smoke test: build dist-server for the host, place it where the host's
+// Smoke test: build zigbase for the host, place it where the host's
 // @zigbase/server-<platform> package would have it, and assert the typegen
 // wrapper chain (typegen.js -> @zigbase/server binaryPath -> binary typegen)
 // resolves and forwards args. Run: `node clients/typescript/npm/test-launcher.mjs`
@@ -11,17 +11,17 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "../../..");
 const key = `${process.platform}-${process.arch}`;
 
-// 1) Build the host dist-server binary.
-const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build", "dist-server", "-Dcpu=baseline"], {
+// 1) Build the host zigbase binary.
+const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build", "-Dcpu=baseline"], {
   cwd: REPO_ROOT, stdio: "inherit",
 });
 if (b.error) throw b.error;
-if (b.status !== 0) throw new Error("dist-server build failed");
+if (b.status !== 0) throw new Error("zigbase build failed");
 
 // 2) Place it at @zigbase/server-<key>/zigbase (where binaryPath() resolves it).
 const platformPkg = join(HERE, `server-${key}`);
 mkdirSync(platformPkg, { recursive: true });
-copyFileSync(join(REPO_ROOT, "zig-out/bin/zigbase-dist"), join(platformPkg, "zigbase"));
+copyFileSync(join(REPO_ROOT, "zig-out/bin/zigbase"), join(platformPkg, "zigbase"));
 
 // 3) node_modules wiring so require.resolve('@zigbase/server-<key>/zigbase') works:
 //    create node_modules symlinks under server/ + typegen/ pointing at the sibling packages.

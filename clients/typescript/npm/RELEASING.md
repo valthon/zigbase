@@ -73,8 +73,8 @@ out of the box.
    node clients/typescript/npm/publish.mjs
    ```
    The script will:
-   - Cross-build `zigbase-dist` for all four targets via
-     `mise exec zig@0.16.0 -- zig build dist-server -Dtarget=<t> -Doptimize=ReleaseFast -Dcpu=baseline`.
+   - Cross-build `zigbase` for all four targets via
+     `mise exec zig@0.16.0 -- zig build -Dtarget=<t> -Doptimize=ReleaseSafe -Dcpu=baseline`.
    - Copy each binary into the corresponding `server-<key>/zigbase`.
    - Verify all `@zigbase/server*` packages share one version.
    - Publish the four platform packages, then the meta, then `@zigbase/typegen`.
