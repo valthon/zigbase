@@ -1,6 +1,6 @@
 {
   "name": "@zigbase/server-linux-x64",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "ZigBase server prebuilt binary for linux-x64.",
   "os": ["linux"],
   "cpu": ["x64"],
