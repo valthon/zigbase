@@ -66,6 +66,8 @@ jobs:
           # trusted publishing; node 22 ships npm 10.x which lacks it.
           node-version: 24
           registry-url: "https://registry.npmjs.org"
+      - name: Generate server package manifests
+        run: node clients/typescript/npm/gen-server-packages.mjs
       - name: Assert @zigbase/server version matches the tag
         run: |
           tag="${GITHUB_REF_NAME}"; expected="${tag#server-v}"

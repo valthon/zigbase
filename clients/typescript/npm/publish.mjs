@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { genServerPackages, versionFromBuildZon } from "./gen-server-packages.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "../../..");
@@ -20,12 +21,7 @@ if (whatIdx >= 0 && !["server", "typegen", "all"].includes(WHAT)) {
   throw new Error("--what must be one of: server, typegen, all");
 }
 
-const TARGETS = [
-  { key: "linux-x64", zig: "x86_64-linux-musl" },
-  { key: "linux-arm64", zig: "aarch64-linux-musl" },
-  { key: "darwin-x64", zig: "x86_64-macos" },
-  { key: "darwin-arm64", zig: "aarch64-macos" },
-];
+const TARGETS = JSON.parse(readFileSync(join(HERE, "server", "targets.json"), "utf8"));
 
 const pkgCache = new Map();
 function readPkg(dir) {
@@ -60,6 +56,8 @@ function publishDir(dir) {
 
 // 1) Build + inject platform binaries (unless --skip-build).
 if (WHAT !== "typegen") {
+  // Regenerate the server package.json + README files from targets.json + build.zig.zon.
+  genServerPackages({ version: versionFromBuildZon(REPO_ROOT), targets: TARGETS, npmDir: HERE });
   for (const t of TARGETS) {
     const dest = join(HERE, `server-${t.key}`, "zigbase");
     if (!SKIP_BUILD) {

@@ -1,0 +1,6 @@
+[
+  { "key": "linux-x64", "zig": "x86_64-linux-musl", "os": "linux", "cpu": "x64" },
+  { "key": "linux-arm64", "zig": "aarch64-linux-musl", "os": "linux", "cpu": "arm64" },
+  { "key": "darwin-x64", "zig": "x86_64-macos", "os": "darwin", "cpu": "x64" },
+  { "key": "darwin-arm64", "zig": "aarch64-macos", "os": "darwin", "cpu": "arm64" }
+]
