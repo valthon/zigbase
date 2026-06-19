@@ -3,13 +3,19 @@
 // wrapper chain (typegen.js -> @zigbase/server binaryPath -> binary typegen)
 // resolves and forwards args. Run: `node clients/typescript/npm/test-launcher.mjs`
 import { execFileSync, spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, symlinkSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, symlinkSync, rmSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { genServerPackages, versionFromBuildZon } from "./gen-server-packages.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "../../..");
 const key = `${process.platform}-${process.arch}`;
+
+// Generate the server package.json files so require.resolve treats the platform
+// + meta dirs as packages.
+const TARGETS = JSON.parse(readFileSync(join(HERE, "server", "targets.json"), "utf8"));
+genServerPackages({ version: versionFromBuildZon(REPO_ROOT), targets: TARGETS, npmDir: HERE });
 
 // 1) Build the host zigbase binary.
 const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build", "-Dcpu=baseline"], {

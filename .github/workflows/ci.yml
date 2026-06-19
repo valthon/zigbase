@@ -173,3 +173,5 @@ jobs:
       - name: Plugins typegen e2e (runtime SDK)
         working-directory: examples/plugins
         run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:e2e
+      - name: Server package generator unit test
+        run: cd clients/typescript/npm && mise exec node@24 -- node --test gen-server-packages.test.mjs
