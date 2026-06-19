@@ -34,22 +34,45 @@ enforces this order automatically:
 
 ## Normal releases — OIDC (after the bootstrap publish)
 
-Push a tag to trigger the `release-server.yml` workflow:
+### Server / project release (`v*`)
 
-- **Server packages:** push a `server-vX.Y.Z` tag (e.g. `server-v0.4.1`).
-  The workflow cross-builds all four platform binaries and publishes all five
-  `@zigbase/server*` packages with `--provenance`.
-- **Typegen:** push a `typegen-vX.Y.Z` tag (e.g. `typegen-v0.2.0`).
-  The workflow publishes `@zigbase/typegen` with `--provenance`.
+Bump the `.version` field in `build.zig.zon` (one line), commit, tag, and push:
 
-The workflow uses `node clients/typescript/npm/publish.mjs --skip-build
---provenance [--what server|typegen]` — the same script as the manual path.
+```bash
+# 1. Edit build.zig.zon — update .version = "X.Y.Z"
+git commit -am "chore: bump version to X.Y.Z"
+git tag vX.Y.Z
+git push --follow-tags
+```
 
-The workflow publishes **exclusively via OIDC trusted publishing** (`--provenance`,
-`id-token: write` permission, no token). OIDC requires each package to already exist on the
-registry, which is why the first publish is done manually (see below). After the first publish,
-configure a per-package trusted publisher on npmjs.com for the `release-server.yml` workflow,
-and all subsequent tag pushes will publish without any npm token.
+CI (`release.yml`) builds the zigbase binary once across all four targets and
+ships the result to **both** the GitHub release (tarballs + SHA256SUMS) **and**
+`@zigbase/server*` on npm with `--provenance`.
+
+The five server `package.json` files are **generated** from `targets.json` +
+`build.zig.zon` via `gen-server-packages.mjs` — do not edit them directly.
+
+A CI version guard (`scripts/assert-version.sh`) asserts the tag matches
+`build.zig.zon` before any build or publish step runs.
+
+### Typegen release (`typegen-v*`)
+
+1. Update `version` in `clients/typescript/npm/typegen/package.json`.
+2. If the minimum compatible `@zigbase/server` version changed, update the
+   `dependencies` range too.
+3. Commit, tag `typegen-vX.Y.Z`, and push:
+   ```bash
+   git commit -am "chore(npm): bump @zigbase/typegen to X.Y.Z"
+   git tag typegen-vX.Y.Z
+   git push --follow-tags
+   ```
+   CI asserts the tag matches `typegen/package.json` then publishes
+   `@zigbase/typegen` with `--provenance`.
+
+### Client SDK release (`client-v*`)
+
+Bump `clients/typescript/package.json`, commit, tag `client-vX.Y.Z`, and push.
+The `release-sdk.yml` workflow handles publishing `@zigbase/client`.
 
 ## First bootstrap publish (manual)
 
@@ -81,40 +104,17 @@ out of the box.
    - Skip any package whose exact version is already on the registry (safe to
      re-run after a partial failure).
 
-## Bumping versions
+## Manual fallback (CI down / first dry-run)
 
-### Server packages (`@zigbase/server*`)
+To release without GitHub Actions:
 
-All five packages share a version that must match `build.zig.zon`. To cut a
-new server release:
+```bash
+# Build + package tarballs + create GitHub release:
+scripts/release.sh --publish
 
-1. Update `version` in `build.zig.zon`.
-2. Update `version` in each of the five `package.json` files under
-   `clients/typescript/npm/server*/` to match. The `optionalDependencies` in
-   `server/package.json` must also be updated to exact-match the new version.
-3. Commit:
-   ```bash
-   git commit -am "chore(npm): bump @zigbase/server* to 0.5.0"
-   ```
-4. Tag and push:
-   ```bash
-   git tag server-v0.5.0
-   git push origin main
-   git push origin server-v0.5.0
-   ```
-
-### Typegen (`@zigbase/typegen`)
-
-1. Update `version` in `clients/typescript/npm/typegen/package.json`.
-2. If the minimum compatible `@zigbase/server` version changed, update the
-   `dependencies` range too.
-3. Commit, tag `typegen-vX.Y.Z`, and push:
-   ```bash
-   git commit -am "chore(npm): bump @zigbase/typegen to 0.2.0"
-   git tag typegen-v0.2.0
-   git push origin main
-   git push origin typegen-v0.2.0
-   ```
+# Then publish to npm:
+node clients/typescript/npm/publish.mjs --provenance
+```
 
 ## Script reference
 

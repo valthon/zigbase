@@ -1,28 +1,8 @@
-# ---------------------------------------------------------------------------
-# TypeScript SDK release workflow (@zigbase/client) — DORMANT.
-#
-# This workflow publishes the SDK to npm and ONLY runs when a tag matching
-# `client-v*` is pushed (e.g. `client-v0.1.0`). It cannot run on a normal
-# push, pull request, schedule, or manual dispatch — the only trigger is the
-# tag filter below.
-#
-# It is intentionally inert until ALL of the following are true:
-#   (a) the npm account / org `@zigbase` exists, and
-#   (b) EITHER a `NPM_TOKEN` repo secret is configured,
-#       OR npm "trusted publishing" (OIDC) is set up for this workflow.
-#
-# Do NOT push any `client-v*` tag until (a) and (b) are done — otherwise the
-# `npm publish` step will simply fail (no account / no auth). No `client-v*`
-# tag exists yet, so this file currently does nothing.
-#
-# SDK versioning is DECOUPLED from the ZigBase server: the server uses `vX`
-# tags; the SDK uses `client-v*` tags. See clients/typescript/RELEASING.md.
-#
-# OIDC note: if you configure npm trusted publishing (OIDC) for this workflow,
-# you can DELETE the `NODE_AUTH_TOKEN` env line below — the `id-token: write`
-# permission and `--provenance` flag are all that publishing needs. The token
-# is only required for classic token-based auth.
-# ---------------------------------------------------------------------------
+# TypeScript SDK release: publishes @zigbase/client to npm on a `client-v*` tag.
+# The SDK is versioned INDEPENDENTLY of the server (which uses `vX.Y.Z` tags).
+# Publishes via OIDC trusted publishing (no token) — a per-package trusted
+# publisher for this workflow must be configured on npmjs.com.
+# See clients/typescript/RELEASING.md.
 name: Release SDK
 
 on:
