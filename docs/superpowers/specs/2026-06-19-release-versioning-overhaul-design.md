@@ -100,9 +100,30 @@ entry *is* per-release content.
   Advanced users who want `ReleaseFast`/`ReleaseSmall` build their own.
 - Net: one artifact per target, identical bytes in the tarball and the npm
   platform package.
-- **Optional (nice-to-have, not required):** a `zigbase version` subcommand /
-  `--version` that reads `build.zig.zon` so the running binary self-reports.
-  Listed for the plan to include only if cheap.
+### 5.1 `--version` build provenance (required)
+Every shipped binary must support `--version` (and the equivalent `version`
+subcommand), printing the tagged version it was built with plus basic build
+provenance for bug reports:
+
+```
+zigbase 0.4.1
+commit:  a51ccb3            # git short SHA at build time (or "unknown" outside a repo)
+build:   ReleaseSafe        # optimize mode
+target:  x86_64-linux-musl  # target triple
+zig:     0.16.0             # compiler version
+```
+
+Implemented as a **framework feature**, not per-binary: `build.zig` reads
+`build.zig.zon` `.version` and runs `git rev-parse --short HEAD` at build time,
+then injects them (plus `@tagName(optimize)`, the resolved target triple, and
+`@import("builtin").zig_version`) into the **library module** (`zigbase_mod`)
+via `b.addOptions(...)`. `App(...).runCli` handles `--version` / `version` and
+prints them. Because it lives in the framework, **every** binary built on
+ZigBase — the shipped `zigbase`, the examples, and downstream user apps — gets
+`--version` for free, reporting the ZigBase version it was compiled against.
+Git-SHA lookup degrades gracefully to `"unknown"` when building outside a git
+checkout (e.g. from a source tarball). Combined with the release guard
+(`tag == build.zig.zon`), a released binary self-reports its exact tag.
 
 ## 6. Single target list + generated npm packages (DRY)
 
@@ -227,6 +248,9 @@ Both 3 and 4 consume the identical artifacts from step 2.
 - **Single-binary build:** `zig build` produces a stripped `ReleaseSafe`
   `zigbase` that runs `serve` and `typegen` (the latter emits its usual usage
   error), proving unification.
+- **`--version`:** the built binary prints the `build.zig.zon` version, a commit
+  SHA (or `"unknown"`), the build mode, target, and zig version; an example
+  binary reports the same ZigBase version (proves the framework-level wiring).
 - **Version-guard:** a tag/version mismatch fails the workflow guard
   (test the guard logic, e.g. a small script with unit coverage).
 - **Site build:** `npm run build` derives the correct `SERVER_VERSION` /
@@ -241,7 +265,7 @@ Both 3 and 4 consume the identical artifacts from step 2.
 ## 11. Decomposition (for the plan)
 
 Cohesive but large; the plan will sequence roughly:
-(a) single binary + one variant (`main.zig`, delete `main_dist.zig` + `dist-server`);
+(a) single binary + one variant (`main.zig`, delete `main_dist.zig` + `dist-server`) + the `--version` framework feature (`build.zig` options module + `runCli` handler);
 (b) `targets.json` + the package/README generator (+ unit test), delete committed platform dirs, rewire `publish.mjs` + launcher to the generated data;
 (c) unified `v*` build-once → both-channels workflow + version guard; refactor `scripts/release.sh` to shared logic; remove `server-v*`; activate `client-v*`;
 (d) site `version.ts` + remark token plugin + `targets.json`-driven download table; README dynamic badge; de-pin `docs/*.md` mirror; fix drift;
