@@ -20,6 +20,15 @@ pub const JobEvent = events.JobEvent; // cron/interval/reactive job + app.submit
 pub const Req = @import("route_types.zig").Req;
 pub const RouteError = @import("route_types.zig").RouteError;
 
+// Auth: consumer-facing helpers for custom auth flows. `issueSession` mints a native
+// `.auth` session (zb_auth + zb_csrf cookies) for a record in an auth collection, so a
+// custom route (e.g. a passwordless magic-link handler) can log a user in without the
+// built-in password/OAuth2 path. `Issued` is its return type (token + the two cookies).
+pub const auth = struct {
+    pub const issueSession = @import("api/auth.zig").issueSession;
+    pub const Issued = @import("api/auth.zig").Issued;
+};
+
 // ---- Plugin / schema / migration consumer types ---------------------------
 // Types an external consumer must be able to NAME to write a custom storage or
 // mailer plugin, an explicit migration, or to reference the built-in plugins.

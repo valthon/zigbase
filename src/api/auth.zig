@@ -115,6 +115,18 @@ pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: [
     };
 }
 
+/// Consumer-facing session mint: resolve a collection's table + the record's tokenKey,
+/// then `issue()` a native `.auth` session (zb_auth + zb_csrf cookies). Lets a custom
+/// route log a user in without the built-in password/OAuth2 path — e.g. a passwordless
+/// magic-link route validates its own emailed token, then calls this. `conn` is the
+/// caller's already-acquired connection (pass the writer you hold to avoid a second
+/// writer checkout). Returns error.NotFound if the record or its tokenKey is absent.
+pub fn issueSession(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, record_id: []const u8) !Issued {
+    const col = (try collections.get(ctx.allocator, conn, collection)) orelse return error.NotFound;
+    const tk = (try tokenKeyFor(ctx.allocator, conn, col.name, record_id)) orelse return error.NotFound;
+    return issue(ctx, conn, collection, record_id, tk);
+}
+
 /// Fire auth.afterAuthSuccess. After-style: never propagates (auth already succeeded).
 pub fn emitAuth(ctx: *http.RequestCtx, collection: []const u8, record: ?std.json.Value, method: events.AuthMethod) void {
     const app = ctx.app orelse return;
