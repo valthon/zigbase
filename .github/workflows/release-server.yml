@@ -62,7 +62,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # node 24 (the repo's mise pin) ships npm >= 11.5, required for OIDC
+          # trusted publishing; node 22 ships npm 10.x which lacks it.
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
       - name: Assert @zigbase/server version matches the tag
         run: |
@@ -96,7 +98,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # node 24 (the repo's mise pin) ships npm >= 11.5, required for OIDC
+          # trusted publishing; node 22 ships npm 10.x which lacks it.
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
       - name: Assert @zigbase/typegen version matches the tag
         run: |

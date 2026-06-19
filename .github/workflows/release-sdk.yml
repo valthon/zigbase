@@ -42,7 +42,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # node 24 (the repo's mise pin) ships npm >= 11.5, required for OIDC
+          # trusted publishing; node 22 ships npm 10.x which lacks it.
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
@@ -73,8 +75,9 @@ jobs:
             exit 1
           fi
 
+      # Publishes via OIDC trusted publishing (no NODE_AUTH_TOKEN): npm sees no
+      # token and authenticates through the GitHub Actions id-token. A trusted
+      # publisher for this workflow must be configured on npmjs.com first.
       - name: Publish to npm
         working-directory: clients/typescript
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
