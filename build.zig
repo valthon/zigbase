@@ -4,6 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Strip debug info from the shipped binaries in release builds. An unstripped
+    // ReleaseFast build is ~24 MiB of mostly compressible debug_info; stripped it
+    // is ~7 MiB — and the @zigbase/server npm packages ship the unpacked binary,
+    // so this is a direct ~72% cut to install size. Debug builds keep symbols;
+    // override with -Dstrip=false to keep them in a release build too.
+    const strip = b.option(bool, "strip", "Strip debug info from shipped binaries (default: on except in Debug)") orelse (optimize != .Debug);
+
     const zap = b.dependency("zap", .{ .target = target, .optimize = optimize });
 
     // The public library module. Consumers `zig fetch` this and import "zigbase".
@@ -31,6 +38,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .link_libc = true,
     });
     exe_mod.addImport("zigbase", zigbase_mod);
@@ -63,6 +71,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main_dist.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .link_libc = true,
     });
     dist_mod.addImport("zigbase", zigbase_mod);
