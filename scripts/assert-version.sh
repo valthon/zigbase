@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 expected="${1:?usage: assert-version.sh <expected-version>}"
-actual="$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+actual="$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | cut -d'"' -f2)"
 echo "expected=$expected build.zig.zon=$actual"
 if [ "$expected" != "$actual" ]; then
   echo "::error::version mismatch: tag implies $expected but build.zig.zon has $actual" >&2

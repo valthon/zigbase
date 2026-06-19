@@ -2,7 +2,7 @@
 # Local unit test for assert-version.sh + package-tarball.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-ver="$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+ver="$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | cut -d'"' -f2)"
 
 # assert-version: matching version exits 0; mismatch exits non-zero.
 scripts/assert-version.sh "$ver"

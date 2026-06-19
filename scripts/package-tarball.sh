@@ -6,12 +6,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version="${1:?version}"; target="${2:?target}"; binary="${3:?binary}"; out="${4:?out-dir}"
+mkdir -p "$out"
+out_abs="$(cd "$out" && pwd)"   # absolute path so `tar -C` is robust across GNU/BSD tar
 name="zigbase-${version}-${target}"
-staging="$out/$name"
+staging="$out_abs/$name"
 mkdir -p "$staging"
 cp "$binary" "$staging/zigbase"
 chmod +x "$staging/zigbase"
 cp LICENSE README.md KNOWN_LIMITATIONS.md "$staging/"
-tar -czf "$out/${name}.tar.gz" -C "$out" "$name"
+tar -czf "$out_abs/${name}.tar.gz" -C "$out_abs" "$name"
 rm -rf "$staging"
-echo "packaged $out/${name}.tar.gz"
+echo "packaged $out_abs/${name}.tar.gz"
