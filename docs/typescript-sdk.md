@@ -7,13 +7,25 @@ cursor pagination, files, low-level realtime subscriptions, and a high-level **l
 
 ## Install
 
-> **Pre-release:** `@zigbase/client` is not yet published to npm. Until the first
-> release you can build it from source (`clients/typescript/`). The `npm install`
-> command below will work once the first `client-v*` release is published.
-
 ```bash
 npm install @zigbase/client
 ```
+
+The SDK is published: `@zigbase/client@0.1.0`. Its `@zigbase/client/typed` and
+`@zigbase/client/realtime` entry points ship in the same package. For the runtime
+generator, see [Runtime introspection](#runtime-introspection-zigbase-typegen) —
+no install needed beyond `npx @zigbase/typegen` (which pulls `@zigbase/server@0.4.0`).
+
+## Which tier should I use?
+
+| Tier | Get it | Typing | Typed custom-route RPC | Needs Zig source |
+|---|---|---|---|---|
+| **Base dynamic** | `npm install @zigbase/client` | you pass `<Type>` | no | no |
+| **Comptime-generated** | `zig build gen-client` | full, from your schema | **yes** (`zb.rpc.*`) | yes |
+| **Runtime introspection** | `npx @zigbase/typegen` | full (db/realtime/files) | no | no |
+
+All three share the same runtime (`@zigbase/client`); the generated tiers add fully-typed
+`zb.db.*` (and, for comptime, `zb.rpc.*`) on top.
 
 ## Create a client
 

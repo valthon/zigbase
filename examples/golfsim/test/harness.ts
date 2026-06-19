@@ -50,7 +50,7 @@ export async function startGolfsim(): Promise<GolfServer> {
   const dataDir = mkdtempSync(join(tmpdir(), "golf-it-"));
   const port = 20000 + Math.floor(Math.random() * 20000);
   const su = spawnSync(BIN, ["superuser", "create", "--email", "admin@golf.local", "--password", "test-password-123", "--data-dir", dataDir], { stdio: "inherit" });
-  if (su.status !== 0) throw new Error("superuser create failed");
+  if (su.status !== 0) { try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } throw new Error("superuser create failed"); }
   // cwd MUST be EXAMPLE_ROOT: the comptime `.static_files = .{ .dir = "frontend/dist" }`
   // is resolved relative to the server's working directory.
   const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });

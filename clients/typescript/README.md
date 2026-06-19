@@ -8,13 +8,13 @@ For the full guide (framework bindings, security notes, known limitations) see
 
 ## Install
 
-> **Pre-release:** `@zigbase/client` is not yet published to npm. Until the first
-> release you can build it from source (`clients/typescript/`). The `npm install`
-> command below will work once the first `client-v*` release is published.
-
 ```bash
 npm install @zigbase/client
 ```
+
+Published: `@zigbase/client@0.1.0`. Three tiers — the base dynamic client (this package),
+the comptime-generated typed client (`zig build gen-client`), and runtime introspection
+(`npx @zigbase/typegen`). See the [TypeScript SDK docs](../../docs/typescript-sdk.md).
 
 ## Quick start
 

@@ -137,10 +137,14 @@ jobs:
         run: |
           chmod +x artifacts/zig-out/bin/zigbase \
                    artifacts/zig-out/bin/dating-server \
-                   artifacts/examples/golfsim/zig-out/bin/golfsim
+                   artifacts/examples/golfsim/zig-out/bin/golfsim \
+                   artifacts/examples/blog/zig-out/bin/blog \
+                   artifacts/examples/plugins/zig-out/bin/plugins
           echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_DATING_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/dating-server" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_GOLFSIM_BINARY=$GITHUB_WORKSPACE/artifacts/examples/golfsim/zig-out/bin/golfsim" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_BLOG_BINARY=$GITHUB_WORKSPACE/artifacts/examples/blog/zig-out/bin/blog" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
       - name: Cache npm downloads
         uses: actions/cache@v4
         with:
@@ -164,4 +168,10 @@ jobs:
         run: mise exec node@24 -- npm run build
       - name: Golfsim e2e
         working-directory: examples/golfsim
+        run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:e2e
+      - name: Blog e2e (base SDK)
+        working-directory: examples/blog
+        run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:e2e
+      - name: Plugins typegen e2e (runtime SDK)
+        working-directory: examples/plugins
         run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:e2e
