@@ -43,7 +43,7 @@ export async function startPlugins(): Promise<PluginsServer> {
   const dataDir = mkdtempSync(join(tmpdir(), "plug-it-"));
   const port = 20000 + Math.floor(Math.random() * 20000);
   const su = spawnSync(BIN, ["superuser", "create", "--email", "admin@plug.local", "--password", "test-password-123", "--data-dir", dataDir], { stdio: "inherit" });
-  if (su.status !== 0) throw new Error("superuser create failed");
+  if (su.status !== 0) { try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } throw new Error("superuser create failed"); }
   const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
   const url = `http://127.0.0.1:${port}`;
   try { await waitForHealth(url); } // health == collections provisioned into the data dir
