@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Build + package ZigBase release artifacts for all supported targets.
-# Usage: scripts/release.sh [--publish]   (--publish runs `gh release create` for the version tag)
+# Build + package ZigBase release artifacts for all supported targets — the
+# MANUAL fallback. The primary path is the `v*` tag → .github/workflows/release.yml,
+# which builds once and ships to BOTH the GitHub release and npm. Use this script
+# for bootstrap / offline / emergency releases.
+# Usage: scripts/release.sh [--publish]   (--publish asserts the version + runs `gh release create`)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -17,17 +20,11 @@ TARGETS=(
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
-echo "Building zigbase ${VERSION} for ${#TARGETS[@]} targets..."
+echo "Building zigbase ${VERSION} for ${#TARGETS[@]} targets (ReleaseSafe)..."
 for t in "${TARGETS[@]}"; do
   echo "  -> $t"
-  "${ZIG[@]}" build -Dtarget="$t" -Doptimize=ReleaseSafe
-  name="zigbase-${VERSION}-${t}"
-  staging="$OUT/$name"
-  mkdir -p "$staging"
-  cp zig-out/bin/zigbase "$staging/zigbase"
-  cp LICENSE README.md KNOWN_LIMITATIONS.md "$staging/"
-  tar -czf "$OUT/${name}.tar.gz" -C "$OUT" "$name"
-  rm -rf "$staging"
+  "${ZIG[@]}" build -Dtarget="$t" -Doptimize=ReleaseSafe -Dcpu=baseline
+  scripts/package-tarball.sh "$VERSION" "$t" zig-out/bin/zigbase "$OUT"
 done
 
 ( cd "$OUT" && sha256sum ./*.tar.gz > SHA256SUMS )
@@ -36,12 +33,14 @@ echo "Artifacts in $OUT/:"
 ls -1 "$OUT"
 echo
 if [[ "${1:-}" == "--publish" ]]; then
-  if ! command -v gh >/dev/null 2>&1; then echo "gh not found; cannot publish." >&2; exit 1; fi
+  command -v gh >/dev/null 2>&1 || { echo "gh not found; cannot publish." >&2; exit 1; }
+  scripts/assert-version.sh "$VERSION"
   echo "Publishing GitHub release ${TAG}..."
   gh release create "$TAG" "$OUT"/*.tar.gz "$OUT/SHA256SUMS" \
     --title "ZigBase ${VERSION}" \
     --notes-file CHANGELOG.md
+  echo "GitHub release done. To publish the npm packages, run:"
+  echo "  node clients/typescript/npm/publish.mjs --provenance"
 else
-  echo "Dry run (no --publish). To publish: scripts/release.sh --publish"
-  echo "(requires a GitHub remote + 'gh auth login'; the tag ${TAG} should exist or gh will create it from HEAD)"
+  echo "Dry run (no --publish). Primary path: push a 'v${VERSION}' tag → CI releases to GitHub + npm."
 fi
