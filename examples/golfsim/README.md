@@ -234,6 +234,8 @@ RAII helpers in routes: `ev.writer()` (write) / `try ev.reader()` (read-only).
 
 ## Generated TypeScript client
 
+> **SDK Tier 2 — comptime-generated typed client.** `zig build gen-client` reads this example's `pub const App` at build time and emits a fully-typed `zbase.gen.ts`: typed `zb.db.<collection>.*` and typed custom-route RPC via `zb.rpc.*` (e.g. `zb.rpc.bookingsConfirm({ id })`). This is the richest tier — it's the only one with typed custom-route RPC. See the [TypeScript SDK docs](../../docs/typescript-sdk.md) and, for runtime generation without Zig source, the plugins example (Tier 3).
+
 `examples/golfsim` ships a **generated, fully type-safe TypeScript client** at
 `clients/typescript/zbase.gen.ts`. The file is committed to the repo; `zig build
 gen-client` regenerates it from the schema, and the CI staleness gate (`zig build
