@@ -39,7 +39,7 @@ jobs:
             runner: macos-latest
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
       - name: Build dist-server (${{ matrix.zig }})
         run: mise exec zig@0.16.0 -- zig build dist-server -Dtarget=${{ matrix.zig }} -Doptimize=ReleaseFast -Dcpu=baseline
@@ -47,7 +47,7 @@ jobs:
         run: |
           mkdir -p staged
           cp zig-out/bin/zigbase-dist "staged/zigbase"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zigbase-${{ matrix.key }}
           path: staged/zigbase
@@ -59,8 +59,8 @@ jobs:
     needs: build-binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           # node 24 (the repo's mise pin) ships npm >= 11.5, required for OIDC
           # trusted publishing; node 22 ships npm 10.x which lacks it.
@@ -78,13 +78,13 @@ jobs:
             mkdir -p "clients/typescript/npm/server-$k"
           done
           # download-artifact below places each into its package dir
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: zigbase-linux-x64, path: clients/typescript/npm/server-linux-x64 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: zigbase-linux-arm64, path: clients/typescript/npm/server-linux-arm64 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: zigbase-darwin-x64, path: clients/typescript/npm/server-darwin-x64 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: zigbase-darwin-arm64, path: clients/typescript/npm/server-darwin-arm64 }
       - name: chmod binaries
         run: chmod +x clients/typescript/npm/server-*/zigbase
@@ -95,8 +95,8 @@ jobs:
     if: startsWith(github.ref_name, 'typegen-v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           # node 24 (the repo's mise pin) ships npm >= 11.5, required for OIDC
           # trusted publishing; node 22 ships npm 10.x which lacks it.
