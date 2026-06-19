@@ -119,17 +119,29 @@ test "clientIpFrom ignores X-Forwarded-For/X-Real-IP unless trust_proxy is set (
 }
 
 fn setZapStatus(r: zap.Request, status: u16) void {
+    // The catch-all maps an unlisted code to 500, so every status a handler can return
+    // must be listed — notably 401 (auth rejection) and 307 (redirect, e.g. magic-link),
+    // which the previous map omitted and so silently turned into 500s.
     const code: zap.http.StatusCode = switch (status) {
         200 => .ok,
         201 => .created,
         204 => .no_content,
+        301 => .moved_permanently,
+        302 => .found,
+        303 => .see_other,
         304 => .not_modified,
+        307 => .temporary_redirect,
+        308 => .permanent_redirect,
         400 => .bad_request,
+        401 => .unauthorized,
         403 => .forbidden,
         404 => .not_found,
         409 => .conflict,
+        410 => .gone,
         422 => .unprocessable_content,
         429 => .too_many_requests,
+        502 => .bad_gateway,
+        503 => .service_unavailable,
         else => .internal_server_error,
     };
     r.setStatus(code);
