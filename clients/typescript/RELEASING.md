@@ -10,20 +10,14 @@ workflow, which typechecks, tests, builds, asserts the tag matches
 `package.json`, and publishes to npm with provenance. Nothing else publishes the
 SDK — a normal push or PR never does.
 
-## Prerequisites (one-time)
+## Prerequisites
 
-The release workflow is **dormant** until both are true:
-
-1. The npm org `@zigbase` exists and you can publish `@zigbase/client` to it.
-2. Authentication is wired, EITHER:
-   - a `NPM_TOKEN` repository secret (classic token auth — an automation token
-     with publish rights), **or**
-   - npm **trusted publishing (OIDC)** configured for the `release-sdk.yml`
-     workflow. With OIDC you can delete the `NODE_AUTH_TOKEN` line in the
-     workflow; `id-token: write` + `--provenance` are enough.
-
-Until both are done, do **not** push a `client-v*` tag — the publish step would
-fail (no account / no auth).
+`@zigbase/client` publishes via npm **trusted publishing (OIDC)** — the
+`release-sdk.yml` workflow needs no token (`id-token: write` + `--provenance`
+only). A per-package trusted publisher for that workflow is configured on
+npmjs.com. OIDC requires the package to already exist on the registry, so the
+very first publish of a brand-new package is done manually; subsequent
+`client-v*` releases publish token-free from CI.
 
 ## Cutting a release
 
