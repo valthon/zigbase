@@ -1,0 +1,139 @@
+---
+import { Code } from 'astro:components';
+
+const tiers = [
+  {
+    title: 'Base — dynamic',
+    blurb: 'Zero-config client for any ZigBase server. You bring the types.',
+    install: 'npm install @zigbase/client',
+    code: `import { createClient } from "@zigbase/client";
+
+const zb = createClient("http://localhost:8090");
+const posts = await zb
+  .collection("posts")
+  .getList(1, 20, { filter: "status = 'published'" });`,
+    lang: 'ts',
+  },
+  {
+    title: 'Comptime — generated',
+    blurb: 'A fully-typed client generated from your Zig schema at build time — typed records and typed custom-route RPC.',
+    install: 'zig build gen-client',
+    code: `import { createClient } from "./zbase.gen.js";
+
+const zb = createClient("http://localhost:8090");
+const post = await zb.db.posts.create({
+  title: "Hello", status: "published",
+});
+const res = await zb.rpc.bookingsConfirm({ id });`,
+    lang: 'ts',
+  },
+  {
+    title: 'Runtime — introspection',
+    blurb: 'Generate a typed client from any running instance — no Zig toolchain. Records, realtime, files.',
+    install: 'npx @zigbase/typegen',
+    code: `npx @zigbase/typegen \\
+  --url https://api.example.com \\
+  --out src/zbase.gen.ts`,
+    lang: 'bash',
+  },
+];
+---
+
+<section class="sdk" id="typescript-sdk">
+  <div class="sdk__inner container">
+    <header class="sdk__head">
+      <h2>A TypeScript SDK in three forms</h2>
+      <p>
+        From a zero-config dynamic client to a fully-typed client generated from your schema —
+        at build time, or from any running instance with no Zig toolchain.
+      </p>
+    </header>
+
+    <div class="sdk__grid">
+      {tiers.map((t) => (
+        <article class="sdk__card">
+          <h3 class="sdk__title">{t.title}</h3>
+          <p class="sdk__blurb">{t.blurb}</p>
+          <div class="sdk__install"><code>{t.install}</code></div>
+          <div class="sdk__code">
+            <Code code={t.code} lang={t.lang} />
+          </div>
+        </article>
+      ))}
+    </div>
+
+    <p class="sdk__more">
+      <a href="/zigbase/docs/typescript-sdk">Read the TypeScript SDK docs →</a>
+    </p>
+  </div>
+</section>
+
+<style>
+  .sdk {
+    padding-block: var(--space-8);
+  }
+  .sdk__inner {
+    max-width: var(--container-max);
+    margin: 0 auto;
+    padding: 0 var(--space-5);
+  }
+  .sdk__head {
+    text-align: center;
+    max-width: 54ch;
+    margin: 0 auto var(--space-6);
+  }
+  .sdk__head h2 {
+    font-size: clamp(1.6rem, 3vw, 2.2rem);
+    margin: 0 0 var(--space-3);
+  }
+  .sdk__head p {
+    color: var(--color-muted);
+    margin-top: var(--space-3);
+  }
+  .sdk__grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+    gap: var(--space-5);
+  }
+  .sdk__card {
+    border: 1px solid var(--color-border);
+    background: var(--color-surface);
+    border-radius: var(--radius-lg);
+    padding: var(--space-5);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  .sdk__title {
+    margin: 0;
+    font-size: var(--text-lg);
+    color: var(--color-accent);
+  }
+  .sdk__blurb {
+    margin: 0;
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+    line-height: var(--leading-normal);
+  }
+  .sdk__install code {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    padding: 0.25rem 0.5rem;
+  }
+  .sdk__code :global(pre) {
+    border-radius: var(--radius-md);
+    font-size: var(--text-xs);
+  }
+  .sdk__more {
+    text-align: center;
+    margin-top: var(--space-6);
+    font-weight: 600;
+  }
+  .sdk__more a {
+    color: var(--color-accent);
+  }
+</style>
