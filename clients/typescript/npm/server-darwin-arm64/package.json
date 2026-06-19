@@ -7,5 +7,5 @@
   "files": ["zigbase", "README.md"],
   "publishConfig": { "access": "public" },
   "repository": { "type": "git", "url": "git+https://github.com/valthon/zigbase.git" },
-  "license": "MIT"
+  "license": "Apache-2.0"
 }
