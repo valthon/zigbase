@@ -40,8 +40,10 @@ with `mise exec zig@0.16.0 --`.
 - **OAuth2** — Authorization-Code + PKCE provider login and account linking. → [docs/api.md](docs/api.md)
 - **Realtime** — subscribe to record changes over WebSocket. → [docs/api.md](docs/api.md)
 - **Files** — local file storage with serving and short-lived file-access tokens. → [docs/api.md](docs/api.md)
-- **TypeScript SDK** — official zero-dependency client (`@zigbase/client`): auth, records,
-  offset + cursor pagination, files, realtime + live store. → [docs/typescript-sdk.md](docs/typescript-sdk.md)
+- **TypeScript SDK** — published official client (`@zigbase/client@0.1.0`): auth, records,
+  offset + cursor pagination, files, realtime + live store — plus a fully-typed client
+  generated from your schema (`zig build gen-client`) or from any running instance
+  (`npx @zigbase/typegen`). → [docs/typescript-sdk.md](docs/typescript-sdk.md)
 - **Static files** — serve a frontend from the same binary: `--serve-static <dir>` at runtime, or pin/embed it at comptime. → [docs/framework.md](docs/framework.md)
 - **Admin UI** — embedded single-page app served at `/_/`. → [docs/api.md](docs/api.md)
 - **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema (with additive auto-migration), and pluggable storage/mailer backends. → [docs/framework.md](docs/framework.md)
