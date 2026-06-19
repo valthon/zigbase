@@ -27,7 +27,7 @@ function writeJson(path, obj) {
 /** Read the server version from build.zig.zon (single source of truth). */
 export function versionFromBuildZon(repoRoot) {
   const zon = readFileSync(join(repoRoot, "build.zig.zon"), "utf8");
-  const m = zon.match(/\.version\s*=\s*"([^"]+)"/);
+  const m = zon.match(/^\s*\.version\s*=\s*"([^"]+)"/m);
   if (!m) throw new Error("gen-server-packages: could not read .version from build.zig.zon");
   return m[1];
 }
@@ -143,7 +143,7 @@ a clear error.
 }
 
 // CLI: generate into the real npm dir using the committed targets.json + build.zig.zon.
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const npmDir = HERE;
   const repoRoot = join(HERE, "..", "..", "..");
   const targets = JSON.parse(readFileSync(join(npmDir, "server", "targets.json"), "utf8"));
