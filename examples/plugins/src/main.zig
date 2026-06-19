@@ -424,6 +424,7 @@ pub fn main(init: std.process.Init) !void {
                 },
             },
         },
+        .enable_typegen = true,
 
         // 4. Explicit migrations — escape hatch for non-additive / seeding changes.
         //    ZigBase records each migration by id in `_migrations` and runs it
