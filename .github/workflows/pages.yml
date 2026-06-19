@@ -6,6 +6,10 @@ on:
     paths:
       - 'site/**'
       - '.github/workflows/pages.yml'
+      # The site derives the displayed versions at build time, so a release that
+      # only bumps these manifests must still redeploy the site.
+      - 'build.zig.zon'
+      - 'clients/typescript/package.json'
   workflow_dispatch:
 
 permissions:
