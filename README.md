@@ -8,7 +8,7 @@ embedded admin UI at `/_/` — all in one statically-linked executable backed by
 It is also an **embeddable Zig framework**: import it as a library and extend the server
 with comptime record hooks, custom HTTP routes, and scheduled jobs.
 
-`v0.4.0 — early release` · `License: Apache-2.0` · see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
+[![Release](https://img.shields.io/github/v/release/valthon/zigbase)](https://github.com/valthon/zigbase/releases) · `early release` · `License: Apache-2.0` · see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
 
 **Website & docs:** <https://valthon.github.io/zigbase>
 
@@ -40,7 +40,7 @@ with `mise exec zig@0.16.0 --`.
 - **OAuth2** — Authorization-Code + PKCE provider login and account linking. → [docs/api.md](docs/api.md)
 - **Realtime** — subscribe to record changes over WebSocket. → [docs/api.md](docs/api.md)
 - **Files** — local file storage with serving and short-lived file-access tokens. → [docs/api.md](docs/api.md)
-- **TypeScript SDK** — published official client (`@zigbase/client@0.1.0`): auth, records,
+- **TypeScript SDK** — published official client (`@zigbase/client`): auth, records,
   offset + cursor pagination, files, realtime + live store — plus a fully-typed client
   generated from your schema (`zig build gen-client`) or from any running instance
   (`npx @zigbase/typegen`). → [docs/typescript-sdk.md](docs/typescript-sdk.md)
