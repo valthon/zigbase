@@ -66,6 +66,7 @@ if (WHAT !== "typegen") {
       console.log(`building zigbase for ${t.zig}`);
       const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build",
         `-Dtarget=${t.zig}`, "-Doptimize=ReleaseSafe", "-Dcpu=baseline"], { cwd: REPO_ROOT, stdio: "inherit" });
+      if (b.error) throw b.error;
       if (b.status !== 0) throw new Error(`build failed for ${t.zig}`);
       copyFileSync(join(REPO_ROOT, "zig-out/bin/zigbase"), dest);
     }

@@ -276,7 +276,7 @@ test "parse typegen: missing flag value errors" {
 }
 
 test "version / --version / -V -> version command" {
-    try std.testing.expectEqual(std.meta.activeTag(try parse(&.{"version"}, .{})), .version);
-    try std.testing.expectEqual(std.meta.activeTag(try parse(&.{"--version"}, .{})), .version);
-    try std.testing.expectEqual(std.meta.activeTag(try parse(&.{"-V"}, .{})), .version);
+    try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"version"}, .{})));
+    try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"--version"}, .{})));
+    try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"-V"}, .{})));
 }

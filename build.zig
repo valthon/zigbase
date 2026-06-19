@@ -172,6 +172,7 @@ fn gitCommit(b: *std.Build) []const u8 {
     const root = b.build_root.path orelse ".";
     var code: u8 = undefined;
     const stdout = b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "--short", "HEAD" }, &code, .ignore) catch return "unknown";
+    if (code != 0) return "unknown";
     const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
     return if (trimmed.len == 0) "unknown" else trimmed;
 }
