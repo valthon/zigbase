@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const HERE = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const EXAMPLE_ROOT = resolve(HERE, ".."); // examples/plugins
 const FRONTEND_ROOT = join(EXAMPLE_ROOT, "frontend");
-const FRONTEND_DIST = join(FRONTEND_ROOT, "dist");
+const FRONTEND_DIST = join(FRONTEND_ROOT, "dist", "index.html");
 const BIN = process.env.ZIGBASE_TEST_PLUGINS_BINARY || join(EXAMPLE_ROOT, "zig-out", "bin", "plugins");
 
 export interface PluginsServer {
