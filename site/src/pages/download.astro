@@ -2,21 +2,14 @@
 import Base from '../layouts/Base.astro';
 import Nav from '../components/Nav.astro';
 import Footer from '../components/Footer.astro';
-import { ZIGBASE_VERSION, ZIGBASE_VERSION_TAG, REPO_URL } from '../config/site';
+import { ZIGBASE_VERSION, ZIGBASE_VERSION_TAG, REPO_URL, TARGETS } from '../config/site';
 
 const REL = ZIGBASE_VERSION_TAG;
 const ASSET_BASE = `${REPO_URL}/releases/download/${REL}`;
 const releasePage = `${REPO_URL}/releases/tag/${REL}`;
 const shasums = `${ASSET_BASE}/SHA256SUMS`;
 
-const targets = [
-  { platform: 'Linux', arch: 'x86_64', triple: 'x86_64-linux-musl' },
-  { platform: 'Linux', arch: 'aarch64', triple: 'aarch64-linux-musl' },
-  { platform: 'macOS', arch: 'x86_64', triple: 'x86_64-macos' },
-  { platform: 'macOS', arch: 'aarch64', triple: 'aarch64-macos' },
-];
-
-const binaries = targets.map((t) => ({
+const binaries = TARGETS.map((t) => ({
   ...t,
   file: `zigbase-${ZIGBASE_VERSION}-${t.triple}.tar.gz`,
 }));
@@ -24,7 +17,7 @@ const binaries = targets.map((t) => ({
 
 <Base
   title="Download — ZigBase"
-  description="Download a prebuilt ZigBase v0.1.0 binary for Linux or macOS, build it from source, or use it as a Zig library."
+  description="Download a prebuilt ZigBase binary for Linux or macOS, build it from source, or use it as a Zig library."
 >
   <Nav />
 

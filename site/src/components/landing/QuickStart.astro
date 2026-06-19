@@ -2,9 +2,10 @@
 import { Code } from 'astro:components';
 import CodeTabs from '../CodeTabs.astro';
 import CopyButton from '../CopyButton.astro';
+import { ZIGBASE_VERSION, ZIGBASE_VERSION_TAG, REPO_URL } from '../../config/site';
 
 const downloadCode = `# Download the prebuilt Linux binary
-curl -L https://github.com/valthon/zigbase/releases/download/v0.1.0/zigbase-0.1.0-x86_64-linux-musl.tar.gz | tar xz
+curl -L ${REPO_URL}/releases/download/${ZIGBASE_VERSION_TAG}/zigbase-${ZIGBASE_VERSION}-x86_64-linux-musl.tar.gz | tar xz
 
 # Create a superuser, then serve
 ./zigbase superuser create --email you@example.com --password "<a strong password>" --data-dir ./zb_data

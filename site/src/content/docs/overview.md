@@ -60,7 +60,7 @@ custom server logic **in Zig** without standing up a separate service. The archi
 favors a small footprint: a warm reader-connection pool, a blocking-mutex writer, and
 comptime "footprint levers" you can tune.
 
-It is an **early release** (`v0.1.0`, Apache-2.0). Read the
+It is an **early release** (Apache-2.0). Read the
 [known limitations](./known-limitations) before deploying — notably that SMTP must be
 configured for email delivery in production, rate limiting ignores proxy-supplied client
 IPs unless `--trust-proxy` is set, comptime auto-migration is additive-only, and the

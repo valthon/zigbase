@@ -11,10 +11,10 @@ cursor pagination, files, low-level realtime subscriptions, and a high-level **l
 npm install @zigbase/client
 ```
 
-The SDK is published: `@zigbase/client@0.1.0`. Its `@zigbase/client/typed` and
+The SDK is published to npm as `@zigbase/client`. Its `@zigbase/client/typed` and
 `@zigbase/client/realtime` entry points ship in the same package. For the runtime
 generator, see [Runtime introspection](#runtime-introspection-zigbase-typegen) —
-no install needed beyond `npx @zigbase/typegen` (which pulls `@zigbase/server@0.4.0`).
+no install needed beyond `npx @zigbase/typegen` (which pulls `@zigbase/server`).
 
 ## Which tier should I use?
 
