@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Strip debug info from the shipped binaries in release builds. An unstripped
-    // ReleaseFast build is ~24 MiB of mostly compressible debug_info; stripped it
+    // release build is ~24 MiB of mostly compressible debug_info; stripped it
     // is ~7 MiB — and the @zigbase/server npm packages ship the unpacked binary,
     // so this is a direct ~72% cut to install size. Debug builds keep symbols;
     // override with -Dstrip=false to keep them in a release build too.
@@ -71,20 +71,6 @@ pub fn build(b: *std.Build) void {
     const dating_srv_exe = b.addExecutable(.{ .name = "dating-server", .root_module = dating_srv_mod });
     const dating_srv_step = b.step("dating-server", "Build the dating fixture as a runnable server");
     dating_srv_step.dependOn(&b.addInstallArtifact(dating_srv_exe, .{}).step);
-
-    // dist-server: the engine with `enable_typegen = true` — the binary the
-    // @zigbase/server npm packages ship. Cross-compile via `-Dtarget=…`.
-    const dist_mod = b.createModule(.{
-        .root_source_file = b.path("src/main_dist.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = strip,
-        .link_libc = true,
-    });
-    dist_mod.addImport("zigbase", zigbase_mod);
-    const dist_exe = b.addExecutable(.{ .name = "zigbase-dist", .root_module = dist_mod });
-    const dist_step = b.step("dist-server", "Build the typegen-enabled engine binary for distribution");
-    dist_step.dependOn(&b.addInstallArtifact(dist_exe, .{}).step);
 
     // Unit tests run against the library module (where all internal test{} live).
     const tests = b.addTest(.{ .root_module = zigbase_mod });
