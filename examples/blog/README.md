@@ -156,6 +156,56 @@ mise exec zig@0.16.0 -- zig build           # produces ./zig-out/bin/blog
 Then create a `posts` record without a `slug` and the hook fills it in from the
 `title`; `reading_time` is computed from the `body` word count.
 
+## Using the base TypeScript SDK (`@zigbase/client`)
+
+This example demonstrates **Tier 1 — the base dynamic client**: address collections by
+name (`zb.collection("posts")`), bring your own types. No code generation required.
+
+Install:
+
+```sh
+npm install @zigbase/client
+```
+
+```ts
+import { createClient } from "@zigbase/client";
+
+const zb = createClient("http://127.0.0.1:8090");
+
+// Sign up and authenticate against the `users` auth collection.
+await zb.collection("users").create({
+  email: "writer@example.com",
+  password: "my-password",
+  passwordConfirm: "my-password",
+  name: "Ada",
+});
+await zb.collection("users").authWithPassword("writer@example.com", "my-password");
+
+// Create a published post (the server hooks derive slug, author, and reading_time).
+const post = await zb.collection("posts").create({
+  title: "Hello from the base SDK",
+  body: "Dynamic client, no codegen.",
+  status: "published",
+});
+
+// List published posts.
+const list = await zb.collection("posts").getList(1, 20, { filter: "status = 'published'" });
+
+// Read, update, delete.
+const one = await zb.collection("posts").getOne(post.id);
+await zb.collection("posts").update(post.id, { title: "Edited title" });
+await zb.collection("posts").delete(post.id);
+```
+
+For a fully-typed client, see golfsim (comptime-generated) and the
+[TypeScript SDK docs](../../docs/typescript-sdk.md).
+
+To run the committed e2e test:
+
+```sh
+mise exec node@24 -- npm install && npm run test:e2e
+```
+
 ## Frontend (Astro + React islands)
 
 `frontend/` is an Astro site with React islands: a public post list with live
