@@ -20,6 +20,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // Build provenance for `zigbase --version`. The server version is single-sourced
+    // from build.zig.zon; the commit is captured at configure time.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    build_options.addOption([]const u8, "commit", gitCommit(b));
+    zigbase_mod.addOptions("build_options", build_options);
+
     zigbase_mod.addIncludePath(b.path("vendor/sqlite"));
     zigbase_mod.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
@@ -172,6 +179,15 @@ pub fn build(b: *std.Build) void {
     gen_test_step.dependOn(&run_gen_test.step);
     // Wire into the main test_step so `zig build test` also runs the golden assertion.
     test_step.dependOn(&run_gen_test.step);
+}
+
+/// Capture the short git commit at configure time; "unknown" outside a repo.
+fn gitCommit(b: *std.Build) []const u8 {
+    const root = b.build_root.path orelse ".";
+    var code: u8 = undefined;
+    const stdout = b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "--short", "HEAD" }, &code, .ignore) catch return "unknown";
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    return if (trimmed.len == 0) "unknown" else trimmed;
 }
 
 // ---------------------------------------------------------------------------

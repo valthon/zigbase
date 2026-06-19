@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const static_files = @import("static_files.zig");
 const app_mod = @import("app.zig");
 const events = @import("events.zig");
@@ -327,6 +329,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .superuser_create => printSuperuserUsage(),
             .typegen => printTypegenUsage(),
         },
+        .version => printVersion(),
         .serve => |sa| {
             const cfg = try loadCfg(init.environ_map, sa);
             try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts);
@@ -380,6 +383,7 @@ fn printUsage(show_serve_static: bool) void {
         \\  migrate             Apply database migrations, then exit.
         \\  superuser create    Create an admin (superuser) account.
         \\  help                Show this help. Also: --help, -h, or no arguments.
+        \\  version             Print version + build provenance. Also: --version, -V.
         \\
         \\  Per-command help is available via `zigbase <command> --help`, e.g.
         \\  `zigbase serve --help` or `zigbase superuser create --help`.
@@ -447,6 +451,26 @@ fn printUsage(show_serve_static: bool) void {
         \\More docs: README.md, docs/api.md, docs/framework.md, docs/tutorial.md.
         \\
     , .{});
+}
+
+/// Print build provenance (for `--version`). std.debug.print keeps it prefix-free.
+fn printVersion() void {
+    std.debug.print(
+        \\zigbase {s}
+        \\commit:  {s}
+        \\build:   {s}
+        \\target:  {s}-{s}-{s}
+        \\zig:     {s}
+        \\
+    , .{
+        build_options.version,
+        build_options.commit,
+        @tagName(builtin.mode),
+        @tagName(builtin.target.cpu.arch),
+        @tagName(builtin.target.os.tag),
+        @tagName(builtin.target.abi),
+        builtin.zig_version_string,
+    });
 }
 
 fn printServeUsage(show_serve_static: bool) void {
