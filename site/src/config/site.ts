@@ -39,7 +39,7 @@ export const CLIENT_VERSION = clientVersion();
 
 /** Back-compat alias: existing importers use ZIGBASE_VERSION for the server release. */
 export const ZIGBASE_VERSION = SERVER_VERSION;
-/** Display form, e.g. "v0.4.0". */
+/** Display form, e.g. "v0.x.y". */
 export const ZIGBASE_VERSION_TAG = `v${SERVER_VERSION}`;
 
 export const REPO_URL = 'https://github.com/valthon/zigbase';
