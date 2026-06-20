@@ -287,6 +287,7 @@ pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
     const fields = std.meta.fields(@TypeOf(specs));
     const Holder = struct {
         const table: [fields.len]RouteMeta = blk: {
+            @setEvalBranchQuota(10_000 + fields.len * 5_000); // scale with route count
             var t: [fields.len]RouteMeta = undefined;
             for (fields, 0..) |f, i| {
                 const s = @field(specs, f.name);
@@ -320,6 +321,7 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
     const meta = comptime routeMeta(specs);
     // Representability + duplicate-name guards, all at comptime.
     comptime {
+        @setEvalBranchQuota(10_000 + meta.len * 5_000); // scale with route count
         for (meta, 0..) |m, i| {
             if (m.name.len == 0)
                 @compileError("route '" ++ m.path ++ "' derives an empty method name; add an explicit .name to the route spec");
@@ -343,6 +345,7 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
     // A struct-namespace const has static lifetime, so &Holder.table is a valid []const returnable at runtime (a plain comptime local is not).
     const Holder = struct {
         const table: [fields.len]RuntimeRoute = blk: {
+            @setEvalBranchQuota(10_000 + fields.len * 5_000); // scale with route count
             var t: [fields.len]RuntimeRoute = undefined;
             for (fields, 0..) |f, i| {
                 const s = @field(specs, f.name);
