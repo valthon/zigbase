@@ -225,6 +225,27 @@ fn validateRouteSpecs(comptime specs: anytype) void {
     }
 }
 
+/// True iff `H` is the UNTYPED route handler form `fn(*RouteEvent) anyerror!http.Response`.
+/// Untyped handlers own the full response (status, cookies, content-type, redirect, raw
+/// body), so they are stored directly instead of being wrapped in a typed thunk. Anything
+/// else is treated as the typed form `fn(*Req(In)) RouteError!Out`.
+pub fn isUntypedHandler(comptime H: type) bool {
+    // Accept either a bare `fn(...)` or a single-item function pointer `*const fn(...)`
+    // — a handler written as `&myHandler` reflects as `.pointer`, not `.@"fn"`.
+    comptime var T = H;
+    if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .one) {
+        T = @typeInfo(T).pointer.child;
+    }
+    const info = @typeInfo(T);
+    if (info != .@"fn") return false;
+    const f = info.@"fn";
+    if (f.params.len != 1) return false;
+    const p = f.params[0].type orelse return false;
+    const pi = @typeInfo(p);
+    if (pi != .pointer or pi.pointer.size != .one) return false;
+    return pi.pointer.child == RouteEvent;
+}
+
 /// Comptime route metadata for a typed route spec: the derived method name plus the
 /// reflected Input/Output types (the bounded Zig→TS subset surfaces). Consumed by the
 /// framework's comptime route assembly (collision + representability checks) and by the
@@ -236,6 +257,10 @@ pub const RouteMeta = struct {
     auth: AuthLevel,
     Input: type,
     Output: type,
+    /// True for untyped `fn(*RouteEvent) anyerror!http.Response` handlers, which own the
+    /// raw response and contribute no typed RPC surface. The TS codegen skips these so it
+    /// doesn't emit a client method that would mis-handle their non-JSON responses.
+    untyped: bool = false,
 };
 
 /// Comptime path→method-name (mirrors codegen `identifiers.routeMethodName`) with an
@@ -291,14 +316,19 @@ pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
             for (fields, 0..) |f, i| {
                 const s = @field(specs, f.name);
                 const H = @TypeOf(s.handler);
+                const untyped = isUntypedHandler(H);
                 const override: ?[]const u8 = if (@hasField(@TypeOf(s), "name")) s.name else null;
                 t[i] = .{
                     .method = s.method,
                     .path = s.path,
                     .name = comptimeRouteName(s.path, override),
                     .auth = if (@hasField(@TypeOf(s), "auth")) s.auth else .superuser,
-                    .Input = route_types.HandlerInput(H),
-                    .Output = route_types.HandlerOutput(H),
+                    // Untyped handlers own the raw response; they contribute no typed RPC
+                    // surface, so Input/Output are void (representable + query-parseable)
+                    // and `untyped` flags them out of TS RPC codegen.
+                    .Input = if (untyped) void else route_types.HandlerInput(H),
+                    .Output = if (untyped) void else route_types.HandlerOutput(H),
+                    .untyped = untyped,
                 };
             }
             break :blk t;
@@ -347,7 +377,11 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
             for (fields, 0..) |f, i| {
                 const s = @field(specs, f.name);
                 const auth: AuthLevel = if (@hasField(@TypeOf(s), "auth")) s.auth else .superuser;
-                t[i] = .{ .method = s.method, .pattern = s.path, .handler = route_types.makeThunk(s.handler), .auth = auth };
+                // Untyped handlers already match RouteHandler — store directly so they keep
+                // full control of the response (cookies/redirect/content-type). Typed handlers
+                // are wrapped in a thunk that parses Input and serializes Output as JSON.
+                const handler = if (isUntypedHandler(@TypeOf(s.handler))) s.handler else route_types.makeThunk(s.handler);
+                t[i] = .{ .method = s.method, .pattern = s.path, .handler = handler, .auth = auth };
             }
             break :blk t;
         };
@@ -621,6 +655,44 @@ test "buildRoutes defaults auth to .superuser when omitted" {
         .{ .method = .GET, .path = "/api/secret", .handler = H.a },
     });
     try std.testing.expect(table[0].auth == .superuser);
+}
+
+test "isUntypedHandler detects raw-response handlers and routeMeta flags them out of codegen" {
+    const H = struct {
+        // Untyped: owns the raw http.Response (cookies/redirect/non-JSON body).
+        fn raw(ev: *RouteEvent) anyerror!http.Response {
+            _ = ev;
+            return error.Unexpected;
+        }
+        // Typed: reflected into the RPC surface.
+        fn typed(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
+        }
+    };
+
+    // Detection accepts both a bare `fn` and a single-item function pointer; a typed
+    // `fn(*Req(...))` handler is not untyped.
+    try std.testing.expect(isUntypedHandler(@TypeOf(H.raw)));
+    try std.testing.expect(isUntypedHandler(*const @TypeOf(H.raw)));
+    try std.testing.expect(!isUntypedHandler(@TypeOf(H.typed)));
+
+    const specs = .{
+        .{ .method = http.Method.GET, .path = "/api/raw", .handler = H.raw, .auth = AuthLevel.public },
+        .{ .method = http.Method.GET, .path = "/api/health", .handler = H.typed },
+    };
+    const meta = comptime routeMeta(specs);
+    // Untyped route: flagged out of codegen, contributes no typed Input/Output.
+    try std.testing.expect(meta[0].untyped);
+    try std.testing.expect(meta[0].Input == void);
+    try std.testing.expect(meta[0].Output == void);
+    // Typed route is unaffected.
+    try std.testing.expect(!meta[1].untyped);
+    try std.testing.expect(meta[1].Input == void); // its declared *Req(void)
+
+    // buildRoutes still assembles a runnable table for both forms.
+    const table = buildRoutes(specs);
+    try std.testing.expectEqual(@as(usize, 2), table.len);
+    try std.testing.expect(table[0].method == .GET);
 }
 
 // ---------------------------------------------------------------------------
