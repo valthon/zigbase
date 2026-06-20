@@ -8,6 +8,14 @@ All notable changes to ZigBase are documented here. The format is based on
 
 ### Added
 
+- **Untyped route handlers in framework mode.** `.routes` now accepts the raw
+  `fn(*RouteEvent) anyerror!http.Response` handler form alongside typed
+  `Req(Input)`/`Output` handlers. An untyped handler owns its full response, so it can
+  set/clear a session cookie, return a redirect (`307`), or serve a non-JSON
+  content-type (e.g. `text/calendar`, an HTML OAuth handoff) — things the typed JSON
+  thunk cannot express. Untyped routes carry no typed `Input`/`Output` and are excluded
+  from the generated TypeScript `zb.rpc.*` client, so they never produce a client method
+  that would mis-parse their response.
 - **`text.pattern` is now enforced on record writes** via a pure-Zig, linear-time
   (DoS-safe) Thompson-NFA matcher (`src/regex.zig`). Matching is unanchored (substring);
   anchor with `^…$` for a full-string match. Supported syntax: literals, `.` (any codepoint
