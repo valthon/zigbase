@@ -309,6 +309,34 @@ fn health(req: *zigbase.Req(void)) zigbase.RouteError!HealthOut {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. Untyped route: GET /api/golfsim/calendar.ics
+//
+//    An UNTYPED handler — `fn(*RouteEvent) anyerror!http.Response` — owns the
+//    whole response, so it can return a non-JSON `content-type` that a typed
+//    `Req(_)`/`Output` route (always 200/204 JSON) cannot express. Untyped
+//    routes are deliberately left out of the generated `zb.rpc.*` client, so
+//    fetch this URL directly (e.g. subscribe to it from a calendar app). The
+//    body is a static literal, so it safely outlives the handler.
+// ---------------------------------------------------------------------------
+fn calendarFeed(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    _ = ev;
+    const ics =
+        \\BEGIN:VCALENDAR
+        \\VERSION:2.0
+        \\PRODID:-//ZigBase//golfsim//EN
+        \\BEGIN:VEVENT
+        \\UID:demo-tee-time@golfsim
+        \\SUMMARY:Tee time at the ZigBase Golf Sim
+        \\DTSTART:20260615T140000Z
+        \\DTEND:20260615T150000Z
+        \\END:VEVENT
+        \\END:VCALENDAR
+        \\
+    ;
+    return .{ .status = 200, .content_type = "text/calendar; charset=utf-8", .body = ics };
+}
+
+// ---------------------------------------------------------------------------
 // 7. File-upload event logger.
 //
 //    Fires after every successful file upload. Signature: fn(*FileEvent) void
@@ -447,6 +475,8 @@ pub const App = zigbase.App(.{
             .{ .method = .POST, .path = "/api/bookings/:id/cancel", .handler = cancelBooking, .auth = .authed },
             .{ .method = .GET, .path = "/api/listings/:id/availability", .handler = listingAvailability, .auth = .authed },
             .{ .method = .GET, .path = "/api/golfsim/health", .handler = health, .auth = .public },
+            // Untyped raw-response route (text/calendar) — see `calendarFeed`. Not in `zb.rpc.*`.
+            .{ .method = .GET, .path = "/api/golfsim/calendar.ics", .handler = calendarFeed, .auth = .public },
         },
         .jobs = .{ .pool_size = 2 },
         .cron = .{
