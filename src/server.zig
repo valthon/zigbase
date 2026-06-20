@@ -118,21 +118,37 @@ test "clientIpFrom ignores X-Forwarded-For/X-Real-IP unless trust_proxy is set (
     try std.testing.expectEqualStrings("", clientIpFrom(true, null, null));
 }
 
+/// Map an HTTP status code to zap's `StatusCode` enum.
+///
+/// `zap.http.StatusCode` is non-exhaustive, so `std.enums.fromInt`/`std.meta.intToEnum`
+/// would pass *any* integer straight through (or, for the latter, no longer exists in
+/// Zig 0.16). Instead we match `status` against the enum's *named* fields, so every
+/// standard code zap defines is recognized — not a hand-maintained subset that silently
+/// turns omitted-but-valid codes (e.g. 401 auth rejections, 307 magic-link redirects,
+/// 405, 415) into 500s. Anything zap doesn't name falls back to 500.
+fn statusToCode(status: u16) zap.http.StatusCode {
+    inline for (std.meta.fields(zap.http.StatusCode)) |field| {
+        if (field.value == status) return @field(zap.http.StatusCode, field.name);
+    }
+    return .internal_server_error;
+}
+
+test "statusToCode maps named codes and falls back to 500 for unknown" {
+    try std.testing.expectEqual(zap.http.StatusCode.ok, statusToCode(200));
+    // Previously omitted from the manual map -> regression guard.
+    try std.testing.expectEqual(zap.http.StatusCode.unauthorized, statusToCode(401));
+    try std.testing.expectEqual(zap.http.StatusCode.temporary_redirect, statusToCode(307));
+    try std.testing.expectEqual(zap.http.StatusCode.gone, statusToCode(410));
+    try std.testing.expectEqual(zap.http.StatusCode.bad_gateway, statusToCode(502));
+    // Codes the manual list never had but zap names are now handled too.
+    try std.testing.expectEqual(zap.http.StatusCode.method_not_allowed, statusToCode(405));
+    try std.testing.expectEqual(zap.http.StatusCode.unsupported_media_type, statusToCode(415));
+    // Genuinely unknown codes fall back to a safe 500.
+    try std.testing.expectEqual(zap.http.StatusCode.internal_server_error, statusToCode(799));
+}
+
 fn setZapStatus(r: zap.Request, status: u16) void {
-    const code: zap.http.StatusCode = switch (status) {
-        200 => .ok,
-        201 => .created,
-        204 => .no_content,
-        304 => .not_modified,
-        400 => .bad_request,
-        403 => .forbidden,
-        404 => .not_found,
-        409 => .conflict,
-        422 => .unprocessable_content,
-        429 => .too_many_requests,
-        else => .internal_server_error,
-    };
-    r.setStatus(code);
+    r.setStatus(statusToCode(status));
 }
 
 fn forbiddenResp(ctx: *http.RequestCtx) !http.Response {

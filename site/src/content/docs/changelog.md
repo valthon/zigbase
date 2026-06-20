@@ -28,6 +28,16 @@ All notable changes to ZigBase are documented here. The format is based on
   (`validation_date`). Bounds are validated at collection-save time and at build time
   (`@compileError`) for comptime schema literals.
 
+### Fixed
+
+- **The HTTP status line now matches the response body for *every* status a handler
+  returns, not a hand-picked subset.** `setZapStatus` previously mapped a short list of
+  codes and sent everything else as `500`, so a custom route's `401` auth rejection, a
+  `307` magic-link redirect, `410`, `502`, and similar went out with a `500` status line
+  even though the JSON body still said e.g. `401`. The mapping now derives from
+  `zap.http.StatusCode`'s named values, so any standard code zap defines is passed through
+  and only genuinely-unknown codes fall back to `500`.
+
 ## [0.4.0] - 2026-06-13
 
 This round makes ZigBase **safe-by-default**: a security audit's findings were fixed and the
