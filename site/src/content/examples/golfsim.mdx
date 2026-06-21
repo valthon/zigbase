@@ -203,7 +203,7 @@ covering CRUD, filtering, auth, and realtime with full TypeScript type-checking.
 
 ### Using `zb.rpc.*`
 
-The generated client exposes typed methods for each custom route under `zb.rpc.*`:
+The generated client exposes typed methods for each **typed** custom route under `zb.rpc.*`:
 
 ```ts
 // bookingsConfirm: POST /api/bookings/:id/confirm → unknown (cast for type-safe access)
@@ -220,6 +220,20 @@ const health = await zb.rpc.golfsimHealth();
 ```
 
 `unknown` outputs correspond to `std.json.Value` in Zig — cast to your concrete type for field access. The e2e test (`test/golfsim.e2e.test.ts`) exercises `bookingsConfirm` live through this surface.
+
+### Untyped routes (raw responses)
+
+`golfsim` also registers an **untyped** route — `GET /api/golfsim/calendar.ics` (`calendarFeed`
+in `src/main.zig`). Untyped handlers (`fn(*RouteEvent) anyerror!http.Response`) own the whole
+response, so they can set a non-JSON `content-type` (here `text/calendar`), cookies, or a
+redirect — none of which the always-JSON typed thunk can express. Because they carry no typed
+`Input`/`Output`, the generator deliberately leaves them **out** of `zb.rpc.*`; call them
+directly:
+
+```ts
+const ics = await fetch("/api/golfsim/calendar.ics").then((r) => r.text());
+// BEGIN:VCALENDAR … a real text/calendar document, not JSON
+```
 
 ## Building and running
 

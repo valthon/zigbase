@@ -94,6 +94,10 @@ pub fn render(comptime routes: []const RouteMeta, alloc: std.mem.Allocator) !Sec
     defer seen.deinit();
 
     inline for (routes) |r| {
+        // Untyped handlers own the raw response (cookies/redirect/non-JSON body) and have
+        // no typed Input/Output — emitting an RPC client method for them would produce a
+        // call that mis-parses the response. Keep them off the typed RPC surface.
+        if (r.untyped) continue;
         const has_params = comptime pathParams(r.path).len > 0;
         const has_input = r.Input != void;
         const out_ts = comptime rpc_ts.tsForType(r.Output);
@@ -257,4 +261,25 @@ test "render handles params+non-void input and no-params+void input call shapes"
     // factory calls send with bare opts (no body/query object)
     try std.testing.expect(std.mem.indexOf(u8, sec.factory_member,
         "return base.send(\"GET\", `/api/ping`, opts);") != null);
+}
+
+test "render skips untyped routes (no typed RPC surface for raw-response handlers)" {
+    const untyped_routes = [_]events.RouteMeta{
+        // Untyped handler: owns the raw response, so it must not appear in the client.
+        .{ .method = .GET, .path = "/api/calendar.ics", .name = "calendarIcs", .auth = .public, .Input = void, .Output = void, .untyped = true },
+        // A typed route alongside it must still be emitted normally.
+        .{ .method = .GET, .path = "/api/search", .name = "search", .auth = .public, .Input = SearchIn, .Output = std.json.Value },
+    };
+    const a = std.testing.allocator;
+    const sec = try render(&untyped_routes, a);
+    defer a.free(sec.decls);
+    defer a.free(sec.iface_member);
+    defer a.free(sec.factory_member);
+
+    // The untyped route contributes nothing: no interface member, factory method, or decls.
+    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member, "calendarIcs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "calendarIcs") == null);
+    // The typed route is still present.
+    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member, "search(input: SearchIn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "search(input, opts) {") != null);
 }

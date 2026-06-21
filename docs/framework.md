@@ -349,6 +349,8 @@ The generated TypeScript method signature mirrors the route shape:
 - Output is the TypeScript equivalent of the Zig return type; `std.json.Value` maps to `unknown`.
 - `.auth` defaults to `.superuser` when omitted — typed routes are locked to superusers unless explicitly set.
 
+Untyped routes (the raw `fn(*zigbase.RouteEvent) anyerror!zigbase.http.Response` form) own their full response — status, cookies, redirect, content-type — and carry no typed `Input`/`Output`, so the generator deliberately **skips** them: they do not appear in `zb.rpc.*`. Call them with your own `fetch`/HTTP client. This is what lets an untyped handler set a session cookie, return a `307` redirect, or serve a non-JSON body (e.g. `text/calendar`) that a typed `zb.rpc.*` method could not express.
+
 See the [TypeScript SDK docs](typescript-sdk.md#typed-rpc--zbrpc) and `examples/golfsim/` for the full worked example.
 
 ## 6. Auth / file / lifecycle events
