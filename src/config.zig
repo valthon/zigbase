@@ -46,12 +46,12 @@ pub const Config = struct {
     rate_limit_max: u32 = 10, // attempts per window per key; 0 = disabled
     rate_limit_window_s: i64 = 60, // window length in seconds
 
-    // Server-side OAuth `state` (CSRF) store (F11). When false (default), CSRF on the
-    // OAuth flow is the client's job (client-driven PKCE + client-held state — the
-    // documented flow). When true, the backend mints a `state` at `oauth2-init` and
-    // requires/verifies it on `auth-with-oauth2`, rejecting a missing/mismatched/
-    // expired/reused state. Opt-in so the existing client-driven flow is unchanged.
-    oauth_state_server: bool = false,
+    // Server-side OAuth `state` (CSRF) store (F11). ON by default: the backend mints a
+    // `state` via the oauth2 method initiate call and requires/verifies it on complete,
+    // rejecting a missing/mismatched/expired/reused state — the secure flow. Set
+    // ZIGBASE_OAUTH_STATE_SERVER=false to opt out (client-driven PKCE + client-held
+    // state only), e.g. for a client that manages its own CSRF state end-to-end.
+    oauth_state_server: bool = true,
     oauth_state_ttl_s: i64 = 600, // server-side state lifetime (10 min)
 
     // SMTP / mailer. When smtp_host is empty (default), the default mailer plugin
@@ -240,6 +240,21 @@ test "rate limit defaults and overrides" {
     const c = try Config.load(G1{});
     try std.testing.expectEqual(@as(u32, 0), c.rate_limit_max);
     try std.testing.expectEqual(@as(i64, 120), c.rate_limit_window_s);
+}
+
+test "oauth_state_server defaults ON, opt-out via env" {
+    const G0 = struct {
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+    };
+    // Secure-by-default: server-side OAuth CSRF state is ON unless explicitly disabled.
+    try std.testing.expectEqual(true, (try Config.load(G0{})).oauth_state_server);
+    const G1 = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_OAUTH_STATE_SERVER")) return "false";
+            return null;
+        }
+    };
+    try std.testing.expectEqual(false, (try Config.load(G1{})).oauth_state_server);
 }
 
 test "realtime origins default empty, overridable" {

@@ -14,9 +14,10 @@ pub const App = struct {
     auth_token_ttl_s: i64 = 14 * 24 * 3600,
     verification_ttl_s: i64 = 7 * 24 * 3600,
     password_reset_ttl_s: i64 = 3600,
-    /// Server-side OAuth `state` CSRF protection (F11). Opt-in: when true, the backend
-    /// issues a `state` at oauth2-init and verifies+consumes it on auth-with-oauth2.
-    oauth_state_server: bool = false,
+    /// Server-side OAuth `state` CSRF protection (F11). ON by default: the backend
+    /// issues a `state` via the oauth2 method initiate call and verifies+consumes it on
+    /// complete. Set ZIGBASE_OAUTH_STATE_SERVER=false to opt out (client-driven state only).
+    oauth_state_server: bool = true,
     oauth_state_ttl_s: i64 = 600,
     realtime_allowed_origins: []const u8 = "",
     /// When false (default), client-IP logic ignores X-Forwarded-For/X-Real-IP and
@@ -42,6 +43,10 @@ pub const App = struct {
     /// In-memory rate limiter for sensitive auth endpoints; null = disabled
     /// (rate_limit_max == 0, or tests/CLI that don't wire it). Set in serveImpl.
     rate_limiter: ?*ratelimit.RateLimiter = null,
+    /// Type-erased pointer to the running auth-method Registry (set by serveImpl); null = not running.
+    /// Cast to `*const @import("auth/registry.zig").Registry` to read slugs. Stored as opaque
+    /// to avoid an import cycle: app.zig must NOT import registry.zig or auth/method.zig.
+    auth_methods: ?*const anyopaque = null,
     /// Type-erased pointer to the running Scheduler (set by Scheduler.start); null = not running.
     scheduler: ?*anyopaque = null,
     /// Submit an ad-hoc job task for async execution; set by Scheduler.start. Task 5 wires App.submit().

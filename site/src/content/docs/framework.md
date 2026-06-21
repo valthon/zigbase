@@ -94,6 +94,7 @@ pub fn main(init: std.process.Init) !void {
 | `static_files` | Comptime static-file mode: absent (default flag), `.disabled`, `.{ .dir = "..." }`, `.{ .embedded = ... }`. |
 | `storage` | Storage plugin TYPE (defaults to local-disk storage). |
 | `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). |
+| `auth_methods` | Register custom `AuthMethod` plugin TYPES (comptime, like `.storage`/`.mailer`). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
@@ -332,8 +333,318 @@ One handler each, registered by the matching config key:
 | `onBeforeTerminate` | `fn (ev: *zigbase.events.LifecycleEvent) void` | Just before shutdown. |
 
 `AuthEvent` carries `app`, `ctx`, `collection`, `record: ?std.json.Value`, and `method`
-(`.password` | `.oauth2`). `FileEvent` carries `app`, `ctx`, `collection`, `record_id`, and
-`filename`. `LifecycleEvent` carries `app`.
+(`.password` | `.oauth2` | `.magic_link` | `.otp` | `.webauthn` | `.custom`). `FileEvent` carries `app`, `ctx`, `collection`,
+`record_id`, and `filename`. `LifecycleEvent` carries `app`.
+
+### Auth methods overview
+
+ZigBase ships with a **pluggable auth-method system** that lets every auth collection enable built-in or custom login methods via config, with no route code. The system is built around a two-phase contract:
+
+1. **Initiate** — challenge delivery (email a link/code, return WebAuthn options, or a no-op for API-key flows).
+2. **Complete** — proof verification. On success the method returns a `Resolution.record(record_id)` and the framework mints the session via the one seam (`issueSession`+`emitAuth`), firing `onAuth`. The method never mints sessions itself.
+
+There are three tiers:
+
+| Tier | How | When |
+|---|---|---|
+| Built-in | `magic_link`, `otp`, `password`, `webauthn` in `.auth.methods` | Most apps — no Zig code needed |
+| Custom plugin | Register a TYPE in `.auth_methods`; reference by slug in `.auth.methods` | Non-standard verification (corp SSO, API keys, etc.) |
+| Escape hatch | Custom routes + `ev.issueSession` / `zigbase.auth` API (see below) | Exotic flows where the two-phase contract doesn't fit |
+
+**Backward compatibility:** an auth collection with no `.auth.methods` config defaults to `password` — existing deployments are unaffected.
+
+### Enabling auth methods per collection (`.auth.methods`)
+
+Each auth collection in `.collections` can declare a `.auth.methods` struct enabling one or more built-in methods:
+
+| Method | Key | Options | Notes |
+|---|---|---|---|
+| Password | `password` | (none beyond `rate_limit`) | Built-in default when no `.methods` specified |
+| Magic link | `magic_link` | `ttl_s: i64` (default 900), `auto_create: bool` (default false) | initiate emails link; complete verifies+consumes |
+| OTP | `otp` | `length: u8` (default 6), `ttl_s: i64` (default 300) | initiate emails code; complete verifies code |
+| WebAuthn | `webauthn` | `rp_id: []const u8`, `rp_name: []const u8`, `origin: []const u8`, `credentials_collection: []const u8`, `require_uv: bool` (default false) | all four string fields required; `require_uv` rejects assertions without user-verification (biometrics/PIN) |
+| OAuth2 | (see below) | gated by `.auth.oauth2.enabled` + `.auth.oauth2.providers` | 5th built-in; uses the contract but is NOT listed in `.auth.methods` |
+
+**Per-collection auth options** (set directly on `.auth`, independent of which methods are enabled):
+
+- **`require_verified: bool`** (default `false`) — when `true`, any login attempt is rejected with `403` if the auth record's `verified` field is `false`. This gate applies to **all** auth methods, including WebAuthn passkeys and OAuth2 accounts created from providers that did not confirm the email address (those are created `verified=false`). Enable it only after ensuring existing users have verified accounts, or after setting up a verification flow.
+
+Each method accepts a `rate_limit` field:
+- `.default` — uses the global env-var rate-limiter (`ZIGBASE_RATE_LIMIT_MAX` / `ZIGBASE_RATE_LIMIT_WINDOW`).
+- `.off` — disables rate-limiting for this method (logged at startup like a `@public` rule).
+- `.{ .custom = .{ .max = 5, .window_s = 60 } }` — per-method override.
+
+Example — two collections, each with different methods:
+
+```zig
+.collections = .{
+    .members = .{ .type = .auth, .auth = .{
+        .methods = .{ .magic_link = .{ .ttl_s = 900 } },
+    } },
+    .staff = .{ .type = .auth, .auth = .{
+        .methods = .{ .password = .{}, .webauthn = .{
+            .rp_id = "app.example.com",
+            .rp_name = "My App",
+            .origin = "https://app.example.com",
+            .credentials_collection = "webauthnCredentials",
+        } },
+    } },
+},
+```
+
+This yields the following endpoints (no route code):
+
+```
+POST /api/collections/members/auth/magic_link/initiate
+POST /api/collections/members/auth/magic_link/complete
+POST /api/collections/staff/auth-with-password           (legacy alias)
+POST /api/collections/staff/auth/webauthn/initiate
+POST /api/collections/staff/auth/webauthn/complete
+POST /api/collections/staff/auth/webauthn/register/begin  (authed)
+POST /api/collections/staff/auth/webauthn/register/finish (authed)
+```
+
+The dispatch enforces enablement: a disabled or unknown method slug returns `404`.
+
+### Custom `AuthMethod` plugin (`.auth_methods`)
+
+For verification logic that the built-ins don't cover, implement an `AuthMethod` plugin type and register it at the app level:
+
+```zig
+// App-level registration of custom method TYPES:
+.auth_methods = .{ WebAuthnMethod, CorpSsoMethod },
+
+// Then reference by slug in a collection's .methods:
+.staff = .{ .type = .auth, .auth = .{
+    .methods = .{ .password = .{}, .custom = &.{"corp-sso"} },
+} },
+```
+
+**The contract** — every plugin type must implement three functions:
+
+```zig
+// Required on every AuthMethod plugin type:
+pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !Self;
+pub fn method(self: *Self) zigbase.AuthMethod;  // returns the vtable view
+pub fn deinit(self: *Self) void;
+```
+
+`zigbase.AuthMethod` vtable:
+
+```zig
+pub const AuthMethod = struct {
+    slug: []const u8,   // URL slug → /auth/<slug>/initiate | /complete
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        initiate: *const fn (ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult,
+        complete: *const fn (ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution,
+    };
+};
+```
+
+`AuthCtx` — what the framework passes to each phase:
+
+```zig
+pub const AuthCtx = struct {
+    app: *Runtime,
+    ctx: *http.RequestCtx,        // body / query / cookies / remote_ip
+    collection: schema.Collection, // the :col auth collection (validated .type == .auth)
+    // No ambient conn — each method acquires its own via writer()/reader().
+
+    // Connection RAII handles:
+    pub fn writer(ac: *AuthCtx) WriterData;               // acquires pool writer (mutex); call deinit()
+    pub fn reader(ac: *AuthCtx) !ReaderData;              // checks out a pooled reader; call deinit()
+
+    // Blessed helpers (each takes the conn you acquired):
+    pub fn rateLimit(ac: *AuthCtx, scope: []const u8, ident: []const u8) !?http.Response;
+    pub fn mintLinkToken(ac: *AuthCtx, conn: *db.Db, record_id: []const u8, ttl_s: i64) ![]const u8;
+    pub fn verifyLinkToken(ac: *AuthCtx, conn: *db.Db, token: []const u8) !?Claims;
+    pub fn consumeLinkToken(ac: *AuthCtx, conn: *db.Db, claims: Claims) !void;
+    pub fn deliverMail(ac: *AuthCtx, to: []const u8, subject: []const u8, body: []const u8) !void;
+    pub fn findByIdentity(ac: *AuthCtx, conn: *db.Db, identity: []const u8) !?[]const u8;
+};
+
+pub const InitiateResult = struct { status: u16 = 200, body: ?[]const u8 = null };
+
+pub const Resolution = union(enum) {
+    record: []const u8,  // record id → framework issues session + fires onAuth
+    fail: struct { status: u16, message: []const u8 },
+};
+```
+
+A plugin type missing `create`/`method`/`deinit` is a **compile error**. Built-in methods (`password`, `magic_link`, `otp`, `webauthn`) implement the exact same contract — no privileged private path.
+
+### WebAuthn — login + passkey registration
+
+**Login flow (via the two-phase contract):**
+
+1. `initiate`: POST body `{ "identity": "user@example.com" }` (optional for discoverable credentials). Returns `{ "challenge": "...", "rpId": "...", "ceremonyId": "..." }`.
+2. Browser calls `navigator.credentials.get()` with the options.
+3. `complete`: POST body `{ "ceremonyId": "...", "credentialId": "...", "authenticatorData": "...", "clientDataJSON": "...", "signature": "..." }`. On success, the framework mints the session and fires `onAuth(.webauthn)`.
+
+**Passkey registration (requires an existing session):**
+
+1. `POST /api/collections/:col/auth/webauthn/register/begin` — returns `{ "challenge": "...", "rpId": "...", "rpName": "...", "ceremonyId": "..." }`.
+2. Browser calls `navigator.credentials.create()` with those options.
+3. `POST /api/collections/:col/auth/webauthn/register/finish` with `{ "ceremonyId": "...", "id": "...", "rawId": "...", "response": { "clientDataJSON": "...", "attestationObject": "..." } }`. Stores the credential in `_webauthnCredentials` bound to the authenticated user.
+
+Notes:
+- Supports ES256 (P-256, COSE -7) and Ed25519 (COSE -8) public keys; the COSE key curve is validated against the algorithm (ES256→P-256, EdDSA→Ed25519).
+- Attestation format: `fmt:"none"` (v1; other formats are future work).
+- `signCount` is tracked; a count regression (possible credential clone) fails authentication closed.
+- Each credential is bound to the collection it was registered on; presenting it on a different collection returns `401`.
+- `require_uv: true` rejects assertions where the authenticator did not perform user verification (biometrics or PIN). Default `false`.
+- Requires `webauthn.credentials_collection` to name a collection that stores credentials.
+
+### ChallengeStore
+
+`ChallengeStore` is a TTL'd, GC'd server-side store backed by `_authChallenges`. It is used internally by `magic_link` (the link token), `otp` (the emailed code), and `webauthn` (ceremony challenges). Custom plugins may access it via `AuthCtx.challengeStore()`, which returns a handle with:
+- `store(id, data, ttl_s)` — store a challenge under `id` with the given TTL.
+- `consume(id) ![]const u8` — retrieve and delete in one atomic step (single-use).
+
+### OAuth2 — contract method
+
+OAuth2 (Google, GitHub, etc.) is the **fifth built-in `AuthMethod`** (slug `oauth2`). It is gated by the existing `.auth.oauth2.enabled` + `.auth.oauth2.providers` config, **not** by `.auth.methods`. When OAuth2 is enabled for a collection the framework auto-mounts three endpoints:
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/collections/:col/auth/oauth2/providers` | Discovery — list enabled providers (name, authURL, clientId, scopes). Secrets never returned. |
+| POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata so the client can drive the authorization redirect. |
+| POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session. |
+
+**`oauth2` initiate** — body `{ "provider": "<name>" }`:
+```json
+// response (200)
+{
+  "authURL": "https://accounts.google.com/o/oauth2/v2/auth?...",
+  "clientId": "my-client-id.apps.googleusercontent.com",
+  "scopes": ["openid", "email", "profile"],
+  "state": "<server-issued-state>"   // always present (ZIGBASE_OAUTH_STATE_SERVER defaults to true)
+}
+```
+
+**`oauth2` complete** — body:
+```json
+{
+  "provider": "google",
+  "code": "<authorization-code>",
+  "codeVerifier": "<pkce-verifier>",
+  "redirectUrl": "https://app.example.com/callback",
+  "state": "<server-issued-state>"   // required by default (ZIGBASE_OAUTH_STATE_SERVER defaults to true)
+}
+```
+```json
+// response (200) — sets zb_auth and zb_csrf cookies
+{ "token": "<jwt>" }
+```
+
+On success the framework fires `onAuth(.oauth2)` through the shared session seam — identical to every other method. All paths share one implementation and enforce the same security: single-use TTL'd CSRF `state` consumed before the code exchange, PKCE required, redirect allow-list, and https-only provider URLs.
+
+> **Connection model:** each auth method manages its own DB connection for the duration of its call. `complete` acquires a writer, consumes the CSRF `state` (single-use, before the provider exchange), then **releases the writer** before the outbound provider HTTP round-trip. A new writer acquisition completes the record lookup and session mint. This means `complete` does **not** hold the writer across blocking I/O — high OAuth2 concurrency does not stall writes. Password `complete` uses a reader (argon2 verification is read-only); the writer is acquired only at session-mint time.
+
+### Tier 3: escape hatch for exotic flows
+
+For flows where the built-in two-phase `AuthMethod` contract doesn't fit, ZigBase exposes
+a `zigbase.auth` helper surface so you can build custom login flows while staying in the
+same session-issuance seam that built-in logins use.
+
+**The seam guarantee:** every login — including custom flows via `ev.issueSession`
+— fires your `onAuth` handler. There is no way to mint a session that bypasses it.
+Built-in flows (password, OAuth2) and custom flows both go through the same
+`issueSession`+`emitAuth` path, so the `onAuth` hook is the single, reliable
+chokepoint for cross-cutting session logic (audit logging, account-state checks, etc.).
+
+#### `zigbase.auth` API reference
+
+```zig
+// src/auth_helpers.zig  (imported as zigbase.auth.*)
+
+pub const Issued    = struct { token: []const u8, cookies: [2]http.Cookie };
+pub const LinkToken = struct { token: []const u8 };
+
+// Issue a full session (sets cookies, fires onAuth).
+// Prefer ev.issueSession (below) from a route — it acquires the writer for you.
+pub fn issueSession(
+    ctx: *http.RequestCtx, conn: *db.Db,
+    collection: []const u8, record_id: []const u8,
+) !Issued
+
+// Single-use magic-link token helpers.
+pub fn mintLinkToken(
+    ctx: *http.RequestCtx, conn: *db.Db,
+    collection: []const u8, record_id: []const u8, ttl_s: i64,
+) !LinkToken
+
+// Returns null when the token is expired, wrong collection, or has a bad signature.
+// claims.id is the record id stored in the token.
+pub fn verifyLinkToken(
+    ctx: *http.RequestCtx, conn: *db.Db,
+    collection: []const u8, token: []const u8,
+) !?jwt.Claims
+
+// Marks the token consumed. Returns error.AlreadyConsumed on replay.
+pub fn consumeLinkToken(conn: *db.Db, claims: jwt.Claims) !void
+
+// Send auth email via the configured mailer (SMTP or log in dev).
+pub fn deliverAuthMail(
+    app: *App, alloc: std.mem.Allocator,
+    to: []const u8, subject: []const u8, body: []const u8,
+) !void
+
+// Rate-limit helper — returns a ready-to-return 429 Response when the caller
+// is over the limit, null otherwise. scope identifies the endpoint; ident is the
+// key (e.g. email or raw request body).
+pub fn rateLimit(
+    ctx: *http.RequestCtx, scope: []const u8, ident: []const u8,
+) !?http.Response
+```
+
+#### `RouteEvent.issueSession` — the ergonomic route helper
+
+From inside a `RouteEvent` handler, use `ev.issueSession` instead of calling
+`zigbase.auth.issueSession` directly. It acquires and releases the DB writer for you:
+
+```zig
+// src/events.zig  (re-exported on RouteEvent)
+pub fn issueSession(
+    ev: *RouteEvent, collection: []const u8, record_id: []const u8,
+) !Issued   // acquires+releases the writer, fires onAuth(.custom)
+```
+
+> **Warning:** `ev.issueSession` acquires the pool writer for you. If your handler already holds the writer (`var w = ev.writer()`), do NOT call `ev.issueSession` — it would deadlock on the single non-reentrant writer. Instead call `zigbase.auth.issueSession(ev.ctx, w.conn, collection, record_id)` with the connection you already hold.
+
+Typical usage in a confirm handler that does NOT separately hold the writer:
+
+```zig
+fn myConfirm(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    // ... verify your token, resolve the record id ...
+    const issued = try ev.issueSession("members", record_id);
+    return .{ .status = 200, .body = "{\"ok\":true}", .cookies = &issued.cookies };
+}
+```
+
+When your handler already holds the writer (e.g. for `verifyLinkToken` and `consumeLinkToken`), reuse it:
+
+```zig
+fn myConfirm(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    var w = ev.writer();
+    defer w.deinit();
+    // ... verifyLinkToken, consumeLinkToken using w.conn ...
+    // Use zigbase.auth.issueSession, NOT ev.issueSession, to avoid double-acquiring the writer.
+    const issued = try zigbase.auth.issueSession(ev.ctx, w.conn, "members", record_id);
+    return .{ .status = 200, .body = "{\"ok\":true}", .cookies = &issued.cookies };
+}
+```
+
+`issued.cookies` is a `[2]http.Cookie` containing `zb_auth` (httpOnly) and
+`zb_csrf` (readable). Pass `&issued.cookies` as the `cookies` field on the
+`http.Response` and the framework writes both Set-Cookie headers.
+
+For a complete, copy-pasteable example (two-route magic-link flow with rate
+limiting, enumeration safety, and single-use token replay protection) see
+[Recipes → magic-link login](./recipes#recipe-magic-link-passwordless-login).
 
 ## 7. Scheduled jobs (`.cron` + `.jobs`)
 
@@ -719,6 +1030,9 @@ The public surface (from `src/root.zig`):
   vtable types; `zigbase.DefaultStoragePlugin` / `zigbase.DefaultMailerPlugin` — the
   built-in defaults; `zigbase.LocalStorage`, `zigbase.LogMailer`, `zigbase.SmtpMailer`,
   `zigbase.SmtpTls` — the concrete backends.
+- `zigbase.AuthMethod` — the auth plugin vtable type.
+- `zigbase.AuthCtx` — the per-request auth context passed to plugin phases.
+- `zigbase.auth.Resolution` / `zigbase.auth.InitiateResult` — the phase return types.
 
 ## See also
 

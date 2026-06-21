@@ -7,6 +7,8 @@ const health = @import("api/health.zig");
 const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
 const auth_api = @import("api/auth.zig");
+const auth_methods_api = @import("api/auth_methods.zig");
+const webauthn_register_api = @import("api/webauthn_register.zig");
 const oauth_api = @import("api/oauth.zig");
 const files_api = @import("api/files.zig");
 const realtime_ws = @import("realtime/ws.zig");
@@ -41,9 +43,11 @@ const routes = [_]router.Route{
     .{ .method = .POST, .pattern = "/api/collections/:col/confirm-verification", .handler = auth_api.confirmVerification },
     .{ .method = .POST, .pattern = "/api/collections/:col/request-password-reset", .handler = auth_api.requestPasswordReset },
     .{ .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .handler = auth_api.confirmPasswordReset },
-    .{ .method = .GET, .pattern = "/api/collections/:col/oauth2-providers", .handler = oauth_api.oauth2Providers },
-    .{ .method = .POST, .pattern = "/api/collections/:col/oauth2-init", .handler = oauth_api.oauth2Init },
-    .{ .method = .POST, .pattern = "/api/collections/:col/auth-with-oauth2", .handler = oauth_api.authWithOAuth2 },
+    .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/initiate", .handler = auth_methods_api.initiate },
+    .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/complete", .handler = auth_methods_api.complete },
+    .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/begin", .handler = webauthn_register_api.begin },
+    .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/finish", .handler = webauthn_register_api.finish },
+    .{ .method = .GET, .pattern = "/api/collections/:col/auth/oauth2/providers", .handler = oauth_api.oauth2Providers },
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
     .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
     .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },

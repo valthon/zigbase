@@ -383,11 +383,129 @@ new password *before* consuming the token, so a too-short password does not burn
 
 Configure SMTP for production; see [Known limitations](./known-limitations).
 
+### Auth method endpoints (pluggable auth)
+
+For every auth collection that enables a method (built-in or custom), two endpoints are auto-mounted:
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/collections/:col/auth/:method/initiate` | Phase 1: challenge/email/options. Returns 200 with method-specific JSON body, or 204 for enumeration-safe methods (e.g. magic-link). |
+| POST | `/api/collections/:col/auth/:method/complete` | Phase 2: proof → session. Returns 200 with `{ token }` and sets `zb_auth`/`zb_csrf` cookies on success. |
+
+`:method` is the method slug (`magic_link`, `otp`, `password`, `webauthn`, `oauth2`, or a custom plugin's slug). Returns 404 when the collection doesn't exist, isn't an auth collection, or the method isn't enabled.
+
+> **`require_verified`:** if the auth collection is configured with `require_verified: true`, `complete` returns **403** when the matched record's `verified` field is `false`. This applies to all methods — including WebAuthn and OAuth2 accounts from providers that did not confirm the email address (created `verified=false`).
+
+**WebAuthn passkey registration** (authed — requires a valid session):
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/collections/:col/auth/webauthn/register/begin` | Returns WebAuthn creation options (challenge, rpId, rpName). |
+| POST | `/api/collections/:col/auth/webauthn/register/finish` | Stores the new passkey bound to the authenticated user. |
+
+**magic_link initiate:**
+
+```json
+// request
+{ "identity": "user@example.com" }
+// response: 204 (enumeration-safe — always 204 whether email exists or not)
+```
+
+**magic_link complete:**
+
+```json
+// request
+{ "token": "<magic-link-token>" }
+// response (200) — sets zb_auth and zb_csrf cookies
+{ "token": "<jwt>" }
+```
+
+**otp initiate:**
+
+```json
+// request
+{ "identity": "user@example.com" }
+// response: 204
+```
+
+**otp complete:**
+
+```json
+// request
+{ "identity": "user@example.com", "code": "123456" }
+// response (200)
+{ "token": "<jwt>" }
+```
+
+**webauthn initiate:**
+
+```json
+// request (identity optional for discoverable credentials)
+{ "identity": "user@example.com" }
+// response (200)
+{ "challenge": "<base64url>", "rpId": "app.example.com", "ceremonyId": "<opaque>" }
+```
+
+**webauthn complete:**
+
+```json
+// request
+{
+  "ceremonyId": "<opaque>",
+  "credentialId": "<base64url>",
+  "authenticatorData": "<base64url>",
+  "clientDataJSON": "<base64url>",
+  "signature": "<base64url>"
+}
+// response (200)
+{ "token": "<jwt>" }
+```
+
+**webauthn register/begin (authed):**
+
+```json
+// request: empty body or {}
+// response (200)
+{ "challenge": "<base64url>", "rpId": "app.example.com", "rpName": "My App", "ceremonyId": "<opaque>" }
+```
+
+**webauthn register/finish (authed):**
+
+```json
+// request
+{
+  "ceremonyId": "<opaque>",
+  "id": "<base64url>",
+  "rawId": "<base64url>",
+  "response": {
+    "clientDataJSON": "<base64url>",
+    "attestationObject": "<base64url>"
+  }
+}
+// response (200): {}
+```
+
+### The `onAuth` hook — fires on every login
+
+Every successful login — password, OAuth2, magic-link, OTP, WebAuthn, and custom flows built with
+`ev.issueSession` / `zigbase.auth.issueSession` — fires the `onAuth` handler
+registered in your `App(.{ .onAuth = ... })`. This is the single chokepoint for
+cross-cutting session logic (audit logging, account-state checks, etc.). There is no
+path through ZigBase's session-issuance machinery that bypasses it.
+
+`AuthEvent.method` is an enum: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`, or `.custom` for custom plugins.
+
+See [Framework §6](./framework#6-auth--file--lifecycle-events) for the
+`zigbase.auth` helper surface and the seam guarantee.
+
 ### Rate limiting
 
-The sensitive auth endpoints — `auth-with-password` (login), `request-verification`, and
-`request-password-reset` — are rate limited. Over the limit, the endpoint returns **`429
+The sensitive auth endpoints — `auth-with-password` (login), `request-verification`,
+`request-password-reset`, and all `auth/:method/initiate` / `auth/:method/complete`
+endpoints — are rate limited. Over the limit, the endpoint returns **`429
 Too Many Requests`** (`{ "message": "Too many requests. Try again later." }`).
+
+Per-method rate-limit behavior is configured in `.auth.methods` via the `rate_limit` field (`.default` | `.off` | `.{ .custom = .{ .max, .window_s } }`). See [Framework §6](./framework#6-auth--file--lifecycle-events).
 
 - **Config:** `ZIGBASE_RATE_LIMIT_MAX` attempts (default `10`) per
   `ZIGBASE_RATE_LIMIT_WINDOW` seconds (default `60`), per client key, per endpoint. Set
@@ -405,46 +523,82 @@ ZigBase uses **client-driven PKCE**: the client generates and holds the PKCE sta
 verifier, runs the authorization redirect itself, then submits the authorization `code` to
 the server.
 
+OAuth2 is the **fifth built-in `AuthMethod`** (slug `oauth2`) and is exposed exclusively
+through the standard auth-method contract endpoints:
+
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/collections/:col/oauth2-providers` | List enabled providers (name, `authURL`, `clientId`, `scopes`). Secrets are never returned. |
-| POST | `/api/collections/:col/oauth2-init` | (Server-side state mode only) Mint a server-issued `state` for a provider. `404` when server-side state is disabled. |
-| POST | `/api/collections/:col/auth-with-oauth2` | Exchange an authorization code for a session. |
+| GET | `/api/collections/:col/auth/oauth2/providers` | List enabled providers (`name`, `authURL`, `clientId`, `scopes`). Secrets are never returned. Gated on `.auth.oauth2.enabled`. |
+| POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata so the client can drive the authorization redirect. |
+| POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session. |
 | DELETE | `/api/collections/:col/records/:id/external-auths/:provider` | Unlink a provider from a record. |
 
+**`GET .../auth/oauth2/providers`** — no request body. Response:
+
 ```json
-// auth-with-oauth2 request
+{
+  "providers": [
+    { "name": "google", "authURL": "https://accounts.google.com/o/oauth2/v2/auth?...", "clientId": "my-client-id.apps.googleusercontent.com", "scopes": ["openid", "email", "profile"] }
+  ]
+}
+```
+
+**`oauth2` initiate** — body `{ "provider": "<name>" }`:
+
+```json
+// response (200)
+{
+  "authURL": "https://accounts.google.com/o/oauth2/v2/auth?...",
+  "clientId": "my-client-id.apps.googleusercontent.com",
+  "scopes": ["openid", "email", "profile"],
+  "state": "<server-issued-state>"
+}
+```
+
+`state` is always present by default (`ZIGBASE_OAUTH_STATE_SERVER` defaults to `true`); omitted only when the server-side state is explicitly disabled.
+
+**`oauth2` complete** — body:
+
+```json
 {
   "provider": "google",
   "code": "<authorization-code>",
   "codeVerifier": "<pkce-verifier>",
-  "redirectUrl": "https://app.example.com/callback"
+  "redirectUrl": "https://app.example.com/callback",
+  "state": "<server-issued-state>"
 }
 ```
 
+`state` is required by default; omitted only when `ZIGBASE_OAUTH_STATE_SERVER=false`.
+`redirectUrl` must be in the provider's configured allowlist.
+
 ```json
-// auth-with-oauth2 response (200) — also sets the auth cookies
-{ "token": "<jwt>", "record": { "id": "..." }, "meta": { "isNew": true } }
+// response (200) — sets zb_auth and zb_csrf cookies
+{ "token": "<jwt>" }
 ```
 
-`redirectUrl` must be in the provider's configured allowlist.
+On success, `onAuth(.oauth2)` fires through the shared session seam. Security enforced on all paths: single-use TTL'd CSRF `state` consumed before the code exchange, PKCE required, redirect allow-list, and https-only provider URLs.
 
 #### CSRF on the OAuth flow: `state`
 
 The OAuth `state` parameter prevents login-CSRF. ZigBase supports two modes:
 
-- **Client-driven (default).** The SPA generates `state`, embeds it in the provider
-  authorization URL, and verifies the returned `state` against what it stored before calling
-  `auth-with-oauth2`. The backend does not see or check `state`. This is the documented flow
-  and is unchanged.
-- **Server-side (opt-in).** Set `ZIGBASE_OAUTH_STATE_SERVER=true` (TTL via
-  `ZIGBASE_OAUTH_STATE_TTL`, default 600s). Then the client calls `POST .../oauth2-init` with
-  `{ "provider": "<name>" }`, receives `{ "state": "<value>" }`, embeds it in the provider
-  authorization URL, and on callback adds `"state": "<value>"` to the `auth-with-oauth2` body.
-  The backend verifies the state exists, matches the (collection, provider), is unexpired, and
-  is **single-use** (deleted on first use). A missing, mismatched, expired, or replayed `state`
-  is rejected with `400` before the provider is contacted. **PKCE (`codeVerifier`) is still
-  required in both modes** — server-side `state` adds CSRF protection, it does not replace PKCE.
+- **Server-side (default).** `ZIGBASE_OAUTH_STATE_SERVER` defaults to `true` (TTL via
+  `ZIGBASE_OAUTH_STATE_TTL`, default 600s). The `initiate` endpoint issues a `state` value
+  that the client must round-trip through the provider and back to `complete`. The backend
+  verifies the state exists, matches the (collection, provider), is unexpired, and is
+  **single-use** (deleted on first use). A missing, mismatched, expired, or replayed `state`
+  is rejected with `400` before the provider is contacted.
+  1. The client calls `POST .../auth/oauth2/initiate` with `{ "provider": "<name>" }` and
+     receives `{ ..., "state": "<value>" }`.
+  2. The client embeds that `state` in the provider authorization URL.
+  3. On callback, the client adds `"state": "<value>"` to the `complete` body.
+- **Client-driven (opt-out).** Set `ZIGBASE_OAUTH_STATE_SERVER=false` to restore the
+  previous behavior: the SPA generates and verifies `state` itself; the backend does not
+  see or check it.
+
+**PKCE (`codeVerifier`) is required in both modes** — server-side `state` adds CSRF
+protection, it does not replace PKCE.
 
 ## Files
 

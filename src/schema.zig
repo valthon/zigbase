@@ -90,10 +90,57 @@ pub const OAuth2Options = struct {
     providers: []const OAuth2Provider = &.{},
 };
 
+pub const RateLimitOpt = union(enum) {
+    default,
+    off,
+    custom: struct { max: u32, window_s: i64 },
+};
+
+pub const PasswordMethodOpts = struct {
+    rate_limit: RateLimitOpt = .default,
+};
+
+pub const MagicLinkMethodOpts = struct {
+    ttl_s: i64 = 900,
+    auto_create: bool = false,
+    rate_limit: RateLimitOpt = .default,
+};
+
+pub const OtpMethodOpts = struct {
+    length: u8 = 6,
+    ttl_s: i64 = 300,
+    auto_create: bool = false,
+    rate_limit: RateLimitOpt = .default,
+};
+
+pub const WebAuthnMethodOpts = struct {
+    rp_id: []const u8 = "",
+    rp_name: []const u8 = "",
+    origin: []const u8 = "",
+    credentials_collection: []const u8 = "",
+    /// Require the User Verified (UV) authenticator flag on register + login.
+    /// Default false (backward-compatible passkey behavior).
+    require_uv: bool = false,
+    rate_limit: RateLimitOpt = .default,
+};
+
+pub const MethodsOptions = struct {
+    password: ?PasswordMethodOpts = null,
+    magic_link: ?MagicLinkMethodOpts = null,
+    otp: ?OtpMethodOpts = null,
+    webauthn: ?WebAuthnMethodOpts = null,
+    custom: []const []const u8 = &.{}, // slugs of .auth_methods to enable on this collection
+};
+
 pub const AuthOptions = struct {
     identityFields: []const []const u8 = &.{"email"},
     minPasswordLength: u8 = 8,
+    /// When true, a login that resolves a record whose `verified` field is not true is
+    /// rejected with 403 instead of minting a session. Default false (backward-compatible:
+    /// no email-verification gate).
+    require_verified: bool = false,
     oauth2: OAuth2Options = .{},
+    methods: MethodsOptions = .{},
 };
 pub const CollectionOptions = struct {
     auth: AuthOptions = .{},
@@ -106,6 +153,7 @@ pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u
     for (c.options.auth.identityFields) |f| try ids.append(.{ .string = f });
     try auth.put(alloc, "identityFields", .{ .array = ids });
     try auth.put(alloc, "minPasswordLength", .{ .integer = c.options.auth.minPasswordLength });
+    try auth.put(alloc, "require_verified", .{ .bool = c.options.auth.require_verified });
 
     var oauth2: ObjectMap = .empty;
     try oauth2.put(alloc, "enabled", .{ .bool = c.options.auth.oauth2.enabled });
@@ -132,8 +180,61 @@ pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u
     try oauth2.put(alloc, "providers", .{ .array = provs });
     try auth.put(alloc, "oauth2", .{ .object = oauth2 });
 
+    // Serialize methods
+    var methods: ObjectMap = .empty;
+    if (c.options.auth.methods.password) |pw| {
+        var pw_obj: ObjectMap = .empty;
+        try pw_obj.put(alloc, "rate_limit", try rateLimitToJsonAlloc(alloc, pw.rate_limit));
+        try methods.put(alloc, "password", .{ .object = pw_obj });
+    }
+    if (c.options.auth.methods.magic_link) |ml| {
+        var ml_obj: ObjectMap = .empty;
+        try ml_obj.put(alloc, "ttl_s", .{ .integer = ml.ttl_s });
+        try ml_obj.put(alloc, "auto_create", .{ .bool = ml.auto_create });
+        try ml_obj.put(alloc, "rate_limit", try rateLimitToJsonAlloc(alloc, ml.rate_limit));
+        try methods.put(alloc, "magic_link", .{ .object = ml_obj });
+    }
+    if (c.options.auth.methods.otp) |otp| {
+        var otp_obj: ObjectMap = .empty;
+        try otp_obj.put(alloc, "length", .{ .integer = @as(i64, otp.length) });
+        try otp_obj.put(alloc, "ttl_s", .{ .integer = otp.ttl_s });
+        try otp_obj.put(alloc, "auto_create", .{ .bool = otp.auto_create });
+        try otp_obj.put(alloc, "rate_limit", try rateLimitToJsonAlloc(alloc, otp.rate_limit));
+        try methods.put(alloc, "otp", .{ .object = otp_obj });
+    }
+    if (c.options.auth.methods.webauthn) |wa| {
+        var wa_obj: ObjectMap = .empty;
+        try wa_obj.put(alloc, "rp_id", .{ .string = wa.rp_id });
+        try wa_obj.put(alloc, "rp_name", .{ .string = wa.rp_name });
+        try wa_obj.put(alloc, "origin", .{ .string = wa.origin });
+        try wa_obj.put(alloc, "credentials_collection", .{ .string = wa.credentials_collection });
+        try wa_obj.put(alloc, "require_uv", .{ .bool = wa.require_uv });
+        try wa_obj.put(alloc, "rate_limit", try rateLimitToJsonAlloc(alloc, wa.rate_limit));
+        try methods.put(alloc, "webauthn", .{ .object = wa_obj });
+    }
+    if (c.options.auth.methods.custom.len > 0) {
+        var custom_arr = std.json.Array.init(alloc);
+        for (c.options.auth.methods.custom) |slug| try custom_arr.append(.{ .string = slug });
+        try methods.put(alloc, "custom", .{ .array = custom_arr });
+    }
+    try auth.put(alloc, "methods", .{ .object = methods });
+
     try root.put(alloc, "auth", .{ .object = auth });
     return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
+}
+
+fn rateLimitToJsonAlloc(alloc: std.mem.Allocator, rl: RateLimitOpt) !std.json.Value {
+    var obj: ObjectMap = .empty;
+    switch (rl) {
+        .default => try obj.put(alloc, "mode", .{ .string = "default" }),
+        .off => try obj.put(alloc, "mode", .{ .string = "off" }),
+        .custom => |cv| {
+            try obj.put(alloc, "mode", .{ .string = "custom" });
+            try obj.put(alloc, "max", .{ .integer = @as(i64, cv.max) });
+            try obj.put(alloc, "window_s", .{ .integer = cv.window_s });
+        },
+    }
+    return .{ .object = obj };
 }
 
 pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptions {
@@ -151,6 +252,9 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
     };
     if (av.object.get("minPasswordLength")) |mv| if (mv == .integer) {
         opts.auth.minPasswordLength = std.math.cast(u8, mv.integer) orelse 8;
+    };
+    if (av.object.get("require_verified")) |rv| if (rv == .bool) {
+        opts.auth.require_verified = rv.bool;
     };
     if (av.object.get("oauth2")) |ov| if (ov == .object) {
         opts.auth.oauth2.enabled = if (ov.object.get("enabled")) |ev| (ev == .bool and ev.bool) else false;
@@ -182,7 +286,78 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
             opts.auth.oauth2.providers = try list.toOwnedSlice(alloc);
         };
     };
+    if (av.object.get("methods")) |mv| if (mv == .object) {
+        const mo = mv.object;
+        if (mo.get("password")) |pv| if (pv == .object) {
+            var pw = PasswordMethodOpts{};
+            if (pv.object.get("rate_limit")) |rlv| pw.rate_limit = rateLimitFromJson(rlv);
+            opts.auth.methods.password = pw;
+        };
+        if (mo.get("magic_link")) |mlv| if (mlv == .object) {
+            var ml = MagicLinkMethodOpts{};
+            if (mlv.object.get("ttl_s")) |x| if (x == .integer) { ml.ttl_s = x.integer; };
+            if (mlv.object.get("auto_create")) |x| if (x == .bool) { ml.auto_create = x.bool; };
+            if (mlv.object.get("rate_limit")) |rlv| ml.rate_limit = rateLimitFromJson(rlv);
+            opts.auth.methods.magic_link = ml;
+        };
+        if (mo.get("otp")) |otpv| if (otpv == .object) {
+            var otp = OtpMethodOpts{};
+            if (otpv.object.get("length")) |x| if (x == .integer) { otp.length = std.math.cast(u8, x.integer) orelse 6; };
+            if (otpv.object.get("ttl_s")) |x| if (x == .integer) { otp.ttl_s = x.integer; };
+            if (otpv.object.get("auto_create")) |x| if (x == .bool) { otp.auto_create = x.bool; };
+            if (otpv.object.get("rate_limit")) |rlv| otp.rate_limit = rateLimitFromJson(rlv);
+            opts.auth.methods.otp = otp;
+        };
+        if (mo.get("webauthn")) |wav| if (wav == .object) {
+            var wa = WebAuthnMethodOpts{};
+            if (wav.object.get("rp_id")) |x| if (x == .string) { wa.rp_id = try alloc.dupe(u8, x.string); };
+            if (wav.object.get("rp_name")) |x| if (x == .string) { wa.rp_name = try alloc.dupe(u8, x.string); };
+            if (wav.object.get("origin")) |x| if (x == .string) { wa.origin = try alloc.dupe(u8, x.string); };
+            if (wav.object.get("credentials_collection")) |x| if (x == .string) { wa.credentials_collection = try alloc.dupe(u8, x.string); };
+            if (wav.object.get("require_uv")) |x| if (x == .bool) { wa.require_uv = x.bool; };
+            if (wav.object.get("rate_limit")) |rlv| wa.rate_limit = rateLimitFromJson(rlv);
+            opts.auth.methods.webauthn = wa;
+        };
+        if (mo.get("custom")) |cv| if (cv == .array) {
+            var list: std.ArrayList([]const u8) = .empty;
+            for (cv.array.items) |it| if (it == .string) try list.append(alloc, try alloc.dupe(u8, it.string));
+            opts.auth.methods.custom = try list.toOwnedSlice(alloc);
+        };
+    };
     return opts;
+}
+
+fn rateLimitFromJson(v: std.json.Value) RateLimitOpt {
+    if (v != .object) return .default;
+    const mode = v.object.get("mode") orelse return .default;
+    if (mode != .string) return .default;
+    if (std.mem.eql(u8, mode.string, "off")) return .off;
+    if (std.mem.eql(u8, mode.string, "custom")) {
+        const max: u32 = blk: {
+            if (v.object.get("max")) |mx| if (mx == .integer) break :blk std.math.cast(u32, mx.integer) orelse 0;
+            break :blk 0;
+        };
+        const window_s: i64 = blk: {
+            if (v.object.get("window_s")) |ws| if (ws == .integer) break :blk ws.integer;
+            break :blk 0;
+        };
+        return .{ .custom = .{ .max = max, .window_s = window_s } };
+    }
+    return .default;
+}
+
+/// Returns true if password-based authentication is enabled for the collection.
+/// A collection must be of type `.auth`. Password is considered enabled if:
+///   - `methods.password` is explicitly non-null, OR
+///   - the whole `methods` is its default/empty value (all built-ins null and custom is empty).
+/// This preserves backward-compat: an auth collection with no methods config allows password auth.
+pub fn passwordEnabled(col: Collection) bool {
+    if (col.type != .auth) return false;
+    const m = col.options.auth.methods;
+    if (m.password != null) return true;
+    // whole methods is default (all built-ins null, no custom slugs) => backward compat
+    const is_default = m.magic_link == null and m.otp == null and m.webauthn == null and m.custom.len == 0;
+    return is_default;
 }
 
 /// Find a field by exact name (case-sensitive). Returns null if absent.
@@ -824,6 +999,20 @@ test "collection options round-trip identity fields" {
     try std.testing.expectEqual(@as(u8, 10), back.auth.minPasswordLength);
 }
 
+test "require_verified round-trips through optionsToJson/optionsFromJson" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // default false
+    const d = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{} };
+    const back_d = try optionsFromJson(a, try optionsToJson(a, d, false));
+    try std.testing.expectEqual(false, back_d.auth.require_verified);
+    // explicit true
+    const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .require_verified = true } } };
+    const back = try optionsFromJson(a, try optionsToJson(a, c, false));
+    try std.testing.expectEqual(true, back.auth.require_verified);
+}
+
 test "validate rejects an auth collection with a non-identifier identity field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -924,4 +1113,49 @@ test "collectionToJson redacts oauth2 clientSecret" {
     const c = Collection{ .id = "id1", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &providers } } } };
     const out = try collectionToJson(a, c);
     try std.testing.expect(std.mem.indexOf(u8, out, "topsecret") == null);
+}
+
+test "AuthOptions.methods serializes + parses (magic_link ttl, password default)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .methods = .{
+        .password = .{},
+        .magic_link = .{ .ttl_s = 1200, .auto_create = true },
+    } } } };
+    const json = try optionsToJson(a, c, false);
+    const back = try optionsFromJson(a, json);
+    try std.testing.expect(back.auth.methods.password != null);
+    try std.testing.expect(back.auth.methods.magic_link != null);
+    try std.testing.expectEqual(@as(i64, 1200), back.auth.methods.magic_link.?.ttl_s);
+    try std.testing.expect(back.auth.methods.magic_link.?.auto_create);
+}
+
+test "AuthOptions.methods custom slugs round-trip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const slugs = [_][]const u8{ "sso_saml", "passkey_corp" };
+    const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .methods = .{
+        .custom = &slugs,
+    } } } };
+    const json = try optionsToJson(a, c, false);
+    const back = try optionsFromJson(a, json);
+    try std.testing.expectEqual(@as(usize, 2), back.auth.methods.custom.len);
+    try std.testing.expectEqualStrings("sso_saml", back.auth.methods.custom[0]);
+    try std.testing.expectEqualStrings("passkey_corp", back.auth.methods.custom[1]);
+}
+
+test "passwordEnabled backward compat and explicit opt-in" {
+    const base_col = Collection{ .id = "c", .name = "posts", .type = .base, .fields = &.{} };
+    try std.testing.expect(!passwordEnabled(base_col));
+    // auth collection with no methods config => password enabled (backward compat)
+    const auth_col_default = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{} };
+    try std.testing.expect(passwordEnabled(auth_col_default));
+    // auth collection with explicit password opt-in
+    const auth_col_pw = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .methods = .{ .password = .{} } } } };
+    try std.testing.expect(passwordEnabled(auth_col_pw));
+    // auth collection with only magic_link (no password) => not enabled
+    const auth_col_ml = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .methods = .{ .magic_link = .{} } } } };
+    try std.testing.expect(!passwordEnabled(auth_col_ml));
 }

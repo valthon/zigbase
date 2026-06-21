@@ -23,3 +23,34 @@ def test_configure_oauth_provider_and_secret_redacted(page):
     page.wait_for_selector('[data-test=oauth-provider]')
     assert page.input_value('[data-test=oauth-clientid]') == 'my-client-id'
     assert page.input_value('[data-test=oauth-secret]') == ''  # redacted, never returned
+
+    # --- Contract endpoint: GET /api/collections/:col/auth/oauth2/providers ---
+    # After the provider is configured, the public-facing discovery endpoint should
+    # list it (without exposing the client secret).
+    r = api_request(page, "GET", "/api/collections/members/auth/oauth2/providers")
+    assert r.status == 200
+    body = r.json()
+    assert "providers" in body
+    assert len(body["providers"]) == 1
+    prov = body["providers"][0]
+    assert prov["clientId"] == "my-client-id"
+    assert "clientSecret" not in prov
+    assert "authURL" in prov
+    assert "scopes" in prov
+
+    # --- Contract endpoint: POST /api/collections/:col/auth/oauth2/initiate ---
+    # Posting a valid provider name should return the redirect-building info
+    # (authURL, clientId, scopes). Server-side CSRF `state` is ON by default, so
+    # initiate also mints a single-use `state` the client must echo back on complete.
+    r2 = api_request(page, "POST", "/api/collections/members/auth/oauth2/initiate",
+                     {"provider": "google"})
+    assert r2.status == 200
+    init_body = r2.json()
+    assert "authURL" in init_body
+    assert "clientId" in init_body
+    assert init_body["clientId"] == "my-client-id"
+    assert "scopes" in init_body
+    assert isinstance(init_body["scopes"], list)
+    # Secure-by-default: a CSRF state is issued.
+    assert "state" in init_body
+    assert isinstance(init_body["state"], str) and len(init_body["state"]) > 0

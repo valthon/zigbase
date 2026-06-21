@@ -90,6 +90,49 @@ fn init_0006(w: *db.Db) db.DbError!void {
     try w.exec("CREATE INDEX IF NOT EXISTS \"idx_cursorstate_expires\" ON \"_cursorStates\" (\"expires\");");
 }
 
+fn init_0007(w: *db.Db) db.DbError!void {
+    // Server-side challenge store for pluggable auth methods (OTP, magic-link, FIDO2, etc.).
+    // A challenge is minted by `put`, returned to the client as an opaque id (or embedded in
+    // a URL), and redeemed exactly once by `take`/`takeByIdentity`. "consumed" tracks
+    // single-use semantics atomically under the writer lock; "expires" is a unix-seconds TTL.
+    // A periodic GC (auth/challenge_store.gcAuthChallenges) prunes consumed/expired rows.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_authChallenges" (
+        \\  "id" TEXT PRIMARY KEY, "collectionRef" TEXT NOT NULL, "method" TEXT NOT NULL,
+        \\  "identity" TEXT NOT NULL, "payload" TEXT NOT NULL, "expires" INTEGER NOT NULL,
+        \\  "consumed" INTEGER NOT NULL DEFAULT 0, "created" TEXT NOT NULL
+        \\);
+    );
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_authchallenge_expires\" ON \"_authChallenges\" (\"expires\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_authchallenge_lookup\" ON \"_authChallenges\" (\"collectionRef\",\"method\",\"identity\");");
+}
+
+fn init_0008(w: *db.Db) db.DbError!void {
+    // Per-credential WebAuthn store. One row per registered authenticator credential.
+    // "credentialId" is the base64url of the raw credential id bytes returned by the
+    // authenticator; it is the lookup key on every assertion and must be globally unique.
+    // "publicKey" stores the COSE_Key bytes (base64-encoded) used to verify assertion
+    // signatures. "signCount" is updated after every successful assertion (clone detection).
+    // "alg" is the COSE algorithm id (e.g. -7 for ES256). "aaguid" / "transports" are
+    // RECOMMENDED for passkey UX but optional; they default to empty string.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_webauthnCredentials" (
+        \\  "id" TEXT PRIMARY KEY,
+        \\  "collectionRef" TEXT NOT NULL,
+        \\  "recordRef" TEXT NOT NULL,
+        \\  "credentialId" TEXT NOT NULL UNIQUE,
+        \\  "publicKey" TEXT NOT NULL,
+        \\  "alg" INTEGER NOT NULL,
+        \\  "signCount" INTEGER NOT NULL,
+        \\  "aaguid" TEXT NOT NULL DEFAULT '',
+        \\  "transports" TEXT NOT NULL DEFAULT '',
+        \\  "created" TEXT NOT NULL,
+        \\  "updated" TEXT NOT NULL
+        \\);
+    );
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_webauthncred_record\" ON \"_webauthnCredentials\" (\"collectionRef\",\"recordRef\");");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -97,6 +140,8 @@ pub const all = [_]Migration{
     .{ .name = "0004_consumed_tokens", .up = init_0004 },
     .{ .name = "0005_oauth_states", .up = init_0005 },
     .{ .name = "0006_cursor_states", .up = init_0006 },
+    .{ .name = "0007_auth_challenges", .up = init_0007 },
+    .{ .name = "0008_webauthn_credentials", .up = init_0008 },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {

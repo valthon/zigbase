@@ -49,6 +49,16 @@ pub const Migration = @import("provision.zig").Migration;
 // build.zig embedStaticDir) and of `.static_files = .{ .embedded = ... }`.
 pub const StaticFile = @import("static_files.zig").StaticFile;
 
+// ---- Auth helper surface (consumer-facing magic-link building blocks) ------
+pub const auth = @import("auth_helpers.zig");
+
+// ---- Pluggable auth method contract types ----------------------------------
+// Types a consumer names when implementing a custom auth method plugin.
+pub const AuthMethod = @import("auth/method.zig").AuthMethod;
+pub const AuthCtx = @import("auth/method.zig").AuthCtx;
+pub const InitiateResult = @import("auth/method.zig").InitiateResult;
+pub const Resolution = @import("auth/method.zig").Resolution;
+
 // ---- Code-generation modules (pure-Zig TS client generator) ---------------
 pub const codegen = struct {
     pub const ts_type = @import("codegen/ts_type.zig");
@@ -149,4 +159,23 @@ test {
     _ = @import("codegen/acquire_http.zig");
     _ = @import("codegen/typegen_cli.zig");
     _ = @import("route_types.zig");
+    _ = @import("auth_helpers.zig");
+    _ = @import("auth/method.zig");
+    _ = @import("auth/methods/password.zig");
+    _ = @import("auth/methods/magic_link.zig");
+    _ = @import("auth/methods/otp.zig");
+    _ = @import("auth/registry.zig");
+    _ = @import("api/auth_methods.zig");
+    _ = @import("auth/methods/oauth2.zig");
+    _ = @import("auth/challenge_store.zig");
+    _ = @import("auth/webauthn/cbor.zig");
+    _ = @import("auth/webauthn/cose.zig");
+    _ = @import("auth/webauthn/authdata.zig");
+    _ = @import("auth/webauthn/verify_sig.zig");
+    _ = @import("auth/webauthn/client_data.zig");
+    _ = @import("auth/webauthn/store.zig");
+    _ = @import("auth/webauthn/register.zig");
+    _ = @import("auth/webauthn/authenticate.zig");
+    _ = @import("auth/methods/webauthn.zig");
+    _ = @import("api/webauthn_register.zig");
 }

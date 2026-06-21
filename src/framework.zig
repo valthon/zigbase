@@ -18,6 +18,7 @@ const provision = @import("provision.zig");
 const schema = @import("schema.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
+const registry = @import("auth/registry.zig");
 
 // ============================================================================
 // Comptime plugins (storage + mailer)
@@ -130,7 +131,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -206,6 +207,20 @@ pub fn App(comptime cfg: anytype) type {
             break :blk P;
         };
 
+        /// Comptime-assembled list of auth method TYPES (built-ins ++ consumer types from
+        /// `.auth_methods`). Each type in the list is validated against the auth-method
+        /// contract (create/method/deinit) at compile time. Used in serveImpl to
+        /// instantiate the Registry stack vars.
+        pub const auth_method_types: []const type = blk: {
+            const am = @import("auth/method.zig");
+            const types = registry.assembleTypes(cfg);
+            // Validate every method type (built-ins AND consumer types) against the
+            // contract, mirroring how assertPluginContract always runs on storage/mailer
+            // — so a broken built-in can't silently escape comptime validation either.
+            for (types) |T| am.assertAuthMethodContract(T);
+            break :blk types;
+        };
+
         /// Comptime static-files mode (see static_files.Mode). Field absent -> .default,
         /// which enables the runtime `--serve-static <dir>` flag on `serve`.
         pub const static_mode: static_files.Mode = blk: {
@@ -264,10 +279,12 @@ pub fn App(comptime cfg: anytype) type {
         };
 
         /// Bundle of comptime-resolved knobs threaded into the serve path: the
-        /// selected storage/mailer plugin TYPES and the reader-pool cap.
+        /// selected storage/mailer plugin TYPES, the auth method type list,
+        /// and the reader-pool cap.
         const Opts = ServeOpts{
             .StoragePlugin = StoragePlugin,
             .MailerPlugin = MailerPlugin,
+            .auth_method_types = auth_method_types,
             .reader_pool_size = reader_pool_size,
             .job_stack_size = job_stack_size,
             .cache_kib = cache_kib,
@@ -290,10 +307,15 @@ pub fn App(comptime cfg: anytype) type {
 }
 
 /// Comptime knobs threaded from `App(cfg)` into the serve path: which storage /
-/// mailer plugin TYPES to instantiate and the warm-reader-pool cap.
+/// mailer plugin TYPES to instantiate, the assembled auth method type list,
+/// and the warm-reader-pool cap.
 pub const ServeOpts = struct {
     StoragePlugin: type,
     MailerPlugin: type,
+    /// Comptime-assembled list of auth method types (built-ins ++ consumer types).
+    /// Defaults to just PasswordMethod when absent. serveImpl uses this to
+    /// instantiate the Registry via registry.build/deinit.
+    auth_method_types: []const type = &.{@import("auth/methods/password.zig").PasswordMethod},
     reader_pool_size: usize,
     job_stack_size: usize = scheduler.default_job_stack_size,
     cache_kib: u32 = db.default_cache_kib,
@@ -683,6 +705,9 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         if (opts.pagination.cursor_token == .stateful) {
             @import("records.zig").gcCursorStates(w) catch |e| std.log.warn("cursor-state GC at startup failed: {s}", .{@errorName(e)});
         }
+        // Sweep expired and consumed auth challenge entries at startup. This is purely space
+        // reclamation; both `take` paths already reject expired/consumed rows at query time.
+        @import("auth/challenge_store.zig").gcAuthChallenges(w) catch |e| std.log.warn("auth-challenge GC at startup failed: {s}", .{@errorName(e)});
     }
     // Instantiate the comptime-selected storage + mailer plugins. The instances are
     // serveImpl stack vars that outlive the server (srv.listen() runs to shutdown),
@@ -694,6 +719,15 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     var mailer_inst = try opts.MailerPlugin.create(allocator, io, cfg);
     defer mailer_inst.deinit();
     const mailer_iface = mailer_inst.interface();
+
+    // Instantiate the comptime-assembled auth method registry. `am_insts` and `am_views`
+    // are serveImpl stack vars that outlive the server (like storage/mailer). The Registry
+    // value points into `am_views`, so all three must remain in scope across srv.listen().
+    const am_types = comptime opts.auth_method_types;
+    var am_insts: registry.Instances(am_types) = undefined;
+    var am_views: [am_types.len]@import("auth/method.zig").AuthMethod = undefined;
+    var am_registry = try registry.build(am_types, &am_insts, &am_views, allocator, io, cfg);
+    defer registry.deinit(am_types, &am_insts);
 
     // In-memory rate limiter for sensitive auth endpoints. A serveImpl stack var that
     // outlives the server (like storage/mailer); skipped entirely when disabled.
@@ -746,6 +780,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         },
         .storage = &storage_iface,
         .mailer = &mailer_iface,
+        .auth_methods = @ptrCast(&am_registry),
         .dispatch = dispatch,
         .rate_limiter = if (cfg.rate_limit_max == 0) null else &rate_limiter,
     };

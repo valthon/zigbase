@@ -17,6 +17,20 @@ export interface AuthResponse {
   meta?: Record<string, unknown>;
 }
 
+/** Response shape from POST /auth/oauth2/complete (record and meta are no longer included). */
+export interface OAuth2AuthResponse {
+  token: string;
+}
+
+/** Response shape from POST /auth/oauth2/initiate. */
+export interface OAuth2InitResponse {
+  authURL?: string;
+  clientId?: string;
+  scopes?: string[];
+  /** OAuth2 CSRF state — present when the server included state in the initiate response. */
+  state?: string;
+}
+
 export interface OAuth2Provider {
   name: string;
   authURL?: string;
@@ -47,7 +61,7 @@ export class CollectionService {
     const res = await this.transport.send<AuthResponse>(`${this.base()}${path}`, {
       method: "POST",
       body,
-      skipAuth: path === "/auth-with-password" || path === "/auth-with-oauth2",
+      skipAuth: path === "/auth-with-password",
     });
     this.authStore.save(res.token, res.record);
     return res;
@@ -61,8 +75,15 @@ export class CollectionService {
     return this.authRequest("/auth-refresh", {});
   }
 
-  authWithOAuth2(args: OAuth2Args): Promise<AuthResponse> {
-    return this.authRequest("/auth-with-oauth2", args);
+  async authWithOAuth2(args: OAuth2Args): Promise<OAuth2AuthResponse> {
+    const res = await this.transport.send<OAuth2AuthResponse>(
+      `${this.base()}/auth/oauth2/complete`,
+      { method: "POST", body: args, skipAuth: true },
+    );
+    // The /auth/oauth2/complete endpoint sets zb_auth/zb_csrf cookies directly.
+    // It does not return a record; store the token only.
+    this.authStore.save(res.token, null);
+    return res;
   }
 
   async logout(): Promise<void> {
@@ -74,11 +95,11 @@ export class CollectionService {
   }
 
   listAuthProviders(): Promise<{ providers: OAuth2Provider[] }> {
-    return this.transport.send(`${this.base()}/oauth2-providers`, { method: "GET" });
+    return this.transport.send(`${this.base()}/auth/oauth2/providers`, { method: "GET" });
   }
 
-  oauth2Init(provider: string): Promise<{ state: string }> {
-    return this.transport.send(`${this.base()}/oauth2-init`, {
+  oauth2Init(provider: string): Promise<OAuth2InitResponse> {
+    return this.transport.send(`${this.base()}/auth/oauth2/initiate`, {
       method: "POST",
       body: { provider },
     });

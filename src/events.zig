@@ -143,8 +143,25 @@ pub const RouteEvent = struct {
     pub fn reader(ev: *RouteEvent) db.DbError!ReaderData {
         return acquireReader(ev.app);
     }
+    /// Mint a session for a known record via the audited seam (`.custom` method tag).
+    /// Acquires the DB writer, calls `auth_helpers.issueSession`, releases the writer,
+    /// and returns the signed JWT + 2 cookies. Fires `onAuth` exactly once.
+    ///
+    /// WARNING: this function acquires the pool writer internally. If the calling
+    /// handler already holds the writer (`var w = ev.writer()`), do NOT call this —
+    /// it would attempt to acquire the single non-reentrant writer a second time and
+    /// deadlock permanently. Instead call `zigbase.auth.issueSession(ev.ctx, w.conn,
+    /// collection, record_id)` with the connection you already hold.
+    pub fn issueSession(ev: *RouteEvent, collection: []const u8, record_id: []const u8) !@import("auth_helpers.zig").Issued {
+        var w = ev.writer();
+        defer w.deinit();
+        return @import("auth_helpers.zig").issueSession(ev.ctx, w.conn, collection, record_id);
+    }
 };
 pub const RouteHandler = *const fn (ev: *RouteEvent) anyerror!http.Response;
+
+/// Re-exported for config code that needs to name the rate-limit callback type.
+pub const RateLimitFn = @import("auth_helpers.zig").RateLimitFn;
 
 /// A custom route after comptime assembly. The framework matches method+pattern
 /// (reusing router.matchPath), enforces `auth`, then calls `handler`.
@@ -155,7 +172,7 @@ pub const RuntimeRoute = struct {
     auth: AuthLevel,
 };
 
-pub const AuthMethod = enum { password, oauth2 };
+pub const AuthMethod = enum { password, oauth2, magic_link, otp, webauthn, custom };
 pub const AuthEvent = struct {
     app: *App,
     ctx: *const request.RequestContext,
@@ -658,6 +675,13 @@ test "buildRoutes defaults auth to .superuser when omitted" {
         .{ .method = .GET, .path = "/api/secret", .handler = H.a },
     });
     try std.testing.expect(table[0].auth == .superuser);
+}
+
+test "AuthMethod enumerates all method tags" {
+    try std.testing.expectEqualStrings("magic_link", @tagName(AuthMethod.magic_link));
+    try std.testing.expectEqualStrings("custom", @tagName(AuthMethod.custom));
+    try std.testing.expectEqualStrings("otp", @tagName(AuthMethod.otp));
+    try std.testing.expectEqualStrings("webauthn", @tagName(AuthMethod.webauthn));
 }
 
 test "isUntypedHandler detects raw-response handlers and routeMeta flags them out of codegen" {
