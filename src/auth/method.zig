@@ -7,32 +7,66 @@ pub const Resolution = union(enum) {
     fail: struct { status: u16, message: []const u8 },
 };
 
-pub const AuthCtx = struct { // FIELDS ONLY in this task; helper methods land in Task 3
+pub const AuthCtx = struct {
     app: *@import("../app.zig").App,
     ctx: *@import("../http.zig").RequestCtx,
-    conn: *@import("../db.zig").Db,
     collection: @import("../schema.zig").Collection,
     config: std.json.Value, // this method's per-collection config (object; .null if none)
 
     const http = @import("../http.zig");
+    const db = @import("../db.zig");
+    const events = @import("../events.zig");
     const jwt = @import("../jwt.zig");
     const auth_helpers = @import("../auth_helpers.zig");
     const api_auth = @import("../api/auth.zig");
 
-    pub fn findByIdentity(ac: *AuthCtx, identity: []const u8) !?[]const u8 {
-        return api_auth.findByIdentity(ac.ctx.allocator, ac.conn, ac.collection, identity);
+    // -----------------------------------------------------------------------
+    // RAII DB-access handles. A method acquires its OWN connection for the
+    // duration it needs it — NOTHING (not the dispatch, not another method)
+    // holds the single non-reentrant pool writer across the method call. This
+    // is what lets OAuth release the writer during its provider HTTP exchange
+    // and lets password verify argon2 under a read-only connection.
+    //
+    //   var w = ac.writer();        // acquires the shared pool writer (mutex)
+    //   defer w.deinit();           // releases it back to the pool — no leak
+    //   ... use w.conn ...
+    //
+    //   var r = try ac.reader();    // checks out a pooled read-only connection
+    //   defer r.deinit();           // returns it to the warm pool — no leak
+    //   ... use &r.conn (a *db.Db) ...
+    // -----------------------------------------------------------------------
+
+    /// Acquire the pool writer for create/update/delete. Caller MUST `deinit()`
+    /// the returned handle (use `defer`). Hold it no longer than necessary —
+    /// only one writer exists pool-wide and it is non-reentrant.
+    pub fn writer(ac: *AuthCtx) events.WriterData {
+        const conn = ac.app.pool.acquireWriter();
+        return .{ .app = ac.app, .pool = ac.app.pool, .conn = conn };
     }
 
-    pub fn mintLinkToken(ac: *AuthCtx, record_id: []const u8, ttl_s: i64) ![]const u8 {
-        return (try auth_helpers.mintLinkToken(ac.ctx, ac.conn, ac.collection.name, record_id, ttl_s)).token;
+    /// Check out a pooled read-only connection for reads. Caller MUST `deinit()`
+    /// the returned handle (use `defer`) to return it to the pool. `r.conn` is a
+    /// `db.Db` value — pass `&r.conn` where a `*db.Db` is needed.
+    pub fn reader(ac: *AuthCtx) db.DbError!events.ReaderData {
+        const conn = try ac.app.pool.acquireReader();
+        return .{ .app = ac.app, .pool = ac.app.pool, .conn = conn };
     }
 
-    pub fn verifyLinkToken(ac: *AuthCtx, token: []const u8) !?jwt.Claims {
-        return auth_helpers.verifyLinkToken(ac.ctx, ac.conn, ac.collection.name, token);
+    pub fn findByIdentity(ac: *AuthCtx, conn: *db.Db, identity: []const u8) !?[]const u8 {
+        return api_auth.findByIdentity(ac.ctx.allocator, conn, ac.collection, identity);
     }
 
-    pub fn consumeLinkToken(ac: *AuthCtx, claims: jwt.Claims) !void {
-        return auth_helpers.consumeLinkToken(ac.conn, claims);
+    pub fn mintLinkToken(ac: *AuthCtx, conn: *db.Db, record_id: []const u8, ttl_s: i64) ![]const u8 {
+        return (try auth_helpers.mintLinkToken(ac.ctx, conn, ac.collection.name, record_id, ttl_s)).token;
+    }
+
+    pub fn verifyLinkToken(ac: *AuthCtx, conn: *db.Db, token: []const u8) !?jwt.Claims {
+        return auth_helpers.verifyLinkToken(ac.ctx, conn, ac.collection.name, token);
+    }
+
+    pub fn consumeLinkToken(ac: *AuthCtx, conn: *db.Db, claims: jwt.Claims) !void {
+        _ = ac;
+        return auth_helpers.consumeLinkToken(conn, claims);
     }
 
     pub fn deliverMail(ac: *AuthCtx, to: []const u8, subject: []const u8, body: []const u8) !void {
@@ -100,17 +134,19 @@ test "AuthCtx helpers: findByIdentity and mintLinkToken delegate correctly" {
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req_ctx,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
 
+    // Exercise the conn-taking helpers against the writer we already hold.
+    // (These helpers do not acquire the pool writer themselves, so passing the
+    // held writer cannot deadlock.)
     // findByIdentity should return the record id
-    const rid = try ac.findByIdentity("u@x.io");
+    const rid = try ac.findByIdentity(w, "u@x.io");
     try std.testing.expect(rid != null);
     try std.testing.expect(rid.?.len > 0);
 
     // mintLinkToken should return a non-empty token string
-    const token = try ac.mintLinkToken(rid.?, 900);
+    const token = try ac.mintLinkToken(w, rid.?, 900);
     try std.testing.expect(token.len > 0);
 }

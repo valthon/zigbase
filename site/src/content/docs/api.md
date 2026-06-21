@@ -390,9 +390,9 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 | Method | Path | Description |
 |---|---|---|
 | POST | `/api/collections/:col/auth/:method/initiate` | Phase 1: challenge/email/options. Returns 200 with method-specific JSON body, or 204 for enumeration-safe methods (e.g. magic-link). |
-| POST | `/api/collections/:col/auth/:method/complete` | Phase 2: proof → session. Returns 200 with `{ token, record }` and sets `zb_auth`/`zb_csrf` cookies on success. |
+| POST | `/api/collections/:col/auth/:method/complete` | Phase 2: proof → session. Returns 200 with `{ token }` and sets `zb_auth`/`zb_csrf` cookies on success. |
 
-`:method` is the method slug (`magic-link`, `otp`, `password`, `webauthn`, `oauth2`, or a custom plugin's slug). Returns 404 when the collection doesn't exist, isn't an auth collection, or the method isn't enabled.
+`:method` is the method slug (`magic_link`, `otp`, `password`, `webauthn`, `oauth2`, or a custom plugin's slug). Returns 404 when the collection doesn't exist, isn't an auth collection, or the method isn't enabled.
 
 **WebAuthn passkey registration** (authed — requires a valid session):
 
@@ -401,7 +401,7 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 | POST | `/api/collections/:col/auth/webauthn/register/begin` | Returns WebAuthn creation options (challenge, rpId, rpName). |
 | POST | `/api/collections/:col/auth/webauthn/register/finish` | Stores the new passkey bound to the authenticated user. |
 
-**magic-link initiate:**
+**magic_link initiate:**
 
 ```json
 // request
@@ -409,13 +409,13 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 // response: 204 (enumeration-safe — always 204 whether email exists or not)
 ```
 
-**magic-link complete:**
+**magic_link complete:**
 
 ```json
 // request
 { "token": "<magic-link-token>" }
 // response (200) — sets zb_auth and zb_csrf cookies
-{ "token": "<jwt>", "record": { "id": "...", "email": "..." } }
+{ "token": "<jwt>" }
 ```
 
 **otp initiate:**
@@ -432,7 +432,7 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 // request
 { "identity": "user@example.com", "code": "123456" }
 // response (200)
-{ "token": "<jwt>", "record": { "id": "..." } }
+{ "token": "<jwt>" }
 ```
 
 **webauthn initiate:**
@@ -456,7 +456,7 @@ For every auth collection that enables a method (built-in or custom), two endpoi
   "signature": "<base64url>"
 }
 // response (200)
-{ "token": "<jwt>", "record": { "id": "..." } }
+{ "token": "<jwt>" }
 ```
 
 **webauthn register/begin (authed):**
@@ -491,7 +491,7 @@ registered in your `App(.{ .onAuth = ... })`. This is the single chokepoint for
 cross-cutting session logic (audit logging, account-state checks, etc.). There is no
 path through ZigBase's session-issuance machinery that bypasses it.
 
-`AuthEvent.method` carries the method slug as a tagged union: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`, or `.custom` for custom plugins (the slug is the plugin's declared slug).
+`AuthEvent.method` is an enum: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`, or `.custom` for custom plugins.
 
 See [Framework §6](./framework#6-auth--file--lifecycle-events) for the
 `zigbase.auth` helper surface and the seam guarantee.
@@ -521,55 +521,25 @@ ZigBase uses **client-driven PKCE**: the client generates and holds the PKCE sta
 verifier, runs the authorization redirect itself, then submits the authorization `code` to
 the server.
 
+OAuth2 is the **fifth built-in `AuthMethod`** (slug `oauth2`) and is exposed exclusively
+through the standard auth-method contract endpoints:
+
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/collections/:col/oauth2-providers` | List enabled providers (name, `authURL`, `clientId`, `scopes`). Secrets are never returned. |
-| POST | `/api/collections/:col/oauth2-init` | (Server-side state mode only) Mint a server-issued `state` for a provider. `404` when server-side state is disabled. |
-| POST | `/api/collections/:col/auth-with-oauth2` | Exchange an authorization code for a session. |
+| GET | `/api/collections/:col/auth/oauth2/providers` | List enabled providers (`name`, `authURL`, `clientId`, `scopes`). Secrets are never returned. Gated on `.auth.oauth2.enabled`. |
+| POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata so the client can drive the authorization redirect. |
+| POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session. |
 | DELETE | `/api/collections/:col/records/:id/external-auths/:provider` | Unlink a provider from a record. |
 
+**`GET .../auth/oauth2/providers`** — no request body. Response:
+
 ```json
-// auth-with-oauth2 request
 {
-  "provider": "google",
-  "code": "<authorization-code>",
-  "codeVerifier": "<pkce-verifier>",
-  "redirectUrl": "https://app.example.com/callback"
+  "providers": [
+    { "name": "google", "authURL": "https://accounts.google.com/o/oauth2/v2/auth?...", "clientId": "my-client-id.apps.googleusercontent.com", "scopes": ["openid", "email", "profile"] }
+  ]
 }
 ```
-
-```json
-// auth-with-oauth2 response (200) — also sets the auth cookies
-{ "token": "<jwt>", "record": { "id": "..." }, "meta": { "isNew": true } }
-```
-
-`redirectUrl` must be in the provider's configured allowlist.
-
-#### CSRF on the OAuth flow: `state`
-
-The OAuth `state` parameter prevents login-CSRF. ZigBase supports two modes:
-
-- **Client-driven (default).** The SPA generates `state`, embeds it in the provider
-  authorization URL, and verifies the returned `state` against what it stored before calling
-  `auth-with-oauth2`. The backend does not see or check `state`. This is the documented flow
-  and is unchanged.
-- **Server-side (opt-in).** Set `ZIGBASE_OAUTH_STATE_SERVER=true` (TTL via
-  `ZIGBASE_OAUTH_STATE_TTL`, default 600s). Then the client calls `POST .../oauth2-init` with
-  `{ "provider": "<name>" }`, receives `{ "state": "<value>" }`, embeds it in the provider
-  authorization URL, and on callback adds `"state": "<value>"` to the `auth-with-oauth2` body.
-  The backend verifies the state exists, matches the (collection, provider), is unexpired, and
-  is **single-use** (deleted on first use). A missing, mismatched, expired, or replayed `state`
-  is rejected with `400` before the provider is contacted. **PKCE (`codeVerifier`) is still
-  required in both modes** — server-side `state` adds CSRF protection, it does not replace PKCE.
-
-### OAuth2 contract endpoints (auth-method dispatch)
-
-OAuth2 is also available as the **fifth built-in `AuthMethod`** (slug `oauth2`) under the standard `/auth/:method/{initiate,complete}` dispatch. These endpoints are auto-mounted when OAuth2 is enabled (`.auth.oauth2.enabled`) and share one implementation with the legacy endpoints above.
-
-| Method | Path | Description |
-| --- | --- | --- |
-| POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata for the authorization redirect. |
-| POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session (contract path). |
 
 **`oauth2` initiate** — body `{ "provider": "<name>" }`:
 
@@ -598,15 +568,30 @@ OAuth2 is also available as the **fifth built-in `AuthMethod`** (slug `oauth2`) 
 ```
 
 `state` is required when server-side state is enabled; omitted otherwise.
+`redirectUrl` must be in the provider's configured allowlist.
 
 ```json
 // response (200) — sets zb_auth and zb_csrf cookies
 { "token": "<jwt>" }
 ```
 
-Both paths enforce the same security as the legacy endpoints: single-use TTL'd CSRF `state` consumed before the code exchange, PKCE required, redirect allow-list, and https-only provider URLs. On success, `onAuth(.oauth2)` fires through the shared session seam.
+On success, `onAuth(.oauth2)` fires through the shared session seam. Security enforced on all paths: single-use TTL'd CSRF `state` consumed before the code exchange, PKCE required, redirect allow-list, and https-only provider URLs.
 
-> **Concurrency note:** `/auth/oauth2/complete` holds the DB writer across the provider HTTP round-trip. Under high OAuth2 concurrency, the legacy `/auth-with-oauth2` (which releases the writer during the provider exchange) remains the throughput-optimal path.
+#### CSRF on the OAuth flow: `state`
+
+The OAuth `state` parameter prevents login-CSRF. ZigBase supports two modes:
+
+- **Client-driven (default).** The SPA generates `state`, embeds it in the provider
+  authorization URL, and verifies the returned `state` against what it stored before calling
+  `complete`. The backend does not see or check `state`.
+- **Server-side (opt-in).** Set `ZIGBASE_OAUTH_STATE_SERVER=true` (TTL via
+  `ZIGBASE_OAUTH_STATE_TTL`, default 600s). Then the client calls `POST .../auth/oauth2/initiate`
+  with `{ "provider": "<name>" }`, receives `{ ..., "state": "<value>" }`, embeds it in the
+  provider authorization URL, and on callback adds `"state": "<value>"` to the `complete` body.
+  The backend verifies the state exists, matches the (collection, provider), is unexpired, and
+  is **single-use** (deleted on first use). A missing, mismatched, expired, or replayed `state`
+  is rejected with `400` before the provider is contacted. **PKCE (`codeVerifier`) is still
+  required in both modes** — server-side `state` adds CSRF protection, it does not replace PKCE.
 
 ## Files
 

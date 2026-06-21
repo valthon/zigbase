@@ -48,8 +48,8 @@ pub const Config = struct {
 
     // Server-side OAuth `state` (CSRF) store (F11). When false (default), CSRF on the
     // OAuth flow is the client's job (client-driven PKCE + client-held state — the
-    // documented flow). When true, the backend mints a `state` at `oauth2-init` and
-    // requires/verifies it on `auth-with-oauth2`, rejecting a missing/mismatched/
+    // documented flow). When true, the backend mints a `state` via the oauth2 method
+    // initiate call and requires/verifies it on complete, rejecting a missing/mismatched/
     // expired/reused state. Opt-in so the existing client-driven flow is unchanged.
     oauth_state_server: bool = false,
     oauth_state_ttl_s: i64 = 600, // server-side state lifetime (10 min)

@@ -77,8 +77,12 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
     var challenge_raw: [32]u8 = undefined;
     ac.app.io.random(&challenge_raw);
 
+    // Persisting the challenge needs the writer.
+    var w = ac.writer();
+    defer w.deinit();
+
     // Store challenge via ChallengeStore with method key "webauthn" (login ceremony).
-    const cs = ChallengeStore{ .conn = ac.conn };
+    const cs = ChallengeStore{ .conn = w.conn };
     const cid = try cs.put(
         ac.ctx.allocator,
         ac.app.io,
@@ -151,10 +155,15 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid signature encoding." } };
     };
 
+    // The whole verify ceremony — take challenge, read credential, verify, update
+    // sign count — stays atomic under ONE writer held for the entire call.
+    var w = ac.writer();
+    defer w.deinit();
+
     // Atomically take (consume) the challenge from the store using the ceremony id.
     // SECURITY: take() filters by method, so a "webauthn_reg" registration challenge
     // cannot be consumed by this login take() that passes "webauthn".
-    const cs = ChallengeStore{ .conn = ac.conn };
+    const cs = ChallengeStore{ .conn = w.conn };
     const challenge_raw_b64 = (try cs.take(ac.ctx.allocator, ceremony_id, "webauthn")) orelse {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid or expired ceremony." } };
     };
@@ -164,7 +173,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
     // Look up the credential by its base64url credential id.
     // SECURITY REQUIREMENT 1: user identity comes from the stored credential's record_ref,
     // never from the client request.
-    const cred_store = CredentialStore{ .conn = ac.conn };
+    const cred_store = CredentialStore{ .conn = w.conn };
     const cred = (try cred_store.getByCredentialId(ac.ctx.allocator, credential_id_b64)) orelse {
         return Resolution{ .fail = .{ .status = 400, .message = "Unknown credential." } };
     };
@@ -217,6 +226,41 @@ const vtable = AuthMethod.VTable{
 // Tests
 // ---------------------------------------------------------------------------
 
+const test_db = @import("../../db.zig");
+const test_migrations = @import("../../migrations.zig");
+const test_schema = @import("../../schema.zig");
+const test_app_mod = @import("../../app.zig");
+
+/// Pool-backed env so methods can acquire their own pool writer (no bare db.Db).
+const WaEnv = struct {
+    tmp: std.testing.TmpDir,
+    pool: test_db.Pool,
+    app: test_app_mod.App,
+
+    fn init() !*WaEnv {
+        const env = try std.testing.allocator.create(WaEnv);
+        env.tmp = std.testing.tmpDir(.{});
+        const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(dir);
+        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/wa.db", .{dir}, 0);
+        defer std.testing.allocator.free(path);
+        env.pool = try test_db.Pool.init(std.testing.allocator, std.testing.io, path);
+        {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            try test_migrations.run(w);
+        }
+        env.app = .{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = &env.pool };
+        return env;
+    }
+
+    fn deinit(env: *WaEnv) void {
+        env.pool.deinit();
+        env.tmp.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+};
+
 test "WebAuthnMethod: method() returns slug=webauthn and contract is satisfied" {
     var m = try WebAuthnMethod.create(std.testing.allocator, std.testing.io, .{});
     const am = m.method();
@@ -227,56 +271,41 @@ test "WebAuthnMethod: method() returns slug=webauthn and contract is satisfied" 
 test "WebAuthnMethod: initiate returns 200 with challenge + rpId + ceremonyId" {
     const http = @import("../../http.zig");
     const collections = @import("../../collections.zig");
-    const migrations = @import("../../migrations.zig");
-    const db = @import("../../db.zig");
-    const schema = @import("../../schema.zig");
-    const app_mod = @import("../../app.zig");
 
-    var d = try db.Db.openMemory();
-    defer d.close();
-    try migrations.run(&d);
-
-    var pool_alloc = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer pool_alloc.deinit();
-
-    // Create auth collection with webauthn configured.
-    var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer setup_arena.deinit();
-    const sa = setup_arena.allocator();
-    _ = try collections.create(sa, std.testing.io, &d, .{
-        .id = "",
-        .name = "wausers",
-        .type = .auth,
-        .fields = &[_]schema.Field{},
-        .options = .{ .auth = .{ .methods = .{ .webauthn = .{
-            .rp_id = "example.test",
-            .rp_name = "Test App",
-            .origin = "https://example.test",
-        } } } },
-    });
-
-    var app = app_mod.App{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-        .pool = undefined,
-    };
+    var wenv = try WaEnv.init();
+    defer wenv.deinit();
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const col = (try collections.get(a, &d, "wausers")).?;
+    const col = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "wausers",
+            .type = .auth,
+            .fields = &[_]test_schema.Field{},
+            .options = .{ .auth = .{ .methods = .{ .webauthn = .{
+                .rp_id = "example.test",
+                .rp_name = "Test App",
+                .origin = "https://example.test",
+            } } } },
+        });
+        break :blk (try collections.get(a, w, "wausers")).?;
+    };
+
     var req = http.RequestCtx{
         .method = .POST,
         .path = "/",
         .body = "{}",
         .allocator = a,
-        .app = &app,
+        .app = &wenv.app,
     };
     var ac = AuthCtx{
-        .app = &app,
+        .app = &wenv.app,
         .ctx = &req,
-        .conn = &d,
         .collection = col,
         .config = .null,
     };
@@ -296,47 +325,36 @@ test "WebAuthnMethod: initiate returns 200 with challenge + rpId + ceremonyId" {
 test "WebAuthnMethod: initiate without webauthn config returns 500" {
     const http = @import("../../http.zig");
     const collections = @import("../../collections.zig");
-    const migrations = @import("../../migrations.zig");
-    const db = @import("../../db.zig");
-    const schema = @import("../../schema.zig");
-    const app_mod = @import("../../app.zig");
 
-    var d = try db.Db.openMemory();
-    defer d.close();
-    try migrations.run(&d);
-
-    var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer setup_arena.deinit();
-    const sa = setup_arena.allocator();
-    _ = try collections.create(sa, std.testing.io, &d, .{
-        .id = "",
-        .name = "wausers2",
-        .type = .auth,
-        .fields = &[_]schema.Field{},
-    });
-
-    var app = app_mod.App{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-        .pool = undefined,
-    };
+    var wenv = try WaEnv.init();
+    defer wenv.deinit();
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const col = (try collections.get(a, &d, "wausers2")).?;
+    const col = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "wausers2",
+            .type = .auth,
+            .fields = &[_]test_schema.Field{},
+        });
+        break :blk (try collections.get(a, w, "wausers2")).?;
+    };
+
     var req = http.RequestCtx{
         .method = .POST,
         .path = "/",
         .body = "{}",
         .allocator = a,
-        .app = &app,
+        .app = &wenv.app,
     };
     var ac = AuthCtx{
-        .app = &app,
+        .app = &wenv.app,
         .ctx = &req,
-        .conn = &d,
         .collection = col,
         .config = .null,
     };
@@ -351,40 +369,19 @@ test "WebAuthnMethod: complete succeeds with valid fixture (ES256)" {
     // Full end-to-end test: pre-insert a credential + challenge, then drive complete().
     const http = @import("../../http.zig");
     const collections = @import("../../collections.zig");
-    const migrations = @import("../../migrations.zig");
-    const db = @import("../../db.zig");
-    const schema = @import("../../schema.zig");
-    const app_mod = @import("../../app.zig");
 
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
     const alloc = std.testing.allocator;
 
-    var d = try db.Db.openMemory();
-    defer d.close();
-    try migrations.run(&d);
-
-    var setup_arena = std.heap.ArenaAllocator.init(alloc);
-    defer setup_arena.deinit();
-    const sa = setup_arena.allocator();
+    var wenv = try WaEnv.init();
+    defer wenv.deinit();
 
     const rp_id = "example.test";
     const origin = "https://example.test";
 
-    // Create auth collection with webauthn configured.
-    _ = try collections.create(sa, std.testing.io, &d, .{
-        .id = "",
-        .name = "wausers3",
-        .type = .auth,
-        .fields = &[_]schema.Field{},
-        .options = .{ .auth = .{ .methods = .{ .webauthn = .{
-            .rp_id = rp_id,
-            .rp_name = "Test App",
-            .origin = origin,
-        } } } },
-    });
-
-    // Insert a test user record.
-    try d.exec("INSERT INTO \"wausers3\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('usr001','','','w@x.io','tk001',1);");
+    var setup_arena = std.heap.ArenaAllocator.init(alloc);
+    defer setup_arena.deinit();
+    const sa = setup_arena.allocator();
 
     // Generate an EC P-256 key pair deterministically.
     const seed = [_]u8{0x42} ** 32;
@@ -409,29 +406,52 @@ test "WebAuthnMethod: complete succeeds with valid fixture (ES256)" {
     const cred_id_b64 = try client_data.b64urlNoPad(alloc, &cred_id_raw);
     defer alloc.free(cred_id_b64);
 
-    // Insert the credential.
-    const cred_store = CredentialStore{ .conn = &d };
-    try cred_store.insert(
-        alloc,
-        std.testing.io,
-        "wausers3",
-        "usr001",
-        cred_id_b64,
-        cose_key_b64,
-        -7,
-        0, // initial signCount
-        "",
-        "",
-    );
-
     // Generate a 32-byte raw challenge.
     const challenge_raw = [_]u8{0xAB} ** 32;
     const challenge_b64 = try client_data.b64urlNoPad(alloc, &challenge_raw);
     defer alloc.free(challenge_b64);
 
-    // Store the challenge in the ChallengeStore with method "webauthn".
-    const cs = ChallengeStore{ .conn = &d };
-    const cid = try cs.put(alloc, std.testing.io, "wausers3", "webauthn", "", &challenge_raw, 300);
+    // All DB setup under a writer that is RELEASED before complete() (which
+    // acquires its own writer). Returns the ceremony id.
+    const cid = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+
+        // Create auth collection with webauthn configured.
+        _ = try collections.create(sa, std.testing.io, w, .{
+            .id = "",
+            .name = "wausers3",
+            .type = .auth,
+            .fields = &[_]test_schema.Field{},
+            .options = .{ .auth = .{ .methods = .{ .webauthn = .{
+                .rp_id = rp_id,
+                .rp_name = "Test App",
+                .origin = origin,
+            } } } },
+        });
+
+        // Insert a test user record.
+        try w.exec("INSERT INTO \"wausers3\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('usr001','','','w@x.io','tk001',1);");
+
+        // Insert the credential.
+        const cred_store = CredentialStore{ .conn = w };
+        try cred_store.insert(
+            alloc,
+            std.testing.io,
+            "wausers3",
+            "usr001",
+            cred_id_b64,
+            cose_key_b64,
+            -7,
+            0, // initial signCount
+            "",
+            "",
+        );
+
+        // Store the challenge in the ChallengeStore with method "webauthn".
+        const cs = ChallengeStore{ .conn = w };
+        break :blk try cs.put(alloc, std.testing.io, "wausers3", "webauthn", "", &challenge_raw, 300);
+    };
     defer alloc.free(cid);
 
     // Build authenticator data (37 bytes: rpIdHash + flags + signCount).
@@ -472,28 +492,25 @@ test "WebAuthnMethod: complete succeeds with valid fixture (ES256)" {
     );
     defer alloc.free(body_str);
 
-    var app = app_mod.App{
-        .allocator = alloc,
-        .io = std.testing.io,
-        .pool = undefined,
-    };
-
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const col = (try collections.get(a, &d, "wausers3")).?;
+    const col = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "wausers3")).?;
+    };
     var req = http.RequestCtx{
         .method = .POST,
         .path = "/",
         .body = body_str,
         .allocator = a,
-        .app = &app,
+        .app = &wenv.app,
     };
     var ac = AuthCtx{
-        .app = &app,
+        .app = &wenv.app,
         .ctx = &req,
-        .conn = &d,
         .collection = col,
         .config = .null,
     };
@@ -513,16 +530,11 @@ test "WebAuthnMethod: complete succeeds with valid fixture (ES256)" {
 test "WebAuthnMethod: complete with tampered signature returns 401" {
     const http = @import("../../http.zig");
     const collections = @import("../../collections.zig");
-    const migrations = @import("../../migrations.zig");
-    const db = @import("../../db.zig");
-    const schema = @import("../../schema.zig");
-    const app_mod = @import("../../app.zig");
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
     const alloc = std.testing.allocator;
 
-    var d = try db.Db.openMemory();
-    defer d.close();
-    try migrations.run(&d);
+    var wenv = try WaEnv.init();
+    defer wenv.deinit();
 
     var setup_arena = std.heap.ArenaAllocator.init(alloc);
     defer setup_arena.deinit();
@@ -530,20 +542,6 @@ test "WebAuthnMethod: complete with tampered signature returns 401" {
 
     const rp_id = "example.test";
     const origin = "https://example.test";
-
-    _ = try collections.create(sa, std.testing.io, &d, .{
-        .id = "",
-        .name = "wausers4",
-        .type = .auth,
-        .fields = &[_]schema.Field{},
-        .options = .{ .auth = .{ .methods = .{ .webauthn = .{
-            .rp_id = rp_id,
-            .rp_name = "Test App",
-            .origin = origin,
-        } } } },
-    });
-
-    try d.exec("INSERT INTO \"wausers4\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('usr002','','','w2@x.io','tk002',1);");
 
     const seed = [_]u8{0x43} ** 32;
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
@@ -561,15 +559,30 @@ test "WebAuthnMethod: complete with tampered signature returns 401" {
     const cred_id_b64 = try client_data.b64urlNoPad(alloc, &cred_id_raw);
     defer alloc.free(cred_id_b64);
 
-    const cred_store = CredentialStore{ .conn = &d };
-    try cred_store.insert(alloc, std.testing.io, "wausers4", "usr002", cred_id_b64, cose_key_b64, -7, 0, "", "");
-
     const challenge_raw = [_]u8{0xCD} ** 32;
     const challenge_b64 = try client_data.b64urlNoPad(alloc, &challenge_raw);
     defer alloc.free(challenge_b64);
 
-    const cs = ChallengeStore{ .conn = &d };
-    const cid = try cs.put(alloc, std.testing.io, "wausers4", "webauthn", "", &challenge_raw, 300);
+    const cid = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        _ = try collections.create(sa, std.testing.io, w, .{
+            .id = "",
+            .name = "wausers4",
+            .type = .auth,
+            .fields = &[_]test_schema.Field{},
+            .options = .{ .auth = .{ .methods = .{ .webauthn = .{
+                .rp_id = rp_id,
+                .rp_name = "Test App",
+                .origin = origin,
+            } } } },
+        });
+        try w.exec("INSERT INTO \"wausers4\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('usr002','','','w2@x.io','tk002',1);");
+        const cred_store = CredentialStore{ .conn = w };
+        try cred_store.insert(alloc, std.testing.io, "wausers4", "usr002", cred_id_b64, cose_key_b64, -7, 0, "", "");
+        const cs = ChallengeStore{ .conn = w };
+        break :blk try cs.put(alloc, std.testing.io, "wausers4", "webauthn", "", &challenge_raw, 300);
+    };
     defer alloc.free(cid);
 
     var auth_data_raw: [37]u8 = undefined;
@@ -609,19 +622,17 @@ test "WebAuthnMethod: complete with tampered signature returns 401" {
     );
     defer alloc.free(body_str);
 
-    var app = app_mod.App{
-        .allocator = alloc,
-        .io = std.testing.io,
-        .pool = undefined,
-    };
-
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const col = (try collections.get(a, &d, "wausers4")).?;
-    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &app };
-    var ac = AuthCtx{ .app = &app, .ctx = &req, .conn = &d, .collection = col, .config = .null };
+    const col = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "wausers4")).?;
+    };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
     const am = m.method();
@@ -635,35 +646,33 @@ test "WebAuthnMethod: complete with tampered signature returns 401" {
 test "WebAuthnMethod: complete with unknown credentialId returns 400" {
     const http = @import("../../http.zig");
     const collections = @import("../../collections.zig");
-    const migrations = @import("../../migrations.zig");
-    const db = @import("../../db.zig");
-    const schema = @import("../../schema.zig");
-    const app_mod = @import("../../app.zig");
     const alloc = std.testing.allocator;
 
-    var d = try db.Db.openMemory();
-    defer d.close();
-    try migrations.run(&d);
+    var wenv = try WaEnv.init();
+    defer wenv.deinit();
 
     var setup_arena = std.heap.ArenaAllocator.init(alloc);
     defer setup_arena.deinit();
     const sa = setup_arena.allocator();
 
-    _ = try collections.create(sa, std.testing.io, &d, .{
-        .id = "",
-        .name = "wausers5",
-        .type = .auth,
-        .fields = &[_]schema.Field{},
-        .options = .{ .auth = .{ .methods = .{ .webauthn = .{
-            .rp_id = "example.test",
-            .rp_name = "Test App",
-            .origin = "https://example.test",
-        } } } },
-    });
-
-    const challenge_raw = [_]u8{0xEF} ** 32;
-    const cs = ChallengeStore{ .conn = &d };
-    const cid = try cs.put(alloc, std.testing.io, "wausers5", "webauthn", "", &challenge_raw, 300);
+    const cid = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        _ = try collections.create(sa, std.testing.io, w, .{
+            .id = "",
+            .name = "wausers5",
+            .type = .auth,
+            .fields = &[_]test_schema.Field{},
+            .options = .{ .auth = .{ .methods = .{ .webauthn = .{
+                .rp_id = "example.test",
+                .rp_name = "Test App",
+                .origin = "https://example.test",
+            } } } },
+        });
+        const challenge_raw = [_]u8{0xEF} ** 32;
+        const cs = ChallengeStore{ .conn = w };
+        break :blk try cs.put(alloc, std.testing.io, "wausers5", "webauthn", "", &challenge_raw, 300);
+    };
     defer alloc.free(cid);
 
     const body_str = try std.fmt.allocPrint(alloc,
@@ -672,14 +681,17 @@ test "WebAuthnMethod: complete with unknown credentialId returns 400" {
     );
     defer alloc.free(body_str);
 
-    var app = app_mod.App{ .allocator = alloc, .io = std.testing.io, .pool = undefined };
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const col = (try collections.get(a, &d, "wausers5")).?;
-    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &app };
-    var ac = AuthCtx{ .app = &app, .ctx = &req, .conn = &d, .collection = col, .config = .null };
+    const col = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "wausers5")).?;
+    };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
     const am = m.method();
@@ -693,36 +705,34 @@ test "WebAuthnMethod: complete with unknown credentialId returns 400" {
 test "WebAuthnMethod: complete with expired ceremonyId returns 400" {
     const http = @import("../../http.zig");
     const collections = @import("../../collections.zig");
-    const migrations = @import("../../migrations.zig");
-    const db = @import("../../db.zig");
-    const schema = @import("../../schema.zig");
-    const app_mod = @import("../../app.zig");
     const alloc = std.testing.allocator;
 
-    var d = try db.Db.openMemory();
-    defer d.close();
-    try migrations.run(&d);
+    var wenv = try WaEnv.init();
+    defer wenv.deinit();
 
     var setup_arena = std.heap.ArenaAllocator.init(alloc);
     defer setup_arena.deinit();
     const sa = setup_arena.allocator();
 
-    _ = try collections.create(sa, std.testing.io, &d, .{
-        .id = "",
-        .name = "wausers6",
-        .type = .auth,
-        .fields = &[_]schema.Field{},
-        .options = .{ .auth = .{ .methods = .{ .webauthn = .{
-            .rp_id = "example.test",
-            .rp_name = "Test App",
-            .origin = "https://example.test",
-        } } } },
-    });
-
-    // Put a challenge with negative TTL (already expired).
-    const challenge_raw = [_]u8{0xF0} ** 32;
-    const cs = ChallengeStore{ .conn = &d };
-    const cid = try cs.put(alloc, std.testing.io, "wausers6", "webauthn", "", &challenge_raw, -1);
+    const cid = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        _ = try collections.create(sa, std.testing.io, w, .{
+            .id = "",
+            .name = "wausers6",
+            .type = .auth,
+            .fields = &[_]test_schema.Field{},
+            .options = .{ .auth = .{ .methods = .{ .webauthn = .{
+                .rp_id = "example.test",
+                .rp_name = "Test App",
+                .origin = "https://example.test",
+            } } } },
+        });
+        // Put a challenge with negative TTL (already expired).
+        const challenge_raw = [_]u8{0xF0} ** 32;
+        const cs = ChallengeStore{ .conn = w };
+        break :blk try cs.put(alloc, std.testing.io, "wausers6", "webauthn", "", &challenge_raw, -1);
+    };
     defer alloc.free(cid);
 
     const body_str = try std.fmt.allocPrint(alloc,
@@ -731,14 +741,17 @@ test "WebAuthnMethod: complete with expired ceremonyId returns 400" {
     );
     defer alloc.free(body_str);
 
-    var app = app_mod.App{ .allocator = alloc, .io = std.testing.io, .pool = undefined };
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const col = (try collections.get(a, &d, "wausers6")).?;
-    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &app };
-    var ac = AuthCtx{ .app = &app, .ctx = &req, .conn = &d, .collection = col, .config = .null };
+    const col = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "wausers6")).?;
+    };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
     const am = m.method();
@@ -753,16 +766,11 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
     // SECURITY: clone detection must reject and NOT update signCount.
     const http = @import("../../http.zig");
     const collections = @import("../../collections.zig");
-    const migrations = @import("../../migrations.zig");
-    const db = @import("../../db.zig");
-    const schema = @import("../../schema.zig");
-    const app_mod = @import("../../app.zig");
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
     const alloc = std.testing.allocator;
 
-    var d = try db.Db.openMemory();
-    defer d.close();
-    try migrations.run(&d);
+    var wenv = try WaEnv.init();
+    defer wenv.deinit();
 
     var setup_arena = std.heap.ArenaAllocator.init(alloc);
     defer setup_arena.deinit();
@@ -770,20 +778,6 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
 
     const rp_id = "example.test";
     const origin = "https://example.test";
-
-    _ = try collections.create(sa, std.testing.io, &d, .{
-        .id = "",
-        .name = "wausers7",
-        .type = .auth,
-        .fields = &[_]schema.Field{},
-        .options = .{ .auth = .{ .methods = .{ .webauthn = .{
-            .rp_id = rp_id,
-            .rp_name = "Test App",
-            .origin = origin,
-        } } } },
-    });
-
-    try d.exec("INSERT INTO \"wausers7\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('usr007','','','w7@x.io','tk007',1);");
 
     const seed = [_]u8{0x77} ** 32;
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
@@ -801,16 +795,31 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
     const cred_id_b64 = try client_data.b64urlNoPad(alloc, &cred_id_raw);
     defer alloc.free(cred_id_b64);
 
-    const cred_store = CredentialStore{ .conn = &d };
-    // Store signCount=5 in DB; assertion will report count=1 → clone signal.
-    try cred_store.insert(alloc, std.testing.io, "wausers7", "usr007", cred_id_b64, cose_key_b64, -7, 5, "", "");
-
     const challenge_raw = [_]u8{0x77} ** 32;
     const challenge_b64 = try client_data.b64urlNoPad(alloc, &challenge_raw);
     defer alloc.free(challenge_b64);
 
-    const cs = ChallengeStore{ .conn = &d };
-    const cid = try cs.put(alloc, std.testing.io, "wausers7", "webauthn", "", &challenge_raw, 300);
+    const cid = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        _ = try collections.create(sa, std.testing.io, w, .{
+            .id = "",
+            .name = "wausers7",
+            .type = .auth,
+            .fields = &[_]test_schema.Field{},
+            .options = .{ .auth = .{ .methods = .{ .webauthn = .{
+                .rp_id = rp_id,
+                .rp_name = "Test App",
+                .origin = origin,
+            } } } },
+        });
+        try w.exec("INSERT INTO \"wausers7\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('usr007','','','w7@x.io','tk007',1);");
+        const cred_store = CredentialStore{ .conn = w };
+        // Store signCount=5 in DB; assertion will report count=1 → clone signal.
+        try cred_store.insert(alloc, std.testing.io, "wausers7", "usr007", cred_id_b64, cose_key_b64, -7, 5, "", "");
+        const cs = ChallengeStore{ .conn = w };
+        break :blk try cs.put(alloc, std.testing.io, "wausers7", "webauthn", "", &challenge_raw, 300);
+    };
     defer alloc.free(cid);
 
     var auth_data_raw: [37]u8 = undefined;
@@ -845,14 +854,17 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
     );
     defer alloc.free(body_str);
 
-    var app = app_mod.App{ .allocator = alloc, .io = std.testing.io, .pool = undefined };
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const col = (try collections.get(a, &d, "wausers7")).?;
-    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &app };
-    var ac = AuthCtx{ .app = &app, .ctx = &req, .conn = &d, .collection = col, .config = .null };
+    const col = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "wausers7")).?;
+    };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
     const am = m.method();
@@ -860,7 +872,11 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
     switch (res) {
         .fail => |f| {
             try std.testing.expectEqual(@as(u16, 401), f.status);
-            // Verify signCount was NOT updated (still 5).
+            // Verify signCount was NOT updated (still 5). Re-check under a fresh writer
+            // (the method has released its own by now).
+            const w = wenv.pool.acquireWriter();
+            defer wenv.pool.releaseWriter();
+            const cred_store = CredentialStore{ .conn = w };
             const after = (try cred_store.getByCredentialId(alloc, cred_id_b64)).?;
             defer {
                 alloc.free(after.id);

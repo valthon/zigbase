@@ -9,7 +9,6 @@ const records = @import("../records.zig");
 const crypto = @import("../crypto.zig");
 const auth = @import("../auth.zig");
 const auth_api = @import("auth.zig");
-const oauth_client = @import("../oauth/client.zig");
 const secrets = @import("../oauth/secrets.zig");
 const id = @import("../id.zig");
 
@@ -56,7 +55,7 @@ fn redirectAllowed(cfg: schema.OAuth2Provider, redirect_url: []const u8) bool {
     return false;
 }
 
-/// GET /api/collections/:col/oauth2-providers — public redirect-building info (no secret).
+/// GET /api/collections/:col/auth/oauth2/providers — public redirect-building info (no secret).
 pub fn oauth2Providers(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
@@ -124,29 +123,6 @@ pub fn consumeState(conn: *db.Db, col_name: []const u8, provider: []const u8, st
     return try st.step(); // true iff a matching, unexpired row was deleted
 }
 
-/// POST /api/collections/:col/oauth2-init — issues a server-side `state` for a provider when
-/// server-side CSRF protection is enabled. Body: { "provider": "<name>" }. The client embeds
-/// the returned `state` in the provider authorization URL and echoes it back on the callback.
-/// 404 when server-side state is disabled (the client-driven flow needs no init call).
-pub fn oauth2Init(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app.?;
-    if (!app.oauth_state_server) return ApiError.notFound().toResponse(ctx.allocator);
-    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-    const provider_name = strField(body, "provider") orelse return ApiError.badRequest("provider is required.").toResponse(ctx.allocator);
-    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
-
-    const w = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
-    const col = (try collections.get(ctx.allocator, w, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
-    if (findProviderConfig(col, provider_name) == null) return ApiError.notFound().toResponse(ctx.allocator);
-
-    const state = try issueState(ctx, w, col_name, provider_name);
-    var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "state", .{ .string = state });
-    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}) };
-}
-
 const Link = struct { collectionRef: []const u8, recordRef: []const u8 };
 
 fn findLink(alloc: std.mem.Allocator, conn: *db.Db, provider: []const u8, provider_id: []const u8) !?Link {
@@ -185,19 +161,6 @@ fn strField(obj: std.json.Value, key: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
-}
-
-fn respondSession(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, rid: []const u8, is_new: bool) !http.Response {
-    const rec = (try records.get(ctx.allocator, conn, col, rid)) orelse return ApiError.internal().toResponse(ctx.allocator);
-    const issued = try auth_api.issueSessionExt(ctx, conn, col.name, rid, .oauth2, rec);
-    var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "token", .{ .string = issued.token });
-    try root.put(ctx.allocator, "record", rec);
-    var meta: std.json.ObjectMap = .empty;
-    try meta.put(ctx.allocator, "isNew", .{ .bool = is_new });
-    try root.put(ctx.allocator, "meta", .{ .object = meta });
-    const cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
-    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}), .cookies = cookies };
 }
 
 /// Create a new password-less auth record from a provider identity. Returns its id.
@@ -298,65 +261,6 @@ pub fn resolveRecordFromIdentity(ctx: *http.RequestCtx, conn: *db.Db, col: schem
     insertLink(app.io, ctx.allocator, conn, col.name, new_rid, provider_name, identity.providerUserId) catch
         return Outcome{ .fail = .{ .status = 409, .message = "Provider already linked." } };
     return Outcome{ .record = .{ .rid = new_rid, .is_new = true } };
-}
-
-/// Testable core. `transport` performs the provider HTTP calls.
-pub fn authWithOAuth2Impl(ctx: *http.RequestCtx, transport: oauth_client.Transport) anyerror!http.Response {
-    const app = ctx.app.?;
-    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
-
-    // Phase 1: load collection under a short-lived reader (no lock held during HTTP).
-    var col: schema.Collection = undefined;
-    {
-        var r = app.pool.acquireReader() catch return ApiError.internal().toResponse(ctx.allocator);
-        defer app.pool.releaseReader(&r);
-        col = (collections.get(ctx.allocator, &r, col_name) catch return ApiError.internal().toResponse(ctx.allocator)) orelse
-            return ApiError.notFound().toResponse(ctx.allocator);
-    }
-    if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
-
-    const prep = switch (try prepareOAuth(ctx, col)) {
-        .fail => |f| return (ApiError{ .status = f.status, .message = f.message }).toResponse(ctx.allocator),
-        .ok => |p| p,
-    };
-
-    // Server-side CSRF (F11): when enabled, require + verify + consume the server-issued
-    // `state` BEFORE touching the provider, so a missing/mismatched/expired/reused state is
-    // rejected without burning the authorization code. Opt-in; the client-driven flow (no
-    // server state) is unchanged. PKCE (codeVerifier) is still required on every path.
-    if (app.oauth_state_server) {
-        const state = prep.state orelse return ApiError.badRequest("state is required.").toResponse(ctx.allocator);
-        const w = app.pool.acquireWriter();
-        const ok = consumeState(w, col_name, prep.provider_name, state) catch {
-            app.pool.releaseWriter();
-            return ApiError.internal().toResponse(ctx.allocator);
-        };
-        app.pool.releaseWriter();
-        if (!ok) return (ApiError{ .status = 400, .message = "Invalid or expired state." }).toResponse(ctx.allocator);
-    }
-
-    // Phase 2: provider HTTP calls — NO database lock held.
-    const access_token = oauth_client.exchangeCode(transport, ctx.allocator, prep.provider, prep.cfg.clientId, prep.secret, prep.code, prep.verifier, prep.redirect_url) catch
-        return ApiError.badRequest("OAuth exchange failed.").toResponse(ctx.allocator);
-    const identity = oauth_client.fetchIdentity(transport, ctx.allocator, prep.provider, access_token) catch
-        return ApiError.badRequest("OAuth identity fetch failed.").toResponse(ctx.allocator);
-
-    // Phase 3: DB decision tree under the writer.
-    const w = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
-
-    const outcome = try resolveRecordFromIdentity(ctx, w, col, prep.provider_name, identity);
-    switch (outcome) {
-        .fail => |f| return (ApiError{ .status = f.status, .message = f.message }).toResponse(ctx.allocator),
-        .record => |r| return respondSession(ctx, w, col, r.rid, r.is_new),
-    }
-}
-
-/// POST /api/collections/:col/auth-with-oauth2 — production handler (real HTTP transport).
-pub fn authWithOAuth2(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app.?;
-    const hc = try oauth_client.httpContext(ctx.allocator, app.io);
-    return authWithOAuth2Impl(ctx, oauth_client.httpTransport(hc));
 }
 
 fn linkCount(alloc: std.mem.Allocator, conn: *db.Db, collection_ref: []const u8, record_ref: []const u8) !i64 {
@@ -466,7 +370,7 @@ const TestEnv = struct {
     }
 };
 
-test "oauth2-providers lists enabled providers without secrets" {
+test "auth/oauth2/providers lists enabled providers without secrets" {
     var env = try TestEnv.init();
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -483,7 +387,7 @@ test "oauth2-providers lists enabled providers without secrets" {
     try std.testing.expect(std.mem.indexOf(u8, res.body, "clientSecret") == null);
 }
 
-test "oauth2-providers 404 when oauth2 disabled" {
+test "auth/oauth2/providers 404 when oauth2 disabled" {
     var env = try TestEnv.init();
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -497,172 +401,6 @@ test "oauth2-providers 404 when oauth2 disabled" {
     const p = [_]http.Param{.{ .key = "col", .value = "plain" }};
     var c = env.ctx(a, .GET, "", &p);
     try std.testing.expectEqual(@as(u16, 404), (try oauth2Providers(&c)).status);
-}
-
-const OAuthStub = struct {
-    pid: []const u8 = "P1",
-    email: []const u8 = "u@x.io",
-    verified: bool = true,
-    fn call(c: *anyopaque, alloc: std.mem.Allocator, m: oauth_client.Method, url: []const u8, h: []const oauth_client.Header, b: ?[]const u8) oauth_client.TransportError!oauth_client.Response {
-        _ = m;
-        _ = h;
-        _ = b;
-        const self: *OAuthStub = @ptrCast(@alignCast(c));
-        if (std.mem.indexOf(u8, url, "token") != null)
-            return .{ .status = 200, .body = try alloc.dupe(u8, "{\"access_token\":\"AT\"}") };
-        const j = try std.fmt.allocPrint(alloc, "{{\"sub\":\"{s}\",\"email\":\"{s}\",\"email_verified\":{s}}}", .{ self.pid, self.email, if (self.verified) "true" else "false" });
-        return .{ .status = 200, .body = j };
-    }
-    fn transport(self: *OAuthStub) oauth_client.Transport {
-        return .{ .ctx = self, .call = call };
-    }
-};
-
-fn oauthBody(a: std.mem.Allocator) ![]const u8 {
-    return std.fmt.allocPrint(a, "{{\"provider\":\"google\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\"}}", .{});
-}
-
-test "anonymous oauth login creates a verified, password-less record (isNew)" {
-    var env = try TestEnv.init();
-    defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try env.seedOAuthCollection(a, "users");
-    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var stub = OAuthStub{};
-    var c = env.ctx(a, .POST, try oauthBody(a), &p);
-    const res = try authWithOAuth2Impl(&c, stub.transport());
-    try std.testing.expectEqual(@as(u16, 200), res.status);
-    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"isNew\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"token\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.body, "passwordHash") == null);
-    try std.testing.expect(std.mem.indexOf(u8, res.body, "tokenKey") == null);
-    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"verified\":true") != null);
-}
-
-test "second oauth login with same identity logs in the same record (not new)" {
-    var env = try TestEnv.init();
-    defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try env.seedOAuthCollection(a, "users");
-    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var stub = OAuthStub{};
-    var c1 = env.ctx(a, .POST, try oauthBody(a), &p);
-    const r1 = try authWithOAuth2Impl(&c1, stub.transport());
-    const id1 = (try std.json.parseFromSlice(std.json.Value, a, r1.body, .{})).value.object.get("record").?.object.get("id").?.string;
-    var c2 = env.ctx(a, .POST, try oauthBody(a), &p);
-    const r2 = try authWithOAuth2Impl(&c2, stub.transport());
-    try std.testing.expect(std.mem.indexOf(u8, r2.body, "\"isNew\":false") != null);
-    const id2 = (try std.json.parseFromSlice(std.json.Value, a, r2.body, .{})).value.object.get("record").?.object.get("id").?.string;
-    try std.testing.expectEqualStrings(id1, id2);
-}
-
-test "provider not enabled -> 404; redirect not allowlisted -> 400" {
-    var env = try TestEnv.init();
-    defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try env.seedOAuthCollection(a, "users");
-    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var stub = OAuthStub{};
-    var cbad = env.ctx(a, .POST, "{\"provider\":\"github\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\"}", &p);
-    try std.testing.expectEqual(@as(u16, 404), (try authWithOAuth2Impl(&cbad, stub.transport())).status);
-    var crd = env.ctx(a, .POST, "{\"provider\":\"google\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://evil/cb\"}", &p);
-    try std.testing.expectEqual(@as(u16, 400), (try authWithOAuth2Impl(&crd, stub.transport())).status);
-}
-
-test "anonymous oauth create colliding email -> 409" {
-    var env = try TestEnv.init();
-    defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try env.seedOAuthCollection(a, "users");
-    {
-        const w = env.pool.acquireWriter();
-        defer env.pool.releaseWriter();
-        try w.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('pre','','','u@x.io','tk',1);");
-    }
-    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var stub = OAuthStub{ .pid = "P9", .email = "u@x.io" };
-    var c = env.ctx(a, .POST, try oauthBody(a), &p);
-    try std.testing.expectEqual(@as(u16, 409), (try authWithOAuth2Impl(&c, stub.transport())).status);
-}
-
-// --- F11: server-side OAuth state (opt-in CSRF) ---
-
-/// Mint a server-side state by calling oauth2Init and pulling it out of the JSON body.
-fn initState(env: *TestEnv, a: std.mem.Allocator, col: []const u8, provider: []const u8) ![]const u8 {
-    const p = [_]http.Param{.{ .key = "col", .value = col }};
-    const body = try std.fmt.allocPrint(a, "{{\"provider\":\"{s}\"}}", .{provider});
-    var c = env.ctx(a, .POST, body, &p);
-    const res = try oauth2Init(&c);
-    try std.testing.expectEqual(@as(u16, 200), res.status);
-    return (try std.json.parseFromSlice(std.json.Value, a, res.body, .{})).value.object.get("state").?.string;
-}
-
-fn oauthBodyState(a: std.mem.Allocator, state: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{{\"provider\":\"google\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\",\"state\":\"{s}\"}}", .{state});
-}
-
-test "F11: oauth2-init 404 when server-side state disabled" {
-    var env = try TestEnv.init();
-    defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try env.seedOAuthCollection(a, "users");
-    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var c = env.ctx(a, .POST, "{\"provider\":\"google\"}", &p);
-    try std.testing.expectEqual(@as(u16, 404), (try oauth2Init(&c)).status); // disabled by default
-}
-
-test "F11: server-side state — valid accepted; missing/mismatched/replayed rejected" {
-    var env = try TestEnv.init();
-    defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    env.app.oauth_state_server = true;
-    try env.seedOAuthCollection(a, "users");
-    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var stub = OAuthStub{};
-
-    // Missing state when server-side enforcement is on -> 400.
-    var cmiss = env.ctx(a, .POST, try oauthBody(a), &p);
-    try std.testing.expectEqual(@as(u16, 400), (try authWithOAuth2Impl(&cmiss, stub.transport())).status);
-
-    // Mismatched (never issued) state -> 400.
-    var cbad = env.ctx(a, .POST, try oauthBodyState(a, "not-a-real-state"), &p);
-    try std.testing.expectEqual(@as(u16, 400), (try authWithOAuth2Impl(&cbad, stub.transport())).status);
-
-    // Valid issued state -> accepted (200, isNew).
-    const state = try initState(env, a, "users", "google");
-    var cok = env.ctx(a, .POST, try oauthBodyState(a, state), &p);
-    const res = try authWithOAuth2Impl(&cok, stub.transport());
-    try std.testing.expectEqual(@as(u16, 200), res.status);
-
-    // Replaying the same (now-consumed) state -> 400.
-    var crep = env.ctx(a, .POST, try oauthBodyState(a, state), &p);
-    try std.testing.expectEqual(@as(u16, 400), (try authWithOAuth2Impl(&crep, stub.transport())).status);
-}
-
-test "F11: client-driven flow still works when server-side state is disabled" {
-    var env = try TestEnv.init();
-    defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try env.seedOAuthCollection(a, "users"); // oauth_state_server defaults false
-    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var stub = OAuthStub{};
-    // No `state` in the body, no oauth2-init call — the documented flow is unchanged.
-    var c = env.ctx(a, .POST, try oauthBody(a), &p);
-    try std.testing.expectEqual(@as(u16, 200), (try authWithOAuth2Impl(&c, stub.transport())).status);
 }
 
 fn linkOne(env: *TestEnv, a: std.mem.Allocator, col: []const u8, rid: []const u8, provider: []const u8, pid: []const u8) !void {
@@ -744,35 +482,3 @@ test "deleting an auth record removes its external-auth links" {
     }
 }
 
-const events = @import("../events.zig");
-
-test "oauth2 login fires onAuth exactly once with .oauth2 tag via issueSession seam" {
-    var env = try TestEnv.init();
-    defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try env.seedOAuthCollection(a, "users");
-
-    // Install a counting onAuth handler on the test app's dispatch.
-    const Counter = struct {
-        var seen: usize = 0;
-        var last_method: events.AuthMethod = .password;
-        fn onAuth(ev: *events.AuthEvent) void { seen += 1; last_method = ev.method; }
-    };
-    Counter.seen = 0;
-    var disp = events.Dispatch{ .on_auth = Counter.onAuth };
-    env.app.dispatch = &disp;
-
-    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var stub = OAuthStub{};
-    var c = env.ctx(a, .POST, try oauthBody(a), &p);
-    const res = try authWithOAuth2Impl(&c, stub.transport());
-    try std.testing.expectEqual(@as(u16, 200), res.status);
-    // The seam must have fired exactly once with the .oauth2 tag.
-    // This test would FAIL if the emitAuth call were removed from issueSession.
-    try std.testing.expectEqual(@as(usize, 1), Counter.seen);
-    try std.testing.expectEqual(events.AuthMethod.oauth2, Counter.last_method);
-    // Session cookies must be present.
-    try std.testing.expectEqual(@as(usize, 2), res.cookies.len);
-}

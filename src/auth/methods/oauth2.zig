@@ -59,10 +59,12 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         return InitiateResult{ .status = 400, .body = "{\"message\":\"Provider misconfigured.\"}" };
     };
 
-    // Optionally mint server-side state.
+    // Optionally mint server-side state (scoped writer — released immediately).
     var state_val: ?[]const u8 = null;
     if (ac.app.oauth_state_server) {
-        state_val = try oauth.issueState(ac.ctx, ac.conn, ac.collection.name, provider_name);
+        var w = ac.writer();
+        defer w.deinit();
+        state_val = try oauth.issueState(ac.ctx, w.conn, ac.collection.name, provider_name);
     }
 
     // Build the JSON response.
@@ -97,16 +99,21 @@ pub fn completeImpl(ac: *AuthCtx, transport: oauth_client.Transport) anyerror!Re
         .ok => |p| p,
     };
 
-    // Phase 2: server-side CSRF state (opt-in).
+    // Phase 2: server-side CSRF state (opt-in). Consume the single-use state in a
+    // SCOPED writer that is released BEFORE the provider HTTP calls — we must not
+    // hold the write lock across network I/O.
     if (ac.app.oauth_state_server) {
         const state = prep.state orelse return Resolution{ .fail = .{ .status = 400, .message = "state is required." } };
-        const ok = oauth.consumeState(ac.conn, ac.collection.name, prep.provider_name, state) catch {
+        var w = ac.writer();
+        defer w.deinit();
+        const ok = oauth.consumeState(w.conn, ac.collection.name, prep.provider_name, state) catch {
             return Resolution{ .fail = .{ .status = 500, .message = "State verification failed." } };
         };
         if (!ok) return Resolution{ .fail = .{ .status = 400, .message = "Invalid or expired state." } };
     }
 
-    // Phase 3: provider HTTP calls.
+    // Phase 3: provider HTTP calls — NO DB connection held (the writer was
+    // released at the end of phase 2), so other writes proceed during the exchange.
     const access_token = oauth_client.exchangeCode(
         transport,
         ac.ctx.allocator,
@@ -125,8 +132,11 @@ pub fn completeImpl(ac: *AuthCtx, transport: oauth_client.Transport) anyerror!Re
         access_token,
     ) catch return Resolution{ .fail = .{ .status = 400, .message = "OAuth identity fetch failed." } };
 
-    // Phase 4: link/create decision tree.
-    return switch (try oauth.resolveRecordFromIdentity(ac.ctx, ac.conn, ac.collection, prep.provider_name, identity)) {
+    // Phase 4: link/create decision tree, under a SECOND scoped writer acquired
+    // only now that the HTTP exchange is done.
+    var w = ac.writer();
+    defer w.deinit();
+    return switch (try oauth.resolveRecordFromIdentity(ac.ctx, w.conn, ac.collection, prep.provider_name, identity)) {
         .fail => |f| Resolution{ .fail = .{ .status = f.status, .message = f.message } },
         .record => |r| Resolution{ .record = r.rid },
     };
@@ -253,15 +263,15 @@ test "OAuth2Method: completeImpl creates a new record (isNew) with valid stub" {
     const a = arena.allocator();
     try env.seedOAuthCollection(a, "oauth2users");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "oauth2users")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "oauth2users")).?;
+    };
     var req = env.ctx(a, .POST, try oauthBody(a), &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -285,14 +295,17 @@ test "OAuth2Method: completeImpl second login returns same rid (not new)" {
     const a = arena.allocator();
     try env.seedOAuthCollection(a, "oauth2users2");
 
-    // First login.
-    var rid1: []const u8 = "";
-    {
+    const col = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        const col = (try collections.get(a, w, "oauth2users2")).?;
+        break :blk (try collections.get(a, w, "oauth2users2")).?;
+    };
+
+    // First login. completeImpl acquires its own writer, so we hold none here.
+    var rid1: []const u8 = "";
+    {
         var req = env.ctx(a, .POST, try oauthBody(a), &[_]http.Param{});
-        var ac = AuthCtx{ .app = &env.app, .ctx = &req, .conn = w, .collection = col, .config = .null };
+        var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
         var stub = OAuthStub{};
         const res = try completeImpl(&ac, stub.transport());
         rid1 = switch (res) {
@@ -303,11 +316,8 @@ test "OAuth2Method: completeImpl second login returns same rid (not new)" {
 
     // Second login — same identity.
     {
-        const w = env.pool.acquireWriter();
-        defer env.pool.releaseWriter();
-        const col = (try collections.get(a, w, "oauth2users2")).?;
         var req = env.ctx(a, .POST, try oauthBody(a), &[_]http.Param{});
-        var ac = AuthCtx{ .app = &env.app, .ctx = &req, .conn = w, .collection = col, .config = .null };
+        var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
         var stub = OAuthStub{};
         const res = try completeImpl(&ac, stub.transport());
         switch (res) {
@@ -325,15 +335,15 @@ test "OAuth2Method: completeImpl token exchange fail returns .fail 400" {
     const a = arena.allocator();
     try env.seedOAuthCollection(a, "oauth2users3");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "oauth2users3")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "oauth2users3")).?;
+    };
     var req = env.ctx(a, .POST, try oauthBody(a), &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -355,15 +365,15 @@ test "OAuth2Method: completeImpl unknown provider returns .fail 404" {
     const a = arena.allocator();
     try env.seedOAuthCollection(a, "oauth2users4");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "oauth2users4")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "oauth2users4")).?;
+    };
     var req = env.ctx(a, .POST, "{\"provider\":\"github\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -391,15 +401,15 @@ test "OAuth2Method: initiate returns 200 JSON with authURL+clientId+scopes" {
     const a = arena.allocator();
     try env.seedOAuthCollection(a, "oauth2init1");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "oauth2init1")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "oauth2init1")).?;
+    };
     var req = env.ctx(a, .POST, "{\"provider\":\"google\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -424,15 +434,15 @@ test "OAuth2Method: initiate missing provider returns 400" {
     const a = arena.allocator();
     try env.seedOAuthCollection(a, "oauth2init2");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "oauth2init2")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "oauth2init2")).?;
+    };
     var req = env.ctx(a, .POST, "{}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -451,15 +461,15 @@ test "OAuth2Method: initiate unknown provider returns 404" {
     const a = arena.allocator();
     try env.seedOAuthCollection(a, "oauth2init3");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "oauth2init3")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "oauth2init3")).?;
+    };
     var req = env.ctx(a, .POST, "{\"provider\":\"github\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -483,13 +493,14 @@ test "OAuth2Method: server-state — missing state returns .fail 400" {
     env.app.oauth_state_server = true;
     try env.seedOAuthCollection(a, "oauth2csrf1");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "oauth2csrf1")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "oauth2csrf1")).?;
+    };
     // Body has no "state" field — should fail closed before any exchange.
     var req = env.ctx(a, .POST, try oauthBody(a), &[_]http.Param{});
-    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .conn = w, .collection = col, .config = .null };
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var stub = OAuthStub{};
     const res = try completeImpl(&ac, stub.transport());
@@ -520,12 +531,13 @@ test "OAuth2Method: server-state — valid issued state returns .record" {
     };
 
     // Use the state in the complete body.
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "oauth2csrf2")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "oauth2csrf2")).?;
+    };
     var req = env.ctx(a, .POST, try oauthBodyWithState(a, state), &[_]http.Param{});
-    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .conn = w, .collection = col, .config = .null };
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var stub = OAuthStub{};
     const res = try completeImpl(&ac, stub.transport());
@@ -555,13 +567,16 @@ test "OAuth2Method: server-state — replayed (consumed) state returns .fail 400
         break :blk try oauth.issueState(&req, w, "oauth2csrf3", "google");
     };
 
-    // First use — consumes the state (should succeed and produce a record).
-    {
+    const col = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        const col = (try collections.get(a, w, "oauth2csrf3")).?;
+        break :blk (try collections.get(a, w, "oauth2csrf3")).?;
+    };
+
+    // First use — consumes the state (should succeed and produce a record).
+    {
         var req = env.ctx(a, .POST, try oauthBodyWithState(a, state), &[_]http.Param{});
-        var ac = AuthCtx{ .app = &env.app, .ctx = &req, .conn = w, .collection = col, .config = .null };
+        var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
         var stub = OAuthStub{};
         const res = try completeImpl(&ac, stub.transport());
         switch (res) {
@@ -572,11 +587,8 @@ test "OAuth2Method: server-state — replayed (consumed) state returns .fail 400
 
     // Second use — state already consumed; must fail 400.
     {
-        const w = env.pool.acquireWriter();
-        defer env.pool.releaseWriter();
-        const col = (try collections.get(a, w, "oauth2csrf3")).?;
         var req = env.ctx(a, .POST, try oauthBodyWithState(a, state), &[_]http.Param{});
-        var ac = AuthCtx{ .app = &env.app, .ctx = &req, .conn = w, .collection = col, .config = .null };
+        var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
         var stub = OAuthStub{};
         const res = try completeImpl(&ac, stub.transport());
         switch (res) {

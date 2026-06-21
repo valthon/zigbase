@@ -13,17 +13,13 @@ All notable changes to ZigBase are documented here. The format is based on
 
 ## [Unreleased]
 
+### Removed
+
+- **BREAKING: legacy OAuth2 endpoints removed** — `GET .../oauth2-providers`, `POST .../oauth2-init`, and `POST .../auth-with-oauth2` no longer exist. OAuth2 is now exclusively the contract method: `POST .../auth/oauth2/initiate`, `POST .../auth/oauth2/complete`, and `GET .../auth/oauth2/providers` (discovery).
+
 ### Added
 
-- **Untyped route handlers in framework mode.** `.routes` now accepts the raw
-  `fn(*RouteEvent) anyerror!http.Response` handler form alongside typed
-  `Req(Input)`/`Output` handlers. An untyped handler owns its full response, so it can
-  set/clear a session cookie, return a redirect (`307`), or serve a non-JSON
-  content-type (e.g. `text/calendar`, an HTML OAuth handoff) — things the typed JSON
-  thunk cannot express. Untyped routes carry no typed `Input`/`Output` and are excluded
-  from the generated TypeScript `zb.rpc.*` client, so they never produce a client method
-  that would mis-parse their response.
-- **OAuth2 is now a first-class `AuthMethod`** — available at the auto-mounted `/auth/oauth2/{initiate,complete}` endpoints in addition to the existing dedicated endpoints (`oauth2-providers`, `oauth2-init`, `auth-with-oauth2`); both paths share one implementation and the single `onAuth` session seam. The legacy endpoints are unchanged. See the [API reference](./api#oauth2-contract-endpoints-auth-method-dispatch) for request/response shapes and the writer-during-HTTP concurrency note.
+- **OAuth2 as a first-class `AuthMethod`** — exclusively at the contract endpoints `POST /auth/oauth2/initiate`, `POST /auth/oauth2/complete`, and `GET /auth/oauth2/providers` (discovery); all paths share one implementation and the single `onAuth` session seam. See the [API reference](./api#oauth2) for request/response shapes.
 - **Pluggable auth-method system** — the `AuthMethod` contract (`initiate`/`complete` + `AuthCtx` blessed helpers + `Resolution`) lets the framework own session issuance while methods plug in verification logic. Built-ins implement the same contract with no privileged path.
 - **Per-collection `.auth.methods` config** — enable and configure built-in methods per auth collection: `password` (backward-compat default when `.methods` is absent), `magic_link` (TTL, auto-create flag), `otp` (code length, TTL), `webauthn` (rp_id, rp_name, origin, credentials_collection). Each method has a `rate_limit` knob (`.default` | `.off` | `.{ .custom = .{ .max, .window_s } }`).
 - **App-level `.auth_methods`** — register custom `AuthMethod` plugin TYPES at comptime (same pattern as `.storage`/`.mailer`); a type missing `create`/`method`/`deinit` is a compile error.
@@ -32,12 +28,20 @@ All notable changes to ZigBase are documented here. The format is based on
 - **`otp` built-in** — enumeration-safe `initiate` emails a 6-digit code stored in the `ChallengeStore`, `complete` verifies the code.
 - **`webauthn` built-in** — passkey login via the two-phase contract (initiate returns `PublicKeyCredentialRequestOptions`; complete verifies the signed assertion). Passkey registration via two authed endpoints (`register/begin` / `register/finish`). ES256 (P-256, COSE -7) and Ed25519 (COSE -8) supported; attestation `fmt:"none"` (v1); signCount clone detection (fail-closed); credentials stored in `_webauthnCredentials`.
 - **`ChallengeStore`** (`_authChallenges`) — TTL'd, GC'd single-use server-side challenge storage used by `otp` and `webauthn`, and accessible to custom plugins via `AuthCtx.challengeStore()`.
-- **`onAuth` method tagging extended** — `AuthEvent.method` is now a tagged union carrying the slug: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`, or `.custom` for custom plugins.
+- **`onAuth` method tagging extended** — `AuthEvent.method` is an enum: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`, or `.custom` for custom plugins.
 - **RPC client generation for auth endpoints** — the generated TypeScript client exposes non-password auth-method endpoints under an `auth` surface (initiate/complete stubs, currently untyped).
 - **`zigbase.auth` consumer surface for custom auth flows** — `issueSession` (and
   `RouteEvent.issueSession`), single-use magic-link tokens (`mintLinkToken` /
   `verifyLinkToken` / `consumeLinkToken`), `deliverAuthMail`, and `rateLimit`. All
   session minting now funnels through one seam that always fires `onAuth`.
+- **Untyped route handlers in framework mode.** `.routes` now accepts the raw
+  `fn(*RouteEvent) anyerror!http.Response` handler form alongside typed
+  `Req(Input)`/`Output` handlers. An untyped handler owns its full response, so it can
+  set/clear a session cookie, return a redirect (`307`), or serve a non-JSON
+  content-type (e.g. `text/calendar`, an HTML OAuth handoff) — things the typed JSON
+  thunk cannot express. Untyped routes carry no typed `Input`/`Output` and are excluded
+  from the generated TypeScript `zb.rpc.*` client, so they never produce a client method
+  that would mis-parse their response.
 - **`text.pattern` is now enforced on record writes** via a pure-Zig, linear-time (DoS-safe)
   Thompson-NFA matcher. Matching is unanchored (substring); anchor with `^…$` for a
   full-string match. Supported syntax: literals, `.` (any codepoint except `\n`), anchors
@@ -51,6 +55,13 @@ All notable changes to ZigBase are documented here. The format is based on
   (`validation_date`). Bounds are validated at collection-save time and at build time
   (`@compileError`) for comptime schema literals.
 
+### Changed
+
+- **Auth methods now manage their own DB connections** — each method holds one connection across its work; OAuth2 `complete` releases the writer during the provider HTTP exchange (no write-throughput stall); password `complete` uses a reader (argon2 is read-only). Neither method blocks writes during I/O.
+- **Session issuance (password, refresh, OAuth2) routes through a single
+  `issueSession`+`emitAuth` seam** — custom routes can no longer mint a session that
+  skips the `onAuth` hook.
+
 ### Fixed
 
 - **The HTTP status line now matches the response body for *every* status a handler
@@ -60,12 +71,6 @@ All notable changes to ZigBase are documented here. The format is based on
   even though the JSON body still said e.g. `401`. The mapping now derives from
   `zap.http.StatusCode`'s named values, so any standard code zap defines is passed through
   and only genuinely-unknown codes fall back to `500`.
-
-### Changed
-
-- **Session issuance (password, refresh, OAuth2) routes through a single
-  `issueSession`+`emitAuth` seam** — custom routes can no longer mint a session that
-  skips the `onAuth` hook.
 
 ## [0.4.0] - 2026-06-13
 

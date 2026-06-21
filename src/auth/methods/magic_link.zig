@@ -38,17 +38,22 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch
             return InitiateResult{ .status = 204 };
         if (parsed.value != .object) return InitiateResult{ .status = 204 };
-        break :blk strField(parsed.value, "email") orelse return InitiateResult{ .status = 204 };
+        break :blk strField(parsed.value, "identity") orelse return InitiateResult{ .status = 204 };
     };
 
     // Rate-limit check
     if (try ac.rateLimit("magic_link", email)) |_|
         return InitiateResult{ .status = 429, .body = "{\"message\":\"Too many requests.\"}" };
 
+    // Resolve identity under a READER (findByIdentity is read-only; mintLinkToken
+    // is a JWT mint and deliverMail is the mailer — neither needs the writer).
+    var r = try ac.reader();
+    defer r.deinit();
+
     // Resolve identity; if found, mint and deliver the link token
-    if (try ac.findByIdentity(email)) |rid| {
+    if (try ac.findByIdentity(&r.conn, email)) |rid| {
         const ttl: i64 = if (ac.collection.options.auth.methods.magic_link) |ml| ml.ttl_s else 900;
-        const token = try ac.mintLinkToken(rid, ttl);
+        const token = try ac.mintLinkToken(&r.conn, rid, ttl);
         const mail_body = try std.fmt.allocPrint(
             ac.ctx.allocator,
             "Your sign-in link token:\n\n{s}\n",
@@ -75,12 +80,17 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         return Resolution{ .fail = .{ .status = 400, .message = "token is required." } };
     };
 
+    // Verify + consume must be atomic against the single-use guard, so they run
+    // under ONE writer held for the whole operation.
+    var w = ac.writer();
+    defer w.deinit();
+
     // Verify token
-    const claims = (try ac.verifyLinkToken(token)) orelse
+    const claims = (try ac.verifyLinkToken(w.conn, token)) orelse
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid or expired link." } };
 
     // Consume (single-use guard)
-    ac.consumeLinkToken(claims) catch
+    ac.consumeLinkToken(w.conn, claims) catch
         return Resolution{ .fail = .{ .status = 400, .message = "Link already used." } };
 
     return Resolution{ .record = claims.id };
@@ -115,22 +125,30 @@ test "MagicLinkMethod: complete with valid token resolves to record id" {
 
     try env.createUser(a, "mlmembers", "u@x.io", "longenough");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
+    // Setup: load collection + mint a link token under a writer that is
+    // RELEASED before the method calls (each acquires its own connection).
+    var rid_buf: [64]u8 = undefined;
+    var rid_len: usize = 0;
+    var token: []const u8 = undefined;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const col = (try collections.get(a, w, "mlmembers")).?;
 
-    const col = (try collections.get(a, w, "mlmembers")).?;
-
-    // Mint a link token directly via AuthCtx
-    var req_ctx = env.ctx(a, .POST, "", &[_]http.Param{});
-    var ac_mint = AuthCtx{
-        .app = &env.app,
-        .ctx = &req_ctx,
-        .conn = w,
-        .collection = col,
-        .config = .null,
+        var req_ctx = env.ctx(a, .POST, "", &[_]http.Param{});
+        var ac_mint = AuthCtx{
+            .app = &env.app,
+            .ctx = &req_ctx,
+            .collection = col,
+            .config = .null,
+        };
+        const rid = (try ac_mint.findByIdentity(w, "u@x.io")).?;
+        @memcpy(rid_buf[0..rid.len], rid);
+        rid_len = rid.len;
+        token = try ac_mint.mintLinkToken(w, rid, 900);
+        break :blk col;
     };
-    const rid = (try ac_mint.findByIdentity("u@x.io")).?;
-    const token = try ac_mint.mintLinkToken(rid, 900);
+    const rid = rid_buf[0..rid_len];
 
     // Build the complete request body
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
@@ -138,7 +156,6 @@ test "MagicLinkMethod: complete with valid token resolves to record id" {
     var ac_ok = AuthCtx{
         .app = &env.app,
         .ctx = &req_ok,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -161,7 +178,6 @@ test "MagicLinkMethod: complete with valid token resolves to record id" {
     var ac_replay = AuthCtx{
         .app = &env.app,
         .ctx = &req_replay,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -183,16 +199,16 @@ test "MagicLinkMethod: complete with garbage token returns .fail 400" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "mlmembers2")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "mlmembers2")).?;
+    };
 
     var req = env.ctx(a, .POST, "{\"token\":\"not.a.real.token\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -217,16 +233,16 @@ test "MagicLinkMethod: complete with missing token field returns .fail 400" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "mlmembers3")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "mlmembers3")).?;
+    };
 
     var req = env.ctx(a, .POST, "{\"other\":\"field\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -256,16 +272,16 @@ test "MagicLinkMethod: initiate with known email returns 204" {
 
     try env.createUser(a, "mlmembers4", "u@x.io", "longenough");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "mlmembers4")).?;
+    };
 
-    const col = (try collections.get(a, w, "mlmembers4")).?;
-
-    var req = env.ctx(a, .POST, "{\"email\":\"u@x.io\"}", &[_]http.Param{});
+    var req = env.ctx(a, .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -287,16 +303,16 @@ test "MagicLinkMethod: initiate with unknown email still returns 204 (enumeratio
     defer arena.deinit();
     const a = arena.allocator();
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "mlmembers5")).?;
+    };
 
-    const col = (try collections.get(a, w, "mlmembers5")).?;
-
-    var req = env.ctx(a, .POST, "{\"email\":\"nobody@x.io\"}", &[_]http.Param{});
+    var req = env.ctx(a, .POST, "{\"identity\":\"nobody@x.io\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -318,16 +334,16 @@ test "MagicLinkMethod: initiate with unparseable body returns 204 (enumeration-s
     defer arena.deinit();
     const a = arena.allocator();
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "mlmembers6")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "mlmembers6")).?;
+    };
 
     var req = env.ctx(a, .POST, "not json at all", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };

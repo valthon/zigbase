@@ -77,7 +77,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch
             return InitiateResult{ .status = 204 };
         if (parsed.value != .object) return InitiateResult{ .status = 204 };
-        break :blk strField(parsed.value, "email") orelse return InitiateResult{ .status = 204 };
+        break :blk strField(parsed.value, "identity") orelse return InitiateResult{ .status = 204 };
     };
 
     // Rate-limit check
@@ -88,14 +88,19 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
     const length: u8 = if (ac.collection.options.auth.methods.otp) |o| o.length else 6;
     const ttl_s: i64 = if (ac.collection.options.auth.methods.otp) |o| o.ttl_s else 300;
 
+    // Identity lookup + challenge store happen under ONE writer (the store write
+    // must persist; keep the lookup atomic with it).
+    var w = ac.writer();
+    defer w.deinit();
+
     // Only issue a code if the identity exists (never reveal whether the email was found)
-    if (try ac.findByIdentity(email)) |_| {
+    if (try ac.findByIdentity(w.conn, email)) |_| {
         // Generate a random numeric code of `length` digits (rejection-sampling, no modulo bias)
         const code = try ac.ctx.allocator.alloc(u8, length);
         generateCode(ac.app.io, code);
 
         // Store via ChallengeStore (single-use, TTL'd)
-        const store = ChallengeStore{ .conn = ac.conn };
+        const store = ChallengeStore{ .conn = w.conn };
         _ = try store.put(ac.ctx.allocator, ac.app.io, ac.collection.name, "otp", email, code, ttl_s);
 
         // Deliver the code by email
@@ -109,26 +114,31 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
 fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
     _ = @as(*OtpMethod, @ptrCast(@alignCast(ctx)));
 
-    // Parse {email, code} from body
+    // Parse {identity, code} from body
     const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch {
-        return Resolution{ .fail = .{ .status = 400, .message = "email and code are required." } };
+        return Resolution{ .fail = .{ .status = 400, .message = "identity and code are required." } };
     };
     if (parsed.value != .object) {
-        return Resolution{ .fail = .{ .status = 400, .message = "email and code are required." } };
+        return Resolution{ .fail = .{ .status = 400, .message = "identity and code are required." } };
     }
-    const email = strField(parsed.value, "email") orelse {
-        return Resolution{ .fail = .{ .status = 400, .message = "email and code are required." } };
+    const email = strField(parsed.value, "identity") orelse {
+        return Resolution{ .fail = .{ .status = 400, .message = "identity and code are required." } };
     };
     const submitted_code = strField(parsed.value, "code") orelse {
-        return Resolution{ .fail = .{ .status = 400, .message = "email and code are required." } };
+        return Resolution{ .fail = .{ .status = 400, .message = "identity and code are required." } };
     };
+
+    // The whole verify path mutates state (takeByIdentity consumes the challenge),
+    // so it runs under ONE writer held for the call.
+    var w = ac.writer();
+    defer w.deinit();
 
     // Atomically fetch-and-consume the stored challenge (single-use gate)
     // takeByIdentity returns null when no valid challenge exists or it was already consumed.
     // Note: this CONSUMES the stored code even if the submitted code is wrong — intentional.
     // This design means a single issued code allows exactly one verification attempt, preventing
     // brute-force enumeration of OTP codes and making exhausted codes untriable after first use.
-    const complete_store = ChallengeStore{ .conn = ac.conn };
+    const complete_store = ChallengeStore{ .conn = w.conn };
     const stored = (try complete_store.takeByIdentity(
         ac.ctx.allocator,
         ac.collection.name,
@@ -141,8 +151,8 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid or expired code." } };
     }
 
-    // Match: resolve the record id
-    const rid = (try ac.findByIdentity(email)) orelse
+    // Match: resolve the record id (same writer)
+    const rid = (try ac.findByIdentity(w.conn, email)) orelse
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid or expired code." } };
 
     return Resolution{ .record = rid };
@@ -211,33 +221,39 @@ test "OtpMethod: complete with known code resolves to record id" {
 
     try env.createUser(a, "otpmembers", "u@x.io", "longenough");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
+    // Setup under a writer that is RELEASED before the method call.
+    var rid_buf: [64]u8 = undefined;
+    var rid_len: usize = 0;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const col = (try collections.get(a, w, "otpmembers")).?;
 
-    const col = (try collections.get(a, w, "otpmembers")).?;
+        // Resolve rid for comparison
+        var req_ctx0 = env.ctx(a, .POST, "", &[_]http.Param{});
+        var ac0 = AuthCtx{
+            .app = &env.app,
+            .ctx = &req_ctx0,
+            .collection = col,
+            .config = .null,
+        };
+        const rid = (try ac0.findByIdentity(w, "u@x.io")).?;
+        @memcpy(rid_buf[0..rid.len], rid);
+        rid_len = rid.len;
 
-    // Resolve rid for comparison
-    var req_ctx0 = env.ctx(a, .POST, "", &[_]http.Param{});
-    var ac0 = AuthCtx{
-        .app = &env.app,
-        .ctx = &req_ctx0,
-        .conn = w,
-        .collection = col,
-        .config = .null,
+        // Directly seed a known code via ChallengeStore.put (bypass initiate so we know the code)
+        const store = ChallengeStore{ .conn = w };
+        _ = try store.put(a, std.testing.io, col.name, "otp", "u@x.io", "123456", 300);
+        break :blk col;
     };
-    const rid = (try ac0.findByIdentity("u@x.io")).?;
-
-    // Directly seed a known code via ChallengeStore.put (bypass initiate so we know the code)
-    const store = ChallengeStore{ .conn = w };
-    _ = try store.put(a, std.testing.io, col.name, "otp", "u@x.io", "123456", 300);
+    const rid = rid_buf[0..rid_len];
 
     // complete with the correct code → should resolve to the record id
-    const body_ok = "{\"email\":\"u@x.io\",\"code\":\"123456\"}";
+    const body_ok = "{\"identity\":\"u@x.io\",\"code\":\"123456\"}";
     var req_ok = env.ctx(a, .POST, body_ok, &[_]http.Param{});
     var ac_ok = AuthCtx{
         .app = &env.app,
         .ctx = &req_ok,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -268,23 +284,24 @@ test "OtpMethod: replay same code returns .fail 400 (single-use)" {
 
     try env.createUser(a, "otpmembers2", "u@x.io", "longenough");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "otpmembers2")).?;
-
-    // Seed a known code
-    const store = ChallengeStore{ .conn = w };
-    _ = try store.put(a, std.testing.io, col.name, "otp", "u@x.io", "654321", 300);
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const col = (try collections.get(a, w, "otpmembers2")).?;
+        // Seed a known code
+        const store = ChallengeStore{ .conn = w };
+        _ = try store.put(a, std.testing.io, col.name, "otp", "u@x.io", "654321", 300);
+        break :blk col;
+    };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
     const am = m.method();
 
-    const body = "{\"email\":\"u@x.io\",\"code\":\"654321\"}";
+    const body = "{\"identity\":\"u@x.io\",\"code\":\"654321\"}";
 
     // First use: succeeds
     var req1 = env.ctx(a, .POST, body, &[_]http.Param{});
-    var ac1 = AuthCtx{ .app = &env.app, .ctx = &req1, .conn = w, .collection = col, .config = .null };
+    var ac1 = AuthCtx{ .app = &env.app, .ctx = &req1, .collection = col, .config = .null };
     const res1 = try am.vtable.complete(am.ctx, &ac1);
     switch (res1) {
         .record => {},
@@ -293,7 +310,7 @@ test "OtpMethod: replay same code returns .fail 400 (single-use)" {
 
     // Replay: the code was consumed, must fail
     var req2 = env.ctx(a, .POST, body, &[_]http.Param{});
-    var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .conn = w, .collection = col, .config = .null };
+    var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col, .config = .null };
     const res2 = try am.vtable.complete(am.ctx, &ac2);
     switch (res2) {
         .fail => |f| try std.testing.expectEqual(@as(u16, 400), f.status),
@@ -314,18 +331,19 @@ test "OtpMethod: wrong code returns .fail 400" {
 
     try env.createUser(a, "otpmembers3", "u@x.io", "longenough");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const col = (try collections.get(a, w, "otpmembers3")).?;
+        // Seed "111111", submit "222222"
+        const store = ChallengeStore{ .conn = w };
+        _ = try store.put(a, std.testing.io, col.name, "otp", "u@x.io", "111111", 300);
+        break :blk col;
+    };
 
-    const col = (try collections.get(a, w, "otpmembers3")).?;
-
-    // Seed "111111", submit "222222"
-    const store = ChallengeStore{ .conn = w };
-    _ = try store.put(a, std.testing.io, col.name, "otp", "u@x.io", "111111", 300);
-
-    const body = "{\"email\":\"u@x.io\",\"code\":\"222222\"}";
+    const body = "{\"identity\":\"u@x.io\",\"code\":\"222222\"}";
     var req = env.ctx(a, .POST, body, &[_]http.Param{});
-    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .conn = w, .collection = col, .config = .null };
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
     const am = m.method();
@@ -350,13 +368,14 @@ test "OtpMethod: initiate with known email returns 204" {
 
     try env.createUser(a, "otpmembers4", "u@x.io", "longenough");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "otpmembers4")).?;
+    };
 
-    const col = (try collections.get(a, w, "otpmembers4")).?;
-
-    var req = env.ctx(a, .POST, "{\"email\":\"u@x.io\"}", &[_]http.Param{});
-    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .conn = w, .collection = col, .config = .null };
+    var req = env.ctx(a, .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
     const am = m.method();
@@ -375,13 +394,14 @@ test "OtpMethod: initiate with unknown email returns 204 (enumeration-safe)" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "otpmembers5")).?;
+    };
 
-    const col = (try collections.get(a, w, "otpmembers5")).?;
-
-    var req = env.ctx(a, .POST, "{\"email\":\"nobody@x.io\"}", &[_]http.Param{});
-    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .conn = w, .collection = col, .config = .null };
+    var req = env.ctx(a, .POST, "{\"identity\":\"nobody@x.io\"}", &[_]http.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
     const am = m.method();
@@ -400,13 +420,14 @@ test "OtpMethod: initiate with unparseable body returns 204 (enumeration-safe)" 
     defer arena.deinit();
     const a = arena.allocator();
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "otpmembers6")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "otpmembers6")).?;
+    };
 
     var req = env.ctx(a, .POST, "not json at all", &[_]http.Param{});
-    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .conn = w, .collection = col, .config = .null };
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
     const am = m.method();
@@ -425,29 +446,30 @@ test "OtpMethod: complete with missing fields returns .fail 400" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "otpmembers7")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "otpmembers7")).?;
+    };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
     const am = m.method();
 
     // Missing code
-    var req1 = env.ctx(a, .POST, "{\"email\":\"u@x.io\"}", &[_]http.Param{});
-    var ac1 = AuthCtx{ .app = &env.app, .ctx = &req1, .conn = w, .collection = col, .config = .null };
+    var req1 = env.ctx(a, .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
+    var ac1 = AuthCtx{ .app = &env.app, .ctx = &req1, .collection = col, .config = .null };
     const res1 = try am.vtable.complete(am.ctx, &ac1);
     switch (res1) {
         .fail => |f| {
             try std.testing.expectEqual(@as(u16, 400), f.status);
-            try std.testing.expectEqualStrings("email and code are required.", f.message);
+            try std.testing.expectEqualStrings("identity and code are required.", f.message);
         },
         .record => return error.TestFailed,
     }
 
     // Missing email
     var req2 = env.ctx(a, .POST, "{\"code\":\"123456\"}", &[_]http.Param{});
-    var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .conn = w, .collection = col, .config = .null };
+    var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col, .config = .null };
     const res2 = try am.vtable.complete(am.ctx, &ac2);
     switch (res2) {
         .fail => |f| try std.testing.expectEqual(@as(u16, 400), f.status),

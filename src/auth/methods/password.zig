@@ -56,14 +56,19 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         return Resolution{ .fail = .{ .status = 400, .message = "identity and password are required." } };
     };
 
+    // Password verification is entirely read-only (identity lookup + hash fetch +
+    // argon2 verify), so it runs under a pooled READER — argon2 never blocks writes.
+    var r = try ac.reader();
+    defer r.deinit();
+
     // Lookup identity
-    const rid = (try ac.findByIdentity(identity)) orelse {
+    const rid = (try ac.findByIdentity(&r.conn, identity)) orelse {
         crypto.dummyVerify(ac.app.io, ac.ctx.allocator);
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid credentials." } };
     };
 
     // Fetch the password hash
-    const phc = (try api_auth.passwordHashFor(ac.ctx.allocator, ac.conn, ac.collection.name, rid)) orelse {
+    const phc = (try api_auth.passwordHashFor(ac.ctx.allocator, &r.conn, ac.collection.name, rid)) orelse {
         crypto.dummyVerify(ac.app.io, ac.ctx.allocator);
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid credentials." } };
     };
@@ -98,17 +103,19 @@ test "PasswordMethod: correct password resolves to record id, wrong password is 
 
     try env.createUser(a, "members", "u@x.io", "longenough");
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "members")).?;
+    // Load the collection under a brief writer that is RELEASED before any
+    // method call (the method acquires its own reader).
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "members")).?;
+    };
 
     // --- correct password ---
     var req_ok = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &[_]http.Param{});
     var ac_ok = AuthCtx{
         .app = &env.app,
         .ctx = &req_ok,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -129,7 +136,6 @@ test "PasswordMethod: correct password resolves to record id, wrong password is 
     var ac_bad = AuthCtx{
         .app = &env.app,
         .ctx = &req_bad,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -152,16 +158,16 @@ test "PasswordMethod: missing identity/password fields returns .fail 400" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "members2")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "members2")).?;
+    };
 
     var req = env.ctx(a, .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };
@@ -189,16 +195,16 @@ test "PasswordMethod: unknown identity returns .fail 400 (timing defense)" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    const col = (try collections.get(a, w, "members3")).?;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "members3")).?;
+    };
 
     var req = env.ctx(a, .POST, "{\"identity\":\"nobody@x.io\",\"password\":\"longenough\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
-        .conn = w,
         .collection = col,
         .config = .null,
     };

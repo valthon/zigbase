@@ -15,7 +15,7 @@ pub const App = struct {
     verification_ttl_s: i64 = 7 * 24 * 3600,
     password_reset_ttl_s: i64 = 3600,
     /// Server-side OAuth `state` CSRF protection (F11). Opt-in: when true, the backend
-    /// issues a `state` at oauth2-init and verifies+consumes it on auth-with-oauth2.
+    /// issues a `state` via the oauth2 method initiate call and verifies+consumes it on complete.
     oauth_state_server: bool = false,
     oauth_state_ttl_s: i64 = 600,
     realtime_allowed_origins: []const u8 = "",

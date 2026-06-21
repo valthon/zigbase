@@ -5,8 +5,9 @@
 ///   POST /api/collections/:col/auth/:method/complete
 ///
 /// The `complete` handler mints a session via the M1 seam (issueSession) on
-/// success and fires `onAuth(.custom)`. `initiate` returns whatever the method
-/// produced (typically a challenge or 200 OK).
+/// success and fires `onAuth` tagged by method slug (`.password`, `.magic_link`,
+/// `.otp`, `.webauthn`, `.oauth2`, or `.custom` for unknown slugs). `initiate`
+/// returns whatever the method produced (typically a challenge or 200 OK).
 const std = @import("std");
 const http = @import("../http.zig");
 const db = @import("../db.zig");
@@ -74,12 +75,18 @@ const DispatchPhase = enum { initiate, complete };
 fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response {
     const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator);
 
-    // 1. Load collection.
+    // 1. Load collection under a BRIEF reader. We do NOT hold any connection
+    //    across the method call — each method acquires its own (a reader for
+    //    read-only work, the writer only when it must persist), so OAuth can
+    //    release the writer during its HTTP exchange and password verifies
+    //    argon2 under a reader.
     const col_name = ctx.param("col") orelse return (ApiError.notFound()).toResponse(ctx.allocator);
-    const w = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
-    const col = (try collections.get(ctx.allocator, w, col_name)) orelse
-        return (ApiError.notFound()).toResponse(ctx.allocator);
+    const col = blk: {
+        var r = app.pool.acquireReader() catch return (ApiError.internal()).toResponse(ctx.allocator);
+        defer app.pool.releaseReader(&r);
+        break :blk (try collections.get(ctx.allocator, &r, col_name)) orelse
+            return (ApiError.notFound()).toResponse(ctx.allocator);
+    };
     if (col.type != .auth) return (ApiError.notFound()).toResponse(ctx.allocator);
 
     // 2. Method enablement check.
@@ -105,11 +112,11 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
         },
     }
 
-    // 5. Build AuthCtx.
+    // 5. Build AuthCtx. No connection is bound — the method acquires its own
+    //    via ac.writer()/ac.reader() for exactly as long as it needs it.
     var ac = method_mod.AuthCtx{
         .app = app,
         .ctx = ctx,
-        .conn = w,
         .collection = col,
         .config = .null, // per-method config object — future milestone; .null is safe
     };
@@ -139,8 +146,17 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                         .magic_link
                     else if (std.mem.eql(u8, slug, "oauth2"))
                         .oauth2
+                    else if (std.mem.eql(u8, slug, "otp"))
+                        .otp
+                    else if (std.mem.eql(u8, slug, "webauthn"))
+                        .webauthn
                     else
                         .custom;
+                    // The method has already released its own connection by the
+                    // time `complete` returned, so acquiring the writer here to
+                    // mint the session cannot deadlock.
+                    const w = app.pool.acquireWriter();
+                    defer app.pool.releaseWriter();
                     const issued = try auth.issueSession(ctx, w, col.name, rid, auth_tag);
                     var root: std.json.ObjectMap = .empty;
                     try root.put(ctx.allocator, "token", .{ .string = issued.token });

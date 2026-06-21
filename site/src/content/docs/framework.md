@@ -391,8 +391,8 @@ Example — two collections, each with different methods:
 This yields the following endpoints (no route code):
 
 ```
-POST /api/collections/members/auth/magic-link/initiate
-POST /api/collections/members/auth/magic-link/complete
+POST /api/collections/members/auth/magic_link/initiate
+POST /api/collections/members/auth/magic_link/complete
 POST /api/collections/staff/auth-with-password           (legacy alias)
 POST /api/collections/staff/auth/webauthn/initiate
 POST /api/collections/staff/auth/webauthn/complete
@@ -447,15 +447,19 @@ pub const AuthCtx = struct {
     app: *Runtime,
     ctx: *http.RequestCtx,        // body / query / cookies / remote_ip
     collection: schema.Collection, // the :col auth collection (validated .type == .auth)
-    conn: *db.Db,                  // pooled connection
+    // No ambient conn — each method acquires its own via writer()/reader().
 
-    // Blessed helpers:
+    // Connection RAII handles:
+    pub fn writer(ac: *AuthCtx) WriterData;               // acquires pool writer (mutex); call deinit()
+    pub fn reader(ac: *AuthCtx) !ReaderData;              // checks out a pooled reader; call deinit()
+
+    // Blessed helpers (each takes the conn you acquired):
     pub fn rateLimit(ac: *AuthCtx, scope: []const u8, ident: []const u8) !?http.Response;
-    pub fn mintLinkToken(ac: *AuthCtx, record_id: []const u8, ttl_s: i64) ![]const u8;
-    pub fn verifyLinkToken(ac: *AuthCtx, token: []const u8) !?Claims;
-    pub fn consumeLinkToken(ac: *AuthCtx, claims: Claims) !void;
+    pub fn mintLinkToken(ac: *AuthCtx, conn: *db.Db, record_id: []const u8, ttl_s: i64) ![]const u8;
+    pub fn verifyLinkToken(ac: *AuthCtx, conn: *db.Db, token: []const u8) !?Claims;
+    pub fn consumeLinkToken(ac: *AuthCtx, conn: *db.Db, claims: Claims) !void;
     pub fn deliverMail(ac: *AuthCtx, to: []const u8, subject: []const u8, body: []const u8) !void;
-    pub fn findByIdentity(ac: *AuthCtx, identity: []const u8) !?[]const u8;  // record_id or null
+    pub fn findByIdentity(ac: *AuthCtx, conn: *db.Db, identity: []const u8) !?[]const u8;
 };
 
 pub const InitiateResult = struct { status: u16 = 200, body: ?[]const u8 = null };
@@ -494,14 +498,13 @@ Notes:
 - `store(id, data, ttl_s)` — store a challenge under `id` with the given TTL.
 - `consume(id) ![]const u8` — retrieve and delete in one atomic step (single-use).
 
-### OAuth2 — contract method + legacy endpoints
+### OAuth2 — contract method
 
-OAuth2 (Google, GitHub, etc.) is the **fifth built-in `AuthMethod`** (slug `oauth2`). It is gated by the existing `.auth.oauth2.enabled` + `.auth.oauth2.providers` config, **not** by `.auth.methods`. When OAuth2 is enabled for a collection the framework auto-mounts two contract endpoints in addition to the unchanged legacy endpoints.
-
-**New contract endpoints (auto-mounted):**
+OAuth2 (Google, GitHub, etc.) is the **fifth built-in `AuthMethod`** (slug `oauth2`). It is gated by the existing `.auth.oauth2.enabled` + `.auth.oauth2.providers` config, **not** by `.auth.methods`. When OAuth2 is enabled for a collection the framework auto-mounts three endpoints:
 
 | Method | Path | Description |
 |---|---|---|
+| GET | `/api/collections/:col/auth/oauth2/providers` | Discovery — list enabled providers (name, authURL, clientId, scopes). Secrets never returned. |
 | POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata so the client can drive the authorization redirect. |
 | POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session. |
 
@@ -531,11 +534,9 @@ OAuth2 (Google, GitHub, etc.) is the **fifth built-in `AuthMethod`** (slug `oaut
 { "token": "<jwt>" }
 ```
 
-On success the framework fires `onAuth(.oauth2)` through the shared session seam — identical to every other method. Both paths share one implementation (`prepareOAuth` + `resolveRecordFromIdentity`) and enforce the same security: single-use TTL'd CSRF `state` consumed before the code exchange, PKCE required, redirect allow-list, and https-only provider URLs.
+On success the framework fires `onAuth(.oauth2)` through the shared session seam — identical to every other method. All paths share one implementation and enforce the same security: single-use TTL'd CSRF `state` consumed before the code exchange, PKCE required, redirect allow-list, and https-only provider URLs.
 
-**Legacy endpoints are unchanged and continue to work:** `GET .../oauth2-providers`, `POST .../oauth2-init`, `POST .../auth-with-oauth2`. The legacy `auth-with-oauth2` response includes `{ token, record, meta: { isNew } }` (richer than the contract `{ token }` shape); use it when you need that extra data.
-
-> **Concurrency note:** the new `/auth/oauth2/complete` runs on the dispatch-held DB writer and holds it across the provider HTTP exchange. Under high OAuth2 concurrency the legacy `/auth-with-oauth2`, which releases the writer during the provider round-trip, remains the throughput-optimal path.
+> **Connection model:** each auth method manages its own DB connection for the duration of its call. `complete` acquires a writer, consumes the CSRF `state` (single-use, before the provider exchange), then **releases the writer** before the outbound provider HTTP round-trip. A new writer acquisition completes the record lookup and session mint. This means `complete` does **not** hold the writer across blocking I/O — high OAuth2 concurrency does not stall writes. Password `complete` uses a reader (argon2 verification is read-only); the writer is acquired only at session-mint time.
 
 ### Tier 3: escape hatch for exotic flows
 

@@ -14,7 +14,7 @@ export interface AuthStore {
   readonly token: string | null;
   readonly record: AuthRecord | null;
   readonly isValid: boolean;
-  save(token: string, record: AuthRecord): void;
+  save(token: string, record: AuthRecord | null): void;
   clear(): void;
   onChange(cb: AuthChangeListener): () => void;
 }
@@ -34,7 +34,7 @@ export class BaseAuthStore implements AuthStore {
     return this._token !== null && !isTokenExpired(this._token);
   }
 
-  save(token: string, record: AuthRecord): void {
+  save(token: string, record: AuthRecord | null): void {
     this._token = token;
     this._record = record;
     this.emit();
@@ -85,7 +85,7 @@ export class LocalAuthStore extends BaseAuthStore {
     }
   }
 
-  override save(token: string, record: AuthRecord): void {
+  override save(token: string, record: AuthRecord | null): void {
     this.storage?.setItem(this.key, JSON.stringify({ token, record }));
     super.save(token, record);
   }
