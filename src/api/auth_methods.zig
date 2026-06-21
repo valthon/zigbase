@@ -31,6 +31,7 @@ fn methodEnabled(col: schema.Collection, slug: []const u8) bool {
     if (std.mem.eql(u8, slug, "magic_link")) return m.magic_link != null;
     if (std.mem.eql(u8, slug, "otp")) return m.otp != null;
     if (std.mem.eql(u8, slug, "webauthn")) return m.webauthn != null;
+    if (std.mem.eql(u8, slug, "oauth2")) return col.options.auth.oauth2.enabled;
     for (m.custom) |cs| {
         if (std.mem.eql(u8, cs, slug)) return true;
     }
@@ -383,4 +384,22 @@ test "methodEnabled: backward-compat and explicit opts" {
     };
     try std.testing.expect(methodEnabled(auth_custom, "mymethod"));
     try std.testing.expect(!methodEnabled(auth_custom, "other"));
+
+    const auth_oauth2_enabled = schema.Collection{
+        .id = "c5",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{ .enabled = true } } },
+    };
+    try std.testing.expect(methodEnabled(auth_oauth2_enabled, "oauth2"));
+
+    const auth_oauth2_disabled = schema.Collection{
+        .id = "c6",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{ .enabled = false } } },
+    };
+    try std.testing.expect(!methodEnabled(auth_oauth2_disabled, "oauth2"));
 }

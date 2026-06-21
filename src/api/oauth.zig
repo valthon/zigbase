@@ -43,7 +43,7 @@ fn isHttps(url: []const u8) bool {
 }
 
 /// Find an enabled provider config by name in a collection's oauth2 options.
-fn findProviderConfig(col: schema.Collection, name: []const u8) ?schema.OAuth2Provider {
+pub fn findProviderConfig(col: schema.Collection, name: []const u8) ?schema.OAuth2Provider {
     if (!col.options.auth.oauth2.enabled) return null;
     for (col.options.auth.oauth2.providers) |p| {
         if (p.enabled and std.mem.eql(u8, p.name, name)) return p;
@@ -89,7 +89,7 @@ pub fn oauth2Providers(ctx: *http.RequestCtx) anyerror!http.Response {
 
 /// Mint + persist a random `state` for (collection, provider), valid for app.oauth_state_ttl_s.
 /// Single-use: it is deleted on the first successful callback verification.
-fn issueState(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, provider: []const u8) ![]const u8 {
+pub fn issueState(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, provider: []const u8) ![]const u8 {
     const app = ctx.app.?;
     const state = try crypto.genToken(app.io, ctx.allocator, 40);
     const now = try auth_api.nowUnix(conn);
@@ -109,7 +109,7 @@ fn issueState(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, provide
 /// Verify + consume a server-side `state`. Returns true only if a row exists for the
 /// (collection, provider), is unexpired, and is then deleted (single-use — a reuse on a
 /// second call finds no row and returns false). Missing/mismatched/expired => false.
-fn consumeState(conn: *db.Db, col_name: []const u8, provider: []const u8, state: []const u8) !bool {
+pub fn consumeState(conn: *db.Db, col_name: []const u8, provider: []const u8, state: []const u8) !bool {
     const now = try auth_api.nowUnix(conn);
     var st = try conn.prepare(
         \\DELETE FROM "_oauthStates"
@@ -214,17 +214,98 @@ fn createOAuthRecord(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection
     return rec.object.get("id").?.string;
 }
 
+/// Parsed and validated OAuth2 request inputs (no DB, no HTTP).
+pub const Prepared = struct {
+    provider_name: []const u8,
+    code: []const u8,
+    verifier: []const u8,
+    redirect_url: []const u8,
+    state: ?[]const u8,
+    cfg: schema.OAuth2Provider,
+    provider: providers.Provider,
+    secret: []const u8,
+};
+
+/// Result of prepareOAuth: either a fully-validated Prepared or an early-exit error.
+pub const PrepareResult = union(enum) {
+    ok: Prepared,
+    fail: struct { status: u16, message: []const u8 },
+};
+
+/// Result of resolveRecordFromIdentity: either a record id+is_new or an error.
+pub const Outcome = union(enum) {
+    record: struct { rid: []const u8, is_new: bool },
+    fail: struct { status: u16, message: []const u8 },
+};
+
+/// Body parse + provider resolve + redirect allow-list + secret decrypt. NO DB, NO HTTP.
+/// `col` must already be loaded and verified to be of type .auth.
+pub fn prepareOAuth(ctx: *http.RequestCtx, col: schema.Collection) !PrepareResult {
+    const app = ctx.app.?;
+    const body = parseBody(ctx) orelse return PrepareResult{ .fail = .{ .status = 400, .message = "Invalid JSON body." } };
+    const provider_name = strField(body, "provider") orelse return PrepareResult{ .fail = .{ .status = 400, .message = "provider is required." } };
+    const code = strField(body, "code") orelse return PrepareResult{ .fail = .{ .status = 400, .message = "code is required." } };
+    const verifier = strField(body, "codeVerifier") orelse return PrepareResult{ .fail = .{ .status = 400, .message = "codeVerifier is required." } };
+    const redirect_url = strField(body, "redirectUrl") orelse return PrepareResult{ .fail = .{ .status = 400, .message = "redirectUrl is required." } };
+    const state = strField(body, "state");
+
+    const cfg = findProviderConfig(col, provider_name) orelse return PrepareResult{ .fail = .{ .status = ApiError.notFound().status, .message = ApiError.notFound().message } };
+    const provider = resolveProvider(cfg) orelse return PrepareResult{ .fail = .{ .status = 400, .message = "Provider misconfigured." } };
+    if (!redirectAllowed(cfg, redirect_url)) return PrepareResult{ .fail = .{ .status = 400, .message = "redirectUrl not allowed." } };
+    const secret = secrets.decryptSecret(ctx.allocator, app.jwt_secret, cfg.clientSecret) catch
+        return PrepareResult{ .fail = .{ .status = ApiError.internal().status, .message = ApiError.internal().message } };
+
+    return PrepareResult{ .ok = .{
+        .provider_name = provider_name,
+        .code = code,
+        .verifier = verifier,
+        .redirect_url = redirect_url,
+        .state = state,
+        .cfg = cfg,
+        .provider = provider,
+        .secret = secret,
+    } };
+}
+
+/// The link/create decision tree given a fetched identity. Uses `conn` (writer).
+/// Returns the resolved record id + is_new, or a fail. Does NOT mint a session.
+pub fn resolveRecordFromIdentity(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection,
+    provider_name: []const u8, identity: providers.Identity) !Outcome {
+    const app = ctx.app.?;
+
+    const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null);
+    const authed_rid: ?[]const u8 = if (authed) |x|
+        (if (std.mem.eql(u8, x.collection, col.name)) x.record.object.get("id").?.string else null)
+    else
+        null;
+
+    if (try findLink(ctx.allocator, conn, provider_name, identity.providerUserId)) |link| {
+        if (authed_rid) |arid| {
+            if (!std.mem.eql(u8, arid, link.recordRef))
+                return Outcome{ .fail = .{ .status = 409, .message = "Provider already linked to another account." } };
+        }
+        return Outcome{ .record = .{ .rid = link.recordRef, .is_new = false } };
+    }
+
+    if (authed_rid) |arid| {
+        insertLink(app.io, ctx.allocator, conn, col.name, arid, provider_name, identity.providerUserId) catch
+            return Outcome{ .fail = .{ .status = 409, .message = "Provider already linked." } };
+        return Outcome{ .record = .{ .rid = arid, .is_new = false } };
+    }
+
+    const new_rid = createOAuthRecord(ctx, conn, col, identity) catch
+        return Outcome{ .fail = .{ .status = 409, .message = "Email already registered; sign in and link instead." } };
+    insertLink(app.io, ctx.allocator, conn, col.name, new_rid, provider_name, identity.providerUserId) catch
+        return Outcome{ .fail = .{ .status = 409, .message = "Provider already linked." } };
+    return Outcome{ .record = .{ .rid = new_rid, .is_new = true } };
+}
+
 /// Testable core. `transport` performs the provider HTTP calls.
 pub fn authWithOAuth2Impl(ctx: *http.RequestCtx, transport: oauth_client.Transport) anyerror!http.Response {
     const app = ctx.app.?;
-    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-    const provider_name = strField(body, "provider") orelse return ApiError.badRequest("provider is required.").toResponse(ctx.allocator);
-    const code = strField(body, "code") orelse return ApiError.badRequest("code is required.").toResponse(ctx.allocator);
-    const verifier = strField(body, "codeVerifier") orelse return ApiError.badRequest("codeVerifier is required.").toResponse(ctx.allocator);
-    const redirect_url = strField(body, "redirectUrl") orelse return ApiError.badRequest("redirectUrl is required.").toResponse(ctx.allocator);
     const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
 
-    // Phase 1: load collection + provider config under a short-lived reader (no lock held during HTTP).
+    // Phase 1: load collection under a short-lived reader (no lock held during HTTP).
     var col: schema.Collection = undefined;
     {
         var r = app.pool.acquireReader() catch return ApiError.internal().toResponse(ctx.allocator);
@@ -234,14 +315,19 @@ pub fn authWithOAuth2Impl(ctx: *http.RequestCtx, transport: oauth_client.Transpo
     }
     if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
 
+    const prep = switch (try prepareOAuth(ctx, col)) {
+        .fail => |f| return (ApiError{ .status = f.status, .message = f.message }).toResponse(ctx.allocator),
+        .ok => |p| p,
+    };
+
     // Server-side CSRF (F11): when enabled, require + verify + consume the server-issued
     // `state` BEFORE touching the provider, so a missing/mismatched/expired/reused state is
     // rejected without burning the authorization code. Opt-in; the client-driven flow (no
     // server state) is unchanged. PKCE (codeVerifier) is still required on every path.
     if (app.oauth_state_server) {
-        const state = strField(body, "state") orelse return ApiError.badRequest("state is required.").toResponse(ctx.allocator);
+        const state = prep.state orelse return ApiError.badRequest("state is required.").toResponse(ctx.allocator);
         const w = app.pool.acquireWriter();
-        const ok = consumeState(w, col_name, provider_name, state) catch {
+        const ok = consumeState(w, col_name, prep.provider_name, state) catch {
             app.pool.releaseWriter();
             return ApiError.internal().toResponse(ctx.allocator);
         };
@@ -249,47 +335,21 @@ pub fn authWithOAuth2Impl(ctx: *http.RequestCtx, transport: oauth_client.Transpo
         if (!ok) return (ApiError{ .status = 400, .message = "Invalid or expired state." }).toResponse(ctx.allocator);
     }
 
-    const cfg = findProviderConfig(col, provider_name) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const provider = resolveProvider(cfg) orelse return ApiError.badRequest("Provider misconfigured.").toResponse(ctx.allocator);
-    if (!redirectAllowed(cfg, redirect_url)) return ApiError.badRequest("redirectUrl not allowed.").toResponse(ctx.allocator);
-    const secret = secrets.decryptSecret(ctx.allocator, app.jwt_secret, cfg.clientSecret) catch
-        return ApiError.internal().toResponse(ctx.allocator);
-
     // Phase 2: provider HTTP calls — NO database lock held.
-    const access_token = oauth_client.exchangeCode(transport, ctx.allocator, provider, cfg.clientId, secret, code, verifier, redirect_url) catch
+    const access_token = oauth_client.exchangeCode(transport, ctx.allocator, prep.provider, prep.cfg.clientId, prep.secret, prep.code, prep.verifier, prep.redirect_url) catch
         return ApiError.badRequest("OAuth exchange failed.").toResponse(ctx.allocator);
-    const identity = oauth_client.fetchIdentity(transport, ctx.allocator, provider, access_token) catch
+    const identity = oauth_client.fetchIdentity(transport, ctx.allocator, prep.provider, access_token) catch
         return ApiError.badRequest("OAuth identity fetch failed.").toResponse(ctx.allocator);
 
     // Phase 3: DB decision tree under the writer.
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
 
-    const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, w) catch null);
-    const authed_rid: ?[]const u8 = if (authed) |x|
-        (if (std.mem.eql(u8, x.collection, col.name)) x.record.object.get("id").?.string else null)
-    else
-        null;
-
-    if (try findLink(ctx.allocator, w, provider_name, identity.providerUserId)) |link| {
-        if (authed_rid) |arid| {
-            if (!std.mem.eql(u8, arid, link.recordRef))
-                return (ApiError{ .status = 409, .message = "Provider already linked to another account." }).toResponse(ctx.allocator);
-        }
-        return respondSession(ctx, w, col, link.recordRef, false);
+    const outcome = try resolveRecordFromIdentity(ctx, w, col, prep.provider_name, identity);
+    switch (outcome) {
+        .fail => |f| return (ApiError{ .status = f.status, .message = f.message }).toResponse(ctx.allocator),
+        .record => |r| return respondSession(ctx, w, col, r.rid, r.is_new),
     }
-
-    if (authed_rid) |arid| {
-        insertLink(app.io, ctx.allocator, w, col.name, arid, provider_name, identity.providerUserId) catch
-            return (ApiError{ .status = 409, .message = "Provider already linked." }).toResponse(ctx.allocator);
-        return respondSession(ctx, w, col, arid, false);
-    }
-
-    const new_rid = createOAuthRecord(ctx, w, col, identity) catch
-        return (ApiError{ .status = 409, .message = "Email already registered; sign in and link instead." }).toResponse(ctx.allocator);
-    insertLink(app.io, ctx.allocator, w, col.name, new_rid, provider_name, identity.providerUserId) catch
-        return (ApiError{ .status = 409, .message = "Provider already linked." }).toResponse(ctx.allocator);
-    return respondSession(ctx, w, col, new_rid, true);
 }
 
 /// POST /api/collections/:col/auth-with-oauth2 — production handler (real HTTP transport).

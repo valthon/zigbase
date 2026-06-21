@@ -393,7 +393,7 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 | POST | `/api/collections/:col/auth/:method/initiate` | Phase 1: challenge/email/options. Returns 200 with method-specific JSON body, or 204 for enumeration-safe methods (e.g. magic-link). |
 | POST | `/api/collections/:col/auth/:method/complete` | Phase 2: proof → session. Returns 200 with `{ token, record }` and sets `zb_auth`/`zb_csrf` cookies on success. |
 
-`:method` is the method slug (`magic-link`, `otp`, `password`, `webauthn`, or a custom plugin's slug). Returns 404 when the collection doesn't exist, isn't an auth collection, or the method isn't enabled.
+`:method` is the method slug (`magic-link`, `otp`, `password`, `webauthn`, `oauth2`, or a custom plugin's slug). Returns 404 when the collection doesn't exist, isn't an auth collection, or the method isn't enabled.
 
 **WebAuthn passkey registration** (authed — requires a valid session):
 
@@ -558,6 +558,52 @@ The OAuth `state` parameter prevents login-CSRF. ZigBase supports two modes:
   Use this when you can't guarantee a correct SPA. **PKCE (`codeVerifier`) is still
   required in both modes** — server-side `state` adds CSRF protection, it does not
   replace PKCE.
+
+### OAuth2 contract endpoints (auth-method dispatch)
+
+OAuth2 is also available as the **fifth built-in `AuthMethod`** (slug `oauth2`) under the standard `/auth/:method/{initiate,complete}` dispatch. These endpoints are auto-mounted when OAuth2 is enabled (`.auth.oauth2.enabled`) and share one implementation with the legacy endpoints above.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata for the authorization redirect. |
+| POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session (contract path). |
+
+**`oauth2` initiate** — body `{ "provider": "<name>" }`:
+
+```json
+// response (200)
+{
+  "authURL": "https://accounts.google.com/o/oauth2/v2/auth?...",
+  "clientId": "my-client-id.apps.googleusercontent.com",
+  "scopes": ["openid", "email", "profile"],
+  "state": "<server-issued-state>"
+}
+```
+
+`state` is present only when `ZIGBASE_OAUTH_STATE_SERVER=true`; omitted otherwise.
+
+**`oauth2` complete** — body:
+
+```json
+{
+  "provider": "google",
+  "code": "<authorization-code>",
+  "codeVerifier": "<pkce-verifier>",
+  "redirectUrl": "https://app.example.com/callback",
+  "state": "<server-issued-state>"
+}
+```
+
+`state` is required when server-side state is enabled; omitted otherwise.
+
+```json
+// response (200) — sets zb_auth and zb_csrf cookies
+{ "token": "<jwt>" }
+```
+
+Both paths enforce the same security as the legacy endpoints: single-use TTL'd CSRF `state` consumed before the code exchange, PKCE required, redirect allow-list, and https-only provider URLs. On success, `onAuth(.oauth2)` fires through the shared session seam.
+
+> **Concurrency note:** `/auth/oauth2/complete` holds the DB writer across the provider HTTP round-trip. Under high OAuth2 concurrency, the legacy `/auth-with-oauth2` (which releases the writer during the provider exchange) remains the throughput-optimal path.
 
 ---
 

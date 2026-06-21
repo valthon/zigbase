@@ -398,6 +398,7 @@ Each auth collection in `.collections` can declare a `.auth.methods` struct enab
 | Magic link | `magic_link` | `ttl_s: i64` (default 900), `auto_create: bool` (default false) | initiate emails link; complete verifies+consumes |
 | OTP | `otp` | `length: u8` (default 6), `ttl_s: i64` (default 300) | initiate emails code; complete verifies code |
 | WebAuthn | `webauthn` | `rp_id: []const u8`, `rp_name: []const u8`, `origin: []const u8`, `credentials_collection: []const u8` | all four required |
+| OAuth2 | (see below) | gated by `.auth.oauth2.enabled` + `.auth.oauth2.providers` | 5th built-in; uses the contract but is NOT listed in `.auth.methods` |
 
 Each method accepts a `rate_limit` field:
 - `.default` — uses the global env-var rate-limiter (`ZIGBASE_RATE_LIMIT_MAX` / `ZIGBASE_RATE_LIMIT_WINDOW`).
@@ -528,9 +529,48 @@ Notes:
 - `store(id, data, ttl_s)` — store a challenge under `id` with the given TTL.
 - `consume(id) ![]const u8` — retrieve and delete in one atomic step (single-use).
 
-### OAuth2 scope
+### OAuth2 — contract method + legacy endpoints
 
-OAuth2 (Google, GitHub, etc.) remains on its existing dedicated endpoints (`oauth2-init` / `auth-with-oauth2`). It already routes through the same `issueSession`+`emitAuth` seam. Refactoring OAuth2 onto the `AuthMethod` contract was a deliberate decision deferred from this release; the dedicated endpoints work correctly and are unchanged.
+OAuth2 (Google, GitHub, etc.) is the **fifth built-in `AuthMethod`** (slug `oauth2`). It is gated by the existing `.auth.oauth2.enabled` + `.auth.oauth2.providers` config, **not** by `.auth.methods`. When OAuth2 is enabled for a collection the framework auto-mounts two contract endpoints in addition to the unchanged legacy endpoints.
+
+**New contract endpoints (auto-mounted):**
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata so the client can drive the authorization redirect. |
+| POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session. |
+
+**`oauth2` initiate** — body `{ "provider": "<name>" }`:
+```json
+// response (200)
+{
+  "authURL": "https://accounts.google.com/o/oauth2/v2/auth?...",
+  "clientId": "my-client-id.apps.googleusercontent.com",
+  "scopes": ["openid", "email", "profile"],
+  "state": "<server-issued-state>"   // present only when ZIGBASE_OAUTH_STATE_SERVER=true
+}
+```
+
+**`oauth2` complete** — body:
+```json
+{
+  "provider": "google",
+  "code": "<authorization-code>",
+  "codeVerifier": "<pkce-verifier>",
+  "redirectUrl": "https://app.example.com/callback",
+  "state": "<server-issued-state>"   // required when ZIGBASE_OAUTH_STATE_SERVER=true
+}
+```
+```json
+// response (200) — sets zb_auth and zb_csrf cookies
+{ "token": "<jwt>" }
+```
+
+On success the framework fires `onAuth(.oauth2)` through the shared session seam — identical to every other method. Both paths share one implementation (`prepareOAuth` + `resolveRecordFromIdentity`) and enforce the same security: single-use TTL'd CSRF `state` consumed before the code exchange, PKCE required, redirect allow-list, and https-only provider URLs.
+
+**Legacy endpoints are unchanged and continue to work:** `GET .../oauth2-providers`, `POST .../oauth2-init`, `POST .../auth-with-oauth2`. The legacy `auth-with-oauth2` response includes `{ token, record, meta: { isNew } }` (richer than the contract `{ token }` shape); use it when you need that extra data.
+
+> **Concurrency note:** the new `/auth/oauth2/complete` runs on the dispatch-held DB writer and holds it across the provider HTTP exchange. Under high OAuth2 concurrency the legacy `/auth-with-oauth2`, which releases the writer during the provider round-trip, remains the throughput-optimal path.
 
 ### Tier 3: escape hatch for exotic flows
 
