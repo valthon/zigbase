@@ -58,10 +58,12 @@ fn redirectAllowed(cfg: schema.OAuth2Provider, redirect_url: []const u8) bool {
 /// GET /api/collections/:col/auth/oauth2/providers — public redirect-building info (no secret).
 pub fn oauth2Providers(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    const w = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
+    // Read-only: only reads the collection + builds a JSON list (no writes).
+    // Use a pooled reader so the single global writer lock is not held.
+    var r = try app.pool.acquireReader();
+    defer app.pool.releaseReader(&r);
     const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const col = (try collections.get(ctx.allocator, w, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const col = (try collections.get(ctx.allocator, &r, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     if (col.type != .auth or !col.options.auth.oauth2.enabled) return ApiError.notFound().toResponse(ctx.allocator);
 
     var arr = std.json.Array.init(ctx.allocator);
@@ -168,7 +170,13 @@ fn createOAuthRecord(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection
     const app = ctx.app.?;
     const tk = try crypto.genToken(app.io, ctx.allocator, 32);
     var data: std.json.ObjectMap = .empty;
-    if (identity.email) |e| try data.put(ctx.allocator, "email", .{ .string = e });
+    // SECURITY: only claim the (UNIQUE) email field when the provider VERIFIED it.
+    // A provider's unverified email is attacker-controllable, so writing it here would
+    // let an attacker squat a victim's address in the namespace. Unverified-email OAuth
+    // records are created without an email (verified=false); the user can link/verify later.
+    if (identity.emailVerified) {
+        if (identity.email) |e| try data.put(ctx.allocator, "email", .{ .string = e });
+    }
     if (identity.name) |n| try data.put(ctx.allocator, "username", .{ .string = n });
     try data.put(ctx.allocator, "passwordHash", .{ .string = "" });
     try data.put(ctx.allocator, "tokenKey", .{ .string = tk });
@@ -453,6 +461,52 @@ test "unlink succeeds when another credential remains (password set)" {
     var c = env.ctx(a, .DELETE, "", &p);
     c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 204), (try unlinkProvider(&c)).status);
+}
+
+test "createOAuthRecord: unverified provider email is NOT claimed (no squat)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.seedOAuthCollection(a, "users");
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const col = (try collections.get(a, w, "users")).?;
+    var req = env.ctx(a, .POST, "", &[_]http.Param{});
+
+    // First identity: provider did NOT verify the email -> record created WITHOUT email.
+    const rid1 = try createOAuthRecord(&req, w, col, .{
+        .providerUserId = "P1", .email = "victim@example.com", .emailVerified = false, .name = "Mallory",
+    });
+    {
+        var st = try w.prepare("SELECT \"email\",\"verified\" FROM \"users\" WHERE \"id\"=?1;");
+        defer st.finalize();
+        try st.bindText(1, rid1);
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqualStrings("", st.columnText(0)); // email left unset
+        try std.testing.expectEqual(@as(i64, 0), st.columnInt(1)); // verified=false
+    }
+
+    // Second identity with the SAME unverified email must NOT collide (no unique email set).
+    const rid2 = try createOAuthRecord(&req, w, col, .{
+        .providerUserId = "P2", .email = "victim@example.com", .emailVerified = false, .name = "Other",
+    });
+    try std.testing.expect(!std.mem.eql(u8, rid1, rid2));
+
+    // A verified-email identity DOES claim the email.
+    const rid3 = try createOAuthRecord(&req, w, col, .{
+        .providerUserId = "P3", .email = "real@example.com", .emailVerified = true, .name = "Real",
+    });
+    {
+        var st = try w.prepare("SELECT \"email\",\"verified\" FROM \"users\" WHERE \"id\"=?1;");
+        defer st.finalize();
+        try st.bindText(1, rid3);
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqualStrings("real@example.com", st.columnText(0));
+        try std.testing.expectEqual(@as(i64, 1), st.columnInt(1));
+    }
 }
 
 test "deleting an auth record removes its external-auth links" {

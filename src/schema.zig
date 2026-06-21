@@ -118,6 +118,9 @@ pub const WebAuthnMethodOpts = struct {
     rp_name: []const u8 = "",
     origin: []const u8 = "",
     credentials_collection: []const u8 = "",
+    /// Require the User Verified (UV) authenticator flag on register + login.
+    /// Default false (backward-compatible passkey behavior).
+    require_uv: bool = false,
     rate_limit: RateLimitOpt = .default,
 };
 
@@ -132,6 +135,10 @@ pub const MethodsOptions = struct {
 pub const AuthOptions = struct {
     identityFields: []const []const u8 = &.{"email"},
     minPasswordLength: u8 = 8,
+    /// When true, a login that resolves a record whose `verified` field is not true is
+    /// rejected with 403 instead of minting a session. Default false (backward-compatible:
+    /// no email-verification gate).
+    require_verified: bool = false,
     oauth2: OAuth2Options = .{},
     methods: MethodsOptions = .{},
 };
@@ -146,6 +153,7 @@ pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u
     for (c.options.auth.identityFields) |f| try ids.append(.{ .string = f });
     try auth.put(alloc, "identityFields", .{ .array = ids });
     try auth.put(alloc, "minPasswordLength", .{ .integer = c.options.auth.minPasswordLength });
+    try auth.put(alloc, "require_verified", .{ .bool = c.options.auth.require_verified });
 
     var oauth2: ObjectMap = .empty;
     try oauth2.put(alloc, "enabled", .{ .bool = c.options.auth.oauth2.enabled });
@@ -200,6 +208,7 @@ pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u
         try wa_obj.put(alloc, "rp_name", .{ .string = wa.rp_name });
         try wa_obj.put(alloc, "origin", .{ .string = wa.origin });
         try wa_obj.put(alloc, "credentials_collection", .{ .string = wa.credentials_collection });
+        try wa_obj.put(alloc, "require_uv", .{ .bool = wa.require_uv });
         try wa_obj.put(alloc, "rate_limit", try rateLimitToJsonAlloc(alloc, wa.rate_limit));
         try methods.put(alloc, "webauthn", .{ .object = wa_obj });
     }
@@ -243,6 +252,9 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
     };
     if (av.object.get("minPasswordLength")) |mv| if (mv == .integer) {
         opts.auth.minPasswordLength = std.math.cast(u8, mv.integer) orelse 8;
+    };
+    if (av.object.get("require_verified")) |rv| if (rv == .bool) {
+        opts.auth.require_verified = rv.bool;
     };
     if (av.object.get("oauth2")) |ov| if (ov == .object) {
         opts.auth.oauth2.enabled = if (ov.object.get("enabled")) |ev| (ev == .bool and ev.bool) else false;
@@ -302,6 +314,7 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
             if (wav.object.get("rp_name")) |x| if (x == .string) { wa.rp_name = try alloc.dupe(u8, x.string); };
             if (wav.object.get("origin")) |x| if (x == .string) { wa.origin = try alloc.dupe(u8, x.string); };
             if (wav.object.get("credentials_collection")) |x| if (x == .string) { wa.credentials_collection = try alloc.dupe(u8, x.string); };
+            if (wav.object.get("require_uv")) |x| if (x == .bool) { wa.require_uv = x.bool; };
             if (wav.object.get("rate_limit")) |rlv| wa.rate_limit = rateLimitFromJson(rlv);
             opts.auth.methods.webauthn = wa;
         };
@@ -984,6 +997,20 @@ test "collection options round-trip identity fields" {
     try std.testing.expectEqual(@as(usize, 2), back.auth.identityFields.len);
     try std.testing.expectEqualStrings("username", back.auth.identityFields[1]);
     try std.testing.expectEqual(@as(u8, 10), back.auth.minPasswordLength);
+}
+
+test "require_verified round-trips through optionsToJson/optionsFromJson" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // default false
+    const d = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{} };
+    const back_d = try optionsFromJson(a, try optionsToJson(a, d, false));
+    try std.testing.expectEqual(false, back_d.auth.require_verified);
+    // explicit true
+    const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .require_verified = true } } };
+    const back = try optionsFromJson(a, try optionsToJson(a, c, false));
+    try std.testing.expectEqual(true, back.auth.require_verified);
 }
 
 test "validate rejects an auth collection with a non-identifier identity field" {

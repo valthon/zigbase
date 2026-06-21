@@ -395,6 +395,8 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 
 `:method` is the method slug (`magic_link`, `otp`, `password`, `webauthn`, `oauth2`, or a custom plugin's slug). Returns 404 when the collection doesn't exist, isn't an auth collection, or the method isn't enabled.
 
+> **`require_verified`:** if the auth collection is configured with `require_verified: true`, `complete` returns **403** when the matched record's `verified` field is `false`. This applies to all methods — including WebAuthn and OAuth2 accounts from providers that did not confirm the email address (created `verified=false`).
+
 **WebAuthn passkey registration** (authed — requires a valid session):
 
 | Method | Path | Description |
@@ -545,7 +547,7 @@ exclusively through the standard auth-method contract endpoints:
 }
 ```
 
-`state` is present only when `ZIGBASE_OAUTH_STATE_SERVER=true`; omitted otherwise.
+`state` is always present by default (`ZIGBASE_OAUTH_STATE_SERVER` defaults to `true`); omitted only when the server-side state is explicitly disabled.
 
 **`oauth2` complete** — body:
 
@@ -559,7 +561,7 @@ exclusively through the standard auth-method contract endpoints:
 }
 ```
 
-`state` is required when server-side state is enabled; omitted otherwise.
+`state` is required by default; omitted only when `ZIGBASE_OAUTH_STATE_SERVER=false`.
 `redirectUrl` must be in the provider's configured allowlist.
 
 ```json
@@ -573,21 +575,22 @@ On success, `onAuth(.oauth2)` fires through the shared session seam. Security en
 
 The OAuth `state` parameter prevents login-CSRF. ZigBase supports two modes:
 
-- **Client-driven (default).** The SPA generates `state`, embeds it in the provider
-  authorization URL, and verifies the returned `state` against what it stored before
-  calling `complete`. The backend does not see or check `state`.
-- **Server-side (opt-in).** Set `ZIGBASE_OAUTH_STATE_SERVER=true` (TTL via
-  `ZIGBASE_OAUTH_STATE_TTL`, default 600s). Then:
+- **Server-side (default).** `ZIGBASE_OAUTH_STATE_SERVER` defaults to `true` (TTL via
+  `ZIGBASE_OAUTH_STATE_TTL`, default 600s). The `initiate` endpoint issues a `state` value
+  that the client must round-trip through the provider and back to `complete`. The backend
+  verifies the state exists, matches the (collection, provider), is unexpired, and is
+  **single-use** (deleted on first use). A missing, mismatched, expired, or replayed `state`
+  is rejected with `400` before the provider is contacted.
   1. The client calls `POST .../auth/oauth2/initiate` with `{ "provider": "<name>" }` and
      receives `{ ..., "state": "<value>" }`.
   2. The client embeds that `state` in the provider authorization URL.
   3. On callback, the client adds `"state": "<value>"` to the `complete` body.
+- **Client-driven (opt-out).** Set `ZIGBASE_OAUTH_STATE_SERVER=false` to restore the
+  previous behavior: the SPA generates and verifies `state` itself; the backend does not
+  see or check it.
 
-  The backend verifies the state exists, matches the (collection, provider), is
-  unexpired, and is **single-use** (deleted on first use). A missing, mismatched,
-  expired, or replayed `state` is rejected with `400` before the provider is contacted.
-  **PKCE (`codeVerifier`) is still required in both modes** — server-side `state` adds
-  CSRF protection, it does not replace PKCE.
+**PKCE (`codeVerifier`) is required in both modes** — server-side `state` adds CSRF
+protection, it does not replace PKCE.
 
 ---
 

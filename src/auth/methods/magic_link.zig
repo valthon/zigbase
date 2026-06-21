@@ -46,20 +46,30 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         return InitiateResult{ .status = 429, .body = "{\"message\":\"Too many requests.\"}" };
 
     // Resolve identity under a READER (findByIdentity is read-only; mintLinkToken
-    // is a JWT mint and deliverMail is the mailer — neither needs the writer).
-    var r = try ac.reader();
-    defer r.deinit();
+    // is a JWT mint — neither needs the writer). Build the mail body into the request
+    // arena so it outlives the scoped reader block. Release the reader before the
+    // blocking SMTP send so a warm connection is not parked across the network round-trip.
+    var pending: ?struct { email: []const u8, mail_body: []const u8 } = null;
+    {
+        var r = try ac.reader();
+        defer r.deinit();
 
-    // Resolve identity; if found, mint and deliver the link token
-    if (try ac.findByIdentity(&r.conn, email)) |rid| {
-        const ttl: i64 = if (ac.collection.options.auth.methods.magic_link) |ml| ml.ttl_s else 900;
-        const token = try ac.mintLinkToken(&r.conn, rid, ttl);
-        const mail_body = try std.fmt.allocPrint(
-            ac.ctx.allocator,
-            "Your sign-in link token:\n\n{s}\n",
-            .{token},
-        );
-        try ac.deliverMail(email, "Your sign-in link", mail_body);
+        // Resolve identity; if found, mint the link token
+        if (try ac.findByIdentity(&r.conn, email)) |rid| {
+            const ttl: i64 = if (ac.collection.options.auth.methods.magic_link) |ml| ml.ttl_s else 900;
+            const token = try ac.mintLinkToken(&r.conn, rid, ttl);
+            const mail_body = try std.fmt.allocPrint(
+                ac.ctx.allocator,
+                "Your sign-in link token:\n\n{s}\n",
+                .{token},
+            );
+            pending = .{ .email = email, .mail_body = mail_body };
+        }
+    } // reader released here — SMTP send happens below without parking a warm connection
+
+    // Deliver the link by email (outside reader lock — SMTP may block)
+    if (pending) |p| {
+        try ac.deliverMail(p.email, "Your sign-in link", p.mail_body);
     }
 
     // ALWAYS return 204 — never reveal whether the email was found

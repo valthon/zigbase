@@ -155,66 +155,115 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid signature encoding." } };
     };
 
-    // The whole verify ceremony — take challenge, read credential, verify, update
-    // sign count — stays atomic under ONE writer held for the entire call.
-    var w = ac.writer();
-    defer w.deinit();
+    // ---- Phase 1 (writer held): consume the challenge + read the credential ----
+    // The challenge is single-use and consumed HERE, before the (expensive) verify.
+    // A failed verify therefore burns the challenge; the client restarts the ceremony.
+    // This matches OAuth state semantics. We capture everything we need into locals,
+    // then RELEASE the writer so the CPU verify in Phase 2 runs off the single lock.
+    var challenge_raw: []const u8 = undefined;
+    var cose_key_bytes: []const u8 = undefined;
+    var record_ref: []const u8 = undefined;
+    var stored_sign_count_p1: u32 = undefined;
+    {
+        var w = ac.writer();
+        defer w.deinit();
 
-    // Atomically take (consume) the challenge from the store using the ceremony id.
-    // SECURITY: take() filters by method, so a "webauthn_reg" registration challenge
-    // cannot be consumed by this login take() that passes "webauthn".
-    const cs = ChallengeStore{ .conn = w.conn };
-    const challenge_raw_b64 = (try cs.take(ac.ctx.allocator, ceremony_id, "webauthn")) orelse {
-        return Resolution{ .fail = .{ .status = 400, .message = "Invalid or expired ceremony." } };
-    };
-    // The stored payload is the raw challenge bytes (not base64url encoded).
-    const challenge_raw = challenge_raw_b64;
+        // Atomically take (consume) the challenge from the store using the ceremony id.
+        // SECURITY: take() filters by method, so a "webauthn_reg" registration challenge
+        // cannot be consumed by this login take() that passes "webauthn".
+        const cs = ChallengeStore{ .conn = w.conn };
+        const ch = (try cs.take(ac.ctx.allocator, ceremony_id, "webauthn")) orelse {
+            return Resolution{ .fail = .{ .status = 400, .message = "Invalid or expired ceremony." } };
+        };
 
-    // Look up the credential by its base64url credential id.
-    // SECURITY REQUIREMENT 1: user identity comes from the stored credential's record_ref,
-    // never from the client request.
-    const cred_store = CredentialStore{ .conn = w.conn };
-    const cred = (try cred_store.getByCredentialId(ac.ctx.allocator, credential_id_b64)) orelse {
-        return Resolution{ .fail = .{ .status = 400, .message = "Unknown credential." } };
-    };
+        // Look up the credential by its base64url credential id.
+        // SECURITY REQUIREMENT 1: user identity comes from the stored credential's record_ref,
+        // never from the client request.
+        const cred_store = CredentialStore{ .conn = w.conn };
+        const cred = (try cred_store.getByCredentialId(ac.ctx.allocator, credential_id_b64)) orelse {
+            return Resolution{ .fail = .{ .status = 400, .message = "Unknown credential." } };
+        };
 
-    // Decode the stored COSE public key (stored as raw COSE bytes, base64url encoded).
-    const cose_key_bytes = b64urlDecode(ac.ctx.allocator, cred.public_key) catch {
-        return Resolution{ .fail = .{ .status = 400, .message = "Stored credential key is invalid." } };
-    };
+        // SECURITY (cross-collection login): credentialIds are globally unique, so a passkey
+        // registered on another collection would otherwise resolve here. Bind the credential to
+        // THIS ceremony's collection. Use the generic "Unknown credential." message so we do not
+        // leak that the credential exists on a different collection.
+        if (!std.mem.eql(u8, cred.collection_ref, ac.collection.name)) {
+            return Resolution{ .fail = .{ .status = 400, .message = "Unknown credential." } };
+        }
 
-    // Parse the COSE key.
+        // Decode the stored COSE public key (stored as raw COSE bytes, base64url encoded).
+        const decoded_key = b64urlDecode(ac.ctx.allocator, cred.public_key) catch {
+            return Resolution{ .fail = .{ .status = 400, .message = "Stored credential key is invalid." } };
+        };
+
+        // Capture into Phase-1-outliving locals (all allocated from the request arena).
+        challenge_raw = ch;
+        cose_key_bytes = decoded_key;
+        record_ref = cred.record_ref;
+        stored_sign_count_p1 = cred.sign_count;
+    } // writer released — the lock is NOT held across the verify below.
+
+    // ---- Phase 2 (NO lock): parse COSE + verify the assertion (pure CPU, no DB) ----
+    // This is the expensive work (CBOR/COSE/signature). Fail closed on any error.
     const cose_result = cose.parseCoseKey(cose_key_bytes) catch {
         return Resolution{ .fail = .{ .status = 400, .message = "Failed to parse credential key." } };
     };
 
-    // Verify the assertion (§7.2).
     const assertion_result = authenticate_mod.verifyAssertion(
         ac.ctx.allocator,
         wa_opts.rp_id,
         wa_opts.origin,
         challenge_raw,
         cose_result.key,
-        cred.sign_count,
+        stored_sign_count_p1,
         cdj_bytes,
         auth_data_bytes,
         sig_bytes,
-        false, // require_uv — do not require user verification flag (passkey-safe default)
+        wa_opts.require_uv,
     ) catch {
         return Resolution{ .fail = .{ .status = 401, .message = "Assertion verification failed." } };
     };
 
-    // SECURITY REQUIREMENT 2: clone_suspected=true → fail 401, do NOT update signCount.
+    // SECURITY REQUIREMENT 2: clone_suspected (from the Phase-1 count) → fail 401, no update.
     if (assertion_result.clone_suspected) {
         return Resolution{ .fail = .{ .status = 401, .message = "Clone suspected. Login denied." } };
     }
 
-    // Update sign count for future clone detection.
-    try cred_store.updateSignCount(credential_id_b64, assertion_result.new_sign_count);
+    // ---- Phase 3 (writer held): re-read signCount, re-check clone, update — ATOMIC ----
+    // Re-acquiring the writer and RE-READING the stored signCount means the read-check-update
+    // happens under one lock, so two concurrent logins cannot both pass clone detection with
+    // the same stored count: the first updates it, the second re-reads the new value and the
+    // verified count is no longer strictly greater.
+    {
+        var w2 = ac.writer();
+        defer w2.deinit();
+
+        const cred_store = CredentialStore{ .conn = w2.conn };
+        const cur = (try cred_store.getByCredentialId(ac.ctx.allocator, credential_id_b64)) orelse {
+            // Credential vanished between phases (deleted concurrently) — fail closed.
+            return Resolution{ .fail = .{ .status = 400, .message = "Unknown credential." } };
+        };
+
+        // Re-evaluate clone detection against the freshly-read count under the lock.
+        // new must be strictly greater than the current stored count, UNLESS both are zero
+        // (counter-less authenticator / passkey), mirroring authenticate.zig step 7.
+        const new_count = assertion_result.new_sign_count;
+        const is_clone = blk: {
+            if (new_count > cur.sign_count) break :blk false;
+            if (new_count == 0 and cur.sign_count == 0) break :blk false;
+            break :blk true;
+        };
+        if (is_clone) {
+            return Resolution{ .fail = .{ .status = 401, .message = "Clone suspected. Login denied." } };
+        }
+
+        try cred_store.updateSignCount(credential_id_b64, new_count);
+    }
 
     // SECURITY REQUIREMENT 1 (enforced): return the credential's stored record_ref, not
     // any user-supplied id from the request body.
-    return Resolution{ .record = cred.record_ref };
+    return Resolution{ .record = record_ref };
 }
 
 const vtable = AuthMethod.VTable{
@@ -888,6 +937,242 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
             }
             try std.testing.expectEqual(@as(u32, 5), after.sign_count);
         },
+        .record => return error.TestFailed,
+    }
+}
+
+test "WebAuthnMethod: complete rejects a credential bound to a DIFFERENT collection (cross-collection)" {
+    // SECURITY (fix #1): credentialIds are globally unique. A passkey registered on collection X
+    // must NOT authenticate on collection Y's complete endpoint. We register the credential for
+    // collection "wax_a" but drive complete() against collection "wax_b" (same rp/origin), and
+    // expect a generic 400 "Unknown credential." (no leak that the credential exists elsewhere).
+    const http = @import("../../http.zig");
+    const collections = @import("../../collections.zig");
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const alloc = std.testing.allocator;
+
+    var wenv = try WaEnv.init();
+    defer wenv.deinit();
+
+    const rp_id = "example.test";
+    const origin = "https://example.test";
+
+    var setup_arena = std.heap.ArenaAllocator.init(alloc);
+    defer setup_arena.deinit();
+    const sa = setup_arena.allocator();
+
+    const seed = [_]u8{0x88} ** 32;
+    const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var x: [32]u8 = undefined;
+    var y: [32]u8 = undefined;
+    @memcpy(&x, sec1[1..33]);
+    @memcpy(&y, sec1[33..65]);
+    const cose_key_buf = try buildEc2CoseKeyBytes(alloc, x, y);
+    defer alloc.free(cose_key_buf);
+    const cose_key_b64 = try client_data.b64urlNoPad(alloc, cose_key_buf);
+    defer alloc.free(cose_key_b64);
+
+    const cred_id_raw = [_]u8{ 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88 };
+    const cred_id_b64 = try client_data.b64urlNoPad(alloc, &cred_id_raw);
+    defer alloc.free(cred_id_b64);
+
+    const challenge_raw = [_]u8{0x88} ** 32;
+    const challenge_b64 = try client_data.b64urlNoPad(alloc, &challenge_raw);
+    defer alloc.free(challenge_b64);
+
+    // Register the credential for collection "wax_a"; mint the LOGIN challenge for "wax_b".
+    const cid = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        inline for (.{ "wax_a", "wax_b" }) |name| {
+            _ = try collections.create(sa, std.testing.io, w, .{
+                .id = "",
+                .name = name,
+                .type = .auth,
+                .fields = &[_]test_schema.Field{},
+                .options = .{ .auth = .{ .methods = .{ .webauthn = .{
+                    .rp_id = rp_id,
+                    .rp_name = "Test App",
+                    .origin = origin,
+                } } } },
+            });
+        }
+        const cred_store = CredentialStore{ .conn = w };
+        // Credential's collectionRef = "wax_a".
+        try cred_store.insert(alloc, std.testing.io, "wax_a", "usr_a", cred_id_b64, cose_key_b64, -7, 0, "", "");
+        // Challenge is for the "wax_b" ceremony.
+        const cs = ChallengeStore{ .conn = w };
+        break :blk try cs.put(alloc, std.testing.io, "wax_b", "webauthn", "", &challenge_raw, 300);
+    };
+    defer alloc.free(cid);
+
+    var auth_data_raw: [37]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(rp_id, auth_data_raw[0..32], .{});
+    auth_data_raw[32] = 0x05;
+    std.mem.writeInt(u32, auth_data_raw[33..37], 1, .big);
+
+    const cdj = try std.fmt.allocPrint(alloc,
+        "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
+        .{ challenge_b64, origin },
+    );
+    defer alloc.free(cdj);
+
+    var sig_base: [37 + 32]u8 = undefined;
+    @memcpy(sig_base[0..37], &auth_data_raw);
+    std.crypto.hash.sha2.Sha256.hash(cdj, sig_base[37..][0..32], .{});
+    const raw_sig = try kp.sign(&sig_base, null);
+    var der_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
+    const der = raw_sig.toDer(&der_buf);
+
+    const auth_data_b64 = try client_data.b64urlNoPad(alloc, &auth_data_raw);
+    defer alloc.free(auth_data_b64);
+    const cdj_b64_enc = try client_data.b64urlNoPad(alloc, cdj);
+    defer alloc.free(cdj_b64_enc);
+    const sig_b64 = try client_data.b64urlNoPad(alloc, der);
+    defer alloc.free(sig_b64);
+
+    const body_str = try std.fmt.allocPrint(alloc,
+        "{{\"ceremonyId\":\"{s}\",\"credentialId\":\"{s}\",\"authenticatorData\":\"{s}\",\"clientDataJSON\":\"{s}\",\"signature\":\"{s}\"}}",
+        .{ cid, cred_id_b64, auth_data_b64, cdj_b64_enc, sig_b64 },
+    );
+    defer alloc.free(body_str);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Drive complete() against collection "wax_b" — the credential belongs to "wax_a".
+    const col = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "wax_b")).?;
+    };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
+
+    var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
+    const am = m.method();
+    const res = try am.vtable.complete(am.ctx, &ac);
+    switch (res) {
+        .fail => |f| {
+            try std.testing.expectEqual(@as(u16, 400), f.status);
+            try std.testing.expectEqualStrings("Unknown credential.", f.message);
+        },
+        .record => return error.TestFailed,
+    }
+}
+
+test "WebAuthnMethod: complete with require_uv=true rejects an assertion lacking the UV flag" {
+    // SECURITY (fix #3): with require_uv=true on the collection, an assertion whose authData
+    // flags have UP set but UV clear must be rejected (401).
+    const http = @import("../../http.zig");
+    const collections = @import("../../collections.zig");
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const alloc = std.testing.allocator;
+
+    var wenv = try WaEnv.init();
+    defer wenv.deinit();
+
+    const rp_id = "example.test";
+    const origin = "https://example.test";
+
+    var setup_arena = std.heap.ArenaAllocator.init(alloc);
+    defer setup_arena.deinit();
+    const sa = setup_arena.allocator();
+
+    const seed = [_]u8{0x99} ** 32;
+    const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var x: [32]u8 = undefined;
+    var y: [32]u8 = undefined;
+    @memcpy(&x, sec1[1..33]);
+    @memcpy(&y, sec1[33..65]);
+    const cose_key_buf = try buildEc2CoseKeyBytes(alloc, x, y);
+    defer alloc.free(cose_key_buf);
+    const cose_key_b64 = try client_data.b64urlNoPad(alloc, cose_key_buf);
+    defer alloc.free(cose_key_b64);
+
+    const cred_id_raw = [_]u8{ 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99 };
+    const cred_id_b64 = try client_data.b64urlNoPad(alloc, &cred_id_raw);
+    defer alloc.free(cred_id_b64);
+
+    const challenge_raw = [_]u8{0x99} ** 32;
+    const challenge_b64 = try client_data.b64urlNoPad(alloc, &challenge_raw);
+    defer alloc.free(challenge_b64);
+
+    const cid = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        _ = try collections.create(sa, std.testing.io, w, .{
+            .id = "",
+            .name = "wausers_uv",
+            .type = .auth,
+            .fields = &[_]test_schema.Field{},
+            .options = .{ .auth = .{ .methods = .{ .webauthn = .{
+                .rp_id = rp_id,
+                .rp_name = "Test App",
+                .origin = origin,
+                .require_uv = true, // <-- policy under test
+            } } } },
+        });
+        try w.exec("INSERT INTO \"wausers_uv\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('usr_uv','','','uv@x.io','tkuv',1);");
+        const cred_store = CredentialStore{ .conn = w };
+        try cred_store.insert(alloc, std.testing.io, "wausers_uv", "usr_uv", cred_id_b64, cose_key_b64, -7, 0, "", "");
+        const cs = ChallengeStore{ .conn = w };
+        break :blk try cs.put(alloc, std.testing.io, "wausers_uv", "webauthn", "", &challenge_raw, 300);
+    };
+    defer alloc.free(cid);
+
+    // authData flags = 0x01 → UP set, UV clear.
+    var auth_data_raw: [37]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(rp_id, auth_data_raw[0..32], .{});
+    auth_data_raw[32] = 0x01;
+    std.mem.writeInt(u32, auth_data_raw[33..37], 1, .big);
+
+    const cdj = try std.fmt.allocPrint(alloc,
+        "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
+        .{ challenge_b64, origin },
+    );
+    defer alloc.free(cdj);
+
+    var sig_base: [37 + 32]u8 = undefined;
+    @memcpy(sig_base[0..37], &auth_data_raw);
+    std.crypto.hash.sha2.Sha256.hash(cdj, sig_base[37..][0..32], .{});
+    const raw_sig = try kp.sign(&sig_base, null);
+    var der_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
+    const der = raw_sig.toDer(&der_buf);
+
+    const auth_data_b64 = try client_data.b64urlNoPad(alloc, &auth_data_raw);
+    defer alloc.free(auth_data_b64);
+    const cdj_b64_enc = try client_data.b64urlNoPad(alloc, cdj);
+    defer alloc.free(cdj_b64_enc);
+    const sig_b64 = try client_data.b64urlNoPad(alloc, der);
+    defer alloc.free(sig_b64);
+
+    const body_str = try std.fmt.allocPrint(alloc,
+        "{{\"ceremonyId\":\"{s}\",\"credentialId\":\"{s}\",\"authenticatorData\":\"{s}\",\"clientDataJSON\":\"{s}\",\"signature\":\"{s}\"}}",
+        .{ cid, cred_id_b64, auth_data_b64, cdj_b64_enc, sig_b64 },
+    );
+    defer alloc.free(body_str);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const col = blk: {
+        const w = wenv.pool.acquireWriter();
+        defer wenv.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "wausers_uv")).?;
+    };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
+
+    var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
+    const am = m.method();
+    const res = try am.vtable.complete(am.ctx, &ac);
+    switch (res) {
+        .fail => |f| try std.testing.expectEqual(@as(u16, 401), f.status),
         .record => return error.TestFailed,
     }
 }

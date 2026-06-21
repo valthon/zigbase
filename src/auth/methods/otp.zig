@@ -89,22 +89,30 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
     const ttl_s: i64 = if (ac.collection.options.auth.methods.otp) |o| o.ttl_s else 300;
 
     // Identity lookup + challenge store happen under ONE writer (the store write
-    // must persist; keep the lookup atomic with it).
-    var w = ac.writer();
-    defer w.deinit();
+    // must persist; keep the lookup atomic with it). Build the mail body into the
+    // request arena so it outlives the scoped writer block below.
+    var pending: ?struct { email: []const u8, code: []const u8 } = null;
+    {
+        var w = ac.writer();
+        defer w.deinit();
 
-    // Only issue a code if the identity exists (never reveal whether the email was found)
-    if (try ac.findByIdentity(w.conn, email)) |_| {
-        // Generate a random numeric code of `length` digits (rejection-sampling, no modulo bias)
-        const code = try ac.ctx.allocator.alloc(u8, length);
-        generateCode(ac.app.io, code);
+        // Only issue a code if the identity exists (never reveal whether the email was found)
+        if (try ac.findByIdentity(w.conn, email)) |_| {
+            // Generate a random numeric code of `length` digits (rejection-sampling, no modulo bias)
+            const code = try ac.ctx.allocator.alloc(u8, length);
+            generateCode(ac.app.io, code);
 
-        // Store via ChallengeStore (single-use, TTL'd)
-        const store = ChallengeStore{ .conn = w.conn };
-        _ = try store.put(ac.ctx.allocator, ac.app.io, ac.collection.name, "otp", email, code, ttl_s);
+            // Store via ChallengeStore (single-use, TTL'd)
+            const store = ChallengeStore{ .conn = w.conn };
+            _ = try store.put(ac.ctx.allocator, ac.app.io, ac.collection.name, "otp", email, code, ttl_s);
 
-        // Deliver the code by email
-        try ac.deliverMail(email, "Your sign-in code", code);
+            pending = .{ .email = email, .code = code };
+        }
+    } // writer released here — SMTP send happens below without holding the writer lock
+
+    // Deliver the code by email (outside writer lock — SMTP may block)
+    if (pending) |p| {
+        try ac.deliverMail(p.email, "Your sign-in code", p.code);
     }
 
     // ALWAYS return 204 — never reveal whether the email was found

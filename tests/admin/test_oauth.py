@@ -40,8 +40,8 @@ def test_configure_oauth_provider_and_secret_redacted(page):
 
     # --- Contract endpoint: POST /api/collections/:col/auth/oauth2/initiate ---
     # Posting a valid provider name should return the redirect-building info
-    # (authURL, clientId, scopes). No state is expected when server-side state
-    # is disabled (the default).
+    # (authURL, clientId, scopes). Server-side CSRF `state` is ON by default, so
+    # initiate also mints a single-use `state` the client must echo back on complete.
     r2 = api_request(page, "POST", "/api/collections/members/auth/oauth2/initiate",
                      {"provider": "google"})
     assert r2.status == 200
@@ -51,3 +51,6 @@ def test_configure_oauth_provider_and_secret_redacted(page):
     assert init_body["clientId"] == "my-client-id"
     assert "scopes" in init_body
     assert isinstance(init_body["scopes"], list)
+    # Secure-by-default: a CSRF state is issued.
+    assert "state" in init_body
+    assert isinstance(init_body["state"], str) and len(init_body["state"]) > 0

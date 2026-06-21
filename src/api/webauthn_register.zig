@@ -131,26 +131,7 @@ pub fn begin(ctx: *http.RequestCtx) anyerror!http.Response {
 pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator);
 
-    const w = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
-
-    // Authenticate the caller.
-    // SECURITY REQUIREMENT 2: credential's record_ref is the authed user id, never body-supplied.
-    const user_id = (try requireAuthed(ctx, w)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
-
-    // Load the collection + webauthn opts.
-    const load = (try loadWebAuthnCollection(ctx, w)) orelse
-        return (ApiError.notFound()).toResponse(ctx.allocator);
-    const col = load.col;
-    const wa_opts = load.opts;
-
-    // Guard: reject mis-configured webauthn (empty rp_id or origin).
-    if (wa_opts.rp_id.len == 0 or wa_opts.origin.len == 0) {
-        return (ApiError{ .status = 500, .message = "WebAuthn is enabled but not configured (rp_id and origin are required)." }).toResponse(ctx.allocator);
-    }
-
-    // Parse the request body.
+    // Parse the request body (no DB / no lock needed).
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch {
         return (ApiError.badRequest("Invalid JSON body.")).toResponse(ctx.allocator);
     };
@@ -169,15 +150,40 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         return (ApiError.badRequest("clientDataJSON is required.")).toResponse(ctx.allocator);
     };
 
-    // Atomically take (consume) the registration challenge.
-    // SECURITY: take() filters by method, so a "webauthn" login challenge cannot be consumed
-    // by this registration take() that passes "webauthn_reg", and vice versa.
-    const cs = ChallengeStore{ .conn = w };
-    const challenge_raw_bytes = (try cs.take(ctx.allocator, ceremony_id, "webauthn_reg")) orelse {
-        return (ApiError{ .status = 400, .message = "Invalid or expired ceremony." }).toResponse(ctx.allocator);
-    };
+    // ---- Phase 1 (writer held): authenticate, load collection, consume the challenge ----
+    // SECURITY REQUIREMENT 2: credential's record_ref is the authed user id, never body-supplied.
+    // The registration challenge is single-use and consumed HERE before the (expensive) verify.
+    var col_name: []const u8 = undefined;
+    var user_id: []const u8 = undefined;
+    var wa_opts: schema.WebAuthnMethodOpts = undefined;
+    var challenge_raw_bytes: []const u8 = undefined;
+    {
+        const w = app.pool.acquireWriter();
+        defer app.pool.releaseWriter();
 
-    // Decode base64url inputs.
+        user_id = (try requireAuthed(ctx, w)) orelse
+            return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+
+        const load = (try loadWebAuthnCollection(ctx, w)) orelse
+            return (ApiError.notFound()).toResponse(ctx.allocator);
+        wa_opts = load.opts;
+        col_name = load.col.name;
+
+        // Guard: reject mis-configured webauthn (empty rp_id or origin).
+        if (wa_opts.rp_id.len == 0 or wa_opts.origin.len == 0) {
+            return (ApiError{ .status = 500, .message = "WebAuthn is enabled but not configured (rp_id and origin are required)." }).toResponse(ctx.allocator);
+        }
+
+        // Atomically take (consume) the registration challenge.
+        // SECURITY: take() filters by method, so a "webauthn" login challenge cannot be consumed
+        // by this registration take() that passes "webauthn_reg", and vice versa.
+        const cs = ChallengeStore{ .conn = w };
+        challenge_raw_bytes = (try cs.take(ctx.allocator, ceremony_id, "webauthn_reg")) orelse {
+            return (ApiError{ .status = 400, .message = "Invalid or expired ceremony." }).toResponse(ctx.allocator);
+        };
+    } // writer released — verifyRegistration below runs OFF the lock.
+
+    // ---- Phase 2 (NO lock): decode inputs + verify the registration ceremony ----
     const att_obj_bytes = b64urlDecode(ctx.allocator, att_obj_b64) catch {
         return (ApiError.badRequest("Invalid attestationObject encoding.")).toResponse(ctx.allocator);
     };
@@ -185,7 +191,6 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         return (ApiError.badRequest("Invalid clientDataJSON encoding.")).toResponse(ctx.allocator);
     };
 
-    // Verify the registration ceremony.
     const reg_result = register_mod.verifyRegistration(
         ctx.allocator,
         wa_opts.rp_id,
@@ -193,37 +198,41 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         challenge_raw_bytes,
         cdj_bytes,
         att_obj_bytes,
-        false, // require_uv: do not require UV flag (passkey default)
+        wa_opts.require_uv,
     ) catch {
         return (ApiError{ .status = 400, .message = "Registration verification failed." }).toResponse(ctx.allocator);
     };
 
-    // Base64url-encode the credential id for storage.
+    // Base64url-encode the credential id, COSE public key, and AAGUID for storage.
     const cred_id_b64 = try client_data.b64urlNoPad(ctx.allocator, reg_result.credential_id);
-
-    // SECURITY REQUIREMENT 3: check uniqueness BEFORE insert.
-    const cred_store = CredentialStore{ .conn = w };
-    if (try cred_store.existsCredentialId(cred_id_b64)) {
-        return (ApiError{ .status = 409, .message = "Credential already registered." }).toResponse(ctx.allocator);
-    }
-
-    // Base64url-encode the COSE public key and AAGUID for storage.
     const cose_pubkey_b64 = try client_data.b64urlNoPad(ctx.allocator, reg_result.cose_pubkey);
     const aaguid_b64 = try client_data.b64urlNoPad(ctx.allocator, &reg_result.aaguid);
 
-    // Insert the credential. record_ref = authed user id (never body-supplied).
-    try cred_store.insert(
-        ctx.allocator,
-        app.io,
-        col.name,
-        user_id, // SECURITY: always the authenticated user, not from request body
-        cred_id_b64,
-        cose_pubkey_b64,
-        reg_result.alg,
-        reg_result.sign_count,
-        aaguid_b64,
-        "", // transports: not parsed from body in v1
-    );
+    // ---- Phase 3 (writer held): uniqueness check + insert (atomic) ----
+    {
+        const w = app.pool.acquireWriter();
+        defer app.pool.releaseWriter();
+
+        const cred_store = CredentialStore{ .conn = w };
+        // SECURITY REQUIREMENT 3: check uniqueness BEFORE insert (insert also enforces UNIQUE).
+        if (try cred_store.existsCredentialId(cred_id_b64)) {
+            return (ApiError{ .status = 409, .message = "Credential already registered." }).toResponse(ctx.allocator);
+        }
+
+        // Insert the credential. record_ref = authed user id (never body-supplied).
+        try cred_store.insert(
+            ctx.allocator,
+            app.io,
+            col_name,
+            user_id, // SECURITY: always the authenticated user, not from request body
+            cred_id_b64,
+            cose_pubkey_b64,
+            reg_result.alg,
+            reg_result.sign_count,
+            aaguid_b64,
+            "", // transports: not parsed from body in v1
+        );
+    }
 
     return http.Response{ .status = 200, .body = "{\"registered\":true}" };
 }

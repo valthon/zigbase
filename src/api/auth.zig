@@ -29,6 +29,19 @@ fn strField(obj: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
+/// True iff the record's `verified` field is truthy. Tolerant of the JSON shapes a
+/// bool column can surface as (bool, integer 0/1, or "true"/"false" string).
+pub fn recordVerified(rec: std.json.Value) bool {
+    if (rec != .object) return false;
+    const v = rec.object.get("verified") orelse return false;
+    return switch (v) {
+        .bool => |b| b,
+        .integer => |i| i != 0,
+        .string => |s| std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1"),
+        else => false,
+    };
+}
+
 /// Wall-clock seconds (no DB connection needed) for the rate limiter, mirroring
 /// scheduler.unixNow — used at the top of the gated endpoints before any conn exists.
 fn wallNowUnix(io: std.Io) i64 {
@@ -192,6 +205,9 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
 
     const rec = (try records.get(ctx.allocator, &r, col, rid)) orelse
         return ApiError.notFound().toResponse(ctx.allocator);
+    // Optional verification gate: refuse to mint a session for an unverified record.
+    if (col.options.auth.require_verified and !recordVerified(rec))
+        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
     const issued = issueSessionExt(ctx, &r, col.name, rid, .password, rec) catch |err| switch (err) {
         error.NotFound => return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator),
         else => return err,
@@ -736,6 +752,42 @@ test "F7: a too-short password does not consume the reset token" {
     const ok = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var good = env.ctx(a, .POST, ok, &p);
     try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&good)).status);
+}
+
+test "require_verified gates password login: unverified 403, verified 200" {
+    var env = try TestEnv.initAuth("gated");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Recreate the collection with require_verified = true (initAuth made a default one).
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const existing = (try collections.get(a, w, "gated")).?;
+        try collections.delete(a, w, existing.id);
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "gated", .type = .auth,
+            .fields = &[_]schema.Field{},
+            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .options = .{ .auth = .{ .require_verified = true } },
+        });
+    }
+    try env.createUser(a, "gated", "g@x.io", "longenough"); // created verified=false
+
+    const p = [_]http.Param{.{ .key = "col", .value = "gated" }};
+    var login = env.ctx(a, .POST, "{\"identity\":\"g@x.io\",\"password\":\"longenough\"}", &p);
+    try std.testing.expectEqual(@as(u16, 403), (try authWithPassword(&login)).status);
+
+    // Mark verified, then login succeeds.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("UPDATE \"gated\" SET \"verified\" = 1 WHERE \"email\" = 'g@x.io';");
+    }
+    var login2 = env.ctx(a, .POST, "{\"identity\":\"g@x.io\",\"password\":\"longenough\"}", &p);
+    try std.testing.expectEqual(@as(u16, 200), (try authWithPassword(&login2)).status);
 }
 
 test "RouteEvent.issueSession mints a session and fires onAuth(custom)" {

@@ -397,8 +397,12 @@ Each auth collection in `.collections` can declare a `.auth.methods` struct enab
 | Password | `password` | (none beyond `rate_limit`) | Built-in default when no `.methods` specified |
 | Magic link | `magic_link` | `ttl_s: i64` (default 900), `auto_create: bool` (default false) | initiate emails link; complete verifies+consumes |
 | OTP | `otp` | `length: u8` (default 6), `ttl_s: i64` (default 300) | initiate emails code; complete verifies code |
-| WebAuthn | `webauthn` | `rp_id: []const u8`, `rp_name: []const u8`, `origin: []const u8`, `credentials_collection: []const u8` | all four required |
+| WebAuthn | `webauthn` | `rp_id: []const u8`, `rp_name: []const u8`, `origin: []const u8`, `credentials_collection: []const u8`, `require_uv: bool` (default false) | all four string fields required; `require_uv` rejects assertions without user-verification (biometrics/PIN) |
 | OAuth2 | (see below) | gated by `.auth.oauth2.enabled` + `.auth.oauth2.providers` | 5th built-in; uses the contract but is NOT listed in `.auth.methods` |
+
+**Per-collection auth options** (set directly on `.auth`, independent of which methods are enabled):
+
+- **`require_verified: bool`** (default `false`) — when `true`, any login attempt is rejected with `403` if the auth record's `verified` field is `false`. This gate applies to **all** auth methods, including WebAuthn passkeys and OAuth2 accounts created from providers that did not confirm the email address (those are created `verified=false`). Enable it only after ensuring existing users have verified accounts, or after setting up a verification flow.
 
 Each method accepts a `rate_limit` field:
 - `.default` — uses the global env-var rate-limiter (`ZIGBASE_RATE_LIMIT_MAX` / `ZIGBASE_RATE_LIMIT_WINDOW`).
@@ -522,9 +526,11 @@ A plugin type missing `create`/`method`/`deinit` is a **compile error**. Built-i
 3. `POST /api/collections/:col/auth/webauthn/register/finish` with `{ "ceremonyId": "...", "id": "...", "rawId": "...", "response": { "clientDataJSON": "...", "attestationObject": "..." } }`. Stores the credential in `_webauthnCredentials` bound to the authenticated user.
 
 Notes:
-- Supports ES256 (P-256, COSE -7) and Ed25519 (COSE -8) public keys.
+- Supports ES256 (P-256, COSE -7) and Ed25519 (COSE -8) public keys; the COSE key curve is validated against the algorithm (ES256→P-256, EdDSA→Ed25519).
 - Attestation format: `fmt:"none"` (v1; other formats are future work).
 - `signCount` is tracked; a count regression (possible credential clone) fails authentication closed.
+- Each credential is bound to the collection it was registered on; presenting it on a different collection returns `401`.
+- `require_uv: true` rejects assertions where the authenticator did not perform user verification (biometrics or PIN). Default `false`.
 - Requires `webauthn.credentials_collection` to name a collection that stores credentials.
 
 ### ChallengeStore
@@ -550,7 +556,7 @@ OAuth2 (Google, GitHub, etc.) is the **fifth built-in `AuthMethod`** (slug `oaut
   "authURL": "https://accounts.google.com/o/oauth2/v2/auth?...",
   "clientId": "my-client-id.apps.googleusercontent.com",
   "scopes": ["openid", "email", "profile"],
-  "state": "<server-issued-state>"   // present only when ZIGBASE_OAUTH_STATE_SERVER=true
+  "state": "<server-issued-state>"   // always present (ZIGBASE_OAUTH_STATE_SERVER defaults to true)
 }
 ```
 
@@ -561,7 +567,7 @@ OAuth2 (Google, GitHub, etc.) is the **fifth built-in `AuthMethod`** (slug `oaut
   "code": "<authorization-code>",
   "codeVerifier": "<pkce-verifier>",
   "redirectUrl": "https://app.example.com/callback",
-  "state": "<server-issued-state>"   // required when ZIGBASE_OAUTH_STATE_SERVER=true
+  "state": "<server-issued-state>"   // required by default (ZIGBASE_OAUTH_STATE_SERVER defaults to true)
 }
 ```
 ```json

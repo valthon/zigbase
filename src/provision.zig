@@ -132,6 +132,9 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
             if (@hasField(A, "methods")) {
                 col.options.auth.methods = buildMethodsOptions(spec.auth.methods);
             }
+            if (@hasField(A, "require_verified")) {
+                col.options.auth.require_verified = spec.auth.require_verified;
+            }
         }
         return col;
     }
@@ -183,6 +186,7 @@ fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
         if (@hasField(@TypeOf(wa), "rp_name")) p.rp_name = wa.rp_name;
         if (@hasField(@TypeOf(wa), "origin")) p.origin = wa.origin;
         if (@hasField(@TypeOf(wa), "credentials_collection")) p.credentials_collection = wa.credentials_collection;
+        if (@hasField(@TypeOf(wa), "require_uv")) p.require_uv = wa.require_uv;
         if (@hasField(@TypeOf(wa), "rate_limit")) p.rate_limit = buildRateLimitOpt(wa.rate_limit);
         out.webauthn = p;
     }

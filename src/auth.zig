@@ -194,10 +194,10 @@ pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, 
     };
     if (!ok) return null;
     const is_super = std.mem.eql(u8, claims.collection, "_superusers");
-    const table = if (is_super) "_superusers" else blk: {
-        const col = (collections.get(alloc, conn, claims.collection) catch return null) orelse return null;
-        break :blk col.name;
-    };
+    // Resolve the collection once and reuse it for both the tokenKey lookup and the
+    // record fetch — avoids a redundant collections.get on every authenticated request.
+    const col_or_null = if (is_super) null else (collections.get(alloc, conn, claims.collection) catch return null) orelse return null;
+    const table = if (is_super) "_superusers" else col_or_null.?.name;
     const tk = (tokenKeyFor(alloc, conn, table, claims.id) catch return null) orelse return null;
     const key = crypto.deriveKey(app.jwt_secret, tk);
     const now = nowUnix(conn) catch return null;
@@ -205,9 +205,8 @@ pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, 
     const rec = if (is_super)
         (superuserRecord(alloc, conn, claims.id) catch return null) orelse return null
     else blk: {
-        const col = (collections.get(alloc, conn, claims.collection) catch return null) orelse return null;
         const records = @import("records.zig");
-        break :blk (records.get(alloc, conn, col, claims.id) catch return null) orelse return null;
+        break :blk (records.get(alloc, conn, col_or_null.?, claims.id) catch return null) orelse return null;
     };
     return .{ .record = rec, .collection = claims.collection, .is_superuser = is_super, .exp = claims.exp };
 }

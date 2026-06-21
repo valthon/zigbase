@@ -18,6 +18,7 @@ const registry_mod = @import("../auth/registry.zig");
 const method_mod = @import("../auth/method.zig");
 const ApiError = @import("error.zig").ApiError;
 const auth = @import("auth.zig");
+const records = @import("../records.zig");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -157,6 +158,14 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                     // mint the session cannot deadlock.
                     const w = app.pool.acquireWriter();
                     defer app.pool.releaseWriter();
+                    // Optional verification gate: refuse to mint a session for a record
+                    // whose `verified` field is not true (when the collection requires it).
+                    if (col.options.auth.require_verified) {
+                        const rec = (try records.get(ctx.allocator, w, col, rid)) orelse
+                            return (ApiError.notFound()).toResponse(ctx.allocator);
+                        if (!auth.recordVerified(rec))
+                            return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
+                    }
                     const issued = try auth.issueSession(ctx, w, col.name, rid, auth_tag);
                     var root: std.json.ObjectMap = .empty;
                     try root.put(ctx.allocator, "token", .{ .string = issued.token });

@@ -261,6 +261,7 @@ test "OAuth2Method: completeImpl creates a new record (isNew) with valid stub" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    env.app.oauth_state_server = false; // exercise the no-state (client-driven) path explicitly
     try env.seedOAuthCollection(a, "oauth2users");
 
     const col = blk: {
@@ -293,6 +294,7 @@ test "OAuth2Method: completeImpl second login returns same rid (not new)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    env.app.oauth_state_server = false; // exercise the no-state (client-driven) path explicitly
     try env.seedOAuthCollection(a, "oauth2users2");
 
     const col = blk: {
@@ -333,6 +335,7 @@ test "OAuth2Method: completeImpl token exchange fail returns .fail 400" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    env.app.oauth_state_server = false; // exercise the no-state (client-driven) path explicitly
     try env.seedOAuthCollection(a, "oauth2users3");
 
     const col = blk: {
@@ -422,8 +425,33 @@ test "OAuth2Method: initiate returns 200 JSON with authURL+clientId+scopes" {
     try std.testing.expect(std.mem.indexOf(u8, result.body.?, "authURL") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.body.?, "clientId") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.body.?, "scopes") != null);
-    // state should NOT be present when oauth_state_server is false
-    try std.testing.expect(std.mem.indexOf(u8, result.body.?, "state") == null);
+    // Secure-by-default: server-side state is ON, so initiate issues a `state`.
+    try std.testing.expect(std.mem.indexOf(u8, result.body.?, "\"state\"") != null);
+}
+
+test "OAuth2Method: initiate omits state when oauth_state_server is disabled" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    env.app.oauth_state_server = false;
+    try env.seedOAuthCollection(a, "oauth2initnostate");
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "oauth2initnostate")).?;
+    };
+    var req = env.ctx(a, .POST, "{\"provider\":\"google\"}", &[_]http.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    var m = try OAuth2Method.create(std.testing.allocator, std.testing.io, .{});
+    const am = m.method();
+    const result = try am.vtable.initiate(am.ctx, &ac);
+    try std.testing.expectEqual(@as(u16, 200), result.status);
+    // No state field when server-side state is opted out.
+    try std.testing.expect(std.mem.indexOf(u8, result.body.?, "\"state\"") == null);
 }
 
 test "OAuth2Method: initiate missing provider returns 400" {

@@ -14,6 +14,8 @@ pub const Error = error{
     UnknownAlgorithm,
     MissingField,
     InvalidFieldSize,
+    /// The COSE_Key's curve does not match its algorithm (curve-confusion guard).
+    CurveMismatch,
 } || cbor.Error;
 
 /// A decoded COSE_Key. For RSA, n/e are slices into the original buffer.
@@ -104,6 +106,8 @@ pub fn parseCoseKey(bytes: []const u8) Error!struct { key: CoseKey, consumed: us
             if (alg == null) return error.MissingField;
             if (alg.? != -8) return error.UnknownAlgorithm;
             if (crv == null) return error.MissingField;
+            // EdDSA (alg=-8) requires crv == Ed25519 (COSE crv id 6) — reject curve confusion.
+            if (crv.? != 6) return error.CurveMismatch;
             if (x_bytes == null) return error.MissingField;
             if (x_bytes.?.len != 32) return error.InvalidFieldSize;
             var x: [32]u8 = undefined;
@@ -114,6 +118,8 @@ pub fn parseCoseKey(bytes: []const u8) Error!struct { key: CoseKey, consumed: us
             if (alg == null) return error.MissingField;
             if (alg.? != -7) return error.UnknownAlgorithm;
             if (crv == null) return error.MissingField;
+            // ES256 (alg=-7) requires crv == P-256 (COSE crv id 1) — reject curve confusion.
+            if (crv.? != 1) return error.CurveMismatch;
             if (x_bytes == null) return error.MissingField;
             if (y_bytes == null) return error.MissingField;
             if (x_bytes.?.len != 32) return error.InvalidFieldSize;
@@ -330,6 +336,41 @@ test "cose: x wrong size returns InvalidFieldSize" {
     defer buf.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.InvalidFieldSize, parseCoseKey(buf.items));
+}
+
+test "cose: EC2/ES256 with wrong crv (Ed25519=6) returns CurveMismatch" {
+    // alg=-7 (ES256) but crv=6 (Ed25519) — curve confusion must be rejected.
+    var x_bytes: [32]u8 = undefined;
+    var y_bytes: [32]u8 = undefined;
+    @memset(&x_bytes, 0x01);
+    @memset(&y_bytes, 0x02);
+
+    var buf = try buildCoseMap(std.testing.allocator, &[_]TestPair{
+        .{ .k = 1, .v = .{ .int = 2 } }, // kty=EC2
+        .{ .k = 3, .v = .{ .int = -7 } }, // alg=ES256
+        .{ .k = -1, .v = .{ .int = 6 } }, // crv=Ed25519 (WRONG for ES256)
+        .{ .k = -2, .v = .{ .bstr = &x_bytes } },
+        .{ .k = -3, .v = .{ .bstr = &y_bytes } },
+    });
+    defer buf.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.CurveMismatch, parseCoseKey(buf.items));
+}
+
+test "cose: OKP/EdDSA with wrong crv (P-256=1) returns CurveMismatch" {
+    // alg=-8 (EdDSA) but crv=1 (P-256) — curve confusion must be rejected.
+    var x_bytes: [32]u8 = undefined;
+    @memset(&x_bytes, 0xab);
+
+    var buf = try buildCoseMap(std.testing.allocator, &[_]TestPair{
+        .{ .k = 1, .v = .{ .int = 1 } }, // kty=OKP
+        .{ .k = 3, .v = .{ .int = -8 } }, // alg=EdDSA
+        .{ .k = -1, .v = .{ .int = 1 } }, // crv=P-256 (WRONG for EdDSA)
+        .{ .k = -2, .v = .{ .bstr = &x_bytes } },
+    });
+    defer buf.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.CurveMismatch, parseCoseKey(buf.items));
 }
 
 test "cose: RSA label -1 is n (not crv)" {
