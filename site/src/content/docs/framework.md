@@ -94,6 +94,7 @@ pub fn main(init: std.process.Init) !void {
 | `static_files` | Comptime static-file mode: absent (default flag), `.disabled`, `.{ .dir = "..." }`, `.{ .embedded = ... }`. |
 | `storage` | Storage plugin TYPE (defaults to local-disk storage). |
 | `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). |
+| `auth_methods` | Register custom `AuthMethod` plugin TYPES (comptime, like `.storage`/`.mailer`). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
@@ -332,14 +333,175 @@ One handler each, registered by the matching config key:
 | `onBeforeTerminate` | `fn (ev: *zigbase.events.LifecycleEvent) void` | Just before shutdown. |
 
 `AuthEvent` carries `app`, `ctx`, `collection`, `record: ?std.json.Value`, and `method`
-(`.password` | `.oauth2` | `.custom`). `FileEvent` carries `app`, `ctx`, `collection`,
+(`.password` | `.oauth2` | `.magic_link` | `.otp` | `.webauthn` | `.custom`). `FileEvent` carries `app`, `ctx`, `collection`,
 `record_id`, and `filename`. `LifecycleEvent` carries `app`.
 
-### Custom auth flows
+### Auth methods overview
 
-ZigBase exposes a `zigbase.auth` helper surface so you can build passwordless,
-magic-link, SSO-token, or any other custom login flow while staying in the same
-session-issuance seam that built-in logins use.
+ZigBase ships with a **pluggable auth-method system** that lets every auth collection enable built-in or custom login methods via config, with no route code. The system is built around a two-phase contract:
+
+1. **Initiate** — challenge delivery (email a link/code, return WebAuthn options, or a no-op for API-key flows).
+2. **Complete** — proof verification. On success the method returns a `Resolution.record(record_id)` and the framework mints the session via the one seam (`issueSession`+`emitAuth`), firing `onAuth`. The method never mints sessions itself.
+
+There are three tiers:
+
+| Tier | How | When |
+|---|---|---|
+| Built-in | `magic_link`, `otp`, `password`, `webauthn` in `.auth.methods` | Most apps — no Zig code needed |
+| Custom plugin | Register a TYPE in `.auth_methods`; reference by slug in `.auth.methods` | Non-standard verification (corp SSO, API keys, etc.) |
+| Escape hatch | Custom routes + `ev.issueSession` / `zigbase.auth` API (see below) | Exotic flows where the two-phase contract doesn't fit |
+
+**Backward compatibility:** an auth collection with no `.auth.methods` config defaults to `password` — existing deployments are unaffected.
+
+### Enabling auth methods per collection (`.auth.methods`)
+
+Each auth collection in `.collections` can declare a `.auth.methods` struct enabling one or more built-in methods:
+
+| Method | Key | Options | Notes |
+|---|---|---|---|
+| Password | `password` | (none beyond `rate_limit`) | Built-in default when no `.methods` specified |
+| Magic link | `magic_link` | `ttl_s: i64` (default 900), `auto_create: bool` (default false) | initiate emails link; complete verifies+consumes |
+| OTP | `otp` | `length: u8` (default 6), `ttl_s: i64` (default 300) | initiate emails code; complete verifies code |
+| WebAuthn | `webauthn` | `rp_id: []const u8`, `rp_name: []const u8`, `origin: []const u8`, `credentials_collection: []const u8` | all four required |
+
+Each method accepts a `rate_limit` field:
+- `.default` — uses the global env-var rate-limiter (`ZIGBASE_RATE_LIMIT_MAX` / `ZIGBASE_RATE_LIMIT_WINDOW`).
+- `.off` — disables rate-limiting for this method (logged at startup like a `@public` rule).
+- `.{ .custom = .{ .max = 5, .window_s = 60 } }` — per-method override.
+
+Example — two collections, each with different methods:
+
+```zig
+.collections = .{
+    .members = .{ .type = .auth, .auth = .{
+        .methods = .{ .magic_link = .{ .ttl_s = 900 } },
+    } },
+    .staff = .{ .type = .auth, .auth = .{
+        .methods = .{ .password = .{}, .webauthn = .{
+            .rp_id = "app.example.com",
+            .rp_name = "My App",
+            .origin = "https://app.example.com",
+            .credentials_collection = "webauthnCredentials",
+        } },
+    } },
+},
+```
+
+This yields the following endpoints (no route code):
+
+```
+POST /api/collections/members/auth/magic-link/initiate
+POST /api/collections/members/auth/magic-link/complete
+POST /api/collections/staff/auth-with-password           (legacy alias)
+POST /api/collections/staff/auth/webauthn/initiate
+POST /api/collections/staff/auth/webauthn/complete
+POST /api/collections/staff/auth/webauthn/register/begin  (authed)
+POST /api/collections/staff/auth/webauthn/register/finish (authed)
+```
+
+The dispatch enforces enablement: a disabled or unknown method slug returns `404`.
+
+### Custom `AuthMethod` plugin (`.auth_methods`)
+
+For verification logic that the built-ins don't cover, implement an `AuthMethod` plugin type and register it at the app level:
+
+```zig
+// App-level registration of custom method TYPES:
+.auth_methods = .{ WebAuthnMethod, CorpSsoMethod },
+
+// Then reference by slug in a collection's .methods:
+.staff = .{ .type = .auth, .auth = .{
+    .methods = .{ .password = .{}, .custom = &.{"corp-sso"} },
+} },
+```
+
+**The contract** — every plugin type must implement three functions:
+
+```zig
+// Required on every AuthMethod plugin type:
+pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !Self;
+pub fn method(self: *Self) zigbase.AuthMethod;  // returns the vtable view
+pub fn deinit(self: *Self) void;
+```
+
+`zigbase.AuthMethod` vtable:
+
+```zig
+pub const AuthMethod = struct {
+    slug: []const u8,   // URL slug → /auth/<slug>/initiate | /complete
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        initiate: *const fn (ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult,
+        complete: *const fn (ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution,
+    };
+};
+```
+
+`AuthCtx` — what the framework passes to each phase:
+
+```zig
+pub const AuthCtx = struct {
+    app: *Runtime,
+    ctx: *http.RequestCtx,        // body / query / cookies / remote_ip
+    collection: schema.Collection, // the :col auth collection (validated .type == .auth)
+    conn: *db.Db,                  // pooled connection
+
+    // Blessed helpers:
+    pub fn rateLimit(ac: *AuthCtx, scope: []const u8, ident: []const u8) !?http.Response;
+    pub fn mintLinkToken(ac: *AuthCtx, record_id: []const u8, ttl_s: i64) ![]const u8;
+    pub fn verifyLinkToken(ac: *AuthCtx, token: []const u8) !?Claims;
+    pub fn consumeLinkToken(ac: *AuthCtx, claims: Claims) !void;
+    pub fn deliverMail(ac: *AuthCtx, to: []const u8, subject: []const u8, body: []const u8) !void;
+    pub fn findByIdentity(ac: *AuthCtx, identity: []const u8) !?[]const u8;  // record_id or null
+};
+
+pub const InitiateResult = struct { status: u16 = 200, body: ?[]const u8 = null };
+
+pub const Resolution = union(enum) {
+    record: []const u8,  // record id → framework issues session + fires onAuth
+    fail: struct { status: u16, message: []const u8 },
+};
+```
+
+A plugin type missing `create`/`method`/`deinit` is a **compile error**. Built-in methods (`password`, `magic_link`, `otp`, `webauthn`) implement the exact same contract — no privileged private path.
+
+### WebAuthn — login + passkey registration
+
+**Login flow (via the two-phase contract):**
+
+1. `initiate`: POST body `{ "identity": "user@example.com" }` (optional for discoverable credentials). Returns `{ "challenge": "...", "rpId": "...", "ceremonyId": "..." }`.
+2. Browser calls `navigator.credentials.get()` with the options.
+3. `complete`: POST body `{ "ceremonyId": "...", "credentialId": "...", "authenticatorData": "...", "clientDataJSON": "...", "signature": "..." }`. On success, the framework mints the session and fires `onAuth(.webauthn)`.
+
+**Passkey registration (requires an existing session):**
+
+1. `POST /api/collections/:col/auth/webauthn/register/begin` — returns `{ "challenge": "...", "rpId": "...", "rpName": "...", "ceremonyId": "..." }`.
+2. Browser calls `navigator.credentials.create()` with those options.
+3. `POST /api/collections/:col/auth/webauthn/register/finish` with `{ "ceremonyId": "...", "id": "...", "rawId": "...", "response": { "clientDataJSON": "...", "attestationObject": "..." } }`. Stores the credential in `_webauthnCredentials` bound to the authenticated user.
+
+Notes:
+- Supports ES256 (P-256, COSE -7) and Ed25519 (COSE -8) public keys.
+- Attestation format: `fmt:"none"` (v1; other formats are future work).
+- `signCount` is tracked; a count regression (possible credential clone) fails authentication closed.
+- Requires `webauthn.credentials_collection` to name a collection that stores credentials.
+
+### ChallengeStore
+
+`ChallengeStore` is a TTL'd, GC'd server-side store backed by `_authChallenges`. It is used internally by `magic_link` (the link token), `otp` (the emailed code), and `webauthn` (ceremony challenges). Custom plugins may access it via `AuthCtx.challengeStore()`, which returns a handle with:
+- `store(id, data, ttl_s)` — store a challenge under `id` with the given TTL.
+- `consume(id) ![]const u8` — retrieve and delete in one atomic step (single-use).
+
+### OAuth2 scope
+
+OAuth2 (Google, GitHub, etc.) remains on its existing dedicated endpoints (`oauth2-init` / `auth-with-oauth2`). It already routes through the same `issueSession`+`emitAuth` seam. Refactoring OAuth2 onto the `AuthMethod` contract was a deliberate decision deferred from this release; the dedicated endpoints work correctly and are unchanged.
+
+### Tier 3: escape hatch for exotic flows
+
+For flows where the built-in two-phase `AuthMethod` contract doesn't fit, ZigBase exposes
+a `zigbase.auth` helper surface so you can build custom login flows while staying in the
+same session-issuance seam that built-in logins use.
 
 **The seam guarantee:** every login — including custom flows via `ev.issueSession`
 — fires your `onAuth` handler. There is no way to mint a session that bypasses it.
@@ -821,6 +983,9 @@ The public surface (from `src/root.zig`):
   vtable types; `zigbase.DefaultStoragePlugin` / `zigbase.DefaultMailerPlugin` — the
   built-in defaults; `zigbase.LocalStorage`, `zigbase.LogMailer`, `zigbase.SmtpMailer`,
   `zigbase.SmtpTls` — the concrete backends.
+- `zigbase.AuthMethod` — the auth plugin vtable type.
+- `zigbase.AuthCtx` — the per-request auth context passed to plugin phases.
+- `zigbase.auth.Resolution` / `zigbase.auth.InitiateResult` — the phase return types.
 
 ## See also
 

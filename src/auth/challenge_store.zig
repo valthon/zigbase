@@ -44,22 +44,27 @@ pub const ChallengeStore = struct {
         return cid;
     }
 
-    /// Atomically fetch-and-consume a challenge by its opaque `id`.
+    /// Atomically fetch-and-consume a challenge by its opaque `id` AND `method`.
     /// Returns the payload slice (allocated from `alloc`) when the challenge exists,
-    /// is unexpired, and has not yet been consumed; marks it consumed atomically.
-    /// Returns null when the id is unknown, already consumed, or expired.
-    pub fn take(self: ChallengeStore, alloc: std.mem.Allocator, id: []const u8) !?[]const u8 {
-        // Conditional UPDATE: only succeeds (changes == 1) if the row is unconsumed and unexpired.
-        // Read changesCount() BEFORE the statement finalizes / any later statement runs, so the
-        // single-use gate never depends on finalize-ordering (a future SELECT here would reset it).
+    /// matches both id and method, is unexpired, and has not yet been consumed; marks it
+    /// consumed atomically. Returns null when the id is unknown, the method does not match,
+    /// the challenge is already consumed, or it is expired.
+    /// The method filter provides defense-in-depth: a "webauthn_reg" challenge cannot be
+    /// consumed by a login take() that passes "webauthn", and vice versa.
+    pub fn take(self: ChallengeStore, alloc: std.mem.Allocator, id: []const u8, method: []const u8) !?[]const u8 {
+        // Conditional UPDATE: only succeeds (changes == 1) if the row is unconsumed, unexpired,
+        // and matches the expected method. Read changesCount() BEFORE the statement finalizes /
+        // any later statement runs, so the single-use gate never depends on finalize-ordering
+        // (a future SELECT here would reset it).
         var changed: i64 = 0;
         {
             var upd = try self.conn.prepare(
                 \\UPDATE "_authChallenges" SET "consumed"=1
-                \\ WHERE "id"=?1 AND "consumed"=0 AND "expires" > unixepoch('now');
+                \\ WHERE "id"=?1 AND "method"=?2 AND "consumed"=0 AND "expires" > unixepoch('now');
             );
             defer upd.finalize();
             try upd.bindText(1, id);
+            try upd.bindText(2, method);
             _ = try upd.step();
             changed = self.conn.changesCount();
         }
@@ -164,22 +169,51 @@ test "ChallengeStore: put/take single-use, take returns null on replay, expired 
     try std.testing.expect(cid.len == 32);
 
     // take once -> returns payload
-    const p1 = try store.take(a, cid);
+    const p1 = try store.take(a, cid, "otp");
     try std.testing.expect(p1 != null);
     try std.testing.expectEqualStrings("secret-payload", p1.?);
 
     // take again (replay) -> null (already consumed)
-    const p2 = try store.take(a, cid);
+    const p2 = try store.take(a, cid, "otp");
     try std.testing.expect(p2 == null);
 
     // put a challenge with negative TTL (already expired at insert)
     const expired_id = try store.put(a, std.testing.io, "users", "otp", "bob@example.com", "should-not-get", -1);
-    const p3 = try store.take(a, expired_id);
+    const p3 = try store.take(a, expired_id, "otp");
     try std.testing.expect(p3 == null);
 
     // unknown id -> null
-    const p4 = try store.take(a, "00000000000000000000000000000000");
+    const p4 = try store.take(a, "00000000000000000000000000000000", "otp");
     try std.testing.expect(p4 == null);
+}
+
+test "ChallengeStore: take with wrong method returns null (cross-method isolation)" {
+    const migrations = @import("../migrations.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const store = ChallengeStore{ .conn = &d };
+
+    // Put a registration challenge under "webauthn_reg"
+    const cid = try store.put(a, std.testing.io, "users", "webauthn_reg", "user1", "reg-payload", 3600);
+
+    // Attempting to take it with the login method "webauthn" must return null
+    const wrong = try store.take(a, cid, "webauthn");
+    try std.testing.expect(wrong == null);
+
+    // The challenge must still be unconsumed — taking with the correct method succeeds
+    const correct = try store.take(a, cid, "webauthn_reg");
+    try std.testing.expect(correct != null);
+    try std.testing.expectEqualStrings("reg-payload", correct.?);
+
+    // A further take with the correct method now returns null (already consumed)
+    const replay = try store.take(a, cid, "webauthn_reg");
+    try std.testing.expect(replay == null);
 }
 
 test "ChallengeStore: takeByIdentity returns and consumes the newest matching challenge" {
@@ -244,7 +278,7 @@ test "gcAuthChallenges removes expired and consumed rows, leaves live ones" {
 
     // Insert a live challenge and then consume it
     const consumed_id = try store.put(a, std.testing.io, "users", "otp", "grace@example.com", "consumed", 3600);
-    _ = try store.take(a, consumed_id);
+    _ = try store.take(a, consumed_id, "otp");
 
     // Verify 3 rows before GC
     {

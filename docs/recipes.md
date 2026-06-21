@@ -715,6 +715,131 @@ Key behaviours to note:
 
 ---
 
+## Recipe: enable magic-link + OTP via config
+
+No route code needed — enable methods in your collection declaration:
+
+```zig
+// No route code needed — enable methods in your collection declaration:
+zigbase.App(.{
+    .collections = .{
+        .members = .{ .type = .auth, .auth = .{
+            .methods = .{
+                .magic_link = .{
+                    .ttl_s = 900,        // link expires in 15 minutes
+                    .auto_create = false, // don't auto-provision new accounts
+                    .rate_limit = .default,
+                },
+                .otp = .{
+                    .length = 6,
+                    .ttl_s = 300,        // code expires in 5 minutes
+                    .rate_limit = .{ .custom = .{ .max = 5, .window_s = 60 } },
+                },
+            },
+        } },
+    },
+}).runCli(init);
+```
+
+This auto-mounts four endpoints (no route code):
+
+```
+POST /api/collections/members/auth/magic_link/initiate   → 204 (enumeration-safe)
+POST /api/collections/members/auth/magic_link/complete   → 200 with session
+POST /api/collections/members/auth/otp/initiate          → 204 (enumeration-safe)
+POST /api/collections/members/auth/otp/complete          → 200 with session
+```
+
+Both built-in methods route through the same `issueSession`+`emitAuth` seam, so your `onAuth` handler fires for every sign-in tagged with `.magic_link` or `.otp`.
+
+Note: the existing custom-route magic-link recipe (above) remains the "low-level" alternative — use it when you need custom logic (e.g. a non-standard token delivery path) that the built-in method doesn't support.
+
+---
+
+## Recipe: custom `AuthMethod` plugin sketch
+
+A minimal custom plugin implementing the `AuthMethod` contract:
+
+```zig
+const std = @import("std");
+const zigbase = @import("zigbase");
+
+/// A minimal custom auth method that validates a pre-shared API key.
+/// In production, key lookup would hit a database or external service.
+const ApiKeyMethod = struct {
+    gpa: std.mem.Allocator,
+
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !ApiKeyMethod {
+        _ = io; _ = cfg;
+        return .{ .gpa = gpa };
+    }
+
+    pub fn method(self: *ApiKeyMethod) zigbase.AuthMethod {
+        return .{
+            .slug = "api-key",
+            .ctx = self,
+            .vtable = &vtable,
+        };
+    }
+
+    pub fn deinit(self: *ApiKeyMethod) void { _ = self; }
+
+    const vtable = zigbase.AuthMethod.VTable{
+        .initiate = initiate,
+        .complete = complete,
+    };
+
+    /// Phase 1: nothing to do for API-key auth (no challenge).
+    fn initiate(ctx: *anyopaque, ac: *zigbase.AuthCtx) anyerror!zigbase.AuthCtx.InitiateResult {
+        _ = ctx; _ = ac;
+        return .{ .status = 204, .body = null };
+    }
+
+    /// Phase 2: validate the key, resolve to a record.
+    fn complete(ctx: *anyopaque, ac: *zigbase.AuthCtx) anyerror!zigbase.auth.Resolution {
+        _ = ctx;
+        const body = ac.ctx.body;
+
+        // Parse {"apiKey":"..."} from the request body.
+        const parsed = std.json.parseFromSlice(
+            struct { apiKey: []const u8 }, ac.ctx.allocator, body, .{},
+        ) catch return .{ .fail = .{ .status = 400, .message = "Missing apiKey." } };
+        defer parsed.deinit();
+
+        // Look up the record by identity (here: by api key field).
+        // findByIdentity matches the collection's configured identity fields.
+        const record_id = (try ac.findByIdentity(parsed.value.apiKey))
+            orelse return .{ .fail = .{ .status = 401, .message = "Invalid API key." } };
+
+        // Return the record id — the framework mints the session + fires onAuth.
+        return .{ .record = record_id };
+    }
+};
+
+// Register at the app level and enable per collection:
+pub fn main(init: std.process.Init) !void {
+    return zigbase.App(.{
+        .auth_methods = .{ApiKeyMethod},
+        .collections = .{
+            .services = .{ .type = .auth, .auth = .{
+                .methods = .{
+                    .custom = &.{"api-key"},  // enable by slug
+                },
+            } },
+        },
+    }).runCli(init);
+}
+```
+
+Key points:
+- The plugin type must implement `create`/`method`/`deinit`. A missing method is a compile error.
+- `complete` NEVER mints a session — it returns a `Resolution`. The framework mints via the seam (`issueSession`+`emitAuth`).
+- Rate-limiting is applied by the framework around both phases; `ac.rateLimit` is available for finer-grained control within the handler.
+- `initiate` may be a no-op (`.{ .status = 204 }`) for methods that need no challenge phase.
+- Custom plugins appear in the generated TypeScript client's `auth` surface as untyped stubs (currently).
+
+---
+
 See also: [fields.md](fields.md) · [tutorial.md](tutorial.md) ·
 [api.md](api.md) · [framework.md](framework.md)
 </content>

@@ -384,22 +384,119 @@ the email exists). The matching `confirm-*` endpoint takes that `token` in its b
 Configure SMTP for production; see
 [KNOWN_LIMITATIONS.md → Auth & email](../KNOWN_LIMITATIONS.md).
 
+### Auth method endpoints (pluggable auth)
+
+For every auth collection that enables a method (built-in or custom), two endpoints are auto-mounted:
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/collections/:col/auth/:method/initiate` | Phase 1: challenge/email/options. Returns 200 with method-specific JSON body, or 204 for enumeration-safe methods (e.g. magic-link). |
+| POST | `/api/collections/:col/auth/:method/complete` | Phase 2: proof → session. Returns 200 with `{ token, record }` and sets `zb_auth`/`zb_csrf` cookies on success. |
+
+`:method` is the method slug (`magic-link`, `otp`, `password`, `webauthn`, or a custom plugin's slug). Returns 404 when the collection doesn't exist, isn't an auth collection, or the method isn't enabled.
+
+**WebAuthn passkey registration** (authed — requires a valid session):
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/collections/:col/auth/webauthn/register/begin` | Returns WebAuthn creation options (challenge, rpId, rpName). |
+| POST | `/api/collections/:col/auth/webauthn/register/finish` | Stores the new passkey bound to the authenticated user. |
+
+**magic-link initiate:**
+```json
+// request
+{ "identity": "user@example.com" }
+// response: 204 (enumeration-safe — always 204 whether email exists or not)
+```
+
+**magic-link complete:**
+```json
+// request
+{ "token": "<magic-link-token>" }
+// response (200) — sets zb_auth and zb_csrf cookies
+{ "token": "<jwt>", "record": { "id": "...", "email": "..." } }
+```
+
+**otp initiate:**
+```json
+// request
+{ "identity": "user@example.com" }
+// response: 204
+```
+
+**otp complete:**
+```json
+// request
+{ "identity": "user@example.com", "code": "123456" }
+// response (200)
+{ "token": "<jwt>", "record": { "id": "..." } }
+```
+
+**webauthn initiate:**
+```json
+// request (identity optional for discoverable credentials)
+{ "identity": "user@example.com" }
+// response (200)
+{ "challenge": "<base64url>", "rpId": "app.example.com", "ceremonyId": "<opaque>" }
+```
+
+**webauthn complete:**
+```json
+// request
+{
+  "ceremonyId": "<opaque>",
+  "credentialId": "<base64url>",
+  "authenticatorData": "<base64url>",
+  "clientDataJSON": "<base64url>",
+  "signature": "<base64url>"
+}
+// response (200)
+{ "token": "<jwt>", "record": { "id": "..." } }
+```
+
+**webauthn register/begin (authed):**
+```json
+// request: empty body or {}
+// response (200)
+{ "challenge": "<base64url>", "rpId": "app.example.com", "rpName": "My App", "ceremonyId": "<opaque>" }
+```
+
+**webauthn register/finish (authed):**
+```json
+// request
+{
+  "ceremonyId": "<opaque>",
+  "id": "<base64url>",
+  "rawId": "<base64url>",
+  "response": {
+    "clientDataJSON": "<base64url>",
+    "attestationObject": "<base64url>"
+  }
+}
+// response (200): {}
+```
+
 ### The `onAuth` hook — fires on every login
 
-Every successful login — password, OAuth2, and custom flows built with
+Every successful login — password, OAuth2, magic-link, OTP, WebAuthn, and custom flows built with
 `ev.issueSession` / `zigbase.auth.issueSession` — fires the `onAuth` handler
 registered in your `App(.{ .onAuth = ... })`. This is the single chokepoint for
 cross-cutting session logic (audit logging, account-state checks, etc.). There is no
 path through ZigBase's session-issuance machinery that bypasses it.
 
-See [framework.md §6 Custom auth flows](framework.md#custom-auth-flows) for the
+`AuthEvent.method` carries the method slug as a tagged union: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`, or `.custom` for custom plugins (the slug is the plugin's declared slug).
+
+See [framework.md §6](framework.md#6-auth--file--lifecycle-events) for the
 `zigbase.auth` helper surface and the seam guarantee.
 
 ### Rate limiting
 
 The sensitive auth endpoints — `auth-with-password` (login), `request-verification`,
-and `request-password-reset` — are rate limited. Over the limit, the endpoint returns
+`request-password-reset`, and all `auth/:method/initiate` / `auth/:method/complete`
+endpoints — are rate limited. Over the limit, the endpoint returns
 **`429 Too Many Requests`** (`{ "message": "Too many requests. Try again later." }`).
+
+Per-method rate-limit behavior is configured in `.auth.methods` via the `rate_limit` field (`.default` | `.off` | `.{ .custom = .{ .max, .window_s } }`). See [framework.md §6](framework.md#6-auth--file--lifecycle-events).
 
 - **Config:** `ZIGBASE_RATE_LIMIT_MAX` attempts (default `10`) per
   `ZIGBASE_RATE_LIMIT_WINDOW` seconds (default `60`), per client key, per endpoint.

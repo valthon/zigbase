@@ -503,6 +503,44 @@ pub const TestEnv = struct {
         return jwt.sign(a, .{ .id = rid, .collection = col_name, .type = tt, .jti = jti, .iat = now, .exp = now + 100000 }, &key);
     }
 
+    /// Initialize a TestEnv with a webauthn-configured auth collection.
+    /// The collection has rp_id="example.test", rp_name="Test App", origin="https://example.test".
+    pub fn initWebAuthn(name: []const u8) !*TestEnv {
+        const env = try std.testing.allocator.create(TestEnv);
+        env.tmp = std.testing.tmpDir(.{});
+        const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(dir);
+        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+        defer std.testing.allocator.free(path);
+        env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
+        {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            try migrations.run(w);
+            var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer setup_arena.deinit();
+            const sa = setup_arena.allocator();
+            _ = try collections.create(sa, std.testing.io, w, .{
+                .id = "",
+                .name = name,
+                .type = .auth,
+                .fields = &[_]schema.Field{},
+                .listRule = "",
+                .viewRule = "",
+                .createRule = "",
+                .updateRule = "",
+                .deleteRule = "",
+                .options = .{ .auth = .{ .methods = .{ .webauthn = .{
+                    .rp_id = "example.test",
+                    .rp_name = "Test App",
+                    .origin = "https://example.test",
+                } } } },
+            });
+        }
+        env.app = .{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = &env.pool };
+        return env;
+    }
+
     fn recordVerified(self: *TestEnv, a: std.mem.Allocator, col_name: []const u8, email: []const u8) bool {
         const w = self.pool.acquireWriter();
         defer self.pool.releaseWriter();

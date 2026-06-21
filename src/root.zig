@@ -167,4 +167,14 @@ test {
     _ = @import("auth/registry.zig");
     _ = @import("api/auth_methods.zig");
     _ = @import("auth/challenge_store.zig");
+    _ = @import("auth/webauthn/cbor.zig");
+    _ = @import("auth/webauthn/cose.zig");
+    _ = @import("auth/webauthn/authdata.zig");
+    _ = @import("auth/webauthn/verify_sig.zig");
+    _ = @import("auth/webauthn/client_data.zig");
+    _ = @import("auth/webauthn/store.zig");
+    _ = @import("auth/webauthn/register.zig");
+    _ = @import("auth/webauthn/authenticate.zig");
+    _ = @import("auth/methods/webauthn.zig");
+    _ = @import("api/webauthn_register.zig");
 }
