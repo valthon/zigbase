@@ -126,8 +126,68 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
             if (@hasField(R, "update")) col.updateRule = spec.rules.update;
             if (@hasField(R, "delete")) col.deleteRule = spec.rules.delete;
         }
+        // auth-specific collection options
+        if (@hasField(S, "auth")) {
+            const A = @TypeOf(spec.auth);
+            if (@hasField(A, "methods")) {
+                col.options.auth.methods = buildMethodsOptions(spec.auth.methods);
+            }
+        }
         return col;
     }
+}
+
+fn buildRateLimitOpt(comptime rl: anytype) schema.RateLimitOpt {
+    const tag = @tagName(rl);
+    if (std.mem.eql(u8, tag, "off")) return .off;
+    if (std.mem.eql(u8, tag, "custom")) {
+        const cv = rl.custom;
+        return .{ .custom = .{ .max = cv.max, .window_s = cv.window_s } };
+    }
+    return .default;
+}
+
+fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
+    const M = @TypeOf(m);
+    var out = schema.MethodsOptions{};
+    // Each optional built-in method field in the comptime literal is an anonymous
+    // struct (not a typed optional), so we use @hasField to detect presence and
+    // treat it as "enabled with those settings".
+    if (@hasField(M, "password")) {
+        const pw = m.password;
+        var p = schema.PasswordMethodOpts{};
+        if (@hasField(@TypeOf(pw), "rate_limit")) p.rate_limit = buildRateLimitOpt(pw.rate_limit);
+        out.password = p;
+    }
+    if (@hasField(M, "magic_link")) {
+        const ml = m.magic_link;
+        var p = schema.MagicLinkMethodOpts{};
+        if (@hasField(@TypeOf(ml), "ttl_s")) p.ttl_s = ml.ttl_s;
+        if (@hasField(@TypeOf(ml), "auto_create")) p.auto_create = ml.auto_create;
+        if (@hasField(@TypeOf(ml), "rate_limit")) p.rate_limit = buildRateLimitOpt(ml.rate_limit);
+        out.magic_link = p;
+    }
+    if (@hasField(M, "otp")) {
+        const otp = m.otp;
+        var p = schema.OtpMethodOpts{};
+        if (@hasField(@TypeOf(otp), "length")) p.length = otp.length;
+        if (@hasField(@TypeOf(otp), "ttl_s")) p.ttl_s = otp.ttl_s;
+        if (@hasField(@TypeOf(otp), "auto_create")) p.auto_create = otp.auto_create;
+        if (@hasField(@TypeOf(otp), "rate_limit")) p.rate_limit = buildRateLimitOpt(otp.rate_limit);
+        out.otp = p;
+    }
+    if (@hasField(M, "webauthn")) {
+        const wa = m.webauthn;
+        var p = schema.WebAuthnMethodOpts{};
+        if (@hasField(@TypeOf(wa), "rp_id")) p.rp_id = wa.rp_id;
+        if (@hasField(@TypeOf(wa), "rp_name")) p.rp_name = wa.rp_name;
+        if (@hasField(@TypeOf(wa), "origin")) p.origin = wa.origin;
+        if (@hasField(@TypeOf(wa), "credentials_collection")) p.credentials_collection = wa.credentials_collection;
+        if (@hasField(@TypeOf(wa), "rate_limit")) p.rate_limit = buildRateLimitOpt(wa.rate_limit);
+        out.webauthn = p;
+    }
+    if (@hasField(M, "custom")) out.custom = strTupleToSlice(m.custom);
+    return out;
 }
 
 fn buildField(comptime col_name: []const u8, comptime f: anytype) schema.Field {
@@ -968,4 +1028,15 @@ test "runMigrations runs each explicit migration once (idempotent)" {
     try runMigrations(a, std.testing.io, &d, &migs);
     try runMigrations(a, std.testing.io, &d, &migs);
     try std.testing.expectEqual(@as(usize, 1), M.calls);
+}
+
+test "buildCollection lowers .auth.methods into collection options" {
+    const specs = comptime buildCollections(.{
+        .accounts = .{ .type = .auth, .fields = .{}, .auth = .{ .methods = .{ .magic_link = .{} } } },
+    });
+    try std.testing.expectEqual(@as(usize, 1), specs.len);
+    const accounts = specs[0];
+    try std.testing.expectEqualStrings("accounts", accounts.name);
+    try std.testing.expect(accounts.options.auth.methods.magic_link != null);
+    try std.testing.expect(accounts.options.auth.methods.password == null);
 }

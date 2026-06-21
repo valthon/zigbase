@@ -71,7 +71,7 @@ pub fn findByIdentity(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collec
     return null;
 }
 
-fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
+pub fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
     var st = try conn.prepare(sql);
     defer st.finalize();

@@ -42,6 +42,10 @@ pub const App = struct {
     /// In-memory rate limiter for sensitive auth endpoints; null = disabled
     /// (rate_limit_max == 0, or tests/CLI that don't wire it). Set in serveImpl.
     rate_limiter: ?*ratelimit.RateLimiter = null,
+    /// Type-erased pointer to the running auth-method Registry (set by serveImpl); null = not running.
+    /// Cast to `*const @import("auth/registry.zig").Registry` to read slugs. Stored as opaque
+    /// to avoid an import cycle: app.zig must NOT import registry.zig or auth/method.zig.
+    auth_methods: ?*const anyopaque = null,
     /// Type-erased pointer to the running Scheduler (set by Scheduler.start); null = not running.
     scheduler: ?*anyopaque = null,
     /// Submit an ad-hoc job task for async execution; set by Scheduler.start. Task 5 wires App.submit().
