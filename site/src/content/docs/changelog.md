@@ -23,6 +23,10 @@ All notable changes to ZigBase are documented here. The format is based on
   thunk cannot express. Untyped routes carry no typed `Input`/`Output` and are excluded
   from the generated TypeScript `zb.rpc.*` client, so they never produce a client method
   that would mis-parse their response.
+- **`zigbase.auth` consumer surface for custom auth flows** — `issueSession` (and
+  `RouteEvent.issueSession`), single-use magic-link tokens (`mintLinkToken` /
+  `verifyLinkToken` / `consumeLinkToken`), `deliverAuthMail`, and `rateLimit`. All
+  session minting now funnels through one seam that always fires `onAuth`.
 - **`text.pattern` is now enforced on record writes** via a pure-Zig, linear-time (DoS-safe)
   Thompson-NFA matcher. Matching is unanchored (substring); anchor with `^…$` for a
   full-string match. Supported syntax: literals, `.` (any codepoint except `\n`), anchors
@@ -45,6 +49,12 @@ All notable changes to ZigBase are documented here. The format is based on
   even though the JSON body still said e.g. `401`. The mapping now derives from
   `zap.http.StatusCode`'s named values, so any standard code zap defines is passed through
   and only genuinely-unknown codes fall back to `500`.
+
+### Changed
+
+- **Session issuance (password, refresh, OAuth2) routes through a single
+  `issueSession`+`emitAuth` seam** — custom routes can no longer mint a session that
+  skips the `onAuth` hook.
 
 ## [0.4.0] - 2026-06-13
 

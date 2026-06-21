@@ -49,6 +49,9 @@ pub const Migration = @import("provision.zig").Migration;
 // build.zig embedStaticDir) and of `.static_files = .{ .embedded = ... }`.
 pub const StaticFile = @import("static_files.zig").StaticFile;
 
+// ---- Auth helper surface (consumer-facing magic-link building blocks) ------
+pub const auth = @import("auth_helpers.zig");
+
 // ---- Code-generation modules (pure-Zig TS client generator) ---------------
 pub const codegen = struct {
     pub const ts_type = @import("codegen/ts_type.zig");
@@ -149,4 +152,5 @@ test {
     _ = @import("codegen/acquire_http.zig");
     _ = @import("codegen/typegen_cli.zig");
     _ = @import("route_types.zig");
+    _ = @import("auth_helpers.zig");
 }

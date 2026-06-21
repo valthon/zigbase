@@ -188,10 +188,8 @@ fn strField(obj: std.json.Value, key: []const u8) ?[]const u8 {
 }
 
 fn respondSession(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, rid: []const u8, is_new: bool) !http.Response {
-    const tk = (try auth_api.tokenKeyFor(ctx.allocator, conn, col.name, rid)) orelse return ApiError.internal().toResponse(ctx.allocator);
-    const issued = try auth_api.issue(ctx, conn, col.name, rid, tk);
     const rec = (try records.get(ctx.allocator, conn, col, rid)) orelse return ApiError.internal().toResponse(ctx.allocator);
-    auth_api.emitAuth(ctx, col.name, rec, .oauth2);
+    const issued = try auth_api.issueSessionExt(ctx, conn, col.name, rid, .oauth2, rec);
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator, "token", .{ .string = issued.token });
     try root.put(ctx.allocator, "record", rec);
@@ -684,4 +682,37 @@ test "deleting an auth record removes its external-auth links" {
         _ = try st.step();
         try std.testing.expectEqual(@as(i64, 0), try linkCount(a, w, "users", "r3"));
     }
+}
+
+const events = @import("../events.zig");
+
+test "oauth2 login fires onAuth exactly once with .oauth2 tag via issueSession seam" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.seedOAuthCollection(a, "users");
+
+    // Install a counting onAuth handler on the test app's dispatch.
+    const Counter = struct {
+        var seen: usize = 0;
+        var last_method: events.AuthMethod = .password;
+        fn onAuth(ev: *events.AuthEvent) void { seen += 1; last_method = ev.method; }
+    };
+    Counter.seen = 0;
+    var disp = events.Dispatch{ .on_auth = Counter.onAuth };
+    env.app.dispatch = &disp;
+
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    var stub = OAuthStub{};
+    var c = env.ctx(a, .POST, try oauthBody(a), &p);
+    const res = try authWithOAuth2Impl(&c, stub.transport());
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    // The seam must have fired exactly once with the .oauth2 tag.
+    // This test would FAIL if the emitAuth call were removed from issueSession.
+    try std.testing.expectEqual(@as(usize, 1), Counter.seen);
+    try std.testing.expectEqual(events.AuthMethod.oauth2, Counter.last_method);
+    // Session cookies must be present.
+    try std.testing.expectEqual(@as(usize, 2), res.cookies.len);
 }

@@ -41,7 +41,7 @@ fn wallNowUnix(io: std.Io) i64 {
 /// ("login"/"reset"/"verify"). The key is the client IP when known, else falls back
 /// to the submitted identity/email so the limiter still functions without a proxy IP.
 /// No-op (null) when no limiter is wired (rate_limit_max == 0 / tests).
-fn rateLimited(ctx: *http.RequestCtx, scope: []const u8, ident: []const u8) !?http.Response {
+pub fn rateLimited(ctx: *http.RequestCtx, scope: []const u8, ident: []const u8) !?http.Response {
     const app = ctx.app.?;
     const limiter = app.rate_limiter orelse return null;
     const key = if (ctx.remote_ip.len > 0)
@@ -60,7 +60,7 @@ pub fn nowUnix(conn: *db.Db) db.DbError!i64 {
 }
 
 /// Try each identity field in order; return the matching non-empty row id, or null.
-fn findByIdentity(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, identity: []const u8) !?[]const u8 {
+pub fn findByIdentity(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, identity: []const u8) !?[]const u8 {
     for (col.options.auth.identityFields) |idf| {
         const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE \"{s}\" = ?1 AND \"{s}\" != '' LIMIT 1;", .{ col.name, idf, idf }, 0);
         var st = try conn.prepare(sql);
@@ -125,6 +125,40 @@ pub fn emitAuth(ctx: *http.RequestCtx, collection: []const u8, record: ?std.json
     h(&ev);
 }
 
+/// THE session seam: resolve a collection's table + the record's tokenKey, sign a
+/// native `.auth` session via `issue()`, then fire `emitAuth(method)`. Every login —
+/// password, refresh, magic-link, custom route — mints through here, so `onAuth`
+/// ALWAYS fires. `conn` is the caller's already-acquired connection.
+pub fn issueSession(
+    ctx: *http.RequestCtx,
+    conn: *db.Db,
+    collection: []const u8,
+    record_id: []const u8,
+    method: events.AuthMethod,
+) !Issued {
+    return issueSessionExt(ctx, conn, collection, record_id, method, null);
+}
+
+/// Like `issueSession` but accepts a pre-fetched record (`opt_record`) to avoid a
+/// redundant DB read when the caller already holds the record. When `opt_record` is
+/// null the record is fetched as usual. `onAuth` still fires exactly once.
+pub fn issueSessionExt(
+    ctx: *http.RequestCtx,
+    conn: *db.Db,
+    collection: []const u8,
+    record_id: []const u8,
+    method: events.AuthMethod,
+    opt_record: ?std.json.Value,
+) !Issued {
+    const col = (try collections.get(ctx.allocator, conn, collection)) orelse return error.NotFound;
+    if (col.type != .auth) return error.NotFound;
+    const tk = (try tokenKeyFor(ctx.allocator, conn, col.name, record_id)) orelse return error.NotFound;
+    const issued = try issue(ctx, conn, col.name, record_id, tk);
+    const rec: ?std.json.Value = if (opt_record) |r| r else try records.get(ctx.allocator, conn, col, record_id);
+    emitAuth(ctx, col.name, rec, method);
+    return issued;
+}
+
 pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
@@ -156,13 +190,12 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     if (!crypto.verifyPassword(app.io, ctx.allocator, phc, password))
         return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
 
-    const tk = (try tokenKeyFor(ctx.allocator, &r, col.name, rid)) orelse
-        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
-    const issued = try issue(ctx, &r, col.name, rid, tk);
     const rec = (try records.get(ctx.allocator, &r, col, rid)) orelse
         return ApiError.notFound().toResponse(ctx.allocator);
-
-    emitAuth(ctx, col.name, rec, .password);
+    const issued = issueSessionExt(ctx, &r, col.name, rid, .password, rec) catch |err| switch (err) {
+        error.NotFound => return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator),
+        else => return err,
+    };
 
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator, "token", .{ .string = issued.token });
@@ -182,10 +215,10 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
         return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
 
     const rid = authed.record.object.get("id").?.string;
-    const tk = (try tokenKeyFor(ctx.allocator, w, col_name, rid)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
-    const issued = try issue(ctx, w, col_name, rid, tk);
-    emitAuth(ctx, col_name, authed.record, .password);
+    const issued = issueSessionExt(ctx, w, col_name, rid, .password, authed.record) catch |err| switch (err) {
+        error.NotFound => return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator),
+        else => return err,
+    };
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator, "token", .{ .string = issued.token });
     try root.put(ctx.allocator, "record", authed.record);
@@ -220,7 +253,7 @@ fn findByEmail(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, e
 /// behavior; with SMTP configured it sends a real email. Falls back to logging
 /// when no mailer is wired (tests/CLI). A real SMTP send failure propagates so it
 /// is not silently dropped.
-fn deliverToken(app: *@import("../app.zig").App, alloc: std.mem.Allocator, email: []const u8, subject: []const u8, body: []const u8) !void {
+pub fn deliverToken(app: *@import("../app.zig").App, alloc: std.mem.Allocator, email: []const u8, subject: []const u8, body: []const u8) !void {
     if (app.mailer) |m| {
         try m.send(app.io, alloc, .{ .to = email, .subject = subject, .text_body = body });
     } else {
@@ -228,7 +261,7 @@ fn deliverToken(app: *@import("../app.zig").App, alloc: std.mem.Allocator, email
     }
 }
 
-fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid: []const u8, token_key: []const u8, tt: jwt.TokenType, ttl: i64) ![]const u8 {
+pub fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid: []const u8, token_key: []const u8, tt: jwt.TokenType, ttl: i64) ![]const u8 {
     const app = ctx.app.?;
     const now = try nowUnix(conn);
     const key = crypto.deriveKey(app.jwt_secret, token_key);
@@ -243,7 +276,7 @@ fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid: []c
 /// was already redeemed. Atomic under the writer lock via the _consumedTokens PRIMARY KEY.
 /// A token minted before this mechanism (empty jti) is treated as non-replayable-safe only
 /// by the legacy rotation path; we reject an empty jti so every single-use redemption is tracked.
-fn consumeToken(conn: *db.Db, claims: jwt.Claims) !void {
+pub fn consumeToken(conn: *db.Db, claims: jwt.Claims) !void {
     if (claims.jti.len == 0) return error.AlreadyConsumed; // no jti => cannot guarantee single-use
     // Classify "already consumed" by the jti's PRESENCE, checked first. consumeToken runs
     // under the single writer lock, so this SELECT-then-INSERT is race-free. This is what
@@ -270,7 +303,7 @@ fn loadAuthCollection(ctx: *http.RequestCtx, conn: *db.Db) !?schema.Collection {
 }
 
 /// Verify a typed token against the record's derived key. Returns claims on success.
-fn verifyTyped(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, token: []const u8, want: jwt.TokenType) !?jwt.Claims {
+pub fn verifyTyped(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, token: []const u8, want: jwt.TokenType) !?jwt.Claims {
     const app = ctx.app.?;
     const claims = jwt.peekClaims(ctx.allocator, token) catch return null;
     if (claims.type != want) return null;
@@ -398,12 +431,12 @@ pub fn confirmPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
 const app_mod = @import("../app.zig");
 const migrations = @import("../migrations.zig");
 
-const TestEnv = struct {
+pub const TestEnv = struct {
     tmp: std.testing.TmpDir,
     pool: db.Pool,
     app: app_mod.App,
 
-    fn initAuth(name: []const u8) !*TestEnv {
+    pub fn initAuth(name: []const u8) !*TestEnv {
         const env = try std.testing.allocator.create(TestEnv);
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -434,7 +467,7 @@ const TestEnv = struct {
         return env;
     }
 
-    fn deinit(env: *TestEnv) void {
+    pub fn deinit(env: *TestEnv) void {
         env.pool.deinit();
         env.tmp.cleanup();
         std.testing.allocator.destroy(env);
@@ -442,7 +475,7 @@ const TestEnv = struct {
 
     /// Create an auth record the same way the records API would (hash password,
     /// gen tokenKey, force verified=false), then insert via the records engine.
-    fn createUser(env: *TestEnv, a: std.mem.Allocator, col_name: []const u8, email: []const u8, pw: []const u8) !void {
+    pub fn createUser(env: *TestEnv, a: std.mem.Allocator, col_name: []const u8, email: []const u8, pw: []const u8) !void {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const col = (try collections.get(a, w, col_name)) orelse return error.NoCollection;
@@ -453,7 +486,7 @@ const TestEnv = struct {
         _ = try records.create(a, env.app.io, w, col, prepared);
     }
 
-    fn ctx(env: *TestEnv, a: std.mem.Allocator, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
+    pub fn ctx(env: *TestEnv, a: std.mem.Allocator, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
         return .{ .method = m, .path = "/", .body = body, .allocator = a, .app = &env.app, .params = params };
     }
 
@@ -665,4 +698,57 @@ test "F7: a too-short password does not consume the reset token" {
     const ok = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var good = env.ctx(a, .POST, ok, &p);
     try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&good)).status);
+}
+
+test "RouteEvent.issueSession mints a session and fires onAuth(custom)" {
+    var env = try TestEnv.initAuth("members");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "members", "r@x.io", "longenough");
+    // resolve rid
+    const w0 = env.pool.acquireWriter();
+    const col = (try collections.get(a, w0, "members")).?;
+    const rid = (try findByIdentity(a, w0, col, "r@x.io")).?;
+    env.pool.releaseWriter();
+
+    const Counter = struct { var seen: usize = 0; var m: events.AuthMethod = .password;
+        fn h(ev: *events.AuthEvent) void { seen += 1; m = ev.method; } };
+    Counter.seen = 0;
+    var disp = events.Dispatch{ .on_auth = Counter.h };
+    env.app.dispatch = &disp;
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var rctx = events.RouteEvent{ .app = &env.app, .ctx = &hctx, .rctx = .{} };
+    const issued = try rctx.issueSession("members", rid);
+    try std.testing.expectEqual(@as(usize, 2), issued.cookies.len);
+    try std.testing.expectEqual(@as(usize, 1), Counter.seen);
+    try std.testing.expectEqual(events.AuthMethod.custom, Counter.m);
+}
+
+test "issueSession is the mint+emit seam: emits onAuth once with the method tag" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "seam@x.io", "longenough");
+
+    // Install a counting onAuth handler on the test app's dispatch.
+    const Counter = struct {
+        var seen: usize = 0;
+        var last_method: events.AuthMethod = .oauth2;
+        fn onAuth(ev: *events.AuthEvent) void { seen += 1; last_method = ev.method; }
+    };
+    Counter.seen = 0;
+    var disp = events.Dispatch{ .on_auth = Counter.onAuth };
+    env.app.dispatch = &disp;
+
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    var login = env.ctx(a, .POST, "{\"identity\":\"seam@x.io\",\"password\":\"longenough\"}", &p);
+    const res = try authWithPassword(&login);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqual(@as(usize, 1), Counter.seen);
+    try std.testing.expectEqual(events.AuthMethod.password, Counter.last_method);
 }

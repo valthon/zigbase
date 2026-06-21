@@ -367,8 +367,110 @@ One handler each, registered by the matching config key:
 | `onBeforeTerminate` | `fn (ev: *zigbase.events.LifecycleEvent) void` | Just before shutdown. |
 
 `AuthEvent` carries `app`, `ctx`, `collection`, `record: ?std.json.Value`, and
-`method` (`.password` | `.oauth2`). `FileEvent` carries `app`, `ctx`,
+`method` (`.password` | `.oauth2` | `.custom`). `FileEvent` carries `app`, `ctx`,
 `collection`, `record_id`, and `filename`. `LifecycleEvent` carries `app`.
+
+### Custom auth flows
+
+ZigBase exposes a `zigbase.auth` helper surface so you can build passwordless,
+magic-link, SSO-token, or any other custom login flow while staying in the same
+session-issuance seam that built-in logins use.
+
+**The seam guarantee:** every login — including custom flows via `ev.issueSession`
+— fires your `onAuth` handler. There is no way to mint a session that bypasses it.
+Built-in flows (password, OAuth2) and custom flows both go through the same
+`issueSession`+`emitAuth` path, so the `onAuth` hook is the single, reliable
+chokepoint for cross-cutting session logic (audit logging, account-state checks, etc.).
+
+#### `zigbase.auth` API reference
+
+```zig
+// src/auth_helpers.zig  (imported as zigbase.auth.*)
+
+pub const Issued    = struct { token: []const u8, cookies: [2]http.Cookie };
+pub const LinkToken = struct { token: []const u8 };
+
+// Issue a full session (sets cookies, fires onAuth).
+// Prefer ev.issueSession (below) from a route — it acquires the writer for you.
+pub fn issueSession(
+    ctx: *http.RequestCtx, conn: *db.Db,
+    collection: []const u8, record_id: []const u8,
+) !Issued
+
+// Single-use magic-link token helpers.
+pub fn mintLinkToken(
+    ctx: *http.RequestCtx, conn: *db.Db,
+    collection: []const u8, record_id: []const u8, ttl_s: i64,
+) !LinkToken
+
+// Returns null when the token is expired, wrong collection, or has a bad signature.
+// claims.id is the record id stored in the token.
+pub fn verifyLinkToken(
+    ctx: *http.RequestCtx, conn: *db.Db,
+    collection: []const u8, token: []const u8,
+) !?jwt.Claims
+
+// Marks the token consumed. Returns error.AlreadyConsumed on replay.
+pub fn consumeLinkToken(conn: *db.Db, claims: jwt.Claims) !void
+
+// Send auth email via the configured mailer (SMTP or log in dev).
+pub fn deliverAuthMail(
+    app: *App, alloc: std.mem.Allocator,
+    to: []const u8, subject: []const u8, body: []const u8,
+) !void
+
+// Rate-limit helper — returns a ready-to-return 429 Response when the caller
+// is over the limit, null otherwise. scope identifies the endpoint; ident is the
+// key (e.g. email or raw request body).
+pub fn rateLimit(
+    ctx: *http.RequestCtx, scope: []const u8, ident: []const u8,
+) !?http.Response
+```
+
+#### `RouteEvent.issueSession` — the ergonomic route helper
+
+From inside a `RouteEvent` handler, use `ev.issueSession` instead of calling
+`zigbase.auth.issueSession` directly. It acquires and releases the DB writer for you:
+
+```zig
+// src/events.zig  (re-exported on RouteEvent)
+pub fn issueSession(
+    ev: *RouteEvent, collection: []const u8, record_id: []const u8,
+) !Issued   // acquires+releases the writer, fires onAuth(.custom)
+```
+
+> **Warning:** `ev.issueSession` acquires the pool writer for you. If your handler already holds the writer (`var w = ev.writer()`), do NOT call `ev.issueSession` — it would deadlock on the single non-reentrant writer. Instead call `zigbase.auth.issueSession(ev.ctx, w.conn, collection, record_id)` with the connection you already hold.
+
+Typical usage in a confirm handler that does NOT separately hold the writer:
+
+```zig
+fn myConfirm(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    // ... verify your token, resolve the record id ...
+    const issued = try ev.issueSession("members", record_id);
+    return .{ .status = 200, .body = "{\"ok\":true}", .cookies = &issued.cookies };
+}
+```
+
+When your handler already holds the writer (e.g. for `verifyLinkToken` and `consumeLinkToken`), reuse it:
+
+```zig
+fn myConfirm(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    var w = ev.writer();
+    defer w.deinit();
+    // ... verifyLinkToken, consumeLinkToken using w.conn ...
+    // Use zigbase.auth.issueSession, NOT ev.issueSession, to avoid double-acquiring the writer.
+    const issued = try zigbase.auth.issueSession(ev.ctx, w.conn, "members", record_id);
+    return .{ .status = 200, .body = "{\"ok\":true}", .cookies = &issued.cookies };
+}
+```
+
+`issued.cookies` is a `[2]http.Cookie` containing `zb_auth` (httpOnly) and
+`zb_csrf` (readable). Pass `&issued.cookies` as the `cookies` field on the
+`http.Response` and the framework writes both Set-Cookie headers.
+
+For a complete, copy-pasteable example (two-route magic-link flow with rate
+limiting, enumeration safety, and single-use token replay protection) see
+[recipes.md → magic-link login](recipes.md#recipe-magic-link-passwordless-login).
 
 ## 7. Scheduled jobs (`.cron` + `.jobs`)
 

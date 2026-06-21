@@ -6,6 +6,19 @@ All notable changes to ZigBase are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`zigbase.auth` consumer surface for custom auth flows** — `issueSession` (and
+  `RouteEvent.issueSession`), single-use magic-link tokens (`mintLinkToken` /
+  `verifyLinkToken` / `consumeLinkToken`), `deliverAuthMail`, and `rateLimit`. All
+  session minting now funnels through one seam that always fires `onAuth`.
+
+### Changed
+
+- **Session issuance (password, refresh, OAuth2) routes through a single
+  `issueSession`+`emitAuth` seam** — custom routes can no longer mint a session that
+  skips the `onAuth` hook.
+
 ## [0.4.1] - 2026-06-19
 
 ### Added

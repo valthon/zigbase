@@ -384,6 +384,17 @@ the email exists). The matching `confirm-*` endpoint takes that `token` in its b
 Configure SMTP for production; see
 [KNOWN_LIMITATIONS.md → Auth & email](../KNOWN_LIMITATIONS.md).
 
+### The `onAuth` hook — fires on every login
+
+Every successful login — password, OAuth2, and custom flows built with
+`ev.issueSession` / `zigbase.auth.issueSession` — fires the `onAuth` handler
+registered in your `App(.{ .onAuth = ... })`. This is the single chokepoint for
+cross-cutting session logic (audit logging, account-state checks, etc.). There is no
+path through ZigBase's session-issuance machinery that bypasses it.
+
+See [framework.md §6 Custom auth flows](framework.md#custom-auth-flows) for the
+`zigbase.auth` helper surface and the seam guarantee.
+
 ### Rate limiting
 
 The sensitive auth endpoints — `auth-with-password` (login), `request-verification`,

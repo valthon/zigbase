@@ -544,6 +544,163 @@ Key points:
 - Scheduling is **single-process, UTC, minute-granularity**; cron is numeric-only. See
   [Framework → Scheduled jobs](./framework#7-scheduled-jobs-cron--jobs) and its caveats.
 
+---
+
+## Recipe: magic-link (passwordless) login
+
+A magic-link flow uses two custom routes: one that mints and emails a single-use
+link token, and one that redeems it and issues a real session. Because the request
+route always returns `204` regardless of whether the email matches a record, it is
+**enumeration-safe** — callers learn nothing about whether the address is registered.
+
+Both routes are registered as `.auth = .public` (no prior session required).
+
+The full `zigbase.auth` surface used here:
+
+- `zigbase.auth.rateLimit(ctx, scope, ident)` — returns a `429 http.Response` when
+  the caller is over the limit, `null` otherwise. Call it first in any public route.
+- `zigbase.auth.mintLinkToken(ctx, conn, collection, record_id, ttl_s)` — mints a
+  signed, single-use JWT and returns `LinkToken{ .token }`.
+- `zigbase.auth.deliverAuthMail(app, alloc, to, subject, body)` — sends the link
+  via the configured mailer (SMTP or log in dev).
+- `zigbase.auth.verifyLinkToken(ctx, conn, collection, token)` — validates the JWT
+  and returns `?jwt.Claims` (`null` → expired / wrong collection / bad signature).
+  `claims.id` is the record id.
+- `zigbase.auth.consumeLinkToken(conn, claims)` — marks the token consumed; returns
+  `error.AlreadyConsumed` on replay.
+- `ev.issueSession(collection, record_id)` — issues a session from a `RouteEvent`,
+  sets the auth cookies, fires `onAuth(.custom)`, and returns `Issued{ .token, .cookies }`.
+  This is the seam that guarantees **every login fires your `onAuth` handler**,
+  including custom flows.
+
+```zig
+const std = @import("std");
+const zigbase = @import("zigbase");
+
+// Body shapes for the two endpoints.
+const MagicRequestBody = struct { email: []const u8 };
+const MagicConfirmBody = struct { token: []const u8 };
+
+/// POST /api/members/magic/request  { "email": "..." }
+///
+/// Always returns 204 — enumeration-safe. If the email matches a record, mints a
+/// single-use link token (TTL 900 s) and mails it. Rate-limited per IP/email.
+fn magicRequest(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    const a = ev.ctx.allocator;
+
+    // 1) Parse the request body first so we can key the rate limit on the parsed
+    //    email rather than the raw body (whitespace/key-order variants of the same
+    //    email would otherwise dodge the per-identity cap).
+    const parsed = std.json.parseFromSlice(MagicRequestBody, a, ev.ctx.body, .{}) catch
+        return .{ .status = 204, .body = "" }; // malformed body -> silent 204
+    defer parsed.deinit();
+    const email = parsed.value.email;
+
+    // 2) Rate-limit on the scope "magic-request" keyed on the parsed email.
+    //    rateLimit returns a ready-to-return 429 Response when limited.
+    if (try zigbase.auth.rateLimit(ev.ctx, "magic-request", email)) |resp| return resp;
+
+    // 3) Acquire a DB writer connection.
+    var w = ev.writer();
+    defer w.deinit();
+
+    // 4) Resolve the member record by email (DB lookup after rate-limit gate).
+    //    data.list returns an empty items slice when nothing matches — we treat both
+    //    "not found" and "found" paths the same way externally (always 204).
+    const results = try w.data().list("members", .{
+        .filter = try std.fmt.allocPrint(a, "email = \"{s}\"", .{email}),
+        .perPage = 1,
+    });
+    if (results.totalItems > 0) {
+        const record = results.items[0];
+        const rid = record.object.get("id").?.string;
+
+        // Mint a single-use link token valid for 15 minutes.
+        const lt = try zigbase.auth.mintLinkToken(ev.ctx, w.conn, "members", rid, 900);
+
+        // Build the magic-link URL (adapt the base URL to your deployment).
+        const link = try std.fmt.allocPrint(a,
+            "https://app.example.com/auth/confirm?token={s}", .{lt.token});
+        const body = try std.fmt.allocPrint(a,
+            "Click to sign in (link expires in 15 minutes):\n\n{s}", .{link});
+
+        // Deliver the email. Uses SMTP when configured, logs the token in dev.
+        try zigbase.auth.deliverAuthMail(
+            ev.app, a, email, "Your sign-in link", body);
+    }
+
+    // Always 204 — callers learn nothing about whether the email is registered.
+    return .{ .status = 204, .body = "" };
+}
+
+/// POST /api/members/magic/confirm  { "token": "..." }
+///
+/// Verifies the single-use link token, consumes it (replay -> 400), issues a
+/// real session, and returns 200 with the auth cookies set. onAuth fires here.
+fn magicConfirm(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    const a = ev.ctx.allocator;
+
+    const parsed = std.json.parseFromSlice(MagicConfirmBody, a, ev.ctx.body, .{}) catch
+        return .{ .status = 400, .body = "{\"message\":\"Invalid request body.\"}" };
+    defer parsed.deinit();
+    const token = parsed.value.token;
+
+    var w = ev.writer();
+    defer w.deinit();
+
+    // Verify: null = expired / wrong collection / bad signature.
+    const claims = (try zigbase.auth.verifyLinkToken(ev.ctx, w.conn, "members", token))
+        orelse return .{ .status = 400, .body = "{\"message\":\"Invalid or expired link.\"}" };
+
+    // Consume: error.AlreadyConsumed on replay — the link is single-use.
+    zigbase.auth.consumeLinkToken(w.conn, claims) catch |err| switch (err) {
+        error.AlreadyConsumed =>
+            return .{ .status = 400, .body = "{\"message\":\"Link already used.\"}" },
+        else => return err,
+    };
+
+    // Issue the session reusing the writer connection already held — do NOT call
+    // ev.issueSession here; it acquires the writer a second time and would deadlock.
+    // zigbase.auth.issueSession takes an explicit conn and fires onAuth(.custom).
+    const issued = try zigbase.auth.issueSession(ev.ctx, w.conn, "members", claims.id);
+    // We mint with `zigbase.auth.issueSession(ev.ctx, w.conn, …)`, reusing the writer we already hold — do **not** call `ev.issueSession(…)` while holding the writer, as it would acquire the single non-reentrant writer a second time and deadlock.
+    return .{ .status = 200, .body = "{\"ok\":true}", .cookies = &issued.cookies };
+}
+```
+
+Register both routes (`.auth = .public` so they're reachable without a prior session):
+
+```zig
+zigbase.App(.{
+    .routes = .{
+        .{ .method = .POST, .path = "/api/members/magic/request",
+           .handler = magicRequest, .auth = .public },
+        .{ .method = .POST, .path = "/api/members/magic/confirm",
+           .handler = magicConfirm, .auth = .public },
+    },
+    // ... hooks, cron, etc.
+}).runCli(init);
+```
+
+Key behaviours to note:
+
+- **Enumeration-safe.** The request route always returns `204` — a missing email, a
+  malformed body, and a found-and-mailed record are all indistinguishable to the caller.
+- **Single-use link.** Once a token is consumed, any subsequent `confirm` with the same
+  token receives `400 "Link already used."`. The link also carries a TTL (900 s above) —
+  an expired token returns `400 "Invalid or expired link."` before `consumeLinkToken` is
+  reached.
+- **`onAuth` fires on confirm.** `zigbase.auth.issueSession` routes through the same seam as
+  password and OAuth2 logins, so your `onAuth` handler (if registered) is called on
+  every magic-link sign-in. There is no way to mint a session via this path — or any
+  custom path — that bypasses it. See [Framework §6 Custom auth flows](./framework#custom-auth-flows).
+- **Rate limiting.** The request route calls `zigbase.auth.rateLimit` keyed on the
+  parsed email (not the raw body). The built-in scope key `"magic-request"` is app-defined;
+  use a descriptive scope per endpoint. Adjust the window and cap via the standard
+  `ZIGBASE_RATE_LIMIT_MAX` / `ZIGBASE_RATE_LIMIT_WINDOW` env vars.
+
+---
+
 ## See also
 
 [Fields](./fields) · [Tutorial](./tutorial) · [API](./api) · [Framework](./framework)

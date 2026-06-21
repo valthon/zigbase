@@ -383,6 +383,17 @@ new password *before* consuming the token, so a too-short password does not burn
 
 Configure SMTP for production; see [Known limitations](./known-limitations).
 
+### The `onAuth` hook — fires on every login
+
+Every successful login — password, OAuth2, and custom flows built with
+`ev.issueSession` / `zigbase.auth.issueSession` — fires the `onAuth` handler
+registered in your `App(.{ .onAuth = ... })`. This is the single chokepoint for
+cross-cutting session logic (audit logging, account-state checks, etc.). There is no
+path through ZigBase's session-issuance machinery that bypasses it.
+
+See [Framework §6 Custom auth flows](./framework#custom-auth-flows) for the
+`zigbase.auth` helper surface and the seam guarantee.
+
 ### Rate limiting
 
 The sensitive auth endpoints — `auth-with-password` (login), `request-verification`, and
