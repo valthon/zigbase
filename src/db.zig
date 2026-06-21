@@ -61,6 +61,13 @@ pub const Db = struct {
     pub fn rollback(self: *Db) DbError!void {
         try self.exec("ROLLBACK;");
     }
+
+    /// Number of rows changed/inserted/deleted by the most recent DML statement on this
+    /// connection. Wraps `sqlite3_changes64`. Safe to call immediately after a Stmt.step()
+    /// that ran a DML statement (UPDATE/INSERT/DELETE) on this connection.
+    pub fn changesCount(self: *Db) i64 {
+        return c.sqlite3_changes64(self.handle);
+    }
 };
 
 /// SQLITE_TRANSIENT tells SQLite to copy bound text/blobs immediately. It is the value

@@ -162,6 +162,9 @@ test {
     _ = @import("auth_helpers.zig");
     _ = @import("auth/method.zig");
     _ = @import("auth/methods/password.zig");
+    _ = @import("auth/methods/magic_link.zig");
+    _ = @import("auth/methods/otp.zig");
     _ = @import("auth/registry.zig");
     _ = @import("api/auth_methods.zig");
+    _ = @import("auth/challenge_store.zig");
 }

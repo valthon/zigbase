@@ -705,6 +705,9 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         if (opts.pagination.cursor_token == .stateful) {
             @import("records.zig").gcCursorStates(w) catch |e| std.log.warn("cursor-state GC at startup failed: {s}", .{@errorName(e)});
         }
+        // Sweep expired and consumed auth challenge entries at startup. This is purely space
+        // reclamation; both `take` paths already reject expired/consumed rows at query time.
+        @import("auth/challenge_store.zig").gcAuthChallenges(w) catch |e| std.log.warn("auth-challenge GC at startup failed: {s}", .{@errorName(e)});
     }
     // Instantiate the comptime-selected storage + mailer plugins. The instances are
     // serveImpl stack vars that outlive the server (srv.listen() runs to shutdown),

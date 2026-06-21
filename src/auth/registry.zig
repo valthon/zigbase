@@ -2,6 +2,8 @@ const std = @import("std");
 const method_mod = @import("method.zig");
 const AuthMethod = method_mod.AuthMethod;
 const PasswordMethod = @import("methods/password.zig").PasswordMethod;
+const MagicLinkMethod = @import("methods/magic_link.zig").MagicLinkMethod;
+const OtpMethod = @import("methods/otp.zig").OtpMethod;
 
 // ---------------------------------------------------------------------------
 // Registry — slug → AuthMethod lookup
@@ -25,7 +27,7 @@ pub const Registry = struct {
 /// Returns a comptime `[]const type` with the built-in method types first,
 /// followed by any types listed in `cfg.auth_methods` (if the field exists).
 pub fn assembleTypes(comptime cfg: anytype) []const type {
-    const builtins: []const type = &.{PasswordMethod};
+    const builtins: []const type = &.{ PasswordMethod, MagicLinkMethod, OtpMethod };
     if (!@hasField(@TypeOf(cfg), "auth_methods")) return builtins;
     // Append consumer-supplied types from the cfg tuple/struct.
     const custom = cfg.auth_methods;
@@ -95,8 +97,8 @@ pub fn deinit(comptime types: []const type, insts: *Instances(types)) void {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "Registry: built-in password method is found by slug, unknown slug returns null" {
-    // assembleTypes with an empty cfg (no .auth_methods field) → just PasswordMethod
+test "Registry: built-in methods are found by slug, unknown slug returns null" {
+    // assembleTypes with an empty cfg (no .auth_methods field) → built-in methods
     const types = comptime assembleTypes(.{});
 
     var insts: Instances(types) = undefined;
@@ -109,15 +111,25 @@ test "Registry: built-in password method is found by slug, unknown slug returns 
     try std.testing.expect(found != null);
     try std.testing.expectEqualStrings("password", found.?.slug);
 
+    const found_ml = reg.get("magic_link");
+    try std.testing.expect(found_ml != null);
+    try std.testing.expectEqualStrings("magic_link", found_ml.?.slug);
+
+    const found_otp = reg.get("otp");
+    try std.testing.expect(found_otp != null);
+    try std.testing.expectEqualStrings("otp", found_otp.?.slug);
+
     const missing = reg.get("nope");
     try std.testing.expect(missing == null);
 }
 
-test "Registry: assembleTypes with no .auth_methods key returns PasswordMethod only" {
+test "Registry: assembleTypes with no .auth_methods key returns built-in methods" {
     const types = comptime assembleTypes(.{});
-    try std.testing.expectEqual(@as(usize, 1), types.len);
+    try std.testing.expectEqual(@as(usize, 3), types.len);
     // Type identity must be checked at comptime.
     comptime std.debug.assert(types[0] == PasswordMethod);
+    comptime std.debug.assert(types[1] == MagicLinkMethod);
+    comptime std.debug.assert(types[2] == OtpMethod);
 }
 
 test "Registry: assembleTypes with .auth_methods appends custom types" {
@@ -131,9 +143,11 @@ test "Registry: assembleTypes with .auth_methods appends custom types" {
     };
 
     const types = comptime assembleTypes(.{ .auth_methods = .{FakeMethod} });
-    try std.testing.expectEqual(@as(usize, 2), types.len);
+    try std.testing.expectEqual(@as(usize, 4), types.len);
     comptime std.debug.assert(types[0] == PasswordMethod);
-    comptime std.debug.assert(types[1] == FakeMethod);
+    comptime std.debug.assert(types[1] == MagicLinkMethod);
+    comptime std.debug.assert(types[2] == OtpMethod);
+    comptime std.debug.assert(types[3] == FakeMethod);
 
     var insts: Instances(types) = undefined;
     var views: [types.len]AuthMethod = undefined;
@@ -141,6 +155,8 @@ test "Registry: assembleTypes with .auth_methods appends custom types" {
     defer deinit(types, &insts);
 
     try std.testing.expect(reg.get("password") != null);
+    try std.testing.expect(reg.get("magic_link") != null);
+    try std.testing.expect(reg.get("otp") != null);
     try std.testing.expect(reg.get("fake") != null);
     try std.testing.expect(reg.get("nope") == null);
 }

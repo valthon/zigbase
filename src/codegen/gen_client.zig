@@ -122,7 +122,7 @@ pub fn generate(
     try section(alloc, &w, "createClient");
     const rpc_section = try @import("rpc.zig").render(routes, alloc);
     // rpc_section slices are owned by the arena (alloc), freed on arena deinit.
-    try emitClientFactory(alloc, &w, cols, client_name, auth_collection, rpc_section, routes.len);
+    try emitClientFactory(alloc, &w, cols, client_name, auth_collection, rpc_section, routes.len, api_prefix);
 
     return w.toOwnedSlice(alloc);
 }
@@ -136,7 +136,16 @@ fn emitClientFactory(
     auth_collection: []const u8,
     rpc_section: @import("rpc.zig").Section,
     routes_len: usize,
+    api_prefix: []const u8,
 ) !void {
+    // Pre-build the auth iface + factory sections (empty if no non-password methods).
+    var auth_iface: W = .empty;
+    var auth_factory: W = .empty;
+    try emitAuthMethodEndpoints(alloc, &auth_iface, &auth_factory, cols, api_prefix);
+    const auth_iface_s = try auth_iface.toOwnedSlice(alloc);
+    const auth_factory_s = try auth_factory.toOwnedSlice(alloc);
+    const has_auth_methods = auth_iface_s.len > 0;
+
     // Emit named RPC Input/Output decls before the client interface (only when routes exist).
     if (routes_len > 0) {
         try w.appendSlice(alloc, rpc_section.decls);
@@ -146,9 +155,11 @@ fn emitClientFactory(
     for (cols) |c| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: {s};\n", .{ c.name, try ident.serviceName(alloc, c.name) }));
     try w.appendSlice(alloc, "  };\n  realtime: {\n");
     for (cols) |c| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: {s};\n", .{ c.name, try ident.realtimeAliasName(alloc, c.name) }));
+    // auth method stubs (non-password methods only; password stays on db.<col>.authWithPassword)
+    try w.appendSlice(alloc, "  };\n");
+    if (has_auth_methods) try w.appendSlice(alloc, auth_iface_s);
     if (routes_len > 0) {
         try w.appendSlice(alloc,
-            \\  };
             \\  files: FilesService;
         );
         try w.appendSlice(alloc, "\n  rpc: {\n");
@@ -163,7 +174,6 @@ fn emitClientFactory(
         );
     } else {
         try w.appendSlice(alloc,
-            \\  };
             \\  files: FilesService;
             \\  authStore: Client["authStore"];
             \\  send: Client["send"];
@@ -254,13 +264,18 @@ fn emitClientFactory(
             "      {0s}: makeTypedRealtime<{1s}, {2s}>(base.realtime, {3s}{4s}),\n",
             .{ c.name, rec, wn, mc, resolver }));
     }
-    if (routes_len > 0) {
+    // auth method stubs in the factory (non-password methods only)
+    if (has_auth_methods) {
+        try w.appendSlice(alloc, "    },\n");
+        try w.appendSlice(alloc, auth_factory_s);
+        try w.appendSlice(alloc, "    files: base.files,\n");
+    } else {
         try w.appendSlice(alloc, "    },\n    files: base.files,\n");
+    }
+    if (routes_len > 0) {
         try w.appendSlice(alloc, "    rpc: {\n");
         try w.appendSlice(alloc, rpc_section.factory_member);
         try w.appendSlice(alloc, "    },\n");
-    } else {
-        try w.appendSlice(alloc, "    },\n    files: base.files,\n");
     }
     try w.appendSlice(alloc,
         \\    authStore: base.authStore,
@@ -275,6 +290,133 @@ fn emitClientFactory(
 fn emit_hasRelations(c: schema.Collection) bool {
     for (c.fields) |f| if (f.options == .relation) return true;
     return false;
+}
+
+/// Convert a snake_case slug (e.g. "magic_link") to camelCase (e.g. "magicLink").
+/// First character is lowercased; underscores become word boundaries.
+fn camelFromSlug(alloc: std.mem.Allocator, slug: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var upper_next = false;
+    var first = true;
+    for (slug) |ch| {
+        if (ch == '_' or ch == '-') {
+            upper_next = true;
+            continue;
+        }
+        if (upper_next) {
+            try out.append(alloc, std.ascii.toUpper(ch));
+            upper_next = false;
+        } else if (first) {
+            try out.append(alloc, std.ascii.toLower(ch));
+        } else {
+            try out.append(alloc, ch);
+        }
+        first = false;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Returns true if the collection has any non-password auth methods enabled.
+fn hasNonPasswordAuthMethods(c: schema.Collection) bool {
+    if (c.type != .auth) return false;
+    const m = c.options.auth.methods;
+    return m.magic_link != null or m.otp != null or m.webauthn != null or m.custom.len > 0;
+}
+
+/// Returns true if any collection in the slice has non-password auth methods.
+fn anyNonPasswordAuthMethods(cols: []const schema.Collection) bool {
+    for (cols) |c| if (hasNonPasswordAuthMethods(c)) return true;
+    return false;
+}
+
+/// Emit the `auth` surface for non-password auth methods into both the interface
+/// and factory sections.
+/// Naming: client.auth.<colName>.<methodCamelCase>.initiate / .complete
+/// Posts to /api/collections/<col>/auth/<slug>/initiate|complete (untyped stubs).
+// TODO(typed): emit typed Initiate/Complete I/O once methods declare comptime types
+fn emitAuthMethodEndpoints(
+    alloc: std.mem.Allocator,
+    w_iface: *W, // receives the auth: { ... } interface body
+    w_factory: *W, // receives the auth: { ... } factory body
+    cols: []const schema.Collection,
+    api_prefix: []const u8,
+) !void {
+    // Build the list of (colName, []slug) pairs for non-password methods.
+    // We need a helper to iterate slugs for a given MethodsOptions.
+    //
+    // Only emit if there is at least one collection with non-password methods.
+    if (!anyNonPasswordAuthMethods(cols)) return;
+
+    // Interface: auth: {
+    try w_iface.appendSlice(alloc,
+        \\  auth: {
+        \\
+    );
+    // Factory: auth: {
+    try w_factory.appendSlice(alloc,
+        \\    auth: {
+        \\
+    );
+
+    for (cols) |c| {
+        if (!hasNonPasswordAuthMethods(c)) continue;
+
+        // Interface: <colName>: {
+        try w_iface.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: {{\n", .{c.name}));
+        // Factory: <colName>: {
+        try w_factory.appendSlice(alloc, try std.fmt.allocPrint(alloc, "      {s}: {{\n", .{c.name}));
+
+        // Collect slugs of enabled non-password methods.
+        const m = c.options.auth.methods;
+
+        // Helper: emit interface + factory lines for one slug.
+        const emit_slug = struct {
+            fn emit(
+                a: std.mem.Allocator,
+                wi: *W,
+                wf: *W,
+                col_name: []const u8,
+                slug: []const u8,
+                prefix: []const u8,
+            ) !void {
+                const camel_name = try camelFromSlug(a, slug);
+                // Interface member
+                try wi.appendSlice(a, try std.fmt.allocPrint(a,
+                    \\      {0s}: {{
+                    \\        // TODO(typed): emit typed Initiate/Complete I/O once methods declare comptime types
+                    \\        initiate(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;
+                    \\        complete(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;
+                    \\      }};
+                    \\
+                , .{camel_name}));
+                // Factory member
+                try wf.appendSlice(a, try std.fmt.allocPrint(a,
+                    \\        {0s}: {{
+                    \\          initiate: (input: Record<string, unknown>, opts?: SendOptions) =>
+                    \\            base.send("POST", `{1s}/collections/{2s}/auth/{3s}/initiate`, {{ body: input, ...opts }}),
+                    \\          complete: (input: Record<string, unknown>, opts?: SendOptions) =>
+                    \\            base.send("POST", `{1s}/collections/{2s}/auth/{3s}/complete`, {{ body: input, ...opts }}),
+                    \\        }},
+                    \\
+                , .{ camel_name, prefix, col_name, slug }));
+            }
+        }.emit;
+
+        if (m.magic_link != null) try emit_slug(alloc, w_iface, w_factory, c.name, "magic_link", api_prefix);
+        if (m.otp != null) try emit_slug(alloc, w_iface, w_factory, c.name, "otp", api_prefix);
+        if (m.webauthn != null) try emit_slug(alloc, w_iface, w_factory, c.name, "webauthn", api_prefix);
+        for (m.custom) |slug| try emit_slug(alloc, w_iface, w_factory, c.name, slug, api_prefix);
+
+        // Interface: close colName
+        try w_iface.appendSlice(alloc, "    };\n");
+        // Factory: close colName
+        try w_factory.appendSlice(alloc, "      },\n");
+    }
+
+    // Interface: close auth
+    try w_iface.appendSlice(alloc, "  };\n");
+    // Factory: close auth
+    try w_factory.appendSlice(alloc, "    },\n");
 }
 
 /// Mirror of emit.zig's hasSingleFileFields: the per-collection fileUrl graft is
@@ -473,4 +615,44 @@ test "guards run inside generate: operator-named relation target errors" {
         .{ .id = "", .name = "posts", .fields = post_f },
     });
     try std.testing.expectError(guards.GuardError.OperatorNameClash, generate(a, cols, &.{}, true, "", "ZbClient", "/api"));
+}
+
+test "auth-method endpoints: magic_link emits initiate/complete stubs; password emits nothing" {
+    // Verifies that emitAuthMethodEndpoints generates initiate/complete stubs for non-password methods.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An auth collection with magic_link enabled.
+    const members_cols = try a.dupe(schema.Collection, &.{
+        .{
+            .id = "",
+            .name = "members",
+            .type = .auth,
+            .fields = &.{},
+            .options = .{ .auth = .{ .methods = .{ .magic_link = .{} } } },
+        },
+    });
+    const out_ml = try generate(a, members_cols, &.{}, true, "members", "MembersClient", "/api");
+    // Should contain magic_link initiate + complete paths
+    try std.testing.expect(std.mem.indexOf(u8, out_ml, "/auth/magic_link/initiate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_ml, "/auth/magic_link/complete") != null);
+    // Should contain the camelCase method name
+    try std.testing.expect(std.mem.indexOf(u8, out_ml, "magicLink") != null);
+
+    // An auth collection with ONLY password — no non-password stubs.
+    const pw_cols = try a.dupe(schema.Collection, &.{
+        .{
+            .id = "",
+            .name = "users",
+            .type = .auth,
+            .fields = &.{},
+            .options = .{ .auth = .{ .methods = .{ .password = .{} } } },
+        },
+    });
+    const out_pw = try generate(a, pw_cols, &.{}, true, "users", "UsersClient", "/api");
+    // Should NOT contain any /auth/password/ URL stubs
+    try std.testing.expect(std.mem.indexOf(u8, out_pw, "/auth/password/") == null);
+    // Should NOT contain an auth namespace on the client interface
+    try std.testing.expect(std.mem.indexOf(u8, out_pw, "auth: {") == null);
 }

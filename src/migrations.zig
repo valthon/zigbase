@@ -90,6 +90,23 @@ fn init_0006(w: *db.Db) db.DbError!void {
     try w.exec("CREATE INDEX IF NOT EXISTS \"idx_cursorstate_expires\" ON \"_cursorStates\" (\"expires\");");
 }
 
+fn init_0007(w: *db.Db) db.DbError!void {
+    // Server-side challenge store for pluggable auth methods (OTP, magic-link, FIDO2, etc.).
+    // A challenge is minted by `put`, returned to the client as an opaque id (or embedded in
+    // a URL), and redeemed exactly once by `take`/`takeByIdentity`. "consumed" tracks
+    // single-use semantics atomically under the writer lock; "expires" is a unix-seconds TTL.
+    // A periodic GC (auth/challenge_store.gcAuthChallenges) prunes consumed/expired rows.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_authChallenges" (
+        \\  "id" TEXT PRIMARY KEY, "collectionRef" TEXT NOT NULL, "method" TEXT NOT NULL,
+        \\  "identity" TEXT NOT NULL, "payload" TEXT NOT NULL, "expires" INTEGER NOT NULL,
+        \\  "consumed" INTEGER NOT NULL DEFAULT 0, "created" TEXT NOT NULL
+        \\);
+    );
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_authchallenge_expires\" ON \"_authChallenges\" (\"expires\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_authchallenge_lookup\" ON \"_authChallenges\" (\"collectionRef\",\"method\",\"identity\");");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -97,6 +114,7 @@ pub const all = [_]Migration{
     .{ .name = "0004_consumed_tokens", .up = init_0004 },
     .{ .name = "0005_oauth_states", .up = init_0005 },
     .{ .name = "0006_cursor_states", .up = init_0006 },
+    .{ .name = "0007_auth_challenges", .up = init_0007 },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {
