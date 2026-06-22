@@ -1,15 +1,27 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const id = @import("id.zig");
 
 const argon2 = std.crypto.pwhash.argon2;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
+/// Argon2id cost parameters. Production uses `interactive_2id` (64 MiB, t=2) for real
+/// resistance. **Test builds** drop to deliberately weak params: the unit suite hashes
+/// and verifies passwords across ~700 tests, and at production cost that KDF work alone
+/// is ~25 s of every `zig build test`. The switch is keyed on `builtin.is_test`, so it
+/// affects ONLY the test binary — the shipped server binary, and the Playwright browser
+/// suite (which drives that real binary), always run full-strength params.
+const hash_params: argon2.Params = if (builtin.is_test)
+    .{ .t = 1, .m = 8, .p = 1 }
+else
+    argon2.Params.interactive_2id;
 
 /// Hash a password with argon2id, returning a PHC-format string allocated from `alloc`.
 pub fn hashPassword(io: std.Io, alloc: std.mem.Allocator, password: []const u8) ![]u8 {
     var buf: [256]u8 = undefined;
     const phc = try argon2.strHash(password, .{
         .allocator = alloc,
-        .params = argon2.Params.interactive_2id,
+        .params = hash_params,
     }, &buf, io);
     return alloc.dupe(u8, phc);
 }
@@ -20,11 +32,16 @@ pub fn verifyPassword(io: std.Io, alloc: std.mem.Allocator, phc: []const u8, pas
     return true;
 }
 
-/// A fixed, valid argon2id PHC hash with the same params (`interactive_2id`) used by
-/// `hashPassword`. Used to perform identity-independent argon2 work on a login miss so the
-/// response time of an unknown identity matches that of a known one (defeats account
-/// enumeration via a timing oracle). The plaintext it hashes is irrelevant — it never matches.
-pub const dummy_password_hash = "$argon2id$v=19$m=65536,t=2,p=1$X6nNL1XIBemv6GtMawOzIiupjeI6RhVcq4OM6oHc2Ds$7q5akLEU/XJR2q91NLbc9ARqZfPFtOSdtSIQZBP4I2o";
+/// A fixed, valid argon2id PHC hash with the same params `hashPassword` uses. Used to
+/// perform identity-independent argon2 work on a login miss so the response time of an
+/// unknown identity matches that of a known one (defeats account enumeration via a timing
+/// oracle). Both variants hash the plaintext "zigbase-login-timing-dummy"; the test build
+/// uses weak params (matching `hash_params`) so the timing-defense work stays cheap under
+/// the unit suite, while production keeps the real 64 MiB / t=2 cost.
+pub const dummy_password_hash = if (builtin.is_test)
+    "$argon2id$v=19$m=8,t=1,p=1$Nogl5w29zufCdU9yMIexgeEuZY1gLIIvqHdjpw3tA7c$8kCzMNdJBFhiyspDpZQLe0e2jmHnCXAQhNbrhC8SmoE"
+else
+    "$argon2id$v=19$m=65536,t=2,p=1$X6nNL1XIBemv6GtMawOzIiupjeI6RhVcq4OM6oHc2Ds$7q5akLEU/XJR2q91NLbc9ARqZfPFtOSdtSIQZBP4I2o";
 
 /// Run an argon2 verify against the fixed dummy hash, discarding the result. Call this on a
 /// login miss (unknown identity / missing hash) to keep the work identity-independent.
