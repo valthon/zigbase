@@ -28,11 +28,29 @@ no install needed beyond `npx @zigbase/typegen` (which pulls `@zigbase/server`).
 | Tier | Get it | Typing | Typed custom-route RPC | Needs Zig source |
 |---|---|---|---|---|
 | **Base dynamic** | `npm install @zigbase/client` | you pass `<Type>` | no | no |
-| **Comptime-generated** | `zig build gen-client` | full, from your schema | **yes** (`zb.rpc.*`) | yes |
 | **Runtime introspection** | `npx @zigbase/typegen` | full (db/realtime/files) | no | no |
+| **Comptime-generated** | `zig build gen-client` | full, from your schema | **yes** (`zb.rpc.*`) | yes |
 
 All three share the same runtime (`@zigbase/client`); the generated tiers add fully-typed
 `zb.db.*` (and, for comptime, `zb.rpc.*`) on top.
+
+**Which one?** Pick the tier by how much of the stack you own — they're ordered above from
+least to most integrated:
+
+- **Base** — reach for it when you just want to **pull the client from a CDN** (or a single
+  `npm install`) and hand-write your own types. Zero build wiring, zero codegen; you pass
+  `<Type>` parameters yourself. Great for quick frontends, prototypes, and apps that consume a
+  ZigBase backend you don't control.
+- **Runtime introspection** — the **middle ground** when you're **not** building a custom
+  ZigBase backend (so there's no Zig source to generate from) but still want a fully
+  type-checked, optimized frontend. `npx @zigbase/typegen` reads a running server (or its data
+  dir) and emits typed `zb.db.*`/realtime/files. No `rpc.*`, since routes aren't introspectable
+  at runtime.
+- **Comptime-generated** — the **biggest win** if you want optimized, custom-tailored client
+  code, **especially when you're already building a custom ZigBase backend in Zig**. `zig build
+  gen-client` reads your comptime schema *and* your registered routes, so you get fully-typed
+  `zb.db.*` **and** typed custom-route RPC (`zb.rpc.*`) — generated straight from the source of
+  truth, with no running server required.
 
 ## Create a client
 
