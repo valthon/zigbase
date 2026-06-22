@@ -16,6 +16,10 @@ pub const Config = struct {
     http_host: []const u8 = "127.0.0.1",
     http_port: u16 = 8090,
     data_dir: []const u8 = "./zb_data",
+    /// Public base URL of this deployment (e.g. "https://app.example.com"). Used
+    /// to build absolute links in auth emails (magic-link). Empty = no link is
+    /// built (magic-link emails the raw token instead). Env: ZIGBASE_PUBLIC_URL.
+    public_url: []const u8 = "",
     // "" = no operator-provided secret: serveImpl auto-generates a strong random
     // secret on first run and persists it at <data_dir>/.jwt_secret (0600), reusing
     // it thereafter. An operator-provided secret must be >= 32 bytes; the old shared
@@ -99,6 +103,7 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_HTTP_HOST")) |v| cfg.http_host = v;
         if (getter.get("ZIGBASE_HTTP_PORT")) |v| cfg.http_port = try std.fmt.parseInt(u16, v, 10);
         if (getter.get("ZIGBASE_DATA_DIR")) |v| cfg.data_dir = v;
+        if (getter.get("ZIGBASE_PUBLIC_URL")) |v| cfg.public_url = v;
         if (getter.get("ZIGBASE_JWT_SECRET")) |v| cfg.jwt_secret = v;
         if (getter.get("ZIGBASE_COOKIE_SECURE")) |v| cfg.cookie_secure = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
         if (getter.get("ZIGBASE_AUTH_TOKEN_TTL")) |v| cfg.auth_token_ttl_s = try std.fmt.parseInt(i64, v, 10);

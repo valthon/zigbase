@@ -45,7 +45,13 @@ The example apps are also built in CI (the `examples/plugins` frontend must be `
 
 **Database connection model (`db.zig`).** A pool of warm reader connections plus a single writer guarded by a mutex; WAL mode. Hook/job/route code obtains a `Data`/`Db` from the pool. `before`-hooks run *before* the write transaction and are **not** transactional with it (mutate `ev.record` via `ev.arena`; use `after`-hooks for side effects). Hook record mutations **must** allocate with `ev.arena` (the request-scoped arena that owns `ev.record`), never `ev.app.allocator`.
 
-**Schema & provisioning (`schema.zig`, `provision.zig`, `ddl.zig`, `migrations.zig`).** A comptime `.collections` literal is lowered by `provision.buildCollections` and provisioned at startup (create-missing + additive field-add + relation-by-name resolution). **Non-additive changes (rename/drop/retype) are detected, logged, and skipped** — they need an explicit `.migrations` entry. **Gotcha:** provisioned columns are named by an 8-char *stable field id* (FNV hash of collection+field), **not** the human field name, so a raw-SQL migration cannot `CREATE INDEX ON posts(status)` — it must target tables the migration itself owns (or resolve the id). The query layer maps field names → ids; raw SQL does not.
+**Schema & provisioning (`schema.zig`, `provision.zig`, `ddl.zig`, `migrations.zig`).** A comptime `.collections` literal is lowered by `provision.buildCollections` and provisioned at startup (create-missing + additive field-add + relation-by-name resolution). **Non-additive changes (rename/drop/retype) are detected, logged, and skipped** — they need an explicit `.migrations` entry. **Stable field ids:** each field carries an 8-char *stable field id* (FNV hash of
+collection+field) used to match columns across additive rebuilds (`ddl.rebuildPlan`
+matches old/new fields by id, preserving data through a table rebuild). The **physical
+SQLite column is named by the human field name**, so a raw-SQL migration can
+`CREATE INDEX ON posts(status)` directly, and the comptime `.indexes` key indexes
+provisioned columns by field name. Migrations remain the escape hatch for tables the
+migration itself owns and for non-additive DDL the provisioner won't perform.
 
 **Access rules (`rules.zig`) are safe-by-default (since v0.4.0).** A blank rule — `null` **or** `""` — means **Locked (superusers only)**. The explicit sentinel **`"@public"`** is the only allow-all; `provision.zig` logs a startup warning for every `@public` rule. Any other string is an expression evaluated per record. Rule parse errors fail **closed** (500, the write never runs).
 
