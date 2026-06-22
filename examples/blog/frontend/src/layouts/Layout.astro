@@ -1,5 +1,6 @@
 ---
 import '../styles/global.css';
+import AuthStatus from '../components/AuthStatus.tsx';
 const { title = 'ZigBase Blog' } = Astro.props;
 ---
 <!doctype html>
@@ -15,6 +16,7 @@ const { title = 'ZigBase Blog' } = Astro.props;
         <a class="brand" href="/">~*~ ZigBase Blog ~*~</a>
         <a href="/write">✍ Write</a>
         <a href="/_/" data-astro-reload>⚙ Admin</a>
+        <AuthStatus client:load />
       </nav>
     </header>
 
