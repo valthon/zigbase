@@ -4,6 +4,7 @@ const schema = @import("schema.zig");
 const collections = @import("collections.zig");
 const records = @import("records.zig");
 const migrations = @import("migrations.zig");
+const auth = @import("auth.zig");
 const App = @import("app.zig").App;
 
 /// Connection-bound, curated record operations. Hooks, custom routes, and jobs
@@ -32,9 +33,26 @@ pub const Data = struct {
         const col = (try collections.get(self.app.allocator, self.conn, col_name)) orelse return null;
         return records.get(self.app.allocator, self.conn, col, id);
     }
+    /// Create a record. On an **auth** collection this runs the same credential transforms
+    /// the HTTP layer applies — the server generates a `tokenKey` (and forces
+    /// `verified=false`), hashing `password` if one is supplied — so the row works with
+    /// `auth.issueSession` / `auth.mintLinkToken` immediately. `password` is OPTIONAL, so a
+    /// passwordless flow (magic-link signup) provisions a credential-less but usable row. A
+    /// non-auth collection takes the plain insert path. (The lower-level engine
+    /// `records.create` does NOT provision — use it directly only for raw import/migration.)
+    /// Errors: `error.UnknownCollection` if the name doesn't resolve; `error.NotObject` if
+    /// `value` isn't a JSON object; `error.PasswordTooShort` if a supplied password is too short.
     pub fn create(self: Data, col_name: []const u8, value: std.json.Value) !std.json.Value {
         const col = (try collections.get(self.app.allocator, self.conn, col_name)) orelse return error.UnknownCollection;
-        return records.create(self.app.allocator, self.io, self.conn, col, value);
+        if (col.type != .auth) return records.create(self.app.allocator, self.io, self.conn, col, value);
+        // Surface the same error as the non-auth path (records.create) for a non-object
+        // value, rather than applyProvision's misleading PasswordTooShort.
+        if (value != .object) return error.NotObject;
+        const prepped = try auth.applyProvision(self.io, self.app.allocator, value, col.options.auth.minPasswordLength);
+        // applyProvision allocates duped keys + cred strings; records.create only reads
+        // `prepped` (it returns a freshly-allocated record), so we own and free it here.
+        defer auth.freeProvisioned(self.app.allocator, prepped);
+        return records.create(self.app.allocator, self.io, self.conn, col, prepped);
     }
     pub fn update(self: Data, col_name: []const u8, id: []const u8, value: std.json.Value) !?std.json.Value {
         const col = (try collections.get(self.app.allocator, self.conn, col_name)) orelse return error.UnknownCollection;

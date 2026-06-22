@@ -590,6 +590,13 @@ The full `zigbase.auth` surface used here:
   This is the seam that guarantees **every login fires your `onAuth` handler**,
   including custom flows.
 
+> **Provisioning a new passwordless account.** The request route below resolves an
+> *existing* member. To create one on the fly (passwordless sign-up), call
+> `w.data().create("members", .{ .object = fields })`: on an auth collection `create`
+> generates the per-record `tokenKey` (and forces `verified=false`) so the new row works
+> with `mintLinkToken` / `issueSession` immediately. `password` is optional, so no
+> credential columns need hand-writing.
+
 ```zig
 const std = @import("std");
 const zigbase = @import("zigbase");

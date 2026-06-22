@@ -281,6 +281,14 @@ const rec = try r.data().findById("posts", id);
 `findById` / `create` / `update` / `delete` / `list`). **Always `defer <handle>.deinit()`**
 — the writer is a single shared connection, so hold it no longer than necessary.
 
+> **Auth collections:** `data().create(collection, fields)` on an auth collection runs
+> the same credential transforms as the HTTP layer (generates the per-record `tokenKey`,
+> forces `verified=false`, and hashes `password` if one is supplied). A `password` is
+> **optional**, so a passwordless flow can provision a credential-less account that
+> `zigbase.auth.issueSession` / `mintLinkToken` can immediately operate on. Non-auth
+> collections take the plain insert path. (The lower-level engine `records.create` does
+> *not* provision — reach for it directly only for raw import/migration.)
+
 ### Typed routes and the generated `rpc` surface
 
 For routes that carry a structured input or output, ZigBase supports **typed routes** declared with a `Req(Input)` / `Output` handler signature instead of the raw `RouteEvent` form. A typed route handler looks like:
