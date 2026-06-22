@@ -38,13 +38,48 @@ A request is authenticated by either of:
 
 1. **Bearer token** — `Authorization: Bearer <jwt>`.
 2. **Cookie** — the httpOnly `zb_auth` cookie. When authenticating via the cookie,
-   unsafe methods (POST, PATCH, DELETE) additionally require a double-submit CSRF
-   check: send the value of the readable `zb_csrf` cookie back in the
+   unsafe methods (POST, PUT, PATCH, DELETE) additionally require a double-submit
+   CSRF check: send the value of the readable `zb_csrf` cookie back in the
    `X-CSRF-Token` header. The server compares it against the CSRF claim embedded in
    the token; a missing or mismatched header fails authentication on unsafe methods.
 
 The `zb_auth` cookie is httpOnly, `SameSite=Strict`; `zb_csrf` is readable (not
 httpOnly), `SameSite=Strict`. Both are set by the auth endpoints (see [Auth](#auth)).
+
+#### CSRF on unsafe methods (cookie sessions)
+
+This applies only to the **cookie** transport. Bearer-token requests carry no
+ambient cookie, so they are not subject to the CSRF check.
+
+- **Safe methods (`GET`, `HEAD`, `OPTIONS`) are exempt.** Reads work with just the
+  cookie — no header needed.
+- **Unsafe methods (`POST`, `PUT`, `PATCH`, `DELETE`) require the header.** The
+  request must carry `X-CSRF-Token` equal to the current `zb_csrf` cookie value, or
+  authentication fails (the request is rejected as unauthenticated → `403`).
+
+If you authenticate and read fine but every write returns `403`, this is almost
+always the missing piece: the client never echoed the `zb_csrf` cookie into the
+`X-CSRF-Token` header.
+
+The `zb_csrf` cookie is deliberately **not** httpOnly so that a browser SPA / `fetch`
+client can read it and replay it as a header on writes — that is what makes the
+double-submit check work. Read the cookie and set the header on every unsafe
+request:
+
+```js
+// read the readable zb_csrf cookie, send it back as X-CSRF-Token on writes
+const csrf = document.cookie
+  .split("; ")
+  .find((c) => c.startsWith("zb_csrf="))
+  ?.slice("zb_csrf=".length);
+
+await fetch("/api/collections/posts/records", {
+  method: "POST",
+  credentials: "include", // send zb_auth + zb_csrf cookies
+  headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+  body: JSON.stringify({ title: "Hello" }),
+});
+```
 
 ---
 
@@ -349,6 +384,10 @@ Auth endpoints target an auth-type collection (`:col`).
 `identity` is matched against the collection's configured identity fields.
 `auth-refresh` returns the same `{ token, record }` shape and re-sets the cookies.
 `auth-logout` clears `zb_auth` and `zb_csrf`.
+
+When you authenticate via these cookies, writes must echo the `zb_csrf` cookie in
+the `X-CSRF-Token` header — see
+[CSRF on unsafe methods](#csrf-on-unsafe-methods-cookie-sessions).
 
 ### Registration / signup
 
