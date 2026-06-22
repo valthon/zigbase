@@ -10,6 +10,13 @@
 //!   - beforeCreate: slugify + setAuthor + computeReadingTime (chained)
 //!   - beforeUpdate: computeReadingTime
 //!
+//! Auth:
+//!   - Built-in magic_link on users (auto_create, ttl 1 h, redirects to "/")
+//!   - Set ZIGBASE_PUBLIC_URL for a clickable link (see README)
+//!
+//! Index:
+//!   - NOCASE unique on users.email (prevents Bob@x.com / bob@x.com duplicates)
+//!
 //! Custom routes:
 //!   - GET /api/blog/ping            — public health check
 //!   - GET /api/blog/posts/:slug     — fetch a single published post by slug
@@ -187,6 +194,25 @@ pub fn main(init: std.process.Init) !void {
                 // Public profiles + open signup: list/view/create are intentionally allow-all
                 // (the explicit "@public" sentinel; an empty string is now LOCKED, not public).
                 .rules = .{ .list = "@public", .view = "@public", .create = "@public", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
+                // Built-in magic-link login: POST initiate -> link emailed (or logged in dev) ->
+                // GET consume sets session cookie + redirects to "/". No password required.
+                // auto_create = true: a first-time visitor signing in gets an account automatically.
+                // Set ZIGBASE_PUBLIC_URL=http://blog.test/ (fake; override to your host to click
+                // the link) so the emailed link is a real clickable URL instead of a raw token.
+                .auth = .{
+                    .methods = .{
+                        .magic_link = .{
+                            .ttl_s = 3600,
+                            .auto_create = true,
+                            .redirect_default = "/",
+                        },
+                    },
+                },
+                // NOCASE unique index on email: prevents duplicate accounts differing only in
+                // case (e.g. Bob@x.com and bob@x.com would otherwise be two separate users).
+                .indexes = .{
+                    .{ .name = "users_email_nocase", .fields = .{"email"}, .unique = true, .collation = .nocase },
+                },
             },
             .posts = .{
                 .fields = .{

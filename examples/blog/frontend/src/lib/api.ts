@@ -29,12 +29,27 @@ export function logout(): void {
   if (typeof localStorage !== 'undefined') localStorage.removeItem(TOKEN_KEY);
 }
 
+/**
+ * Read the zb_csrf cookie value (JS-readable: http_only=false).
+ * Returns empty string when not present (no cookie session active).
+ */
+function csrfToken(): string {
+  if (typeof document === 'undefined') return '';
+  const m = document.cookie.match(/(?:^|;\s*)zb_csrf=([^;]+)/);
+  return m ? decodeURIComponent(m[1]) : '';
+}
+
 async function req(path: string, init: RequestInit = {}): Promise<any> {
   const headers: Record<string, string> = {};
   const t = token();
+  const csrf = csrfToken();
   if (t) headers['Authorization'] = `Bearer ${t}`;
+  // Include cookie credentials and CSRF token when a cookie session is active.
+  // CSRF is required for unsafe methods (POST/PATCH/DELETE) with cookie auth.
+  if (!t && csrf) headers['x-csrf-token'] = csrf;
   if (init.body) headers['Content-Type'] = 'application/json';
-  const r = await fetch(path, { ...init, headers });
+  const credentials: RequestCredentials = (!t && csrf) ? 'include' : 'same-origin';
+  const r = await fetch(path, { ...init, headers: { ...init.headers, ...headers }, credentials });
   if (!r.ok) {
     const err = await r.json().catch(() => null);
     throw new Error(err?.message ?? `HTTP ${r.status}`);
@@ -104,4 +119,56 @@ export function subscribePosts(onEvent: (ev: RealtimeEvent) => void): () => void
     }
   });
   return () => ws.close();
+}
+
+/**
+ * Initiate a magic-link login. Always resolves (server returns 204 — enumeration-safe).
+ * The server emails (or logs in dev) a link to the consume endpoint.
+ * Set ZIGBASE_PUBLIC_URL on the server so the link is a full clickable URL.
+ */
+export async function initiateLogin(email: string): Promise<void> {
+  await fetch('/api/collections/users/auth/magic_link/initiate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ identity: email }),
+  });
+  // 204 — no body, always resolves regardless of whether the email exists (enumeration-safe).
+}
+
+/**
+ * Return the current user record if a session cookie is active (set by the
+ * magic-link consume redirect), or null if unauthenticated.
+ * Uses auth-refresh (POST, cookie-based) — the framework's session-detection endpoint.
+ * Requires zb_csrf cookie to be present (set alongside zb_auth by the consume redirect).
+ */
+export type Me = { id: string; email: string; name?: string };
+export async function getMe(): Promise<Me | null> {
+  try {
+    const csrf = csrfToken();
+    if (!csrf) return null; // no cookie session — skip the round-trip
+    const r = await fetch('/api/collections/users/auth-refresh', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'x-csrf-token': csrf },
+    });
+    if (!r.ok) return null;
+    const out = await r.json();
+    return (out?.record as Me) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Server-side logout: clears the zb_auth and zb_csrf session cookies.
+ * Call this in addition to clearing localStorage when the user logs out.
+ */
+export async function logoutCookie(): Promise<void> {
+  const csrf = csrfToken();
+  if (!csrf) return; // no cookie session
+  await fetch('/api/collections/users/auth-logout', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'x-csrf-token': csrf },
+  }).catch(() => {}); // best-effort: fire-and-forget; local state is cleared regardless
 }
