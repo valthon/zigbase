@@ -66,8 +66,14 @@ pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.I
     for (idx.fields, 0..) |fname, i| {
         if (i > 0) try out.append(alloc, ',');
         try out.appendSlice(alloc, try quoteIdent(alloc, fname));
+        try out.appendSlice(alloc, idx.collation.sqlSuffix());
     }
-    try out.appendSlice(alloc, ");");
+    try out.append(alloc, ')');
+    if (idx.where) |w| {
+        try out.appendSlice(alloc, " WHERE ");
+        try out.appendSlice(alloc, w);
+    }
+    try out.append(alloc, ';');
     return out.toOwnedSlice(alloc);
 }
 
@@ -152,6 +158,19 @@ test "createIndexSql builds unique and non-unique" {
     try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_title\" ON \"posts\" (\"title\");", u);
     const n = try createIndexSql(a, "posts", .{ .name = "idx_ab", .fields = &.{ "a", "b" }, .unique = false });
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_ab\" ON \"posts\" (\"a\",\"b\");", n);
+}
+
+test "createIndexSql emits COLLATE NOCASE and a partial WHERE predicate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ci = try createIndexSql(a, "customers", .{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase });
+    try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_email\" ON \"customers\" (\"email\" COLLATE NOCASE);", ci);
+    const partial = try createIndexSql(a, "posts", .{ .name = "idx_active", .fields = &.{"slug"}, .unique = true, .where = "deleted_at IS NULL" });
+    try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_active\" ON \"posts\" (\"slug\") WHERE deleted_at IS NULL;", partial);
+    // collation applies per-column, predicate follows the column list
+    const both = try createIndexSql(a, "t", .{ .name = "idx_both", .fields = &.{ "a", "b" }, .collation = .nocase, .where = "a IS NOT NULL" });
+    try std.testing.expectEqualStrings("CREATE INDEX \"idx_both\" ON \"t\" (\"a\" COLLATE NOCASE,\"b\" COLLATE NOCASE) WHERE a IS NOT NULL;", both);
 }
 
 test "rebuildPlan copies retained columns by field id, adds new, drops removed" {
