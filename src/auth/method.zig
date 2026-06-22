@@ -59,11 +59,11 @@ pub const AuthCtx = struct {
         return api_auth.findByIdentity(ac.ctx.allocator, conn, ac.collection, identity);
     }
 
-    /// Find-or-create an auth record for  under an already-held writer.
+    /// Find-or-create an auth record for `identity` under an already-held writer.
     /// Returns the record id (arena-allocated). When the identity is not found and
-    ///  is false, returns null. When  is true and the
+    /// `auto_create` is false, returns null. When `auto_create` is true and the
     /// identity is not found, inserts a minimal auth record (identity field(s) set to
-    /// , passwordHash = "", fresh tokenKey, verified = false) and returns
+    /// `identity`, passwordHash = "", fresh tokenKey, verified = false) and returns
     /// its id. If insert fails with a unique constraint race (StepFailed), retries
     /// findByIdentity once and returns whatever is there.
     pub fn resolveOrCreate(

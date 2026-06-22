@@ -531,11 +531,16 @@ pub fn injectOAuthSecrets(
             // Build ZIGBASE_OAUTH_<UPPER(NAME)>_CLIENT_ID / _SECRET.
             // Provider names are validated as identifiers at comptime (buildOAuth2Provider),
             // so they are ASCII letters/digits/underscore — uppercase is char-by-char.
+            // These three are scratch for the env lookup only — none escape, so free them
+            // at the end of the iteration (callers may pass a long-lived gpa).
             const upper_buf = try alloc.alloc(u8, p.name.len);
+            defer alloc.free(upper_buf);
             for (p.name, 0..) |ch, ui| upper_buf[ui] = std.ascii.toUpper(ch);
             const upper = upper_buf;
             const id_key = try std.fmt.allocPrint(alloc, "ZIGBASE_OAUTH_{s}_CLIENT_ID", .{upper});
+            defer alloc.free(id_key);
             const sec_key = try std.fmt.allocPrint(alloc, "ZIGBASE_OAUTH_{s}_CLIENT_SECRET", .{upper});
+            defer alloc.free(sec_key);
             if (getter.get(id_key)) |v| if (v.len > 0) {
                 np[i].clientId = try alloc.dupe(u8, v);
             };
