@@ -320,30 +320,39 @@ pub const CommandMailer = struct {
         const msg = try buildMessage(alloc, self.from, email, now_s);
         defer alloc.free(msg);
 
-        // stdin is a pipe we feed the message to; stdout/stderr are inherited so
-        // an MTA's diagnostics land in the server log alongside our own.
-        var child = try std.process.spawn(io, .{
-            .argv = self.argv,
-            .stdin = .pipe,
-            .stdout = .inherit,
-            .stderr = .inherit,
-        });
-        // If anything below fails before `wait`, reap the child so we don't leak it.
-        errdefer child.kill(io);
+        // Spawn → write stdin → wait, all inside a block so the `errdefer kill`
+        // is scoped to the spawned-but-not-yet-reaped window. `wait` reaps the
+        // child and releases its PID; once it returns the block exits normally
+        // and the errdefer is disarmed — so a later non-zero-exit error never
+        // signals an already-reaped (possibly PID-recycled) process.
+        const term = blk: {
+            // stdin is a pipe we feed the message to; stdout/stderr are inherited
+            // so an MTA's diagnostics land in the server log alongside our own.
+            var child = try std.process.spawn(io, .{
+                .argv = self.argv,
+                .stdin = .pipe,
+                .stdout = .inherit,
+                .stderr = .inherit,
+            });
+            // If writing stdin or waiting fails, reap the child so we don't leak it.
+            errdefer child.kill(io);
 
-        // Write the full message, then close stdin so the child reads EOF. The
-        // close must happen before `wait`, or a child that drains all of stdin
-        // (sendmail/msmtp do) would block forever waiting for more input.
-        const stdin = child.stdin.?;
-        try stdin.writeStreamingAll(io, msg);
-        stdin.close(io);
-        child.stdin = null;
+            // Write the full message, then close stdin so the child reads EOF. The
+            // close must happen before `wait`, or a child that drains all of stdin
+            // (sendmail/msmtp do) would block forever waiting for more input.
+            const stdin = child.stdin.?;
+            try stdin.writeStreamingAll(io, msg);
+            stdin.close(io);
+            child.stdin = null;
+
+            break :blk try child.wait(io);
+        };
 
         // Exit 0 is success. A non-zero exit (or a signal/abnormal termination)
         // becomes an error so the caller surfaces it (e.g. to Sentry / the
         // framework's onError) rather than us swallowing it here; this mirrors
-        // SmtpMailer, which likewise returns errors without logging.
-        const term = try child.wait(io);
+        // SmtpMailer, which likewise returns errors without logging. The child is
+        // already reaped at this point, so we must NOT kill here.
         switch (term) {
             .exited => |code| if (code != 0) return error.MailCommandFailed,
             else => return error.MailCommandFailed,
