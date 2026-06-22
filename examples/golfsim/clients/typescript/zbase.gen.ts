@@ -646,6 +646,15 @@ export interface ZbClient {
     bookings: BookingsRealtime;
     reviews: ReviewsRealtime;
   };
+  auth: {
+    users: {
+      otp: {
+        // TODO(typed): emit typed Initiate/Complete I/O once methods declare comptime types
+        initiate(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;
+        complete(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;
+      };
+    };
+  };
   files: FilesService;
   rpc: {
     bookingsConfirm(params: { id: string }, opts?: SendOptions): Promise<unknown>;
@@ -691,6 +700,16 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       listings: makeTypedRealtime<Listing, ListingWhere>(base.realtime, listingsMeta, relationResolver),
       bookings: makeTypedRealtime<Booking, BookingWhere>(base.realtime, bookingsMeta, relationResolver),
       reviews: makeTypedRealtime<Review, ReviewWhere>(base.realtime, reviewsMeta, relationResolver),
+    },
+    auth: {
+      users: {
+        otp: {
+          initiate: (input: Record<string, unknown>, opts?: SendOptions) =>
+            base.send("POST", `/api/collections/users/auth/otp/initiate`, { body: input, ...opts }),
+          complete: (input: Record<string, unknown>, opts?: SendOptions) =>
+            base.send("POST", `/api/collections/users/auth/otp/complete`, { body: input, ...opts }),
+        },
+      },
     },
     files: base.files,
     rpc: {

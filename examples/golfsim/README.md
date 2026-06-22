@@ -190,7 +190,7 @@ Real DB access inside a background job: acquire the pooled writer, wrap it in a
 
 | Collection | Type | Key fields |
 |---|---|---|
-| `users` | auth | `name` |
+| `users` | auth | `name`; `require_verified=true`; OTP + password methods; Google OAuth2 |
 | `simulators` | base | `label`, `owner` → users |
 | `listings` | base | `title`, `price_per_hour`, `status` (draft/published/archived), `simulator` → simulators, `photos` (file ×6) |
 | `bookings` | base | `listing`, `guest`, `starts_at`, `ends_at`, `price_total`, `status` (pending/confirmed/cancelled) |
@@ -228,7 +228,7 @@ RAII helpers in routes: `ev.writer()` (write) / `try ev.reader()` (read-only).
   photos via multipart/form-data.
 - **`MyBookings`** — view bookings, cancel pending/confirmed bookings, leave a
   rating + review on a confirmed booking; live-updates via realtime WebSocket.
-- **`Auth`** — email/password sign-in + sign-up.
+- **`Auth`** — multi-step auth: password sign-in, OTP initiate/complete, signup, email-verification, and OAuth2 (Google).
 
 ---
 
@@ -295,6 +295,65 @@ const health = await zb.rpc.golfsimHealth();
 ```
 
 `unknown` outputs correspond to `std.json.Value` in Zig — cast to your concrete type for field access. The e2e test (`test/golfsim.e2e.test.ts`) exercises `bookingsConfirm` live through this surface.
+
+---
+
+## Auth & onboarding
+
+`golfsim` uses `require_verified = true` on the `users` collection: a guest must
+have a verified email before a session is minted. This is appropriate for a
+booking/payments app — unverified accounts cannot hold time slots.
+
+### Onboarding flow (new users)
+
+1. **Sign up** — email + password via the login card on the home page.
+   (API: `POST /api/collections/users/records`)
+2. **Verify email** — a verification token is emailed (dev: printed to the server log
+   by the default LogMailer). Paste it into the "Verify your account" input.
+   (API: `POST /api/collections/users/confirm-verification`)
+3. **Sign in** — password login now succeeds, or use OTP for future logins.
+
+### OTP passwordless login (returning verified users)
+
+Once verified, users may sign in with a one-time code instead of their password:
+
+1. Enter email → "Send one-time code".
+   (API: `POST /api/collections/users/auth/otp/initiate`)
+2. Enter the 6-digit code from the email (dev: server log). Valid for 5 minutes.
+   (API: `POST /api/collections/users/auth/otp/complete`)
+
+`auto_create = false` means OTP will NOT create new accounts — it is a convenience
+for existing, verified users only. First-time onboarding always uses password signup.
+
+### OAuth2 — Sign in with Google
+
+Google OAuth2 is declared at comptime and enabled when environment credentials are set:
+
+```sh
+export ZIGBASE_OAUTH_GOOGLE_CLIENT_ID=<your_client_id>
+export ZIGBASE_OAUTH_GOOGLE_CLIENT_SECRET=<your_client_secret>
+```
+
+Google-verified accounts are created with `verified=true` and can book immediately,
+bypassing the email-verification step. This flow is **not exercised in CI** (it
+requires live Google credentials).
+
+To test locally:
+1. Create a Google OAuth2 client in GCP (Web application type).
+2. Add `http://localhost:8090/api/oauth2/google/callback` as an authorized redirect URI.
+3. Set the env vars above and restart the binary.
+4. The "Sign in with Google" button on the login card will redirect to Google.
+
+### Comptime indexes
+
+Two indexes are provisioned at startup via comptime `.indexes`:
+
+- **`idx_users_email_nocase`** — unique, `COLLATE NOCASE` on `users.email`. Prevents
+  `Bob@x.com` and `bob@x.com` from being treated as distinct accounts.
+- **`idx_bookings_listing_time_active`** — composite `(listing, starts_at)` with
+  `WHERE status != 'cancelled'`. Backs the double-booking overlap check
+  (`prepareBooking`) and the availability route — only active bookings are indexed,
+  so availability queries are O(active bookings per listing).
 
 ---
 

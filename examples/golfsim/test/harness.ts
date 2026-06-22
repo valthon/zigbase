@@ -12,7 +12,21 @@ const BIN = process.env.ZIGBASE_TEST_GOLFSIM_BINARY || join(EXAMPLE_ROOT, "zig-o
 const FRONTEND_ROOT = join(EXAMPLE_ROOT, "frontend");
 const FRONTEND_DIST = join(FRONTEND_ROOT, "dist", "index.html");
 
-export interface GolfServer { url: string; stop(): void; }
+export interface GolfServer {
+  url: string;
+  stop(): void;
+  /**
+   * Wait for the LogMailer to emit a verification token for `email` (subject
+   * "Verify your email"). Returns the raw JWT string. Rejects after `timeoutMs`
+   * if no matching token appears.
+   *
+   * Call this immediately after POST /api/collections/users/request-verification
+   * so the token is captured from the server's LogMailer output (server stderr).
+   * The LogMailer emits (via std.log.info):
+   *   info: [mail] to=<email> subject=Verify your email body=Verify your email (users). Your verification token:\n\n<TOKEN>\n
+   */
+  captureVerificationToken(email: string, timeoutMs?: number): Promise<string>;
+}
 
 /**
  * golfsim bakes in `.static_files = .{ .dir = "frontend/dist" }` at comptime, so
@@ -53,8 +67,19 @@ export async function startGolfsim(): Promise<GolfServer> {
   if (su.status !== 0) { try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } throw new Error("superuser create failed"); }
   // cwd MUST be EXAMPLE_ROOT: the comptime `.static_files = .{ .dir = "frontend/dist" }`
   // is resolved relative to the server's working directory.
-  const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
+  // stderr is piped so captureVerificationToken() can read LogMailer output;
+  // stdout (facil.io startup banner) is inherited for visibility.
+  const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], { cwd: EXAMPLE_ROOT, stdio: ["inherit", "inherit", "pipe"] });
   const url = `http://127.0.0.1:${port}`;
+
+  // Accumulate all server stderr text for token extraction; mirror to process stderr.
+  let stderrText = "";
+  proc.stderr!.on("data", (chunk: Buffer) => {
+    const text = chunk.toString();
+    process.stderr.write(text);
+    stderrText += text;
+  });
+
   try {
     await waitForHealth(url);
   } catch (err) {
@@ -62,5 +87,26 @@ export async function startGolfsim(): Promise<GolfServer> {
     try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
     throw err;
   }
-  return { url, stop() { proc.kill("SIGTERM"); try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } } };
+
+  return {
+    url,
+    stop() { proc.kill("SIGTERM"); try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } },
+    async captureVerificationToken(email: string, timeoutMs = 5_000): Promise<string> {
+      // The LogMailer emits (via std.log.info, writing to stderr):
+      //   info: [mail] to=<email> subject=Verify your email body=Verify your email (users). Your verification token:\n\nTOKEN\n
+      // The body newlines are literal — the log entry spans multiple lines in stderr.
+      const marker = `[mail] to=${email} subject=Verify your email body=`;
+      const tokenRe = /Your verification token:\s*\n+([A-Za-z0-9._\-]+)/;
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const idx = stderrText.indexOf(marker);
+        if (idx !== -1) {
+          const m = stderrText.slice(idx).match(tokenRe);
+          if (m) return m[1]!;
+        }
+        if (Date.now() > deadline) throw new Error(`No verification token logged for ${email} within ${timeoutMs}ms`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    },
+  };
 }

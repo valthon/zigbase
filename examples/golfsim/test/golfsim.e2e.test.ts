@@ -6,11 +6,26 @@ let server: GolfServer;
 beforeAll(async () => { server = await startGolfsim(); });
 afterAll(() => server?.stop());
 
-/** Public signup + auth (users has @public create/list/view). */
+/** Public signup + auth (users has @public create/list/view).
+ *
+ * users.require_verified = true means authWithPassword returns 403 until the
+ * user is verified.  We simulate the email-verification step by:
+ *   1. Calling requestVerification (triggers the LogMailer to emit the token).
+ *   2. Capturing the token from server stderr via harness.captureVerificationToken.
+ *   3. Calling confirmVerification to set verified=true on the record.
+ * Then authWithPassword succeeds.
+ */
 async function host(email: string) {
   const zb = createClient(server.url, { WebSocket: globalThis.WebSocket });
-  const user = await zb.db.users.create({ email, password: "member-pass-1", passwordConfirm: "member-pass-1", name: email.split("@")[0]! });
-  await zb.db.users.authWithPassword(email, "member-pass-1");
+  await zb.db.users.create({ email, password: "member-pass-1", passwordConfirm: "member-pass-1", name: email.split("@")[0]! });
+
+  // Trigger verification email (LogMailer logs it to server stderr).
+  await zb.send("POST", "/api/collections/users/request-verification", { body: { email } });
+  // Capture the token the LogMailer wrote and confirm it.
+  const token = await server.captureVerificationToken(email);
+  await zb.send("POST", "/api/collections/users/confirm-verification", { body: { token } });
+
+  const { record: user } = await zb.db.users.authWithPassword(email, "member-pass-1");
   return { zb, user };
 }
 

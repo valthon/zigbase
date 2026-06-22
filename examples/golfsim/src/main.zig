@@ -25,6 +25,15 @@
 //!      from the authenticated identity and enforces the review gate (you may
 //!      only review your OWN booking, and only once it is `confirmed`).
 //!
+//!   9. `require_verified = true` on `users`: email verification is required before
+//!      a session is minted — guests cannot hold booking slots with unverified accounts.
+//!  10. OTP passwordless login (`auto_create = false`): a one-step login convenience
+//!      for existing, verified accounts. First-time onboarding uses password signup +
+//!      the `request-verification` / `confirm-verification` flow.
+//!  11. Two comptime indexes: `NOCASE` unique on `users.email` (prevents case-variant
+//!      duplicate accounts) and a partial composite index on `bookings(listing, starts_at)
+//!      WHERE status != 'cancelled'` backing overlap/availability queries.
+//!
 //! The five collections (users / simulators / listings / bookings / reviews) are
 //! provisioned at COMPTIME via `.collections` in the App config — the schema is
 //! set up automatically at startup (additive auto-migration). The Astro + React
@@ -508,9 +517,45 @@ pub const App = zigbase.App(.{
                 .fields = .{
                     .{ .name = "name", .type = .text, .max = 100 },
                 },
+                // require_verified: guests must verify their email before a session is minted.
+                // Justified for a booking/payments app — unverified accounts cannot hold slots.
+                // OTP offers a one-step passwordless login convenience for existing, verified accounts.
+                // First-time onboarding: password signup + email verification (see Auth.tsx).
+                // NOTE: .password = .{} must be explicit — specifying .methods at all opts OUT of the
+                // implicit password default. Omitting it would disable /auth-with-password entirely.
+                .auth = .{
+                    .require_verified = true,
+                    .methods = .{
+                        .password = .{}, // keep password login (required for post-verify signin)
+                        .otp = .{ .auto_create = false }, // OTP for existing, verified accounts only
+                    },
+                    // OAuth2: "Sign in with Google" — client credentials are sourced from env
+                    // at provision time (ZIGBASE_OAUTH_GOOGLE_CLIENT_ID / _SECRET).
+                    // Google-verified accounts are created with verified=true so they can
+                    // book immediately without a separate email-verification step.
+                    // See README.md "Auth & onboarding > OAuth2" for setup instructions.
+                    .oauth2 = .{
+                        .enabled = true,
+                        .providers = .{
+                            .{
+                                .name = "google",
+                                // clientId/clientSecret left empty here; the framework
+                                // injects ZIGBASE_OAUTH_GOOGLE_CLIENT_ID/SECRET at provision.
+                                .redirectUrls = .{"http://localhost:8090/api/oauth2/google/callback"},
+                                .enabled = true,
+                            },
+                        },
+                    },
+                },
                 // Public profiles + open signup: "@public" is the explicit allow-all sentinel
                 // (empty "" is now LOCKED, not public).
                 .rules = .{ .list = "@public", .view = "@public", .create = "@public", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
+                // NOCASE unique index on email: prevents Bob@x.com and bob@x.com from being
+                // treated as distinct accounts (doubly important with require_verified since
+                // a collision would block both from verifying).
+                .indexes = .{
+                    .{ .name = "idx_users_email_nocase", .fields = .{"email"}, .unique = true, .collation = .nocase },
+                },
             },
             .simulators = .{
                 .fields = .{
@@ -556,6 +601,17 @@ pub const App = zigbase.App(.{
                     .create = "@request.auth.id != \"\"",
                     .update = "@request.auth.id = listing.simulator.owner",
                     .delete = "@request.auth.id = guest",
+                },
+                // Partial composite index backing the overlap check (prepareBooking) and
+                // availability route (listingAvailability). Only active (non-cancelled)
+                // bookings are indexed: shrinks the index and makes availability queries
+                // O(active bookings per listing) rather than O(all bookings per listing).
+                .indexes = .{
+                    .{
+                        .name = "idx_bookings_listing_time_active",
+                        .fields = .{ "listing", "starts_at" },
+                        .where = "status != 'cancelled'",
+                    },
                 },
             },
             // The FIFTH comptime collection. Provisioning five collections / ~19 fields
