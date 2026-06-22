@@ -514,6 +514,72 @@ Notes:
 - `store(id, data, ttl_s)` — store a challenge under `id` with the given TTL.
 - `consume(id) ![]const u8` — retrieve and delete in one atomic step (single-use).
 
+### OAuth2 providers (`.auth.oauth2`)
+
+Configure OAuth2 sign-in for an auth collection by adding `.auth.oauth2` to its `.auth` block:
+
+```zig
+.users = .{ .type = .auth, .fields = .{}, .auth = .{
+    .oauth2 = .{
+        .enabled = true,
+        .providers = .{
+            // Preset provider — endpoints come from ZigBase's built-in table.
+            .{ .name = "google", .redirectUrls = .{"https://app.example/oauth/callback"} },
+            // Generic provider — all three endpoint URLs are required (all https://).
+            .{ .name = "myprovider",
+               .authURL = "https://myprovider.example/oauth/authorize",
+               .tokenURL = "https://myprovider.example/oauth/token",
+               .userinfoURL = "https://myprovider.example/api/user",
+               .redirectUrls = .{"https://app.example/oauth/callback"} },
+        },
+    },
+} },
+```
+
+**Built-in presets** (endpoint URLs supplied automatically): `google`, `github`, `microsoft`, `discord`.
+A generic provider requires `authURL`, `tokenURL`, and `userinfoURL` (all must be `https://`).
+
+**Per-provider fields** (all optional except `.name`):
+
+| Field | Default | Notes |
+|---|---|---|
+| `name` | — | **Required**. Valid identifier; becomes the slug and is uppercased into the env var name. |
+| `enabled` | `true` | Set `false` to temporarily disable without removing the declaration. |
+| `redirectUrls` | `&.{}` | Tuple of allowed OAuth2 redirect URLs. |
+| `clientId` | `""` | Prefer env (see below); literal is accepted but bakes the value into the binary. |
+| `clientSecret` | `""` | **Do not set in the literal.** Use env — the literal embeds the secret in the binary. |
+| `authURL` | `null` | Generic provider only. |
+| `tokenURL` | `null` | Generic provider only. |
+| `userinfoURL` | `null` | Generic provider only. |
+| `scopes` | `null` | Override default scopes for a preset, or supply scopes for a generic provider. |
+
+#### Runtime secrets via environment variables
+
+The `clientId` and `clientSecret` are **NOT** read from the comptime literal at runtime (a comptime literal cannot hold a secret safely). Instead, set environment variables at provisioning time:
+
+```
+ZIGBASE_OAUTH_<UPPER(NAME)>_CLIENT_ID=<your-client-id>
+ZIGBASE_OAUTH_<UPPER(NAME)>_CLIENT_SECRET=<your-client-secret>
+```
+
+For example, for `name = "google"`:
+
+```
+ZIGBASE_OAUTH_GOOGLE_CLIENT_ID=123456789-abc.apps.googleusercontent.com
+ZIGBASE_OAUTH_GOOGLE_CLIENT_SECRET=GOCSPX-...
+```
+
+The framework uppercases the provider name character-by-character to form the env var key. The `clientSecret` is encrypted (AES-256-GCM, HKDF key derived from the JWT secret) before being persisted in the database — the plaintext never reaches disk.
+
+#### Provisioning caveat (applied on first creation only)
+
+The env-secret injection and collection creation happen at startup, but only on the **first boot** (when the collection does not yet exist in the database). On subsequent boots the live database options are preserved — the env vars are ignored for an already-provisioned collection. This means:
+
+- **Rotating a secret:** update the value via the admin API (PATCH `/api/collections/:col`) or the admin UI. The admin path re-encrypts under the new plaintext.
+- **Changing a redirect URL or adding a provider:** update the comptime literal AND use an explicit `.migrations` entry to apply the change (provisioning is additive-only; it does not re-apply options on existing collections).
+
+> **CI/e2e caveat:** this feature cannot be exercised in automated CI without real provider credentials. All verification is at the unit level (comptime lowering + encrypt-on-inject with a stub env getter and a fake app secret).
+
 ### OAuth2 — contract method
 
 OAuth2 (Google, GitHub, etc.) is the **fifth built-in `AuthMethod`** (slug `oauth2`). It is gated by the existing `.auth.oauth2.enabled` + `.auth.oauth2.providers` config, **not** by `.auth.methods`. When OAuth2 is enabled for a collection the framework auto-mounts three endpoints:
