@@ -28,10 +28,12 @@ const ApiError = @import("error.zig").ApiError;
 // ---------------------------------------------------------------------------
 
 /// A candidate redirect target is "safe" only when it is a same-origin relative
-/// path: it must start with a single "/", and must not begin with "//" or "/\"
-/// (protocol-relative URLs that browsers resolve to a remote origin), nor contain
-/// a scheme separator, nor any control/whitespace byte that could smuggle a
-/// second header or confuse the URL parser.
+/// path: it must start with a single "/", must not begin with "//" or "/\"
+/// (protocol-relative URLs that browsers resolve to a remote origin), must not
+/// contain any control/whitespace byte that could smuggle a second header or
+/// confuse the URL parser, and must not contain a path-traversal (`.`/`..`) or
+/// backslash sequence that a browser would normalize to escape an allowed prefix
+/// (e.g. `/club/../admin` resolves to `/admin` and would bypass the allow-list).
 fn isSafeRelative(path: []const u8) bool {
     if (path.len == 0) return false;
     if (path[0] != '/') return false; // must be origin-relative
@@ -39,9 +41,34 @@ fn isSafeRelative(path: []const u8) bool {
     for (path) |c| {
         // Reject controls, space, and the CR/LF that header injection relies on.
         if (c <= 0x20 or c == 0x7f) return false;
+        // Reject backslashes entirely — browsers normalize "\" to "/", so they
+        // enable both protocol-relative and traversal bypasses.
+        if (c == '\\') return false;
         // A ':' before the first '/' would be a scheme ("javascript:"); but since
         // we already require path[0]=='/', any ':' here is inside the path and is
         // legal (query strings, matrix params). No extra check needed.
+    }
+
+    // Reject path-traversal segments in the path portion (before any '?'). The
+    // value is already percent-decoded once, so literal ".." is caught here; the
+    // encoded-form checks below catch double-encoded payloads (%2e, %2f, %5c)
+    // that would otherwise survive to a second decode.
+    const limit = std.mem.indexOfScalar(u8, path, '?') orelse path.len;
+    const path_part = path[0..limit];
+    if (std.mem.indexOf(u8, path_part, "/../") != null or
+        std.mem.indexOf(u8, path_part, "/./") != null or
+        std.mem.endsWith(u8, path_part, "/..") or
+        std.mem.endsWith(u8, path_part, "/."))
+    {
+        return false;
+    }
+    // Defense in depth: refuse any still-encoded dot/slash/backslash anywhere in
+    // the target so a double-encoded "%252e" -> "%2e" -> "." can't slip through.
+    if (std.ascii.indexOfIgnoreCase(path, "%2e") != null or // '.'
+        std.ascii.indexOfIgnoreCase(path, "%2f") != null or // '/'
+        std.ascii.indexOfIgnoreCase(path, "%5c") != null) // '\'
+    {
+        return false;
     }
     return true;
 }
@@ -153,6 +180,26 @@ test "isSafeRelative: accepts origin-relative, rejects off-origin and injection"
     try std.testing.expect(!isSafeRelative("https://evil.example.com")); // absolute scheme
     try std.testing.expect(!isSafeRelative("/app\r\nSet-Cookie: x=1")); // CRLF injection
     try std.testing.expect(!isSafeRelative("/app path")); // raw space
+}
+
+test "isSafeRelative: rejects path traversal and backslash bypasses" {
+    // Literal "../" traversal that browsers normalize to escape an allowed prefix.
+    try std.testing.expect(!isSafeRelative("/club/../admin"));
+    try std.testing.expect(!isSafeRelative("/../admin"));
+    try std.testing.expect(!isSafeRelative("/club/.."));
+    try std.testing.expect(!isSafeRelative("/club/./admin"));
+    try std.testing.expect(!isSafeRelative("/club/."));
+    // Backslash variants (browsers treat "\" as "/").
+    try std.testing.expect(!isSafeRelative("/foo/..\\admin"));
+    try std.testing.expect(!isSafeRelative("/club\\..\\admin"));
+    // Double-encoded forms that would survive to a second decode.
+    try std.testing.expect(!isSafeRelative("/club/..%2fadmin"));
+    try std.testing.expect(!isSafeRelative("/club/%2e%2e/admin"));
+    try std.testing.expect(!isSafeRelative("/club/%2E%2E%2Fadmin")); // uppercase encoded
+    try std.testing.expect(!isSafeRelative("/foo%5c..%5cadmin"));
+    // A legitimate path with a dot in a filename segment is still fine.
+    try std.testing.expect(isSafeRelative("/club/report.v2"));
+    try std.testing.expect(isSafeRelative("/files/a.b.c"));
 }
 
 test "matchesAllow: exact and prefix entries" {
@@ -308,6 +355,42 @@ test "consume: non-whitelisted redirect falls back to default (no open redirect)
     const res = try consume(&ctx);
     try std.testing.expectEqual(@as(u16, 302), res.status);
     try std.testing.expectEqualStrings("/club/welcome", locationHeader(res).?);
+}
+
+test "consume: traversal redirect cannot escape an allowed prefix" {
+    const allow = [_][]const u8{"/club/"};
+    var env = try setupConsumeEnv("mlconsume5", &allow, "/club/welcome");
+    defer env.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try env.createUser(a, "mlconsume5", "u@x.io", "longenough");
+
+    // Each attack uses a freshly minted token (consume is single-use).
+    const attacks = [_][]const u8{
+        "%2Fclub%2F..%2Fadmin", // /club/../admin
+        "%2Fclub%2F..%252fadmin", // /club/..%2fadmin (double-encoded slash)
+        "%2Ffoo%2F..%5Cadmin", // /foo/..\admin (backslash)
+    };
+    for (attacks) |atk| {
+        var mint_ctx = consumeCtx(env, a, "mlconsume5", "");
+        const token = blk: {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            const col = (try collections.get(a, w, "mlconsume5")).?;
+            const rid = (try api_auth.findByIdentity(a, w, col, "u@x.io")).?;
+            break :blk (try auth_helpers.mintLinkToken(&mint_ctx, w, "mlconsume5", rid, 900)).token;
+        };
+        const q = try std.fmt.allocPrint(a, "token={s}&redirect={s}", .{ token, atk });
+        var ctx = consumeCtx(env, a, "mlconsume5", q);
+        const res = try consume(&ctx);
+        // Login still succeeds (302) but the target is forced to the default —
+        // never the traversed "/admin".
+        try std.testing.expectEqual(@as(u16, 302), res.status);
+        try std.testing.expectEqualStrings("/club/welcome", locationHeader(res).?);
+    }
 }
 
 test "consume: missing token → 400; magic_link disabled → 404" {
