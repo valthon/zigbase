@@ -55,11 +55,14 @@ ambient cookie, so they are not subject to the CSRF check.
   cookie — no header needed.
 - **Unsafe methods (`POST`, `PUT`, `PATCH`, `DELETE`) require the header.** The
   request must carry `X-CSRF-Token` equal to the current `zb_csrf` cookie value, or
-  authentication fails (the request is rejected as unauthenticated → `403`).
+  the request is treated as **unauthenticated**. The resulting status then follows
+  the [access rules](#access-rules): a `POST` (create) denial returns `403`, while a
+  `PATCH`/`DELETE` denial on a protected record returns `404` (to hide the record's
+  existence).
 
-If you authenticate and read fine but every write returns `403`, this is almost
-always the missing piece: the client never echoed the `zb_csrf` cookie into the
-`X-CSRF-Token` header.
+If you authenticate and read fine but writes return `403` (or `404` on
+updates/deletes), this is almost always the missing piece: the client never echoed
+the `zb_csrf` cookie into the `X-CSRF-Token` header.
 
 The `zb_csrf` cookie is deliberately **not** httpOnly so that a browser SPA / `fetch`
 client can read it and replay it as a header on writes — that is what makes the
