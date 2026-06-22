@@ -9,17 +9,33 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      # All zig builds in this job (main + every example, via inherited env) share
+      # ONE local cache dir, which is persisted across runs below. This is where the
+      # compiled vendored SQLite object actually lives.
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
-      # Shared, persisted zig global cache: the vendored SQLite amalgamation
-      # compiles once and is reused across main/blog/plugins and across runs.
+      # Global cache holds toolchain-shared artifacts (compiler_rt, translate-c, libc).
       - name: Cache zig global cache
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+      # Local cache holds the compiled SQLite amalgamation (the dominant clean-build
+      # cost — ~5-8s per `zig build`, recompiled for each example without this) plus
+      # every other build object. The sha-suffixed key writes a fresh entry each run;
+      # restore-keys fuzzy-match the most recent, and zig's content-addressed cache
+      # reuses any unchanged object (sqlite3.o) even when other sources changed.
+      - name: Cache zig local cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-local
+          key: zig-local-build-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          restore-keys: |
+            zig-local-build-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
+            zig-local-build-${{ runner.os }}-zig0.16.0-
       - name: Cache npm downloads
         uses: actions/cache@v5
         with:
@@ -67,6 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -76,6 +93,17 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+      # Persists the compiled SQLite object (and the test binary) across runs — see the
+      # build job for rationale. Separate key prefix: the test binary differs from the
+      # build job's artifacts, so they don't share cache entries.
+      - name: Cache zig local cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-local
+          key: zig-local-unit-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          restore-keys: |
+            zig-local-unit-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
+            zig-local-unit-${{ runner.os }}-zig0.16.0-
       - name: Unit tests
         run: mise exec zig@0.16.0 -- zig build test --summary all
 
