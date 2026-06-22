@@ -166,6 +166,7 @@ test {
     _ = @import("auth/methods/otp.zig");
     _ = @import("auth/registry.zig");
     _ = @import("api/auth_methods.zig");
+    _ = @import("api/magic_link_consume.zig");
     _ = @import("auth/methods/oauth2.zig");
     _ = @import("auth/challenge_store.zig");
     _ = @import("auth/webauthn/cbor.zig");

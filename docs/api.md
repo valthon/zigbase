@@ -419,6 +419,29 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 { "token": "<jwt>" }
 ```
 
+**magic_link consume + redirect (the classic email-link UX):**
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/collections/:col/auth/magic_link/consume?token=...&redirect=/app` | Verify + consume the token, set `zb_auth`/`zb_csrf` cookies, and `302` to the redirect target. For browser email links: the user clicks a plain GET URL and lands logged-in. Fires `onAuth(.magic_link)` and honors `require_verified` (403) exactly like `complete`. |
+
+The token is single-use (replay returns `400 Link already used.`); a missing token returns `400`, and the route `404`s unless `magic_link` is enabled on the collection.
+
+The `redirect` target is validated **server-side** so each app does not re-implement an open-redirect guard. Only same-origin **relative** paths are ever honored — anything with a scheme/host, a protocol-relative `//host`, or a control/CRLF byte is rejected. A per-method allow-list narrows it further:
+
+```jsonc
+// collection options.auth.methods.magic_link
+{
+  "ttl_s": 900,
+  "redirect_default": "/club/welcome",      // used when ?redirect= is absent or rejected
+  "redirect_allow": ["/club/", "/dashboard"] // entry ending in "/" is a prefix; else exact path
+}
+```
+
+- Empty `redirect_allow` ⇒ any same-origin relative path is accepted (the scheme/host guard still applies).
+- A non-empty `redirect_allow` restricts to matching paths; a non-matching (or unsafe) `?redirect=` falls back to `redirect_default`.
+- `redirect_default` itself must be a safe relative path; an off-origin value degrades to `/`.
+
 **otp initiate:**
 ```json
 // request
