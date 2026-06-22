@@ -828,10 +828,11 @@ pub fn indexesFromJson(alloc: std.mem.Allocator, s: []const u8) ![]Index {
     const items = root.array.items;
     const out = try alloc.alloc(Index, items.len);
     for (items, 0..) |it, i| {
-        const collation: Collation = if (try getStr(alloc, it, "collation")) |c|
-            (std.meta.stringToEnum(Collation, c) orelse return error.InvalidSchema)
-        else
-            .binary;
+        const collation: Collation = if (objGet(it, "collation")) |cv| blk: {
+            if (cv == .null) break :blk .binary;
+            if (cv != .string) return error.InvalidSchema;
+            break :blk std.meta.stringToEnum(Collation, cv.string) orelse return error.InvalidSchema;
+        } else .binary;
         out[i] = .{
             .name = (try getStr(alloc, it, "name")) orelse return error.InvalidSchema,
             .fields = (try getStrArray(alloc, it, "fields")) orelse &.{},

@@ -70,8 +70,11 @@ pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.I
     }
     try out.append(alloc, ')');
     if (idx.where) |w| {
-        try out.appendSlice(alloc, " WHERE ");
-        try out.appendSlice(alloc, w);
+        const trimmed = std.mem.trim(u8, w, " \t\r\n");
+        if (trimmed.len > 0) {
+            try out.appendSlice(alloc, " WHERE ");
+            try out.appendSlice(alloc, trimmed);
+        }
     }
     try out.append(alloc, ';');
     return out.toOwnedSlice(alloc);
@@ -171,6 +174,11 @@ test "createIndexSql emits COLLATE NOCASE and a partial WHERE predicate" {
     // collation applies per-column, predicate follows the column list
     const both = try createIndexSql(a, "t", .{ .name = "idx_both", .fields = &.{ "a", "b" }, .collation = .nocase, .where = "a IS NOT NULL" });
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_both\" ON \"t\" (\"a\" COLLATE NOCASE,\"b\" COLLATE NOCASE) WHERE a IS NOT NULL;", both);
+    // an empty or whitespace-only predicate emits no WHERE clause (not "WHERE ;")
+    const empty = try createIndexSql(a, "t", .{ .name = "idx_e", .fields = &.{"a"}, .where = "" });
+    try std.testing.expectEqualStrings("CREATE INDEX \"idx_e\" ON \"t\" (\"a\");", empty);
+    const ws = try createIndexSql(a, "t", .{ .name = "idx_w", .fields = &.{"a"}, .where = "  \t\n" });
+    try std.testing.expectEqualStrings("CREATE INDEX \"idx_w\" ON \"t\" (\"a\");", ws);
 }
 
 test "rebuildPlan copies retained columns by field id, adds new, drops removed" {
