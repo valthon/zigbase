@@ -472,7 +472,7 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 
 The token is single-use (replay returns `400 Link already used.`); a missing token returns `400`, and the route `404`s unless `magic_link` is enabled on the collection.
 
-The `redirect` target is validated **server-side** so each app does not re-implement an open-redirect guard. Only same-origin **relative** paths are ever honored — anything with a scheme/host, a protocol-relative `//host`, or a control/CRLF byte is rejected. A per-method allow-list narrows it further:
+The `redirect` target is validated **server-side** so each app does not re-implement an open-redirect guard. Only same-origin **relative** paths are ever honored — anything with a scheme/host, a protocol-relative `//host`, a backslash, a `.`/`..` path-traversal segment, an encoded `%2e`/`%2f`/`%5c`, or a control/CRLF byte is rejected. A per-method allow-list narrows it further:
 
 ```jsonc
 // collection options.auth.methods.magic_link
