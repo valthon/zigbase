@@ -573,8 +573,11 @@ The full `zigbase.auth` surface used here:
 
 - `zigbase.auth.rateLimit(ctx, scope, ident)` — returns a `429 http.Response` when
   the caller is over the limit, `null` otherwise. Call it first in any public route.
-- `zigbase.auth.mintLinkToken(ctx, conn, collection, record_id, ttl_s)` — mints a
-  signed, single-use JWT and returns `LinkToken{ .token }`.
+- `zigbase.auth.mintLinkToken(ctx, conn, collection, record_id, ttl_s, opts)` — mints a
+  signed, single-use JWT and returns `LinkToken{ .token }`. `opts.payload` (default `""`)
+  binds a small opaque, signed, tamper-proof string into the token (e.g. a post-login
+  redirect path), returned by `verifyLinkToken` as `claims.pl` — carry bound state in the
+  one token instead of an unsigned `&next=` URL param.
 - `zigbase.auth.deliverAuthMail(app, alloc, to, subject, body)` — sends the link
   via the configured mailer (SMTP or log in dev).
 - `zigbase.auth.verifyLinkToken(ctx, conn, collection, token)` — validates the JWT
@@ -629,8 +632,9 @@ fn magicRequest(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
         const record = results.items[0];
         const rid = record.object.get("id").?.string;
 
-        // Mint a single-use link token valid for 15 minutes.
-        const lt = try zigbase.auth.mintLinkToken(ev.ctx, w.conn, "members", rid, 900);
+        // Mint a single-use link token valid for 15 minutes. Pass `.{}` for no bound
+        // payload, or `.{ .payload = "/dashboard" }` to carry a signed post-login target.
+        const lt = try zigbase.auth.mintLinkToken(ev.ctx, w.conn, "members", rid, 900, .{});
 
         // Build the magic-link URL (adapt the base URL to your deployment).
         const link = try std.fmt.allocPrint(a,
