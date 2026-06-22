@@ -16,36 +16,45 @@
 //!      contract for `zigbase.Mailer` / `zigbase.Email`. Logs + counts every
 //!      outbound email. Registered via `App(.{ .mailer = AuditMailer })`.
 //!
-//!   3. COMPTIME SCHEMA via `.collections` — THREE related collections:
-//!      `authors`, `posts` (relation → authors), and `comments` (relation →
-//!      posts + author-name text). Access rules are applied per-collection
-//!      (list/view/create/update/delete).
+//!   3. COMPTIME SCHEMA via `.collections` -- FOUR related collections:
+//!      `authors` (auth: webauthn + api_token), `commenters` (auth: magic_link),
+//!      `posts` (relation -> authors), and `comments` (relation -> posts +
+//!      commenters). Access rules are applied per-collection.
 //!
-//!   4. EXPLICIT MIGRATIONS via `.migrations` — two `zigbase.Migration` entries:
+//!   4. EXPLICIT MIGRATIONS via `.migrations` -- two `zigbase.Migration` entries:
 //!      - `0001_create_audit_log`: creates a side table via `w.exec`.
-//!      - `0002_index_audit_note`: multi-statement migration — creates an index
+//!      - `0002_index_audit_note`: multi-statement migration -- creates an index
 //!        on the migration-owned `plugin_audit_log` table AND seeds a metadata
-//!        row (DDL + DML in one transaction). Targets a migration-owned table
-//!        because comptime-provisioned collection columns are id-named, not
-//!        field-name-named (see the note on `addAuditNoteIndex`).
+//!        row (DDL + DML in one transaction). Targets a migration-owned table to
+//!        demonstrate the escape-hatch pattern; for comptime-managed collections
+//!        use `.indexes` in the collection spec (see `authors`).
 //!
-//!   5. `onError` HANDLER — `.onError = handleError`, receiving a
+//!   5. `onError` HANDLER -- `.onError = handleError`, receiving a
 //!      `*zigbase.ErrorEvent` whose `.phase` field identifies where the error
-//!      originated (.request / .cron / .job / .file_serve …).
+//!      originated (.request / .cron / .job / .file_serve ...).
 //!
-//!   6. CRON JOB — a `* * * * *` (every-minute) job that reads the DB via
+//!   6. CRON JOB -- a `* * * * *` (every-minute) job that reads the DB via
 //!      `ev.reader()` to count published posts, then writes an audit log row
 //!      via `ev.writer()`. Demonstrates both DB-access handles in one handler.
 //!
-//!   7. POOL LEVERS via `.pools` — reader/job pool sizes + page-cache budget.
+//!   7. POOL LEVERS via `.pools` -- reader/job pool sizes + page-cache budget.
 //!
-//!   8. FULLY EMBEDDED STATIC FRONTEND via `embedStaticDir` — the Astro build
+//!   8. FULLY EMBEDDED STATIC FRONTEND via `embedStaticDir` -- the Astro build
 //!      output in `frontend/dist` is compiled into the binary at build time;
 //!      there is no runtime dependency on the frontend directory.
 //!
-//! The whole point: this package compiles against the PUBLISHED `zigbase`
-//! module, proving the documented plugin/schema/migration/cron/error features
-//! are usable by an external consumer.
+//!   9. `onAuth` HOOK -- logs collection + method for every successful session
+//!      mint. With two auth collections and three methods in use, log lines show:
+//!      `[onAuth] collection=authors method=webauthn`, `method=custom` (api_token),
+//!      and `collection=commenters method=magic_link`.
+//!
+//!  10. CUSTOM `AuthMethod` PLUGIN (`ApiTokenMethod`) via `.auth_methods`.
+//!      Demonstrates the auth-method plugin contract alongside storage + mailer.
+//!      Enabled on `authors` via `.auth.methods.custom = .{"api_token"}`.
+//!
+//!  11. COMPTIME `.indexes` with `.collation = .nocase` on `authors.contact_email`.
+//!      Demonstrates the correct tool for indexing comptime-managed collections
+//!      (field columns are human-named, not id-named -- see migration 0002 comment).
 
 const std = @import("std");
 const zigbase = @import("zigbase");
@@ -54,35 +63,25 @@ const zigbase = @import("zigbase");
 // 1. Custom storage plugin.
 //
 //    The plugin contract (mirrors the built-in DefaultStoragePlugin):
-//      - create(gpa, io, cfg) !Self       — construct from runtime config.
-//      - interface(*Self) zigbase.Storage — hand back the vtable the app calls.
-//      - deinit(*Self) void               — release anything `create` allocated.
+//      - create(gpa, io, cfg) !Self       -- construct from runtime config.
+//      - interface(*Self) zigbase.Storage -- hand back the vtable the app calls.
+//      - deinit(*Self) void               -- release anything `create` allocated.
 //
 //    `AuditStorage` wraps a `zigbase.LocalStorage` backend (rooted at
 //    `<cfg.data_dir>/storage`), intercepting every vtable call to emit a
 //    structured log line BEFORE delegating to the inner backend.
 //
-//    The `zigbase.Storage.VTable` has exactly four function pointers (verified
-//    by reading src/files/storage.zig — all four must be present; a missing
-//    entry leaves a null fn pointer and crashes on the first file operation):
-//
+//    The `zigbase.Storage.VTable` has exactly four function pointers:
 //      put(ctx, io, col, record_id, filename, bytes) anyerror!void
 //      localPath(ctx, alloc, col, record_id, filename) anyerror!?[]const u8
 //      delete(ctx, io, col, record_id, filename) anyerror!void
 //      deleteRecord(ctx, io, col, record_id) anyerror!void
-//
-//    Each wrapper: @ptrCast/@alignCast `ctx` → *AuditStorage, logs, delegates.
 // ---------------------------------------------------------------------------
 const AuditStorage = struct {
-    /// Backing LocalStorage; held by value so it has a stable address here.
     local: zigbase.LocalStorage,
-    /// Cached vtable-view of `local`; refreshed by interface() after placement.
     inner: zigbase.Storage,
-    /// GPA used in create(); freed in deinit().
     gpa: std.mem.Allocator,
-    /// Root path string (heap-allocated by create(); freed by deinit()).
     root: []const u8,
-    /// Running operation counters, one per vtable method.
     puts: usize = 0,
     deletes: usize = 0,
     delete_records: usize = 0,
@@ -90,11 +89,8 @@ const AuditStorage = struct {
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !AuditStorage {
         _ = io;
-        // Mirror DefaultStoragePlugin: root at <data_dir>/storage.
         const root = try std.fmt.allocPrint(gpa, "{s}/storage", .{cfg.data_dir});
         var local = zigbase.LocalStorage.init(root);
-        // Snapshot the inner vtable; interface() re-snaps using the stable
-        // struct-field address once the struct is placed on the stack of serveImpl.
         const inner = local.storage();
         return .{ .gpa = gpa, .root = root, .local = local, .inner = inner };
     }
@@ -110,8 +106,6 @@ const AuditStorage = struct {
     pub fn deinit(self: *AuditStorage) void {
         self.gpa.free(self.root);
     }
-
-    // ---- Static VTable (all four methods required) --------------------------
 
     const vtable = zigbase.Storage.VTable{
         .put = auditPut,
@@ -182,11 +176,6 @@ const AuditStorage = struct {
 // ---------------------------------------------------------------------------
 // 2. Custom mailer plugin.
 //
-//    The plugin contract (mirrors the built-in DefaultMailerPlugin):
-//      - create(gpa, io, cfg) !Self     — construct from runtime config.
-//      - interface(*Self) zigbase.Mailer — hand back the vtable the app calls.
-//      - deinit(*Self) void             — release anything `create` allocated.
-//
 //    `AuditMailer` logs every outbound `zigbase.Email` (to / subject) and
 //    counts sends. Demonstrates compiling against the public
 //    `zigbase.Mailer` / `zigbase.Email` vtable types.
@@ -221,17 +210,121 @@ const AuditMailer = struct {
 };
 
 // ---------------------------------------------------------------------------
+// 10. Custom AuthMethod plugin: "api_token"
+//
+// Demonstrates the zigbase.AuthMethod plugin contract. An author authenticates
+// by sending their API token (a shared secret stored in the record's `bio` field
+// for simplicity -- a real app would use a dedicated hashed-token field) in the
+// request body as `{ "identity": "<email>", "token": "..." }`.
+//
+// Plugin contract (mirrors AuditStorage / AuditMailer):
+//   create(gpa, io, cfg) !Self       -- construct; gpa/cfg available if needed.
+//   method(*Self) zigbase.AuthMethod -- return the vtable the auth dispatch calls.
+//   deinit(*Self) void               -- release any resources.
+//
+// The framework validates this contract at comptime via assertAuthMethodContract.
+// Registered app-level via `.auth_methods = .{ApiTokenMethod}` and enabled on
+// the `authors` collection via `.auth.methods.custom = .{"api_token"}`.
+//
+// AuthCtx helpers used here (all via public zigbase.AuthCtx):
+//   ac.findByIdentity(conn, identity)  -- looks up record_id by the auth identity.
+//   ac.rateLimit(scope, ident)         -- returns ?Response; non-null means limited.
+//   ac.reader()                        -- RAII read-only connection handle.
+//
+// Resolution variants:
+//   .record = id_string              -- framework mints session + fires onAuth(.custom).
+//   .fail = { .status, .message }    -- framework returns the status code + body.
+// ---------------------------------------------------------------------------
+const ApiTokenMethod = struct {
+    pub fn create(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cfg: zigbase.Config,
+    ) !ApiTokenMethod {
+        _ = gpa;
+        _ = io;
+        _ = cfg;
+        return .{};
+    }
+
+    pub fn method(self: *ApiTokenMethod) zigbase.AuthMethod {
+        return .{
+            .slug = "api_token",
+            .ctx = self,
+            .vtable = &vtable,
+        };
+    }
+
+    pub fn deinit(self: *ApiTokenMethod) void {
+        _ = self;
+    }
+
+    const vtable = zigbase.AuthMethod.VTable{
+        .initiate = initiate,
+        .complete = complete,
+    };
+
+    // initiate: called by POST /api/collections/authors/auth/api_token/initiate.
+    // For a simple token-exchange method, initiate is a no-op (everything in complete).
+    fn initiate(ctx: *anyopaque, ac: *zigbase.AuthCtx) anyerror!zigbase.InitiateResult {
+        _ = ctx;
+        _ = ac;
+        return .{ .status = 200, .body = "{\"flow\":\"direct\"}" };
+    }
+
+    // complete: called by POST /api/collections/authors/auth/api_token/complete.
+    // Expects JSON body: { "identity": "<email>", "token": "<api_token>" }
+    // The "token" is compared to the record's `bio` field (demo simplification:
+    // in a real app use a dedicated hashed-token field, not a human-visible text field).
+    fn complete(ctx: *anyopaque, ac: *zigbase.AuthCtx) anyerror!zigbase.Resolution {
+        _ = ctx;
+
+        // Rate-limit by IP before any DB access.
+        if (try ac.rateLimit("api_token", "ip")) |_| {
+            return .{ .fail = .{ .status = 429, .message = "rate limited" } };
+        }
+
+        // ac.ctx is *http.RequestCtx; .body is a []const u8 field (empty string = no body).
+        const body = ac.ctx.body;
+        if (body.len == 0) return .{ .fail = .{ .status = 400, .message = "missing body" } };
+
+        const parsed = std.json.parseFromSlice(
+            struct { identity: []const u8, token: []const u8 },
+            ac.ctx.allocator,
+            body,
+            .{},
+        ) catch return .{ .fail = .{ .status = 400, .message = "invalid JSON" } };
+        defer parsed.deinit();
+
+        // Look up the record by identity (system email field).
+        var r = try ac.reader();
+        defer r.deinit();
+        const record_id = try ac.findByIdentity(&r.conn, parsed.value.identity) orelse
+            return .{ .fail = .{ .status = 401, .message = "unknown identity" } };
+
+        // Fetch the record to verify the token against `bio` (demo: bio IS the token).
+        const rec = try r.data().findById("authors", record_id) orelse
+            return .{ .fail = .{ .status = 401, .message = "record not found" } };
+        const stored_token = switch (rec.object.get("bio") orelse .null) {
+            .string => |s| s,
+            else => "",
+        };
+        // Guard against empty tokens: an author with no bio would match any empty client token.
+        if (parsed.value.token.len == 0 or stored_token.len == 0) {
+            return .{ .fail = .{ .status = 401, .message = "invalid token" } };
+        }
+        // Note: this compare is not constant-time; acceptable for a demo.
+        if (!std.mem.eql(u8, stored_token, parsed.value.token)) {
+            return .{ .fail = .{ .status = 401, .message = "invalid token" } };
+        }
+
+        std.log.info("[api_token] authenticated author id={s}", .{record_id});
+        return .{ .record = record_id };
+    }
+};
+
+// ---------------------------------------------------------------------------
 // 5. onError handler.
-//
-//    `zigbase.ErrorEvent` fields:
-//      .app     — *zigbase.Runtime
-//      .ctx     — ?*RequestContext (null for cron/job/lifecycle phases)
-//      .err     — anyerror
-//      .phase   — .request | .before_hook | .after_hook | .cron | .job | .file_serve
-//      .message — []const u8 (human-readable, always safe to log)
-//
-//    This handler emits a structured one-liner so operators can distinguish
-//    request errors from background-job failures at a glance.
 // ---------------------------------------------------------------------------
 fn handleError(ev: *zigbase.ErrorEvent) void {
     const phase_name = switch (ev.phase) {
@@ -248,55 +341,99 @@ fn handleError(ev: *zigbase.ErrorEvent) void {
 }
 
 // ---------------------------------------------------------------------------
+// 9. onAuth hook -- fires after every successful session mint across all collections.
+//
+// This binary issues sessions for TWO collections via THREE distinct methods:
+//   authors    -> webauthn (passkey)
+//   authors    -> custom / api_token (programmatic)
+//   commenters -> magic_link (emailed link)
+//
+// `ev.method` is a `zigbase.events.AuthMethod` enum (password/oauth2/magic_link/
+// otp/webauthn/custom). `ev.record` is ?std.json.Value -- null only for OAuth2
+// provider-unknown paths. Extract the record id via `.object.get("id")`.
+// ---------------------------------------------------------------------------
+fn handleAuth(ev: *zigbase.AuthEvent) void {
+    const method_name = switch (ev.method) {
+        .password => "password",
+        .oauth2 => "oauth2",
+        .magic_link => "magic_link",
+        .otp => "otp",
+        .webauthn => "webauthn",
+        .custom => "custom",
+    };
+    const record_id = if (ev.record) |r|
+        if (r.object.get("id")) |v| switch (v) {
+            .string => |s| s,
+            else => "(non-string id)",
+        } else "(no id field)"
+    else
+        "(unknown)";
+    std.log.info("[onAuth] collection={s} method={s} record={s}", .{
+        ev.collection, method_name, record_id,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// beforeCreate hook for comments -- auto-populate `commenter` from session.
+//
+//    The create rule (@request.auth.id != "") already gated access, so ev.ctx
+//    is guaranteed to carry a valid auth identity at this point. We populate
+//    `commenter` from the session so the frontend does not need to pass it
+//    explicitly (and so the relation is always authoritative).
+//
+//    ev.ctx is *const request.RequestContext which carries:
+//      .auth: ?std.json.Value  -- the authenticated record object
+//    There is no direct `auth_id` shortcut; extract it from the JSON object.
+//    Allocate with ev.arena (the request-scoped allocator that owns ev.record's
+//    JSON storage) -- never ev.app.allocator.
+// ---------------------------------------------------------------------------
+fn beforeCreateComment(ev: *zigbase.RecordEvent) anyerror!void {
+    // Populate `commenter` from the session identity if not provided by the client.
+    if (ev.record.object.get("commenter") == null) {
+        const auth = ev.ctx.auth orelse return; // should never be null (rule gated)
+        const auth_id = switch (auth.object.get("id") orelse .null) {
+            .string => |s| s,
+            else => return, // malformed auth object -- skip silently
+        };
+        try ev.record.object.put(ev.arena, "commenter", .{ .string = auth_id });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 6. Cron / interval job: "audit-sweep".
 //
 //    Fires every minute (cron "* * * * *", UTC, numeric 5-field format).
 //    Demonstrates the correct DB-access pattern for job handlers:
-//      - reads  use ev.reader() — checked out of the warm reader pool.
-//      - writes use ev.writer() — the single mutex-guarded pool writer.
+//      - reads  use ev.reader() -- checked out of the warm reader pool.
+//      - writes use ev.writer() -- the single mutex-guarded pool writer.
 //    Both RAII handles must be defer'd to avoid a pool leak.
-//
-//    The handler counts published posts (read), then appends a row to
-//    plugin_audit_log (write) — a realistic "heartbeat audit" pattern.
-//
-//    NOTE: jobs have no request arena. The handler uses a stack buffer for the
-//    formatted INSERT SQL (no heap allocation required).
 // ---------------------------------------------------------------------------
 fn auditSweepJob(ev: *zigbase.events.JobEvent) anyerror!void {
-    // --- read phase: count published posts via a pooled reader connection ----
     var r = try ev.reader();
     defer r.deinit();
     const result = try r.data().list("posts", .{
         .filter = "status = \"published\"",
-        .perPage = 1, // we only need totalItems, not all rows
+        .perPage = 1,
     });
-    // totalItems is optional (cursor mode may skip the COUNT); offset mode always sets it.
     const published_count = result.totalItems orelse 0;
     std.log.info("[audit-sweep] published_posts={d}", .{published_count});
 
-    // --- write phase: append an audit row ------------------------------------
     var w = ev.writer();
     defer w.deinit();
 
-    // Db.exec takes [:0]const u8 — use bufPrintZ into a local stack buffer.
     var buf: [256]u8 = undefined;
     const insert_sql = std.fmt.bufPrintZ(
         &buf,
         "INSERT INTO plugin_audit_log(note) VALUES('sweep: published_posts={d}');",
         .{published_count},
-    ) catch return; // truncation is not expected at 256 bytes
+    ) catch return;
     w.conn.exec(insert_sql) catch |e| {
-        // Non-fatal: warn and continue if the table is somehow unavailable.
         std.log.warn("[audit-sweep] audit insert failed: {s}", .{@errorName(e)});
     };
 }
 
 // ---------------------------------------------------------------------------
-// 4a. Migration 0001 — create the plugin audit-log side table.
-//
-//     This table lives outside the comptime-managed `.collections` schema;
-//     it is a good example of the migration escape hatch for ad-hoc DDL that
-//     the additive auto-provisioner won't produce on its own.
+// 4a. Migration 0001 -- create the plugin audit-log side table.
 // ---------------------------------------------------------------------------
 fn createAuditLog(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void {
     _ = alloc;
@@ -310,35 +447,29 @@ fn createAuditLog(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror
 }
 
 // ---------------------------------------------------------------------------
-// 4b. Migration 0002 — multi-statement migration: index + seeded metadata row.
+// 4b. Migration 0002 -- multi-statement migration: index + seeded metadata row.
 //
-//     A more realistic migration demonstrating two statements in one `up` call:
-//       (a) Creates an index on the `plugin_audit_log` table (created by 0001).
-//       (b) Seeds a metadata row into plugin_audit_log so operators can confirm
-//           this migration ran by inspecting the table.
+//     WHEN TO USE RAW SQL MIGRATIONS vs. COMPTIME .indexes:
+//       For comptime-managed collections, use `.indexes` in the collection literal --
+//       those are lowered at provision time and reference columns by their human
+//       field name (e.g. `contact_email`). The `stableFieldId` is an internal
+//       rebuild-matching key, never used as a SQL column name. So `CREATE INDEX ...
+//       ON posts (status)` DOES work in a raw migration if you own the query.
 //
-//     CRITICAL LESSON — raw SQL migrations and comptime collections:
-//       A migration is hand-written SQL, so it can only safely reference columns
-//       whose names it KNOWS. The comptime `.collections` provisioner names each
-//       collection's SQLite columns by its STABLE FIELD ID (an 8-char hex string
-//       from `stableFieldId`), NOT by the human-readable field name. So a posts
-//       row's "status" lives in a column like "a1b2c3d4" — there is no literal
-//       `status` column, and `CREATE INDEX ... ON posts (status)` fails with
-//       ExecFailed, aborting startup. The safe target for a raw migration is a
-//       table the MIGRATION ITSELF owns (here `plugin_audit_log`, whose column
-//       names we chose), where the names are known. (To index a provisioned
-//       column you would have to resolve its field id first.)
+//       The reason THIS migration targets `plugin_audit_log` -- a migration-owned
+//       table -- is that the migration is demonstrating the escape-hatch pattern
+//       for non-additive DDL on tables the migration itself creates. For a
+//       comptime-managed collection, prefer `.indexes = .{ ... }` in the collection
+//       spec (see the `authors` collection for a working example).
 //
 //     Both statements run inside the single transaction that ZigBase opens
-//     around every migration's `up` call — either both succeed or neither does.
+//     around every migration's `up` call -- either both succeed or neither does.
 // ---------------------------------------------------------------------------
 fn addAuditNoteIndex(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void {
     _ = alloc;
     _ = io;
 
-    // (a) Index on plugin_audit_log.note — a migration-owned table, so the
-    //     column name is known. IF NOT EXISTS is defensive; ZigBase already
-    //     guards against re-runs.
+    // (a) Index on plugin_audit_log.note -- a migration-owned table.
     try w.exec(
         \\CREATE INDEX IF NOT EXISTS idx_audit_note
         \\  ON plugin_audit_log (note);
@@ -353,92 +484,129 @@ fn addAuditNoteIndex(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyer
 
 // ---------------------------------------------------------------------------
 // Wire it all together. One `App(...)` registers both custom plugins, the
-// three-collection comptime schema, two explicit migrations, the error handler,
-// the cron job, and the pool levers, then `runCli` exposes `serve` / `migrate`
-// / `help`.
+// four-collection comptime schema, two explicit migrations, the error handler,
+// the auth handler, the record hooks, the cron job, and the pool levers, then
+// `runCli` exposes `serve` / `migrate` / `help`.
 // ---------------------------------------------------------------------------
 pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{
-        // 1. Custom storage plugin — wraps LocalStorage with audit logging.
-        //    Intercepts all four vtable methods: put / localPath / delete /
-        //    deleteRecord. Registered the same way as the mailer plugin.
+        // 1. Custom storage plugin -- wraps LocalStorage with audit logging.
         .storage = AuditStorage,
 
-        // 2. Custom mailer plugin — logs + counts every outbound email.
+        // 2. Custom mailer plugin -- logs + counts every outbound email.
         .mailer = AuditMailer,
 
-        // 3. Comptime schema: THREE related collections.
-        //
-        //    Relation graph (resolved by name at provision time):
-        //      posts.author → authors    (many posts per author, cascade-delete)
-        //      comments.post → posts     (many comments per post, cascade-delete)
-        //
-        //    Access rules demonstrate per-collection policy:
-        //      authors  — publicly listable + viewable.
-        //      posts    — only status="published" rows visible in list.
-        //      comments — approved=true rows are public; anyone can submit.
+        // 10. App-level custom auth method registry.
+        //     ApiTokenMethod is enabled on `authors` via `.auth.methods.custom = .{"api_token"}`.
+        .auth_methods = .{ApiTokenMethod},
+
+        // 3. Comptime schema: FOUR related collections.
+        //    Relation graph:
+        //      posts.author       -> authors     (cascade-delete)
+        //      comments.post      -> posts       (cascade-delete)
+        //      comments.commenter -> commenters
         .collections = .{
             .authors = .{
-                .type = .base,
+                // Auth collection: system fields (email, passwordHash, verified, ...) are
+                // injected automatically. contact_email and bio are user-defined fields.
+                // NOTE: "email" is a reserved system field name on auth collections.
+                .type = .auth,
                 .fields = .{
                     .{ .name = "name", .type = .text, .required = true },
-                    // "email" is reserved for auth collections; base collections
-                    // must pick a different field name.
                     .{ .name = "contact_email", .type = .email },
                     .{ .name = "bio", .type = .text, .max = 500 },
                 },
-                // Authors are publicly readable ("@public"); empty "" is now LOCKED.
+                // webauthn: passkey login for human authors.
+                // custom:   "api_token" slug enables ApiTokenMethod for programmatic auth.
+                .auth = .{
+                    .methods = .{
+                        .webauthn = .{
+                            .rp_id = "localhost",
+                            .rp_name = "ZigBase Plugins Example",
+                            .origin = "http://localhost:8090",
+                        },
+                        .custom = .{"api_token"},
+                    },
+                },
                 .rules = .{ .list = "@public", .view = "@public" },
+                // Comptime index: NOCASE on contact_email so lookups are case-insensitive.
+                // Contrast: migration 0002 indexes plugin_audit_log.note (a migration-owned table)
+                // because that table is outside the comptime schema. For comptime-managed
+                // collections, .indexes is the right tool -- columns are human-named (field.name).
+                .indexes = .{
+                    .{ .name = "idx_authors_contact_email", .fields = .{"contact_email"}, .collation = .nocase },
+                },
+            },
+            .commenters = .{
+                // Lightweight passwordless auth collection for casual readers who want to comment.
+                // magic_link with auto_create = true: account is created on first login
+                // (no separate sign-up step). Set ZIGBASE_PUBLIC_URL for clickable email links;
+                // in local dev the token also appears in the server log.
+                .type = .auth,
+                .fields = .{
+                    .{ .name = "display_name", .type = .text, .max = 80 },
+                },
+                .auth = .{
+                    .methods = .{
+                        .magic_link = .{ .ttl_s = 900, .auto_create = true },
+                    },
+                },
+                // Publicly listable (frontend can render display_name on comments);
+                // full record view is gated on authentication.
+                .rules = .{
+                    .list = "@public",
+                    .view = "@request.auth.id != \"\"",
+                },
             },
             .posts = .{
                 .type = .base,
                 .fields = .{
                     .{ .name = "title", .type = .text, .required = true, .max = 200 },
                     .{ .name = "body", .type = .text },
-                    // Relation field: target is the collection NAME ("authors").
-                    // ZigBase resolves the name → collection id at provision time.
                     .{ .name = "author", .type = .relation, .target = "authors", .cascadeDelete = true },
                     .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
                 },
-                // Comptime list rule — the API enforces this without handler code.
                 .rules = .{ .list = "status = \"published\"" },
             },
-            // NEW: comments collection — adds a SECOND cross-collection relation.
-            // comments.post → posts; cascade-delete propagates post removal.
             .comments = .{
                 .type = .base,
                 .fields = .{
                     .{ .name = "body", .type = .text, .required = true, .max = 2000 },
-                    // Relation to the parent post (cascade-delete).
                     .{ .name = "post", .type = .relation, .target = "posts", .cascadeDelete = true },
-                    // Display name for the commenter (guests are welcome).
-                    .{ .name = "author_name", .type = .text, .max = 100 },
+                    // commenter relation replaces the old free-text author_name field.
+                    // The beforeCreateComment hook auto-populates this from the session.
+                    .{ .name = "commenter", .type = .relation, .target = "commenters" },
                     .{ .name = "approved", .type = .bool },
                 },
-                // Approved comments are publicly readable; anyone can submit ("@public" create —
-                // an empty "" would now LOCK creation to superusers).
                 .rules = .{
                     .list = "approved = true",
                     .view = "approved = true",
-                    .create = "@public",
+                    // Gate: requester must have a valid session (any collection).
+                    .create = "@request.auth.id != \"\"",
                 },
             },
         },
         .enable_typegen = true,
 
-        // 4. Explicit migrations — escape hatch for non-additive / seeding changes.
-        //    ZigBase records each migration by id in `_migrations` and runs it
-        //    exactly once, in id order, inside an individual transaction.
+        // 4. Explicit migrations -- escape hatch for non-additive / seeding changes.
         .migrations = &[_]zigbase.Migration{
             .{ .id = "0001_create_audit_log", .up = createAuditLog },
             .{ .id = "0002_index_audit_note", .up = addAuditNoteIndex },
         },
 
-        // 5. onError handler — logs phase + message for every caught error.
+        // 5. onError handler -- logs phase + message for every caught error.
         .onError = handleError,
 
-        // 6. Cron job — fires every minute (UTC, 5-field numeric cron).
-        //    .pools.jobs = 1 is sufficient for this single light job.
+        // 9. onAuth hook -- fires after any successful session mint across all collections.
+        .onAuth = handleAuth,
+
+        // Record hooks -- beforeCreate on comments auto-populates the `commenter`
+        // relation from the session identity.
+        .hooks = .{
+            .comments = .{ .beforeCreate = beforeCreateComment },
+        },
+
+        // 6. Cron job -- fires every minute (UTC, 5-field numeric cron).
         .cron = .{
             .{
                 .name = "audit-sweep",
