@@ -18,6 +18,21 @@ TARGETS=(
   "aarch64-macos"
 )
 
+# Assemble changelog fragments (changelog.d/*.md) into a `## [${VERSION}] - <date>` section
+# of CHANGELOG.md + its site mirror, then delete them. See changelog.d/README.md. Skipped
+# (not an error) when there are no fragments — e.g. the changelog was already assembled.
+shopt -s nullglob
+frags=(changelog.d/*.md)
+shopt -u nullglob
+have_frags=0
+for f in "${frags[@]}"; do [[ "${f##*/}" == "README.md" ]] || have_frags=1; done
+if [[ "$have_frags" == 1 ]]; then
+  echo "Assembling changelog fragments into ${VERSION}..."
+  scripts/assemble-changelog.sh "$VERSION"
+else
+  echo "No changelog fragments to assemble (changelog already finalized for ${VERSION})."
+fi
+
 rm -rf "$OUT"
 mkdir -p "$OUT"
 echo "Building zigbase ${VERSION} for ${#TARGETS[@]} targets (ReleaseSafe)..."
