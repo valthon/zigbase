@@ -20,6 +20,7 @@ const db = @import("db.zig");
 const rules = @import("rules.zig");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
+const secrets = @import("oauth/secrets.zig");
 
 /// F3 startup lint: log a prominent warning for every `@public` (allow-all) rule on `col`, so a
 /// wide-open collection is never silent. Called once per collection during provisioning.
@@ -135,6 +136,9 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
             if (@hasField(A, "require_verified")) {
                 col.options.auth.require_verified = spec.auth.require_verified;
             }
+            if (@hasField(A, "oauth2")) {
+                col.options.auth.oauth2 = buildOAuth2Options(spec.auth.oauth2);
+            }
         }
         if (@hasField(S, "indexes")) col.indexes = buildIndexes(name, spec.indexes);
         return col;
@@ -195,6 +199,56 @@ fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
     }
     if (@hasField(M, "custom")) out.custom = strTupleToSlice(m.custom);
     return out;
+}
+
+fn buildOAuth2Options(comptime o: anytype) schema.OAuth2Options {
+    comptime {
+        const O = @TypeOf(o);
+        var out = schema.OAuth2Options{};
+        if (@hasField(O, "enabled")) out.enabled = o.enabled;
+        if (@hasField(O, "providers")) {
+            const pt = o.providers;
+            const PT = @TypeOf(pt);
+            const pinfo = @typeInfo(PT);
+            if (pinfo != .@"struct")
+                @compileError(".auth.oauth2.providers must be a tuple of provider literals");
+            const pf = pinfo.@"struct".fields;
+            var provs: [pf.len]schema.OAuth2Provider = undefined;
+            for (pf, 0..) |pff, i| {
+                provs[i] = buildOAuth2Provider(@field(pt, pff.name));
+            }
+            const frozen = provs;
+            out.providers = &frozen;
+        }
+        return out;
+    }
+}
+
+/// Lower a single comptime provider literal into a `schema.OAuth2Provider`.
+/// - `.name` is REQUIRED; must be a valid identifier (uppercased into env var name).
+/// - `.clientId`/`.clientSecret` are accepted but discouraged (they bake values into
+///   the binary); env always wins at provision time (`injectOAuthSecrets`).
+/// - Negative (compile-error) cases: missing `.name`, or a `.name` that fails
+///   `schema.isValidIdentifier`, produce a `@compileError`.
+fn buildOAuth2Provider(comptime p: anytype) schema.OAuth2Provider {
+    comptime {
+        const P = @TypeOf(p);
+        if (!@hasField(P, "name"))
+            @compileError(".auth.oauth2 provider is missing .name");
+        const pname: []const u8 = p.name;
+        if (!schema.isValidIdentifier(pname))
+            @compileError("oauth2 provider name '" ++ pname ++ "' must be a valid identifier (it is used as a slug and uppercased into an env var name)");
+        var out = schema.OAuth2Provider{ .name = pname };
+        if (@hasField(P, "clientId")) out.clientId = p.clientId;
+        if (@hasField(P, "clientSecret")) out.clientSecret = p.clientSecret;
+        if (@hasField(P, "enabled")) out.enabled = p.enabled;
+        if (@hasField(P, "redirectUrls")) out.redirectUrls = strTupleToSlice(p.redirectUrls);
+        if (@hasField(P, "authURL")) out.authURL = p.authURL;
+        if (@hasField(P, "tokenURL")) out.tokenURL = p.tokenURL;
+        if (@hasField(P, "userinfoURL")) out.userinfoURL = p.userinfoURL;
+        if (@hasField(P, "scopes")) out.scopes = strTupleToSlice(p.scopes);
+        return out;
+    }
 }
 
 fn buildField(comptime col_name: []const u8, comptime f: anytype) schema.Field {
@@ -442,6 +496,75 @@ pub fn applySchema(
 /// `alloc` is used only as the backing allocator for an internal arena; nothing
 /// allocated inside this function escapes the call (all results are written to
 /// the DB). Callers may safely pass their long-lived gpa.
+/// Return a copy of `specs` where every auth collection's oauth2 providers have their
+/// clientId/clientSecret filled in from the environment and the secret encrypted.
+/// A provider whose env CLIENT_ID/SECRET are both absent is left as declared (empty strings).
+///
+/// `getter` is a duck-typed env getter: `fn get(self, key: []const u8) ?[]const u8`.
+/// Pass `config.EnvGetter{ .environ = environ }` in production; pass a stub in tests.
+///
+/// Only allocates a new outer slice when at least one auth collection has providers to
+/// rewrite; passes the original slice through otherwise (cheap pre-scan).
+pub fn injectOAuthSecrets(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    app_secret: []const u8,
+    getter: anytype,
+    specs: []const schema.Collection,
+) ![]const schema.Collection {
+    // Cheap pre-scan: only allocate a new outer slice when any auth collection has providers.
+    var any = false;
+    for (specs) |c| if (c.type == .auth and c.options.auth.oauth2.providers.len > 0) {
+        any = true;
+        break;
+    };
+    if (!any) return specs;
+
+    const out = try alloc.alloc(schema.Collection, specs.len);
+    for (specs, 0..) |c, ci| {
+        out[ci] = c;
+        if (c.type != .auth or c.options.auth.oauth2.providers.len == 0) continue;
+        const src = c.options.auth.oauth2.providers;
+        const np = try alloc.alloc(schema.OAuth2Provider, src.len);
+        for (src, 0..) |p, i| {
+            np[i] = p;
+            // Build ZIGBASE_OAUTH_<UPPER(NAME)>_CLIENT_ID / _SECRET.
+            // Provider names are validated as identifiers at comptime (buildOAuth2Provider),
+            // so they are ASCII letters/digits/underscore — uppercase is char-by-char.
+            // These three are scratch for the env lookup only — none escape, so free them
+            // at the end of the iteration (callers may pass a long-lived gpa).
+            const upper_buf = try alloc.alloc(u8, p.name.len);
+            defer alloc.free(upper_buf);
+            for (p.name, 0..) |ch, ui| upper_buf[ui] = std.ascii.toUpper(ch);
+            const upper = upper_buf;
+            const id_key = try std.fmt.allocPrint(alloc, "ZIGBASE_OAUTH_{s}_CLIENT_ID", .{upper});
+            defer alloc.free(id_key);
+            const sec_key = try std.fmt.allocPrint(alloc, "ZIGBASE_OAUTH_{s}_CLIENT_SECRET", .{upper});
+            defer alloc.free(sec_key);
+            if (getter.get(id_key)) |v| if (v.len > 0) {
+                np[i].clientId = try alloc.dupe(u8, v);
+            };
+            if (getter.get(sec_key)) |v| if (v.len > 0) {
+                // Guard: if somehow the env already contains an encrypted blob (e.g. the
+                // operator copied a blob), pass it through unchanged — never double-encrypt.
+                np[i].clientSecret = if (secrets.isEncrypted(v))
+                    try alloc.dupe(u8, v)
+                else
+                    try secrets.encryptSecret(io, alloc, app_secret, v);
+            };
+            // Encrypt any still-plaintext secret regardless of its source (env above OR a
+            // plaintext clientSecret baked into the comptime literal). Mirrors the admin path
+            // (api/collections.zig prepareOAuthConfig): no plaintext secret is ever persisted.
+            // The isEncrypted guard keeps this idempotent (never double-encrypts).
+            if (np[i].clientSecret.len > 0 and !secrets.isEncrypted(np[i].clientSecret)) {
+                np[i].clientSecret = try secrets.encryptSecret(io, alloc, app_secret, np[i].clientSecret);
+            }
+        }
+        out[ci].options.auth.oauth2.providers = np;
+    }
+    return out;
+}
+
 pub fn applySpecs(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -1117,4 +1240,106 @@ test "buildCollection lowers .indexes with collation and partial predicate" {
     try std.testing.expect(!u.indexes[1].unique);
     try std.testing.expectEqual(schema.Collation.binary, u.indexes[1].collation);
     try std.testing.expectEqualStrings("name != ''", u.indexes[1].where.?);
+}
+
+test "buildCollection lowers .auth.oauth2 providers" {
+    const specs = comptime buildCollections(.{
+        .users = .{ .type = .auth, .fields = .{}, .auth = .{ .oauth2 = .{
+            .enabled = true,
+            .providers = .{
+                .{ .name = "google", .redirectUrls = .{"https://app.example/cb"} },
+                .{ .name = "github", .enabled = false, .clientId = "baked-id" },
+            },
+        } } },
+    });
+    const o = specs[0].options.auth.oauth2;
+    try std.testing.expect(o.enabled);
+    try std.testing.expectEqual(@as(usize, 2), o.providers.len);
+    try std.testing.expectEqualStrings("google", o.providers[0].name);
+    try std.testing.expectEqual(@as(usize, 1), o.providers[0].redirectUrls.len);
+    try std.testing.expectEqualStrings("https://app.example/cb", o.providers[0].redirectUrls[0]);
+    try std.testing.expect(o.providers[0].enabled); // struct default true
+    try std.testing.expect(!o.providers[1].enabled);
+    try std.testing.expectEqualStrings("baked-id", o.providers[1].clientId);
+    // comptime literal carries NO secret
+    try std.testing.expectEqualStrings("", o.providers[0].clientSecret);
+}
+
+test "injectOAuthSecrets sources clientId/secret from env and encrypts the secret" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Getter = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_OAUTH_GOOGLE_CLIENT_ID")) return "gid-123";
+            if (std.mem.eql(u8, key, "ZIGBASE_OAUTH_GOOGLE_CLIENT_SECRET")) return "raw-secret";
+            return null;
+        }
+    };
+    const provs = [_]schema.OAuth2Provider{.{ .name = "google", .redirectUrls = &.{"https://x/cb"} }};
+    const cols = [_]schema.Collection{.{
+        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
+    }};
+
+    const out = try injectOAuthSecrets(a, std.testing.io, "app-secret-32-bytes-long-xxxxxxx", Getter{}, &cols);
+    const p = out[0].options.auth.oauth2.providers[0];
+    try std.testing.expectEqualStrings("gid-123", p.clientId);
+    try std.testing.expect(secrets.isEncrypted(p.clientSecret));
+    // round-trips back to the raw env value
+    const pt = try secrets.decryptSecret(a, "app-secret-32-bytes-long-xxxxxxx", p.clientSecret);
+    try std.testing.expectEqualStrings("raw-secret", pt);
+}
+
+test "injectOAuthSecrets leaves providers untouched when env is absent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Getter = struct {
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+    };
+    const provs = [_]schema.OAuth2Provider{.{ .name = "google" }};
+    const cols = [_]schema.Collection{.{
+        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
+    }};
+    const out = try injectOAuthSecrets(a, std.testing.io, "app-secret", Getter{}, &cols);
+    const p = out[0].options.auth.oauth2.providers[0];
+    try std.testing.expectEqualStrings("", p.clientId);
+    try std.testing.expectEqualStrings("", p.clientSecret);
+}
+
+test "injectOAuthSecrets encrypts a plaintext clientSecret baked into the literal (no env)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Getter = struct {
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+    };
+    // A provider with a plaintext clientSecret in the comptime literal and NO env var set:
+    // the secret must still be encrypted before it could be persisted (parity with the admin path).
+    const provs = [_]schema.OAuth2Provider{.{ .name = "google", .clientSecret = "literal-secret" }};
+    const cols = [_]schema.Collection{.{
+        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
+    }};
+    const out = try injectOAuthSecrets(a, std.testing.io, "app-secret-32-bytes-long-xxxxxxx", Getter{}, &cols);
+    const p = out[0].options.auth.oauth2.providers[0];
+    try std.testing.expect(secrets.isEncrypted(p.clientSecret));
+    const pt = try secrets.decryptSecret(a, "app-secret-32-bytes-long-xxxxxxx", p.clientSecret);
+    try std.testing.expectEqualStrings("literal-secret", pt);
+}
+
+test "injectOAuthSecrets passes non-oauth collections through" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Getter = struct {
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+    };
+    const cols = [_]schema.Collection{.{ .id = "", .name = "posts", .fields = &.{} }};
+    const out = try injectOAuthSecrets(a, std.testing.io, "app-secret", Getter{}, &cols);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqualStrings("posts", out[0].name);
 }

@@ -88,16 +88,20 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
     const length: u8 = if (ac.collection.options.auth.methods.otp) |o| o.length else 6;
     const ttl_s: i64 = if (ac.collection.options.auth.methods.otp) |o| o.ttl_s else 300;
 
+    const auto_create: bool = if (ac.collection.options.auth.methods.otp) |o| o.auto_create else false;
+
     // Identity lookup + challenge store happen under ONE writer (the store write
-    // must persist; keep the lookup atomic with it). Build the mail body into the
-    // request arena so it outlives the scoped writer block below.
+    // must persist; keep the lookup atomic with it). resolveOrCreate handles the
+    // auto_create case: creates a minimal auth record if the identity is unknown.
+    // Build the mail body into the request arena so it outlives the scoped writer block below.
     var pending: ?struct { email: []const u8, code: []const u8 } = null;
     {
         var w = ac.writer();
         defer w.deinit();
 
-        // Only issue a code if the identity exists (never reveal whether the email was found)
-        if (try ac.findByIdentity(w.conn, email)) |_| {
+        // resolveOrCreate: returns existing rid, creates one if auto_create=true + unknown, or null.
+        // OTP initiate only needs to know whether a record exists/was-created; discard the id.
+        if (try ac.resolveOrCreate(w.conn, email, auto_create)) |_| {
             // Generate a random numeric code of `length` digits (rejection-sampling, no modulo bias)
             const code = try ac.ctx.allocator.alloc(u8, length);
             generateCode(ac.app.io, code);
@@ -513,4 +517,164 @@ test "OtpMethod: length/ttl_s read from collection opts (default 6/300 when opts
     const ttl_custom: i64 = if (col_opts.options.auth.methods.otp) |o| o.ttl_s else 300;
     try std.testing.expectEqual(@as(u8, 8), length_custom);
     try std.testing.expectEqual(@as(i64, 600), ttl_custom);
+}
+
+test "OtpMethod: initiate auto_create=true creates record for unknown identity" {
+    const http_mod = @import("../../http.zig");
+    const collections = @import("../../collections.zig");
+    const schema_mod = @import("../../schema.zig");
+
+    var env = try api_auth.TestEnv.initAuth("otp_ac");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const existing = (try collections.get(a, w, "otp_ac")).?;
+        try collections.delete(a, w, existing.id);
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "otp_ac", .type = .auth,
+            .fields = &[_]schema_mod.Field{},
+            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .options = .{ .auth = .{ .methods = .{ .otp = .{ .auto_create = true } } } },
+        });
+    }
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "otp_ac")).?;
+    };
+
+    var req = env.ctx(a, .POST, "{\"identity\":\"brand_new@x.io\"}", &[_]http_mod.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
+    const am = m.method();
+    const res = try am.vtable.initiate(am.ctx, &ac);
+    try std.testing.expectEqual(@as(u16, 204), res.status);
+
+    // Record now exists
+    const w2 = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const col2 = (try collections.get(a, w2, "otp_ac")).?;
+    var req2 = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col2, .config = .null };
+    const rid = try ac2.findByIdentity(w2, "brand_new@x.io");
+    try std.testing.expect(rid != null);
+}
+
+test "OtpMethod: initiate auto_create=false creates nothing for unknown identity" {
+    const http_mod = @import("../../http.zig");
+    const collections = @import("../../collections.zig");
+    const schema_mod = @import("../../schema.zig");
+
+    var env = try api_auth.TestEnv.initAuth("otp_noac");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const existing = (try collections.get(a, w, "otp_noac")).?;
+        try collections.delete(a, w, existing.id);
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "otp_noac", .type = .auth,
+            .fields = &[_]schema_mod.Field{},
+            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .options = .{ .auth = .{ .methods = .{ .otp = .{ .auto_create = false } } } },
+        });
+    }
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "otp_noac")).?;
+    };
+
+    var req = env.ctx(a, .POST, "{\"identity\":\"ghost@x.io\"}", &[_]http_mod.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
+    const am = m.method();
+    const res = try am.vtable.initiate(am.ctx, &ac);
+    try std.testing.expectEqual(@as(u16, 204), res.status);
+
+    // Record must NOT exist
+    const w2 = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const col2 = (try collections.get(a, w2, "otp_noac")).?;
+    var req2 = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col2, .config = .null };
+    const rid = try ac2.findByIdentity(w2, "ghost@x.io");
+    try std.testing.expectEqual(@as(?[]const u8, null), rid);
+}
+
+test "OtpMethod: auto_create initiate then complete succeeds end-to-end" {
+    const http_mod = @import("../../http.zig");
+    const collections = @import("../../collections.zig");
+    const schema_mod = @import("../../schema.zig");
+
+    var env = try api_auth.TestEnv.initAuth("otp_e2e");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const existing = (try collections.get(a, w, "otp_e2e")).?;
+        try collections.delete(a, w, existing.id);
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "otp_e2e", .type = .auth,
+            .fields = &[_]schema_mod.Field{},
+            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .options = .{ .auth = .{ .methods = .{ .otp = .{ .auto_create = true } } } },
+        });
+    }
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "otp_e2e")).?;
+    };
+
+    // initiate creates record + stores a code (unknown to us — consume and replace)
+    var req_init = env.ctx(a, .POST, "{\"identity\":\"fresh@x.io\"}", &[_]http_mod.Param{});
+    var ac_init = AuthCtx{ .app = &env.app, .ctx = &req_init, .collection = col, .config = .null };
+    var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
+    const am = m.method();
+    _ = try am.vtable.initiate(am.ctx, &ac_init);
+
+    // Consume the auto-stored code and replace with a known one
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const cs = challenge_store.ChallengeStore{ .conn = w };
+        _ = try cs.takeByIdentity(a, "otp_e2e", "otp", "fresh@x.io");
+        _ = try cs.put(a, std.testing.io, "otp_e2e", "otp", "fresh@x.io", "999999", 300);
+    }
+
+    const col2 = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "otp_e2e")).?;
+    };
+    const body = "{\"identity\":\"fresh@x.io\",\"code\":\"999999\"}";
+    var req_comp = env.ctx(a, .POST, body, &[_]http_mod.Param{});
+    var ac_comp = AuthCtx{ .app = &env.app, .ctx = &req_comp, .collection = col2, .config = .null };
+    const res = try am.vtable.complete(am.ctx, &ac_comp);
+    switch (res) {
+        .record => {},
+        .fail => |f| {
+            std.debug.print("Expected .record, got .fail: {d} {s}\n", .{ f.status, f.message });
+            return error.TestFailed;
+        },
+    }
 }

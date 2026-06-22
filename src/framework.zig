@@ -331,7 +331,7 @@ pub fn App(comptime cfg: anytype) type {
 
         /// Start the HTTP server directly with an explicit config (no CLI parsing).
         pub fn run(init: std.process.Init, cfg_runtime: config.Config) !void {
-            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts);
+            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts, init.environ_map);
         }
     };
 }
@@ -384,7 +384,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         .version => printVersion(init.io, std.Io.File.stdout()),
         .serve => |sa| {
             const cfg = try loadCfg(init.environ_map, sa);
-            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts);
+            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map);
         },
         .migrate => |sa| try migrateImpl(allocator, init.io, init.environ_map, sa),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
@@ -700,7 +700,7 @@ fn resolveJwtSecret(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config
     return secret;
 }
 
-fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts) !void {
+fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts, environ: *const std.process.Environ.Map) !void {
     var cfg = cfg_in;
     const jwt_secret = try resolveJwtSecret(allocator, io, cfg);
     defer allocator.free(jwt_secret);
@@ -731,7 +731,12 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             try provision.runMigrations(allocator, io, w, schema_migrations);
         }
         if (schema_collections.len > 0) {
-            try provision.applySpecs(allocator, io, w, schema_collections);
+            const resolved = try provision.injectOAuthSecrets(
+                allocator, io, jwt_secret,
+                config.EnvGetter{ .environ = environ },
+                schema_collections,
+            );
+            try provision.applySpecs(allocator, io, w, resolved);
         }
         // Stateful cursor mode accumulates rows in `_cursorStates`; sweep expired entries at
         // startup. (Lookups already ignore expired rows, so this is purely space reclamation.)

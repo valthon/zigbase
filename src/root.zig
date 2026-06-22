@@ -17,6 +17,8 @@ pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
 pub const RouteEvent = events.RouteEvent;
 pub const JobEvent = events.JobEvent; // cron/interval/reactive job + app.submit handlers
+pub const AuthEvent = events.AuthEvent;
+pub const AuthHandler = events.AuthHandler;
 pub const Req = @import("route_types.zig").Req;
 pub const RouteError = @import("route_types.zig").RouteError;
 

@@ -403,14 +403,16 @@ Each auth collection in `.collections` can declare a `.auth.methods` struct enab
 | Method | Key | Options | Notes |
 |---|---|---|---|
 | Password | `password` | (none beyond `rate_limit`) | Built-in default when no `.methods` specified |
-| Magic link | `magic_link` | `ttl_s: i64` (default 900), `auto_create: bool` (default false) | initiate emails link; complete verifies+consumes |
-| OTP | `otp` | `length: u8` (default 6), `ttl_s: i64` (default 300) | initiate emails code; complete verifies code |
+| Magic link | `magic_link` | `ttl_s: i64` (default 900), `auto_create: bool` (default false) | when `auto_create=true`, provisions an account for unknown identities; initiate emails link; complete verifies+consumes |
+| OTP | `otp` | `length: u8` (default 6), `ttl_s: i64` (default 300), `auto_create: bool` (default false) | when `auto_create=true`, provisions an account for unknown identities; initiate emails code; complete verifies code |
 | WebAuthn | `webauthn` | `rp_id: []const u8`, `rp_name: []const u8`, `origin: []const u8`, `credentials_collection: []const u8`, `require_uv: bool` (default false) | all four string fields required; `require_uv` rejects assertions without user-verification (biometrics/PIN) |
 | OAuth2 | (see below) | gated by `.auth.oauth2.enabled` + `.auth.oauth2.providers` | 5th built-in; uses the contract but is NOT listed in `.auth.methods` |
 
 **Per-collection auth options** (set directly on `.auth`, independent of which methods are enabled):
 
 - **`require_verified: bool`** (default `false`) — when `true`, any login attempt is rejected with `403` if the auth record's `verified` field is `false`. This gate applies to **all** auth methods, including WebAuthn passkeys and OAuth2 accounts created from providers that did not confirm the email address (those are created `verified=false`). Enable it only after ensuring existing users have verified accounts, or after setting up a verification flow.
+
+> **`auto_create`** (on `magic_link` and `otp`, default `false`) — when `true`, `initiate` automatically provisions a passwordless auth record (`verified = false`) for email addresses not yet in the collection, then sends the link/code as usual. Enables "sign up or sign in" with a single step. **Note:** auto-created accounts have `verified = false`; if the collection also sets `require_verified = true`, those accounts cannot log in until verified. Consider whether to pair these settings. Works best with single-field `identityFields` (the default `email`).
 
 Each method accepts a `rate_limit` field:
 - `.default` — uses the global env-var rate-limiter (`ZIGBASE_RATE_LIMIT_MAX` / `ZIGBASE_RATE_LIMIT_WINDOW`).
@@ -546,6 +548,72 @@ Notes:
 `ChallengeStore` is a TTL'd, GC'd server-side store backed by `_authChallenges`. It is used internally by `magic_link` (the link token), `otp` (the emailed code), and `webauthn` (ceremony challenges). Custom plugins may access it via `AuthCtx.challengeStore()`, which returns a handle with:
 - `store(id, data, ttl_s)` — store a challenge under `id` with the given TTL.
 - `consume(id) ![]const u8` — retrieve and delete in one atomic step (single-use).
+
+### OAuth2 providers (`.auth.oauth2`)
+
+Configure OAuth2 sign-in for an auth collection by adding `.auth.oauth2` to its `.auth` block:
+
+```zig
+.users = .{ .type = .auth, .fields = .{}, .auth = .{
+    .oauth2 = .{
+        .enabled = true,
+        .providers = .{
+            // Preset provider — endpoints come from ZigBase's built-in table.
+            .{ .name = "google", .redirectUrls = .{"https://app.example/oauth/callback"} },
+            // Generic provider — all three endpoint URLs are required (all https://).
+            .{ .name = "myprovider",
+               .authURL = "https://myprovider.example/oauth/authorize",
+               .tokenURL = "https://myprovider.example/oauth/token",
+               .userinfoURL = "https://myprovider.example/api/user",
+               .redirectUrls = .{"https://app.example/oauth/callback"} },
+        },
+    },
+} },
+```
+
+**Built-in presets** (endpoint URLs supplied automatically): `google`, `github`, `microsoft`, `discord`.
+A generic provider requires `authURL`, `tokenURL`, and `userinfoURL` (all must be `https://`).
+
+**Per-provider fields** (all optional except `.name`):
+
+| Field | Default | Notes |
+|---|---|---|
+| `name` | — | **Required**. Valid identifier; becomes the slug and is uppercased into the env var name. |
+| `enabled` | `true` | Set `false` to temporarily disable without removing the declaration. |
+| `redirectUrls` | `&.{}` | Tuple of allowed OAuth2 redirect URLs. |
+| `clientId` | `""` | Prefer env (see below); literal is accepted but bakes the value into the binary. |
+| `clientSecret` | `""` | **Do not set in the literal.** Use env — the literal embeds the secret in the binary. |
+| `authURL` | `null` | Generic provider only. |
+| `tokenURL` | `null` | Generic provider only. |
+| `userinfoURL` | `null` | Generic provider only. |
+| `scopes` | `null` | Override default scopes for a preset, or supply scopes for a generic provider. |
+
+#### Runtime secrets via environment variables
+
+The `clientId` and `clientSecret` are **NOT** read from the comptime literal at runtime (a comptime literal cannot hold a secret safely). Instead, set environment variables at provisioning time:
+
+```
+ZIGBASE_OAUTH_<UPPER(NAME)>_CLIENT_ID=<your-client-id>
+ZIGBASE_OAUTH_<UPPER(NAME)>_CLIENT_SECRET=<your-client-secret>
+```
+
+For example, for `name = "google"`:
+
+```
+ZIGBASE_OAUTH_GOOGLE_CLIENT_ID=123456789-abc.apps.googleusercontent.com
+ZIGBASE_OAUTH_GOOGLE_CLIENT_SECRET=GOCSPX-...
+```
+
+The framework uppercases the provider name character-by-character to form the env var key. The `clientSecret` is encrypted (AES-256-GCM, HKDF key derived from the JWT secret) before being persisted in the database — the plaintext never reaches disk.
+
+#### Provisioning caveat (applied on first creation only)
+
+The env-secret injection and collection creation happen at startup, but only on the **first boot** (when the collection does not yet exist in the database). On subsequent boots the live database options are preserved — the env vars are ignored for an already-provisioned collection. This means:
+
+- **Rotating a secret:** update the value via the admin API (PATCH `/api/collections/:col`) or the admin UI. The admin path re-encrypts under the new plaintext.
+- **Changing a redirect URL or adding a provider:** update the comptime literal AND use an explicit `.migrations` entry to apply the change (provisioning is additive-only; it does not re-apply options on existing collections).
+
+> **CI/e2e caveat:** this feature cannot be exercised in automated CI without real provider credentials. All verification is at the unit level (comptime lowering + encrypt-on-inject with a stub env getter and a fake app secret).
 
 ### OAuth2 — contract method
 

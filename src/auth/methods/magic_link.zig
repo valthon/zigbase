@@ -45,20 +45,37 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
     if (try ac.rateLimit("magic_link", email)) |_|
         return InitiateResult{ .status = 429, .body = "{\"message\":\"Too many requests.\"}" };
 
-    // Resolve identity under a READER (findByIdentity is read-only; mintLinkToken
-    // is a JWT mint — neither needs the writer). Build the mail body into the request
-    // arena so it outlives the scoped reader block. Release the reader before the
-    // blocking SMTP send so a warm connection is not parked across the network round-trip.
+    const ml_opts = ac.collection.options.auth.methods.magic_link;
+    const auto_create: bool = if (ml_opts) |ml| ml.auto_create else false;
+    const ttl: i64 = if (ml_opts) |ml| ml.ttl_s else 900;
+    const redirect: []const u8 = if (ml_opts) |ml| ml.redirect_default else "/";
+
+    // Build the mail body into the request arena so it outlives the lock scope.
+    // Release the DB connection before the blocking SMTP send.
     var pending: ?struct { email: []const u8, mail_body: []const u8 } = null;
-    {
+
+    if (auto_create) {
+        // Need the writer: create record if missing, then mintLinkToken (read under writer is fine in WAL).
+        var w = ac.writer();
+        defer w.deinit();
+
+        if (try ac.resolveOrCreate(w.conn, email, true)) |rid| {
+            const token = try ac.mintLinkToken(w.conn, rid, ttl, .{});
+            const mail_body = try buildMailBody(
+                ac.ctx.allocator,
+                ac.app.public_url,
+                ac.collection.name,
+                token,
+                redirect,
+            );
+            pending = .{ .email = email, .mail_body = mail_body };
+        }
+    } else {
+        // Original path: READER only (no change to existing behavior).
         var r = try ac.reader();
         defer r.deinit();
 
-        // Resolve identity; if found, mint the link token
         if (try ac.findByIdentity(&r.conn, email)) |rid| {
-            const ml_opts = ac.collection.options.auth.methods.magic_link;
-            const ttl: i64 = if (ml_opts) |ml| ml.ttl_s else 900;
-            const redirect: []const u8 = if (ml_opts) |ml| ml.redirect_default else "/";
             const token = try ac.mintLinkToken(&r.conn, rid, ttl, .{});
             const mail_body = try buildMailBody(
                 ac.ctx.allocator,
@@ -69,7 +86,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
             );
             pending = .{ .email = email, .mail_body = mail_body };
         }
-    } // reader released here — SMTP send happens below without parking a warm connection
+    } // connection released above — SMTP send happens below without parking a connection
 
     // Deliver the link by email (outside reader lock — SMTP may block)
     if (pending) |p| {
@@ -437,4 +454,173 @@ test "MagicLinkMethod: ttl_s is read from collection opts (default 900 when opts
     };
     const ttl_custom: i64 = if (col_with_opts.options.auth.methods.magic_link) |ml| ml.ttl_s else 900;
     try std.testing.expectEqual(@as(i64, 1800), ttl_custom);
+}
+
+test "MagicLinkMethod: initiate auto_create=true creates record for unknown identity" {
+    const http_mod = @import("../../http.zig");
+    const collections = @import("../../collections.zig");
+    const schema_mod = @import("../../schema.zig");
+
+    var env = try api_auth.TestEnv.initAuth("ml_ac");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Replace with a collection that has magic_link.auto_create = true
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const existing = (try collections.get(a, w, "ml_ac")).?;
+        try collections.delete(a, w, existing.id);
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "ml_ac", .type = .auth,
+            .fields = &[_]schema_mod.Field{},
+            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .options = .{ .auth = .{ .methods = .{ .magic_link = .{ .auto_create = true } } } },
+        });
+    }
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "ml_ac")).?;
+    };
+
+    var req = env.ctx(a, .POST, "{\"identity\":\"brand_new@x.io\"}", &[_]http_mod.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    var m = try MagicLinkMethod.create(std.testing.allocator, std.testing.io, .{});
+    const am = m.method();
+    const res = try am.vtable.initiate(am.ctx, &ac);
+    try std.testing.expectEqual(@as(u16, 204), res.status);
+
+    // Verify the record now exists
+    const w2 = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const col2 = (try collections.get(a, w2, "ml_ac")).?;
+    var req2 = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col2, .config = .null };
+    const rid = try ac2.findByIdentity(w2, "brand_new@x.io");
+    try std.testing.expect(rid != null);
+}
+
+test "MagicLinkMethod: initiate auto_create=false creates nothing for unknown identity" {
+    const http_mod = @import("../../http.zig");
+    const collections = @import("../../collections.zig");
+    const schema_mod = @import("../../schema.zig");
+
+    var env = try api_auth.TestEnv.initAuth("ml_noac");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const existing = (try collections.get(a, w, "ml_noac")).?;
+        try collections.delete(a, w, existing.id);
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "ml_noac", .type = .auth,
+            .fields = &[_]schema_mod.Field{},
+            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .options = .{ .auth = .{ .methods = .{ .magic_link = .{ .auto_create = false } } } },
+        });
+    }
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "ml_noac")).?;
+    };
+
+    var req = env.ctx(a, .POST, "{\"identity\":\"ghost@x.io\"}", &[_]http_mod.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    var m = try MagicLinkMethod.create(std.testing.allocator, std.testing.io, .{});
+    const am = m.method();
+    const res = try am.vtable.initiate(am.ctx, &ac);
+    try std.testing.expectEqual(@as(u16, 204), res.status);
+
+    // Record must NOT exist
+    const w2 = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const col2 = (try collections.get(a, w2, "ml_noac")).?;
+    var req2 = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col2, .config = .null };
+    const rid = try ac2.findByIdentity(w2, "ghost@x.io");
+    try std.testing.expectEqual(@as(?[]const u8, null), rid);
+}
+
+test "MagicLinkMethod: auto_create initiate then complete succeeds end-to-end" {
+    const http_mod = @import("../../http.zig");
+    const collections = @import("../../collections.zig");
+    const schema_mod = @import("../../schema.zig");
+
+    var env = try api_auth.TestEnv.initAuth("ml_e2e");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const existing = (try collections.get(a, w, "ml_e2e")).?;
+        try collections.delete(a, w, existing.id);
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "ml_e2e", .type = .auth,
+            .fields = &[_]schema_mod.Field{},
+            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .options = .{ .auth = .{ .methods = .{ .magic_link = .{ .auto_create = true } } } },
+        });
+    }
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "ml_e2e")).?;
+    };
+
+    // initiate creates the record
+    var req_init = env.ctx(a, .POST, "{\"identity\":\"fresh@x.io\"}", &[_]http_mod.Param{});
+    var ac_init = AuthCtx{ .app = &env.app, .ctx = &req_init, .collection = col, .config = .null };
+    var m = try MagicLinkMethod.create(std.testing.allocator, std.testing.io, .{});
+    const am = m.method();
+    _ = try am.vtable.initiate(am.ctx, &ac_init);
+
+    // Retrieve the rid + mint a fresh token directly (bypass opaque mailer delivery)
+    var token: []const u8 = undefined;
+    var rid_buf: [64]u8 = undefined;
+    var rid_len: usize = 0;
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const col2 = (try collections.get(a, w, "ml_e2e")).?;
+        var req_mint = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+        var ac_mint = AuthCtx{ .app = &env.app, .ctx = &req_mint, .collection = col2, .config = .null };
+        const rid = (try ac_mint.findByIdentity(w, "fresh@x.io")).?;
+        @memcpy(rid_buf[0..rid.len], rid);
+        rid_len = rid.len;
+        token = try ac_mint.mintLinkToken(w, rid, 900, .{});
+    }
+
+    // complete resolves to the auto-created record's id
+    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
+    var req_comp = env.ctx(a, .POST, body, &[_]http_mod.Param{});
+    const col3 = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "ml_e2e")).?;
+    };
+    var ac_comp = AuthCtx{ .app = &env.app, .ctx = &req_comp, .collection = col3, .config = .null };
+    const res = try am.vtable.complete(am.ctx, &ac_comp);
+    switch (res) {
+        .record => |r| try std.testing.expectEqualStrings(rid_buf[0..rid_len], r),
+        .fail => |f| {
+            std.debug.print("Expected .record, got .fail: {d} {s}\n", .{ f.status, f.message });
+            return error.TestFailed;
+        },
+    }
 }
