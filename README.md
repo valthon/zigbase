@@ -203,6 +203,21 @@ examples/
 - [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — current caveats
 - [CHANGELOG.md](CHANGELOG.md) — release history
 
+## Changelog
+
+Don't edit `CHANGELOG.md` directly. For every recorded change, add a small fragment file
+`changelog.d/<slug>.md` whose body is one or more `### <Section>` headings (each with
+bullet lines) — a single fragment may populate multiple sections. Recognized sections, in
+emit order: **Breaking, Features, Fixes, Changed, Performance, Deprecated, Removed,
+Security, Internal**. The changelog is consumer-facing, so the first eight are for
+**user-visible** changes; **Internal** (rendered last) is for contributor-facing changes
+with no consumer impact (build/CI, tests, refactors, tooling). Rule of thumb: *would a user
+notice → a consumer section; only contributors notice → Internal; nobody needs it recorded
+→ no fragment.* See [changelog.d/README.md](changelog.d/README.md). Fragments mean parallel
+PRs never conflict on the shared changelog; at release time `scripts/assemble-changelog.sh`
+aggregates them per section into a new version block in `CHANGELOG.md` (and its `site/`
+mirror) and deletes them.
+
 ## License
 
 Apache-2.0.
