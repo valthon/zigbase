@@ -43,13 +43,50 @@ A request is authenticated by either of:
 
 1. **Bearer token** — `Authorization: Bearer <jwt>`.
 2. **Cookie** — the httpOnly `zb_auth` cookie. When authenticating via the cookie, unsafe
-   methods (POST, PATCH, DELETE) additionally require a double-submit CSRF check: send the
-   value of the readable `zb_csrf` cookie back in the `X-CSRF-Token` header. The server
+   methods (POST, PUT, PATCH, DELETE) additionally require a double-submit CSRF check: send
+   the value of the readable `zb_csrf` cookie back in the `X-CSRF-Token` header. The server
    compares it against the CSRF claim embedded in the token; a missing or mismatched header
    fails authentication on unsafe methods.
 
 The `zb_auth` cookie is httpOnly, `SameSite=Strict`; `zb_csrf` is readable (not httpOnly),
 `SameSite=Strict`. Both are set by the auth endpoints (see [Auth](#auth)).
+
+#### CSRF on unsafe methods (cookie sessions)
+
+This applies only to the **cookie** transport. Bearer-token requests carry no ambient
+cookie, so they are not subject to the CSRF check.
+
+- **Safe methods (`GET`, `HEAD`, `OPTIONS`) are exempt.** Reads work with just the cookie —
+  no header needed.
+- **Unsafe methods (`POST`, `PUT`, `PATCH`, `DELETE`) require the header.** The request must
+  carry `X-CSRF-Token` equal to the current `zb_csrf` cookie value, or the request is
+  treated as **unauthenticated**. The resulting status then follows the
+  [access rules](#access-rules): a `POST` (create) denial returns `403`, while a
+  `PATCH`/`DELETE` denial on a protected record returns `404` (to hide the record's
+  existence).
+
+If you authenticate and read fine but writes return `403` (or `404` on updates/deletes),
+this is almost always the missing piece: the client never echoed the `zb_csrf` cookie into
+the `X-CSRF-Token` header.
+
+The `zb_csrf` cookie is deliberately **not** httpOnly so that a browser SPA / `fetch` client
+can read it and replay it as a header on writes — that is what makes the double-submit check
+work. Read the cookie and set the header on every unsafe request:
+
+```js
+// read the readable zb_csrf cookie, send it back as X-CSRF-Token on writes
+const csrf = document.cookie
+  .split("; ")
+  .find((c) => c.startsWith("zb_csrf="))
+  ?.slice("zb_csrf=".length);
+
+await fetch("/api/collections/posts/records", {
+  method: "POST",
+  credentials: "include", // send zb_auth + zb_csrf cookies
+  headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+  body: JSON.stringify({ title: "Hello" }),
+});
+```
 
 ## Collections
 
@@ -345,6 +382,9 @@ Auth endpoints target an auth-type collection (`:col`).
 returns the same `{ token, record }` shape and re-sets the cookies. `auth-logout` clears
 `zb_auth` and `zb_csrf`.
 
+When you authenticate via these cookies, writes must echo the `zb_csrf` cookie in the
+`X-CSRF-Token` header — see [CSRF on unsafe methods](#csrf-on-unsafe-methods-cookie-sessions).
+
 ### Registration / signup
 
 There is **no dedicated register endpoint**. Signing up a user is a normal **record create
@@ -422,6 +462,29 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 // response (200) — sets zb_auth and zb_csrf cookies
 { "token": "<jwt>" }
 ```
+
+**magic_link consume + redirect (the classic email-link UX):**
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/collections/:col/auth/magic_link/consume?token=...&redirect=/app` | Verify + consume the token, set `zb_auth`/`zb_csrf` cookies, and `302` to the redirect target. For browser email links: the user clicks a plain GET URL and lands logged-in. Fires `onAuth(.magic_link)` and honors `require_verified` (403) exactly like `complete`. |
+
+The token is single-use (replay returns `400 Link already used.`); a missing token returns `400`, and the route `404`s unless `magic_link` is enabled on the collection.
+
+The `redirect` target is validated **server-side** so each app does not re-implement an open-redirect guard. Only same-origin **relative** paths are ever honored — anything with a scheme/host, a protocol-relative `//host`, a backslash, a `.`/`..` path-traversal segment, an encoded `%2e`/`%2f`/`%5c`, or a control/CRLF byte is rejected. A per-method allow-list narrows it further:
+
+```jsonc
+// collection options.auth.methods.magic_link
+{
+  "ttl_s": 900,
+  "redirect_default": "/club/welcome",      // used when ?redirect= is absent or rejected
+  "redirect_allow": ["/club/", "/dashboard"] // entry ending in "/" is a prefix; else exact path
+}
+```
+
+- Empty `redirect_allow` ⇒ any same-origin relative path is accepted (the scheme/host guard still applies).
+- A non-empty `redirect_allow` restricts to matching paths; a non-matching (or unsafe) `?redirect=` falls back to `redirect_default`.
+- `redirect_default` itself must be a safe relative path; an off-origin value degrades to `/`.
 
 **otp initiate:**
 
