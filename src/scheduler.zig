@@ -1,6 +1,7 @@
 const std = @import("std");
 const schedule = @import("schedule.zig");
 const events = @import("events.zig");
+const clock = @import("clock.zig");
 const App = @import("app.zig").App;
 
 /// A registered job after comptime assembly. `run` is a uniform wrapper returning
@@ -150,9 +151,10 @@ pub const default_job_stack_size: usize = 1 << 20; // 1 MiB
 /// is clamped up to it rather than allowed to crash the process at startup.
 pub const min_job_stack_size: usize = 1 << 20; // 1 MiB
 
+/// The framework's scheduling clock — wall-clock seconds, honoring the dev-only
+/// `ZIGBASE_FAKE_NOW` override (see `clock.zig`) so e2e suites can freeze next-fire math.
 fn unixNow(io: std.Io) i64 {
-    const ts = std.Io.Timestamp.now(io, .real);
-    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+    return clock.nowUnix(io);
 }
 
 /// Threaded scheduler runtime: a scheduler thread ticks the `JobState` table on a fixed

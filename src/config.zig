@@ -1,4 +1,5 @@
 const std = @import("std");
+const clock = @import("clock.zig");
 
 /// SMTP transport security mode (config-driven).
 ///   none     — plaintext SMTP (MailHog / local relays; current behavior).
@@ -73,6 +74,12 @@ pub const Config = struct {
     // "msmtp -t"); the From: header still comes from smtp_from.
     sendmail_command: []const u8 = "", // "" = off (use SMTP/Log); non-empty = CommandMailer
 
+    // DEV-ONLY frozen clock (`ZIGBASE_FAKE_NOW`, an ISO-8601 UTC instant). Resolved to unix
+    // seconds here so serveImpl can `clock.install` it. ALWAYS null on a production build —
+    // `clock.resolveFromEnv` is comptime-gated off when the `dev_clock` build option is false,
+    // so a prod binary ignores the env var entirely (see clock.zig). null = wall-clock.
+    fake_now_unix: ?i64 = null,
+
     /// Resolve `auto` to a concrete TLS mode from the port:
     ///   465 → implicit (SMTPS), 587 → starttls, anything else → none.
     /// `none`/`starttls`/`implicit` are returned unchanged.
@@ -121,6 +128,9 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_SMTP_INSECURE")) |v|
             cfg.smtp_insecure_skip_verify = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
         if (getter.get("ZIGBASE_SENDMAIL_COMMAND")) |v| cfg.sendmail_command = v;
+        // Dev-only frozen clock. resolveFromEnv is comptime-gated off on a prod build, so this
+        // is always null there regardless of the env var.
+        cfg.fake_now_unix = clock.resolveFromEnv(getter.get(clock.env_var));
         return cfg;
     }
 };

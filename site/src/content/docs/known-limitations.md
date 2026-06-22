@@ -51,6 +51,22 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   task submitted right before shutdown may be cut off. (Cron jobs use the bounded, cleanly
   joined pool.)
 
+## Testing & determinism
+
+- **The `ZIGBASE_FAKE_NOW` test clock governs the framework's clock, not SQLite's.** Setting
+  `ZIGBASE_FAKE_NOW` to an ISO-8601 UTC instant (dev builds only) freezes every "now" the
+  framework controls — token `iat`/`exp`, the scheduler's next-fire math, the auth rate-limiter
+  wall clock, and the auth-challenge / keyset-cursor TTL and expiry checks — so time-boundary
+  e2e scenarios are reproducible. **Out of scope:** a `datetime('now')`/`unixepoch('now')` a
+  *consumer* writes in their own custom SQL, and SQLite column `DEFAULT` timestamps (e.g. a
+  record's `created`/`updated`), still read the OS wall clock. The override does not replace
+  SQLite's global clock; route consumer time-logic through the framework helpers if it must be
+  frozen.
+- **The test clock is impossible to enable on a production build.** It is compiled in only when
+  the `dev_clock` build option is true (on in `Debug`, off in any release build; the release
+  script ships it off). A production binary never reads `ZIGBASE_FAKE_NOW` — the override folds
+  to a comptime no-op — so time can never be frozen in production.
+
 ## Static file serving
 
 - Static files are served without authentication — collection access rules do not apply

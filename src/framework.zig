@@ -13,6 +13,7 @@ const db = @import("db.zig");
 const crypto = @import("crypto.zig");
 const id_gen = @import("id.zig");
 const scheduler = @import("scheduler.zig");
+const clock = @import("clock.zig");
 const mail = @import("mail/mailer.zig");
 const provision = @import("provision.zig");
 const schema = @import("schema.zig");
@@ -704,6 +705,10 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     const jwt_secret = try resolveJwtSecret(allocator, io, cfg);
     defer allocator.free(jwt_secret);
     cfg.jwt_secret = jwt_secret;
+    // Install the dev-only frozen clock (ZIGBASE_FAKE_NOW) so every framework "now" — token
+    // expiry, scheduling, challenge/cursor TTLs — reads the override. No-op + null on a prod
+    // build (the gate is comptime-off; see clock.zig).
+    clock.install(cfg.fake_now_unix);
     if (std.mem.eql(u8, cfg.http_host, "0.0.0.0") or std.mem.eql(u8, cfg.http_host, "::")) {
         std.log.warn("binding to all interfaces ({s}); ensure a firewall/reverse proxy is in front (default is loopback 127.0.0.1)", .{cfg.http_host});
     }

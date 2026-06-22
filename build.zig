@@ -25,6 +25,13 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
     build_options.addOption([]const u8, "commit", gitCommit(b));
+    // Dev-only injectable clock (ZIGBASE_FAKE_NOW). Compiled in ONLY when this is true so
+    // a production binary can never freeze time. Defaults to on in Debug, off in any
+    // release/optimized build; the release script cross-compiles ReleaseFast/ReleaseSafe,
+    // so shipped binaries get `false` and the override code folds to comptime-dead. Override
+    // with -Ddev-clock=true to build a debuggable binary that still honors the env (e2e dev).
+    const dev_clock = b.option(bool, "dev-clock", "Compile in the dev-only ZIGBASE_FAKE_NOW test clock (default: on in Debug, off in release)") orelse (optimize == .Debug);
+    build_options.addOption(bool, "dev_clock", dev_clock);
     zigbase_mod.addOptions("build_options", build_options);
 
     zigbase_mod.addIncludePath(b.path("vendor/sqlite"));
