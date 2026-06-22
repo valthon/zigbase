@@ -797,20 +797,20 @@ A collection may declare `.indexes` — a tuple of index literals provisioned as
 `CREATE INDEX` statements when the collection is created:
 
 ```zig
-.indexes = &.{
-    .{ .name = "idx_posts_status", .fields = &.{"status"} },
-    .{ .name = "idx_posts_slug",   .fields = &.{"slug"}, .unique = true },
+.indexes = .{
+    // unique, case-sensitive (default collation)
+    .{ .name = "idx_users_handle", .fields = .{"handle"}, .unique = true },
     // case-insensitive: emits ("email" COLLATE NOCASE)
-    .{ .name = "idx_users_email",  .fields = &.{"email"}, .unique = true, .collation = .nocase },
+    .{ .name = "idx_users_email",  .fields = .{"email"}, .unique = true, .collation = .nocase },
     // partial / conditional-unique: emits ... WHERE deleted_at IS NULL
-    .{ .name = "idx_active_slug",  .fields = &.{"slug"}, .unique = true, .where = "deleted_at IS NULL" },
-}
+    .{ .name = "idx_active_slug",  .fields = .{"slug"}, .unique = true, .where = "deleted_at IS NULL" },
+},
 ```
 
 `.collation` (`.binary` default / `.nocase`) is applied to every indexed column;
 `.where` is an optional partial-index predicate emitted verbatim as `WHERE <where>`.
 The index `.name` and `.fields` are validated as identifiers; the `.where` predicate
-is raw SQL authored in the schema.
+is raw SQL authored in the schema. Index `.fields` reference fields by their declared name (not an internal id); `.name` and each field are validated as identifiers at compile time.
 
 ### Startup provisioning + additive auto-migration
 

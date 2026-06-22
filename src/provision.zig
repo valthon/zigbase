@@ -136,6 +136,7 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
                 col.options.auth.require_verified = spec.auth.require_verified;
             }
         }
+        if (@hasField(S, "indexes")) col.indexes = buildIndexes(name, spec.indexes);
         return col;
     }
 }
@@ -329,6 +330,40 @@ fn strTupleToSlice(comptime t: anytype) []const []const u8 {
         for (tf, 0..) |tff, i| {
             const v: []const u8 = @field(t, tff.name);
             out[i] = v;
+        }
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+fn buildIndexes(comptime col_name: []const u8, comptime t: anytype) []const schema.Index {
+    comptime {
+        const T = @TypeOf(t);
+        const info = @typeInfo(T);
+        if (info != .@"struct")
+            @compileError("collection '" ++ col_name ++ "' .indexes must be a tuple of index literals");
+        const tf = info.@"struct".fields;
+        var out: [tf.len]schema.Index = undefined;
+        for (tf, 0..) |tff, i| {
+            const idx = @field(t, tff.name);
+            const I = @TypeOf(idx);
+            if (!@hasField(I, "name"))
+                @compileError("an index in collection '" ++ col_name ++ "' is missing .name");
+            if (!@hasField(I, "fields"))
+                @compileError("an index in collection '" ++ col_name ++ "' is missing .fields");
+            const iname: []const u8 = idx.name;
+            if (!schema.isValidIdentifier(iname))
+                @compileError("index name '" ++ iname ++ "' in collection '" ++ col_name ++ "' is not a valid identifier");
+            const fields = strTupleToSlice(idx.fields);
+            for (fields) |fname| {
+                if (!schema.isValidIdentifier(fname))
+                    @compileError("index '" ++ iname ++ "' in collection '" ++ col_name ++ "' references an invalid field identifier '" ++ fname ++ "'");
+            }
+            var oi = schema.Index{ .name = iname, .fields = fields };
+            if (@hasField(I, "unique")) oi.unique = idx.unique;
+            if (@hasField(I, "collation")) oi.collation = idx.collation;
+            if (@hasField(I, "where")) oi.where = idx.where;
+            out[i] = oi;
         }
         const frozen = out;
         return &frozen;
@@ -1059,4 +1094,27 @@ test "buildCollection plumbs magic_link redirect_default/redirect_allow" {
     try std.testing.expectEqual(@as(usize, 2), ml.redirect_allow.len);
     try std.testing.expectEqualStrings("/club/", ml.redirect_allow[0]);
     try std.testing.expectEqualStrings("/dashboard", ml.redirect_allow[1]);
+}
+
+test "buildCollection lowers .indexes with collation and partial predicate" {
+    const cols = comptime buildCollections(.{
+        .users = .{
+            .type = .auth,
+            .fields = .{.{ .name = "name", .type = .text }},
+            .indexes = .{
+                .{ .name = "idx_users_email", .fields = .{"email"}, .unique = true, .collation = .nocase },
+                .{ .name = "idx_named", .fields = .{"name"}, .where = "name != ''" },
+            },
+        },
+    });
+    const u = cols[0];
+    try std.testing.expectEqual(@as(usize, 2), u.indexes.len);
+    try std.testing.expectEqualStrings("idx_users_email", u.indexes[0].name);
+    try std.testing.expect(u.indexes[0].unique);
+    try std.testing.expectEqual(schema.Collation.nocase, u.indexes[0].collation);
+    try std.testing.expectEqualStrings("email", u.indexes[0].fields[0]);
+    try std.testing.expectEqual(@as(?[]const u8, null), u.indexes[0].where);
+    try std.testing.expect(!u.indexes[1].unique);
+    try std.testing.expectEqual(schema.Collation.binary, u.indexes[1].collation);
+    try std.testing.expectEqualStrings("name != ''", u.indexes[1].where.?);
 }
