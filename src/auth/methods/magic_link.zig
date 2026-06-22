@@ -57,7 +57,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         // Resolve identity; if found, mint the link token
         if (try ac.findByIdentity(&r.conn, email)) |rid| {
             const ttl: i64 = if (ac.collection.options.auth.methods.magic_link) |ml| ml.ttl_s else 900;
-            const token = try ac.mintLinkToken(&r.conn, rid, ttl);
+            const token = try ac.mintLinkToken(&r.conn, rid, ttl, .{});
             const mail_body = try std.fmt.allocPrint(
                 ac.ctx.allocator,
                 "Your sign-in link token:\n\n{s}\n",
@@ -155,7 +155,7 @@ test "MagicLinkMethod: complete with valid token resolves to record id" {
         const rid = (try ac_mint.findByIdentity(w, "u@x.io")).?;
         @memcpy(rid_buf[0..rid.len], rid);
         rid_len = rid.len;
-        token = try ac_mint.mintLinkToken(w, rid, 900);
+        token = try ac_mint.mintLinkToken(w, rid, 900, .{});
         break :blk col;
     };
     const rid = rid_buf[0..rid_len];

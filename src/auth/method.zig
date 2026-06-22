@@ -56,8 +56,12 @@ pub const AuthCtx = struct {
         return api_auth.findByIdentity(ac.ctx.allocator, conn, ac.collection, identity);
     }
 
-    pub fn mintLinkToken(ac: *AuthCtx, conn: *db.Db, record_id: []const u8, ttl_s: i64) ![]const u8 {
-        return (try auth_helpers.mintLinkToken(ac.ctx, conn, ac.collection.name, record_id, ttl_s)).token;
+    /// Mint a single-use magic-link token. `opts.payload` (default empty) binds a small
+    /// opaque, tamper-proof string into the token's signed `pl` claim (returned by
+    /// `verifyLinkToken` as `claims.pl`) — e.g. a post-login redirect carried through the
+    /// link. See `auth_helpers.MintOptions`.
+    pub fn mintLinkToken(ac: *AuthCtx, conn: *db.Db, record_id: []const u8, ttl_s: i64, opts: auth_helpers.MintOptions) ![]const u8 {
+        return (try auth_helpers.mintLinkToken(ac.ctx, conn, ac.collection.name, record_id, ttl_s, opts)).token;
     }
 
     pub fn verifyLinkToken(ac: *AuthCtx, conn: *db.Db, token: []const u8) !?jwt.Claims {
@@ -146,7 +150,14 @@ test "AuthCtx helpers: findByIdentity and mintLinkToken delegate correctly" {
     try std.testing.expect(rid != null);
     try std.testing.expect(rid.?.len > 0);
 
-    // mintLinkToken should return a non-empty token string
-    const token = try ac.mintLinkToken(w, rid.?, 900);
+    // mintLinkToken should return a non-empty token string; an empty payload yields pl="".
+    const token = try ac.mintLinkToken(w, rid.?, 900, .{});
     try std.testing.expect(token.len > 0);
+    const claims_bare = (try ac.verifyLinkToken(w, token)).?;
+    try std.testing.expectEqualStrings("", claims_bare.pl);
+
+    // opts.payload binds an opaque value that verifyLinkToken returns as pl.
+    const tok_pl = try ac.mintLinkToken(w, rid.?, 900, .{ .payload = "/dashboard" });
+    const claims = (try ac.verifyLinkToken(w, tok_pl)).?;
+    try std.testing.expectEqualStrings("/dashboard", claims.pl);
 }

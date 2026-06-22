@@ -572,13 +572,18 @@ pub fn issueSession(
 ) !Issued
 
 // Single-use magic-link token helpers.
+// opts.payload (default "") binds a small opaque, signed, tamper-proof string into the
+// token — returned by verifyLinkToken as claims.pl. Use it to carry e.g. a post-login
+// redirect target in the one token instead of an unsigned &next= URL param. Signed, not
+// encrypted: readable-but-tamper-proof; keep it small (base64url'd into the JWT payload).
+pub const MintOptions = struct { payload: []const u8 = "" };
 pub fn mintLinkToken(
     ctx: *http.RequestCtx, conn: *db.Db,
-    collection: []const u8, record_id: []const u8, ttl_s: i64,
+    collection: []const u8, record_id: []const u8, ttl_s: i64, opts: MintOptions,
 ) !LinkToken
 
 // Returns null when the token is expired, wrong collection, or has a bad signature.
-// claims.id is the record id stored in the token.
+// claims.id is the record id stored in the token; claims.pl is the bound payload ("" if none).
 pub fn verifyLinkToken(
     ctx: *http.RequestCtx, conn: *db.Db,
     collection: []const u8, token: []const u8,

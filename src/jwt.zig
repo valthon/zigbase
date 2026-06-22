@@ -15,6 +15,12 @@ pub const Claims = struct {
     /// redemption can be recorded in `_consumedTokens` and a replay rejected. Empty on
     /// auth/file tokens, which are not single-use.
     jti: []const u8 = "",
+    /// Optional opaque application state carried in the signed claim (e.g. a post-login
+    /// redirect path). Covered by the HMAC signature, so it is tamper-proof; bound to the
+    /// `jti` because it travels in the same single-use token. Empty (`""`) when unused, and
+    /// serialized as `"pl":""` like the other default-empty claims; on parse a missing `pl`
+    /// (e.g. a non-magic-link token) falls back to this default.
+    pl: []const u8 = "",
     iat: i64,
     exp: i64,
 };
@@ -97,6 +103,27 @@ test "sign then verify round-trips claims" {
     try std.testing.expectEqualStrings("users", out.collection);
     try std.testing.expectEqual(TokenType.auth, out.type);
     try std.testing.expectEqualStrings("c1", out.csrf);
+}
+
+test "pl claim round-trips, empty and set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = crypto.deriveKey("secret", "tk1");
+
+    // No payload: pl serializes as the empty string, like the other default-empty claims.
+    const bare = Claims{ .id = "u1", .collection = "users", .type = .magic_link, .jti = "j1", .iat = 1000, .exp = 2000 };
+    const bare_json = try std.json.Stringify.valueAlloc(a, bare, .{});
+    try std.testing.expect(std.mem.indexOf(u8, bare_json, "\"pl\":\"\"") != null);
+    const bare_out = try verify(a, try sign(a, bare, &key), &key, 1500);
+    try std.testing.expectEqualStrings("", bare_out.pl);
+
+    // With a payload: the key is present and the value round-trips through sign/verify.
+    const withpl = Claims{ .id = "u1", .collection = "users", .type = .magic_link, .jti = "j1", .pl = "/club/profile", .iat = 1000, .exp = 2000 };
+    const withpl_json = try std.json.Stringify.valueAlloc(a, withpl, .{});
+    try std.testing.expect(std.mem.indexOf(u8, withpl_json, "\"pl\":\"/club/profile\"") != null);
+    const withpl_out = try verify(a, try sign(a, withpl, &key), &key, 1500);
+    try std.testing.expectEqualStrings("/club/profile", withpl_out.pl);
 }
 
 test "tampered payload fails the signature" {

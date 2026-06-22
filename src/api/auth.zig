@@ -277,7 +277,11 @@ pub fn deliverToken(app: *@import("../app.zig").App, alloc: std.mem.Allocator, e
     }
 }
 
-pub fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid: []const u8, token_key: []const u8, tt: jwt.TokenType, ttl: i64) ![]const u8 {
+/// Mint a single-use token. `payload` binds an opaque value into the signed `pl` claim;
+/// it travels in the same token (bound to its `jti`) and is covered by the HMAC signature,
+/// so it cannot be tampered with in transit. Pass `""` when the token carries no payload
+/// (verification / password-reset).
+pub fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid: []const u8, token_key: []const u8, tt: jwt.TokenType, ttl: i64, payload: []const u8) ![]const u8 {
     const app = ctx.app.?;
     const now = try nowUnix(conn);
     const key = crypto.deriveKey(app.jwt_secret, token_key);
@@ -285,7 +289,7 @@ pub fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid:
     // _consumedTokens; a replay is rejected even within the TTL and independent of
     // the tokenKey-rotation side effect.
     const jti = try crypto.genToken(app.io, ctx.allocator, 32);
-    return jwt.sign(ctx.allocator, .{ .id = rid, .collection = col_name, .type = tt, .jti = jti, .iat = now, .exp = now + ttl }, &key);
+    return jwt.sign(ctx.allocator, .{ .id = rid, .collection = col_name, .type = tt, .jti = jti, .pl = payload, .iat = now, .exp = now + ttl }, &key);
 }
 
 /// Record a single-use token's `jti` as consumed, or return error.AlreadyConsumed if it
@@ -348,7 +352,7 @@ pub fn requestVerification(ctx: *http.RequestCtx) anyerror!http.Response {
         if (strField(body, "email")) |email| {
             if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
                 if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
-                    const token = try mintToken(ctx, w, col.name, rid, tk, .verification, app.verification_ttl_s);
+                    const token = try mintToken(ctx, w, col.name, rid, tk, .verification, app.verification_ttl_s, "");
                     const mail_body = try std.fmt.allocPrint(ctx.allocator, "Verify your email ({s}). Your verification token:\n\n{s}\n", .{ col.name, token });
                     pending = .{ .email = email, .mail_body = mail_body };
                 }
@@ -399,7 +403,7 @@ pub fn requestPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
         if (strField(body, "email")) |email| {
             if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
                 if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
-                    const token = try mintToken(ctx, w, col.name, rid, tk, .password_reset, app.password_reset_ttl_s);
+                    const token = try mintToken(ctx, w, col.name, rid, tk, .password_reset, app.password_reset_ttl_s, "");
                     const mail_body = try std.fmt.allocPrint(ctx.allocator, "Reset your password ({s}). Your password-reset token:\n\n{s}\n", .{ col.name, token });
                     pending = .{ .email = email, .mail_body = mail_body };
                 }

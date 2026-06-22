@@ -309,7 +309,7 @@ test "consume: valid token → 302 with session cookies + allowed redirect; repl
         defer env.pool.releaseWriter();
         const col = (try collections.get(a, w, "mlconsume1")).?;
         const rid = (try api_auth.findByIdentity(a, w, col, "u@x.io")).?;
-        break :blk (try auth_helpers.mintLinkToken(&mint_ctx, w, "mlconsume1", rid, 900)).token;
+        break :blk (try auth_helpers.mintLinkToken(&mint_ctx, w, "mlconsume1", rid, 900, .{})).token;
     };
 
     // First consume: 302 + Location=/club/me + both cookies.
@@ -350,7 +350,7 @@ test "consume: non-whitelisted redirect falls back to default (no open redirect)
         defer env.pool.releaseWriter();
         const col = (try collections.get(a, w, "mlconsume2")).?;
         const rid = (try api_auth.findByIdentity(a, w, col, "u@x.io")).?;
-        break :blk (try auth_helpers.mintLinkToken(&mint_ctx, w, "mlconsume2", rid, 900)).token;
+        break :blk (try auth_helpers.mintLinkToken(&mint_ctx, w, "mlconsume2", rid, 900, .{})).token;
     };
 
     // redirect points off-list (and a protocol-relative open-redirect attempt):
@@ -386,7 +386,7 @@ test "consume: traversal redirect cannot escape an allowed prefix" {
             defer env.pool.releaseWriter();
             const col = (try collections.get(a, w, "mlconsume5")).?;
             const rid = (try api_auth.findByIdentity(a, w, col, "u@x.io")).?;
-            break :blk (try auth_helpers.mintLinkToken(&mint_ctx, w, "mlconsume5", rid, 900)).token;
+            break :blk (try auth_helpers.mintLinkToken(&mint_ctx, w, "mlconsume5", rid, 900, .{})).token;
         };
         const q = try std.fmt.allocPrint(a, "token={s}&redirect={s}", .{ token, atk });
         var ctx = consumeCtx(env, a, "mlconsume5", q);

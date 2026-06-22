@@ -17,6 +17,19 @@ pub const Issued = api_auth.Issued;
 
 pub const LinkToken = struct { token: []const u8 };
 
+/// Options for `mintLinkToken`. `payload` is a small opaque string bound into the
+/// signed token (the `pl` claim) and returned verbatim by `verifyLinkToken` as
+/// `claims.pl`. Use it to carry tamper-proof state through the link — e.g. a
+/// post-login redirect path — instead of an unsigned URL query param.
+///
+/// Size note: the payload is base64url-encoded inside the JWT payload, so keep it
+/// small (a path, an id, a short opaque tag). It is signed but NOT encrypted — do not
+/// put secrets in it; treat it as readable-but-tamper-proof, exactly like any other
+/// claim.
+pub const MintOptions = struct {
+    payload: []const u8 = "",
+};
+
 /// Callback type for a custom rate-limit function (optional; not used by the
 /// built-in `rateLimit` wrapper, but exported so consumers can type their own hook).
 pub const RateLimitFn = *const fn (ctx: *http.RequestCtx, scope: []const u8, ident: []const u8) bool;
@@ -40,16 +53,22 @@ pub fn issueSession(
 /// Mint a single-use verification token for `record_id` in `collection` with the
 /// given TTL in seconds. The token carries a random `jti` so it can only be consumed
 /// once via `consumeLinkToken`.
+///
+/// `opts.payload` (default empty) attaches a small opaque, signed, tamper-proof
+/// payload bound to the token's `jti`; `verifyLinkToken` returns it as `claims.pl`.
+/// Use it to carry e.g. a post-login redirect target in the single token instead of an
+/// unsigned `&next=` URL param. See `MintOptions` for the size/secrecy caveats.
 pub fn mintLinkToken(
     ctx: *http.RequestCtx,
     conn: *db.Db,
     collection: []const u8,
     record_id: []const u8,
     ttl_s: i64,
+    opts: MintOptions,
 ) !LinkToken {
     const tk = (try api_auth.tokenKeyFor(ctx.allocator, conn, collection, record_id)) orelse
         return error.NotFound;
-    const token = try api_auth.mintToken(ctx, conn, collection, record_id, tk, .magic_link, ttl_s);
+    const token = try api_auth.mintToken(ctx, conn, collection, record_id, tk, .magic_link, ttl_s, opts.payload);
     return .{ .token = token };
 }
 
@@ -115,7 +134,7 @@ test "magic-link helpers: mint -> verify -> consume; replay rejected" {
     const rid = (try api_auth.findByIdentity(a, w, col, "m@x.io")).?;
 
     var ctx = h.ctx(a, .POST, "", &[_]http.Param{});
-    const lt = try mintLinkToken(&ctx, w, "members", rid, 900);
+    const lt = try mintLinkToken(&ctx, w, "members", rid, 900, .{});
     const claims = (try verifyLinkToken(&ctx, w, "members", lt.token)).?;
     try consumeLinkToken(w, claims);
     try std.testing.expectError(error.AlreadyConsumed, consumeLinkToken(w, claims));
@@ -144,14 +163,53 @@ test "magic-link token type is distinct: email-verification token rejected by ve
 
     // Mint a standard EMAIL-VERIFICATION token (type=.verification).
     const ver_token = try api_auth.mintToken(&ctx, w, "members", rid,
-        (try api_auth.tokenKeyFor(a, w, "members", rid)).?, .verification, 900);
+        (try api_auth.tokenKeyFor(a, w, "members", rid)).?, .verification, 900, "");
 
     // verifyLinkToken must REJECT it (null) — cross-type security boundary.
     const result = try verifyLinkToken(&ctx, w, "members", ver_token);
     try std.testing.expectEqual(@as(?jwt.Claims, null), result);
 
     // Happy path: a token minted by mintLinkToken IS accepted by verifyLinkToken.
-    const lt = try mintLinkToken(&ctx, w, "members", rid, 900);
+    const lt = try mintLinkToken(&ctx, w, "members", rid, 900, .{});
     const ok = try verifyLinkToken(&ctx, w, "members", lt.token);
     try std.testing.expect(ok != null);
+}
+
+test "magic-link payload: opaque bound payload round-trips, is tamper-proof, replay-rejected" {
+    var h = try api_auth.TestEnv.initAuth("members");
+    defer h.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try h.createUser(a, "members", "p@x.io", "longenough");
+
+    const w = h.pool.acquireWriter();
+    defer h.pool.releaseWriter();
+    const col = (try collections.get(a, w, "members")).?;
+    const rid = (try api_auth.findByIdentity(a, w, col, "p@x.io")).?;
+
+    var ctx = h.ctx(a, .POST, "", &[_]http.Param{});
+
+    // Mint with an opaque payload (e.g. a post-login redirect target).
+    const lt = try mintLinkToken(&ctx, w, "members", rid, 900, .{ .payload = "/club/profile" });
+
+    // verifyLinkToken returns the same payload, verbatim, in claims.pl.
+    const claims = (try verifyLinkToken(&ctx, w, "members", lt.token)).?;
+    try std.testing.expectEqualStrings("/club/profile", claims.pl);
+
+    // Tampering with the payload (flip a byte in the JWT payload segment) fails verification:
+    // the pl claim is covered by the HMAC signature.
+    const buf = try a.dupe(u8, lt.token);
+    const first_dot = std.mem.indexOfScalar(u8, buf, '.').?;
+    buf[first_dot + 1] = if (buf[first_dot + 1] == 'A') 'B' else 'A';
+    try std.testing.expectEqual(@as(?jwt.Claims, null), try verifyLinkToken(&ctx, w, "members", buf));
+
+    // Replay guard still holds: consume once, then a second consume is rejected.
+    try consumeLinkToken(w, claims);
+    try std.testing.expectError(error.AlreadyConsumed, consumeLinkToken(w, claims));
+
+    // Back-compat: minting without a payload yields an empty pl claim.
+    const lt2 = try mintLinkToken(&ctx, w, "members", rid, 900, .{});
+    const claims2 = (try verifyLinkToken(&ctx, w, "members", lt2.token)).?;
+    try std.testing.expectEqualStrings("", claims2.pl);
 }
