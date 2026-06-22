@@ -56,12 +56,16 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
 
         // Resolve identity; if found, mint the link token
         if (try ac.findByIdentity(&r.conn, email)) |rid| {
-            const ttl: i64 = if (ac.collection.options.auth.methods.magic_link) |ml| ml.ttl_s else 900;
+            const ml_opts = ac.collection.options.auth.methods.magic_link;
+            const ttl: i64 = if (ml_opts) |ml| ml.ttl_s else 900;
+            const redirect: []const u8 = if (ml_opts) |ml| ml.redirect_default else "/";
             const token = try ac.mintLinkToken(&r.conn, rid, ttl, .{});
-            const mail_body = try std.fmt.allocPrint(
+            const mail_body = try buildMailBody(
                 ac.ctx.allocator,
-                "Your sign-in link token:\n\n{s}\n",
-                .{token},
+                ac.app.public_url,
+                ac.collection.name,
+                token,
+                redirect,
             );
             pending = .{ .email = email, .mail_body = mail_body };
         }
@@ -104,6 +108,31 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         return Resolution{ .fail = .{ .status = 400, .message = "Link already used." } };
 
     return Resolution{ .record = claims.id };
+}
+
+/// Build the magic-link email body. With no configured public base URL the
+/// server cannot form an absolute link, so it falls back to emailing the raw
+/// token (legacy behavior). With `public_url` set, it emits a clickable link to
+/// the GET consume endpoint, which verifies+consumes the token, sets the session
+/// cookie, and 302-redirects to `redirect`. JWT link tokens use the URL-safe
+/// base64url alphabet (plus `.`), so the token needs no escaping; `redirect`
+/// should be a simple origin-relative path (it is re-validated server-side).
+fn buildMailBody(
+    alloc: std.mem.Allocator,
+    public_url: []const u8,
+    col_name: []const u8,
+    token: []const u8,
+    redirect: []const u8,
+) ![]const u8 {
+    if (public_url.len == 0) {
+        return std.fmt.allocPrint(alloc, "Your sign-in link token:\n\n{s}\n", .{token});
+    }
+    const base = std.mem.trimEnd(u8, public_url, "/");
+    return std.fmt.allocPrint(
+        alloc,
+        "Click the link to sign in:\n\n{s}/api/collections/{s}/auth/magic_link/consume?token={s}&redirect={s}\n",
+        .{ base, col_name, token, redirect },
+    );
 }
 
 const vtable = AuthMethod.VTable{
@@ -362,6 +391,24 @@ test "MagicLinkMethod: initiate with unparseable body returns 204 (enumeration-s
     const am = m.method();
     const res = try am.vtable.initiate(am.ctx, &ac);
     try std.testing.expectEqual(@as(u16, 204), res.status);
+}
+
+test "buildMailBody: raw token when public_url is empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try buildMailBody(arena.allocator(), "", "users", "TOK.EN", "/");
+    try std.testing.expect(std.mem.indexOf(u8, body, "TOK.EN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "http") == null);
+}
+
+test "buildMailBody: clickable consume link when public_url is set (trailing slash trimmed)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try buildMailBody(arena.allocator(), "http://blog.test/", "users", "TOK.EN", "/dashboard");
+    try std.testing.expectEqualStrings(
+        "Click the link to sign in:\n\nhttp://blog.test/api/collections/users/auth/magic_link/consume?token=TOK.EN&redirect=/dashboard\n",
+        body,
+    );
 }
 
 test "MagicLinkMethod: ttl_s is read from collection opts (default 900 when opts is null)" {

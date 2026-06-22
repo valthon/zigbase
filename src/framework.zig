@@ -795,6 +795,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .io = io,
         .pool = &pool,
         .jwt_secret = cfg.jwt_secret,
+        .public_url = cfg.public_url,
         .cookie_secure = cfg.cookie_secure,
         .auth_token_ttl_s = cfg.auth_token_ttl_s,
         .verification_ttl_s = cfg.verification_ttl_s,
