@@ -8,6 +8,7 @@ const jwt = @import("jwt.zig");
 const api_auth = @import("api/auth.zig");
 const collections = @import("collections.zig");
 const app_mod = @import("app.zig");
+const Data = @import("data.zig").Data;
 
 // ---- Re-exports ----------------------------------------------------------------
 
@@ -141,6 +142,76 @@ test "magic-link helpers: mint -> verify -> consume; replay rejected" {
 
     const issued = try issueSession(&ctx, w, "members", rid);
     try std.testing.expect(issued.cookies.len == 2);
+}
+
+test "data.create provisions a usable auth row: mintLinkToken + issueSession succeed" {
+    // Regression for #53: a passwordless flow provisions an auth record via the Data
+    // facade (no hand-written tokenKey). Plain data.create on an auth collection now runs
+    // the credential transforms, so the row carries a tokenKey the auth helpers accept.
+    var h = try api_auth.TestEnv.initAuth("members");
+    defer h.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const w = h.pool.acquireWriter();
+    defer h.pool.releaseWriter();
+
+    // Provision a credential-less (passwordless) auth record via the facade. The Data
+    // facade allocates scratch via app.allocator and expects it bulk-freed, so back it
+    // with the test arena rather than the leak-checked testing allocator.
+    var app = h.app;
+    app.allocator = a;
+    const d = Data{ .app = &app, .conn = w, .io = app.io };
+    var fields: std.json.ObjectMap = .empty;
+    try fields.put(a, "email", .{ .string = "pw-less@x.io" });
+    const created = try d.create("members", .{ .object = fields });
+    const rid = created.object.get("id").?.string;
+
+    // The provisioned row must carry a tokenKey, so the auth helpers operate on it.
+    const tk = (try api_auth.tokenKeyFor(a, w, "members", rid)).?;
+    try std.testing.expectEqual(@as(usize, 32), tk.len);
+
+    var ctx = h.ctx(a, .POST, "", &[_]http.Param{});
+    const lt = try mintLinkToken(&ctx, w, "members", rid, 900, .{});
+    const claims = (try verifyLinkToken(&ctx, w, "members", lt.token)).?;
+    try std.testing.expectEqualStrings(rid, claims.id);
+
+    const issued = try issueSession(&ctx, w, "members", rid);
+    try std.testing.expect(issued.cookies.len == 2);
+
+    // A non-object value on an auth collection surfaces NotObject (same as the non-auth
+    // path), not applyProvision's PasswordTooShort.
+    try std.testing.expectError(error.NotObject, d.create("members", .{ .string = "nope" }));
+}
+
+test "data.create on a non-auth collection inserts plainly (no provisioning)" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("PRAGMA foreign_keys=ON;");
+    try @import("migrations.zig").run(&conn);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    _ = try collections.create(a, io, &conn, .{
+        .id = "",
+        .name = "posts",
+        .fields = &[_]@import("schema.zig").Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
+    });
+
+    var app = app_mod.App{ .allocator = a, .io = io, .pool = undefined };
+    const d = Data{ .app = &app, .conn = &conn, .io = io };
+    var fields: std.json.ObjectMap = .empty;
+    try fields.put(a, "title", .{ .string = "hi" });
+    // Non-auth: plain insert, no tokenKey transform — the value is stored as given.
+    const created = try d.create("posts", .{ .object = fields });
+    try std.testing.expectEqualStrings("hi", created.object.get("title").?.string);
+    try std.testing.expect(created.object.get("tokenKey") == null);
+    // Unknown collection still errors.
+    try std.testing.expectError(error.UnknownCollection, d.create("nope", .{ .object = fields }));
 }
 
 test "magic-link token type is distinct: email-verification token rejected by verifyLinkToken" {

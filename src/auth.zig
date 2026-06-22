@@ -43,6 +43,67 @@ pub fn applyCreate(io: std.Io, alloc: std.mem.Allocator, data: std.json.Value, m
     return .{ .object = out };
 }
 
+/// Programmatic-provisioning variant of `applyCreate` for auth records created via the
+/// `Data` facade (not the HTTP layer). Unlike `applyCreate`, a `password` is OPTIONAL —
+/// a passwordless flow (magic-link signup) provisions a credential-less row. The server
+/// always generates a `tokenKey` (so `issueSession`/`mintLinkToken` work) and forces
+/// `verified=false`; when a `password` IS supplied it is hashed (and length-checked
+/// against `min_len`). Client-supplied server-managed fields are always stripped.
+pub fn applyProvision(io: std.Io, alloc: std.mem.Allocator, data: std.json.Value, min_len: u8) AuthError!std.json.Value {
+    if (data != .object) return error.PasswordTooShort;
+
+    // Validate + allocate the owned credentials up front so the error paths below
+    // (short password, hash/token failure) can't leak a half-built object map.
+    var phc: ?[]const u8 = null;
+    errdefer if (phc) |p| alloc.free(p);
+    if (data.object.get("password")) |pw| {
+        if (pw != .string or pw.string.len < min_len) return error.PasswordTooShort;
+        phc = try crypto.hashPassword(io, alloc, pw.string);
+    }
+    var tk: ?[]const u8 = try crypto.genToken(io, alloc, 32);
+    errdefer if (tk) |t| alloc.free(t);
+
+    var out: std.json.ObjectMap = .empty;
+    errdefer freeProvisioned(alloc, .{ .object = out }); // free duped keys + owned cred strings on failure
+
+    var it = data.object.iterator();
+    while (it.next()) |e| {
+        if (isServerManagedField(e.key_ptr.*)) continue; // never copy server-managed credential fields
+        try out.put(alloc, try alloc.dupe(u8, e.key_ptr.*), e.value_ptr.*);
+    }
+    // Once a cred string is in `out`, `out` owns it (freeProvisioned frees it). Null the
+    // local so the per-string errdefer above won't ALSO free it on a later error — running
+    // both cleanups would be a double-free.
+    if (phc) |p| {
+        try out.put(alloc, "passwordHash", .{ .string = p });
+        phc = null;
+    }
+    try out.put(alloc, "tokenKey", .{ .string = tk.? });
+    tk = null;
+    try out.put(alloc, "verified", .{ .bool = false }); // never trust a client-supplied verified flag
+    return .{ .object = out };
+}
+
+/// Free a value returned by `applyProvision`. Frees what `applyProvision` *owns*: the
+/// duplicated field-name keys and the generated `passwordHash`/`tokenKey` strings. The
+/// copied field *values* are borrowed from the caller's input (a shallow `json.Value`
+/// copy), so they are never freed here. Literal map keys (`passwordHash`/`tokenKey`/
+/// `verified`) are static and also skipped. Callers using an arena can ignore this.
+pub fn freeProvisioned(alloc: std.mem.Allocator, provisioned: std.json.Value) void {
+    if (provisioned != .object) return;
+    var obj = provisioned.object;
+    var it = obj.iterator();
+    while (it.next()) |e| {
+        const k = e.key_ptr.*;
+        // The three server-set fields use static-literal keys (not duped); skip them.
+        if (std.mem.eql(u8, k, "passwordHash") or std.mem.eql(u8, k, "tokenKey") or std.mem.eql(u8, k, "verified")) continue;
+        alloc.free(k);
+    }
+    if (obj.get("passwordHash")) |ph| alloc.free(ph.string);
+    if (obj.get("tokenKey")) |tk| alloc.free(tk.string);
+    obj.deinit(alloc);
+}
+
 /// For an update: if `data` contains a new `password`, return a copy with a fresh `passwordHash`
 /// and a rotated `tokenKey` (invalidating existing tokens), plaintext removed. If no password is
 /// present, returns `data` unchanged.
@@ -79,6 +140,89 @@ test "applyCreate hashes the password, sets tokenKey/verified, strips plaintext"
     try std.testing.expectEqual(@as(usize, 32), out.object.get("tokenKey").?.string.len);
     try std.testing.expectEqual(false, out.object.get("verified").?.bool);
     try std.testing.expectEqualStrings("a@b.c", out.object.get("email").?.string);
+}
+
+test "applyProvision generates tokenKey/verified with NO password (passwordless flow)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "email", .{ .string = "a@b.c" });
+    const out = try applyProvision(std.testing.io, a, .{ .object = data }, 8);
+    // No password supplied -> no passwordHash, but a tokenKey is still generated.
+    try std.testing.expect(out.object.get("passwordHash") == null);
+    try std.testing.expectEqual(@as(usize, 32), out.object.get("tokenKey").?.string.len);
+    try std.testing.expectEqual(false, out.object.get("verified").?.bool);
+    try std.testing.expectEqualStrings("a@b.c", out.object.get("email").?.string);
+}
+
+test "applyProvision hashes a supplied password and still strips plaintext" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "email", .{ .string = "a@b.c" });
+    try data.put(a, "password", .{ .string = "longenough" });
+    const out = try applyProvision(std.testing.io, a, .{ .object = data }, 8);
+    try std.testing.expect(out.object.get("password") == null);
+    try std.testing.expect(std.mem.startsWith(u8, out.object.get("passwordHash").?.string, "$argon2id$"));
+    try std.testing.expectEqual(@as(usize, 32), out.object.get("tokenKey").?.string.len);
+}
+
+test "applyProvision rejects a short password when one is supplied" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "password", .{ .string = "short" });
+    try std.testing.expectError(error.PasswordTooShort, applyProvision(std.testing.io, a, .{ .object = data }, 8));
+}
+
+test "applyProvision strips client-supplied tokenKey/verified (forces server values)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "email", .{ .string = "a@b.c" });
+    try data.put(a, "tokenKey", .{ .string = "client-supplied" });
+    try data.put(a, "verified", .{ .bool = true });
+    const out = try applyProvision(std.testing.io, a, .{ .object = data }, 8);
+    try std.testing.expect(!std.mem.eql(u8, out.object.get("tokenKey").?.string, "client-supplied"));
+    try std.testing.expectEqual(@as(usize, 32), out.object.get("tokenKey").?.string.len);
+    try std.testing.expectEqual(false, out.object.get("verified").?.bool);
+}
+
+test "applyProvision + freeProvisioned leak nothing under the gpa (passwordless)" {
+    // Run directly on the leak-checking testing allocator (no arena): applyProvision owns
+    // the duped keys + generated tokenKey, and freeProvisioned must release exactly them.
+    const a = std.testing.allocator;
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "email", .{ .string = "a@b.c" });
+    const out = try applyProvision(std.testing.io, a, .{ .object = data }, 8);
+    try std.testing.expectEqual(@as(usize, 32), out.object.get("tokenKey").?.string.len);
+    freeProvisioned(a, out);
+}
+
+test "applyProvision + freeProvisioned leak nothing under the gpa (with password)" {
+    const a = std.testing.allocator;
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "email", .{ .string = "a@b.c" });
+    try data.put(a, "password", .{ .string = "longenough" });
+    const out = try applyProvision(std.testing.io, a, .{ .object = data }, 8);
+    try std.testing.expect(std.mem.startsWith(u8, out.object.get("passwordHash").?.string, "$argon2id$"));
+    freeProvisioned(a, out);
+}
+
+test "applyProvision short-password failure leaks nothing under the gpa" {
+    // Validation runs before any allocation, so the error path must allocate nothing.
+    const a = std.testing.allocator;
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "email", .{ .string = "a@b.c" });
+    try data.put(a, "password", .{ .string = "short" });
+    try std.testing.expectError(error.PasswordTooShort, applyProvision(std.testing.io, a, .{ .object = data }, 8));
 }
 
 test "applyCreate rejects a short password" {
@@ -233,7 +377,10 @@ fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: [
 }
 
 fn isUnsafe(m: http.Method) bool {
-    return switch (m) { .POST, .PUT, .PATCH, .DELETE => true, else => false };
+    return switch (m) {
+        .POST, .PUT, .PATCH, .DELETE => true,
+        else => false,
+    };
 }
 
 /// Constant-time slice equality (length is not secret).
@@ -284,9 +431,15 @@ test "authenticate resolves a valid bearer token to its record" {
     defer arena.deinit();
     const a = arena.allocator();
     _ = try collections.create(a, std.testing.io, &d, .{
-        .id = "", .name = "users", .type = .auth,
+        .id = "",
+        .name = "users",
+        .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
-        .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+        .listRule = "",
+        .viewRule = "",
+        .createRule = "",
+        .updateRule = "",
+        .deleteRule = "",
     });
     try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk-secret',1);");
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
@@ -308,7 +461,9 @@ test "authenticate rejects a token signed with the wrong key (returns null)" {
     defer arena.deinit();
     const a = arena.allocator();
     _ = try collections.create(a, std.testing.io, &d, .{
-        .id = "", .name = "users", .type = .auth,
+        .id = "",
+        .name = "users",
+        .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
     });
     try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk-secret',1);");
@@ -327,7 +482,9 @@ test "authenticate requires CSRF on the cookie + unsafe-method path" {
     defer arena.deinit();
     const a = arena.allocator();
     _ = try collections.create(a, std.testing.io, &d, .{
-        .id = "", .name = "users", .type = .auth,
+        .id = "",
+        .name = "users",
+        .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
     });
     try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk-secret',1);");
@@ -353,7 +510,9 @@ test "verifyToken resolves a valid token string to a record + exp" {
     defer arena.deinit();
     const a = arena.allocator();
     _ = try collections.create(a, std.testing.io, &d, .{
-        .id = "", .name = "users", .type = .auth,
+        .id = "",
+        .name = "users",
+        .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
     });
     try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk-secret',1);");
