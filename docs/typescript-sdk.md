@@ -30,7 +30,7 @@ All three share the same runtime (`@zigbase/client`); the generated tiers add fu
 **Which one?** Pick the tier by how much of the stack you own — they're ordered above from
 least to most integrated:
 
-- **Base** — reach for it when you just want to **pull the client from a CDN** (or a single
+- **Base dynamic** — reach for it when you just want to **pull the client from a CDN** (or a single
   `npm install`) and hand-write your own types. Zero build wiring, zero codegen; you pass
   `<Type>` parameters yourself. Great for quick frontends, prototypes, and apps that consume a
   ZigBase backend you don't control.
