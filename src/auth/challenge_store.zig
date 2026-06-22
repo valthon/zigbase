@@ -1,6 +1,7 @@
 const std = @import("std");
 const db = @import("../db.zig");
 const id_gen = @import("../id.zig");
+const clock = @import("../clock.zig");
 
 /// Server-side TTL'd single-use challenge store backed by the `_authChallenges` table
 /// (created by migration 0007). Challenges are minted by `put` and redeemed exactly once
@@ -60,11 +61,12 @@ pub const ChallengeStore = struct {
         {
             var upd = try self.conn.prepare(
                 \\UPDATE "_authChallenges" SET "consumed"=1
-                \\ WHERE "id"=?1 AND "method"=?2 AND "consumed"=0 AND "expires" > unixepoch('now');
+                \\ WHERE "id"=?1 AND "method"=?2 AND "consumed"=0 AND "expires" > ?3;
             );
             defer upd.finalize();
             try upd.bindText(1, id);
             try upd.bindText(2, method);
+            try upd.bindInt(3, try nowUnixDb(self.conn));
             _ = try upd.step();
             changed = self.conn.changesCount();
         }
@@ -98,13 +100,14 @@ pub const ChallengeStore = struct {
             var sel = try self.conn.prepare(
                 \\SELECT "id" FROM "_authChallenges"
                 \\ WHERE "collectionRef"=?1 AND "method"=?2 AND "identity"=?3
-                \\   AND "consumed"=0 AND "expires" > unixepoch('now')
+                \\   AND "consumed"=0 AND "expires" > ?4
                 \\ ORDER BY "created" DESC LIMIT 1;
             );
             defer sel.finalize();
             try sel.bindText(1, collection);
             try sel.bindText(2, method);
             try sel.bindText(3, identity);
+            try sel.bindInt(4, try nowUnixDb(self.conn));
             if (!try sel.step()) return null;
             break :blk try alloc.dupe(u8, sel.columnText(0));
         };
@@ -114,10 +117,11 @@ pub const ChallengeStore = struct {
         {
             var upd = try self.conn.prepare(
                 \\UPDATE "_authChallenges" SET "consumed"=1
-                \\ WHERE "id"=?1 AND "consumed"=0 AND "expires" > unixepoch('now');
+                \\ WHERE "id"=?1 AND "consumed"=0 AND "expires" > ?2;
             );
             defer upd.finalize();
             try upd.bindText(1, cid);
+            try upd.bindInt(2, try nowUnixDb(self.conn));
             _ = try upd.step();
             changed = self.conn.changesCount();
         }
@@ -139,17 +143,17 @@ pub const ChallengeStore = struct {
 pub fn gcAuthChallenges(w: *db.Db) db.DbError!void {
     var st = try w.prepare(
         \\DELETE FROM "_authChallenges"
-        \\ WHERE "expires" <= unixepoch('now') OR "consumed"=1;
+        \\ WHERE "expires" <= ?1 OR "consumed"=1;
     );
     defer st.finalize();
+    try st.bindInt(1, try nowUnixDb(w));
     _ = try st.step();
 }
 
+/// Unix seconds for challenge TTL/expiry, via the clock seam (honors the dev-only
+/// `ZIGBASE_FAKE_NOW` override so frozen-clock e2e tests expire challenges deterministically).
 fn nowUnixDb(conn: *db.Db) db.DbError!i64 {
-    var st = try conn.prepare("SELECT unixepoch('now');");
-    defer st.finalize();
-    _ = try st.step();
-    return st.columnInt(0);
+    return clock.sqlNowUnix(conn);
 }
 
 test "ChallengeStore: put/take single-use, take returns null on replay, expired returns null" {

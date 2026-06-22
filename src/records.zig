@@ -6,6 +6,7 @@ const migrations = @import("migrations.zig");
 const values = @import("values.zig");
 const ddl = @import("ddl.zig");
 const id_gen = @import("id.zig");
+const clock = @import("clock.zig");
 const compiler = @import("query/compiler.zig");
 const lexer = @import("query/lexer.zig");
 const parser = @import("query/parser.zig");
@@ -1255,11 +1256,10 @@ fn decodeCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col: schem
     return cur;
 }
 
+/// Unix seconds for cursor-state TTL/expiry, via the clock seam (honors the dev-only
+/// `ZIGBASE_FAKE_NOW` override so a frozen e2e clock expires cursors deterministically).
 fn nowUnixDb(conn: *db.Db) db.DbError!i64 {
-    var st = try conn.prepare("SELECT strftime('%s','now');");
-    defer st.finalize();
-    _ = try st.step();
-    return std.fmt.parseInt(i64, st.columnText(0), 10) catch 0;
+    return clock.sqlNowUnix(conn);
 }
 
 /// GC: delete expired stateful cursor entries. Safe to call periodically (scheduler) or inline.
