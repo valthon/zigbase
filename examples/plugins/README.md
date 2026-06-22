@@ -33,18 +33,14 @@ configures in code:
    for `zigbase.Mailer` / `zigbase.Email`, logging every outbound email and
    counting sends. Registered via `App(.{ .mailer = AuditMailer })`.
 
-3. **Comptime schema** via `.collections`. **Three** related collections:
+3. **Comptime schema** via `.collections`. **Four** related collections:
 
-   | Collection | Relations | Access rules |
-   | --- | --- | --- |
-   | `authors` | — | list/view public |
-   | `posts` | `author → authors` (cascade-delete) | list: `status = "published"` only |
-   | `comments` | `post → posts` (cascade-delete) | list/view: `approved = true`; create: open |
-
-   `posts.author` and `comments.post` are both `.relation` fields whose
-   `.target` names are resolved to collection ids at provision time. The
-   `comments` collection demonstrates a second cross-collection relation and
-   a `.bool` field with a comptime list/view rule.
+   | Collection  | Type | Auth methods                   | Relations                           | Access rules |
+   |-------------|------|-------------------------------|-------------------------------------|---|
+   | `authors`   | auth | webauthn (passkey) + api_token | —                                   | list/view: public |
+   | `commenters`| auth | magic_link (auto_create=true)  | —                                   | list: public; view: authed |
+   | `posts`     | base | —                              | `author → authors` (cascade-delete) | list: `status = "published"` |
+   | `comments`  | base | —                              | `post → posts`, `commenter → commenters` | list/view: `approved=true`; create: authed |
 
 4. **Explicit migrations** via `.migrations`. Two `zigbase.Migration` entries
    run once each (recorded in `_migrations`):
@@ -53,11 +49,12 @@ configures in code:
    - `0002_index_audit_note` — a more realistic multi-statement migration:
      creates `idx_audit_note` on `plugin_audit_log` **and** seeds a metadata row
      in the same transaction. It targets the **migration-owned** table on
-     purpose: comptime `.collections` names each collection's SQLite columns by
-     its *stable field id* (8-char hex), not the human field name, so a raw
-     migration like `CREATE INDEX ... ON posts (status)` fails — there is no
-     literal `status` column. Raw SQL migrations should target tables the
-     migration itself owns (or resolve the field id first).
+     purpose: the migration is demonstrating the escape-hatch pattern for
+     non-additive DDL on tables the migration itself creates. For comptime-managed
+     collections, use `.indexes = .{ ... }` in the collection spec instead —
+     physical columns are named by their human field name (not an internal id),
+     so `CREATE INDEX ... ON posts (status)` would work fine in a raw migration
+     too. See the `authors` collection for a working `.indexes` example.
 
 5. **`onError` handler** via `.onError`. Receives `*zigbase.ErrorEvent` with
    `.phase` (`.request` / `.before_hook` / `.after_hook` / `.cron` / `.job` /
@@ -78,7 +75,55 @@ configures in code:
    build output in `frontend/dist` is compiled into the binary at build time via
    `.static_files = .{ .embedded = &@import("static_assets").files }` — there is
    no runtime dependency on the `frontend/dist` directory. The frontend shows
-   authors, published posts, and approved comments (three relations live).
+   authors, published posts, approved comments, and a magic-link comment flow.
+
+9. **`onAuth` hook** via `.onAuth` — logs `collection + method` for every
+   successful session mint. With two auth collections and three methods in use,
+   the log shows the three distinct paths:
+   ```
+   [onAuth] collection=authors   method=webauthn   record=<id>
+   [onAuth] collection=authors   method=custom     record=<id>
+   [onAuth] collection=commenters method=magic_link record=<id>
+   ```
+
+10. **Custom `AuthMethod` plugin** (`ApiTokenMethod`) via `.auth_methods = .{ApiTokenMethod}`.
+    Enabled on `authors` via `.auth.methods.custom = .{"api_token"}`. Implements the
+    plugin contract `create(gpa, io, cfg) !Self` / `method(*Self) zigbase.AuthMethod` /
+    `deinit(*Self) void`, using `zigbase.AuthCtx` helpers (`findByIdentity`, `rateLimit`,
+    `reader`). Returns a `zigbase.Resolution` (`.record` or `.fail`).
+    - Initiate: `POST /api/collections/authors/auth/api_token/initiate` → `{"flow":"direct"}`
+    - Complete: `POST /api/collections/authors/auth/api_token/complete` with
+      `{ "identity": "author@example.com", "token": "<bio-value>" }`
+
+11. **Comptime `.indexes`** on `authors.contact_email` with `.collation = .nocase`
+    (case-insensitive lookup). This demonstrates the correct tool for indexing
+    comptime-managed collections — `.indexes` in the collection spec, because
+    physical columns ARE named by their human field name (`contact_email`), not an
+    internal id.
+
+## Auth methods in this example
+
+Three collections use four auth methods, all disambiguated by `onAuth`:
+
+| Collection   | Method       | How it works |
+|--------------|--------------|---|
+| `authors`    | `webauthn`   | Passkey registration + authentication via browser WebAuthn API. See [WebAuthn endpoints](#webauthn-endpoints-passkeys-for-authors) below. |
+| `authors`    | `api_token`  | Custom plugin: `POST .../auth/api_token/complete` with `{ "identity": "...", "token": "..." }`. Token is verified against the record's `bio` field (demo only — use a dedicated hashed-token field in production). |
+| `commenters` | `magic_link` | `POST .../auth/magic_link/initiate` with `{ "identity": "..." }`. Server emails a link. Set `ZIGBASE_PUBLIC_URL` for a clickable URL; otherwise look in the server log for the raw token. Account auto-created on first login (`auto_create = true`). |
+
+### WebAuthn endpoints (passkeys for authors)
+
+```text
+POST /api/collections/authors/auth/webauthn/register/begin     -- start registration
+POST /api/collections/authors/auth/webauthn/register/finish    -- complete registration
+POST /api/collections/authors/auth/webauthn/authenticate/begin   -- start login
+POST /api/collections/authors/auth/webauthn/authenticate/finish  -- complete login, mint session
+```
+
+Building a full passkey UI requires `navigator.credentials.create()` / `.get()`, CBOR
+encoding, and careful error handling — a substantial frontend project. The Zig/schema
+wiring is complete; the UI implementation is left as a reader exercise. See the
+[WebAuthn spec](https://www.w3.org/TR/webauthn-2/) and the `src/auth/webauthn/` directory.
 
 ## Generate a typed client at runtime — no Zig toolchain (SDK Tier 3)
 
@@ -96,8 +141,8 @@ npx @zigbase/typegen --data-dir ./pb_data --out src/zbase.gen.ts
 ```
 
 Runtime introspection generates the **db / realtime / files** surface for the
-three collections (`authors`, `posts`, `comments`). It does NOT produce typed
-`rpc.*` methods — for that, use the comptime tier (see `examples/golfsim`).
+four collections (`authors`, `commenters`, `posts`, `comments`). It does NOT
+produce typed `rpc.*` methods — for that, use the comptime tier (see `examples/golfsim`).
 
 **How it is verified here:** the e2e in `test/typegen.e2e.test.ts` starts the
 plugins server to provision a data dir, then runs:
@@ -107,7 +152,7 @@ plugins server to provision a data dir, then runs:
 ```
 
 …and asserts the generated file contains `// generated by zigbase`, `createClient`,
-and all three collection names. Run it locally with:
+and all collection names. Run it locally with:
 
 ```sh
 cd examples/plugins
@@ -127,9 +172,9 @@ cd frontend && npm install && npm run build && cd ..
 mise exec zig@0.16.0 -- zig build
 ./zig-out/bin/plugins help
 # --insecure-cookies: local dev over plain HTTP (auth cookies are Secure by default).
-# A random JWT secret is generated + persisted on first run; the embedded frontend is
-# served same-origin, so realtime needs no --realtime-origins.
-./zig-out/bin/plugins serve --insecure-cookies   # provisions authors/posts/comments + runs both migrations
+# ZIGBASE_PUBLIC_URL makes magic-link emails contain a real clickable URL.
+# In local dev the token also appears in the server log (look for "magic_link token=").
+ZIGBASE_PUBLIC_URL=http://localhost:8090 ./zig-out/bin/plugins serve --insecure-cookies
 # open http://127.0.0.1:8090/  (admin UI at /_/)
 ```
 
