@@ -377,11 +377,14 @@ the email exists). The matching `confirm-*` endpoint takes that `token` in its b
 - **With SMTP configured** (`ZIGBASE_SMTP_HOST` + friends — see the
   [README config table](../README.md#configuration)), the token is **emailed** over
   the configured transport (`none` / `starttls` / `implicit` / `auto`).
-- **Without SMTP** (the default), the token is **logged to the server** instead — a
+- **With a local MTA** (`ZIGBASE_SENDMAIL_COMMAND`, e.g. `sendmail -t -i` / `msmtp -t`),
+  the message is piped to that command instead — the app holds no SMTP credentials. This
+  takes precedence over `ZIGBASE_SMTP_HOST`.
+- **Without either** (the default), the token is **logged to the server** instead — a
   dev/CI convenience. To complete a flow locally, read the token from the log and POST
   it to the matching `confirm-*` endpoint.
 
-Configure SMTP for production; see
+Configure SMTP or a local MTA command for production; see
 [KNOWN_LIMITATIONS.md → Auth & email](../KNOWN_LIMITATIONS.md).
 
 ### Auth method endpoints (pluggable auth)

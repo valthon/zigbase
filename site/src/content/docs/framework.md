@@ -824,10 +824,11 @@ built-in wiring:
 
 - `.storage` defaults to **`zigbase`'s `DefaultStoragePlugin`** — local-disk storage rooted
   at `<data_dir>/storage`.
-- `.mailer` defaults to **`DefaultMailerPlugin`** — a `LogMailer` (logs the email) when no
-  SMTP is configured, or an `SmtpMailer` (STARTTLS / implicit TLS / plaintext) when
-  `ZIGBASE_SMTP_HOST` is set. Switching is config-driven; no code change is needed to
-  upgrade from logging to real SMTP.
+- `.mailer` defaults to **`DefaultMailerPlugin`** — config-driven with a fixed precedence: a
+  `CommandMailer` (pipes the message to a local MTA's stdin) when `ZIGBASE_SENDMAIL_COMMAND`
+  is set, else an `SmtpMailer` (STARTTLS / implicit TLS / plaintext) when `ZIGBASE_SMTP_HOST`
+  is set, else a `LogMailer` (logs the email). Switching is config-driven; no code change is
+  needed to upgrade from logging to a local sendmail/msmtp relay or real SMTP.
 
 A plugin is a type with this uniform contract (built from the runtime `zigbase.Config`):
 
@@ -1029,7 +1030,7 @@ The public surface (from `src/root.zig`):
 - `zigbase.Storage` / `zigbase.Mailer` / `zigbase.Email` — the storage & mailer plugin
   vtable types; `zigbase.DefaultStoragePlugin` / `zigbase.DefaultMailerPlugin` — the
   built-in defaults; `zigbase.LocalStorage`, `zigbase.LogMailer`, `zigbase.SmtpMailer`,
-  `zigbase.SmtpTls` — the concrete backends.
+  `zigbase.CommandMailer`, `zigbase.SmtpTls` — the concrete backends.
 - `zigbase.AuthMethod` — the auth plugin vtable type.
 - `zigbase.AuthCtx` — the per-request auth context passed to plugin phases.
 - `zigbase.auth.Resolution` / `zigbase.auth.InitiateResult` — the phase return types.

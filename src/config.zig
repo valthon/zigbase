@@ -65,6 +65,14 @@ pub const Config = struct {
     smtp_tls: SmtpTls = .auto, // transport security: none/starttls/implicit/auto
     smtp_insecure_skip_verify: bool = false, // true = skip cert verification (self-signed relays)
 
+    // Local-command mailer. When sendmail_command is non-empty it takes
+    // precedence over SMTP: the default mailer plugin resolves to CommandMailer,
+    // which pipes the RFC822 message to this command's stdin (exit 0 = sent).
+    // This is the "delegate delivery to a local MTA, hold no SMTP creds" setup.
+    // The string is whitespace-split into argv (e.g. "sendmail -t -i" or
+    // "msmtp -t"); the From: header still comes from smtp_from.
+    sendmail_command: []const u8 = "", // "" = off (use SMTP/Log); non-empty = CommandMailer
+
     /// Resolve `auto` to a concrete TLS mode from the port:
     ///   465 → implicit (SMTPS), 587 → starttls, anything else → none.
     /// `none`/`starttls`/`implicit` are returned unchanged.
@@ -112,6 +120,7 @@ pub const Config = struct {
         }
         if (getter.get("ZIGBASE_SMTP_INSECURE")) |v|
             cfg.smtp_insecure_skip_verify = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        if (getter.get("ZIGBASE_SENDMAIL_COMMAND")) |v| cfg.sendmail_command = v;
         return cfg;
     }
 };

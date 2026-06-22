@@ -69,13 +69,24 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_SMTP_FROM` | — | `noreply@zigbase.dev` | envelope + `From:` address |
 | `ZIGBASE_SMTP_TLS` | — | `auto` | transport security: `none` / `starttls` / `implicit` / `auto` (auto: 465→implicit, 587→starttls, else→none) |
 | `ZIGBASE_SMTP_INSECURE` | — | `false` | skip TLS cert verification (self-signed relays only) |
+| `ZIGBASE_SENDMAIL_COMMAND` | — | `""` (off) | local-MTA command to pipe mail to (e.g. `sendmail -t -i` or `msmtp -t`); when set, **overrides** SMTP. App holds no SMTP creds |
 
 ## Email delivery
 
-With `ZIGBASE_SMTP_HOST` set, verification and password-reset tokens are **emailed** over
-the configured SMTP transport. Without it (the default), they are **logged** to the server
-(a dev/CI convenience). Configure SMTP for production. TLS verifies certificates by default;
-`ZIGBASE_SMTP_INSECURE` disables verification for self-signed relays.
+Three backends, selected by config with a fixed precedence (no code change to switch):
+
+1. **`ZIGBASE_SENDMAIL_COMMAND` set** → the message (the same RFC822 bytes the SMTP backend
+   sends) is piped to a **local command's stdin** and exit 0 means delivered. This is the
+   standard "delegate delivery to a local MTA/relay, hold no SMTP credentials in the app"
+   setup — point it at `sendmail -t -i` or `msmtp -t`. The string is whitespace-split into
+   argv; `From:` still comes from `ZIGBASE_SMTP_FROM`. Takes precedence over SMTP.
+2. **`ZIGBASE_SMTP_HOST` set** → verification and password-reset tokens are **emailed** over
+   the configured SMTP transport (STARTTLS / implicit TLS / plaintext). TLS verifies
+   certificates by default; `ZIGBASE_SMTP_INSECURE` disables verification for self-signed
+   relays.
+3. **Neither set** (the default) → tokens are **logged** to the server (a dev/CI convenience).
+
+Configure a real backend (sendmail command or SMTP) for production.
 
 ## Rate limiting
 

@@ -34,6 +34,7 @@ pub const Mailer = @import("mail/mailer.zig").Mailer;
 pub const Email = @import("mail/mailer.zig").Email;
 pub const LogMailer = @import("mail/mailer.zig").LogMailer;
 pub const SmtpMailer = @import("mail/mailer.zig").SmtpMailer;
+pub const CommandMailer = @import("mail/mailer.zig").CommandMailer;
 pub const SmtpTls = @import("config.zig").SmtpTls;
 
 // Built-in plugins (for composition / overriding only one side of the pair).
