@@ -3,6 +3,7 @@ const db = @import("db.zig");
 const schema = @import("schema.zig");
 const crypto = @import("crypto.zig");
 const jwt = @import("jwt.zig");
+const clock = @import("clock.zig");
 const http = @import("http.zig");
 const collections = @import("collections.zig");
 const migrations = @import("migrations.zig");
@@ -215,12 +216,10 @@ pub fn nowUnixPub(conn: *db.Db) db.DbError!i64 {
     return nowUnix(conn);
 }
 
-/// Current unix time from SQLite (keeps pure code clock-free).
+/// Current unix time for token verification, via the clock seam (honors the dev-only
+/// `ZIGBASE_FAKE_NOW` override so expiry checks agree with the frozen clock).
 fn nowUnix(conn: *db.Db) db.DbError!i64 {
-    var st = try conn.prepare("SELECT unixepoch('now');");
-    defer st.finalize();
-    _ = try st.step();
-    return st.columnInt(0);
+    return clock.sqlNowUnix(conn);
 }
 
 /// Fetch an auth record's tokenKey by id from `table`. Null if absent.

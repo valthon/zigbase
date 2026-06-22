@@ -7,6 +7,7 @@ const schema = @import("../schema.zig");
 const crypto = @import("../crypto.zig");
 const jwt = @import("../jwt.zig");
 const auth = @import("../auth.zig");
+const clock = @import("../clock.zig");
 const events = @import("../events.zig");
 const request = @import("../request.zig");
 const ApiError = @import("error.zig").ApiError;
@@ -44,9 +45,9 @@ pub fn recordVerified(rec: std.json.Value) bool {
 
 /// Wall-clock seconds (no DB connection needed) for the rate limiter, mirroring
 /// scheduler.unixNow — used at the top of the gated endpoints before any conn exists.
+/// Honors the dev-only `ZIGBASE_FAKE_NOW` override (see `clock.zig`).
 fn wallNowUnix(io: std.Io) i64 {
-    const ts = std.Io.Timestamp.now(io, .real);
-    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+    return clock.nowUnix(io);
 }
 
 /// Rate-limit gate for a sensitive auth endpoint. Returns a 429 Response when the
@@ -65,11 +66,10 @@ pub fn rateLimited(ctx: *http.RequestCtx, scope: []const u8, ident: []const u8) 
     return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator);
 }
 
+/// SQL `now` for framework token logic (iat/exp, consumed-token expiry), honoring the
+/// dev-only `ZIGBASE_FAKE_NOW` override so issued tokens agree with the frozen wall clock.
 pub fn nowUnix(conn: *db.Db) db.DbError!i64 {
-    var st = try conn.prepare("SELECT unixepoch('now');");
-    defer st.finalize();
-    _ = try st.step();
-    return st.columnInt(0);
+    return clock.sqlNowUnix(conn);
 }
 
 /// Try each identity field in order; return the matching non-empty row id, or null.

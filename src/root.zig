@@ -178,4 +178,6 @@ test {
     _ = @import("auth/webauthn/authenticate.zig");
     _ = @import("auth/methods/webauthn.zig");
     _ = @import("api/webauthn_register.zig");
+    _ = @import("clock.zig");
+    _ = @import("clock_test.zig");
 }

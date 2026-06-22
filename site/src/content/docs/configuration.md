@@ -69,6 +69,7 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_SMTP_FROM` | — | `noreply@zigbase.dev` | envelope + `From:` address |
 | `ZIGBASE_SMTP_TLS` | — | `auto` | transport security: `none` / `starttls` / `implicit` / `auto` (auto: 465→implicit, 587→starttls, else→none) |
 | `ZIGBASE_SMTP_INSECURE` | — | `false` | skip TLS cert verification (self-signed relays only) |
+| `ZIGBASE_FAKE_NOW` | — | _unset_ | **DEV-ONLY test clock.** Freeze the framework's "now" to an ISO-8601 UTC instant (e.g. `2029-03-07T16:00:00Z`) for deterministic time-boundary e2e tests. **Ignored entirely on a production build** (compiled out unless built with `-Ddev-clock=true`; off in any release build). See [Known limitations → Testing](./known-limitations) for scope |
 
 ## Email delivery
 
