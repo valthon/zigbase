@@ -403,14 +403,16 @@ Each auth collection in `.collections` can declare a `.auth.methods` struct enab
 | Method | Key | Options | Notes |
 |---|---|---|---|
 | Password | `password` | (none beyond `rate_limit`) | Built-in default when no `.methods` specified |
-| Magic link | `magic_link` | `ttl_s: i64` (default 900), `auto_create: bool` (default false) | initiate emails link; complete verifies+consumes |
-| OTP | `otp` | `length: u8` (default 6), `ttl_s: i64` (default 300) | initiate emails code; complete verifies code |
+| Magic link | `magic_link` | `ttl_s: i64` (default 900), `auto_create: bool` (default false) | when `auto_create=true`, provisions an account for unknown identities; initiate emails link; complete verifies+consumes |
+| OTP | `otp` | `length: u8` (default 6), `ttl_s: i64` (default 300), `auto_create: bool` (default false) | when `auto_create=true`, provisions an account for unknown identities; initiate emails code; complete verifies code |
 | WebAuthn | `webauthn` | `rp_id: []const u8`, `rp_name: []const u8`, `origin: []const u8`, `credentials_collection: []const u8`, `require_uv: bool` (default false) | all four string fields required; `require_uv` rejects assertions without user-verification (biometrics/PIN) |
 | OAuth2 | (see below) | gated by `.auth.oauth2.enabled` + `.auth.oauth2.providers` | 5th built-in; uses the contract but is NOT listed in `.auth.methods` |
 
 **Per-collection auth options** (set directly on `.auth`, independent of which methods are enabled):
 
 - **`require_verified: bool`** (default `false`) — when `true`, any login attempt is rejected with `403` if the auth record's `verified` field is `false`. This gate applies to **all** auth methods, including WebAuthn passkeys and OAuth2 accounts created from providers that did not confirm the email address (those are created `verified=false`). Enable it only after ensuring existing users have verified accounts, or after setting up a verification flow.
+
+> **`auto_create`** (on `magic_link` and `otp`, default `false`) — when `true`, `initiate` automatically provisions a passwordless auth record (`verified = false`) for email addresses not yet in the collection, then sends the link/code as usual. Enables "sign up or sign in" with a single step. **Note:** auto-created accounts have `verified = false`; if the collection also sets `require_verified = true`, those accounts cannot log in until verified. Consider whether to pair these settings. Works best with single-field `identityFields` (the default `email`).
 
 Each method accepts a `rate_limit` field:
 - `.default` — uses the global env-var rate-limiter (`ZIGBASE_RATE_LIMIT_MAX` / `ZIGBASE_RATE_LIMIT_WINDOW`).

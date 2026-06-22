@@ -52,8 +52,61 @@ pub const AuthCtx = struct {
         return .{ .app = ac.app, .pool = ac.app.pool, .conn = conn };
     }
 
+    const records_mod = @import("../records.zig");
+    const crypto_mod = @import("../crypto.zig");
+
     pub fn findByIdentity(ac: *AuthCtx, conn: *db.Db, identity: []const u8) !?[]const u8 {
         return api_auth.findByIdentity(ac.ctx.allocator, conn, ac.collection, identity);
+    }
+
+    /// Find-or-create an auth record for  under an already-held writer.
+    /// Returns the record id (arena-allocated). When the identity is not found and
+    ///  is false, returns null. When  is true and the
+    /// identity is not found, inserts a minimal auth record (identity field(s) set to
+    /// , passwordHash = "", fresh tokenKey, verified = false) and returns
+    /// its id. If insert fails with a unique constraint race (StepFailed), retries
+    /// findByIdentity once and returns whatever is there.
+    pub fn resolveOrCreate(
+        ac: *AuthCtx,
+        conn: *db.Db,
+        identity: []const u8,
+        auto_create: bool,
+    ) !?[]const u8 {
+        // 1. Try the cheap path first — works for existing records regardless of auto_create.
+        if (try ac.findByIdentity(conn, identity)) |rid| return rid;
+        if (!auto_create) return null;
+
+        // 2. Build the minimal auth record data.
+        const tk = try crypto_mod.genToken(ac.app.io, ac.ctx.allocator, 32);
+        var data: std.json.ObjectMap = .empty;
+        // Set each identity field to the supplied identity (covers both email-only and
+        // email+username collections).
+        for (ac.collection.options.auth.identityFields) |idf| {
+            try data.put(ac.ctx.allocator, idf, .{ .string = identity });
+        }
+        try data.put(ac.ctx.allocator, "passwordHash", .{ .string = "" });
+        try data.put(ac.ctx.allocator, "tokenKey",    .{ .string = tk });
+        try data.put(ac.ctx.allocator, "verified",    .{ .bool = false });
+
+        // 3. Insert. Two create errors are folded into the same enumeration-safe recovery:
+        //    - error.StepFailed: a SQLite UNIQUE collision from a concurrent initiate for the
+        //      same identity — the other request already created the record, so re-read it.
+        //    - error.Validation: the supplied identity is malformed (e.g. the system `email`
+        //      field rejects bad format). A malformed identity can never be a stored record,
+        //      so findByIdentity returns null and initiate then silently returns 204. This
+        //      preserves the always-204 contract for junk input (it is NOT an enumeration leak,
+        //      since malformed input can never match a real identity).
+        //    Any OTHER error propagates unchanged — genuine infra failures must not be masked.
+        const rec = records_mod.create(
+            ac.ctx.allocator, ac.app.io, conn, ac.collection,
+            std.json.Value{ .object = data },
+        ) catch |err| {
+            if (err == error.StepFailed or err == error.Validation) {
+                return try ac.findByIdentity(conn, identity);
+            }
+            return err;
+        };
+        return rec.object.get("id").?.string;
     }
 
     /// Mint a single-use magic-link token. `opts.payload` (default empty) binds a small
@@ -160,4 +213,124 @@ test "AuthCtx helpers: findByIdentity and mintLinkToken delegate correctly" {
     const tok_pl = try ac.mintLinkToken(w, rid.?, 900, .{ .payload = "/dashboard" });
     const claims = (try ac.verifyLinkToken(w, tok_pl)).?;
     try std.testing.expectEqualStrings("/dashboard", claims.pl);
+}
+
+test "AuthCtx.resolveOrCreate: unknown identity + auto_create=false returns null" {
+    const api_auth = @import("../api/auth.zig");
+    const http_mod = @import("../http.zig");
+    const collections = @import("../collections.zig");
+
+    var env = try api_auth.TestEnv.initAuth("rc_nocreate");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "rc_nocreate")).?;
+    };
+    var req = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const rid = try ac.resolveOrCreate(w, "nobody@x.io", false);
+    try std.testing.expectEqual(@as(?[]const u8, null), rid);
+}
+
+test "AuthCtx.resolveOrCreate: unknown identity + auto_create=true creates record" {
+    const api_auth = @import("../api/auth.zig");
+    const http_mod = @import("../http.zig");
+    const collections = @import("../collections.zig");
+
+    var env = try api_auth.TestEnv.initAuth("rc_create");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "rc_create")).?;
+    };
+    var req = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+
+    const rid1 = (try ac.resolveOrCreate(w, "new@x.io", true)).?;
+    try std.testing.expect(rid1.len > 0);
+
+    // Idempotent: a second call returns the same id (no duplicate created).
+    const rid2 = (try ac.resolveOrCreate(w, "new@x.io", true)).?;
+    try std.testing.expectEqualStrings(rid1, rid2);
+}
+
+test "AuthCtx.resolveOrCreate: known identity + auto_create=true returns existing record" {
+    const api_auth = @import("../api/auth.zig");
+    const http_mod = @import("../http.zig");
+    const collections = @import("../collections.zig");
+
+    var env = try api_auth.TestEnv.initAuth("rc_existing");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try env.createUser(a, "rc_existing", "u@x.io", "longenough");
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "rc_existing")).?;
+    };
+    var req = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+
+    // Get the expected rid from findByIdentity
+    const expected_rid = (try ac.findByIdentity(w, "u@x.io")).?;
+
+    // resolveOrCreate with auto_create=true must return the same id, not insert another row
+    const rid = (try ac.resolveOrCreate(w, "u@x.io", true)).?;
+    try std.testing.expectEqualStrings(expected_rid, rid);
+}
+
+test "AuthCtx.resolveOrCreate: unknown MALFORMED identity + auto_create=true returns null (no 500, no record)" {
+    const api_auth = @import("../api/auth.zig");
+    const http_mod = @import("../http.zig");
+    const collections = @import("../collections.zig");
+
+    var env = try api_auth.TestEnv.initAuth("rc_malformed");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "rc_malformed")).?;
+    };
+    var req = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+
+    // A malformed email is rejected by the system `email` field's validation
+    // (records.create returns error.Validation). resolveOrCreate must fold that into
+    // the enumeration-safe recovery and return null — NOT propagate the error (500).
+    const rid = try ac.resolveOrCreate(w, "notanemail", true);
+    try std.testing.expectEqual(@as(?[]const u8, null), rid);
+
+    // And no record was created for the malformed identity.
+    const found = try ac.findByIdentity(w, "notanemail");
+    try std.testing.expectEqual(@as(?[]const u8, null), found);
 }
