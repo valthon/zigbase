@@ -731,8 +731,15 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             try provision.runMigrations(allocator, io, w, schema_migrations);
         }
         if (schema_collections.len > 0) {
+            // injectOAuthSecrets allocates a rewritten collections slice (+ provider arrays
+            // and encrypted secret strings) only needed through provisioning; applySpecs
+            // persists the encrypted secret into the DB. Scope those in an arena so they are
+            // freed after provisioning instead of leaking once at startup (the e2e
+            // leak-checker flags the leak).
+            var prov_arena = std.heap.ArenaAllocator.init(allocator);
+            defer prov_arena.deinit();
             const resolved = try provision.injectOAuthSecrets(
-                allocator, io, jwt_secret,
+                prov_arena.allocator(), io, jwt_secret,
                 config.EnvGetter{ .environ = environ },
                 schema_collections,
             );
