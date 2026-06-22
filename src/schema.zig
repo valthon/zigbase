@@ -104,6 +104,18 @@ pub const MagicLinkMethodOpts = struct {
     ttl_s: i64 = 900,
     auto_create: bool = false,
     rate_limit: RateLimitOpt = .default,
+    /// Where the GET consume+redirect endpoint sends the browser after a
+    /// successful login when the request's `?redirect=` is absent or rejected
+    /// by the allow-list. Must be a same-origin relative path ("/...") — an
+    /// off-origin value here is treated as "/".
+    redirect_default: []const u8 = "/",
+    /// Allow-list of same-origin relative paths the `?redirect=` parameter may
+    /// match. Each entry is an exact path OR a prefix ending in "/" (e.g.
+    /// "/club/" allows "/club/anything"). Empty list ⇒ any same-origin relative
+    /// path is accepted (the open-redirect guard — scheme/host rejection — still
+    /// applies); a non-empty list restricts to matching paths, falling back to
+    /// `redirect_default` otherwise.
+    redirect_allow: []const []const u8 = &.{},
 };
 
 pub const OtpMethodOpts = struct {
@@ -192,6 +204,10 @@ pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u
         try ml_obj.put(alloc, "ttl_s", .{ .integer = ml.ttl_s });
         try ml_obj.put(alloc, "auto_create", .{ .bool = ml.auto_create });
         try ml_obj.put(alloc, "rate_limit", try rateLimitToJsonAlloc(alloc, ml.rate_limit));
+        try ml_obj.put(alloc, "redirect_default", .{ .string = ml.redirect_default });
+        var allow_arr = std.json.Array.init(alloc);
+        for (ml.redirect_allow) |p| try allow_arr.append(.{ .string = p });
+        try ml_obj.put(alloc, "redirect_allow", .{ .array = allow_arr });
         try methods.put(alloc, "magic_link", .{ .object = ml_obj });
     }
     if (c.options.auth.methods.otp) |otp| {
@@ -298,6 +314,12 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
             if (mlv.object.get("ttl_s")) |x| if (x == .integer) { ml.ttl_s = x.integer; };
             if (mlv.object.get("auto_create")) |x| if (x == .bool) { ml.auto_create = x.bool; };
             if (mlv.object.get("rate_limit")) |rlv| ml.rate_limit = rateLimitFromJson(rlv);
+            if (mlv.object.get("redirect_default")) |x| if (x == .string) { ml.redirect_default = try alloc.dupe(u8, x.string); };
+            if (mlv.object.get("redirect_allow")) |x| if (x == .array) {
+                var list: std.ArrayList([]const u8) = .empty;
+                for (x.array.items) |it| if (it == .string) try list.append(alloc, try alloc.dupe(u8, it.string));
+                ml.redirect_allow = try list.toOwnedSlice(alloc);
+            };
             opts.auth.methods.magic_link = ml;
         };
         if (mo.get("otp")) |otpv| if (otpv == .object) {
@@ -1119,9 +1141,10 @@ test "AuthOptions.methods serializes + parses (magic_link ttl, password default)
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const allow = [_][]const u8{ "/club/", "/dashboard" };
     const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .methods = .{
         .password = .{},
-        .magic_link = .{ .ttl_s = 1200, .auto_create = true },
+        .magic_link = .{ .ttl_s = 1200, .auto_create = true, .redirect_default = "/club/welcome", .redirect_allow = &allow },
     } } } };
     const json = try optionsToJson(a, c, false);
     const back = try optionsFromJson(a, json);
@@ -1129,6 +1152,11 @@ test "AuthOptions.methods serializes + parses (magic_link ttl, password default)
     try std.testing.expect(back.auth.methods.magic_link != null);
     try std.testing.expectEqual(@as(i64, 1200), back.auth.methods.magic_link.?.ttl_s);
     try std.testing.expect(back.auth.methods.magic_link.?.auto_create);
+    // redirect_default + redirect_allow survive the JSON round-trip (key names + list handling).
+    try std.testing.expectEqualStrings("/club/welcome", back.auth.methods.magic_link.?.redirect_default);
+    try std.testing.expectEqual(@as(usize, 2), back.auth.methods.magic_link.?.redirect_allow.len);
+    try std.testing.expectEqualStrings("/club/", back.auth.methods.magic_link.?.redirect_allow[0]);
+    try std.testing.expectEqualStrings("/dashboard", back.auth.methods.magic_link.?.redirect_allow[1]);
 }
 
 test "AuthOptions.methods custom slugs round-trip" {

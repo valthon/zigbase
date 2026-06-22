@@ -168,6 +168,8 @@ fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
         if (@hasField(@TypeOf(ml), "ttl_s")) p.ttl_s = ml.ttl_s;
         if (@hasField(@TypeOf(ml), "auto_create")) p.auto_create = ml.auto_create;
         if (@hasField(@TypeOf(ml), "rate_limit")) p.rate_limit = buildRateLimitOpt(ml.rate_limit);
+        if (@hasField(@TypeOf(ml), "redirect_default")) p.redirect_default = ml.redirect_default;
+        if (@hasField(@TypeOf(ml), "redirect_allow")) p.redirect_allow = strTupleToSlice(ml.redirect_allow);
         out.magic_link = p;
     }
     if (@hasField(M, "otp")) {
@@ -1043,4 +1045,18 @@ test "buildCollection lowers .auth.methods into collection options" {
     try std.testing.expectEqualStrings("accounts", accounts.name);
     try std.testing.expect(accounts.options.auth.methods.magic_link != null);
     try std.testing.expect(accounts.options.auth.methods.password == null);
+}
+
+test "buildCollection plumbs magic_link redirect_default/redirect_allow" {
+    const specs = comptime buildCollections(.{
+        .accounts = .{ .type = .auth, .fields = .{}, .auth = .{ .methods = .{ .magic_link = .{
+            .redirect_default = "/club/welcome",
+            .redirect_allow = .{ "/club/", "/dashboard" },
+        } } } },
+    });
+    const ml = specs[0].options.auth.methods.magic_link.?;
+    try std.testing.expectEqualStrings("/club/welcome", ml.redirect_default);
+    try std.testing.expectEqual(@as(usize, 2), ml.redirect_allow.len);
+    try std.testing.expectEqualStrings("/club/", ml.redirect_allow[0]);
+    try std.testing.expectEqualStrings("/dashboard", ml.redirect_allow[1]);
 }

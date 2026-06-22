@@ -8,6 +8,7 @@ const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
 const auth_api = @import("api/auth.zig");
 const auth_methods_api = @import("api/auth_methods.zig");
+const magic_link_consume_api = @import("api/magic_link_consume.zig");
 const webauthn_register_api = @import("api/webauthn_register.zig");
 const oauth_api = @import("api/oauth.zig");
 const files_api = @import("api/files.zig");
@@ -45,6 +46,7 @@ const routes = [_]router.Route{
     .{ .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .handler = auth_api.confirmPasswordReset },
     .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/initiate", .handler = auth_methods_api.initiate },
     .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/complete", .handler = auth_methods_api.complete },
+    .{ .method = .GET, .pattern = "/api/collections/:col/auth/magic_link/consume", .handler = magic_link_consume_api.consume },
     .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/begin", .handler = webauthn_register_api.begin },
     .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/finish", .handler = webauthn_register_api.finish },
     .{ .method = .GET, .pattern = "/api/collections/:col/auth/oauth2/providers", .handler = oauth_api.oauth2Providers },
