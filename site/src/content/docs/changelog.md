@@ -11,7 +11,7 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.5.0] - 2026-06-21
 
 ### Removed
 
@@ -30,30 +30,7 @@ All notable changes to ZigBase are documented here. The format is based on
 - **`ChallengeStore`** (`_authChallenges`) — TTL'd, GC'd single-use server-side challenge storage used by `otp` and `webauthn`, and accessible to custom plugins via `AuthCtx.challengeStore()`.
 - **`onAuth` method tagging extended** — `AuthEvent.method` is an enum: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`, or `.custom` for custom plugins.
 - **RPC client generation for auth endpoints** — the generated TypeScript client exposes non-password auth-method endpoints under an `auth` surface (initiate/complete stubs, currently untyped).
-- **`zigbase.auth` consumer surface for custom auth flows** — `issueSession` (and
-  `RouteEvent.issueSession`), single-use magic-link tokens (`mintLinkToken` /
-  `verifyLinkToken` / `consumeLinkToken`), `deliverAuthMail`, and `rateLimit`. All
-  session minting now funnels through one seam that always fires `onAuth`.
-- **Untyped route handlers in framework mode.** `.routes` now accepts the raw
-  `fn(*RouteEvent) anyerror!http.Response` handler form alongside typed
-  `Req(Input)`/`Output` handlers. An untyped handler owns its full response, so it can
-  set/clear a session cookie, return a redirect (`307`), or serve a non-JSON
-  content-type (e.g. `text/calendar`, an HTML OAuth handoff) — things the typed JSON
-  thunk cannot express. Untyped routes carry no typed `Input`/`Output` and are excluded
-  from the generated TypeScript `zb.rpc.*` client, so they never produce a client method
-  that would mis-parse their response.
-- **`text.pattern` is now enforced on record writes** via a pure-Zig, linear-time (DoS-safe)
-  Thompson-NFA matcher. Matching is unanchored (substring); anchor with `^…$` for a
-  full-string match. Supported syntax: literals, `.` (any codepoint except `\n`), anchors
-  `^`/`$`, character classes `[…]`/`[^…]`/ranges, predefined classes `\d \D \w \W \s \S`
-  (ASCII), escapes `\t \n \r \f \v` and `\`-escaped metacharacters, alternation `|`, groups
-  `(…)`/`(?:…)`, and quantifiers `* + ? {m} {m,} {m,n}`. Patterns are validated when a
-  collection is saved (a bad regex is a `400` field error), and at build time (`@compileError`)
-  for comptime schema literals.
-- **`date` field `min`/`max` are now enforced** on record writes, with date normalization so
-  mixed formats compare correctly. Malformed or out-of-range date values are rejected with `400`
-  (`validation_date`). Bounds are validated at collection-save time and at build time
-  (`@compileError`) for comptime schema literals.
+- **`zigbase.auth` consumer surface for custom auth flows** — `issueSession` (and `RouteEvent.issueSession`), single-use magic-link tokens (`mintLinkToken` / `verifyLinkToken` / `consumeLinkToken`), `deliverAuthMail`, and `rateLimit`. All session minting now funnels through one seam that always fires `onAuth`.
 
 ### Security
 
@@ -74,6 +51,47 @@ All notable changes to ZigBase are documented here. The format is based on
 - **Session issuance (password, refresh, OAuth2) routes through a single
   `issueSession`+`emitAuth` seam** — custom routes can no longer mint a session that
   skips the `onAuth` hook.
+
+## [0.4.1] - 2026-06-19
+
+### Added
+
+- **`zigbase --version`** (and the `version` subcommand) prints build provenance —
+  the `build.zig.zon` version, the git commit, the build mode, the target triple,
+  and the Zig version. Implemented at the framework level, so every binary built
+  on ZigBase (including the examples and downstream apps) inherits it.
+
+### Changed
+
+- **Prebuilt server binaries are now stripped** — release builds drop debug
+  symbols, cutting each `@zigbase/server-<platform>` package and GitHub-release
+  tarball from ~24 MiB to ~7 MiB (about 73% smaller) with no API or behavior
+  change. `npm install @zigbase/server` and `npx @zigbase/typegen` download
+  much less.
+
+### Added
+
+- **Untyped route handlers in framework mode.** `.routes` now accepts the raw
+  `fn(*RouteEvent) anyerror!http.Response` handler form alongside typed
+  `Req(Input)`/`Output` handlers. An untyped handler owns its full response, so it can
+  set/clear a session cookie, return a redirect (`307`), or serve a non-JSON
+  content-type (e.g. `text/calendar`, an HTML OAuth handoff) — things the typed JSON
+  thunk cannot express. Untyped routes carry no typed `Input`/`Output` and are excluded
+  from the generated TypeScript `zb.rpc.*` client, so they never produce a client method
+  that would mis-parse their response.
+- **`text.pattern` is now enforced on record writes** via a pure-Zig, linear-time
+  (DoS-safe) Thompson-NFA matcher (`src/regex.zig`). Matching is unanchored (substring);
+  anchor with `^…$` for a full-string match. Supported syntax: literals, `.` (any codepoint
+  except `\n`), anchors `^`/`$`, character classes `[…]`/`[^…]`/ranges, predefined classes
+  `\d \D \w \W \s \S` (ASCII), escapes `\t \n \r \f \v` and `\`-escaped metacharacters,
+  alternation `|`, groups `(…)`/`(?:…)`, and quantifiers `* + ? {m} {m,} {m,n}`. Patterns
+  are validated when a collection is saved (a bad regex is a `400` field error), and at build
+  time (`@compileError`) for comptime schema literals.
+- **`date` field `min`/`max` are now enforced** on record writes, with date normalization
+  (`src/datetime.zig`) so mixed formats (e.g. `2026-06-10 08:00:00` vs
+  `2026-06-10T08:00:00Z`) compare correctly. Malformed or out-of-range date values are
+  rejected with `400` (`validation_date`). Bounds are validated at collection-save time
+  and at build time (`@compileError`) for comptime schema literals.
 
 ### Fixed
 
