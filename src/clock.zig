@@ -40,20 +40,17 @@ pub const enabled = build_options.dev_clock;
 /// The name of the env var that freezes time (dev builds only).
 pub const env_var = "ZIGBASE_FAKE_NOW";
 
-/// Process-global frozen instant, installed once at startup (`install`) from the resolved
-/// config. Read by every helper below. Guarded by a spinlock so the scheduler/worker threads
-/// can read it concurrently with a (one-shot, startup-only) install. On a prod build `enabled`
-/// is comptime-false, so `install` is a no-op and `value` is permanently null.
-const Cache = struct {
-    var mutex: std.atomic.Mutex = .unlocked;
-    var value: ?i64 = null;
+/// Sentinel for "no override installed" — a unix-seconds value no real instant will ever be.
+/// Lets the cache live in a single atomic with no separate "is set" flag.
+const unset_sentinel: i64 = std.math.minInt(i64);
 
-    fn lock() void {
-        while (!mutex.tryLock()) std.atomic.spinLoopHint();
-    }
-    fn unlock() void {
-        mutex.unlock();
-    }
+/// Process-global frozen instant, installed once at startup (`install`) from the resolved
+/// config and never mutated afterward. Because it is write-once-before-readers and the
+/// payload is a single i64, an atomic load/store is sufficient — every read is lock-free, so
+/// the scheduler/worker threads never contend on a clock read. On a prod build `enabled` is
+/// comptime-false, so `install` is a no-op and the value stays at `unset_sentinel`.
+const Cache = struct {
+    var value: std.atomic.Value(i64) = std.atomic.Value(i64).init(unset_sentinel);
 };
 
 /// Parse a `ZIGBASE_FAKE_NOW` value to unix seconds, gated by the build. Returns null on a
@@ -76,9 +73,7 @@ pub fn resolveFromEnv(raw: ?[]const u8) ?i64 {
 /// were somehow threaded in. Logged loudly when an override is actually active.
 pub fn install(frozen: ?i64) void {
     if (!enabled) return;
-    Cache.lock();
-    defer Cache.unlock();
-    Cache.value = frozen;
+    Cache.value.store(frozen orelse unset_sentinel, .release);
     if (frozen) |v| std.log.warn(
         "DEV CLOCK FROZEN via {s} ({d}) — framework time is overridden. This must NEVER appear on a production build.",
         .{ env_var, v },
@@ -86,12 +81,12 @@ pub fn install(frozen: ?i64) void {
 }
 
 /// The installed frozen instant (unix seconds) on a dev build with an override set, else null.
-/// On a prod build this is `comptime null`.
+/// A lock-free atomic load (the value is write-once at startup). On a prod build this is
+/// `comptime null` — the atomic is never even touched.
 pub fn frozenUnix() ?i64 {
     if (!enabled) return null;
-    Cache.lock();
-    defer Cache.unlock();
-    return Cache.value;
+    const v = Cache.value.load(.acquire);
+    return if (v == unset_sentinel) null else v;
 }
 
 /// TEST-ONLY: force the cached override to `v` (or back to wall-clock with null) so a unit
@@ -105,9 +100,7 @@ pub fn setForTest(v: ?i64) void {
 /// TEST-ONLY: drop the cached override (back to wall-clock).
 pub fn resetForTest() void {
     if (!builtin.is_test) @compileError("clock.resetForTest is test-only");
-    Cache.lock();
-    defer Cache.unlock();
-    Cache.value = null;
+    Cache.value.store(unset_sentinel, .release);
 }
 
 /// Wall-clock seconds, honoring the override. The framework clock (`scheduler.unixNow`)
@@ -119,15 +112,25 @@ pub fn nowUnix(io: std.Io) i64 {
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
 }
 
-/// SQL `now` (unix seconds) for framework-issued timestamp logic: returns the frozen
-/// instant when overridden, else `SELECT unixepoch('now')`. Replaces the per-file
-/// `SELECT unixepoch('now')` helpers so they all agree with the wall clock above.
+/// Host wall-clock seconds via libc `clock_gettime(CLOCK_REALTIME)`. The framework links libc
+/// and only targets Linux/macOS, so this is always available and needs no `std.Io`. Used by the
+/// SQL-`now` path to skip a SQLite roundtrip (see `sqlNowUnix`).
+fn wallSeconds() i64 {
+    var ts: std.c.timespec = undefined;
+    // CLOCK_REALTIME never fails for a valid struct pointer; fall back to 0 defensively.
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @intCast(ts.sec);
+}
+
+/// SQL `now` (unix seconds) for framework-issued timestamp logic: the frozen instant when
+/// overridden, else the host wall clock. SQLite is embedded in THIS process, so `unixepoch('now')`
+/// reads the same host clock — calling `clock_gettime` directly returns the identical value while
+/// skipping a prepare/step/finalize SQLite roundtrip per read. The `conn` parameter and `DbError`
+/// return are kept so the per-file `nowUnix(conn)` call sites (and their `try`) are unchanged.
 pub fn sqlNowUnix(conn: *db.Db) db.DbError!i64 {
+    _ = conn;
     if (frozenUnix()) |v| return v;
-    var st = try conn.prepare("SELECT unixepoch('now');");
-    defer st.finalize();
-    _ = try st.step();
-    return st.columnInt(0);
+    return wallSeconds();
 }
 
 test "resolveFromEnv parses, tolerates garbage, and is gated by the build" {
