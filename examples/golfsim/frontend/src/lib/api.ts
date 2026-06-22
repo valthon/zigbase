@@ -44,6 +44,26 @@ export function token(): string | null {
 
 export function logout(): void {
   if (typeof localStorage !== 'undefined') localStorage.removeItem(TOKEN_KEY);
+  const headers: Record<string, string> = {};
+  const csrf = csrfToken();
+  if (csrf) headers['x-csrf-token'] = csrf;
+  const t = token();
+  if (t) headers['Authorization'] = `Bearer ${t}`;
+  fetch('/api/collections/users/auth-logout', { method: 'POST', headers, credentials: 'include' }).catch(() => {});
+}
+
+/** Thrown by login() when the account exists but email is not yet verified. */
+export class EmailNotVerifiedError extends Error {
+  constructor(public readonly email: string) {
+    super('Email not verified. Check your inbox for a verification token.');
+  }
+}
+
+/** Read the CSRF token from the zb_csrf cookie (set by the server on login). */
+function csrfToken(): string | null {
+  if (typeof document === 'undefined') return null;
+  const m = document.cookie.match(/(?:^|;\s*)zb_csrf=([^;]+)/);
+  return m ? decodeURIComponent(m[1]) : null;
 }
 
 async function req(path: string, init: RequestInit = {}): Promise<any> {
@@ -53,19 +73,37 @@ async function req(path: string, init: RequestInit = {}): Promise<any> {
   // Only set Content-Type for JSON strings — omit it for FormData so the
   // browser can set the correct multipart boundary automatically.
   if (init.body && typeof init.body === 'string') headers['Content-Type'] = 'application/json';
-  const r = await fetch(path, { ...init, headers });
+  // For state-mutating methods, attach the CSRF token from the zb_csrf cookie.
+  const method = (init.method ?? 'GET').toUpperCase();
+  if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(method)) {
+    const csrf = csrfToken();
+    if (csrf) headers['x-csrf-token'] = csrf;
+  }
+  const r = await fetch(path, { ...init, headers, credentials: 'include' });
   if (!r.ok) {
     const err = await r.json().catch(() => null);
     throw new Error(err?.message ?? `HTTP ${r.status}`);
   }
+  // Some endpoints return 204 No Content (no body)
+  if (r.status === 204) return null;
   return r.json();
 }
 
 export async function login(email: string, password: string): Promise<void> {
-  const out = await req('/api/collections/users/auth-with-password', {
+  const r = await fetch('/api/collections/users/auth-with-password', {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
     body: JSON.stringify({ identity: email, password }),
   });
+  if (!r.ok) {
+    const err = await r.json().catch(() => null);
+    const msg = err?.message ?? `HTTP ${r.status}`;
+    // Surface the unverified case distinctly so the UI can switch to the verify step.
+    if (r.status === 403 && msg.includes('not verified')) throw new EmailNotVerifiedError(email);
+    throw new Error(msg);
+  }
+  const out = await r.json();
   if (typeof localStorage !== 'undefined') localStorage.setItem(TOKEN_KEY, out.token);
 }
 
@@ -74,7 +112,61 @@ export async function signup(email: string, password: string): Promise<void> {
     method: 'POST',
     body: JSON.stringify({ email, password, passwordConfirm: password }),
   });
-  await login(email, password);
+  // Immediately trigger the verification email. The server sends one automatically
+  // on creation; this is belt-and-suspenders to ensure the user gets it.
+  await requestVerification(email);
+  // Do NOT auto-login: require_verified will 403 until the user confirms their email.
+}
+
+// ---------------------------------------------------------------------------
+// Email verification helpers
+// ---------------------------------------------------------------------------
+
+/** Request a verification email for the given address (POST request-verification → 204). */
+export async function requestVerification(email: string): Promise<void> {
+  await req('/api/collections/users/request-verification', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  });
+}
+
+/** Confirm email verification with the token from the verification email (→ 200 {verified:true}). */
+export async function confirmVerification(token: string): Promise<void> {
+  await req('/api/collections/users/confirm-verification', {
+    method: 'POST',
+    body: JSON.stringify({ token }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// OTP passwordless login (existing, verified accounts only; auto_create = false)
+// ---------------------------------------------------------------------------
+
+/** Initiate OTP: sends a 6-digit code to the given email address (POST otp/initiate → 204).
+ *  With auto_create=false, unknown emails return a 4xx — catch this and show a generic
+ *  error prompting the user to sign up instead. */
+export async function otpInitiate(email: string): Promise<void> {
+  await req('/api/collections/users/auth/otp/initiate', {
+    method: 'POST',
+    body: JSON.stringify({ identity: email }),
+  });
+}
+
+/** Complete OTP: exchange the 6-digit code for a session token (POST otp/complete → 200 {token}).
+ *  Saves the token to localStorage on success; throws on bad/expired code. */
+export async function otpComplete(email: string, code: string): Promise<void> {
+  const r = await fetch('/api/collections/users/auth/otp/complete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ identity: email, code }),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => null);
+    throw new Error(err?.message ?? `HTTP ${r.status}`);
+  }
+  const out = await r.json();
+  if (typeof localStorage !== 'undefined') localStorage.setItem(TOKEN_KEY, out.token);
 }
 
 export async function listListings(): Promise<Listing[]> {
