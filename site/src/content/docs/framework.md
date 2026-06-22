@@ -778,6 +778,27 @@ syntax) or a malformed `date` field `.min`/`.max` bound in a comptime `.collecti
 literal is likewise a `@compileError` at build time — consistent with the rest of the
 comptime-validated surface.
 
+### Indexes
+
+A collection may declare `.indexes` — a tuple of index literals provisioned as
+`CREATE INDEX` statements when the collection is created:
+
+```zig
+.indexes = &.{
+    .{ .name = "idx_posts_status", .fields = &.{"status"} },
+    .{ .name = "idx_posts_slug",   .fields = &.{"slug"}, .unique = true },
+    // case-insensitive: emits ("email" COLLATE NOCASE)
+    .{ .name = "idx_users_email",  .fields = &.{"email"}, .unique = true, .collation = .nocase },
+    // partial / conditional-unique: emits ... WHERE deleted_at IS NULL
+    .{ .name = "idx_active_slug",  .fields = &.{"slug"}, .unique = true, .where = "deleted_at IS NULL" },
+}
+```
+
+`.collation` (`.binary` default / `.nocase`) is applied to every indexed column;
+`.where` is an optional partial-index predicate emitted verbatim as `WHERE <where>`.
+The index `.name` and `.fields` are validated as identifiers; the `.where` predicate
+is raw SQL authored in the schema.
+
 ### Startup provisioning + additive auto-migration
 
 On every startup, ZigBase diffs each declared collection against the live database and

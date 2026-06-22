@@ -446,7 +446,29 @@ test "injectAuthFields prepends the 5 auth fields for auth collections only" {
     try std.testing.expectEqual(@as(usize, 1), base_col.fields.len);
 }
 
-pub const Index = struct { name: []const u8, fields: []const []const u8, unique: bool = false };
+pub const Collation = enum {
+    binary,
+    nocase,
+
+    pub fn sqlSuffix(self: Collation) []const u8 {
+        return switch (self) {
+            .binary => "", // SQLite default; emit nothing to preserve existing DDL
+            .nocase => " COLLATE NOCASE",
+        };
+    }
+};
+
+pub const Index = struct {
+    name: []const u8,
+    fields: []const []const u8,
+    unique: bool = false,
+    /// Collation applied to every indexed column (`COLLATE NOCASE` for
+    /// case-insensitive lookups). `.binary` emits nothing.
+    collation: Collation = .binary,
+    /// Optional partial-index predicate emitted as `WHERE <where>`
+    /// (e.g. `"deleted_at IS NULL"`). Raw SQL authored in the schema.
+    where: ?[]const u8 = null,
+};
 
 pub const ValidationError = struct { field: []const u8, code: []const u8, message: []const u8 };
 
@@ -634,6 +656,9 @@ pub fn indexesToJson(alloc: std.mem.Allocator, idx: []const Index) ![]u8 {
         for (ix.fields) |fn_| try farr.append(jStr(fn_));
         try obj.put(alloc, "fields", .{ .array = farr });
         try obj.put(alloc, "unique", jBool(ix.unique));
+        if (ix.collation != .binary)
+            try obj.put(alloc, "collation", jStr(@tagName(ix.collation)));
+        if (ix.where) |w| try obj.put(alloc, "where", jStr(w));
         try arr.append(.{ .object = obj });
     }
     return std.json.Stringify.valueAlloc(alloc, Value{ .array = arr }, .{});
@@ -803,10 +828,17 @@ pub fn indexesFromJson(alloc: std.mem.Allocator, s: []const u8) ![]Index {
     const items = root.array.items;
     const out = try alloc.alloc(Index, items.len);
     for (items, 0..) |it, i| {
+        const collation: Collation = if (objGet(it, "collation")) |cv| blk: {
+            if (cv == .null) break :blk .binary;
+            if (cv != .string) return error.InvalidSchema;
+            break :blk std.meta.stringToEnum(Collation, cv.string) orelse return error.InvalidSchema;
+        } else .binary;
         out[i] = .{
             .name = (try getStr(alloc, it, "name")) orelse return error.InvalidSchema,
             .fields = (try getStrArray(alloc, it, "fields")) orelse &.{},
             .unique = getBool(it, "unique", false),
+            .collation = collation,
+            .where = try getStr(alloc, it, "where"),
         };
     }
     return out;
@@ -1007,6 +1039,26 @@ test "indexes round-trip" {
     try std.testing.expectEqual(@as(usize, 1), back.len);
     try std.testing.expectEqualStrings("idx_title", back[0].name);
     try std.testing.expect(back[0].unique);
+    // defaults: no collation, no partial predicate
+    try std.testing.expectEqual(Collation.binary, back[0].collation);
+    try std.testing.expect(back[0].where == null);
+}
+
+test "indexes round-trip collation and where predicate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const idx = [_]Index{
+        .{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase },
+        .{ .name = "idx_active", .fields = &.{"slug"}, .unique = true, .where = "deleted_at IS NULL" },
+    };
+    const s = try indexesToJson(a, &idx);
+    const back = try indexesFromJson(a, s);
+    try std.testing.expectEqual(@as(usize, 2), back.len);
+    try std.testing.expectEqual(Collation.nocase, back[0].collation);
+    try std.testing.expect(back[0].where == null);
+    try std.testing.expectEqual(Collation.binary, back[1].collation);
+    try std.testing.expectEqualStrings("deleted_at IS NULL", back[1].where.?);
 }
 
 test "collection options round-trip identity fields" {
