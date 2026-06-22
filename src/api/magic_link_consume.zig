@@ -137,8 +137,13 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
 
     const claims = (try auth_helpers.verifyLinkToken(ctx, w, col.name, token)) orelse
         return (ApiError.badRequest("Invalid or expired link.")).toResponse(ctx.allocator);
-    auth_helpers.consumeLinkToken(w, claims) catch
-        return (ApiError.badRequest("Link already used.")).toResponse(ctx.allocator);
+    // Only a genuine replay (the token's jti is already recorded) is a 400. Any
+    // other failure (DB prepare/step, I/O) must propagate to the 500 backstop
+    // rather than masquerading as "Link already used."
+    auth_helpers.consumeLinkToken(w, claims) catch |err| switch (err) {
+        error.AlreadyConsumed => return (ApiError.badRequest("Link already used.")).toResponse(ctx.allocator),
+        else => return err,
+    };
 
     // Optional verification gate: refuse to mint a session for an unverified
     // record when the collection requires it (parity with `complete`).

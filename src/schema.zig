@@ -1141,9 +1141,10 @@ test "AuthOptions.methods serializes + parses (magic_link ttl, password default)
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const allow = [_][]const u8{ "/club/", "/dashboard" };
     const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .methods = .{
         .password = .{},
-        .magic_link = .{ .ttl_s = 1200, .auto_create = true },
+        .magic_link = .{ .ttl_s = 1200, .auto_create = true, .redirect_default = "/club/welcome", .redirect_allow = &allow },
     } } } };
     const json = try optionsToJson(a, c, false);
     const back = try optionsFromJson(a, json);
@@ -1151,6 +1152,11 @@ test "AuthOptions.methods serializes + parses (magic_link ttl, password default)
     try std.testing.expect(back.auth.methods.magic_link != null);
     try std.testing.expectEqual(@as(i64, 1200), back.auth.methods.magic_link.?.ttl_s);
     try std.testing.expect(back.auth.methods.magic_link.?.auto_create);
+    // redirect_default + redirect_allow survive the JSON round-trip (key names + list handling).
+    try std.testing.expectEqualStrings("/club/welcome", back.auth.methods.magic_link.?.redirect_default);
+    try std.testing.expectEqual(@as(usize, 2), back.auth.methods.magic_link.?.redirect_allow.len);
+    try std.testing.expectEqualStrings("/club/", back.auth.methods.magic_link.?.redirect_allow[0]);
+    try std.testing.expectEqualStrings("/dashboard", back.auth.methods.magic_link.?.redirect_allow[1]);
 }
 
 test "AuthOptions.methods custom slugs round-trip" {
