@@ -66,6 +66,14 @@ pub const Config = struct {
     smtp_tls: SmtpTls = .auto, // transport security: none/starttls/implicit/auto
     smtp_insecure_skip_verify: bool = false, // true = skip cert verification (self-signed relays)
 
+    // Local-command mailer. When sendmail_command is non-empty it takes
+    // precedence over SMTP: the default mailer plugin resolves to CommandMailer,
+    // which pipes the RFC822 message to this command's stdin (exit 0 = sent).
+    // This is the "delegate delivery to a local MTA, hold no SMTP creds" setup.
+    // The string is whitespace-split into argv (e.g. "sendmail -t -i" or
+    // "msmtp -t"); the From: header still comes from smtp_from.
+    sendmail_command: []const u8 = "", // "" = off (use SMTP/Log); non-empty = CommandMailer
+
     // DEV-ONLY frozen clock (`ZIGBASE_FAKE_NOW`, an ISO-8601 UTC instant). Resolved to unix
     // seconds here so serveImpl can `clock.install` it. ALWAYS null on a production build —
     // `clock.resolveFromEnv` is comptime-gated off when the `dev_clock` build option is false,
@@ -119,6 +127,7 @@ pub const Config = struct {
         }
         if (getter.get("ZIGBASE_SMTP_INSECURE")) |v|
             cfg.smtp_insecure_skip_verify = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        if (getter.get("ZIGBASE_SENDMAIL_COMMAND")) |v| cfg.sendmail_command = v;
         // Dev-only frozen clock. resolveFromEnv is comptime-gated off on a prod build, so this
         // is always null there regardless of the env var.
         cfg.fake_now_unix = clock.resolveFromEnv(getter.get(clock.env_var));

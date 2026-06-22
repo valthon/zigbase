@@ -63,18 +63,33 @@ pub const DefaultStoragePlugin = struct {
     }
 };
 
-/// Default mailer plugin: `LogMailer` when `cfg.smtp_host` is empty (logs the
-/// email — pre-mailer dev/CI behavior), else an `SmtpMailer` built from the SMTP
-/// config. Switching is purely config-driven; no code change is needed to upgrade.
+/// Default mailer plugin, config-driven with a fixed precedence and no code
+/// change to switch between backends:
+///   1. `cfg.sendmail_command` non-empty → `CommandMailer` (pipe to a local MTA).
+///   2. else `cfg.smtp_host` non-empty   → `SmtpMailer` (direct SMTP/TLS).
+///   3. else                             → `LogMailer` (logs; dev/CI default).
 pub const DefaultMailerPlugin = struct {
     log_backend: mail.LogMailer = .{},
     smtp_backend: ?mail.SmtpMailer = null,
+    command_backend: ?mail.CommandMailer = null,
+    /// Owned argv parsed from `cfg.sendmail_command`; freed in `deinit`.
+    command_argv: ?[][]const u8 = null,
+    gpa: std.mem.Allocator = undefined,
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !DefaultMailerPlugin {
-        _ = gpa;
         _ = io;
-        if (cfg.smtp_host.len == 0) return .{};
-        return .{ .smtp_backend = mail.SmtpMailer.initTls(
+        if (cfg.sendmail_command.len > 0) {
+            const argv = try parseCommand(gpa, cfg.sendmail_command);
+            errdefer gpa.free(argv);
+            if (argv.len == 0) return error.EmptySendmailCommand;
+            return .{
+                .gpa = gpa,
+                .command_argv = argv,
+                .command_backend = mail.CommandMailer.init(argv, cfg.smtp_from),
+            };
+        }
+        if (cfg.smtp_host.len == 0) return .{ .gpa = gpa };
+        return .{ .gpa = gpa, .smtp_backend = mail.SmtpMailer.initTls(
             cfg.smtp_host,
             cfg.smtp_port,
             cfg.smtp_username,
@@ -86,12 +101,26 @@ pub const DefaultMailerPlugin = struct {
     }
 
     pub fn interface(self: *DefaultMailerPlugin) mail.Mailer {
+        if (self.command_backend) |*c| return c.mailer();
         if (self.smtp_backend) |*s| return s.mailer();
         return self.log_backend.mailer();
     }
 
     pub fn deinit(self: *DefaultMailerPlugin) void {
-        _ = self;
+        if (self.command_argv) |argv| self.gpa.free(argv);
+    }
+
+    /// Split a command string into argv on ASCII whitespace runs (no quoting —
+    /// argv elements with embedded spaces aren't expressible this way; a consumer
+    /// needing that supplies a `CommandMailer` directly via `.mailer = T`). The
+    /// returned slice borrows `cmd`'s bytes (which live in the config), so only
+    /// the outer slice is heap-allocated.
+    fn parseCommand(gpa: std.mem.Allocator, cmd: []const u8) ![][]const u8 {
+        var parts: std.ArrayList([]const u8) = .empty;
+        defer parts.deinit(gpa);
+        var it = std.mem.tokenizeAny(u8, cmd, " \t\r\n");
+        while (it.next()) |tok| try parts.append(gpa, tok);
+        return parts.toOwnedSlice(gpa);
     }
 };
 
@@ -924,6 +953,42 @@ test "App(.{}) resolves the default storage + mailer plugins and reader pool" {
     try std.testing.expectEqual(DefaultStoragePlugin, A.StoragePlugin);
     try std.testing.expectEqual(DefaultMailerPlugin, A.MailerPlugin);
     try std.testing.expectEqual(@as(usize, 16), A.reader_pool_size);
+}
+
+test "DefaultMailerPlugin selects Command > SMTP > Log by config" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Default config → LogMailer (no SMTP host, no sendmail command).
+    {
+        var p = try DefaultMailerPlugin.create(a, io, .{});
+        defer p.deinit();
+        try std.testing.expect(p.command_backend == null);
+        try std.testing.expect(p.smtp_backend == null);
+    }
+    // SMTP host set, no sendmail command → SmtpMailer.
+    {
+        var p = try DefaultMailerPlugin.create(a, io, .{ .smtp_host = "smtp.example.com" });
+        defer p.deinit();
+        try std.testing.expect(p.command_backend == null);
+        try std.testing.expect(p.smtp_backend != null);
+    }
+    // sendmail command wins even when SMTP is also configured; argv is split on
+    // whitespace and From: defaults from smtp_from.
+    {
+        var p = try DefaultMailerPlugin.create(a, io, .{
+            .smtp_host = "smtp.example.com",
+            .sendmail_command = "  msmtp   -t ",
+            .smtp_from = "ops@zigbase.dev",
+        });
+        defer p.deinit();
+        try std.testing.expect(p.smtp_backend == null);
+        const c = p.command_backend.?;
+        try std.testing.expectEqual(@as(usize, 2), c.argv.len);
+        try std.testing.expectEqualStrings("msmtp", c.argv[0]);
+        try std.testing.expectEqualStrings("-t", c.argv[1]);
+        try std.testing.expectEqualStrings("ops@zigbase.dev", c.from);
+    }
 }
 
 test "App(cfg) carries comptime pool-size levers (readers + jobs)" {

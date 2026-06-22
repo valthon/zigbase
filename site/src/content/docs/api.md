@@ -372,7 +372,10 @@ exists). The matching `confirm-*` endpoint takes that `token` in its body.
 - **With SMTP configured** (`ZIGBASE_SMTP_HOST` + friends — see the
   [Configuration table](./configuration#environment-variables)), the token is **emailed**
   over the configured transport (`none` / `starttls` / `implicit` / `auto`).
-- **Without SMTP** (the default), the token is **logged to the server** instead — a dev/CI
+- **With a local MTA** (`ZIGBASE_SENDMAIL_COMMAND`, e.g. `sendmail -t -i` / `msmtp -t`), the
+  message is piped to that command instead — the app holds no SMTP credentials. This takes
+  precedence over `ZIGBASE_SMTP_HOST`.
+- **Without either** (the default), the token is **logged to the server** instead — a dev/CI
   convenience. To complete a flow locally, read the token from the log and POST it to the
   matching `confirm-*` endpoint.
 
@@ -381,7 +384,7 @@ random `jti` that is recorded on first redemption, so a second `confirm-*` with 
 token is rejected with `400` (independent of the token's TTL). The reset path validates the
 new password *before* consuming the token, so a too-short password does not burn it.
 
-Configure SMTP for production; see [Known limitations](./known-limitations).
+Configure SMTP or a local MTA command for production; see [Known limitations](./known-limitations).
 
 ### Auth method endpoints (pluggable auth)
 

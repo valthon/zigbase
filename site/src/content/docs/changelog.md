@@ -15,8 +15,8 @@ All notable changes to ZigBase are documented here. The format is based on
 
 ### Added
 
+- **`CommandMailer` (local-command / sendmail mailer)** — a built-in mailer that pipes the serialized RFC822 message to a local MTA's stdin (e.g. `sendmail -t -i` or `msmtp -t`) and treats exit 0 as success. The standard "delegate delivery to a local relay, hold no SMTP credentials in the app" setup. Selected via the new `ZIGBASE_SENDMAIL_COMMAND` env var (whitespace-split into argv; `From:` from `ZIGBASE_SMTP_FROM`), which takes precedence over SMTP in `DefaultMailerPlugin`. Re-exported as `zigbase.CommandMailer`.
 - **Dev-only injectable test clock (`ZIGBASE_FAKE_NOW`)** — freeze the framework's "now" to an ISO-8601 UTC instant (e.g. `2029-03-07T16:00:00Z`) so time-boundary scenarios (token expiry, scheduling, challenge/cursor TTLs) are deterministic in e2e suites. Every framework-controlled timestamp routes through one clock seam (`src/clock.zig`) that honors the override. **Gated off in production:** compiled in only on a `dev_clock` build (on in `Debug`, off in any release build / shipped binary), so a production binary never reads the env var and time can never be frozen. Scope and the production gate are documented in [Known limitations → Testing](./known-limitations). Closes #58.
-
 ## [0.5.0] - 2026-06-21
 
 ### Removed

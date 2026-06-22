@@ -273,6 +273,93 @@ pub const SmtpMailer = struct {
     }
 };
 
+/// Local-command backend: pipes the serialized RFC822 message to a child
+/// process's stdin (e.g. `sendmail -t -i` or `msmtp -t`) and treats exit 0 as
+/// success. This is the standard setup for apps that delegate delivery to a
+/// local MTA/relay and hold NO SMTP credentials in the app itself.
+///
+/// `argv` is the command to spawn; `argv[0]` is resolved via the parent's PATH
+/// when it has no '/'. The default (`default_argv`) is `sendmail -t -i`, which
+/// reads the recipient(s) from the message's `To:`/`Cc:`/`Bcc:` headers (`-t`)
+/// and does not treat a lone `.` line as end-of-input (`-i`). `msmtp -t` accepts
+/// the same flags. The message bytes are exactly what `buildMessage` produces
+/// (the same header set the SMTP backend sends), so header-injection is rejected
+/// there before a single byte reaches the child.
+///
+/// Spawn (stdin=pipe) -> write message -> close stdin (child sees EOF) -> wait ->
+/// require `Term{ .exited = 0 }`. Any non-zero exit, a signal, or a spawn/IO
+/// failure surfaces as an error so the caller can react (the SMTP/Log backends
+/// likewise return `anyerror!void`).
+pub const CommandMailer = struct {
+    argv: []const []const u8 = default_argv,
+    from: []const u8 = "noreply@zigbase.dev",
+
+    /// The recipient is carried in the message headers, so `-t` tells the MTA to
+    /// extract it; `-i` keeps a lone `.` line from terminating the body.
+    pub const default_argv: []const []const u8 = &.{ "sendmail", "-t", "-i" };
+
+    pub fn init(argv: []const []const u8, from: []const u8) CommandMailer {
+        return .{ .argv = argv, .from = from };
+    }
+
+    pub fn mailer(self: *CommandMailer) Mailer {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = Mailer.VTable{ .send = send };
+
+    pub const CommandError = error{ EmptyArgv, MailCommandFailed };
+
+    fn send(ptr: *anyopaque, io: std.Io, alloc: std.mem.Allocator, email: Email) anyerror!void {
+        const self: *CommandMailer = @ptrCast(@alignCast(ptr));
+        if (self.argv.len == 0) return error.EmptyArgv;
+
+        // buildMessage validates from/to/subject against header injection, so the
+        // bytes handed to the child are always a well-formed RFC822 message.
+        const now_s = std.Io.Clock.real.now(io).toSeconds();
+        const msg = try buildMessage(alloc, self.from, email, now_s);
+        defer alloc.free(msg);
+
+        // Spawn → write stdin → wait, all inside a block so the `errdefer kill`
+        // is scoped to the spawned-but-not-yet-reaped window. `wait` reaps the
+        // child and releases its PID; once it returns the block exits normally
+        // and the errdefer is disarmed — so a later non-zero-exit error never
+        // signals an already-reaped (possibly PID-recycled) process.
+        const term = blk: {
+            // stdin is a pipe we feed the message to; stdout/stderr are inherited
+            // so an MTA's diagnostics land in the server log alongside our own.
+            var child = try std.process.spawn(io, .{
+                .argv = self.argv,
+                .stdin = .pipe,
+                .stdout = .inherit,
+                .stderr = .inherit,
+            });
+            // If writing stdin or waiting fails, reap the child so we don't leak it.
+            errdefer child.kill(io);
+
+            // Write the full message, then close stdin so the child reads EOF. The
+            // close must happen before `wait`, or a child that drains all of stdin
+            // (sendmail/msmtp do) would block forever waiting for more input.
+            const stdin = child.stdin.?;
+            try stdin.writeStreamingAll(io, msg);
+            stdin.close(io);
+            child.stdin = null;
+
+            break :blk try child.wait(io);
+        };
+
+        // Exit 0 is success. A non-zero exit (or a signal/abnormal termination)
+        // becomes an error so the caller surfaces it (e.g. to Sentry / the
+        // framework's onError) rather than us swallowing it here; this mirrors
+        // SmtpMailer, which likewise returns errors without logging. The child is
+        // already reaped at this point, so we must NOT kill here.
+        switch (term) {
+            .exited => |code| if (code != 0) return error.MailCommandFailed,
+            else => return error.MailCommandFailed,
+        }
+    }
+};
+
 /// Owns the TLS client + the buffers it borrows and (optionally) the CA bundle.
 /// `std.crypto.tls.Client` keeps pointers into `read_buffer`/`write_buffer`, so
 /// they must outlive the client — hence heap-allocated and freed in `deinit`.
@@ -510,6 +597,75 @@ test "SmtpMailer.initTls records explicit mode + insecure flag" {
     const m = SmtpMailer.initTls("smtp.example.com", 465, "u", "p", "from@example.com", .implicit, true);
     try std.testing.expectEqual(SmtpTls.implicit, m.tls);
     try std.testing.expectEqual(true, m.insecure_skip_verify);
+}
+
+test "CommandMailer pipes the serialized message to the child and accepts exit 0" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Capture the child's stdin to a temp file so we can assert the exact bytes
+    // the mailer piped, then read them back. `sh -c 'cat > FILE'` exits 0. The
+    // child inherits this process's cwd, so a cwd-relative path lines up between
+    // the shell redirect and the `std.Io.Dir.cwd()` readback.
+    const cwd = std.Io.Dir.cwd();
+    var rand_bytes: [8]u8 = undefined;
+    io.random(&rand_bytes);
+    var name_buf: [64]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&name_buf, "zb-cmdmailer-{x}.eml", .{std.mem.readInt(u64, &rand_bytes, .little)});
+    defer cwd.deleteFile(io, rel) catch {};
+    const script = try std.fmt.allocPrint(a, "cat > '{s}'", .{rel});
+    defer a.free(script);
+
+    var cm = CommandMailer.init(&.{ "/bin/sh", "-c", script }, "noreply@zigbase.dev");
+    const m = cm.mailer();
+    try m.send(io, a, .{
+        .to = "user@example.com",
+        .subject = "Verify your email",
+        .text_body = "Your token: abc123",
+    });
+
+    const captured = try cwd.readFileAlloc(io, rel, a, .limited(64 * 1024));
+    defer a.free(captured);
+    try std.testing.expect(std.mem.startsWith(u8, captured, "From: noreply@zigbase.dev\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, captured, "\r\nTo: user@example.com\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "\r\nSubject: Verify your email\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, captured, "\r\n\r\nYour token: abc123"));
+}
+
+test "CommandMailer surfaces a non-zero child exit as an error" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // `sh -c 'exit 7'` consumes nothing and fails; send must not report success.
+    var cm = CommandMailer.init(&.{ "/bin/sh", "-c", "exit 7" }, "noreply@zigbase.dev");
+    const m = cm.mailer();
+    try std.testing.expectError(error.MailCommandFailed, m.send(std.testing.io, a, .{
+        .to = "user@example.com",
+        .subject = "Hi",
+        .text_body = "body",
+    }));
+}
+
+test "CommandMailer rejects header injection before spawning" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // A CRLF in `to` is caught by buildMessage; argv points at a missing binary
+    // so a spawn would error too, but the injection check fires first.
+    var cm = CommandMailer.init(&.{"/nonexistent/sendmail"}, "noreply@zigbase.dev");
+    const m = cm.mailer();
+    try std.testing.expectError(error.HeaderInjection, m.send(std.testing.io, a, .{
+        .to = "victim@x.io\r\nBcc: spam@evil.com",
+        .subject = "Hi",
+        .text_body = "body",
+    }));
+}
+
+test "CommandMailer.init defaults to sendmail -t -i argv" {
+    const cm = CommandMailer{};
+    try std.testing.expectEqual(@as(usize, 3), cm.argv.len);
+    try std.testing.expectEqualStrings("sendmail", cm.argv[0]);
+    try std.testing.expectEqualStrings("-t", cm.argv[1]);
+    try std.testing.expectEqualStrings("-i", cm.argv[2]);
 }
 
 test "base64 AUTH LOGIN encoding matches expected" {
