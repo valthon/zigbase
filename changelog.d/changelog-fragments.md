@@ -1,2 +1,0 @@
-### Internal
-- **Changelog-fragments workflow** — changes now add a `changelog.d/<slug>.md` fragment (with one or more `### <Section>` headings) instead of editing `CHANGELOG.md`, so parallel PRs never conflict on the shared changelog. `scripts/assemble-changelog.sh` aggregates the fragments per section into a new version block in `CHANGELOG.md` (and its `site/` mirror) at release time (run from `scripts/release.sh`) and deletes them. See [`changelog.d/README.md`](changelog.d/README.md).
