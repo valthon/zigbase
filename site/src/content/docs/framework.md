@@ -424,6 +424,62 @@ const res2 = try client.post("https://webhook.example.com/notify", .{
 });
 ```
 
+### Test-mode capture — assert sent mail + mock outbound HTTP (`zigbase.testcapture`)
+
+For deterministic e2e/integration tests, the framework can capture what it *sent* — an
+in-memory mail **outbox** and a record of every outbound `ctx.http()` call — and inject
+**canned HTTP responses** instead of hitting the network. It mirrors the determinism seam
+(`ZIGBASE_FAKE_NOW`) and shares the **same comptime gate**: it is compiled in only on a
+`dev_clock` build (on in `Debug`, off in any release build), so a production binary is
+byte-for-byte unaffected — `zigbase.testcapture.enabled` is `comptime false` there, the
+seams fold away, and there is no runtime branch or perf cost. Every API below is a no-op /
+returns empty when the gate is off.
+
+**Mail outbox.** `Mailer.send` (the single seam every backend — Log/SMTP/Command/your own
+plugin — routes through) records each email when capture is on:
+
+```zig
+const tc = zigbase.testcapture;
+tc.mail.enable(true);     // capture + SUPPRESS real delivery (deterministic e2e mode)
+defer tc.mail.reset();    // clear + free
+
+// ... trigger a flow that sends mail (signup verification, password reset, your route) ...
+
+try expectEqual(@as(usize, 1), tc.mail.count());
+const e = tc.mail.get(0).?;               // { from, to, subject, body }
+try expectEqualStrings("user@example.com", e.to);
+try expect(tc.mail.find("Verify") != null);
+```
+
+`mail.enable(suppress)`: `suppress = true` records and skips real delivery; `false` records
+**and** still delivers (assert against a live MailHog/log run). `from` is the backend's
+configured sender (empty for `LogMailer`, which has none).
+
+**HTTP capture / mock.** `HttpClient.request` (what `ctx.http()` returns) consults the
+capture before touching the network — recording the request and, if a mock matches the URL
+substring, returning the canned response with **no network at all**:
+
+```zig
+tc.http.enable(true);     // capture; block_unmocked=true → un-mocked URLs error (no network)
+defer tc.http.reset();
+tc.http.mock("api.stripe.com", .{
+    .status = 200,
+    .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    .body = "{\"id\":\"ch_123\",\"paid\":true}",
+});
+
+// ... trigger a route/hook that calls ctx.http().post("https://api.stripe.com/...") ...
+
+try expectEqual(@as(usize, 1), tc.http.requestCount());
+const rq = tc.http.requestAt(0).?;        // { method, url, headers, body }
+try expectEqual(zigbase.HttpMethod.POST, rq.method);
+```
+
+`http.enable(block_unmocked)`: with `block_unmocked = true` (recommended) a request to an
+un-mocked URL fails with `error.TransportFailed` rather than silently hitting the network;
+`false` lets un-mocked URLs pass through to the real network. Mocked responses are matched
+newest-registration-first on URL substring.
+
 ### Error helpers (`ctx.fail`, `ctx.invalid`, `ctx.errorResponse`)
 
 For untyped route handlers, use the Ctx helpers to produce standard error responses

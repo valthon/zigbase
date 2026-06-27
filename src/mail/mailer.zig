@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("../config.zig");
+const testcapture = @import("../testcapture.zig");
 const SmtpTls = config.SmtpTls;
 
 /// A single outbound email. Text-only for now (no `html_body`) to keep the
@@ -22,12 +23,24 @@ pub const Email = struct {
 pub const Mailer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// The backend's configured sender address, surfaced purely so the dev-only test
+    /// outbox can capture `from` (the `Email` itself carries no `from`). Additive with a
+    /// `""` default: existing consumer plugins compile unchanged, and `LogMailer` — which
+    /// has no sender — leaves it empty. Not used on the delivery path.
+    from: []const u8 = "",
 
     pub const VTable = struct {
         send: *const fn (ptr: *anyopaque, io: std.Io, alloc: std.mem.Allocator, email: Email) anyerror!void,
     };
 
     pub fn send(self: Mailer, io: std.Io, alloc: std.mem.Allocator, email: Email) anyerror!void {
+        // Dev-only outbox capture (#96). Comptime-dead on a prod build, so no runtime
+        // branch and no perf cost there; `Mailer.send` is the single seam every backend
+        // (Log/SMTP/Command/consumer plugin) routes through.
+        if (testcapture.enabled) {
+            testcapture.mail.record(self.from, email.to, email.subject, email.text_body);
+            if (testcapture.mail.suppressed()) return; // capture-only: skip real delivery
+        }
         return self.vtable.send(self.ptr, io, alloc, email);
     }
 };
@@ -102,7 +115,7 @@ pub const SmtpMailer = struct {
     }
 
     pub fn mailer(self: *SmtpMailer) Mailer {
-        return .{ .ptr = self, .vtable = &vtable };
+        return .{ .ptr = self, .vtable = &vtable, .from = self.from };
     }
 
     const vtable = Mailer.VTable{ .send = send };
@@ -303,7 +316,7 @@ pub const CommandMailer = struct {
     }
 
     pub fn mailer(self: *CommandMailer) Mailer {
-        return .{ .ptr = self, .vtable = &vtable };
+        return .{ .ptr = self, .vtable = &vtable, .from = self.from };
     }
 
     const vtable = Mailer.VTable{ .send = send };

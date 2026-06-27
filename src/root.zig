@@ -65,6 +65,13 @@ pub const HttpResponse = @import("http_client.zig").HttpResponse;
 pub const HttpRequestOptions = @import("http_client.zig").RequestOptions;
 pub const HttpPostOptions = @import("http_client.zig").PostOptions;
 
+// ---- Dev-only test-mode capture (#96) -------------------------------------
+// Assert what the framework SENT in e2e/integration tests: an in-memory mail outbox
+// (`testcapture.mail`) and outbound `ctx.http()` capture + canned-response mocking
+// (`testcapture.http`). Gated by the same comptime flag as the test clock — compiled out
+// of any release build (`testcapture.enabled == false`), so production is unaffected.
+pub const testcapture = @import("testcapture.zig");
+
 // ---- Auth helper surface (consumer-facing magic-link building blocks) ------
 pub const auth = @import("auth_helpers.zig");
 
@@ -205,4 +212,5 @@ test {
     _ = @import("ctx.zig");
     _ = @import("session.zig");
     _ = @import("http_client.zig");
+    _ = @import("testcapture.zig");
 }
