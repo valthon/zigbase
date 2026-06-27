@@ -503,14 +503,23 @@ test "coerce: non-object data is returned as-is" {
 }
 
 pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value) RecordError!std.json.Value {
-    return createImpl(alloc, io, w, col, data, null);
+    return createInTxn(alloc, io, w, col, data);
 }
 
 pub fn createGuarded(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value, guard: Guard) RecordError!std.json.Value {
-    return createImpl(alloc, io, w, col, data, guard);
+    try w.begin();
+    errdefer w.rollback() catch {};
+    const rec = try createInTxn(alloc, io, w, col, data);
+    const rid = rec.object.get("id").?.string;
+    if (!try guardPasses(alloc, w, col, rid, guard)) return error.Forbidden;
+    try w.commit();
+    return rec;
 }
 
-fn createImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value, guard: ?Guard) RecordError!std.json.Value {
+/// Insert a record on `w` WITHOUT opening a transaction. The caller must already
+/// be inside one (or accept autocommit). Applies the same column/JSON handling as
+/// the former createImpl but performs no begin/commit/guard.
+pub fn createInTxn(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value) RecordError!std.json.Value {
     last_errors = null;
     if (data != .object) return error.NotObject;
     var errs: std.ArrayList(schema.ValidationError) = .empty;
@@ -555,11 +564,6 @@ fn createImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Colle
     const rcols = try columnList(alloc, col);
     var gen_id = id_gen.collectionId(io);
 
-    if (guard != null) try w.begin();
-    errdefer if (guard != null) {
-        w.rollback() catch {};
-    };
-
     const sql = try std.fmt.allocPrintSentinel(alloc, "INSERT INTO \"{s}\" ({s}) VALUES ({s}) RETURNING {s};", .{ col.name, cols.items, vals.items, rcols }, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
@@ -574,12 +578,6 @@ fn createImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Colle
     if (!try st.step()) return error.NotFound;
     const rec = try rowToObject(alloc, &st, col);
     while (try st.step()) {} // drain to DONE so the statement isn't active at commit time
-    if (guard) |g| {
-        if (!try guardPasses(alloc, w, col, &gen_id, g)) {
-            return error.Forbidden;
-        }
-        try w.commit();
-    }
     return rec;
 }
 
@@ -890,14 +888,24 @@ test "update enforces the same constraints" {
 }
 
 pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
-    return updateImpl(alloc, w, col, id, data, null);
+    return updateInTxn(alloc, w, col, id, data);
 }
 
 pub fn updateGuarded(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value, guard: Guard) RecordError!?std.json.Value {
-    return updateImpl(alloc, w, col, id, data, guard);
+    try w.begin();
+    errdefer w.rollback() catch {};
+    const rec = try updateInTxn(alloc, w, col, id, data) orelse {
+        w.rollback() catch {};
+        return null;
+    };
+    if (!try guardPasses(alloc, w, col, id, guard)) return error.Forbidden;
+    try w.commit();
+    return rec;
 }
 
-fn updateImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value, guard: ?Guard) RecordError!?std.json.Value {
+/// Update a record on `w` WITHOUT opening a transaction. The caller must already
+/// be inside one (or accept autocommit). Returns null if the row does not exist.
+pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
     last_errors = null;
     if (data != .object) return error.NotObject;
     var errs: std.ArrayList(schema.ValidationError) = .empty;
@@ -924,11 +932,6 @@ fn updateImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
 
     const rcols = try columnList(alloc, col);
 
-    if (guard != null) try w.begin();
-    errdefer if (guard != null) {
-        w.rollback() catch {};
-    };
-
     const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ col.name, sets.items, rcols }, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
@@ -940,22 +943,32 @@ fn updateImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
             return error.Validation;
         };
     }
-    if (!try st.step()) {
-        if (guard != null) w.rollback() catch {};
-        return null;
-    }
+    if (!try st.step()) return null;
     const rec = try rowToObject(alloc, &st, col);
     while (try st.step()) {} // drain to DONE so the statement isn't active at commit time
-    if (guard) |g| {
-        if (!try guardPasses(alloc, w, col, id, g)) {
-            return error.Forbidden;
-        }
-        try w.commit();
-    }
     return rec;
 }
 
 pub fn delete(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
+    return deleteInTxn(alloc, w, col, id);
+}
+
+pub fn deleteGuarded(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, guard: Guard) RecordError!bool {
+    try w.begin();
+    errdefer w.rollback() catch {};
+    if (!try guardPasses(alloc, w, col, id, guard)) return error.Forbidden;
+    const found = try deleteInTxn(alloc, w, col, id);
+    if (!found) {
+        w.rollback() catch {};
+        return false;
+    }
+    try w.commit();
+    return true;
+}
+
+/// Delete a record on `w` WITHOUT opening a transaction. The caller must already
+/// be inside one (or accept autocommit). Returns true if a row was deleted.
+pub fn deleteInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
     const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"id\"=?1 RETURNING \"id\";", .{col.name}, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
@@ -1058,6 +1071,27 @@ test "delete removes the row; 404 on missing" {
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','x',1);");
     try std.testing.expect(try delete(a, &d, col, "r1"));
     try std.testing.expect(!try delete(a, &d, col, "r1"));
+}
+
+test "createInTxn inserts without opening its own transaction" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("PRAGMA foreign_keys=ON;");
+    try migrations.run(&conn);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } }};
+    const col = try collections.create(a, io, &conn, .{ .id = "", .name = "posts", .fields = &fields });
+
+    // Caller owns the transaction; createInTxn must participate, not nest.
+    try conn.beginImmediate();
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "title", .{ .string = "x" });
+    const rec = try createInTxn(a, io, &conn, col, .{ .object = o });
+    try conn.rollback(); // caller rolls back -> row must be gone
+    try std.testing.expect((try get(a, &conn, col, rec.object.get("id").?.string)) == null);
 }
 
 pub const ListMode = enum { offset, cursor };
