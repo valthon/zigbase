@@ -14,6 +14,7 @@ const rules = @import("../rules.zig");
 const request = @import("../request.zig");
 const Ctx = @import("../ctx.zig").Ctx;
 const auth = @import("../auth.zig");
+const api_auth = @import("auth.zig");
 const realtime_ws = @import("../realtime/ws.zig");
 const file_plan = @import("../files/plan.zig");
 const events = @import("../events.zig");
@@ -229,6 +230,15 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return hookRejected(ctx);
     };
+    // #98: auth-collection registration hook. Fires INSIDE the create transaction, after the
+    // generic before_create hook and before the INSERT. An abort rolls back the whole create
+    // (fail closed) and returns the Ctx-mapped response. `data_mut` is the writable record.
+    if (col.type == .auth) {
+        if (try api_auth.fireAuthLifecycleBefore(ctx, w, col.name, "", .before_register, &data_mut, null)) |resp| {
+            w.rollback() catch {};
+            return resp;
+        }
+    }
     // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
     // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
     const rec = records.createInTxn(ctx.allocator, app.io, w, col, data_mut) catch |e| switch (e) {
@@ -264,6 +274,10 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     emitFileUploads(app, &rctx, col.name, rid, all.writes);
     var rec_mut = rec;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &rec_mut, .after_create) catch {};
+    // #98: auth-collection registration after-hook (post-commit, notify-only). `rec_mut` is
+    // the persisted account (id populated); it also seeds the hook's `ctx.user()` identity.
+    if (col.type == .auth)
+        api_auth.emitAuthLifecycle(ctx, w, col.name, rid, .after_register, &rec_mut, rec_mut);
     realtime_ws.broadcast(app, col, .create, rid, rec_mut);
     return jsonResponse(ctx, 201, rec_mut);
 }
@@ -894,6 +908,113 @@ test "creating an auth record hashes the password, hides secrets, forces verifie
     try std.testing.expect(std.mem.indexOf(u8, res.body, "tokenKey") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "password") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"verified\":false") != null);
+}
+
+// ---------------------------------------------------------------------------
+// #98 — register lifecycle hooks (beforeRegister / afterRegister)
+// ---------------------------------------------------------------------------
+
+test "#98 register: beforeRegister mutates the account; afterRegister sees it persisted" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedAuth(env, "regusers", "@public");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Hook = struct {
+        var before_seen: usize = 0;
+        var after_seen: usize = 0;
+        var after_rid: []const u8 = "";
+        var after_col: []const u8 = "";
+        var before_id_empty = false;
+        fn before(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
+            before_seen += 1;
+            before_id_empty = ev.record_id.len == 0; // no id yet at before_register
+            if (ev.record) |r| try r.object.put(ctx.arena, "bio", .{ .string = "seeded" });
+        }
+        fn after(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
+            _ = ctx;
+            after_seen += 1;
+            after_rid = ev.record_id;
+            after_col = ev.collection;
+        }
+    };
+    Hook.before_seen = 0;
+    Hook.after_seen = 0;
+    var disp = events.Dispatch{ .auth_lifecycle = events.buildAuthLifecycleDispatcher(.{
+        .beforeRegister = Hook.before,
+        .afterRegister = Hook.after,
+    }) };
+    env.app.dispatch = &disp;
+    defer env.app.dispatch = null;
+
+    const p = [_]http.Param{.{ .key = "col", .value = "regusers" }};
+    var cctx = ctxFor(env, a, .POST, "{\"email\":\"r@x.io\",\"password\":\"longenough\"}", &p);
+    const res = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 201), res.status);
+    try std.testing.expectEqual(@as(usize, 1), Hook.before_seen);
+    try std.testing.expectEqual(@as(usize, 1), Hook.after_seen);
+    try std.testing.expect(Hook.before_id_empty);
+    try std.testing.expect(Hook.after_rid.len > 0);
+    try std.testing.expectEqualStrings("regusers", Hook.after_col);
+    // The beforeRegister mutation persisted (the INSERT used the mutated data).
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"bio\":\"seeded\"") != null);
+    try std.testing.expectEqual(@as(i64, 1), try countRows(env, "regusers"));
+}
+
+test "#98 register: an aborting beforeRegister blocks the account (fail closed)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedAuth(env, "regblock", "@public");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Hook = struct {
+        fn abort(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
+            _ = ev;
+            return ctx.fail(403, "registration closed");
+        }
+    };
+    var disp = events.Dispatch{ .auth_lifecycle = events.buildAuthLifecycleDispatcher(.{ .beforeRegister = Hook.abort }) };
+    env.app.dispatch = &disp;
+    defer env.app.dispatch = null;
+
+    const p = [_]http.Param{.{ .key = "col", .value = "regblock" }};
+    var cctx = ctxFor(env, a, .POST, "{\"email\":\"blocked@x.io\",\"password\":\"longenough\"}", &p);
+    const res = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 403), res.status);
+    // Fail closed: no account row was created.
+    try std.testing.expectEqual(@as(i64, 0), try countRows(env, "regblock"));
+}
+
+test "#98 register: lifecycle hook does NOT fire for a non-auth collection create" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    // TestEnv.init seeds a base "posts" collection (createRule @public).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Hook = struct {
+        var seen: usize = 0;
+        fn before(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
+            _ = ctx;
+            _ = ev;
+            seen += 1;
+        }
+    };
+    Hook.seen = 0;
+    var disp = events.Dispatch{ .auth_lifecycle = events.buildAuthLifecycleDispatcher(.{ .beforeRegister = Hook.before }) };
+    env.app.dispatch = &disp;
+    defer env.app.dispatch = null;
+
+    const p = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &p);
+    const res = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 201), res.status);
+    try std.testing.expectEqual(@as(usize, 0), Hook.seen);
 }
 
 // ---------------------------------------------------------------------------
