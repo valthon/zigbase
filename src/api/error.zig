@@ -28,6 +28,12 @@ pub const ApiError = struct {
     pub fn validation(fields: []const FieldError) ApiError {
         return .{ .status = 400, .message = "Failed to validate the request.", .fields = fields };
     }
+    pub fn forbidden() ApiError {
+        return .{ .status = 403, .message = "Forbidden." };
+    }
+    pub fn unauthorized() ApiError {
+        return .{ .status = 401, .message = "Unauthorized." };
+    }
 
     pub fn renderBody(self: ApiError, alloc: std.mem.Allocator) ![]u8 {
         // Build the ObjectMap tree in a temporary arena; serialize into `alloc`.

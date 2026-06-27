@@ -10,6 +10,8 @@ const collections = @import("collections.zig");
 const schema = @import("schema.zig");
 const expand_mod = @import("query/expand.zig");
 const http_client = @import("http_client.zig");
+const error_mod = @import("api/error.zig");
+const http_mod = @import("http.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -20,6 +22,8 @@ pub const Ctx = struct {
     bound_conn: ?*db.Db = null,
     /// Lazily checked-out reader, cached for the Ctx lifetime (route/job context only).
     reader: ?events.ReaderData = null,
+    /// Stashed error from ctx.fail/ctx.invalid; consumed by errorResponse(error.Handled).
+    handled: ?error_mod.ApiError = null,
 
     /// A connection suitable for reads. Bound conn wins; else lazily check out + cache a reader.
     pub fn connForRead(self: *Ctx) !*db.Db {
@@ -46,6 +50,37 @@ pub const Ctx = struct {
     /// Returns an outbound HTTP client bound to this Ctx's arena and the app's io.
     pub fn http(self: *Ctx) http_client.HttpClient {
         return .{ .alloc = self.arena, .io = self.app.io };
+    }
+
+    /// Sentinel error type returned by fail/invalid so callers can propagate.
+    pub const FailError = error{Handled};
+
+    /// Stash a custom status+message error and return error.Handled for propagation.
+    pub fn fail(self: *Ctx, status: u16, message: []const u8) FailError {
+        self.handled = .{ .status = status, .message = message };
+        return error.Handled;
+    }
+
+    /// Stash a validation error (400 with field details) and return error.Handled.
+    pub fn invalid(self: *Ctx, fields: []const error_mod.FieldError) FailError {
+        self.handled = error_mod.ApiError.validation(fields);
+        return error.Handled;
+    }
+
+    /// Map any error to an http.Response. error.Handled renders the stashed ApiError;
+    /// known errors map to canonical status codes; anything else → 500 (no detail leaked).
+    pub fn errorResponse(self: *Ctx, err: anyerror) http_mod.Response {
+        const ae: error_mod.ApiError = switch (err) {
+            error.Handled => self.handled orelse error_mod.ApiError.internal(),
+            error.NotFound => error_mod.ApiError.notFound(),
+            error.BadRequest => error_mod.ApiError.badRequest("Bad request."),
+            error.Conflict => error_mod.ApiError.conflict("Conflict."),
+            error.Forbidden => error_mod.ApiError.forbidden(),
+            error.Unauthorized => error_mod.ApiError.unauthorized(),
+            else => error_mod.ApiError.internal(),
+        };
+        return ae.toResponse(self.arena) catch
+            error_mod.ApiError.internal().toResponse(self.arena) catch unreachable;
     }
 };
 
@@ -325,6 +360,25 @@ test "ctx.http() returns a client bound to the ctx arena and io" {
     try std.testing.expect(client.alloc.ptr == client2.alloc.ptr);
     // Assert the allocator pointer matches the ctx's arena allocator.
     try std.testing.expect(client.alloc.ptr == ctx.arena.ptr);
+}
+
+test "errorResponse maps known errors to status codes, unknown to 500" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    try std.testing.expectEqual(@as(u16, 404), ctx.errorResponse(error.NotFound).status);
+    try std.testing.expectEqual(@as(u16, 403), ctx.errorResponse(error.Forbidden).status);
+    try std.testing.expectEqual(@as(u16, 400), ctx.errorResponse(error.BadRequest).status);
+    try std.testing.expectEqual(@as(u16, 409), ctx.errorResponse(error.Conflict).status);
+    try std.testing.expectEqual(@as(u16, 500), ctx.errorResponse(error.SomethingWeird).status);
+
+    // ctx.fail stashes a custom message that errorResponse(error.Handled) renders.
+    const e = ctx.fail(422, "nope");
+    try std.testing.expectError(error.Handled, @as(error{Handled}!void, e));
+    const r = ctx.errorResponse(error.Handled);
+    try std.testing.expectEqual(@as(u16, 422), r.status);
 }
 
 test "ctx.records expand nests the related record under \"expand\"" {
