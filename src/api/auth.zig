@@ -105,6 +105,21 @@ pub fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, ri
     return try alloc.dupe(u8, st.columnText(0));
 }
 
+pub const KeyEpoch = struct { token_key: []const u8, epoch: i64 };
+
+/// Fetch the record's `tokenKey` AND its session `token_epoch` (#99) in ONE SELECT — the
+/// same single read every mint path already did for the tokenKey, now carrying one extra
+/// column. This is what keeps epoch-mode login zero-new-query: `issue()` no longer runs its
+/// own epoch SELECT, it takes the epoch from here. NULL epoch reads as 0 (back-compat).
+pub fn tokenKeyAndEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?KeyEpoch {
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    var st = try conn.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, rid);
+    if (!try st.step()) return null;
+    return .{ .token_key = try alloc.dupe(u8, st.columnText(0)), .epoch = st.columnInt(1) };
+}
+
 /// Read the record's current session epoch (#99), treating a NULL value (back-compat
 /// default) as 0; the column itself is guaranteed present by migration 0010. `table` is the
 /// physical auth table (collection name, or "_superusers"). Returns null only when no such
@@ -222,15 +237,15 @@ pub fn listSessions(alloc: std.mem.Allocator, conn: *db.Db, collection: []const 
 
 pub const Issued = struct { token: []const u8, cookies: [2]http.Cookie };
 
-pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: []const u8, token_key: []const u8) !Issued {
+pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: []const u8, token_key: []const u8, epoch: i64) !Issued {
     const app = ctx.app.?;
     const csrf = try crypto.genToken(app.io, ctx.allocator, 32);
     const now = try nowUnix(conn);
     const exp = now + app.auth_token_ttl_s;
-    // Embed the record's current session epoch (#99) so verify can reject the token once
-    // the epoch is bumped ("revoke all sessions"). 0 when the column is NULL/absent —
-    // matching the default claim, so pre-epoch behavior is preserved.
-    const epoch = (try tokenEpochFor(ctx.allocator, conn, collection, rid)) orelse 0;
+    // `epoch` (#99) is passed in by the caller, folded into the SAME `tokenKey` SELECT every
+    // mint path already does (see `tokenKeyAndEpochFor`) — so epoch-mode login adds NO new
+    // query. It is embedded so verify can reject the token once the epoch is bumped ("revoke
+    // all sessions"); 0 is the back-compat default that matches a NULL/absent column.
     // Variant B: in TABLE mode only, record a server-side session row and bind its id into
     // the token as `sid`. In epoch mode `sid` stays null — NO session row is written and the
     // token serializes byte-identically (the user's zero-overhead requirement). `conn` must be
@@ -298,8 +313,10 @@ pub fn issueSessionExt(
 ) !Issued {
     const col = (try collections.get(ctx.allocator, conn, collection)) orelse return error.NotFound;
     if (col.type != .auth) return error.NotFound;
-    const tk = (try tokenKeyFor(ctx.allocator, conn, col.name, record_id)) orelse return error.NotFound;
-    const issued = try issue(ctx, conn, col.name, record_id, tk);
+    // One SELECT for tokenKey + epoch (no separate epoch query) — keeps epoch-mode login at the
+    // same query count as before #99.
+    const ke = (try tokenKeyAndEpochFor(ctx.allocator, conn, col.name, record_id)) orelse return error.NotFound;
+    const issued = try issue(ctx, conn, col.name, record_id, ke.token_key, ke.epoch);
     const rec: ?std.json.Value = if (opt_record) |r| r else try records.get(ctx.allocator, conn, col, record_id);
     emitAuth(ctx, col.name, rec, method);
     return issued;
@@ -318,8 +335,8 @@ pub fn issueSessionNoEmit(
 ) !Issued {
     const col = (try collections.get(ctx.allocator, conn, collection)) orelse return error.NotFound;
     if (col.type != .auth) return error.NotFound;
-    const tk = (try tokenKeyFor(ctx.allocator, conn, col.name, record_id)) orelse return error.NotFound;
-    return issue(ctx, conn, col.name, record_id, tk);
+    const ke = (try tokenKeyAndEpochFor(ctx.allocator, conn, col.name, record_id)) orelse return error.NotFound;
+    return issue(ctx, conn, col.name, record_id, ke.token_key, ke.epoch);
 }
 
 /// Fire the writable, abortable `beforeAuthSuccess` hook (#80) inside the login's write
@@ -1508,11 +1525,14 @@ test "#99 table mode: listActiveSessions + is_current; revoke authorizes owner-o
     } else try std.testing.expect(!s.is_current);
     try std.testing.expect(current_seen);
 
-    // A DIFFERENT user may not revoke the owner's session (fail closed).
+    // A DIFFERENT user may not revoke the owner's session (fail closed). The error is
+    // NotFound (indistinguishable from an absent id) — no existence oracle on others' sids.
     const other_rec = try loadRecord(env, a, "users", other_rid);
     var other_cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = other_rec, .collection = "users" }, .request = &hctx };
     defer other_cx.deinit();
-    try std.testing.expectError(error.Forbidden, other_cx.auth().revoke(sid1));
+    try std.testing.expectError(error.NotFound, other_cx.auth().revoke(sid1));
+    // Probing a non-existent id yields the SAME error (proves indistinguishability).
+    try std.testing.expectError(error.NotFound, other_cx.auth().revoke("does-not-exist"));
     try std.testing.expectEqual(@as(i64, 2), try sessionCount(env)); // nothing deleted
 
     // The owner CAN revoke their own session.

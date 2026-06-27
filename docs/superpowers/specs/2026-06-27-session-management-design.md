@@ -92,10 +92,20 @@ existing transaction (refresh) that already carries `errdefer w.rollback()`.
 
 ### Fail-closed verify + authz
 Verify rejects a table-mode `.auth` token whose `sid` row is absent/expired (same discipline as
-the epoch mismatch). `revoke(sessionId)` is owner-or-superuser only (`error.Forbidden`
-otherwise; `error.NotFound` for an absent row). Logout deletes the current `sid` row;
-`revokeAllSessions` clears all the principal's rows (and still bumps the epoch); `refresh`/
-`rotate` rotate the current device's row (delete-old-then-insert-new — no accumulation).
+the epoch mismatch). `revoke(sessionId)` is owner-or-superuser only; a non-owner gets the SAME
+`error.NotFound` as an absent row (no existence oracle on other users' session ids). Logout
+deletes the current `sid` row; `revokeAllSessions` clears all the principal's rows (and still
+bumps the epoch); `refresh`/`rotate` rotate the current device's row (delete-old-then-insert-new
+— wrapped in one `beginImmediate`/`commit` with `errdefer rollback` on the non-bound writer
+path, so a failed reissue never silently logs the device out).
+
+A token minted under `.epoch` (no `sid`) skips the per-device check if `.table` is later
+enabled — switching modes is not retroactive; `revokeAllSessions` (epoch bump) clears them.
+
+Zero epoch-mode overhead is preserved on LOGIN too: `issue()` takes the epoch as a parameter,
+folded into the single `tokenKey` SELECT every mint path already runs (`tokenKeyAndEpochFor`) —
+it no longer runs a separate `tokenEpochFor` query. So epoch-mode login keeps the same query
+count as before #99.
 
 ### Deferred (small)
 A periodic GC sweep of expired `_sessions` rows (verify already ignores them; they are inert).

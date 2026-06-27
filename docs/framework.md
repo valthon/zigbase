@@ -1222,8 +1222,9 @@ fn logout(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 Sessions are stateless JWTs, but they are still **revocable** via a per-auth-record
 **token epoch**. Each `.auth` token embeds the record's `token_epoch`; verification rejects
 a token whose epoch no longer matches the record's current value (fail closed). This is the
-**default** model (`App(.{ .session_store = .epoch })`) and costs no extra query — the epoch
-is read alongside the signing key on the existing verify lookup.
+**default** model (`App(.{ .session_store = .epoch })`) and costs **no extra query on either
+the verify hot path or login** — the epoch is folded into the single `tokenKey` SELECT each
+already performs (one extra column, not an extra round-trip).
 
 | verb | effect |
 |---|---|
@@ -1250,13 +1251,18 @@ maintains a server-side `_sessions` row per session, enabling a full per-device 
 | verb (table mode only) | effect |
 |---|---|
 | `ctx.auth().listActiveSessions()` | the current principal's active sessions (`id`, `created`, `last_seen`, `user_agent`, `ip`, `is_current`), newest first. |
-| `ctx.auth().revoke(sessionId)` | "log out THIS device" — delete one session row. Authorized: only the owning user (or a superuser) may revoke a given session; others get `error.Forbidden`. |
+| `ctx.auth().revoke(sessionId)` | "log out THIS device" — delete one session row. Authorized: only the owning user (or a superuser) may revoke a given session; a non-owner gets `error.NotFound` (indistinguishable from an absent id, so revoke can't probe other users' session ids). |
 
 In table mode, login/refresh/oauth issuance records a session row and embeds its id in the
 token (`sid` claim); **verify checks the row exists and is unexpired** (one extra indexed read
 per authenticated request — the accepted cost of this mode). Logout and `revoke` delete the
 row; `revokeAllSessions` clears all of the principal's rows (and bumps the epoch). `refresh`/
 `rotate` rotate the current device's row (no accumulation).
+
+> **Switching an existing app to `.table` is not retroactive.** Tokens already minted under
+> `.epoch` carry no `sid`, so they skip the per-device session check and stay valid until they
+> expire — `revoke(sessionId)` can't kill them (no row exists). Use `revokeAllSessions()` (an
+> epoch bump) once after enabling `.table` to invalidate every pre-existing session.
 
 **`.epoch` is the default and is unchanged: it issues ZERO session-table queries, and its
 tokens are byte-identical to before this feature** (the `sid` claim is omitted when absent). In

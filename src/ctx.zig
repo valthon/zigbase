@@ -342,8 +342,19 @@ pub const AuthApi = struct {
         }
         const w = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        if (table and cur.len > 0) _ = try api_auth.deleteSession(w, cur);
-        return auth_helpers.issueSession(req, w, u.collection, u.id);
+        // Epoch mode does no pre-issue write, so no transaction is needed (issue() just
+        // reads + signs). Table mode performs delete-old + insert-new (in issue) — wrap them
+        // in ONE transaction so a mid-way failure never silently logs the device out.
+        if (!table) return auth_helpers.issueSession(req, w, u.collection, u.id);
+        try w.beginImmediate();
+        errdefer w.rollback() catch {};
+        if (cur.len > 0) _ = try api_auth.deleteSession(w, cur);
+        const issued = try auth_helpers.issueSession(req, w, u.collection, u.id);
+        w.commit() catch |e| {
+            w.rollback() catch {};
+            return e;
+        };
+        return issued;
     }
 
     /// Rotate: bump the epoch (invalidating ALL prior tokens, including the one on THIS
@@ -362,9 +373,24 @@ pub const AuthApi = struct {
         }
         const w = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
+        // Epoch mode: a single epoch bump (UPDATE) then issue() (read + sign) — no multi-write
+        // to make atomic; a failed issue returns an error the caller sees. Table mode bundles
+        // bump + delete-old + insert-new (in issue) into ONE transaction so a mid-way failure
+        // never leaves the device's row deleted without a replacement (silent logout).
+        if (!table) {
+            _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
+            return auth_helpers.issueSession(req, w, u.collection, u.id);
+        }
+        try w.beginImmediate();
+        errdefer w.rollback() catch {};
         _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
-        if (table and cur.len > 0) _ = try api_auth.deleteSession(w, cur);
-        return auth_helpers.issueSession(req, w, u.collection, u.id);
+        if (cur.len > 0) _ = try api_auth.deleteSession(w, cur);
+        const issued = try auth_helpers.issueSession(req, w, u.collection, u.id);
+        w.commit() catch |e| {
+            w.rollback() catch {};
+            return e;
+        };
+        return issued;
     }
 
     /// Variant B (`App(.{ .session_store = .table })`): list the current principal's active
@@ -390,8 +416,9 @@ pub const AuthApi = struct {
     }
 
     /// Variant B: revoke ONE session by id ("log out this device"). AUTHORIZED — a
-    /// non-superuser may revoke only a session they OWN; revoking another user's session
-    /// fails with `error.Forbidden`. `error.NotFound` when no such session row exists.
+    /// non-superuser may revoke only a session they OWN. A non-owner gets `error.NotFound`
+    /// whether or not the session id exists (indistinguishable — no existence oracle on other
+    /// users' session ids); a genuinely absent id is also `error.NotFound`.
     /// `error.SessionStoreNotEnabled` in `.epoch` mode.
     pub fn revoke(self: AuthApi, session_id: []const u8) !void {
         if (self.ctx.app.session_store != .table) return error.SessionStoreNotEnabled;
@@ -403,10 +430,12 @@ pub const AuthApi = struct {
     }
 
     /// Authorize + delete one session row on `conn`. Owner-or-superuser only (fail closed).
+    /// A non-owner is given the SAME `error.NotFound` as a missing row — collapsing the
+    /// owner-mismatch and absent-row cases so revoke can't probe other users' session ids.
     fn revokeOn(self: AuthApi, conn: *db.Db, u: Ctx.User, session_id: []const u8) !void {
         const owner = (try api_auth.sessionOwner(self.ctx.arena, conn, session_id)) orelse return error.NotFound;
         const is_owner = std.mem.eql(u8, owner.collection, u.collection) and std.mem.eql(u8, owner.record, u.id);
-        if (!u.is_superuser and !is_owner) return error.Forbidden;
+        if (!u.is_superuser and !is_owner) return error.NotFound; // indistinguishable from absent
         _ = try api_auth.deleteSession(conn, session_id);
     }
 };

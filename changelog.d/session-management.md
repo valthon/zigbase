@@ -5,9 +5,10 @@
   (bump + re-mint, keep this session and kill every other). Free-function forms
   `zigbase.auth.revokeAllSessions/refresh/rotate(ctx)`. Sessions remain stateless JWTs but
   are now **revocable** via a per-auth-record token epoch (the default
-  `App(.{ .session_store = .epoch })` model) — no extra query on the verify hot path (the
-  epoch is read alongside the signing key). Existing valid tokens keep working: tokens
-  minted before the epoch existed and freshly created records both read as epoch 0.
+  `App(.{ .session_store = .epoch })` model) — **no extra query on either the verify hot path
+  or login**: the epoch is folded into the single `tokenKey` SELECT each already performs.
+  Existing valid tokens keep working: tokens minted before the epoch existed and freshly
+  created records both read as epoch 0.
 - New comptime config key `.session_store` (`.epoch` default, or `.table`). The `.table`
   variant adds a server-side `_sessions` store for full **per-device** management:
   `ctx.auth().listActiveSessions()` (with `is_current`) and `ctx.auth().revoke(sessionId)`
