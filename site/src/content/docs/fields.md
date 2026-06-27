@@ -31,7 +31,10 @@ identical in both directions:
 }
 ```
 
-`required` and `unique` are common to every type and both default to `false`. The `options`
+`required` and `unique` are common to every type and both default to `false`. A third
+common boolean, `encrypted` (default `false`), stores the value encrypted at rest and is
+valid only on `text`/`editor`/`json` fields — see
+[Encryption at rest](#encryption-at-rest-encrypted). The `options`
 object is type-specific; unknown/omitted option keys fall back to the defaults listed for
 each type. A field whose `options` you don't care about can pass `"options": {}` (all
 defaults).
@@ -320,6 +323,48 @@ create/update and served from `GET /api/files/:col/:rec/:name` (see
 { "name": "photos", "type": "file",
   "options": { "maxSelect": 6, "maxSize": 5242880, "mimeTypes": ["image/png", "image/jpeg", "image/webp"] } }
 ```
+
+## Encryption at rest (`encrypted`)
+
+Set `"encrypted": true` on a field to store its value **encrypted at rest** (AES-256-GCM,
+versioned envelope, a fresh random nonce per write). The records layer encrypts on write and
+decrypts on read, so your handlers, the records API, and HTTP responses always see
+**plaintext** — only the SQLite file holds ciphertext.
+
+```jsonc
+{ "name": "ssn", "type": "text", "encrypted": true }
+```
+
+| Rule | Behavior |
+| --- | --- |
+| **Allowed types** | `text`, `editor`, `json` only. `encrypted` on any other type is rejected. |
+| **Cannot combine with** | `unique`, an index, a `?filter`, or a `?sort` — ciphertext is per-row-nonce, so it is not comparable. A request filtering/sorting on an encrypted field returns **`400`**. |
+| **Key** | Comes only from the `ZIGBASE_FIELD_KEY` env var; it is never auto-generated, persisted, or logged. If any collection declares an encrypted field and the key is unset, the **server refuses to start** (fail-closed). |
+| **Reads are strict** | A stored value that is not a valid envelope (e.g. legacy plaintext) or fails authentication **fails closed** — there is no plaintext passthrough. Enabling `encrypted` on a column that already holds plaintext requires running `zigbase rewrap` first. |
+
+Access rules that compare an encrypted field compare against ciphertext and effectively never
+match — don't reference encrypted fields in rules. Key rotation (multiple generations via
+`ZIGBASE_FIELD_KEY_V<n>`) and the `zigbase rewrap` command are covered in
+[Framework → Field encryption at rest](./framework#field-encryption-at-rest-encrypted).
+
+## Row expiry (`ttl_field`) — a collection option
+
+`ttl_field` is a **collection-level** option (not a field option): it names an existing
+`date`/`autodate` field on the collection to use as each row's **expiry timestamp**. Rows
+whose value is non-null and at/before "now" are reaped by an internal GC and hidden from
+every read. It is set in the collection body's `options` object, not on a field:
+
+```jsonc
+{
+  "name": "sessions",
+  "type": "base",
+  "fields": [ { "name": "expires_at", "type": "date" } ],
+  "options": { "ttl_field": "expires_at" }
+}
+```
+
+See [API → Collection options](./api#collection-options) and
+[Framework → Row expiry (TTL)](./framework#row-expiry-ttl--ttl_field) for full semantics.
 
 ## Auth collections and system fields
 

@@ -130,9 +130,38 @@ On **output**, the serialized collection exposes the field list under the key
 ### Fields
 
 A field has a `name`, a `type` (e.g. `text`, `relation`, `file`, …), and a
-type-specific `options` object. Common options include `required` and `unique`;
+type-specific `options` object. Common options include `required`, `unique`, and
+`encrypted` (text/editor/json only — see
+[fields.md → Encryption at rest](fields.md#encryption-at-rest-encrypted));
 `relation` fields reference another collection. Auth collections (`"type":"auth"`)
 have system fields such as `email` injected automatically.
+
+### Collection options
+
+The collection body carries an `options` object for collection-level settings. Beyond the
+auth block on auth collections (see [Auth](#auth)), one notable option is row expiry:
+
+| Option | Type | Meaning |
+| --- | --- | --- |
+| `ttl_field` | string \| null | Name of a `date`/`autodate` field on this collection used as the row's **expiry timestamp**. Rows whose value is non-null and at/before "now" are reaped by an internal GC and **hidden from every read** (list, get, relation expand). Default `null` = no expiry. |
+
+```jsonc
+// create a TTL collection — "expires_at" rows auto-expire
+{
+  "name": "sessions",
+  "type": "base",
+  "fields": [
+    { "name": "token", "type": "text" },
+    { "name": "expires_at", "type": "date" }
+  ],
+  "options": { "ttl_field": "expires_at" }
+}
+```
+
+Expiry is **eventually consistent**: the GC sweeps at startup and every ~5 minutes, but
+expired rows are excluded from reads immediately by a read-time predicate. See
+[framework.md → Row expiry (TTL)](framework.md#row-expiry-ttl--ttl_field) for the full
+semantics.
 
 ---
 
@@ -308,6 +337,12 @@ title ~ "zig" && views >= 100
 author.role = "admin" || @request.method = "GET"
 ```
 
+> **Encrypted fields are not filterable or sortable.** A field marked `encrypted` (see
+> [fields.md → Encryption at rest](fields.md#encryption-at-rest-encrypted)) is stored as
+> per-row-nonce ciphertext, so referencing it in `filter` or `sort` returns
+> **`400`** (`"Cannot filter or sort by an encrypted field."`). The same applies to an
+> access rule comparing an encrypted field — it can only ever match against ciphertext.
+
 ### sort
 
 Comma-separated field list. Prefix a field with `-` for descending; ascending is the
@@ -392,6 +427,14 @@ When you authenticate via these cookies, writes must echo the `zb_csrf` cookie i
 the `X-CSRF-Token` header — see
 [CSRF on unsafe methods](#csrf-on-unsafe-methods-cookie-sessions).
 
+> **Embeddable hooks.** When ZigBase is used as a Zig library, `auth-refresh` and
+> `auth-logout` run through the `.auth` lifecycle hook group (`before_refresh` /
+> `after_refresh`, `before_logout` / `after_logout`); a `before` hook that fails closed
+> aborts the request before any session change. Embedders also get the `ctx.auth()` session
+> verbs (`refresh` / `rotate` / `revokeAllSessions`, and per-device `listActiveSessions` /
+> `revoke`) and the optional table-backed session store. See
+> [framework.md §6](framework.md#6-auth--file--lifecycle-events).
+
 ### Registration / signup
 
 There is **no dedicated register endpoint**. Signing up a user is a normal
@@ -425,6 +468,11 @@ the email exists). The matching `confirm-*` endpoint takes that `token` in its b
 - **Without either** (the default), the token is **logged to the server** instead — a
   dev/CI convenience. To complete a flow locally, read the token from the log and POST
   it to the matching `confirm-*` endpoint.
+
+Verification and password-reset tokens are **strictly single-use**: each token carries a
+random `jti` that is recorded on first redemption, so a second `confirm-*` with the same
+token is rejected with `400` (independent of the token's TTL). The reset path validates the
+new password *before* consuming the token, so a too-short password does not burn it.
 
 Configure SMTP or a local MTA command for production; see
 [KNOWN_LIMITATIONS.md → Auth & email](../KNOWN_LIMITATIONS.md).
@@ -570,7 +618,10 @@ Per-method rate-limit behavior is configured in `.auth.methods` via the `rate_li
 
 - **Config:** `ZIGBASE_RATE_LIMIT_MAX` attempts (default `10`) per
   `ZIGBASE_RATE_LIMIT_WINDOW` seconds (default `60`), per client key, per endpoint.
-  Set `ZIGBASE_RATE_LIMIT_MAX=0` to disable rate limiting entirely.
+  Setting `ZIGBASE_RATE_LIMIT_MAX=0` disables only the **global** env-configured limiter;
+  any per-method `.auth.methods.<m>.rate_limit = .{ .custom = … }` still applies (a custom
+  limit overrides the global one for that method). To turn a specific method's limiting off,
+  set its `rate_limit = .off`.
 - **Keying:** `X-Forwarded-For` / `X-Real-IP` are **ignored by default** — they are
   attacker-controlled on direct exposure. With `--trust-proxy` (`ZIGBASE_TRUST_PROXY=true`),
   set **only** behind a trusted reverse proxy that rewrites them, the key is the IP from
@@ -659,6 +710,34 @@ The OAuth `state` parameter prevents login-CSRF. ZigBase supports two modes:
 
 **PKCE (`codeVerifier`) is required in both modes** — server-side `state` adds CSRF
 protection, it does not replace PKCE.
+
+---
+
+## Settings (key/value store)
+
+ZigBase ships a built-in key→value store (backed by an internal `_kv` system table) and a
+**superuser-only** HTTP surface over it. It is the same store that the embeddable
+`ctx.kv()` / `ctx.flag()` API and the admin UI's "Settings / Feature Flags" screen use.
+Every endpoint requires a valid **superuser** token (`401`/`403` otherwise); values are
+server-managed and never public by default.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/api/settings` | List every setting: `[{ key, value, created, updated }, …]`. |
+| GET | `/api/settings/:key` | Fetch one: `{ key, value }`; `404` if absent. |
+| PUT | `/api/settings/:key` | Upsert. Body `{ "value": "..." }`; returns `{ key, value }`. A malformed body is `400`. |
+| DELETE | `/api/settings/:key` | Remove; `204`, or `404` if absent. |
+
+```json
+// PUT /api/settings/welcome_banner   (Authorization: Bearer <superuser-jwt>)
+{ "value": "Closed for maintenance" }
+```
+
+Values are stored as opaque strings. A boolean feature flag is just a value of `"true"` /
+`"false"` (the `ctx.flag()` helper reads `"true"`/`"1"` as truthy). To publish a specific
+value to non-superusers, write your own custom route that reads it via `ctx.kv()` /
+`ctx.flag()` — see
+[framework.md → KV / feature flags](framework.md#ctxkv--built-in-keyvalue-settings-store).
 
 ---
 

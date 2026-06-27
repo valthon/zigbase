@@ -855,6 +855,112 @@ Key points:
 
 ---
 
+## Recipe: encrypt a field at rest (+ key rotation with `rewrap`)
+
+Mark a `text`/`editor`/`json` field `.encrypted = true` to store it AES-256-GCM-encrypted;
+reads and writes see plaintext, the SQLite file holds ciphertext. The key comes **only** from
+`ZIGBASE_FIELD_KEY` (never auto-generated) — if any encrypted field exists and the key is
+unset, the server refuses to start.
+
+```zig
+zigbase.App(.{
+    .collections = .{
+        .patients = .{ .fields = .{
+            .{ .name = "name", .type = .text },
+            .{ .name = "ssn",  .type = .text, .encrypted = true },  // ciphertext at rest
+        } },
+    },
+}).runCli(init);
+```
+
+```sh
+ZIGBASE_FIELD_KEY="a-long-random-secret" ./myserver serve --data-dir ./zb_data
+```
+
+Encrypted fields can't be `.unique`, indexed, or used in a `?filter`/`?sort` (a request that
+tries gets `400`). To **rotate keys** (generation 1 → 2) or to migrate existing plaintext into
+ciphertext, run `zigbase rewrap` with the new primary key plus every older generation present:
+
+```sh
+# write new data as v2 while still reading v1; then re-encrypt every v1 cell as v2:
+ZIGBASE_FIELD_KEY=newkey ZIGBASE_FIELD_KEY_GENERATION=2 ZIGBASE_FIELD_KEY_V1=oldkey \
+  ./myserver rewrap --data-dir ./zb_data        # --dry-run reports counts only
+```
+
+`rewrap` is idempotent and fail-closed (a cell it can't decrypt aborts that collection's
+transaction). Full envelope/rotation details: [framework.md → Field encryption at rest](framework.md#field-encryption-at-rest-encrypted).
+
+## Recipe: auto-expiring rows (TTL collections)
+
+Name a `date`/`autodate` field as a collection's `.ttl_field` and the framework reaps expired
+rows for you (no cron of your own) **and** hides them from every read immediately:
+
+```zig
+.holds = .{ .fields = .{
+    .{ .name = "slot",       .type = .text },
+    .{ .name = "expires_at", .type = .date },   // ISO-8601 UTC
+} , .ttl_field = "expires_at" },
+```
+
+A row with `expires_at` non-null and at/before "now" is excluded from list/get/expand
+immediately and deleted by the internal `_ttl_gc` job (startup + every ~5 minutes). A `null`
+ttl value never expires. Over the REST API, set `"options": { "ttl_field": "expires_at" }` in
+the collection body (see [api.md → Collection options](api.md#collection-options)).
+
+## Recipe: built-in KV store and feature flags
+
+`ctx.kv()` is a schema-less key→value store (backed by an internal `_kv` table, invisible to
+the record API); `ctx.flag()` / `ctx.setFlag()` are a typed boolean view over the same store:
+
+```zig
+fn toggleBeta(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    try ctx.setFlag("new_checkout", true);          // stores "true"
+    try ctx.kv().set("welcome_banner", "Hi there"); // arbitrary string value
+    const on = try ctx.flag("new_checkout");         // false if unset; "true"/"1" are truthy
+    const banner = try ctx.kv().get("welcome_banner"); // ?[]const u8
+    _ = on; _ = banner;
+    return .{ .status = 204, .body = "" };
+}
+```
+
+KV/flags are **server-side and superuser-managed** by default. Superusers can manage them over
+HTTP (`GET/PUT/DELETE /api/settings[/:key]`) or in the admin UI's "Settings / Feature Flags"
+screen. To expose one value publicly, write a one-line custom route that reads it via
+`ctx.flag()` / `ctx.kv()` — exposing a flag is then an explicit choice, not the default.
+
+## Recipe: deterministic tests (frozen clock, seeded IDs, captured mail/HTTP)
+
+Dev builds expose three determinism seams (all compiled out of release binaries). Freeze the
+clock and seed the entropy source from the environment so two runs produce byte-for-byte
+identical timestamps, IDs, and tokens:
+
+```sh
+ZIGBASE_FAKE_NOW="2029-03-07T16:00:00Z" \
+ZIGBASE_FAKE_SEED=12345 \
+  ./myserver serve --data-dir ./zb_data --insecure-cookies
+```
+
+`ZIGBASE_FAKE_NOW` freezes every framework "now" **and** consumer SQL `'now'` /
+`CURRENT_TIMESTAMP` / `DEFAULT CURRENT_TIMESTAMP`; `ZIGBASE_FAKE_SEED` makes record IDs and
+tokens reproducible. In Zig tests, capture outbound mail and HTTP without touching the network
+via `zigbase.testcapture`:
+
+```zig
+const tc = zigbase.testcapture;
+tc.mail.enable(true);     // capture + suppress real delivery
+defer tc.mail.reset();
+// ... trigger a magic-link / verification flow ...
+const link_email = tc.mail.find("sign in").?;   // assert against captured mail
+
+tc.http.enable(true);     // block un-mocked URLs (no real network)
+defer tc.http.reset();
+tc.http.mock("api.stripe.com", .{ .status = 200, .body = "{\"paid\":true}" });
+// ... trigger a route/hook that calls ctx.http() ...
+```
+
+See [framework.md §14](framework.md#14-test--dev-mode-determinism-seams) and the
+testcapture section for `mail.entries()` / `http.requests()` and the full API.
+
 See also: [fields.md](fields.md) · [tutorial.md](tutorial.md) ·
 [api.md](api.md) · [framework.md](framework.md)
 </content>
