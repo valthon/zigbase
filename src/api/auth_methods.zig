@@ -172,6 +172,12 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                     // atomically with session issuance; an aborting hook rolls everything
                     // back and blocks the session (fail closed).
                     try w.beginImmediate();
+                    // Safety net for EVERY error-return after begin (fireBeforeAuthSuccess can
+                    // propagate, issueSessionNoEmit, commit): roll back so a failed login never
+                    // leaves an open transaction on the single shared writer (which would poison
+                    // all subsequent writes). Value-returns below roll back explicitly; the
+                    // double-rollback a later error would cause is a harmless no-op (no active txn).
+                    errdefer w.rollback() catch {};
                     if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, rid, auth_tag, rec)) |resp| {
                         w.rollback() catch {};
                         return resp;
