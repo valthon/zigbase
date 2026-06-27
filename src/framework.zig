@@ -13,6 +13,7 @@ const db = @import("db.zig");
 const crypto = @import("crypto.zig");
 const id_gen = @import("id.zig");
 const scheduler = @import("scheduler.zig");
+const schedule = @import("schedule.zig");
 const clock = @import("clock.zig");
 const mail = @import("mail/mailer.zig");
 const provision = @import("provision.zig");
@@ -187,8 +188,29 @@ pub fn App(comptime cfg: anytype) type {
             break :blk d;
         };
 
-        /// The comptime-assembled cron/interval/reactive job table (empty when no `.cron`).
-        pub const jobs: []const scheduler.RuntimeJob = if (@hasField(@TypeOf(cfg), "cron")) scheduler.buildJobs(cfg.cron) else &.{};
+        /// The consumer's cron/interval/reactive job table (empty when no `.cron`).
+        const user_jobs: []const scheduler.RuntimeJob = if (@hasField(@TypeOf(cfg), "cron")) scheduler.buildJobs(cfg.cron) else &.{};
+
+        /// True when ANY comptime collection opts into TTL (`.ttl_field`). Gates the
+        /// framework-internal `_ttl_gc` job and the startup one-shot sweep.
+        pub const has_ttl_collection: bool = blk: {
+            for (collections) |col| if (col.options.ttl_field != null) break :blk true;
+            break :blk false;
+        };
+
+        /// Framework-internal jobs: a periodic TTL sweep when any collection opts in,
+        /// else empty. Appended after the consumer's jobs so user `.cron` names win the
+        /// lower indices and the internal job runs even with no user cron.
+        const internal_jobs: []const scheduler.RuntimeJob = if (has_ttl_collection)
+            scheduler.buildJobs(.{
+                .{ .name = "_ttl_gc", .schedule = schedule.Schedule{ .interval = .{ .minutes = 5 } }, .handler = ttlGcJob },
+            })
+        else
+            &.{};
+
+        /// The full job table = consumer jobs ++ framework-internal jobs. The scheduler
+        /// starts whenever this is non-empty, so a TTL collection alone starts it.
+        pub const jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(user_jobs, internal_jobs);
         /// Worker pool size for the scheduler. Precedence: `.pools.jobs` (the new
         /// unified lever), then the legacy `.jobs.pool_size`, then the default 2.
         pub const job_pool_size: usize = blk: {
@@ -321,6 +343,7 @@ pub fn App(comptime cfg: anytype) type {
             .static_mode = static_mode,
             .pagination = pagination_config,
             .enable_typegen = enable_typegen,
+            .has_ttl = has_ttl_collection,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -334,6 +357,16 @@ pub fn App(comptime cfg: anytype) type {
             return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts, init.environ_map);
         }
     };
+}
+
+/// The framework-internal `_ttl_gc` job handler: acquires the writer and reaps
+/// expired rows across every TTL-enabled collection. Registered only when the
+/// comptime schema declares at least one `.ttl_field` (see `App.internal_jobs`).
+fn ttlGcJob(ctx: *@import("ctx.zig").Ctx, ev: *events.JobEvent) anyerror!void {
+    _ = ev;
+    const w = ctx.app.pool.acquireWriter();
+    defer ctx.app.pool.releaseWriter();
+    _ = try @import("records.zig").gcExpiredRecords(ctx.arena, w);
 }
 
 /// Comptime knobs threaded from `App(cfg)` into the serve path: which storage /
@@ -354,6 +387,10 @@ pub const ServeOpts = struct {
     /// When true, compiles the `typegen` CLI subcommand into the binary.
     /// Off by default so production builds carry no codegen.
     enable_typegen: bool = false,
+    /// True when the comptime schema declares at least one `.ttl_field`. Gates the
+    /// startup one-shot TTL sweep in serveImpl (the periodic job is gated separately
+    /// by `jobs`).
+    has_ttl: bool = false,
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -754,6 +791,13 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         // Sweep expired and consumed auth challenge entries at startup. This is purely space
         // reclamation; both `take` paths already reject expired/consumed rows at query time.
         @import("auth/challenge_store.zig").gcAuthChallenges(w) catch |e| std.log.warn("auth-challenge GC at startup failed: {s}", .{@errorName(e)});
+        // One-shot TTL sweep at startup (the periodic `_ttl_gc` job handles the rest). Only
+        // compiled in when the comptime schema declares at least one `.ttl_field`.
+        if (opts.has_ttl) {
+            var ttl_arena = std.heap.ArenaAllocator.init(allocator);
+            defer ttl_arena.deinit();
+            _ = @import("records.zig").gcExpiredRecords(ttl_arena.allocator(), w) catch |e| std.log.warn("TTL GC at startup failed: {s}", .{@errorName(e)});
+        }
     }
     // Instantiate the comptime-selected storage + mailer plugins. The instances are
     // serveImpl stack vars that outlive the server (srv.listen() runs to shutdown),
@@ -976,6 +1020,31 @@ test "App(cfg) exposes the comptime job table and pool size" {
     const B = App(.{});
     try std.testing.expectEqual(@as(usize, 0), B.jobs.len);
     try std.testing.expectEqual(@as(usize, 2), B.job_pool_size); // default pool size
+}
+
+test "App(cfg) registers the internal _ttl_gc job when a collection opts into TTL" {
+    // No TTL collection => no internal job, scheduler stays off (jobs empty).
+    const Plain = App(.{
+        .collections = .{
+            .posts = .{ .fields = .{.{ .name = "title", .type = .text }} },
+        },
+    });
+    try std.testing.expect(!Plain.has_ttl_collection);
+    try std.testing.expectEqual(@as(usize, 0), Plain.jobs.len);
+
+    // A TTL collection => has_ttl flag set and a single internal `_ttl_gc` job appended.
+    const Ttl = App(.{
+        .collections = .{
+            .sessions = .{ .fields = .{
+                .{ .name = "token", .type = .text },
+                .{ .name = "expires_at", .type = .date },
+            }, .ttl_field = "expires_at" },
+        },
+    });
+    try std.testing.expect(Ttl.has_ttl_collection);
+    try std.testing.expectEqual(@as(usize, 1), Ttl.jobs.len);
+    try std.testing.expectEqualStrings("_ttl_gc", Ttl.jobs[0].name);
+    try std.testing.expect(Ttl.jobs[0].schedule == .interval);
 }
 
 test "App(.{}) resolves the default storage + mailer plugins and reader pool" {
