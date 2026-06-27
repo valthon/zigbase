@@ -191,6 +191,33 @@ pub fn deleteSession(conn: *db.Db, sid: []const u8) !bool {
     return try st.step();
 }
 
+/// Delete a session row AND return its original `created` timestamp (RETURNING). Used by
+/// refresh/rotate to carry the true session-start time forward onto the replacement row.
+/// Null when no row existed. Writer required.
+pub fn deleteSessionReturningCreated(alloc: std.mem.Allocator, conn: *db.Db, sid: []const u8) !?[]const u8 {
+    var st = try conn.prepare("DELETE FROM \"_sessions\" WHERE \"id\" = ?1 RETURNING \"created\";");
+    defer st.finalize();
+    try st.bindText(1, sid);
+    if (!try st.step()) return null;
+    return try alloc.dupe(u8, st.columnText(0));
+}
+
+/// After a refresh/rotate reissue, carry the OLD session's `created` onto the NEW row so
+/// `created` = the true session start (not the last refresh), while leaving the new row's
+/// freshly-set `lastSeen` = now. `new_token` is the just-issued JWT (its `sid` names the new
+/// row). No-op when `old_created` is null or the token carries no `sid`. Writer required.
+pub fn carrySessionCreated(alloc: std.mem.Allocator, conn: *db.Db, new_token: []const u8, old_created: ?[]const u8) !void {
+    const oc = old_created orelse return;
+    const claims = jwt.peekClaims(alloc, new_token) catch return;
+    const ns = claims.sid orelse return;
+    if (ns.len == 0) return;
+    var st = try conn.prepare("UPDATE \"_sessions\" SET \"created\" = ?2 WHERE \"id\" = ?1;");
+    defer st.finalize();
+    try st.bindText(1, ns);
+    try st.bindText(2, oc);
+    _ = try st.step();
+}
+
 /// Delete EVERY session row for a principal (revoke-all cleanliness). Writer required.
 pub fn deleteSessionsForPrincipal(conn: *db.Db, collection: []const u8, rid: []const u8) !void {
     var st = try conn.prepare("DELETE FROM \"_sessions\" WHERE \"collectionRef\" = ?1 AND \"recordRef\" = ?2;");
@@ -1538,6 +1565,54 @@ test "#99 table mode: listActiveSessions + is_current; revoke authorizes owner-o
     // The owner CAN revoke their own session.
     try cx.auth().revoke(sid1);
     try std.testing.expectEqual(@as(i64, 1), try sessionCount(env));
+}
+
+test "#99 table mode: refresh preserves created (session start) and advances last_seen" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    env.app.session_store = .table;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "rs@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "rs@x.io");
+    const rec = try loadRecord(env, a, "users", rid);
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    const s1 = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+    const sid1 = (try jwt.peekClaims(a, s1.token)).sid.?;
+    // Backdate the original session so the carried `created` is distinguishable from `now`.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var st = try w.prepare("UPDATE \"_sessions\" SET \"created\"='2020-01-01 00:00:00', \"lastSeen\"='2020-01-01 00:00:00' WHERE \"id\"=?1;");
+        defer st.finalize();
+        try st.bindText(1, sid1);
+        _ = try st.step();
+    }
+
+    // Refresh rotates the row (delete old + insert new). created must carry forward; last_seen advances.
+    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users", .session_id = sid1 }, .request = &hctx };
+    defer cx.deinit();
+    _ = try cx.auth().refresh();
+
+    // Exactly one row remains; read its created + lastSeen.
+    try std.testing.expectEqual(@as(i64, 1), try sessionCount(env));
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    var st = try r.prepare("SELECT \"created\", \"lastSeen\" FROM \"_sessions\" LIMIT 1;");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    const created = st.columnText(0);
+    const last_seen = st.columnText(1);
+    // created carried forward from the original session (true session start).
+    try std.testing.expectEqualStrings("2020-01-01 00:00:00", created);
+    // last_seen advanced to the refresh time (no longer equal to the backdated created).
+    try std.testing.expect(!std.mem.eql(u8, last_seen, "2020-01-01 00:00:00"));
 }
 
 test "#99 table mode: logout deletes the current device's session row" {

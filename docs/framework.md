@@ -1257,17 +1257,21 @@ In table mode, login/refresh/oauth issuance records a session row and embeds its
 token (`sid` claim); **verify checks the row exists and is unexpired** (one extra indexed read
 per authenticated request — the accepted cost of this mode). Logout and `revoke` delete the
 row; `revokeAllSessions` clears all of the principal's rows (and bumps the epoch). `refresh`/
-`rotate` rotate the current device's row (no accumulation).
+`rotate` rotate the current device's row (no accumulation), carrying the original `created`
+(session start) forward and stamping `last_seen = now`. **By design `last_seen` reflects the
+last token *refresh*, not every request** — verify never writes the session table, so an
+authenticated request stays one read (no per-request write amplification on the single writer).
 
 > **Switching an existing app to `.table` is not retroactive.** Tokens already minted under
 > `.epoch` carry no `sid`, so they skip the per-device session check and stay valid until they
 > expire — `revoke(sessionId)` can't kill them (no row exists). Use `revokeAllSessions()` (an
 > epoch bump) once after enabling `.table` to invalidate every pre-existing session.
 
-**`.epoch` is the default and is unchanged: it issues ZERO session-table queries, and its
-tokens are byte-identical to before this feature** (the `sid` claim is omitted when absent). In
-`.epoch` mode `listActiveSessions`/`revoke` return `error.SessionStoreNotEnabled` (there is no
-per-session inventory); `revokeAllSessions`/`refresh`/`rotate` work in **both** modes. See the
+**`.epoch` is the default and is unchanged: it issues ZERO session-table queries, and enabling
+`.table` does not alter the `.epoch`-mode token shape** — the `sid` claim is simply omitted when
+absent. In `.epoch` mode `listActiveSessions`/`revoke` return `error.SessionStoreNotEnabled`
+(there is no per-session inventory); `revokeAllSessions`/`refresh`/`rotate` work in **both**
+modes. See the
 [session-management design spec](superpowers/specs/2026-06-27-session-management-design.md).
 
 ## 7. Scheduled jobs (`.cron` + `.jobs`)

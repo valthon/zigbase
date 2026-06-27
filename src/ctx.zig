@@ -337,8 +337,12 @@ pub const AuthApi = struct {
         const table = self.ctx.app.session_store == .table;
         const cur = self.ctx.rctx.session_id;
         if (self.ctx.bound_conn) |c| {
-            if (table and cur.len > 0) _ = try api_auth.deleteSession(c, cur);
-            return auth_helpers.issueSession(req, c, u.collection, u.id);
+            // Carry the old row's `created` forward (session-start time) onto the new row,
+            // whose `lastSeen` is set to now by issue() — see carrySessionCreated.
+            const old_created = if (table and cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, c, cur) else null;
+            const issued = try auth_helpers.issueSession(req, c, u.collection, u.id);
+            if (table) try api_auth.carrySessionCreated(self.ctx.arena, c, issued.token, old_created);
+            return issued;
         }
         const w = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
@@ -348,8 +352,9 @@ pub const AuthApi = struct {
         if (!table) return auth_helpers.issueSession(req, w, u.collection, u.id);
         try w.beginImmediate();
         errdefer w.rollback() catch {};
-        if (cur.len > 0) _ = try api_auth.deleteSession(w, cur);
+        const old_created = if (cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, w, cur) else null;
         const issued = try auth_helpers.issueSession(req, w, u.collection, u.id);
+        try api_auth.carrySessionCreated(self.ctx.arena, w, issued.token, old_created);
         w.commit() catch |e| {
             w.rollback() catch {};
             return e;
@@ -368,8 +373,10 @@ pub const AuthApi = struct {
         const cur = self.ctx.rctx.session_id;
         if (self.ctx.bound_conn) |c| {
             _ = try api_auth.bumpTokenEpoch(self.ctx.arena, c, u.collection, u.id);
-            if (table and cur.len > 0) _ = try api_auth.deleteSession(c, cur);
-            return auth_helpers.issueSession(req, c, u.collection, u.id);
+            const old_created = if (table and cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, c, cur) else null;
+            const issued = try auth_helpers.issueSession(req, c, u.collection, u.id);
+            if (table) try api_auth.carrySessionCreated(self.ctx.arena, c, issued.token, old_created);
+            return issued;
         }
         const w = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
@@ -384,8 +391,9 @@ pub const AuthApi = struct {
         try w.beginImmediate();
         errdefer w.rollback() catch {};
         _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
-        if (cur.len > 0) _ = try api_auth.deleteSession(w, cur);
+        const old_created = if (cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, w, cur) else null;
         const issued = try auth_helpers.issueSession(req, w, u.collection, u.id);
+        try api_auth.carrySessionCreated(self.ctx.arena, w, issued.token, old_created);
         w.commit() catch |e| {
             w.rollback() catch {};
             return e;

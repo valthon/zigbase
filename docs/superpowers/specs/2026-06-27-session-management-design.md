@@ -99,6 +99,14 @@ bumps the epoch); `refresh`/`rotate` rotate the current device's row (delete-old
 — wrapped in one `beginImmediate`/`commit` with `errdefer rollback` on the non-bound writer
 path, so a failed reissue never silently logs the device out).
 
+### `last_seen` semantics (deliberately NOT per-request)
+`created` = true session start, `last_seen` = last token **refresh**. On rotate the original
+`created` is carried forward (RETURNING from the delete → UPDATE the new row) while `last_seen`
+is stamped `now`. Verify NEVER writes the session table — updating `last_seen` on every
+authenticated request would add a single-writer write to the hot path (write amplification /
+contention), violating the "one extra indexed READ per request" budget. So `last_seen` advances
+on refresh, not on every request.
+
 A token minted under `.epoch` (no `sid`) skips the per-device check if `.table` is later
 enabled — switching modes is not retroactive; `revokeAllSessions` (epoch bump) clears them.
 

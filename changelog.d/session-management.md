@@ -15,8 +15,9 @@
   ("log out THIS device", owner-or-superuser authorized). In table mode each token carries an
   opaque `sid` and verification additionally requires a live (unexpired) session row — one
   extra indexed read per authenticated request. `.epoch` stays the default and is unchanged:
-  **zero extra DB work and byte-identical tokens** (the `sid` claim is omitted entirely). In
-  `.epoch` mode the per-device verbs return `error.SessionStoreNotEnabled`.
+  **zero extra DB work, and enabling `.table` does not alter the `.epoch`-mode token shape**
+  (the `sid` claim is simply omitted when absent). In `.epoch` mode the per-device verbs
+  return `error.SessionStoreNotEnabled`.
 
 ### Security
 
