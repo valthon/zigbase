@@ -485,6 +485,8 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         error.CursorSort => return ApiError.badRequest("Cursor does not match the requested sort.").toResponse(ctx.allocator),
         error.CursorFilter => return ApiError.badRequest("Cursor does not match the requested filter.").toResponse(ctx.allocator),
         error.BadCursor => return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator),
+        error.EncryptedField =>
+            return ApiError.badRequest("Cannot filter or sort by an encrypted field.").toResponse(ctx.allocator),
         error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep =>
             return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
         else => return e,

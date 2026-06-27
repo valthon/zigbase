@@ -1179,6 +1179,54 @@ A collection may declare `.indexes` — a tuple of index literals provisioned as
 The index `.name` and `.fields` are validated as identifiers; the `.where` predicate
 is raw SQL authored in the schema. Index `.fields` reference fields by their declared name (not an internal id); `.name` and each field are validated as identifiers at compile time.
 
+### Field encryption at rest (`.encrypted`)
+
+Mark a `text`, `editor`, or `json` field `.encrypted = true` to store it
+encrypted at rest. The records layer encrypts on write and decrypts on read, so
+your handlers, the records API, and the HTTP responses always see **plaintext** —
+only the SQLite file holds ciphertext:
+
+```zig
+.fields = .{
+    .{ .name = "ssn",   .type = .text, .encrypted = true },
+    .{ .name = "notes", .type = .json, .encrypted = true },
+},
+```
+
+**Envelope.** AES-256-GCM, versioned: each value is stored as
+`v1:` + base64url(nonce ‖ ciphertext ‖ tag) with a fresh random nonce per write.
+
+**Key (required).** The key comes **only** from the `ZIGBASE_FIELD_KEY`
+environment variable (HKDF-derived; the raw value may be any length). Unlike the
+JWT secret it is **never auto-generated, persisted, or logged** — losing or
+rotating it determines whether the data is recoverable, so you must manage it.
+If any collection declares an `.encrypted` field and `ZIGBASE_FIELD_KEY` is unset,
+**the server refuses to start** (fail-closed — it never silently stores plaintext).
+
+**Constraints (enforced).** Encrypted values are per-row-nonce ciphertext, so they
+cannot be indexed, marked `.unique`, or used in a `?filter`/`?sort`:
+
+- Indexing an encrypted field, marking it `.unique`, or setting `.encrypted` on a
+  non-`text`/`editor`/`json` field is a **compile error**.
+- A request that filters or sorts by an encrypted field gets a **400**.
+- Access rules that compare an encrypted field will compare against ciphertext and
+  effectively never match — don't reference encrypted fields in rules.
+
+**Strict reads / enabling on existing data.** Reads are strict: a stored value
+that is not a valid `v1:` envelope (e.g. legacy plaintext) or that fails
+authentication (wrong key, tamper) **fails closed** — there is no plaintext
+passthrough. Therefore, turning `.encrypted` on for a column that already holds
+plaintext rows requires an explicit rewrap migration first; "encrypted means
+encrypted".
+
+**Rotation.** The `v<N>:` version prefix selects the key generation. v1 ships a
+single key; the format is designed so a future generation can be added (reads
+dispatch on the prefix, writes use the primary) with a lazy/rewrap forward path.
+
+> Note: the envelope hides a value's *contents* but not its *length* — ciphertext
+> length is proportional to plaintext length. A single long-lived key suits typical
+> volumes; for very high write volumes, periodic `v<N>:` key rotation is recommended.
+
 ### Startup provisioning + additive auto-migration
 
 On every startup, ZigBase diffs each declared collection against the live database

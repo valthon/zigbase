@@ -29,6 +29,11 @@ pub const Field = struct {
     required: bool = false,
     unique: bool = false,
     hidden: bool = false,
+    /// Transparent at-rest encryption (Theme B1). When true the column stores an
+    /// AES-256-GCM envelope; the records layer encrypts on write and decrypts on
+    /// read. Only text/editor/json fields may set this (enforced at comptime in
+    /// provision.zig). Encrypted fields are non-indexable/-unique/-filterable.
+    encrypted: bool = false,
     options: FieldOptions,
 
     pub fn fieldType(self: Field) FieldType {
@@ -481,6 +486,22 @@ pub fn isValidIdentifier(s: []const u8) bool {
     return true;
 }
 
+/// Field types whose storage representation is a plain string and may therefore
+/// carry an at-rest encryption envelope (Theme B1): text, editor, json. This is the
+/// SINGLE SOURCE OF TRUTH for the encryptable set — the comptime guards
+/// (provision.zig), the runtime validator (`validate` below), and the value layer
+/// (field_policy.zig) all defer to it.
+pub fn isEncryptableType(t: FieldType) bool {
+    return t == .text or t == .editor or t == .json;
+}
+
+/// True if any field in `c` is `.encrypted`. Drives the fail-closed key checks
+/// (startup guard over comptime collections; runtime collections-API guard).
+pub fn hasEncryptedField(c: Collection) bool {
+    for (c.fields) |f| if (f.encrypted) return true;
+    return false;
+}
+
 /// Appends any validation problems to `errors`. Self-sizing; messages/codes are static or borrowed from `c`.
 pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(ValidationError)) std.mem.Allocator.Error!void {
     if (!isValidIdentifier(c.name))
@@ -497,6 +518,17 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
         for (c.fields[0..i]) |g| {
             if (std.ascii.eqlIgnoreCase(f.name, g.name))
                 try errors.append(alloc, .{ .field = f.name, .code = "validation_duplicate_name", .message = "Duplicate field name." });
+        }
+        // At-rest encryption constraints (Theme B1). The comptime `.collections` path
+        // enforces these with @compileError; the runtime collections API (superuser
+        // create/update) reaches here, so mirror them — otherwise `.encrypted` on a
+        // non-string type would be SILENTLY STORED AS PLAINTEXT (the value layer only
+        // encrypts the text/editor/json branches).
+        if (f.encrypted) {
+            if (!isEncryptableType(f.fieldType()))
+                try errors.append(alloc, .{ .field = f.name, .code = "validation_encrypted_type", .message = "Only text, editor, and json fields can be encrypted." });
+            if (f.unique)
+                try errors.append(alloc, .{ .field = f.name, .code = "validation_encrypted_unique", .message = "An encrypted field cannot be unique." });
         }
         switch (f.options) {
             .text => |o| if (o.pattern) |pat| {
@@ -539,6 +571,11 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
         for (idx.fields) |fname| {
             if (!isValidIdentifier(fname))
                 try errors.append(alloc, .{ .field = fname, .code = "validation_invalid_name", .message = "Invalid index field name." });
+            // An encrypted column holds per-row-nonce ciphertext, so an index over it
+            // is useless (every row's stored bytes differ). Reject rather than build a
+            // dead index. (Comptime path enforces this with @compileError.)
+            if (fieldByName(c, fname)) |fl| if (fl.encrypted)
+                try errors.append(alloc, .{ .field = fname, .code = "validation_encrypted_index", .message = "Cannot index an encrypted field." });
         }
     }
 
@@ -587,6 +624,7 @@ fn fieldToValue(alloc: std.mem.Allocator, f: Field) !Value {
     try obj.put(alloc, "name", jStr(f.name));
     try obj.put(alloc, "required", jBool(f.required));
     try obj.put(alloc, "unique", jBool(f.unique));
+    try obj.put(alloc, "encrypted", jBool(f.encrypted));
     try obj.put(alloc, "type", jStr(@tagName(std.meta.activeTag(f.options))));
 
     var opts: ObjectMap = .empty;
@@ -805,6 +843,7 @@ fn fieldFromValue(alloc: std.mem.Allocator, v: Value) !Field {
         .name = name,
         .required = getBool(v, "required", false),
         .unique = getBool(v, "unique", false),
+        .encrypted = getBool(v, "encrypted", false),
         .options = try optionsFromValue(alloc, t, opts),
     };
 }

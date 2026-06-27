@@ -1,8 +1,42 @@
 const std = @import("std");
 const db = @import("db.zig");
 const schema = @import("schema.zig");
+const field_policy = @import("field_policy.zig");
 
 pub const ValueError = error{ TypeMismatch, TooPrecise, Overflow, BadNumber, BadSelect, NotObject } || std.mem.Allocator.Error;
+
+/// Raised when an `.encrypted` field is read or written but no field cipher is
+/// configured on the connection (ZIGBASE_FIELD_KEY unset). Fail-closed: we never
+/// store an encrypted field as plaintext, nor return ciphertext as plaintext.
+pub const EncryptError = error{FieldKeyMissing};
+
+/// Recover the field cipher stamped on the connection (db.Db.field_cipher), or null.
+fn cipherOf(stmt: *db.Stmt) ?field_policy.Cipher {
+    const p = stmt.field_cipher orelse return null;
+    const cph: *const field_policy.Cipher = @ptrCast(@alignCast(p));
+    return cph.*;
+}
+
+/// Bind a storage string, sealing it into an at-rest envelope first when the field
+/// is `.encrypted`. Fail-closed: an encrypted field with no configured cipher errors.
+fn bindStorage(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: schema.Field, storage: []const u8) (EncryptError || db.DbError || std.mem.Allocator.Error)!void {
+    if (field.encrypted) {
+        const cph = cipherOf(stmt) orelse return error.FieldKeyMissing;
+        return stmt.bindText(idx, try field_policy.seal(cph, alloc, storage));
+    }
+    return stmt.bindText(idx, storage);
+}
+
+/// Read a column's storage string, STRICTLY decrypting it when the field is
+/// `.encrypted`. A legacy/plaintext or undecryptable stored value fails closed.
+fn readStorage(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: schema.Field) ![]u8 {
+    const raw = stmt.columnText(idx);
+    if (field.encrypted) {
+        const cph = cipherOf(stmt) orelse return error.FieldKeyMissing;
+        return field_policy.open(cph, alloc, raw);
+    }
+    return alloc.dupe(u8, raw);
+}
 
 /// 10^scale as i64. error.Overflow when scale > 18 (i64 holds up to 10^18).
 /// The single source of scale arithmetic for fixed/int number handling.
@@ -74,12 +108,12 @@ pub fn scaledIntToDecimal(alloc: std.mem.Allocator, v: i64, scale: u8) ![]u8 {
 }
 
 /// Bind a `std.json.Value` into a prepared statement parameter according to the field's type.
-pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: schema.Field, v: std.json.Value) (ValueError || db.DbError)!void {
+pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: schema.Field, v: std.json.Value) (ValueError || db.DbError || EncryptError)!void {
     if (v == .null) return stmt.bindNull(idx);
     switch (field.options) {
         .text, .email, .url, .editor, .date, .autodate => {
             if (v != .string) return error.TypeMismatch;
-            try stmt.bindText(idx, v.string);
+            try bindStorage(alloc, stmt, idx, field, v.string);
         },
         .@"bool" => {
             if (v != .bool) return error.TypeMismatch;
@@ -105,7 +139,7 @@ pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
         },
         .json => {
             const s = try std.json.Stringify.valueAlloc(alloc, v, .{});
-            try stmt.bindText(idx, s);
+            try bindStorage(alloc, stmt, idx, field, s);
         },
         .select, .relation, .file => {
             if (field.isMultiValue()) {
@@ -127,7 +161,7 @@ pub fn readValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
     if (stmt.isNull(idx)) return .null;
     switch (field.options) {
         .text, .email, .url, .editor, .date, .autodate => {
-            return .{ .string = try alloc.dupe(u8, stmt.columnText(idx)) };
+            return .{ .string = try readStorage(alloc, stmt, idx, field) };
         },
         .@"bool" => return .{ .bool = stmt.columnInt(idx) != 0 },
         .number => |o| switch (o.mode) {
@@ -136,7 +170,12 @@ pub fn readValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
             .fixed => return .{ .string = try scaledIntToDecimal(alloc, stmt.columnInt(idx), o.scale orelse 0) },
         },
         .json => {
-            const txt = stmt.columnText(idx);
+            // Fast path: parseFromSlice copies into `alloc` during the parse and the
+            // columnText slice stays valid for that call, so a non-encrypted JSON value
+            // needs no intermediate dup. Only route through readStorage (decrypt) when
+            // the field is encrypted. (The text/string branch still MUST dup —
+            // columnText is invalidated on the next stmt.step.)
+            const txt = if (field.encrypted) try readStorage(alloc, stmt, idx, field) else stmt.columnText(idx);
             return (try std.json.parseFromSlice(std.json.Value, alloc, txt, .{})).value;
         },
         .select, .relation, .file => {
