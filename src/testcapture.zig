@@ -316,7 +316,7 @@ pub const http = struct {
         const ca = g_http.alloc();
         const rec = HttpRequest{
             .method = opts.method,
-            .url = ca.dupe(u8, opts.url) catch opts.url,
+            .url = ca.dupe(u8, opts.url) catch "",
             .headers = dupeHeaders(ca, opts.headers) catch &.{},
             .body = if (opts.body) |b| (ca.dupe(u8, b) catch null) else null,
         };
