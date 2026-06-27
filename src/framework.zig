@@ -188,7 +188,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -230,15 +230,28 @@ pub fn App(comptime cfg: anytype) type {
             break :blk false;
         };
 
-        /// Framework-internal jobs: a periodic TTL sweep when any collection opts in,
-        /// else empty. Appended after the consumer's jobs so user `.cron` names win the
-        /// lower indices and the internal job runs even with no user cron.
-        const internal_jobs: []const scheduler.RuntimeJob = if (has_ttl_collection)
+        /// TTL sweep job (when any collection opts into `.ttl_field`), else empty.
+        const ttl_jobs: []const scheduler.RuntimeJob = if (has_ttl_collection)
             scheduler.buildJobs(.{
                 .{ .name = "_ttl_gc", .schedule = schedule.Schedule{ .interval = .{ .minutes = 5 } }, .handler = ttlGcJob },
             })
         else
             &.{};
+
+        /// Expired-`_sessions` GC sweep (#114) — auto-installed ONLY in table mode, so `.epoch`
+        /// installs no job/timer/writer touch (the zero-overhead guarantee). Cadence comes from
+        /// `.session_gc_cron` (default hourly, `"0 * * * *"`).
+        const session_gc_jobs: []const scheduler.RuntimeJob = if (session_store_config == .table)
+            scheduler.buildJobs(.{
+                .{ .name = "_session_gc", .schedule = schedule.Schedule{ .cron = session_gc_cron }, .handler = sessionGcJob },
+            })
+        else
+            &.{};
+
+        /// Framework-internal jobs: the TTL sweep and/or the session-GC sweep, each gated on
+        /// its own condition. Appended after the consumer's jobs so user `.cron` names win the
+        /// lower indices, and an internal job runs even with no user cron.
+        const internal_jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(ttl_jobs, session_gc_jobs);
 
         /// The full job table = consumer jobs ++ framework-internal jobs. The scheduler
         /// starts whenever this is non-empty, so a TTL collection alone starts it.
@@ -296,6 +309,11 @@ pub fn App(comptime cfg: anytype) type {
             if (std.mem.eql(u8, @tagName(ss), "table")) break :blk .table;
             @compileError("session_store: unknown value '." ++ @tagName(ss) ++ "'; expected .epoch or .table");
         };
+
+        /// Cadence (UTC, minute-granularity cron) for the table-mode expired-`_sessions` GC
+        /// sweep (#114). Default hourly; override with `.session_gc_cron = "..."`. Only consumed
+        /// when `.session_store == .table` (otherwise no GC job is installed at all).
+        pub const session_gc_cron: []const u8 = if (@hasField(@TypeOf(cfg), "session_gc_cron")) cfg.session_gc_cron else "0 * * * *";
 
         /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
         /// A custom type missing a contract method fails with a contract-specific message.
@@ -414,6 +432,16 @@ fn ttlGcJob(ctx: *@import("ctx.zig").Ctx, ev: *events.JobEvent) anyerror!void {
     const w = ctx.app.pool.acquireWriter();
     defer ctx.app.pool.releaseWriter();
     _ = try @import("records.zig").gcExpiredRecords(ctx.arena, w);
+}
+
+/// The framework-internal `_session_gc` job handler (#114): acquires the writer and reaps
+/// expired `_sessions` rows in bounded batches. Registered only in table mode (see
+/// `App.session_gc_jobs`); never installed in `.epoch` mode.
+fn sessionGcJob(ctx: *@import("ctx.zig").Ctx, ev: *events.JobEvent) anyerror!void {
+    _ = ev;
+    const w = ctx.app.pool.acquireWriter();
+    defer ctx.app.pool.releaseWriter();
+    _ = try @import("api/auth.zig").gcExpiredSessions(w);
 }
 
 /// Comptime knobs threaded from `App(cfg)` into the serve path: which storage /
@@ -1353,6 +1381,27 @@ test "App(cfg) resolves the comptime session_store config (#99; defaults to .epo
     try std.testing.expectEqual(app_mod.SessionStore.epoch, App(.{}).session_store_config);
     try std.testing.expectEqual(app_mod.SessionStore.epoch, App(.{ .session_store = .epoch }).session_store_config);
     try std.testing.expectEqual(app_mod.SessionStore.table, App(.{ .session_store = .table }).session_store_config);
+}
+
+test "#114 session-GC job installs in table mode only (absent in epoch); cadence overridable" {
+    // Epoch (default): no `_session_gc` job is installed at all — zero-overhead guarantee.
+    for (App(.{}).jobs) |j| try std.testing.expect(!std.mem.eql(u8, j.name, "_session_gc"));
+    for (App(.{ .session_store = .epoch }).jobs) |j| try std.testing.expect(!std.mem.eql(u8, j.name, "_session_gc"));
+
+    // Table mode: exactly one `_session_gc` job with the default hourly cron.
+    {
+        var found = false;
+        for (App(.{ .session_store = .table }).jobs) |j| if (std.mem.eql(u8, j.name, "_session_gc")) {
+            found = true;
+            try std.testing.expect(j.schedule == .cron);
+            try std.testing.expectEqualStrings("0 * * * *", j.schedule.cron);
+        };
+        try std.testing.expect(found);
+    }
+
+    // `.session_gc_cron` overrides the cadence.
+    for (App(.{ .session_store = .table, .session_gc_cron = "*/30 * * * *" }).jobs) |j|
+        if (std.mem.eql(u8, j.name, "_session_gc")) try std.testing.expectEqualStrings("*/30 * * * *", j.schedule.cron);
 }
 
 test "App(cfg) resolves the comptime pagination config (defaults + overrides)" {

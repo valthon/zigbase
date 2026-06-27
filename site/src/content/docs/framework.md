@@ -103,6 +103,7 @@ pub fn main(init: std.process.Init) !void {
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
 | `session_store` | Session-management model: `.epoch` (default, stateless token-epoch revocation, zero extra DB work) or `.table` (server-side `_sessions` store for per-device list/revoke, one extra read per request). See [Revoking sessions](#revoking-sessions-99). |
+| `session_gc_cron` | Cadence (UTC cron) for the table-mode expired-`_sessions` GC sweep. Default `"0 * * * *"` (hourly). Only consumed when `.session_store = .table`. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
 
 ## 3b. The `typegen` gate (`.enable_typegen`) {#the-apptypegen-gate-enable_typegen}
@@ -1231,6 +1232,15 @@ row; `revokeAllSessions` clears all of the principal's rows (and bumps the epoch
 (session start) forward and stamping `last_seen = now`. **By design `last_seen` reflects the
 last token *refresh*, not every request** — verify never writes the session table, so an
 authenticated request stays one read (no per-request write amplification on the single writer).
+
+**Expired-session GC.** Enabling `.table` auto-installs a framework-internal recurring job
+(`_session_gc`) that deletes expired `_sessions` rows (those whose `expires` has passed; NULL =
+never expires) in bounded batches on the writer — no opt-in needed, and **nothing is installed
+in `.epoch` mode** (no job, no timer). The default cadence is **hourly** (`"0 * * * *"`);
+override it with `.session_gc_cron` (UTC, minute-granularity cron syntax), e.g.
+`App(.{ .session_store = .table, .session_gc_cron = "*/30 * * * *" })` for every 30 minutes.
+(Expired rows are inert before collection — verify already rejects them — so GC is housekeeping,
+not a correctness gate.)
 
 > **Switching an existing app to `.table` is not retroactive.** Tokens already minted under
 > `.epoch` carry no `sid`, so they skip the per-device session check and stay valid until they
