@@ -16,10 +16,9 @@
 //!      their own booking (403 when called by anyone else).
 //!   4. A custom route `GET /api/listings/:id/availability` that returns all
 //!      non-cancelled bookings for a listing so the frontend can render an
-//!      availability calendar. Uses `ev.caps().records().list()` — reader is
-//!      lazily acquired and released via `ctx.deinit()`, no manual pool wiring.
-//!   5. A DB-touching interval cron job that opens a `Data` from the pool and
-//!      expires stale pending holds.
+//!      availability calendar.
+//!   5. A DB-touching interval cron job that expires stale pending holds via the
+//!      `ev.caps().records()` capability object (no manual pool/Data wiring).
 //!   6. A trivial public smoke route `GET /api/golfsim/health`.
 //!   7. A file-upload logger `onFileUpload` that records every upload.
 //!   8. A validating `before_create` hook on `reviews` that stamps the author
@@ -231,58 +230,58 @@ fn cancelBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 // 4. Custom route: GET /api/listings/:id/availability  (auth required).
 //
 //    Returns all non-cancelled bookings for the listing so the frontend can
-//    render an availability calendar. Demonstrates ev.caps().records().list():
-//    the reader is lazily checked out and released via ctx.deinit(), replacing
-//    the manual pool acquire/release and Data construction from the old version.
-//    Output: `{"items":[...]}` (identical wire shape, including an empty array).
+//    render an availability calendar. Acquires a pooled READER directly (this is
+//    a read-only path). Output is `std.json.Value` so the exact `{"items":[...]}`
+//    body is preserved byte-for-byte (including an empty `{"items":[]}`).
 // ---------------------------------------------------------------------------
-fn listingAvailability(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    var ctx = ev.caps();
-    defer ctx.deinit(); // releases the lazily-acquired reader
-
-    const id = ev.ctx.param("id") orelse
-        return ctx.errorResponse(ctx.fail(400, "Missing listing id."));
+fn listingAvailability(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
+    const id = req.param("id") orelse return req.fail(400, "Missing listing id.");
     // The id is interpolated into the filter below — validate it first so a
     // crafted id cannot inject filter syntax.
-    if (!isSafeId(id))
-        return ctx.errorResponse(ctx.fail(400, "Invalid listing id."));
+    if (!isSafeId(id)) return req.fail(400, "Invalid listing id.");
 
-    const arena = ev.ctx.allocator;
+    const app: *zigbase.Runtime = @ptrCast(@alignCast(req.app.?));
+
+    // Acquire a pooled, read-only connection and build a reader-bound Data facade.
+    // `acquireReader` returns the connection by value; keep it in a local so its
+    // address is stable for `releaseReader(&conn)` and the Data facade.
+    var conn = app.pool.acquireReader() catch return error.RouteFailed;
+    defer app.pool.releaseReader(&conn);
+    const data = zigbase.Data{ .app = app, .conn = &conn, .io = app.io };
+
     const filter = std.fmt.allocPrint(
-        arena,
+        req.arena.?,
         "listing = \"{s}\" && status != \"cancelled\"",
         .{id},
-    ) catch return ctx.errorResponse(error.OutOfMemory);
+    ) catch return error.RouteFailed;
+    const result = data.list("bookings", .{ .filter = filter, .perPage = 200 }) catch return error.RouteFailed;
 
-    const result = ctx.records().list("bookings", .{ .filter = filter, .perPage = 200 }) catch |err|
-        return ctx.errorResponse(err);
-
-    // Build the `{"items":[...]}` wrapper and serialize it to the 200 body.
-    var arr = std.json.Array.init(arena);
-    for (result.items) |item| arr.append(item) catch return ctx.errorResponse(error.OutOfMemory);
+    // Build the `{"items":[...]}` wrapper as a JSON Value; the thunk serializes it
+    // to the 200 body (identical wire shape, including an empty array).
+    var arr = std.json.Array.init(req.arena.?);
+    for (result.items) |item| arr.append(item) catch return error.RouteFailed;
     var obj: std.json.ObjectMap = .empty;
-    obj.put(arena, "items", .{ .array = arr }) catch return ctx.errorResponse(error.OutOfMemory);
-    const body = std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = obj }, .{}) catch
-        return ctx.errorResponse(error.OutOfMemory);
-    return .{ .status = 200, .body = body };
+    obj.put(req.arena.?, "items", .{ .array = arr }) catch return error.RouteFailed;
+    return .{ .object = obj };
 }
 
 // ---------------------------------------------------------------------------
 // 5. DB-touching interval cron job: expire stale pending holds.
 //
-//    Signature: fn(*zigbase.events.JobEvent) anyerror!void. The job builds a
-//    `Data` from the pool (acquire the writer, release on exit), lists stale
-//    pending bookings via a filter, and marks them cancelled.
+//    Signature: fn(*zigbase.events.JobEvent) anyerror!void. Demonstrates the
+//    handler capability object: `ev.caps()` returns a `Ctx` whose `records()`
+//    handle reads via a pooled reader and writes via the pool writer — replacing
+//    the manual `pool.acquireWriter()` + hand-built `Data` this job used to do.
+//    `ctx.deinit()` releases any lazily-acquired reader on exit.
 // ---------------------------------------------------------------------------
 fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
-    const conn = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = conn, .io = ev.app.io };
+    var ctx = ev.caps();
+    defer ctx.deinit();
 
     // Holds that are still "pending" but whose slot already started are stale.
     // The filter language compares fields to a literal; `@now` is the current
     // server time. (No-op until the `bookings` collection exists.)
-    const stale = data.list("bookings", .{
+    const stale = ctx.records().list("bookings", .{
         .filter = "status = \"pending\" && starts_at < @now",
         .perPage = 200,
     }) catch |err| switch (err) {
@@ -301,7 +300,7 @@ fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
         var patch: std.json.ObjectMap = .empty;
         defer patch.deinit(ev.app.allocator);
         try patch.put(ev.app.allocator, "status", .{ .string = "cancelled" });
-        _ = data.update("bookings", id, .{ .object = patch }) catch continue;
+        _ = ctx.records().update("bookings", id, .{ .object = patch }) catch continue;
         expired += 1;
     }
     if (expired > 0) std.log.info("expire-holds: cancelled {d} stale hold(s)", .{expired});

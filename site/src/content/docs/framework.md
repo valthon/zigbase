@@ -337,19 +337,28 @@ error model, without manually acquiring connections from the pool.
 
 `ev.caps().records()` returns a `Records` handle. For reads it lazily checks out and
 caches a pooled reader (released on `ctx.deinit()`); write methods (`create`/`update`/`delete`)
-acquire the pool writer and release it per-call. Always `defer ctx.deinit()` in the handler:
+acquire the pool writer and release it per-call. Always `defer ctx.deinit()` in the handler.
+This replaces hand-built `pool.acquireWriter()` + `Data` wiring — e.g. a cron job that
+expires stale booking holds (the form used by `examples/golfsim`):
 
 ```zig
-fn listingAvailability(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
     var ctx = ev.caps();
-    defer ctx.deinit(); // releases the lazily-acquired reader
+    defer ctx.deinit();
 
-    const filter = try std.fmt.allocPrint(ev.ctx.allocator,
-        "listing = \"{s}\" && status != \"cancelled\"", .{id});
+    const stale = try ctx.records().list("bookings", .{
+        .filter = "status = \"pending\" && starts_at < @now",
+        .perPage = 200,
+    });
+    // stale.items: []std.json.Value  |  stale.totalItems: ?u64
 
-    const result = try ctx.records().list("bookings", .{ .filter = filter, .perPage = 200 });
-    // result.items: []std.json.Value  |  result.totalItems: ?u64
-    // ...
+    for (stale.items) |item| {
+        const id = item.object.get("id").?.string;
+        var patch: std.json.ObjectMap = .empty;
+        defer patch.deinit(ev.app.allocator);
+        try patch.put(ev.app.allocator, "status", .{ .string = "cancelled" });
+        _ = try ctx.records().update("bookings", id, .{ .object = patch });
+    }
 }
 ```
 

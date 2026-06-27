@@ -659,6 +659,7 @@ export interface ZbClient {
   rpc: {
     bookingsConfirm(params: { id: string }, opts?: SendOptions): Promise<unknown>;
     bookingsCancel(params: { id: string }, opts?: SendOptions): Promise<unknown>;
+    listingsAvailability(params: { id: string }, opts?: SendOptions): Promise<unknown>;
     golfsimHealth(opts?: SendOptions): Promise<HealthOut>;
   };
   authStore: Client["authStore"];
@@ -717,6 +718,9 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       },
       bookingsCancel(params, opts) {
         return base.send("POST", `/api/bookings/${encodeURIComponent(String(params.id))}/cancel`, opts);
+      },
+      listingsAvailability(params, opts) {
+        return base.send("GET", `/api/listings/${encodeURIComponent(String(params.id))}/availability`, opts);
       },
       golfsimHealth(opts) {
         return base.send("GET", `/api/golfsim/health`, opts);
