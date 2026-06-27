@@ -69,11 +69,13 @@ pub fn parse(s: []const u8) ParseError!i64 {
 }
 
 /// Inverse of `daysFromCivil`: a count of days since 1970-01-01 back to a civil
-/// (year, month, day). Howard Hinnant's `civil_from_days`, using floor division so it is
-/// correct for negative day counts (pre-epoch). Returns month in [1,12], day in [1,31].
+/// (year, month, day). Howard Hinnant's `civil_from_days`. The era term uses TRUNCATING
+/// division with the `z - 146096` adjustment (exactly as Hinnant writes it) so it is correct
+/// for negative day counts (pre-epoch); `@divFloor` here would double-correct and give the
+/// wrong era for `z < 0`. Returns month in [1,12], day in [1,31].
 fn civilFromDays(z_in: i64) struct { y: i64, m: i64, d: i64 } {
     const z = z_in + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const era = @divTrunc(if (z >= 0) z else z - 146096, 146097);
     const doe = z - era * 146097; // [0, 146096]
     const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365); // [0, 399]
     const y = yoe + era * 400;
@@ -194,6 +196,12 @@ test "formatUtc renders canonical UTC datetime and round-trips through parse" {
     for ([_]i64{ 0, 86400, 1867593600, 1577836800, -86400, -1, 1718000000 }) |t| {
         try std.testing.expectEqual(t, try parse(&formatUtc(t)));
     }
+    // Deep pre-epoch: before 0000-03-01 the internal day count goes negative (z < 0 in
+    // civilFromDays), which is the regime where the era term must use TRUNCATING division.
+    // @divFloor here would mis-compute the era and corrupt these; @divTrunc gets them right.
+    try std.testing.expectEqualStrings("0001-01-01 00:00:00", &formatUtc(try parse("0001-01-01")));
+    try std.testing.expectEqualStrings("0000-01-01 00:00:00", &formatUtc(try parse("0000-01-01")));
+    try std.testing.expectEqual(try parse("0000-01-01"), try parse(&formatUtc(try parse("0000-01-01"))));
 }
 
 test "runs at comptime" {
