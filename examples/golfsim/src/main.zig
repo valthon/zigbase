@@ -459,6 +459,36 @@ fn epochSeconds(ts: []const u8) !i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Auth lifecycle (#80 + #86)
+// ---------------------------------------------------------------------------
+
+/// `beforeAuthSuccess` hook: runs INSIDE the login transaction, AFTER the
+/// credentials/token are verified but BEFORE the session is issued, with a
+/// writable `*Ctx` bound to the login's writer. Here we bump a per-user login
+/// counter (reading the prior value off `ev.record`) — it commits atomically
+/// with the session. Returning an error would roll this write back AND block the
+/// login (fail closed): the canonical use is "claim anonymous records on first
+/// login" / "deny a banned account".
+fn bumpLoginCount(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!void {
+    const prev: i64 = if (ev.record.object.get("loginCount")) |v| switch (v) {
+        .integer => |i| i,
+        else => 0,
+    } else 0;
+    var patch: std.json.ObjectMap = .empty;
+    try patch.put(ctx.arena, "loginCount", .{ .integer = prev + 1 });
+    // ctx.records() reuses the bound transaction connection (do NOT call ctx.tx here).
+    _ = try ctx.records().update(ev.collection, ev.record_id, .{ .object = patch });
+}
+
+/// One-line logout (#86): `ctx.auth().clearSession()` returns the cleared
+/// `zb_auth`/`zb_csrf` cookies built from the framework's own cookie policy, so a
+/// custom logout matches the built-in `/auth-logout` exactly. `.public` so a stale
+/// or expired cookie can still be cleared.
+fn logout(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
+}
+
+// ---------------------------------------------------------------------------
 // App wiring
 // ---------------------------------------------------------------------------
 pub const App = zigbase.App(.{
@@ -466,11 +496,15 @@ pub const App = zigbase.App(.{
             .bookings = .{ .beforeCreate = prepareBooking },
             .reviews = .{ .beforeCreate = prepareReview },
         },
+        // #80: stamp last-seen on every successful login, transactionally with the session.
+        .beforeAuthSuccess = bumpLoginCount,
         .routes = .{
             .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
             .{ .method = .POST, .path = "/api/bookings/:id/cancel", .handler = cancelBooking, .auth = .authed },
             .{ .method = .GET, .path = "/api/listings/:id/availability", .handler = listingAvailability, .auth = .authed },
             .{ .method = .GET, .path = "/api/golfsim/health", .handler = health, .auth = .public },
+            // #86: custom one-line logout via ctx.auth().clearSession().
+            .{ .method = .POST, .path = "/api/golfsim/logout", .handler = logout, .auth = .public },
             // Untyped raw-response route (text/calendar) — see `calendarFeed`. Not in `zb.rpc.*`.
             .{ .method = .GET, .path = "/api/golfsim/calendar.ics", .handler = calendarFeed, .auth = .public },
         },
@@ -503,6 +537,8 @@ pub const App = zigbase.App(.{
                 .type = .auth,
                 .fields = .{
                     .{ .name = "name", .type = .text, .max = 100 },
+                    // Stamped by the beforeAuthSuccess hook on every login (#80).
+                    .{ .name = "lastSeenAt", .type = .number },
                 },
                 // require_verified: guests must verify their email before a session is minted.
                 // Justified for a booking/payments app — unverified accounts cannot hold slots.
