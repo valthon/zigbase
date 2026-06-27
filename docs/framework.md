@@ -673,6 +673,8 @@ the KV store (every endpoint requires a valid superuser token):
 | `PUT /api/settings/:key` | Upsert; body `{"value":"…"}`. |
 | `DELETE /api/settings/:key` | Remove; 204, or 404 if absent. |
 
+The embedded admin UI also exposes these endpoints as a "Settings / Feature Flags" section where superusers can view, create, edit, delete entries, and toggle boolean flags with a checkbox — no API client required.
+
 This is the management plane; the public read plane is whatever custom route you choose
 to expose (above).
 
