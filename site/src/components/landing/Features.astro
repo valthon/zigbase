@@ -38,7 +38,7 @@ import FeatureCard from '../FeatureCard.astro';
         <path d="M14 3v6h6" />
         <path d="M9 14h6M9 17h4" />
       </svg>
-      Local or S3-style storage with short-lived file-access tokens.
+      Local (pluggable) file storage with short-lived file-access tokens.
     </FeatureCard>
 
     <FeatureCard title="Single static binary">
@@ -72,6 +72,64 @@ import FeatureCard from '../FeatureCard.astro';
         <path d="M16 16l3 3 5-6" transform="translate(-2 -3)" />
       </svg>
       Generate a fully-typed client from your Zig schema — or from any running instance with <code>npx @zigbase/typegen</code>. Records, realtime, files, and typed custom-route RPC.
+    </FeatureCard>
+
+    <FeatureCard title="Session management">
+      <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="8" r="4" />
+        <path d="M4 20c0-4 3.6-7 8-7s8 3 8 7" />
+        <path d="M17 14l2 2 4-3" transform="translate(-3 0)" />
+      </svg>
+      Revoke all sessions instantly via epoch rotation. Optional per-device session table: list active sessions, revoke one device, or log out everywhere.
+    </FeatureCard>
+
+    <FeatureCard title="Rate limiting">
+      <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 3" />
+      </svg>
+      Global rate limiter plus per-auth-method limits — set each method's <code>.rate_limit</code> option at comptime, or call <code>ac.rateLimit()</code> from a custom auth method at runtime.
+    </FeatureCard>
+
+    <FeatureCard title="Field encryption">
+      <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="4" y="10" width="16" height="11" rx="2" />
+        <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+        <path d="M12 15v2" />
+      </svg>
+      Mark any text/JSON field <code>encrypted</code> for transparent AES-256-GCM at rest. Rotate keys live with <code>zigbase rewrap</code> — no downtime.
+    </FeatureCard>
+
+    <FeatureCard title="TTL & KV store">
+      <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 6h18M3 12h18M3 18h18" />
+        <circle cx="19" cy="6" r="2" fill="currentColor" />
+      </svg>
+      Auto-expiring records via <code>.ttl_field</code> (GC'd every 5 min). Built-in KV store for feature flags and settings, surfaced in the admin UI.
+    </FeatureCard>
+
+    <FeatureCard title="Auth lifecycle hooks">
+      <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 2l3 7h7l-5.5 4 2 7L12 16l-6.5 4 2-7L2 9h7z" />
+      </svg>
+      Magic-link, OTP, and WebAuthn passkeys. Hook <code>beforeAuthSuccess</code> and <code>beforeRegister</code> to gate logins, seed fields, and claim anonymous data — transactionally with the session.
+    </FeatureCard>
+
+    <FeatureCard title="Ctx capability layer">
+      <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="8" height="8" rx="1" />
+        <rect x="13" y="3" width="8" height="8" rx="1" />
+        <rect x="3" y="13" width="8" height="8" rx="1" />
+        <rect x="13" y="13" width="8" height="8" rx="1" />
+      </svg>
+      A single <code>*Ctx</code> handed to every hook, route, and job — wraps records, auth, KV, flags, outbound HTTP, and atomic transactions. Connection pooling handled for you.
+    </FeatureCard>
+
+    <FeatureCard title="Deterministic testing">
+      <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2V9M9 21H5a2 2 0 0 0-2-2V9m0 0h18" />
+      </svg>
+      Freeze time with <code>ZIGBASE_FAKE_NOW</code>, fix randomness with <code>ZIGBASE_FAKE_SEED</code>, and capture outbound mail in test suites — all gated off in production builds.
     </FeatureCard>
   </div>
 </section>

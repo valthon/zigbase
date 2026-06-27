@@ -278,7 +278,7 @@ migration notes below before upgrading.
   and golfsim also gain comptime `.collections` schemas so the examples provision themselves
   at startup.
 
-## [0.1.0] — 2026-06-10
+## [0.1.0] - 2026-06-10
 
 First public release: a single-binary, PocketBase-inspired (not API-compatible)
 backend-as-a-service in Zig 0.16, plus an embeddable Zig framework.

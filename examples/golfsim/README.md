@@ -90,6 +90,8 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 | `GET` | `/api/listings/:id/availability` | authed | Returns all non-cancelled bookings for a listing for availability calendar rendering. Reads via `req.ctx.records()`. |
 | `GET` | `/api/golfsim/health` | public | Smoke endpoint. |
 | `GET` | `/api/golfsim/flags/:name` | public | Public read of one feature flag via `ctx.flag` → `{"name","enabled"}`. Manage values with the superuser settings API (`PUT /api/settings/:key`). |
+| `POST` | `/api/golfsim/logout` | public | Clears the `zb_auth`/`zb_csrf` session cookies via `ctx.auth().clearSession()`. Works even with a stale or expired cookie. |
+| `GET` | `/api/golfsim/calendar.ics` | public | Returns a static iCal feed (`text/calendar`). Untyped handler (raw `http.Response`) — not in the generated `zb.rpc.*` client; subscribe to this URL directly from a calendar app. |
 
 Feature flags use the built-in KV/settings store (`ctx.kv`/`ctx.flag`, backed by the
 internal `_kv` table). Flags are superuser-managed and not public by default — the
@@ -201,16 +203,26 @@ lifetime and releases any lazily-acquired connection on exit.
 
 | Collection | Type | Key fields |
 |---|---|---|
-| `users` | auth | `name`; `require_verified=true`; OTP + password methods; Google OAuth2 |
+| `users` | auth | `name`, `loginCount`; `require_verified=true`; OTP + password methods; Google OAuth2 |
 | `simulators` | base | `label`, `owner` → users |
 | `listings` | base | `title`, `price_per_hour`, `status` (draft/published/archived), `simulator` → simulators, `photos` (file ×6) |
 | `bookings` | base | `listing`, `guest`, `starts_at`, `ends_at`, `price_total`, `status` (pending/confirmed/cancelled) |
 | `reviews` | base | `booking` → bookings, `author` → users, `rating` (int 1–5), `body` (text) |
+| `holds` | base | `listing`, `guest`, `expires_at` (TTL field — auto-GC'd by `_ttl_gc`) |
 
-All five collections are provisioned at startup via comptime `.collections` — no
+All six collections are provisioned at startup via comptime `.collections` — no
 manual API calls needed. (Lowering a schema this size FNV-hashes every collection
 + field name at comptime, which would exceed Zig's default branch quota; ZigBase
 raises its own quota in `provision.buildCollections`, so it just works.)
+
+### TTL records — `holds`
+
+A "hold" is an ephemeral soft-reservation a guest places while paying. Declaring
+`.ttl_field = "expires_at"` on the `holds` collection tells the framework's internal
+`_ttl_gc` job to sweep and delete expired rows automatically (once at startup, then
+every 5 minutes) — no cron required. The `prepareHold` `beforeCreate` hook stamps
+`expires_at = now + 15m` server-side; any client-supplied value is ignored, so a
+caller cannot pin a hold forever.
 
 ---
 
@@ -357,6 +369,24 @@ To test locally:
 2. Add `http://localhost:8090/api/oauth2/google/callback` as an authorized redirect URI.
 3. Set the env vars above and restart the binary.
 4. The "Sign in with Google" button on the login card will redirect to Google.
+
+### Auth lifecycle hooks
+
+`golfsim` demonstrates two auth lifecycle hooks:
+
+- **`beforeAuthSuccess` / `bumpLoginCount`** — runs *inside* the login transaction, after
+  credentials are verified but before the session is issued. It reads the current
+  `loginCount` off `ev.record` and increments it via `ctx.records().update(...)`. The
+  write commits atomically with the session — returning an error here rolls it back AND
+  blocks the login.
+- **`.auth.beforeRegister` / `seedNewUser`** — runs inside the account-create
+  transaction before the row is inserted. Seeds `loginCount = 0` so the field is
+  initialized at signup rather than only on the first login. Returning an error aborts
+  registration entirely (the canonical hook for gating sign-ups).
+
+The custom `POST /api/golfsim/logout` route returns `ctx.auth().clearSession()` — a
+single line that builds and returns the cleared `zb_auth`/`zb_csrf` cookies, matching
+the built-in `/auth-logout` behavior exactly without any extra logic.
 
 ### Comptime indexes
 

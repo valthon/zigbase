@@ -403,11 +403,14 @@ The framework invites custom rules, hooks, routes, and plugins. The sharp edges:
    *Guardrail (now in place):* the built-in builder/SMTP path rejects CR/LF/NUL in headers, so even
    a custom mailer that reuses `buildMessage` is protected; a *fully custom* backend still must
    sanitize — document this.
-3. **`before`-hook writes are not transactional (KNOWN_LIMITATIONS).** A hook that does a side
-   `ctx.records().create(...)` for an "atomic" audit/log row will commit it even if the triggering write
-   later fails — a correctness footgun that can become a security one (e.g. a "grant" row written
-   before an authz failure). *Guardrail:* the docs already warn; consider routing hook writes
-   through the request transaction in a later release.
+3. **`before`-hook writes now fold into the write transaction — RESOLVED (shipped).** On the HTTP
+   create/update/delete path, `before`-hooks run inside the write transaction: a
+   `ctx.records().create(...)` side-write inside a hook commits or rolls back atomically with the
+   triggering write — the correctness footgun described in earlier audit drafts is closed. Returning
+   an error from the hook rolls back both the hook write and the triggering write. *Residual nuance:*
+   hooks that acquire their own writer connection directly (e.g. calling `pool.acquireWriter()`
+   manually) bypass the shared transaction context; the safe path is always `ctx.records()`, which
+   reuses the bound in-transaction connection.
 4. **Rule `@request.data.*` is evaluated pre-hook (in-code KNOWN LIMITATION at
    `api/records.zig:213`).** A create/update rule like `@request.data.role != "admin"` can be
    defeated if a before-hook *sets* `role` after the guard was compiled — the WHERE clause saw the

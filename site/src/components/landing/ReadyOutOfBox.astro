@@ -18,7 +18,7 @@ const modules = [
     href: base + 'docs/api',
   },
   {
-    title: 'Local / S3 file storage',
+    title: 'Local (pluggable) file storage',
     body: 'Upload, serve, and gate files behind short-lived file-access tokens.',
     href: base + 'docs/api',
   },
@@ -35,6 +35,26 @@ const modules = [
   {
     title: 'Extensible in Zig',
     body: 'Comptime record hooks, custom routes, scheduled jobs, and plugins.',
+    href: base + 'docs/framework',
+  },
+  {
+    title: 'Session management',
+    body: 'Token-epoch revocation, optional per-device session table, and one-line logout via ctx.auth().',
+    href: base + 'docs/framework',
+  },
+  {
+    title: 'Field encryption + key rotation',
+    body: 'Mark fields encrypted for AES-256-GCM at rest. Rotate keys live with zigbase rewrap.',
+    href: base + 'docs/framework',
+  },
+  {
+    title: 'TTL records & KV store',
+    body: 'Auto-expiring rows via .ttl_field, and a built-in key-value store for feature flags and settings.',
+    href: base + 'docs/framework',
+  },
+  {
+    title: 'Auth lifecycle hooks',
+    body: 'Magic-link, OTP, and WebAuthn passkeys. beforeAuthSuccess and beforeRegister run inside the login transaction.',
     href: base + 'docs/framework',
   },
 ];

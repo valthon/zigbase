@@ -74,7 +74,8 @@ pub const Ctx = struct {
     /// `zigbase.auth.issueSession(self.request.?, bound_conn, collection, record_id)`
     /// directly with the connection you already hold.
     ///
-    /// NOTE: full session verbs (clearSession, refresh, revoke) arrive with Theme D.
+    /// NOTE: for full session management (clearSession, revokeAllSessions, refresh,
+    /// rotate, listActiveSessions, revoke), use `ctx.auth()` — all shipped.
     pub fn issueSession(self: *Ctx, collection: []const u8, record_id: []const u8) !auth_helpers.Issued {
         const conn = self.app.pool.acquireWriter();
         defer self.app.pool.releaseWriter();
