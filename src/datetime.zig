@@ -68,6 +68,43 @@ pub fn parse(s: []const u8) ParseError!i64 {
     return days * 86400 + hour * 3600 + min * 60 + sec - offset;
 }
 
+/// Inverse of `daysFromCivil`: a count of days since 1970-01-01 back to a civil
+/// (year, month, day). Howard Hinnant's `civil_from_days`, using floor division so it is
+/// correct for negative day counts (pre-epoch). Returns month in [1,12], day in [1,31].
+fn civilFromDays(z_in: i64) struct { y: i64, m: i64, d: i64 } {
+    const z = z_in + 719468;
+    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe = z - era * 146097; // [0, 146096]
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365); // [0, 399]
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100)); // [0, 365]
+    const mp = @divFloor(5 * doy + 2, 153); // [0, 11]
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1; // [1, 31]
+    const m = if (mp < 10) mp + 3 else mp - 9; // [1, 12]
+    return .{ .y = if (m <= 2) y + 1 else y, .m = m, .d = d };
+}
+
+/// Format UTC seconds-since-epoch as the canonical SQLite UTC datetime
+/// `YYYY-MM-DD HH:MM:SS` (no zone suffix; SQLite reads a bare datetime as UTC, matching
+/// `'now'`). Returns a fixed 19-byte array. The inverse of the space-form `parse`, so
+/// `parse(&formatUtc(t)) == t` for any second-granular instant in range.
+pub fn formatUtc(unix: i64) [19]u8 {
+    const days = @divFloor(unix, 86400);
+    const secs_of_day = @mod(unix, 86400); // [0, 86399], correct for negative unix via floor/mod
+    const civ = civilFromDays(days);
+    const hh = @divTrunc(secs_of_day, 3600);
+    const mm = @divTrunc(@mod(secs_of_day, 3600), 60);
+    const ss = @mod(secs_of_day, 60);
+    var buf: [19]u8 = undefined;
+    // Year is clamped to 4 digits by the caller's contract (frozen instants are modern);
+    // bufPrint can't fail into a 19-byte buffer for in-range values.
+    _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        @as(u64, @intCast(civ.y)), @as(u64, @intCast(civ.m)), @as(u64, @intCast(civ.d)),
+        @as(u64, @intCast(hh)),    @as(u64, @intCast(mm)),    @as(u64, @intCast(ss)),
+    }) catch unreachable;
+    return buf;
+}
+
 fn readN(s: []const u8, i: *usize, n: usize) ParseError!i64 {
     if (i.* + n > s.len) return error.InvalidFormat;
     var v: i64 = 0;
@@ -147,6 +184,16 @@ test "rejects malformed shapes and trailing garbage" {
 test "ordering is correct across mixed formats" {
     try std.testing.expect((try parse("2025-12-31 23:59:59")) < (try parse("2026-01-01")));
     try std.testing.expect((try parse("2026-12-31 23:59:59")) < (try parse("2027-01-01 00:00:00")));
+}
+
+test "formatUtc renders canonical UTC datetime and round-trips through parse" {
+    try std.testing.expectEqualStrings("1970-01-01 00:00:00", &formatUtc(0));
+    try std.testing.expectEqualStrings("1970-01-02 00:00:00", &formatUtc(86400));
+    try std.testing.expectEqualStrings("2029-03-07 16:00:00", &formatUtc(1867593600));
+    // round-trips: parse(formatUtc(t)) == t for a spread of instants, including pre-epoch.
+    for ([_]i64{ 0, 86400, 1867593600, 1577836800, -86400, -1, 1718000000 }) |t| {
+        try std.testing.expectEqual(t, try parse(&formatUtc(t)));
+    }
 }
 
 test "runs at comptime" {
