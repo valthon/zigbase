@@ -6,7 +6,7 @@
   in-transaction connection with no deadlock. Nesting is rejected immediately
   (`error.NestedTransaction`).
 
-### Changed
+### Fixes
 
 - `before*` record hooks now run INSIDE the triggering write's transaction on the
   HTTP create/update/delete path. A hook's side-writes (via `ev.data` /
