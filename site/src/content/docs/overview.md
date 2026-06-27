@@ -37,20 +37,41 @@ There are two ways to use ZigBase:
   on startup.
 - **Records & query API** — typed CRUD with `filter`, `sort`, and `expand` on relations.
   → [API](./api)
-- **Access rules** — per-collection list / view / create / update / delete rules.
+- **Access rules** — per-collection list / view / create / update / delete rules;
+  blank = locked, `"@public"` = open.
   → [API](./api#access-rules)
-- **Auth** — argon2id password auth, JWT tokens, verification and password-reset flows.
-  → [API](./api#auth)
+- **Auth** — argon2id password, magic-link, OTP, and WebAuthn passkey auth. JWT tokens,
+  verification, and password-reset flows. → [API](./api#auth)
 - **OAuth2** — Authorization-Code + PKCE provider login and account linking.
   → [API](./api#oauth2)
+- **Session management** — token-epoch revocation (`revokeAllSessions`), optional
+  per-device session table (`listActiveSessions` / `revoke`), and auth lifecycle hooks
+  (`beforeAuthSuccess`, `beforeRegister`). → [Framework](./framework)
+- **Rate limiting** — global rate limiter plus per-auth-method limits; configurable at
+  comptime or at runtime via `ctx.rateLimit()`.
+- **Field encryption** — mark any text/JSON field `encrypted` for AES-256-GCM at rest;
+  rotate keys live with `zigbase rewrap`. → [Framework](./framework)
+- **TTL / expiry** — declare `.ttl_field` on a collection and the framework GC's expired
+  rows automatically every 5 minutes. → [Framework](./framework)
+- **KV store & feature flags** — built-in key-value store (`ctx.kv` / `ctx.flag`)
+  accessible from hooks and routes; managed in the admin Settings UI.
+  → [Framework](./framework)
+- **Ctx capability layer** — a single `*Ctx` passed to every hook, route, and job wraps
+  records, auth, KV, flags, outbound HTTP, and atomic transactions; connection pooling
+  is handled for you. → [Framework](./framework)
 - **Realtime** — subscribe to record changes over WebSocket. → [API](./api#realtime-websocket)
-- **Files** — local file storage with serving and short-lived file-access tokens.
-  → [API](./api#files)
-- **Admin UI** — embedded single-page app served at `/_/`.
+- **Files** — local (pluggable) file storage with serving and short-lived file-access
+  tokens. → [API](./api#files)
+- **Admin UI** — embedded single-page app served at `/_/`, including a Settings screen
+  for managing KV/feature flags.
 - **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema
   (with additive auto-migration), and pluggable storage/mailer backends. → [Framework](./framework)
 - **Email** — pluggable SMTP mailer (STARTTLS / implicit TLS / plaintext) delivering
-  verification and password-reset email; logs the tokens in dev when SMTP is unset.
+  verification, password-reset, magic-link, and OTP email; logs tokens in dev when SMTP
+  is unset.
+- **Deterministic testing** — freeze time (`ZIGBASE_FAKE_NOW`), fix randomness
+  (`ZIGBASE_FAKE_SEED`), and capture outbound mail in test suites — all gated off in
+  production builds.
 
 ## When to use ZigBase
 
