@@ -60,11 +60,6 @@ pub fn Req(comptime InputT: type) type {
         /// Set by `makeThunk`; typed handlers reach capabilities via `req.ctx.records()`,
         /// `req.ctx.http()`, `req.ctx.user()`, etc.
         ctx: *Ctx,
-        // Legacy runtime handles, kept for the example apps (blog/golfsim) which still read
-        // `req.app.?`/`req.arena.?`. Sourced from `ctx` by the thunk; new code uses `req.ctx`.
-        // (Removal is deferred so this single-file task does not break the example builds.)
-        app: ?*anyopaque = null,
-        arena: ?std.mem.Allocator = null,
 
         pub fn param(self: *const Self, name: []const u8) ?[]const u8 {
             for (self.params) |p| if (std.mem.eql(u8, p.key, name)) return p.value;
@@ -206,7 +201,7 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
             var params = try a.alloc(Param, rc.params.len);
             for (rc.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
             const auth_id = cx.rctx.resolveMacro("@request.auth.id") orelse "";
-            var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .ctx = cx, .app = cx.app, .arena = a };
+            var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .ctx = cx };
             // 3. Call handler; map errors -> status+message.
             const out: Out = handler(&req) catch |e| {
                 if (req.failure) |f|
