@@ -141,6 +141,25 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
             }
         }
         if (@hasField(S, "indexes")) col.indexes = buildIndexes(name, spec.indexes);
+        // TTL: `.ttl_field` names an existing date/autodate field as the row's expiry
+        // timestamp (a framework-internal GC reaps expired rows). Validate at comptime:
+        // the field must exist and store an ISO-8601 UTC string (date/autodate) so the
+        // GC's lexical `<=` comparison against strftime('...Z','now') is correct.
+        if (@hasField(S, "ttl_field")) {
+            const tf: []const u8 = spec.ttl_field;
+            var matched: ?schema.FieldType = null;
+            for (frozen_fields) |f| {
+                if (std.mem.eql(u8, f.name, tf)) {
+                    matched = f.fieldType();
+                    break;
+                }
+            }
+            if (matched == null)
+                @compileError("collection '" ++ name ++ "': .ttl_field '" ++ tf ++ "' must name an existing date/autodate field, but no such field exists");
+            if (matched.? != .date and matched.? != .autodate)
+                @compileError("collection '" ++ name ++ "': .ttl_field '" ++ tf ++ "' must name a date/autodate field (got ." ++ @tagName(matched.?) ++ ")");
+            col.options.ttl_field = tf;
+        }
         return col;
     }
 }
@@ -849,6 +868,28 @@ test "buildCollections lowers a literal into collection/field specs" {
 
     // field ids are stable + 8 chars
     try std.testing.expectEqual(@as(usize, 8), listings.fields[0].id.len);
+}
+
+test "buildCollection lowers .ttl_field naming a date/autodate field into options" {
+    const specs = comptime buildCollections(.{
+        .sessions = .{ .fields = .{
+            .{ .name = "token", .type = .text },
+            .{ .name = "expires_at", .type = .date },
+        }, .ttl_field = "expires_at" },
+        .events = .{ .fields = .{
+            .{ .name = "kind", .type = .text },
+            .{ .name = "created_at", .type = .autodate },
+        }, .ttl_field = "created_at" },
+        .plain = .{ .fields = .{
+            .{ .name = "title", .type = .text },
+        } },
+    });
+    try std.testing.expect(specs[0].options.ttl_field != null);
+    try std.testing.expectEqualStrings("expires_at", specs[0].options.ttl_field.?);
+    try std.testing.expect(specs[1].options.ttl_field != null);
+    try std.testing.expectEqualStrings("created_at", specs[1].options.ttl_field.?);
+    // a collection without .ttl_field leaves it null
+    try std.testing.expect(specs[2].options.ttl_field == null);
 }
 
 test "buildCollections lowers a large schema without exhausting the comptime branch budget" {
