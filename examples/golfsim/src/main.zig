@@ -16,7 +16,8 @@
 //!      their own booking (403 when called by anyone else).
 //!   4. A custom route `GET /api/listings/:id/availability` that returns all
 //!      non-cancelled bookings for a listing so the frontend can render an
-//!      availability calendar.
+//!      availability calendar. Uses `ev.caps().records().list()` — reader is
+//!      lazily acquired and released via `ctx.deinit()`, no manual pool wiring.
 //!   5. A DB-touching interval cron job that opens a `Data` from the pool and
 //!      expires stale pending holds.
 //!   6. A trivial public smoke route `GET /api/golfsim/health`.
@@ -230,39 +231,40 @@ fn cancelBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 // 4. Custom route: GET /api/listings/:id/availability  (auth required).
 //
 //    Returns all non-cancelled bookings for the listing so the frontend can
-//    render an availability calendar. Acquires a pooled READER directly (this is
-//    a read-only path). Output is `std.json.Value` so the exact `{"items":[...]}`
-//    body is preserved byte-for-byte (including an empty `{"items":[]}`).
+//    render an availability calendar. Demonstrates ev.caps().records().list():
+//    the reader is lazily checked out and released via ctx.deinit(), replacing
+//    the manual pool acquire/release and Data construction from the old version.
+//    Output: `{"items":[...]}` (identical wire shape, including an empty array).
 // ---------------------------------------------------------------------------
-fn listingAvailability(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
-    const id = req.param("id") orelse return req.fail(400, "Missing listing id.");
+fn listingAvailability(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    var ctx = ev.caps();
+    defer ctx.deinit(); // releases the lazily-acquired reader
+
+    const id = ev.ctx.param("id") orelse
+        return ctx.errorResponse(ctx.fail(400, "Missing listing id."));
     // The id is interpolated into the filter below — validate it first so a
     // crafted id cannot inject filter syntax.
-    if (!isSafeId(id)) return req.fail(400, "Invalid listing id.");
+    if (!isSafeId(id))
+        return ctx.errorResponse(ctx.fail(400, "Invalid listing id."));
 
-    const app: *zigbase.Runtime = @ptrCast(@alignCast(req.app.?));
-
-    // Acquire a pooled, read-only connection and build a reader-bound Data facade.
-    // `acquireReader` returns the connection by value; keep it in a local so its
-    // address is stable for `releaseReader(&conn)` and the Data facade.
-    var conn = app.pool.acquireReader() catch return error.RouteFailed;
-    defer app.pool.releaseReader(&conn);
-    const data = zigbase.Data{ .app = app, .conn = &conn, .io = app.io };
-
+    const arena = ev.ctx.allocator;
     const filter = std.fmt.allocPrint(
-        req.arena.?,
+        arena,
         "listing = \"{s}\" && status != \"cancelled\"",
         .{id},
-    ) catch return error.RouteFailed;
-    const result = data.list("bookings", .{ .filter = filter, .perPage = 200 }) catch return error.RouteFailed;
+    ) catch return ctx.errorResponse(error.OutOfMemory);
 
-    // Build the `{"items":[...]}` wrapper as a JSON Value; the thunk serializes it
-    // to the 200 body (identical wire shape, including an empty array).
-    var arr = std.json.Array.init(req.arena.?);
-    for (result.items) |item| arr.append(item) catch return error.RouteFailed;
+    const result = ctx.records().list("bookings", .{ .filter = filter, .perPage = 200 }) catch |err|
+        return ctx.errorResponse(err);
+
+    // Build the `{"items":[...]}` wrapper and serialize it to the 200 body.
+    var arr = std.json.Array.init(arena);
+    for (result.items) |item| arr.append(item) catch return ctx.errorResponse(error.OutOfMemory);
     var obj: std.json.ObjectMap = .empty;
-    obj.put(req.arena.?, "items", .{ .array = arr }) catch return error.RouteFailed;
-    return .{ .object = obj };
+    obj.put(arena, "items", .{ .array = arr }) catch return ctx.errorResponse(error.OutOfMemory);
+    const body = std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = obj }, .{}) catch
+        return ctx.errorResponse(error.OutOfMemory);
+    return .{ .status = 200, .body = body };
 }
 
 // ---------------------------------------------------------------------------

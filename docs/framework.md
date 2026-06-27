@@ -362,6 +362,124 @@ Untyped routes (the raw `fn(*zigbase.RouteEvent) anyerror!zigbase.http.Response`
 
 See the [TypeScript SDK docs](typescript-sdk.md#typed-rpc--zbrpc) and `examples/golfsim/` for the full worked example.
 
+## 5b. Handler capabilities (`ctx`)
+
+Every handler type — route, hook, and job — exposes `ev.caps()`, which returns a `Ctx`
+capability object. It provides curated DB access, an outbound HTTP client, and a standard
+error model, without manually acquiring connections from the pool.
+
+### `ctx.records()` — records access
+
+`ev.caps().records()` returns a `Records` handle. For reads it lazily checks out and
+caches a pooled reader (released on `ctx.deinit()`); write methods (`create`/`update`/`delete`)
+acquire the pool writer and release it per-call. Always `defer ctx.deinit()` in the handler:
+
+```zig
+fn listingAvailability(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    var ctx = ev.caps();
+    defer ctx.deinit(); // releases the lazily-acquired reader
+
+    const filter = try std.fmt.allocPrint(ev.ctx.allocator,
+        "listing = \"{s}\" && status != \"cancelled\"", .{id});
+
+    const result = try ctx.records().list("bookings", .{ .filter = filter, .perPage = 200 });
+    // result.items: []std.json.Value  |  result.totalItems: ?u64
+    // ...
+}
+```
+
+Available `Records` methods:
+
+| Method | Notes |
+| --- | --- |
+| `list(col, opts) !ListResult` | `opts`: `filter`, `sort`, `page`, `perPage`, `limit`, `cursor`, `expand` |
+| `get(col, id, opts) !?Value` | `opts`: `expand`; returns `null` for a missing record |
+| `create(col, value) !Value` | acquires + releases the pool writer |
+| `update(col, id, value) !?Value` | acquires + releases the pool writer |
+| `delete(col, id) !bool` | acquires + releases the pool writer |
+
+**Expanding relations** — pass `.expand` in opts to inline related records under an `"expand"` key:
+
+```zig
+// get a post and expand its author relation
+const post = (try ctx.records().get("posts", id, .{ .expand = "author" })).?;
+const author_name = post.object.get("expand").?.object.get("author").?.object.get("name").?.string;
+
+// list with expand
+const page = try ctx.records().list("posts", .{
+    .filter = "status = \"published\"",
+    .sort = "-created",
+    .perPage = 50,
+    .expand = "author",
+});
+```
+
+### `ctx.http()` — outbound HTTP client
+
+Returns an `HttpClient` bound to the Ctx's arena and the app's `io`:
+
+```zig
+var ctx = ev.caps();
+defer ctx.deinit();
+const client = ctx.http();
+
+const res = try client.get("https://api.example.com/data");
+// res: HttpResponse{ status: u16, headers: []const Header, body: []const u8 }
+
+const res2 = try client.post("https://webhook.example.com/notify", .{
+    .body = "{\"event\":\"booking_confirmed\"}",
+    .headers = &.{ .{ .name = "Content-Type", .value = "application/json" } },
+});
+```
+
+### Error helpers (`ctx.fail`, `ctx.invalid`, `ctx.errorResponse`)
+
+For untyped `RouteEvent` handlers, use the Ctx helpers to produce standard error responses
+rather than building raw HTTP error responses by hand:
+
+```zig
+fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+    var ctx = ev.caps();
+    defer ctx.deinit();
+
+    const id = ev.ctx.param("id") orelse
+        return ctx.errorResponse(ctx.fail(400, "Missing booking id."));
+
+    const booking = (try ctx.records().get("bookings", id, .{})) orelse
+        return ctx.errorResponse(error.NotFound);
+
+    if (!isOwner(ev.rctx, booking))
+        return ctx.errorResponse(ctx.fail(403, "Not the owner."));
+
+    // ... update booking ...
+}
+```
+
+`ctx.fail(status, message)` stashes the error and returns `error.Handled`.
+`ctx.errorResponse(err)` maps any error to a `{code, message, data}` JSON response:
+
+| `anyerror` | HTTP status |
+| --- | --- |
+| `error.Handled` | renders the stashed `ctx.fail` / `ctx.invalid` error |
+| `error.NotFound` | 404 |
+| `error.Forbidden` | 403 |
+| `error.Unauthorized` | 401 |
+| `error.BadRequest` | 400 |
+| `error.Conflict` | 409 |
+| anything else | 500 (no detail leaked) |
+
+`ctx.invalid(fields)` stashes a 400 validation error with per-field detail:
+
+```zig
+return ctx.errorResponse(ctx.invalid(&.{
+    .{ .field = "email", .code = "invalid", .message = "Must be a valid email." },
+}));
+```
+
+> **In a `before*` hook**, `ev.caps()` binds to the hook's in-transaction connection and
+> never acquires from the pool. The hook's `ev.data` facade is still the idiomatic API for
+> data access in hooks; `ev.caps()` shines in route and job handlers.
+
 ## 6. Auth / file / lifecycle events
 
 One handler each, registered by the matching config key:
