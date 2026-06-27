@@ -275,11 +275,26 @@ pub const Records = struct {
     }
 };
 
-/// Session-management namespace (`ctx.auth()`). The first verb mirrors `issueSession`:
-/// `clearSession` returns the cleared session cookies built from the framework's own
-/// cookie policy (`session.zig`), so a logout handler is one line and can never drift
-/// from the built-in `authLogout`. refresh/rotate/list-active/revoke are designed and
-/// deferred (see the Theme D spec).
+/// Session-management namespace (`ctx.auth()`). Full shipped surface (PRs #111/#112):
+///
+/// - `clearSession`       — return the cleared `zb_auth`+`zb_csrf` cookies; a logout
+///                          handler is a single `return .{ .cookies = try ctx.auth().clearSession() }`.
+/// - `revokeAllSessions`  — bump the principal's `token_epoch` so every outstanding
+///                          token stops verifying immediately; in table mode also wipes
+///                          the principal's `_sessions` rows ("log out everywhere").
+/// - `refresh`            — re-mint a session token (new `exp`, same epoch, sliding
+///                          window); in table mode rotates the current device's row.
+///                          Route context only (requires `ctx.request`).
+/// - `rotate`             — bump epoch + mint a fresh token in one step ("rotate
+///                          credentials, keep this device, kill all others"); table mode
+///                          atomically replaces the device row. Route context only.
+/// - `listActiveSessions` — list the principal's active (unexpired) sessions, newest
+///                          first, with `is_current` marked. Requires
+///                          `session_store = .table`; returns `error.SessionStoreNotEnabled`
+///                          in the default `.epoch` mode.
+/// - `revoke(id)`         — revoke ONE session by id ("log out this device"); owner-or-
+///                          superuser only, collapsing non-owner and absent-id into
+///                          `error.NotFound`. Requires `session_store = .table`.
 pub const AuthApi = struct {
     ctx: *Ctx,
 
