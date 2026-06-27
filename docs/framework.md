@@ -454,6 +454,62 @@ const res2 = try client.post("https://webhook.example.com/notify", .{
 });
 ```
 
+### Test-mode capture — assert sent mail + mock outbound HTTP (`zigbase.testcapture`)
+
+For deterministic e2e/integration tests, the framework can capture what it *sent* — an
+in-memory mail **outbox** and a record of every outbound `ctx.http()` call — and inject
+**canned HTTP responses** instead of hitting the network. It mirrors the determinism seam
+(`ZIGBASE_FAKE_NOW`) and shares the **same comptime gate**: it is compiled in only on a
+`dev_clock` build (on in `Debug`, off in any release build), so a production binary is
+byte-for-byte unaffected — `zigbase.testcapture.enabled` is `comptime false` there, the
+seams fold away, and there is no runtime branch or perf cost. Every API below is a no-op /
+returns empty when the gate is off.
+
+**Mail outbox.** `Mailer.send` (the single seam every backend — Log/SMTP/Command/your own
+plugin — routes through) records each email when capture is on:
+
+```zig
+const tc = zigbase.testcapture;
+tc.mail.enable(true);     // capture + SUPPRESS real delivery (deterministic e2e mode)
+defer tc.mail.reset();    // clear + free
+
+// ... trigger a flow that sends mail (signup verification, password reset, your route) ...
+
+try expectEqual(@as(usize, 1), tc.mail.count());
+const e = tc.mail.get(0).?;               // { from, to, subject, body }
+try expectEqualStrings("user@example.com", e.to);
+try expect(tc.mail.find("Verify") != null);
+```
+
+`mail.enable(suppress)`: `suppress = true` records and skips real delivery; `false` records
+**and** still delivers (assert against a live MailHog/log run). `from` is the backend's
+configured sender (empty for `LogMailer`, which has none).
+
+**HTTP capture / mock.** `HttpClient.request` (what `ctx.http()` returns) consults the
+capture before touching the network — recording the request and, if a mock matches the URL
+substring, returning the canned response with **no network at all**:
+
+```zig
+tc.http.enable(true);     // capture; block_unmocked=true → un-mocked URLs error (no network)
+defer tc.http.reset();
+tc.http.mock("api.stripe.com", .{
+    .status = 200,
+    .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    .body = "{\"id\":\"ch_123\",\"paid\":true}",
+});
+
+// ... trigger a route/hook that calls ctx.http().post("https://api.stripe.com/...") ...
+
+try expectEqual(@as(usize, 1), tc.http.requestCount());
+const rq = tc.http.requestAt(0).?;        // { method, url, headers, body }
+try expectEqual(zigbase.HttpMethod.POST, rq.method);
+```
+
+`http.enable(block_unmocked)`: with `block_unmocked = true` (recommended) a request to an
+un-mocked URL fails with `error.TransportFailed` rather than silently hitting the network;
+`false` lets un-mocked URLs pass through to the real network. Mocked responses are matched
+newest-registration-first on URL substring.
+
 ### Error helpers (`ctx.fail`, `ctx.invalid`, `ctx.errorResponse`)
 
 For untyped route handlers, use the Ctx helpers to produce standard error responses
@@ -616,6 +672,8 @@ the KV store (every endpoint requires a valid superuser token):
 | `GET /api/settings/:key` | Fetch one (`{key,value}`); 404 if absent. |
 | `PUT /api/settings/:key` | Upsert; body `{"value":"…"}`. |
 | `DELETE /api/settings/:key` | Remove; 204, or 404 if absent. |
+
+The embedded admin UI also exposes these endpoints as a "Settings / Feature Flags" section where superusers can view, create, edit, delete entries, and toggle boolean flags with a checkbox — no API client required.
 
 This is the management plane; the public read plane is whatever custom route you choose
 to expose (above).
@@ -1268,20 +1326,22 @@ Semantics:
 
 - `.ttl_field` must name a field declared on the **same collection** and of type
   `.date` or `.autodate` — anything else is a **compile error** (those types hold an
-  ISO-8601 instant). The TTL GC normalizes both sides via SQLite `strftime(...)`
-  before comparing, so non-canonical `.date` values (timezone offsets, space
-  separator, date-only) are handled correctly — do not assume lexical comparison.
+  ISO-8601 instant). Both the read-exclusion predicate and the GC normalize both
+  sides via SQLite `strftime(...)` before comparing, so non-canonical `.date` values
+  (timezone offsets, space separator, date-only) are handled correctly — do not
+  assume lexical comparison.
 - A row is reaped when its ttl value is **non-null and at/before "now"**. A row
   whose ttl field is `null` never expires (so an optional, never-set expiry is a
-  permanent row).
-- The sweep runs **once at startup** and then on a **5-minute interval** (a
-  framework-internal job named `_ttl_gc`; see §7). Declaring a TTL collection
-  starts the scheduler even if you have no `.cron` of your own.
-- This is **eventually consistent**: a just-expired row can still be returned by a
-  query in the up-to-5-minute window before the next sweep. Reads are *not*
-  filtered by expiry; the GC is the only reaper. If you need a hard
-  read-time guarantee, add an explicit `expires_at > @now`-style filter in your
-  rule/query (a built-in read-time exclusion is not implemented).
+  permanent row). A row with an unparseable ttl value is treated the same as `null`
+  — fail-safe: it remains visible and is never reaped by the GC.
+- **Read-time exclusion**: expired rows are **automatically hidden from every read**
+  (list and get, via the HTTP API, `ctx.records()`, and relation expand). The
+  predicate is ANDed with your filter, access rule, and keyset cursor, so it composes
+  transparently. You do not need to add a manual `expires_at > @now` filter.
+- The GC sweep still runs **once at startup** and then on a **5-minute interval**
+  (framework-internal job `_ttl_gc`; see §7), deleting expired rows so the table does
+  not grow unboundedly. Declaring a TTL collection starts the scheduler even if you
+  have no `.cron` of your own.
 - With an `.autodate` ttl field, prefer one whose value you set explicitly to the
   intended expiry (autodate defaults to write-on-create "now", which would expire
   the row immediately).
@@ -1652,6 +1712,64 @@ a **fatal startup error** naming the path.
 
 See [examples/blog/](../examples/blog/) (runtime flag), [examples/golfsim/](../examples/golfsim/)
 (hardcoded dir), and [examples/plugins/](../examples/plugins/) (embedded).
+
+## 14. Test / dev-mode determinism seams
+
+Two env vars (dev builds only) make a test suite reproducible. Both are compiled out
+entirely in production — a release binary never reads either var.
+
+### Freezing time: `ZIGBASE_FAKE_NOW`
+
+Set `ZIGBASE_FAKE_NOW` to an ISO-8601 UTC instant (e.g. `2029-03-07T16:00:00Z`) to
+freeze the framework's clock for the lifetime of the process. Every framework-controlled
+timestamp routes through the seam:
+
+- Token `iat` / `exp` (JWT auth tokens).
+- The scheduler's next-fire math (cron / interval jobs).
+- Auth rate-limiter wall clock.
+- Auth-challenge and keyset-cursor TTL/expiry checks.
+- A consumer's own `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')` /
+  `date('now')` / `time('now')` / `julianday('now')` in raw SQL — those date/time
+  functions are shadowed on every connection and resolve to the frozen instant when a
+  freeze is active.
+
+```sh
+ZIGBASE_FAKE_NOW="2029-03-07T16:00:00Z" ./zigbase serve ...
+```
+
+**Not covered:** `CURRENT_TIMESTAMP` / `CURRENT_TIME` / `CURRENT_DATE` and SQLite
+column `DEFAULT` timestamps — these are SQL keywords that read SQLite's time directly
+and cannot be overridden via a user-defined function.
+
+### Seeding entropy: `ZIGBASE_FAKE_SEED`
+
+Set `ZIGBASE_FAKE_SEED` to a decimal `u64` (e.g. `12345`) to plant a deterministic
+Xoshiro256++ PRNG as the entropy source for ID/token generation. Every record ID,
+field ID, and token key generated in the process comes from that seeded PRNG instead of
+the OS CSPRNG, so two runs with the same seed produce byte-for-byte identical IDs and
+tokens — useful for snapshot tests.
+
+```sh
+ZIGBASE_FAKE_SEED=12345 ./zigbase serve ...
+```
+
+The seam routes through `src/id.generate`, covering:
+- Collection IDs and field IDs (provisioning, record creates).
+- `tokenKey` per auth record and the OAuth2 CSRF state value.
+
+Other randomness (AEAD nonces, OTP digits, WebAuthn challenges) is **not** routed
+through this seam — those are security-critical at runtime and seeding them is unsafe.
+
+### Production gate
+
+Both seams are compiled in ONLY when the `dev_clock` build option is `true` (the
+default in `Debug` builds). The release script forces `-Ddev-clock=false` for all
+shipped binaries, so a production binary has the override code comptime-eliminated:
+
+- `ZIGBASE_FAKE_NOW` is never read; the clock always returns wall time.
+- `ZIGBASE_FAKE_SEED` is never read; ID/token generation always uses the OS CSPRNG.
+
+You can also force the prod-safe behavior explicitly: `zig build -Ddev-clock=false`.
 
 ## Exported names reference
 
