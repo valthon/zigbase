@@ -391,6 +391,37 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     try rec.put(ev.arena, "author", .{ .string = author_dup });
 }
 
+/// beforeCreate hook on `holds` — stamps the TTL field SERVER-SIDE. A "hold" is an
+/// ephemeral soft-reservation that must auto-expire; trusting a client-supplied
+/// `expires_at` would let a caller pin a hold forever (and is the exact mismatched-
+/// timezone surface ZigBase's instant-aware TTL GC guards against). So we ignore any
+/// client value and stamp `expires_at = now + 15m` (canonical UTC), plus the guest
+/// from the authenticated identity. The framework's `_ttl_gc` job then reaps the row
+/// once it expires — no cron of our own.
+const hold_ttl_seconds: i64 = 15 * 60;
+
+fn prepareHold(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    if (ev.record.* != .object) return error.InvalidHold;
+    const rec = &ev.record.object;
+
+    // Server-authoritative guest = the authenticated identity (overwrites client input).
+    var guest_id: ?[]const u8 = null;
+    if (ev.ctx.auth) |auth| if (auth == .object) {
+        if (auth.object.get("id")) |idv| if (idv == .string) {
+            guest_id = idv.string;
+        };
+    };
+    const guest = guest_id orelse return error.Unauthenticated;
+    try rec.put(ev.arena, "guest", .{ .string = try ev.arena.dupe(u8, guest) });
+
+    // Server-stamped expiry (now + 15m), ignoring any client-supplied expires_at.
+    // Wall-clock "now" comes from the app's std.Io (Zig 0.16 has no std.time.timestamp()).
+    const ts = std.Io.Timestamp.now(ctx.app.io, .real);
+    const now_s: i64 = @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+    const expires_at = try isoFromEpoch(ev.arena, now_s + hold_ttl_seconds);
+    try rec.put(ev.arena, "expires_at", .{ .string = expires_at });
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -459,6 +490,30 @@ fn epochSeconds(ts: []const u8) !i64 {
     return days * 86400 + hour * 3600 + minute * 60 + second;
 }
 
+/// Format a unix epoch (seconds) as a canonical `YYYY-MM-DDTHH:MM:SSZ` UTC string —
+/// the inverse of `epochSeconds`, using Howard Hinnant's civil_from_days. Allocated
+/// with `alloc` (pass `ev.arena` from a hook). The canonical trailing `Z` form is what
+/// ZigBase's TTL GC and date validators expect.
+fn isoFromEpoch(alloc: std.mem.Allocator, secs: i64) ![]u8 {
+    const days = @divFloor(secs, 86400);
+    const rem = secs - days * 86400; // 0..86399
+    const hour = @divTrunc(rem, 3600);
+    const minute = @divTrunc(@mod(rem, 3600), 60);
+    const second = @mod(rem, 60);
+    // civil_from_days (Hinnant)
+    const z = days + 719468;
+    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe = z - era * 146097; // 0..146096
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365); // 0..399
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100)); // 0..365
+    const mp = @divFloor(5 * doy + 2, 153); // 0..11
+    const day = doy - @divFloor(153 * mp + 2, 5) + 1; // 1..31
+    const month = if (mp < 10) mp + 3 else mp - 9; // 1..12
+    const year = if (month <= 2) y + 1 else y;
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{ year, month, day, hour, minute, second });
+}
+
 // ---------------------------------------------------------------------------
 // App wiring
 // ---------------------------------------------------------------------------
@@ -466,6 +521,7 @@ pub const App = zigbase.App(.{
         .hooks = .{
             .bookings = .{ .beforeCreate = prepareBooking },
             .reviews = .{ .beforeCreate = prepareReview },
+            .holds = .{ .beforeCreate = prepareHold },
         },
         .routes = .{
             .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
@@ -632,7 +688,8 @@ pub const App = zigbase.App(.{
             // not converted to a booking. Declaring `.ttl_field = "expires_at"` lets the
             // framework's internal `_ttl_gc` job delete expired holds automatically (once at
             // startup, then every 5 minutes) — no cron of our own. `expires_at` is a `date`
-            // (ISO-8601 UTC) the create flow would set to now+15m.
+            // (ISO-8601 UTC) the `prepareHold` beforeCreate hook stamps SERVER-SIDE to now+15m
+            // (any client-supplied value is ignored), so a caller can't pin a hold forever.
             .holds = .{
                 .fields = .{
                     .{ .name = "listing", .type = .relation, .target = "listings", .required = true, .cascadeDelete = true },

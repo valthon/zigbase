@@ -53,6 +53,12 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 - **`app.submit` runs ad-hoc tasks on a detached thread** that is not joined at shutdown; a
   task submitted right before shutdown may be cut off. (Cron jobs use the bounded, cleanly
   joined pool.)
+- **TTL record expiry is eventually consistent (~5 minutes).** A collection's `.ttl_field` is
+  reaped by an internal GC job that runs once at startup and then **every 5 minutes**; the
+  interval is not tunable. Reads are **not** filtered by expiry — a just-expired row can still
+  be returned by a query in the window before the next sweep. For a hard read-time guarantee,
+  add an explicit `expires_at > @now`-style filter to your rule/query (a built-in read-time
+  exclusion is not implemented).
 
 ## Testing & determinism
 

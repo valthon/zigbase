@@ -682,6 +682,20 @@ pub fn ensureCollection(
         }
     }
 
+    // TTL: a `.ttl_field` newly added to (or changed on) an EXISTING collection must
+    // be persisted, else the GC never sees it. Compare the spec's ttl_field against
+    // the live one and, if it differs, force an update (narrowly — we only carry the
+    // ttl_field across below, never wholesale-copying spec.options, which would clobber
+    // persisted OAuth secrets).
+    const ttl_differs = blk: {
+        const a = spec.options.ttl_field;
+        const b = live.options.ttl_field;
+        if (a == null and b == null) break :blk false;
+        if (a == null or b == null) break :blk true;
+        break :blk !std.mem.eql(u8, a.?, b.?);
+    };
+    if (ttl_differs) changed = true;
+
     if (!changed) return; // idempotent no-op
 
     // Additive auto-migration: rebuild the table with the union of live + new
@@ -704,6 +718,9 @@ pub fn ensureCollection(
     newdef.createRule = spec.createRule orelse live.createRule;
     newdef.updateRule = spec.updateRule orelse live.updateRule;
     newdef.deleteRule = spec.deleteRule orelse live.deleteRule;
+    // Carry the (possibly newly-set) ttl_field; keep the rest of live.options
+    // (e.g. persisted OAuth secrets) untouched by NOT copying spec.options wholesale.
+    newdef.options.ttl_field = spec.options.ttl_field;
     _ = try collections.update(alloc, io, w, live.id, newdef);
     std.log.info("provision: collection '{s}' added {d} field(s)", .{ spec.name, additions.items.len });
 }
@@ -1050,6 +1067,44 @@ test "applySpecs additively adds a new field (auto-migration), preserving data" 
     try std.testing.expect(try st.step());
     try std.testing.expectEqualStrings("hello", st.columnText(0)); // data preserved
     try std.testing.expect(st.isNull(1)); // new column, null for old row
+}
+
+test "applySpecs persists a ttl_field added to an existing collection (then GC reaps)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // v1: a collection with a date field but NO ttl_field.
+    const fields = [_]schema.Field{
+        .{ .id = "f_tok", .name = "token", .options = .{ .text = .{} } },
+        .{ .id = "f_exp", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    const s1 = [_]schema.Collection{.{ .id = "", .name = "sessions", .fields = &fields }};
+    try applySpecs(a, std.testing.io, &d, &s1);
+    try d.exec("INSERT INTO \"sessions\" (\"id\",\"created\",\"updated\",\"token\",\"expires_at\") VALUES ('s1','','','t','2000-01-01T00:00:00Z');");
+
+    // Before: ttl_field not set, GC reaps nothing.
+    try std.testing.expect((try collections.get(a, &d, "sessions")).?.options.ttl_field == null);
+    try std.testing.expectEqual(@as(usize, 0), try @import("records.zig").gcExpiredRecords(a, &d));
+
+    // v2: same fields, now declaring .ttl_field — must be persisted by re-provisioning.
+    const s2 = [_]schema.Collection{.{ .id = "", .name = "sessions", .fields = &fields, .options = .{ .ttl_field = "expires_at" } }};
+    try applySpecs(a, std.testing.io, &d, &s2);
+
+    // The persisted options blob now carries the ttl_field...
+    const live = (try collections.get(a, &d, "sessions")).?;
+    try std.testing.expect(live.options.ttl_field != null);
+    try std.testing.expectEqualStrings("expires_at", live.options.ttl_field.?);
+
+    // ...and the GC now reaps the expired row.
+    try std.testing.expectEqual(@as(usize, 1), try @import("records.zig").gcExpiredRecords(a, &d));
+    var st = try d.prepare("SELECT COUNT(*) FROM \"sessions\";");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
 }
 
 test "applySpecs logs+skips a destructive type change (does not destroy data)" {

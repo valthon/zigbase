@@ -1291,6 +1291,56 @@ test "gcExpiredRecords deletes past rows, keeps future rows, ignores non-ttl col
     try std.testing.expectEqual(@as(i64, 1), try Counter.count(&d, "SELECT COUNT(*) FROM posts;"));
 }
 
+test "gcExpiredRecords compares ttl as an instant, not lexically (offsets/date-only/space)" {
+    // Regression: `.date` values are stored RAW and the validator accepts non-canonical
+    // ISO-8601 (offsets, date-only, space separator). A naive lexical `tf <= '...Z'`
+    // wrongly reaps a FUTURE instant whose literal sorts before "now" (e.g. a negative
+    // UTC offset: '-' < 'Z'). The GC normalizes both sides via strftime, so it compares
+    // true instants.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "label", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tokens", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
+
+    // KEPT — future instant whose literal sorts BEFORE "now" (the exact lexical-vs-instant
+    // bug). Built in SQL relative to now: a wall-clock literal one minute in the past (so it
+    // is lexically < the canonical "...Z" now) but tagged -05:00, making the INSTANT now+~5h.
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('future_neg','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a', strftime('%Y-%m-%dT%H:%M:%S','now','-1 minute') || '-05:00');");
+    // KEPT — canonical far-future Z (sanity that the canonical path is unchanged).
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('future_z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
+    // KEPT — unparseable garbage: strftime -> NULL -> NULL <= x -> NULL -> not deleted (fail-safe).
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('garbage','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','c','not-a-date');");
+    // DELETED — genuinely-past non-canonical forms: positive-offset, date-only, space-separated.
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('past_offset','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','d','2000-01-01T00:00:00+05:00');");
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('past_dateonly','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','e','2000-01-01');");
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('past_space','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','f','2000-01-01 00:00:00');");
+
+    const deleted = try gcExpiredRecords(a, &d);
+    try std.testing.expectEqual(@as(usize, 3), deleted);
+
+    const C = struct {
+        fn n(dd: *db.Db, sql: [:0]const u8) !i64 {
+            var st = try dd.prepare(sql);
+            defer st.finalize();
+            _ = try st.step();
+            return st.columnInt(0);
+        }
+    };
+    // future/garbage rows survive
+    try std.testing.expectEqual(@as(i64, 1), try C.n(&d, "SELECT COUNT(*) FROM tokens WHERE id='future_neg';"));
+    try std.testing.expectEqual(@as(i64, 1), try C.n(&d, "SELECT COUNT(*) FROM tokens WHERE id='future_z';"));
+    try std.testing.expectEqual(@as(i64, 1), try C.n(&d, "SELECT COUNT(*) FROM tokens WHERE id='garbage';"));
+    // past non-canonical forms reaped
+    try std.testing.expectEqual(@as(i64, 0), try C.n(&d, "SELECT COUNT(*) FROM tokens WHERE id IN ('past_offset','past_dateonly','past_space');"));
+}
+
 /// GC: delete rows whose `ttl_field` timestamp is at/before "now" across every
 /// collection that opts into TTL (`options.ttl_field != null`). Returns the total
 /// number of rows deleted. Safe to call periodically (the framework-internal
@@ -1302,10 +1352,16 @@ test "gcExpiredRecords deletes past rows, keeps future rows, ignores non-ttl col
 /// The comptime `.collections` path already guarantees valid names, but a
 /// hand-crafted `_collections` row must not be trusted.
 ///
-/// The expiry comparison uses `strftime('%Y-%m-%dT%H:%M:%SZ','now')` — byte-identical
-/// to how autodate columns are written — so the lexical `<=` over fixed-width ISO-8601
-/// UTC strings is correct. `IS NOT NULL` keeps an unset (optional) ttl column from
-/// being reaped as if already expired.
+/// Both sides of the comparison are normalized to a canonical UTC instant via
+/// `strftime('%Y-%m-%dT%H:%M:%SZ', x)` BEFORE comparing. This matters because a
+/// `.date` value is stored RAW (whatever the writer bound) and the validator accepts
+/// non-canonical ISO-8601 forms — `±HH:MM` offsets, fractional seconds, a space
+/// separator, or date-only. A future instant written with a negative offset (e.g.
+/// `"2026-06-27T12:00:00-05:00"`, i.e. 17:00Z) sorts LEXICALLY before `"…Z"` and
+/// would be wrongly reaped by a raw string `<=`. Letting SQLite parse both sides as
+/// instants fixes that. `strftime` returns NULL for unparseable input, so a garbage
+/// ttl value yields `NULL <= x` → NULL → the row is NOT deleted (fail-safe). The
+/// outer `IS NOT NULL` keeps an unset (optional) ttl column from ever being reaped.
 pub fn gcExpiredRecords(alloc: std.mem.Allocator, w: *db.Db) !usize {
     const cols = try collections.list(alloc, w);
     var total: usize = 0;
@@ -1313,7 +1369,7 @@ pub fn gcExpiredRecords(alloc: std.mem.Allocator, w: *db.Db) !usize {
         const tf = col.options.ttl_field orelse continue;
         if (!schema.isValidIdentifier(col.name)) continue;
         if (!schema.isValidIdentifier(tf)) continue;
-        const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND \"{s}\" <= strftime('%Y-%m-%dT%H:%M:%SZ','now');", .{ col.name, tf, tf }, 0);
+        const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\") <= strftime('%Y-%m-%dT%H:%M:%SZ','now');", .{ col.name, tf, tf }, 0);
         var st = try w.prepare(sql);
         defer st.finalize();
         _ = try st.step();
