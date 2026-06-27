@@ -52,6 +52,9 @@ pub const Migration = @import("provision.zig").Migration;
 // build.zig embedStaticDir) and of `.static_files = .{ .embedded = ... }`.
 pub const StaticFile = @import("static_files.zig").StaticFile;
 
+// ---- Ctx capability object -------------------------------------------------
+pub const Ctx = @import("ctx.zig").Ctx;
+
 // ---- Auth helper surface (consumer-facing magic-link building blocks) ------
 pub const auth = @import("auth_helpers.zig");
 
@@ -184,4 +187,5 @@ test {
     _ = @import("api/webauthn_register.zig");
     _ = @import("clock.zig");
     _ = @import("clock_test.zig");
+    _ = @import("ctx.zig");
 }
