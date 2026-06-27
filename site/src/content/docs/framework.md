@@ -36,6 +36,9 @@ validated when your program compiles:
 - A typo'd hook phase (e.g. `.beforeCreat`) is a **compile error**.
 - A route or job spec missing a required field, or with a wrong-typed handler, is a
   **compile error**.
+- An unknown key on a `.collections` collection or field spec (e.g. `.requied`,
+  `.encrypte`, `.ttl_filed`, or a misspelled rule under `.rules`) is a
+  **compile error** — the message lists the recognized keys for that spec.
 
 So a misconfigured extension never reaches runtime — it fails the build loudly.
 
@@ -1268,6 +1271,10 @@ JWT secret it is **never auto-generated, persisted, or logged** — losing or
 rotating it determines whether the data is recoverable, so you must manage it.
 If any collection declares an `.encrypted` field and `ZIGBASE_FIELD_KEY` is unset,
 **the server refuses to start** (fail-closed — it never silently stores plaintext).
+This holds for both comptime `.collections` and collections created at **runtime**
+(via the admin/collections API): startup scans the live database schema after
+provisioning, so a restart without the key is refused even for a runtime-added
+encrypted field.
 
 **Constraints (enforced).** Encrypted values are per-row-nonce ciphertext, so they
 cannot be indexed, marked `.unique`, or used in a `?filter`/`?sort`:

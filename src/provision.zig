@@ -89,6 +89,85 @@ pub fn buildCollections(comptime cfg: anytype) []const schema.Collection {
     }
 }
 
+/// Comma-joined `.key` list for a friendly @compileError message.
+fn keyList(comptime allowed: []const []const u8) []const u8 {
+    comptime {
+        var msg: []const u8 = "";
+        for (allowed, 0..) |a, i| msg = msg ++ (if (i == 0) "" else ", ") ++ "." ++ a;
+        return msg;
+    }
+}
+
+/// Fail loud on a typo'd key. For each declared field of the struct literal `spec`,
+/// `@compileError` if its name is not in `allowed`. Mirrors the unknown-key gates in
+/// `events.validateHooks` / `events.validateRouteSpecs`: a misspelled option (e.g.
+/// `.requied`, `.ttl_filed`, `.viewRul`) would otherwise be SILENTLY IGNORED because the
+/// builders read keys via `@hasField`. `what` describes the spec for the message.
+/// Non-struct specs are left to the existing shape checks (which produce their own error).
+fn rejectUnknownKeys(comptime spec: anytype, comptime allowed: []const []const u8, comptime what: []const u8) void {
+    comptime {
+        const info = @typeInfo(@TypeOf(spec));
+        if (info != .@"struct") return;
+        for (info.@"struct".fields) |fld| {
+            var ok = false;
+            for (allowed) |a| {
+                if (std.mem.eql(u8, fld.name, a)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok)
+                @compileError(what ++ ": unknown key '." ++ fld.name ++ "' (recognized keys: " ++ keyList(allowed) ++ ")");
+        }
+    }
+}
+
+/// Field keys read by `buildOptions` for a given field type, on top of the common
+/// keys handled in `buildField` (name/type/required/unique/hidden/encrypted). Kept in
+/// lock-step with the `switch (ftype)` in `buildOptions` — a key read there must appear
+/// here or a valid spec would falsely @compileError.
+fn fieldOptionKeys(comptime ftype: schema.FieldType) []const []const u8 {
+    return switch (ftype) {
+        .text => &.{ "min", "max", "pattern" },
+        .email => &.{},
+        .url => &.{},
+        .editor => &.{},
+        .date => &.{ "min", "max" },
+        .autodate => &.{ "onCreate", "onUpdate" },
+        .@"bool" => &.{},
+        .number => &.{ "mode", "scale", "min", "max" },
+        .json => &.{"maxSize"},
+        .select => &.{ "values", "maxSelect" },
+        .relation => &.{ "target", "cascadeDelete", "minSelect", "maxSelect" },
+        .file => &.{ "maxSelect", "maxSize", "mimeTypes" },
+    };
+}
+
+/// Field-key gate: a field literal's allowed keys are the common ones (read in
+/// `buildField`) plus the per-type option keys (`fieldOptionKeys`). Split out from
+/// `rejectUnknownKeys` because the allowed set is two parts and varies by field type.
+fn rejectUnknownFieldKeys(comptime f: anytype, comptime ftype: schema.FieldType, comptime where: []const u8) void {
+    comptime {
+        const info = @typeInfo(@TypeOf(f));
+        if (info != .@"struct") return;
+        const common = [_][]const u8{ "name", "type", "required", "unique", "hidden", "encrypted" };
+        const opt = fieldOptionKeys(ftype);
+        for (info.@"struct".fields) |fld| {
+            var ok = false;
+            for (common) |a| {
+                if (std.mem.eql(u8, fld.name, a)) ok = true;
+            }
+            if (!ok) for (opt) |a| {
+                if (std.mem.eql(u8, fld.name, a)) ok = true;
+            };
+            if (!ok) {
+                const opt_msg = if (opt.len == 0) "" else " (+ for type ." ++ @tagName(ftype) ++ ": " ++ keyList(opt) ++ ")";
+                @compileError(where ++ ": unknown key '." ++ fld.name ++ "' (recognized keys: " ++ keyList(&common) ++ opt_msg ++ ")");
+            }
+        }
+    }
+}
+
 fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Collection {
     comptime {
         if (!schema.isValidIdentifier(name))
@@ -96,6 +175,9 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
         const S = @TypeOf(spec);
         const sinfo = @typeInfo(S);
         if (sinfo != .@"struct") @compileError("collection '" ++ name ++ "' must be a struct literal");
+        // Fail loud on an unknown collection-level key (a typo would otherwise be a silent
+        // no-op). These are exactly the keys read below in this function.
+        rejectUnknownKeys(spec, &.{ "type", "fields", "rules", "auth", "indexes", "ttl_field" }, "collection '" ++ name ++ "'");
 
         // collection type (default .base)
         const ctype: schema.CollectionType = if (@hasField(S, "type")) spec.type else .base;
@@ -120,6 +202,7 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
             .fields = &frozen_fields,
         };
         if (@hasField(S, "rules")) {
+            rejectUnknownKeys(spec.rules, &.{ "list", "view", "create", "update", "delete" }, "collection '" ++ name ++ "' .rules");
             const R = @TypeOf(spec.rules);
             if (@hasField(R, "list")) col.listRule = spec.rules.list;
             if (@hasField(R, "view")) col.viewRule = spec.rules.view;
@@ -129,6 +212,7 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
         }
         // auth-specific collection options
         if (@hasField(S, "auth")) {
+            rejectUnknownKeys(spec.auth, &.{ "methods", "require_verified", "oauth2" }, "collection '" ++ name ++ "' .auth");
             const A = @TypeOf(spec.auth);
             if (@hasField(A, "methods")) {
                 col.options.auth.methods = buildMethodsOptions(spec.auth.methods);
@@ -292,6 +376,11 @@ fn buildField(comptime col_name: []const u8, comptime f: anytype) schema.Field {
         if (schema.isSystemFieldName(fname)) @compileError("collection '" ++ col_name ++ "': field name '" ++ fname ++ "' is reserved by the engine (id/created/updated/email/username/passwordHash/tokenKey/verified); pick another name");
         if (!@hasField(F, "type")) @compileError("field '" ++ fname ++ "' in collection '" ++ col_name ++ "' is missing .type");
         const ftype: schema.FieldType = f.type;
+
+        // Fail loud on an unknown field key (a typo like `.requied`/`.encrypte` would
+        // otherwise be silently ignored). Allowed = the common keys read below plus the
+        // per-type option keys read in `buildOptions`.
+        rejectUnknownFieldKeys(f, ftype, "field '" ++ fname ++ "' in collection '" ++ col_name ++ "'");
 
         // A stable field id derived from collection+field name keeps provisioning
         // idempotent (the rebuild path matches columns by field id across runs).
@@ -911,6 +1000,45 @@ test "buildCollections lowers a literal into collection/field specs" {
 
     // field ids are stable + 8 chars
     try std.testing.expectEqual(@as(usize, 8), listings.fields[0].id.len);
+}
+
+test "unknown-key gate (#103): accepts a spec exercising every recognized key, across all field types" {
+    // POSITIVE coverage for the unknown-key @compileError gate: a typo'd key
+    // (e.g. `.requied`, `.encrypte`, `.ttl_filed`, `.viewRul`) is now a comptime error
+    // instead of a silent no-op. A @compileError cannot be asserted at runtime, so this
+    // test instead pins the FULL valid key surface: if a future edit to the gate drops a
+    // legitimate key from the allowed set, THIS spec stops compiling and the test fails to
+    // build — i.e. it guards against the gate becoming over-strict (a false positive on a
+    // valid spec). The negative case (a bad key fails to compile) is verified by building
+    // the stock binary + all three examples in CI; see `rejectUnknownKeys`/`rejectUnknownFieldKeys`.
+    const specs = comptime buildCollections(.{
+        .everything = .{
+            .type = .auth,
+            .fields = .{
+                .{ .name = "t", .type = .text, .required = true, .unique = true, .hidden = true, .min = 1, .max = 10, .pattern = "^x" },
+                .{ .name = "secret", .type = .text, .encrypted = true },
+                .{ .name = "e", .type = .email },
+                .{ .name = "u", .type = .url },
+                .{ .name = "rich", .type = .editor },
+                .{ .name = "d", .type = .date, .min = "2020-01-01", .max = "2030-01-01" },
+                .{ .name = "ad", .type = .autodate, .onCreate = true, .onUpdate = true },
+                .{ .name = "flag", .type = .@"bool" },
+                .{ .name = "n", .type = .number, .mode = .fixed, .scale = 2, .min = 0, .max = 100 },
+                .{ .name = "j", .type = .json, .maxSize = 4096 },
+                .{ .name = "sel", .type = .select, .values = .{ "a", "b" }, .maxSelect = 2 },
+                .{ .name = "rel", .type = .relation, .target = "everything", .cascadeDelete = true, .minSelect = 0, .maxSelect = 3 },
+                .{ .name = "files", .type = .file, .maxSelect = 4, .maxSize = 1024, .mimeTypes = .{"image/png"} },
+            },
+            .rules = .{ .list = "", .view = "", .create = "", .update = "", .delete = "" },
+            .auth = .{ .require_verified = true, .methods = .{ .password = .{} } },
+            .indexes = .{
+                .{ .name = "idx_t", .fields = .{"t"}, .unique = true },
+            },
+            .ttl_field = "d",
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 1), specs.len);
+    try std.testing.expectEqual(@as(usize, 13), specs[0].fields.len);
 }
 
 test "buildCollection lowers .ttl_field naming a date/autodate field into options" {

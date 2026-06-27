@@ -30,6 +30,22 @@ fn anyEncryptedField(cols: []const schema.Collection) bool {
     return false;
 }
 
+/// Startup fail-closed detection for RUNTIME-created encrypted fields (#102). The comptime
+/// guard (`anyEncryptedField` over the `.collections` literal) cannot see a collection
+/// whose encrypted field was created at runtime via the superuser collections API. After
+/// provisioning has settled the live schema, scan the DB-resident collections and return
+/// the name of the first one declaring an encrypted field (or null if none) — the caller
+/// (serveImpl) turns a non-null result into a logged `error.FieldKeyRequired` refusal when
+/// no cipher is configured. The value layer also fails closed on read/write, so plaintext
+/// never leaks; this just turns a silently half-broken server into a loud startup refusal.
+/// The returned slice is owned by `arena`. Logging lives in the caller so this stays a
+/// pure, unit-testable scan (a `.err` log would otherwise fail the test runner).
+fn liveEncryptedCollection(arena: std.mem.Allocator, w: *db.Db) !?[]const u8 {
+    const live = try @import("collections.zig").list(arena, w);
+    for (live) |c| if (schema.hasEncryptedField(c)) return c.name;
+    return null;
+}
+
 // ============================================================================
 // Comptime plugins (storage + mailer)
 // ----------------------------------------------------------------------------
@@ -804,6 +820,23 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             );
             try provision.applySpecs(allocator, io, w, resolved);
         }
+        // Fail-closed for RUNTIME-created encrypted fields (Theme B1, gap #102). The
+        // comptime guard above only sees the `.collections` literal; a collection whose
+        // encrypted field was added at runtime (via the superuser collections API while a
+        // key was set) is invisible to it. Now that provisioning/migrations have run and
+        // the live schema is settled, scan the DB-resident collections: if any declares an
+        // encrypted field but no key is configured, refuse to start rather than serve a
+        // schema whose ciphertext can never be read. (The value layer also fails closed on
+        // read/write, so plaintext never leaks; this just turns a silent half-broken server
+        // into a loud startup refusal.)
+        if (pool.field_cipher == null) {
+            var scan_arena = std.heap.ArenaAllocator.init(allocator);
+            defer scan_arena.deinit();
+            if (try liveEncryptedCollection(scan_arena.allocator(), w)) |cname| {
+                std.log.err("refusing to start: collection '{s}' has an .encrypted field but ZIGBASE_FIELD_KEY is not set (encrypted data would be unreadable)", .{cname});
+                return error.FieldKeyRequired;
+            }
+        }
         // Stateful cursor mode accumulates rows in `_cursorStates`; sweep expired entries at
         // startup. (Lookups already ignore expired rows, so this is purely space reclamation.)
         // For long-lived servers, schedule `records.gcCursorStates` on a `.cron` interval too.
@@ -1258,4 +1291,29 @@ test "anyEncryptedField detects an .encrypted field (drives the startup fail-clo
         .{ .id = "f2", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
     } }};
     try std.testing.expect(anyEncryptedField(&some));
+}
+
+test "liveEncryptedCollection detects a RUNTIME-created encrypted collection (drives the #102 startup refusal)" {
+    const collections = @import("collections.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A plain collection created at RUNTIME (as via the collections API) — no encrypted
+    // field, so the scan finds nothing and serveImpl proceeds even without a key.
+    const plain = [_]schema.Field{.{ .id = "", .name = "title", .options = .{ .text = .{} } }};
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &plain });
+    try std.testing.expect((try liveEncryptedCollection(a, &d)) == null);
+
+    // Simulate the gap #102 closes: a collection with an encrypted field was created at
+    // runtime (while a key was set). It is now DB-resident, invisible to the comptime
+    // guard. The scan must surface it so serveImpl refuses to start without a key.
+    const enc = [_]schema.Field{.{ .id = "", .name = "secret", .encrypted = true, .options = .{ .text = .{} } }};
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "vault", .fields = &enc });
+    const found = try liveEncryptedCollection(a, &d);
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("vault", found.?);
 }
