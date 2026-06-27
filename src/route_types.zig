@@ -46,13 +46,22 @@ pub fn Req(comptime InputT: type) type {
     return struct {
         const Self = @This();
         pub const Input = InputT;
+        // Lazy import: `ctx: *Ctx` is a pointer field, so Req's layout does not depend on
+        // Ctx's layout — this avoids the route_types <- events <- ctx import cycle becoming
+        // a comptime layout dependency.
+        const Ctx = @import("ctx.zig").Ctx;
 
         input: InputT,
         params: []const Param,
         auth_id: []const u8,
         failure: ?Failure = null,
-        // Runtime handles wired by the thunk (opaque here to keep route_types import-light;
-        // the thunk sets these from the RouteEvent). Untyped pointers avoid a framework import cycle.
+        /// The per-request capability object (DB/records, http client, auth identity, fail/tx).
+        /// Set by `makeThunk`; typed handlers reach capabilities via `req.ctx.records()`,
+        /// `req.ctx.http()`, `req.ctx.user()`, etc.
+        ctx: *Ctx,
+        // Legacy runtime handles, kept for the example apps (blog/golfsim) which still read
+        // `req.app.?`/`req.arena.?`. Sourced from `ctx` by the thunk; new code uses `req.ctx`.
+        // (Removal is deferred so this single-file task does not break the example builds.)
         app: ?*anyopaque = null,
         arena: ?std.mem.Allocator = null,
 
@@ -196,7 +205,7 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
             var params = try a.alloc(Param, rc.params.len);
             for (rc.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
             const auth_id = cx.rctx.resolveMacro("@request.auth.id") orelse "";
-            var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .app = cx.app, .arena = a };
+            var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .ctx = cx, .app = cx.app, .arena = a };
             // 3. Call handler; map errors -> status+message.
             const out: Out = handler(&req) catch |e| {
                 if (req.failure) |f|
@@ -310,13 +319,16 @@ fn coerceQueryField(comptime F: type, a: std.mem.Allocator, raw: ?[]const u8) !F
 const testing = std.testing;
 
 test "Req carries typed input + records a custom failure" {
+    const Ctx = @import("ctx.zig").Ctx;
     const In = struct { note: []const u8 };
     var ctx_params = [_]Param{.{ .key = "id", .value = "abc" }};
+    var cx = Ctx{ .app = undefined, .arena = undefined, .rctx = .{} };
     var req = Req(In){
         .input = .{ .note = "hi" },
         .params = &ctx_params,
         .auth_id = "user1",
         .failure = null,
+        .ctx = &cx,
     };
     try testing.expectEqualStrings("hi", req.input.note);
     try testing.expectEqualStrings("abc", req.param("id").?);
@@ -471,6 +483,36 @@ test "isQueryParseable: nested struct returns false; mixed flat struct returns t
 
     // void is still parseable.
     try testing.expect(isQueryParseable(void));
+}
+
+test "makeThunk wires req.ctx with app + arena" {
+    const http = @import("http.zig");
+    const Ctx = @import("ctx.zig").Ctx;
+    // Container-level statics capture what the handler observed via req.ctx.
+    const Observed = struct {
+        var ctx_ptr: ?*Ctx = null;
+        var arena_ptr: ?*anyopaque = null;
+    };
+    Observed.ctx_ptr = null;
+    Observed.arena_ptr = null;
+    const H = struct {
+        fn h(req: *Req(void)) RouteError!void {
+            Observed.ctx_ptr = req.ctx;
+            Observed.arena_ptr = req.ctx.arena.ptr;
+        }
+    }.h;
+    const thunk = makeThunk(H);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = arena.allocator() };
+    const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
+    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = rctx, .request = &ctx };
+    defer cx.deinit();
+    _ = try thunk(&cx);
+    // req.ctx points exactly at the Ctx the thunk received...
+    try testing.expect(Observed.ctx_ptr == &cx);
+    // ...and that Ctx's arena is the request arena.
+    try testing.expect(Observed.arena_ptr == arena.allocator().ptr);
 }
 
 test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
