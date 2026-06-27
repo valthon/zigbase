@@ -975,6 +975,11 @@ The scheduler is intentionally simple (see [Known limitations](./known-limitatio
   *completion*, not a fixed wall clock, so long-running jobs drift.
 - **Single-flight** — a job never overlaps itself.
 
+The framework may also register **internal jobs** of its own alongside your
+`.cron` table. Declaring a TTL collection (`.ttl_field`, see §8) registers a
+5-minute interval job named `_ttl_gc` that reaps expired rows; it runs on the same
+worker pool and starts the scheduler even when you have no `.cron` configured.
+
 ### Ad-hoc background work: `app.submit`
 
 To offload one-off background work from a route or hook onto the worker pool:
@@ -1068,6 +1073,42 @@ A collection may declare `.indexes` — a tuple of index literals provisioned as
 `.where` is an optional partial-index predicate emitted verbatim as `WHERE <where>`.
 The index `.name` and `.fields` are validated as identifiers; the `.where` predicate
 is raw SQL authored in the schema. Index `.fields` reference fields by their declared name (not an internal id); `.name` and each field are validated as identifiers at compile time.
+
+### Row expiry (TTL) — `.ttl_field`
+
+A collection may name an existing `date`/`autodate` field as the row's **expiry
+timestamp** via `.ttl_field`. A framework-internal garbage-collector then reaps
+rows whose timestamp is in the past — automatically, with no cron of your own:
+
+```zig
+.sessions = .{
+    .fields = .{
+        .{ .name = "token",      .type = .text },
+        .{ .name = "expires_at", .type = .date },   // ISO-8601 UTC, e.g. "2026-07-01T00:00:00Z"
+    },
+    .ttl_field = "expires_at",   // rows with expires_at <= now are deleted
+},
+```
+
+Semantics:
+
+- `.ttl_field` must name a field declared on the **same collection** and of type
+  `.date` or `.autodate` — anything else is a **compile error** (those types store
+  a fixed-width ISO-8601 UTC string that compares correctly with a lexical `<=`).
+- A row is reaped when its ttl value is **non-null and at/before "now"**. A row
+  whose ttl field is `null` never expires (so an optional, never-set expiry is a
+  permanent row).
+- The sweep runs **once at startup** and then on a **5-minute interval** (a
+  framework-internal job named `_ttl_gc`; see §7). Declaring a TTL collection
+  starts the scheduler even if you have no `.cron` of your own.
+- This is **eventually consistent**: a just-expired row can still be returned by a
+  query in the up-to-5-minute window before the next sweep. Reads are *not*
+  filtered by expiry; the GC is the only reaper. If you need a hard
+  read-time guarantee, add an explicit `expires_at > @now`-style filter in your
+  rule/query (a built-in read-time exclusion is not implemented).
+- With an `.autodate` ttl field, prefer one whose value you set explicitly to the
+  intended expiry (autodate defaults to write-on-create "now", which would expire
+  the row immediately).
 
 ### Startup provisioning + additive auto-migration
 

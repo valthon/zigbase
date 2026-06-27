@@ -35,7 +35,8 @@
 //!      duplicate accounts) and a partial composite index on `bookings(listing, starts_at)
 //!      WHERE status != 'cancelled'` backing overlap/availability queries.
 //!
-//! The five collections (users / simulators / listings / bookings / reviews) are
+//! The six collections (users / simulators / listings / bookings / reviews /
+//! holds — the last demonstrating TTL records via `.ttl_field`) are
 //! provisioned at COMPTIME via `.collections` in the App config — the schema is
 //! set up automatically at startup (additive auto-migration). The Astro + React
 //! frontend in `frontend/` is served at the root path via the comptime-hardcoded
@@ -601,7 +602,8 @@ pub const App = zigbase.App(.{
                     },
                 },
             },
-            // The FIFTH comptime collection. Provisioning five collections / ~19 fields
+            // The FIFTH comptime collection (a sixth, `holds`, follows). Provisioning
+            // this many collections / fields
             // exceeds Zig's *default* comptime branch quota inside the framework's
             // `.collections` lowering; ZigBase raises its own quota (see
             // provision.buildCollections), so a rich schema like this lowers cleanly.
@@ -624,6 +626,26 @@ pub const App = zigbase.App(.{
                     .update = "@request.auth.id = author",
                     .delete = "@request.auth.id = author",
                 },
+            },
+            // A SIXTH collection demonstrating TTL records (`.ttl_field`). A "hold" is an
+            // ephemeral soft-reservation a guest places while paying; it must auto-expire if
+            // not converted to a booking. Declaring `.ttl_field = "expires_at"` lets the
+            // framework's internal `_ttl_gc` job delete expired holds automatically (once at
+            // startup, then every 5 minutes) — no cron of our own. `expires_at` is a `date`
+            // (ISO-8601 UTC) the create flow would set to now+15m.
+            .holds = .{
+                .fields = .{
+                    .{ .name = "listing", .type = .relation, .target = "listings", .required = true, .cascadeDelete = true },
+                    .{ .name = "guest", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+                    .{ .name = "expires_at", .type = .date, .required = true },
+                },
+                .rules = .{
+                    .list = "@request.auth.id = guest",
+                    .view = "@request.auth.id = guest",
+                    .create = "@request.auth.id != \"\"",
+                    .delete = "@request.auth.id = guest",
+                },
+                .ttl_field = "expires_at",
             },
         },
 });
