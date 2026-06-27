@@ -321,10 +321,14 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const updated = records.updateInTxn(ctx.allocator, w, col, rid, data_mut) catch |e| switch (e) {
         error.Validation => {
             w.rollback() catch {};
+            // Files were written before the UPDATE (above); a validation failure must not
+            // leave them orphaned in storage (mirrors the not-found / guard-miss branches).
+            if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
             return validationResponse(ctx);
         },
         error.NotObject => {
             w.rollback() catch {};
+            if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
             return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator);
         },
         else => return e, // errdefer rolls back
