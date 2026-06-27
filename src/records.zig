@@ -35,7 +35,9 @@ fn guardJoinsSql(alloc: std.mem.Allocator, joins: []const []const u8) ![]u8 {
 }
 
 /// SELECT 1 FROM col <joins> WHERE col.id=?1 AND (where) — bound id + guard params.
-fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8, g: Guard) !bool {
+/// Public so an HTTP handler that owns the write transaction can evaluate the
+/// access-rule guard inside that same transaction (see api/records.zig).
+pub fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8, g: Guard) !bool {
     const js = try guardJoinsSql(alloc, g.joins);
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, js, col.name, g.where_sql }, 0);
     var st = try w.prepare(sql);

@@ -11,12 +11,15 @@ const App = @import("app.zig").App;
 /// receive a `Data` rather than a raw connection. Ops run on the passed `conn`
 /// using `app.allocator` (the gpa).
 ///
-/// ATOMICITY (as shipped): NOT atomic for `before*` record hooks. The triggering
-/// write opens its transaction inside records.createGuarded/updateGuarded, which run
-/// AFTER the before-hook returns; so side-writes a hook issues via `ev.data` are
-/// committed independently of (and before) the triggering write, and their results
-/// are gpa-allocated rather than request-scoped. (A later plan will route these
-/// through a request arena / a true shared transaction.)
+/// ATOMICITY: on the HTTP write path (`api/records.zig` create/update/delete),
+/// `before*` record hooks now run INSIDE the triggering write's transaction. The
+/// handler opens `BEGIN IMMEDIATE` before the before-hook, performs the row
+/// write + access-rule guard, and only then commits; a before-hook error (or a
+/// denied guard) rolls the WHOLE transaction back — so a side-write a hook issues
+/// via `ev.data` / `ev.caps().records()` commits atomically with the triggering
+/// write and is discarded on abort (fail closed). NOTE: ops issued through a `Data`
+/// still allocate their returned record on the gpa (app.allocator), not a request
+/// arena; hooks that keep a side-write's result should copy what they need.
 ///
 /// Unknown-collection contract:
 ///   - `findById` returns `null` for BOTH an unknown collection and a missing

@@ -225,11 +225,13 @@ collection name does not resolve.
 > for the duration of the hook. Do not store one *into* `ev.record` without first
 > copying it with `ev.arena` (mixing allocators on the arena-backed JSON map is UB).
 
-> **Atomicity caveat:** a `before*` hook's `ev.data` writes are **NOT** atomic
-> with the triggering write. The triggering write opens its transaction *after*
-> the before-hook returns, so side-writes a hook issues via `ev.data` commit
-> independently of (and before) the triggering write. See
-> [../KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md).
+> **Atomicity:** on the HTTP create/update/delete path a `before*` hook runs
+> **inside** the triggering write's transaction. Side-writes a hook issues via
+> `ev.data` / `ev.caps().records()` commit atomically with the triggering write,
+> and a before-hook that returns an error — or a denied access rule — rolls the
+> whole transaction back, so a rejected write persists nothing (fail closed).
+> (Values *returned* by `ev.data` are still gpa-allocated, per the
+> result-lifetime note above.)
 
 ## 5. Custom HTTP routes (`.routes`)
 
