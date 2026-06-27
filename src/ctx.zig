@@ -9,6 +9,7 @@ const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
 const schema = @import("schema.zig");
 const expand_mod = @import("query/expand.zig");
+const http_client = @import("http_client.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -40,6 +41,11 @@ pub const Ctx = struct {
     /// Returns a Records namespace bound to this Ctx for read operations.
     pub fn records(self: *Ctx) Records {
         return .{ .ctx = self };
+    }
+
+    /// Returns an outbound HTTP client bound to this Ctx's arena and the app's io.
+    pub fn http(self: *Ctx) http_client.HttpClient {
+        return .{ .alloc = self.arena, .io = self.app.io };
     }
 };
 
@@ -304,6 +310,21 @@ test "ctx.records create/update/delete round-trips and releases the writer" {
     const w2 = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     _ = w2;
+}
+
+test "ctx.http() returns a client bound to the ctx arena and io" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    const client = ctx.http();
+    // Assert the client is bound to the app's io (same userdata pointer).
+    try std.testing.expect(client.io.userdata == env.app.io.userdata);
+    // Assert two successive calls return clients with the same arena allocator pointer.
+    const client2 = ctx.http();
+    try std.testing.expect(client.alloc.ptr == client2.alloc.ptr);
+    // Assert the allocator pointer matches the ctx's arena allocator.
+    try std.testing.expect(client.alloc.ptr == ctx.arena.ptr);
 }
 
 test "ctx.records expand nests the related record under \"expand\"" {
