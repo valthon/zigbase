@@ -182,16 +182,21 @@ fn init_0010_token_epoch(w: *db.Db) db.DbError!void {
     }
     for (names.items) |nm| {
         if (!isSafeIdent(nm)) continue; // defensive: never interpolate an unvalidated name
-        var buf: [320]u8 = undefined;
-        const sql = std.fmt.bufPrintZ(&buf, "ALTER TABLE \"{s}\" ADD COLUMN \"token_epoch\" INTEGER NOT NULL DEFAULT 0;", .{nm}) catch return error.ExecFailed;
+        // Allocate the ALTER (no fixed buffer) so a long-but-valid collection name is never
+        // stranded without the column — `schema.isValidIdentifier` has no length cap, so a
+        // 251+ char name passes creation and MUST also be migrated here.
+        const sql = std.fmt.allocPrintSentinel(a, "ALTER TABLE \"{s}\" ADD COLUMN \"token_epoch\" INTEGER NOT NULL DEFAULT 0;", .{nm}, 0) catch return error.ExecFailed;
+        defer a.free(sql);
         w.exec(sql) catch {}; // ignore "duplicate column" when the column already exists
     }
 }
 
 /// Local identifier guard for migration 0010's dynamic ALTER (avoids importing schema.zig).
-/// Mirrors `schema.isValidIdentifier`: first char a letter, rest alphanumeric/underscore.
+/// Mirrors `schema.isValidIdentifier`'s CHAR CLASS (first char a letter, rest alphanumeric/
+/// underscore) for injection safety. Deliberately NO length cap — `isValidIdentifier` has
+/// none either, so capping here would strand a long-but-valid auth table without the column.
 fn isSafeIdent(s: []const u8) bool {
-    if (s.len == 0 or s.len > 250) return false;
+    if (s.len == 0) return false;
     if (!std.ascii.isAlphabetic(s[0])) return false;
     for (s) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
     return true;
@@ -362,6 +367,32 @@ test "0010 backfills token_epoch onto a pre-existing user auth table" {
     _ = try e.step();
     try std.testing.expectEqual(@as(i64, 0), e.columnInt(0));
     try std.testing.expectEqualStrings("tk", e.columnText(1));
+}
+
+test "0010 backfills a long-named (251+ char) auth table — no fixed-buffer length cap" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(
+        \\CREATE TABLE "_migrations" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT UNIQUE NOT NULL, "applied_at" TEXT NOT NULL);
+    );
+    inline for (.{ "0001_init", "0002_auth", "0003_external_auths", "0004_consumed_tokens", "0005_oauth_states", "0006_cursor_states", "0007_auth_challenges", "0008_webauthn_credentials", "0009_kv" }) |name| {
+        try d.exec("INSERT INTO \"_migrations\" (\"name\",\"applied_at\") VALUES ('" ++ name ++ "', datetime('now'));");
+    }
+    try d.exec("CREATE TABLE \"_collections\" (\"id\" TEXT PRIMARY KEY, \"name\" TEXT UNIQUE NOT NULL, \"type\" TEXT NOT NULL DEFAULT 'base');");
+    try d.exec("CREATE TABLE \"_superusers\" (\"id\" TEXT PRIMARY KEY, \"email\" TEXT);");
+    // A valid identifier of 260 chars (alpha-first, alnum) — passes schema.isValidIdentifier
+    // (no length cap), so it must also be migrated. The old [320]u8/len<=250 guard skipped it.
+    const long_name = "a" ++ ("b" ** 259);
+    try std.testing.expectEqual(@as(usize, 260), long_name.len);
+    try d.exec("INSERT INTO \"_collections\" (\"id\",\"name\",\"type\") VALUES ('c1','" ++ long_name ++ "','auth');");
+    try d.exec("CREATE TABLE \"" ++ long_name ++ "\" (\"id\" TEXT PRIMARY KEY, \"tokenKey\" TEXT);");
+
+    try run(&d); // applies 0010 + 0011
+
+    var c = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('" ++ long_name ++ "') WHERE name='token_epoch';");
+    defer c.finalize();
+    _ = try c.step();
+    try std.testing.expectEqual(@as(i64, 1), c.columnInt(0)); // column present -> auth won't break
 }
 
 test "0011 creates the _sessions store with its indexes" {

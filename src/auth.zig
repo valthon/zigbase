@@ -376,7 +376,8 @@ fn nowUnix(conn: *db.Db) db.DbError!i64 {
 const KeyEpoch = struct { token_key: []const u8, epoch: i64 };
 
 /// Fetch an auth record's `tokenKey` AND its session `token_epoch` (#99) in one SELECT.
-/// A NULL/absent epoch column reads as 0 (back-compat). Null when the row is absent.
+/// A NULL epoch (back-compat default) reads as 0; the column itself is guaranteed present by
+/// migration 0010. Null when the row is absent.
 fn tokenKeyEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?KeyEpoch {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
     var st = try conn.prepare(sql);

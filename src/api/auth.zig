@@ -104,9 +104,10 @@ pub fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, ri
     return try alloc.dupe(u8, st.columnText(0));
 }
 
-/// Read the record's current session epoch (#99), treating a NULL/absent column as 0.
-/// `table` is the physical auth table (collection name, or "_superusers"). Returns null
-/// only when no such row exists.
+/// Read the record's current session epoch (#99), treating a NULL value (back-compat
+/// default) as 0; the column itself is guaranteed present by migration 0010. `table` is the
+/// physical auth table (collection name, or "_superusers"). Returns null only when no such
+/// row exists.
 pub fn tokenEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?i64 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
     var st = try conn.prepare(sql);
