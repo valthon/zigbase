@@ -19,6 +19,7 @@ const method_mod = @import("../auth/method.zig");
 const ApiError = @import("error.zig").ApiError;
 const auth = @import("auth.zig");
 const records = @import("../records.zig");
+const Ctx = @import("../ctx.zig").Ctx;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -158,15 +159,39 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                     // mint the session cannot deadlock.
                     const w = app.pool.acquireWriter();
                     defer app.pool.releaseWriter();
+                    // Fetch the record once: it feeds the verification gate, the
+                    // beforeAuthSuccess hook, and session issuance (no redundant reads).
+                    const rec = (try records.get(ctx.allocator, w, col, rid)) orelse
+                        return (ApiError.notFound()).toResponse(ctx.allocator);
                     // Optional verification gate: refuse to mint a session for a record
                     // whose `verified` field is not true (when the collection requires it).
-                    if (col.options.auth.require_verified) {
-                        const rec = (try records.get(ctx.allocator, w, col, rid)) orelse
-                            return (ApiError.notFound()).toResponse(ctx.allocator);
-                        if (!auth.recordVerified(rec))
-                            return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
+                    if (col.options.auth.require_verified and !auth.recordVerified(rec))
+                        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
+
+                    // Transactional login: the beforeAuthSuccess hook's side-writes commit
+                    // atomically with session issuance; an aborting hook rolls everything
+                    // back and blocks the session (fail closed).
+                    try w.beginImmediate();
+                    // Safety net for EVERY error-return after begin (fireBeforeAuthSuccess can
+                    // propagate, issueSessionNoEmit, commit): roll back so a failed login never
+                    // leaves an open transaction on the single shared writer (which would poison
+                    // all subsequent writes). Value-returns below roll back explicitly; the
+                    // double-rollback a later error would cause is a harmless no-op (no active txn).
+                    errdefer w.rollback() catch {};
+                    if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, rid, auth_tag, rec)) |resp| {
+                        w.rollback() catch {};
+                        return resp;
                     }
-                    const issued = try auth.issueSession(ctx, w, col.name, rid, auth_tag);
+                    const issued = auth.issueSessionNoEmit(ctx, w, col.name, rid) catch |e| {
+                        w.rollback() catch {};
+                        return e;
+                    };
+                    w.commit() catch |e| {
+                        w.rollback() catch {};
+                        return e;
+                    };
+                    // onAuth fires only AFTER a durable commit (session truly issued).
+                    auth.emitAuth(ctx, col.name, rec, auth_tag);
                     var root: std.json.ObjectMap = .empty;
                     try root.put(ctx.allocator, "token", .{ .string = issued.token });
                     const cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
@@ -243,6 +268,134 @@ test "auth-method dispatch: password complete succeeds + 2 cookies + onAuth fire
     try std.testing.expect(saw_auth and saw_csrf);
     try std.testing.expectEqual(@as(usize, 1), Counter.seen);
     try std.testing.expectEqual(events.AuthMethod.password, Counter.last_method);
+}
+
+// ---------------------------------------------------------------------------
+// #80 — beforeAuthSuccess: writable, transactional, abortable
+// ---------------------------------------------------------------------------
+
+/// Create a base `posts` collection so a beforeAuthSuccess hook has somewhere to
+/// write (the "claim anonymous records" use case writes through ctx.records()).
+fn createPostsCollection(env: *@import("auth.zig").TestEnv, a: std.mem.Allocator) !void {
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    _ = try collections.create(a, std.testing.io, w, .{
+        .id = "",
+        .name = "posts",
+        .type = .base,
+        .fields = &[_]schema.Field{.{ .id = "t1", .name = "title", .options = .{ .text = .{} } }},
+        .listRule = null,
+        .viewRule = null,
+        .createRule = null,
+        .updateRule = null,
+        .deleteRule = null,
+    });
+}
+
+/// COUNT(*) of posts rows on a fresh writer (sees committed rows only).
+fn countPosts(env: *@import("auth.zig").TestEnv) !i64 {
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var st = try w.prepare("SELECT COUNT(*) FROM \"posts\";");
+    defer st.finalize();
+    _ = try st.step();
+    return st.columnInt(0);
+}
+
+test "#80 beforeAuthSuccess fires on complete with a writable, committing ctx" {
+    const api_auth = @import("auth.zig");
+    var env = try api_auth.TestEnv.initAuth("users80a");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users80a", "u@x.io", "longenough");
+    try createPostsCollection(env, a);
+
+    const types = comptime registry_mod.assembleTypes(.{});
+    var insts: registry_mod.Instances(types) = undefined;
+    var views: [types.len]method_mod.AuthMethod = undefined;
+    var reg = try registry_mod.build(types, &insts, &views, std.testing.allocator, std.testing.io, .{});
+    defer registry_mod.deinit(types, &insts);
+    env.app.auth_methods = @ptrCast(&reg);
+
+    // Hook writes a marker post through the bound (transactional) connection and records
+    // what it saw. A clean return commits with the session.
+    const Hook = struct {
+        var seen: usize = 0;
+        var method: events.AuthMethod = .custom;
+        var rid: []const u8 = "";
+        fn write(ctx: *Ctx, ev: *events.AuthSuccessEvent) anyerror!void {
+            seen += 1;
+            method = ev.method;
+            rid = ev.record_id;
+            var o: std.json.ObjectMap = .empty;
+            try o.put(ctx.arena, "title", .{ .string = "claimed" });
+            _ = try ctx.records().create("posts", .{ .object = o });
+        }
+    };
+    Hook.seen = 0;
+    var disp = events.Dispatch{ .before_auth_success = Hook.write };
+    env.app.dispatch = &disp;
+
+    const params = [_]http.Param{
+        .{ .key = "col", .value = "users80a" },
+        .{ .key = "method", .value = "password" },
+    };
+    var ctx = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &params);
+    const res = try complete(&ctx);
+
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqual(@as(usize, 1), Hook.seen);
+    try std.testing.expectEqual(events.AuthMethod.password, Hook.method);
+    try std.testing.expect(Hook.rid.len > 0);
+    try std.testing.expectEqual(@as(usize, 2), res.cookies.len); // session issued
+    try std.testing.expectEqual(@as(i64, 1), try countPosts(env)); // hook's write committed
+}
+
+test "#80 aborting beforeAuthSuccess blocks the session AND rolls back its side-writes" {
+    const api_auth = @import("auth.zig");
+    var env = try api_auth.TestEnv.initAuth("users80b");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users80b", "u@x.io", "longenough");
+    try createPostsCollection(env, a);
+
+    const types = comptime registry_mod.assembleTypes(.{});
+    var insts: registry_mod.Instances(types) = undefined;
+    var views: [types.len]method_mod.AuthMethod = undefined;
+    var reg = try registry_mod.build(types, &insts, &views, std.testing.allocator, std.testing.io, .{});
+    defer registry_mod.deinit(types, &insts);
+    env.app.auth_methods = @ptrCast(&reg);
+
+    // Hook writes a marker post, THEN vetoes the login via ctx.fail(403). The write must
+    // roll back (atomic with the login) and no session may be issued.
+    const Hook = struct {
+        fn writeThenAbort(ctx: *Ctx, ev: *events.AuthSuccessEvent) anyerror!void {
+            _ = ev;
+            var o: std.json.ObjectMap = .empty;
+            try o.put(ctx.arena, "title", .{ .string = "should-roll-back" });
+            _ = try ctx.records().create("posts", .{ .object = o });
+            return ctx.fail(403, "not allowed");
+        }
+    };
+    var disp = events.Dispatch{ .before_auth_success = Hook.writeThenAbort };
+    env.app.dispatch = &disp;
+
+    const params = [_]http.Param{
+        .{ .key = "col", .value = "users80b" },
+        .{ .key = "method", .value = "password" },
+    };
+    var ctx = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &params);
+    const res = try complete(&ctx);
+
+    // Fail closed: the hook's chosen status, no session cookies.
+    try std.testing.expectEqual(@as(u16, 403), res.status);
+    try std.testing.expectEqual(@as(usize, 0), res.cookies.len);
+    // Atomicity: the hook's side-write rolled back with the blocked login.
+    try std.testing.expectEqual(@as(i64, 0), try countPosts(env));
 }
 
 test "auth-method dispatch: unknown method slug returns 404" {

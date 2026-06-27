@@ -81,7 +81,8 @@ pub fn main(init: std.process.Init) !void {
 | `hooks` | Per-collection record lifecycle hooks (before/after create/update/delete). |
 | `onError` | Consumer error handler, runs before the built-in backstop. |
 | `routes` | Custom HTTP routes. |
-| `onAuth` | Fires after a successful login / oauth2. |
+| `onAuth` | Notify-only: fires *after* a session is issued (login / oauth2). |
+| `beforeAuthSuccess` | Writable, transactional, abortable hook that runs *before* the session is issued (claim records on first login; veto a login). |
 | `onFileServe` | Fires before serving a file download (may deny). |
 | `onFileUpload` | Fires after a file upload. |
 | `onBootstrap` | Lifecycle: after bootstrap. |
@@ -592,7 +593,8 @@ One handler each, registered by the matching config key:
 
 | Key | Signature | When |
 | --- | --- | --- |
-| `onAuth` | `fn (ev: *zigbase.events.AuthEvent) void` | After a successful login / oauth2. |
+| `onAuth` | `fn (ev: *zigbase.events.AuthEvent) void` | Notify-only, **after** a session is issued (login / oauth2). |
+| `beforeAuthSuccess` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!void` | Writable + abortable, **before** the session is issued. See [Auth lifecycle](#auth-lifecycle-beforeauthsuccess). |
 | `onFileServe` | `fn (ev: *zigbase.events.FileEvent) anyerror!void` | Before serving a download; **return an error to deny** (framework → `404`). |
 | `onFileUpload` | `fn (ev: *zigbase.events.FileEvent) void` | After a successful upload. |
 | `onBootstrap` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | After bootstrap. |
@@ -602,6 +604,44 @@ One handler each, registered by the matching config key:
 `AuthEvent` carries `app`, `ctx`, `collection`, `record: ?std.json.Value`, and `method`
 (`.password` | `.oauth2` | `.magic_link` | `.otp` | `.webauthn` | `.custom`). `FileEvent` carries `app`, `ctx`, `collection`,
 `record_id`, and `filename`. `LifecycleEvent` carries `app`.
+
+### Auth lifecycle (`beforeAuthSuccess`)
+
+`onAuth` is notify-only and fires **after** a session exists — perfect for logging or
+audit, useless for mutating state as part of the login. `beforeAuthSuccess` is the
+writable, abortable counterpart: it runs **after** the credentials/token are verified
+(and, for magic-link, the link token is consumed) but **before** the session JWT is
+issued, with a `*Ctx` bound to the login's **in-transaction writer**.
+
+```zig
+fn claimGuestPosts(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!void {
+    // ev.record is the just-authenticated record; ev.record_id / ev.method are also set.
+    const email = ev.record.object.get("email").?.string;
+    // ctx.records() reuses the login transaction — this write commits WITH the session.
+    var patch: std.json.ObjectMap = .empty;
+    try patch.put(ctx.arena, "author", .{ .string = ev.record_id });
+    for (try guestPostIds(ctx, email)) |id| _ = try ctx.records().update("posts", id, .{ .object = patch });
+}
+// App(.{ .beforeAuthSuccess = claimGuestPosts, ... })
+```
+
+Guarantees:
+
+- **Transactional & atomic.** The consume path runs in `BEGIN IMMEDIATE … COMMIT`. The
+  hook's `ctx.records()` writes commit together with the login.
+- **Abortable, fail-closed.** Return *any* error to block the login: the transaction rolls
+  back (the hook's side-writes are discarded, and a magic-link token is **un-consumed** so
+  the link still works) and **no session is issued**. Use `ctx.fail(status, msg)` for a
+  chosen status, `error.Forbidden`/`error.Unauthorized` for 403/401; any other error → 500.
+- **Bound connection.** Do **not** call `ctx.tx` inside the hook (you are already in a
+  transaction → `error.NestedTransaction`); use `ctx.records()` directly. `ctx.user()`
+  reflects the just-authenticated principal.
+
+Where it fires: the unified `POST /api/collections/:col/auth/:method/complete` endpoint
+(password / otp / webauthn / oauth2 / custom) and the magic-link
+`GET …/auth/magic_link/consume` link. The legacy `/auth-with-password` and `/auth-refresh`
+endpoints and the register/logout/refresh/password-change phases are not yet covered
+(planned — see the Theme D spec). `onAuth` still fires once, after issuance, as before.
 
 ### Auth methods overview
 
@@ -927,6 +967,11 @@ pub fn verifyLinkToken(
 // Marks the token consumed. Returns error.AlreadyConsumed on replay.
 pub fn consumeLinkToken(conn: *db.Db, claims: jwt.Claims) !void
 
+// Clear the session cookies (logout), mirroring issueSession. Returns arena-owned
+// zb_auth/zb_csrf cookies built from the framework's own cookie policy, so they match
+// the built-in logout exactly. Equivalent to ctx.auth().clearSession() (below).
+pub fn clearSession(ctx: *Ctx) ![]const http.Cookie
+
 // Send auth email via the configured mailer (SMTP or log in dev).
 pub fn deliverAuthMail(
     app: *App, alloc: std.mem.Allocator,
@@ -986,6 +1031,22 @@ fn myConfirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 For a complete, copy-pasteable example (two-route magic-link flow with rate
 limiting, enumeration safety, and single-use token replay protection) see
 [Recipes → magic-link login](./recipes#recipe-magic-link-passwordless-login).
+
+#### `ctx.auth()` — session management (`clearSession`)
+
+The `ctx.auth()` namespace is the session-management surface. Its first verb,
+`clearSession`, mirrors `issueSession` for logout: it returns the cleared session cookies
+built from the framework's own cookie policy (the same one the built-in `authLogout` uses),
+arena-owned so they slot straight into `Response.cookies`. A logout handler is one line:
+
+```zig
+fn logout(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
+}
+```
+
+`zigbase.auth.clearSession(ctx)` is the equivalent free-function form. (refresh / rotate /
+list-active / revoke are designed and deferred — see the Theme D spec.)
 
 ## 7. Scheduled jobs (`.cron` + `.jobs`)
 

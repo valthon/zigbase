@@ -10,6 +10,8 @@ const auth = @import("../auth.zig");
 const clock = @import("../clock.zig");
 const events = @import("../events.zig");
 const request = @import("../request.zig");
+const session = @import("../session.zig");
+const Ctx = @import("../ctx.zig").Ctx;
 const ApiError = @import("error.zig").ApiError;
 
 fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value, cookies: []const http.Cookie) !http.Response {
@@ -121,10 +123,9 @@ pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: [
     const max_age: i32 = @intCast(app.auth_token_ttl_s);
     return .{
         .token = token,
-        .cookies = .{
-            .{ .name = "zb_auth", .value = token, .max_age_s = max_age, .http_only = true, .secure = app.cookie_secure, .same_site = .strict },
-            .{ .name = "zb_csrf", .value = csrf, .max_age_s = max_age, .http_only = false, .secure = app.cookie_secure, .same_site = .strict },
-        },
+        // Built via the shared session-cookie policy (session.zig) so login + logout +
+        // clearSession never drift on cookie attributes.
+        .cookies = session.sessionCookies(app.cookie_secure, token, csrf, max_age),
     };
 }
 
@@ -170,6 +171,62 @@ pub fn issueSessionExt(
     const rec: ?std.json.Value = if (opt_record) |r| r else try records.get(ctx.allocator, conn, col, record_id);
     emitAuth(ctx, col.name, rec, method);
     return issued;
+}
+
+/// Like `issueSessionExt` but does NOT fire `onAuth`. Used by the transactional consume
+/// paths (`auth_methods.complete`, `magic_link_consume`) so they can emit the notification
+/// AFTER `COMMIT` via `emitAuth`, preserving the invariant that `onAuth` only fires once a
+/// session has been durably issued. (`issueSessionExt` keeps emitting inline for the legacy
+/// non-transactional callers — `authWithPassword`/`authRefresh`.)
+pub fn issueSessionNoEmit(
+    ctx: *http.RequestCtx,
+    conn: *db.Db,
+    collection: []const u8,
+    record_id: []const u8,
+) !Issued {
+    const col = (try collections.get(ctx.allocator, conn, collection)) orelse return error.NotFound;
+    if (col.type != .auth) return error.NotFound;
+    const tk = (try tokenKeyFor(ctx.allocator, conn, col.name, record_id)) orelse return error.NotFound;
+    return issue(ctx, conn, col.name, record_id, tk);
+}
+
+/// Fire the writable, abortable `beforeAuthSuccess` hook (#80) inside the login's write
+/// transaction. `conn` is the in-transaction writer; the hook's `*Ctx` is bound to it so
+/// its `ctx.records()` writes participate in (and roll back with) the login.
+///
+/// Returns `null` to proceed (no hook registered, or the hook returned cleanly). When the
+/// hook ABORTS (returns any error) it returns a ready-to-send `http.Response` mapped via
+/// the `Ctx` error model (`ctx.fail` status / `error.Forbidden`→403 / else 500) — the
+/// CALLER must `ROLLBACK` before returning it, so the session is never issued (fail closed).
+pub fn fireBeforeAuthSuccess(
+    req: *http.RequestCtx,
+    conn: *db.Db,
+    col_name: []const u8,
+    rid: []const u8,
+    method: events.AuthMethod,
+    rec: std.json.Value,
+) !?http.Response {
+    const app = req.app orelse return null;
+    const d = app.dispatch orelse return null;
+    const h = d.before_auth_success orelse return null;
+    // Identity context: the hook's ctx.user() reflects the just-authenticated principal.
+    const rctx = request.RequestContext{
+        .auth = rec,
+        .is_superuser = false,
+        .collection = col_name,
+        .method = @tagName(req.method),
+    };
+    var cx = Ctx{ .app = app, .arena = req.allocator, .rctx = rctx, .request = req, .bound_conn = conn };
+    defer cx.deinit(); // no-op when bound (reads reuse bound_conn), kept for hygiene
+    var ev = events.AuthSuccessEvent{
+        .app = app,
+        .collection = col_name,
+        .record_id = rid,
+        .method = method,
+        .record = rec,
+    };
+    h(&cx, &ev) catch |e| return cx.errorResponse(e);
+    return null;
 }
 
 pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -243,10 +300,8 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
-    const cleared = [_]http.Cookie{
-        .{ .name = "zb_auth", .value = "", .max_age_s = -1, .http_only = true, .secure = ctx.app.?.cookie_secure, .same_site = .strict },
-        .{ .name = "zb_csrf", .value = "", .max_age_s = -1, .http_only = false, .secure = ctx.app.?.cookie_secure, .same_site = .strict },
-    };
+    // Shared policy: the cleared cookies match what `issue()`/`clearSession` produce.
+    const cleared = session.clearedCookies(ctx.app.?.cookie_secure);
     const cookies = try ctx.allocator.dupe(http.Cookie, &cleared);
     return .{ .status = 204, .body = "", .cookies = cookies };
 }

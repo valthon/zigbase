@@ -13,6 +13,7 @@ const http_client = @import("http_client.zig");
 const error_mod = @import("api/error.zig");
 const http_mod = @import("http.zig");
 const auth_helpers = @import("auth_helpers.zig");
+const session = @import("session.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -98,6 +99,12 @@ pub const Ctx = struct {
 
     /// Returns a Records namespace bound to this Ctx for read operations.
     pub fn records(self: *Ctx) Records {
+        return .{ .ctx = self };
+    }
+
+    /// Returns the session-management namespace (`ctx.auth()`). The first verb is
+    /// `clearSession` (#86); refresh/rotate/revoke arrive in later Theme D slices.
+    pub fn auth(self: *Ctx) AuthApi {
         return .{ .ctx = self };
     }
 
@@ -263,6 +270,23 @@ pub const Records = struct {
         const conn = try self.ctx.connForRead();
         const col = (try collections.get(self.ctx.arena, conn, collection)) orelse return;
         try expand_mod.expand(self.ctx.arena, conn, col, rec, s, 0, &self.ctx.rctx);
+    }
+};
+
+/// Session-management namespace (`ctx.auth()`). The first verb mirrors `issueSession`:
+/// `clearSession` returns the cleared session cookies built from the framework's own
+/// cookie policy (`session.zig`), so a logout handler is one line and can never drift
+/// from the built-in `authLogout`. refresh/rotate/list-active/revoke are designed and
+/// deferred (see the Theme D spec).
+pub const AuthApi = struct {
+    ctx: *Ctx,
+
+    /// Clear the `zb_auth` + `zb_csrf` session cookies (logout). Returns arena-owned
+    /// cookies that slot straight into a handler's `Response.cookies`:
+    ///   return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
+    pub fn clearSession(self: AuthApi) ![]const http_mod.Cookie {
+        const cleared = session.clearedCookies(self.ctx.app.cookie_secure);
+        return self.ctx.arena.dupe(http_mod.Cookie, &cleared);
     }
 };
 
@@ -439,6 +463,37 @@ test "ctx.user() reflects the resolved auth identity; anonymous is null" {
     try std.testing.expectEqualStrings("abc123", u.id);
     try std.testing.expectEqualStrings("users", u.collection);
     try std.testing.expect(!u.is_superuser);
+}
+
+test "#86 ctx.auth().clearSession returns arena cookies matching the framework's logout policy" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    defer ctx.deinit();
+
+    const cookies = try ctx.auth().clearSession();
+    try std.testing.expectEqual(@as(usize, 2), cookies.len);
+
+    // Identical to the shared session policy that the built-in authLogout uses — so the
+    // one-line consumer logout can never drift from the framework's own clear.
+    const expected = session.clearedCookies(env.app.cookie_secure);
+    for (cookies, 0..) |c, i| {
+        try std.testing.expectEqualStrings(expected[i].name, c.name);
+        try std.testing.expectEqualStrings("", c.value);
+        try std.testing.expect(c.max_age_s < 0);
+        try std.testing.expectEqual(expected[i].http_only, c.http_only);
+        try std.testing.expectEqual(expected[i].secure, c.secure);
+        try std.testing.expect(c.same_site == .strict);
+        try std.testing.expectEqualStrings("/", c.path);
+    }
+    // zb_auth is HttpOnly; zb_csrf is readable by JS (double-submit).
+    try std.testing.expect(cookies[0].http_only and !cookies[1].http_only);
+
+    // The zigbase.auth.clearSession(ctx) re-export delegates to the same policy.
+    const via_helper = try @import("auth_helpers.zig").clearSession(&ctx);
+    try std.testing.expectEqualStrings(cookies[0].name, via_helper[0].name);
+    try std.testing.expectEqualStrings(cookies[1].name, via_helper[1].name);
 }
 
 test "ctx.records.list returns created rows; get fetches one by id" {
