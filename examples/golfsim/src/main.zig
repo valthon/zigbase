@@ -352,7 +352,10 @@ fn calendarFeed(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 fn flagStatus(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const name = ctx.request.?.param("name") orelse return ctx.errorResponse(ctx.fail(400, "Missing flag name."));
     const enabled = try ctx.flag(name);
-    const body = try std.fmt.allocPrint(ctx.arena, "{{\"name\":\"{s}\",\"enabled\":{}}}", .{ name, enabled });
+    var o: std.json.ObjectMap = .empty;
+    try o.put(ctx.arena, "name", .{ .string = name });
+    try o.put(ctx.arena, "enabled", .{ .bool = enabled });
+    const body = try std.json.Stringify.valueAlloc(ctx.arena, std.json.Value{ .object = o }, .{});
     return .{ .status = 200, .body = body };
 }
 
