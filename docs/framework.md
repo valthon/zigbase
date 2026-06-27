@@ -1268,20 +1268,22 @@ Semantics:
 
 - `.ttl_field` must name a field declared on the **same collection** and of type
   `.date` or `.autodate` — anything else is a **compile error** (those types hold an
-  ISO-8601 instant). The TTL GC normalizes both sides via SQLite `strftime(...)`
-  before comparing, so non-canonical `.date` values (timezone offsets, space
-  separator, date-only) are handled correctly — do not assume lexical comparison.
+  ISO-8601 instant). Both the read-exclusion predicate and the GC normalize both
+  sides via SQLite `strftime(...)` before comparing, so non-canonical `.date` values
+  (timezone offsets, space separator, date-only) are handled correctly — do not
+  assume lexical comparison.
 - A row is reaped when its ttl value is **non-null and at/before "now"**. A row
   whose ttl field is `null` never expires (so an optional, never-set expiry is a
-  permanent row).
-- The sweep runs **once at startup** and then on a **5-minute interval** (a
-  framework-internal job named `_ttl_gc`; see §7). Declaring a TTL collection
-  starts the scheduler even if you have no `.cron` of your own.
-- This is **eventually consistent**: a just-expired row can still be returned by a
-  query in the up-to-5-minute window before the next sweep. Reads are *not*
-  filtered by expiry; the GC is the only reaper. If you need a hard
-  read-time guarantee, add an explicit `expires_at > @now`-style filter in your
-  rule/query (a built-in read-time exclusion is not implemented).
+  permanent row). A row with an unparseable ttl value is treated the same as `null`
+  — fail-safe: it remains visible and is never reaped by the GC.
+- **Read-time exclusion**: expired rows are **automatically hidden from every read**
+  (list and get, via the HTTP API, `ctx.records()`, and relation expand). The
+  predicate is ANDed with your filter, access rule, and keyset cursor, so it composes
+  transparently. You do not need to add a manual `expires_at > @now` filter.
+- The GC sweep still runs **once at startup** and then on a **5-minute interval**
+  (framework-internal job `_ttl_gc`; see §7), deleting expired rows so the table does
+  not grow unboundedly. Declaring a TTL collection starts the scheduler even if you
+  have no `.cron` of your own.
 - With an `.autodate` ttl field, prefer one whose value you set explicitly to the
   intended expiry (autodate defaults to write-on-create "now", which would expire
   the row immediately).
