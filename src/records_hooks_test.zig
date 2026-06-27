@@ -9,18 +9,23 @@ const sentry = @import("sentry.zig");
 const App = @import("app.zig").App;
 const records_api = @import("api/records.zig");
 
+const Ctx = @import("ctx.zig").Ctx;
+
 const Hooks = struct {
-    fn stampTitle(ev: *events.RecordEvent) anyerror!void {
+    fn stampTitle(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+        _ = ctx;
         // Mutations that grow the record's map MUST allocate with the request-scoped
         // arena (ev.arena) — the same allocator that owns ev.record — not app.allocator.
         try ev.record.object.put(ev.arena, "title", .{ .string = "stamped" });
     }
-    fn boom(ev: *events.RecordEvent) anyerror!void {
+    fn boom(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+        _ = ctx;
         _ = ev;
         return error.HookRejected;
     }
     var calls: usize = 0;
-    fn counter(ev: *events.RecordEvent) anyerror!void {
+    fn counter(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+        _ = ctx;
         _ = ev;
         calls += 1;
     }

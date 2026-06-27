@@ -102,7 +102,6 @@ pub const RecordPhase = enum {
 pub const RecordEvent = struct {
     app: *App,
     ctx: *const request.RequestContext,
-    data: Data,
     /// Request-scoped allocator that owns `record`'s JSON storage. Hooks MUST use
     /// this (not `app.allocator`) for any allocation that becomes part of `record`,
     /// so growth is consistent with the map's backing and is freed with the request.
@@ -110,14 +109,9 @@ pub const RecordEvent = struct {
     collection: []const u8,
     record: *std.json.Value, // mutable in before_*; the persisted record in after_*
     phase: RecordPhase,
-
-    /// Returns a `Ctx` bound to this hook's in-transaction connection. CRITICAL:
-    /// `bound_conn` is set to `ev.data.conn` so all ctx ops reuse the hook's
-    /// connection and never attempt to re-acquire the pool writer (which would
-    /// deadlock, since the hook already holds it).
-    pub fn caps(ev: *RecordEvent) Ctx {
-        return .{ .app = ev.app, .arena = ev.arena, .rctx = ev.ctx.*, .bound_conn = ev.data.conn };
-    }
+    // DB capabilities are delivered to a record hook via its `*Ctx` parameter
+    // (`ctx.records()`), whose `bound_conn` is the triggering write's in-transaction
+    // connection — so a before-hook's side-write commits/rolls back atomically with it.
 };
 
 pub const ErrorPhase = enum { request, before_hook, after_hook, cron, job, file_serve };
@@ -130,7 +124,7 @@ pub const ErrorEvent = struct {
     message: []const u8,
 };
 
-pub const RecordHandler = *const fn (ev: *RecordEvent) anyerror!void;
+pub const RecordHandler = *const fn (ctx: *Ctx, ev: *RecordEvent) anyerror!void;
 pub const ErrorHandler = *const fn (ev: *ErrorEvent) void;
 
 pub const AuthLevel = enum { public, authed, superuser };
@@ -504,7 +498,7 @@ fn validateHooks(comptime hooks: anytype) void {
 pub fn buildRecordDispatcher(comptime hooks: anytype) RecordHandler {
     comptime validateHooks(hooks);
     const Gen = struct {
-        fn dispatch(ev: *RecordEvent) anyerror!void {
+        fn dispatch(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
             // Pass 1: wildcard ("any") groups. Pass 2: collection-specific groups.
             inline for (.{ true, false }) |wildcard_pass| {
                 inline for (std.meta.fields(@TypeOf(hooks))) |group| {
@@ -519,7 +513,7 @@ pub fn buildRecordDispatcher(comptime hooks: anytype) RecordHandler {
                                 inline else => |p| {
                                     const fname = comptime phaseFieldName(p);
                                     if (@hasField(@TypeOf(g), fname)) {
-                                        try @field(g, fname)(ev);
+                                        try @field(g, fname)(ctx, ev);
                                     }
                                 },
                             }
@@ -535,11 +529,13 @@ pub fn buildRecordDispatcher(comptime hooks: anytype) RecordHandler {
 test "record dispatcher fires wildcard then specific, in order, and mutations stick" {
     const Trace = struct {
         var seq: std.ArrayListUnmanaged([]const u8) = .empty;
-        fn wild(ev: *RecordEvent) anyerror!void {
+        fn wild(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
+            _ = ctx;
             try seq.append(std.testing.allocator, "wild");
             try ev.record.object.put(std.testing.allocator, "touched", .{ .bool = true });
         }
-        fn specific(ev: *RecordEvent) anyerror!void {
+        fn specific(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
+            _ = ctx;
             try seq.append(std.testing.allocator, "specific");
             _ = ev;
         }
@@ -556,9 +552,11 @@ test "record dispatcher fires wildcard then specific, in order, and mutations st
     defer obj.deinit(std.testing.allocator);
     try obj.put(std.testing.allocator, "touched", .{ .bool = false });
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
+    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
+    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    defer ctx.deinit();
 
-    try dispatch(&ev);
+    try dispatch(&ctx, &ev);
     try std.testing.expectEqual(@as(usize, 2), Trace.seq.items.len);
     try std.testing.expectEqualStrings("wild", Trace.seq.items[0]);
     try std.testing.expectEqualStrings("specific", Trace.seq.items[1]);
@@ -567,7 +565,8 @@ test "record dispatcher fires wildcard then specific, in order, and mutations st
 
 test "before hook error aborts (propagates) and unrelated collection is skipped" {
     const H = struct {
-        fn boom(ev: *RecordEvent) anyerror!void {
+        fn boom(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
+            _ = ctx;
             _ = ev;
             return error.HookRejected;
         }
@@ -577,11 +576,13 @@ test "before hook error aborts (propagates) and unrelated collection is skipped"
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .arena = std.testing.allocator, .collection = "comments", .record = &rec, .phase = .before_create };
-    try dispatch(&ev); // "comments" not registered -> no-op, no error
+    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .arena = std.testing.allocator, .collection = "comments", .record = &rec, .phase = .before_create };
+    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    defer ctx.deinit();
+    try dispatch(&ctx, &ev); // "comments" not registered -> no-op, no error
 
     ev.collection = "posts";
-    try std.testing.expectError(error.HookRejected, dispatch(&ev));
+    try std.testing.expectError(error.HookRejected, dispatch(&ctx, &ev));
 }
 
 /// Route a framework-caught error: run the consumer onError handler (if any),
@@ -628,7 +629,8 @@ test "dispatchError runs consumer handler before the backstop" {
 test "only the matching phase's handler runs" {
     const H = struct {
         var after_calls: usize = 0;
-        fn onAfter(ev: *RecordEvent) anyerror!void {
+        fn onAfter(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
+            _ = ctx;
             _ = ev;
             after_calls += 1;
         }
@@ -638,11 +640,13 @@ test "only the matching phase's handler runs" {
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
-    try dispatch(&ev); // before_create fired, but only afterCreate is registered -> no call
+    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
+    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    defer ctx.deinit();
+    try dispatch(&ctx, &ev); // before_create fired, but only afterCreate is registered -> no call
     try std.testing.expectEqual(@as(usize, 0), H.after_calls);
     ev.phase = .after_create;
-    try dispatch(&ev);
+    try dispatch(&ctx, &ev);
     try std.testing.expectEqual(@as(usize, 1), H.after_calls);
 }
 
@@ -847,22 +851,6 @@ test "RouteEvent.writer() create round-trips and releases the writer (no leak)" 
         defer env.pool.releaseWriter();
         _ = w2;
     }
-}
-
-test "RecordEvent.caps() binds to the hook's connection (no pool acquisition)" {
-    const env = try TestEnv.init();
-    defer env.deinit();
-    const w = env.pool.acquireWriter();
-    defer env.pool.releaseWriter();
-
-    var rec: std.json.Value = .{ .object = .empty };
-    var ev = RecordEvent{
-        .app = &env.app, .ctx = &.{}, .data = .{ .app = &env.app, .conn = w, .io = env.app.io },
-        .arena = env.arena.allocator(), .collection = "posts", .record = &rec, .phase = .before_create,
-    };
-    var ctx = ev.caps();
-    defer ctx.deinit();
-    try std.testing.expect(ctx.bound_conn == w);
 }
 
 test "JobEvent.reader() sees a committed write and returns the conn to the pool (no leak)" {

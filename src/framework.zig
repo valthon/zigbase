@@ -917,7 +917,8 @@ test "App(cfg) builds a record dispatcher only when hooks are present" {
     try std.testing.expect(Empty.dispatch.record == null);
 
     const H = struct {
-        fn f(ev: *@import("events.zig").RecordEvent) anyerror!void {
+        fn f(ctx: *@import("ctx.zig").Ctx, ev: *@import("events.zig").RecordEvent) anyerror!void {
+            _ = ctx;
             _ = ev;
         }
     };

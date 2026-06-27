@@ -12,6 +12,7 @@ const params_mod = @import("../query/params.zig");
 const expand_mod = @import("../query/expand.zig");
 const rules = @import("../rules.zig");
 const request = @import("../request.zig");
+const Ctx = @import("../ctx.zig").Ctx;
 const auth = @import("../auth.zig");
 const realtime_ws = @import("../realtime/ws.zig");
 const file_plan = @import("../files/plan.zig");
@@ -40,16 +41,21 @@ pub fn emitRecord(
     var ev = events.RecordEvent{
         .app = app,
         .ctx = rctx,
-        .data = .{ .app = app, .conn = conn, .io = app.io },
         .arena = arena,
         .collection = col_name,
         .record = value,
         .phase = phase,
     };
+    // The hook's capabilities (`ctx.records()`) ride on a Ctx bound to the triggering
+    // write's IN-TRANSACTION connection (A2): a before-hook side-write reuses the txn and
+    // commits/rolls back atomically with the primary write — never re-acquiring the pool
+    // writer (which would deadlock, since the handler already holds it).
+    var ctx = Ctx{ .app = app, .arena = arena, .rctx = rctx.*, .bound_conn = conn };
+    defer ctx.deinit();
     if (is_before) {
-        try handler(&ev);
+        try handler(&ctx, &ev);
     } else {
-        handler(&ev) catch |e| {
+        handler(&ctx, &ev) catch |e| {
             var err_ev = events.ErrorEvent{ .app = app, .ctx = rctx, .err = e, .phase = .after_hook, .message = @errorName(e) };
             events.dispatchError(app, app.dispatch, &err_ev);
         };
@@ -1091,17 +1097,18 @@ test "creating an auth record without a password is a 400" {
 // the `audit` row survived (this test FAILS there) — proof the abort is atomic.
 // ---------------------------------------------------------------------------
 
-fn auditThenRejectHook(ev: *events.RecordEvent) anyerror!void {
+fn auditThenRejectHook(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
     if (ev.phase != .before_create) return;
     if (!std.mem.eql(u8, ev.collection, "posts")) return; // act only on the primary write
-    // Side-write into `audit` on the hook's IN-TRANSACTION connection (ev.data.conn).
-    // We call records.create directly with ev.arena rather than ev.data.create — the
+    // Side-write into `audit` on the hook's IN-TRANSACTION connection (ctx.bound_conn).
+    // We call records.create directly with ev.arena rather than ctx.records().create — the
     // latter would allocate the throwaway record on app.allocator and trip the test's
     // leak detector; the connection (and thus the shared transaction) is identical.
-    const acol = (try collections.get(ev.arena, ev.data.conn, "audit")) orelse return error.AuditMissing;
+    const conn = ctx.bound_conn.?;
+    const acol = (try collections.get(ev.arena, conn, "audit")) orelse return error.AuditMissing;
     var obj: std.json.ObjectMap = .empty;
     try obj.put(ev.arena, "title", .{ .string = "audit-side-write" });
-    _ = try records.create(ev.arena, ev.data.io, ev.data.conn, acol, .{ .object = obj });
+    _ = try records.create(ev.arena, ctx.app.io, conn, acol, .{ .object = obj });
     return error.HookRejected;
 }
 
