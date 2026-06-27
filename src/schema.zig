@@ -29,6 +29,11 @@ pub const Field = struct {
     required: bool = false,
     unique: bool = false,
     hidden: bool = false,
+    /// Transparent at-rest encryption (Theme B1). When true the column stores an
+    /// AES-256-GCM envelope; the records layer encrypts on write and decrypts on
+    /// read. Only text/editor/json fields may set this (enforced at comptime in
+    /// provision.zig). Encrypted fields are non-indexable/-unique/-filterable.
+    encrypted: bool = false,
     options: FieldOptions,
 
     pub fn fieldType(self: Field) FieldType {
@@ -587,6 +592,7 @@ fn fieldToValue(alloc: std.mem.Allocator, f: Field) !Value {
     try obj.put(alloc, "name", jStr(f.name));
     try obj.put(alloc, "required", jBool(f.required));
     try obj.put(alloc, "unique", jBool(f.unique));
+    try obj.put(alloc, "encrypted", jBool(f.encrypted));
     try obj.put(alloc, "type", jStr(@tagName(std.meta.activeTag(f.options))));
 
     var opts: ObjectMap = .empty;
@@ -805,6 +811,7 @@ fn fieldFromValue(alloc: std.mem.Allocator, v: Value) !Field {
         .name = name,
         .required = getBool(v, "required", false),
         .unique = getBool(v, "unique", false),
+        .encrypted = getBool(v, "encrypted", false),
         .options = try optionsFromValue(alloc, t, opts),
     };
 }
