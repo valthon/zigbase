@@ -137,6 +137,13 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     try w.beginImmediate();
+    // Safety net for EVERY error-return after begin (verifyLinkToken/consumeLinkToken DB
+    // errors, records.get, the hook, issueSession, commit): roll back so a failed login
+    // never leaves an open transaction on the single shared writer (which would poison all
+    // subsequent writes). Value-returns below (NULL/replay/gate/veto cases) roll back
+    // explicitly since errdefer does not fire on a normal return; the double-rollback that
+    // a later error would cause is harmless (no active txn → caught).
+    errdefer w.rollback() catch {};
 
     const claims = (try auth_helpers.verifyLinkToken(ctx, w, col.name, token)) orelse {
         w.rollback() catch {};
@@ -144,16 +151,13 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
     };
     // Only a genuine replay (the token's jti is already recorded) is a 400. Any
     // other failure (DB prepare/step, I/O) must propagate to the 500 backstop
-    // rather than masquerading as "Link already used."
+    // rather than masquerading as "Link already used." (errdefer rolls back the propagation.)
     auth_helpers.consumeLinkToken(w, claims) catch |err| switch (err) {
         error.AlreadyConsumed => {
             w.rollback() catch {};
             return (ApiError.badRequest("Link already used.")).toResponse(ctx.allocator);
         },
-        else => {
-            w.rollback() catch {};
-            return err;
-        },
+        else => return err,
     };
 
     // Fetch the record once for the verification gate, the hook, and session issuance.
@@ -173,14 +177,10 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
         return resp;
     }
 
-    const issued = auth.issueSessionExt(ctx, w, col.name, claims.id, .magic_link, rec) catch |e| {
-        w.rollback() catch {};
-        return e;
-    };
-    w.commit() catch |e| {
-        w.rollback() catch {};
-        return e;
-    };
+    const issued = try auth.issueSessionNoEmit(ctx, w, col.name, claims.id);
+    try w.commit();
+    // onAuth fires only AFTER a durable commit (session truly issued).
+    auth.emitAuth(ctx, col.name, rec, .magic_link);
 
     const cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
     const headers = try ctx.allocator.dupe(http.Header, &[_]http.Header{
@@ -417,6 +417,57 @@ test "#80 consume: aborting beforeAuthSuccess blocks session AND leaves the link
     var ctx3 = consumeCtx(env, a, "mlconsume80", q3);
     const res3 = try consume(&ctx3);
     try std.testing.expectEqual(@as(u16, 400), res3.status);
+}
+
+test "L1 consume: a DB error after begin rolls back (writer not poisoned)" {
+    var env = try setupConsumeEnv("mlconsumeL1", &.{}, "/home");
+    defer env.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try env.createUser(a, "mlconsumeL1", "u@x.io", "longenough");
+
+    const mintToken = struct {
+        fn go(e: *api_auth.TestEnv, alloc: std.mem.Allocator) ![]const u8 {
+            var mc = consumeCtx(e, alloc, "mlconsumeL1", "");
+            const w = e.pool.acquireWriter();
+            defer e.pool.releaseWriter();
+            const col = (try collections.get(alloc, w, "mlconsumeL1")).?;
+            const rid = (try api_auth.findByIdentity(alloc, w, col, "u@x.io")).?;
+            return (try auth_helpers.mintLinkToken(&mc, w, "mlconsumeL1", rid, 900, .{})).token;
+        }
+    }.go;
+
+    const t1 = try mintToken(env, a);
+
+    // Drop the single-use ledger so consumeLinkToken errors AFTER beginImmediate. Without
+    // the errdefer rollback the failed login would leave the writer in an open transaction
+    // and poison every subsequent login.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("DROP TABLE \"_consumedTokens\";");
+    }
+    {
+        const q = try std.fmt.allocPrint(a, "token={s}", .{t1});
+        var ctx = consumeCtx(env, a, "mlconsumeL1", q);
+        // The error propagates (it is not a replay); we only care that the writer is left clean.
+        if (consume(&ctx)) |_| {} else |_| {}
+    }
+    // Restore the ledger and prove the writer is still usable: a fresh login commits to 302.
+    // (If the writer were poisoned, the next beginImmediate would fail and this would not be 302.)
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("CREATE TABLE \"_consumedTokens\" (\"jti\" TEXT PRIMARY KEY, \"expires\" INTEGER, \"consumed\" TEXT);");
+    }
+    const t2 = try mintToken(env, a);
+    const q2 = try std.fmt.allocPrint(a, "token={s}", .{t2});
+    var ctx2 = consumeCtx(env, a, "mlconsumeL1", q2);
+    const res = try consume(&ctx2);
+    try std.testing.expectEqual(@as(u16, 302), res.status);
 }
 
 test "consume: non-whitelisted redirect falls back to default (no open redirect)" {

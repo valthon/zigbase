@@ -173,6 +173,23 @@ pub fn issueSessionExt(
     return issued;
 }
 
+/// Like `issueSessionExt` but does NOT fire `onAuth`. Used by the transactional consume
+/// paths (`auth_methods.complete`, `magic_link_consume`) so they can emit the notification
+/// AFTER `COMMIT` via `emitAuth`, preserving the invariant that `onAuth` only fires once a
+/// session has been durably issued. (`issueSessionExt` keeps emitting inline for the legacy
+/// non-transactional callers — `authWithPassword`/`authRefresh`.)
+pub fn issueSessionNoEmit(
+    ctx: *http.RequestCtx,
+    conn: *db.Db,
+    collection: []const u8,
+    record_id: []const u8,
+) !Issued {
+    const col = (try collections.get(ctx.allocator, conn, collection)) orelse return error.NotFound;
+    if (col.type != .auth) return error.NotFound;
+    const tk = (try tokenKeyFor(ctx.allocator, conn, col.name, record_id)) orelse return error.NotFound;
+    return issue(ctx, conn, col.name, record_id, tk);
+}
+
 /// Fire the writable, abortable `beforeAuthSuccess` hook (#80) inside the login's write
 /// transaction. `conn` is the in-transaction writer; the hook's `*Ctx` is bound to it so
 /// its `ctx.records()` writes participate in (and roll back with) the login.

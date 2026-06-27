@@ -537,8 +537,8 @@ pub const App = zigbase.App(.{
                 .type = .auth,
                 .fields = .{
                     .{ .name = "name", .type = .text, .max = 100 },
-                    // Stamped by the beforeAuthSuccess hook on every login (#80).
-                    .{ .name = "lastSeenAt", .type = .number },
+                    // Incremented by the beforeAuthSuccess hook on every login (#80).
+                    .{ .name = "loginCount", .type = .number },
                 },
                 // require_verified: guests must verify their email before a session is minted.
                 // Justified for a booking/payments app — unverified accounts cannot hold slots.

@@ -176,7 +176,7 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                         w.rollback() catch {};
                         return resp;
                     }
-                    const issued = auth.issueSessionExt(ctx, w, col.name, rid, auth_tag, rec) catch |e| {
+                    const issued = auth.issueSessionNoEmit(ctx, w, col.name, rid) catch |e| {
                         w.rollback() catch {};
                         return e;
                     };
@@ -184,6 +184,8 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                         w.rollback() catch {};
                         return e;
                     };
+                    // onAuth fires only AFTER a durable commit (session truly issued).
+                    auth.emitAuth(ctx, col.name, rec, auth_tag);
                     var root: std.json.ObjectMap = .empty;
                     try root.put(ctx.allocator, "token", .{ .string = issued.token });
                     const cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
