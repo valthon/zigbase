@@ -133,6 +133,24 @@ fn init_0008(w: *db.Db) db.DbError!void {
     try w.exec("CREATE INDEX IF NOT EXISTS \"idx_webauthncred_record\" ON \"_webauthnCredentials\" (\"collectionRef\",\"recordRef\");");
 }
 
+fn init_0009_kv(w: *db.Db) db.DbError!void {
+    // Built-in key→value/settings store (#87). A single internal table holding small,
+    // mutable, superuser-managed values keyed by an arbitrary string: feature flags
+    // (#88, a typed bool view over this same store), maintenance toggles, cached
+    // external tokens, a JSON settings blob the caller (de)serializes, etc. It is NOT a
+    // `_collections` row, so it is invisible to the record API, query engine, and
+    // access-rule system — settings stay superuser-only by default. "created"/"updated"
+    // are ISO-8601 datetimes; an upsert preserves "created" and bumps "updated".
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_kv" (
+        \\  "key" TEXT PRIMARY KEY,
+        \\  "value" TEXT NOT NULL,
+        \\  "created" TEXT NOT NULL,
+        \\  "updated" TEXT NOT NULL
+        \\);
+    );
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -142,6 +160,7 @@ pub const all = [_]Migration{
     .{ .name = "0006_cursor_states", .up = init_0006 },
     .{ .name = "0007_auth_challenges", .up = init_0007 },
     .{ .name = "0008_webauthn_credentials", .up = init_0008 },
+    .{ .name = "0009_kv", .up = init_0009_kv },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {
@@ -207,6 +226,21 @@ test "0002 adds options column and seeds _superusers" {
     defer c.finalize();
     _ = try c.step();
     try std.testing.expectEqual(@as(i64, 1), c.columnInt(0));
+}
+
+test "0009 creates _kv settings table with key/value/created/updated columns" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try run(&d);
+    var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('_kv');");
+    defer t.finalize();
+    _ = try t.step();
+    try std.testing.expectEqual(@as(i64, 4), t.columnInt(0));
+    // key is the primary key.
+    var pk = try d.prepare("SELECT pk FROM pragma_table_info('_kv') WHERE name='key';");
+    defer pk.finalize();
+    _ = try pk.step();
+    try std.testing.expectEqual(@as(i64, 1), pk.columnInt(0));
 }
 
 test "0003 creates _externalAuths with unique provider/providerId and per-record indexes" {
