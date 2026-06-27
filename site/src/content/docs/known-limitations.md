@@ -71,10 +71,12 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   including their zero-argument implicit-`'now'` forms): those date/time builtins are shadowed
   on every reader and writer connection so they resolve to the frozen instant, while every
   other input (explicit datetimes, `'+1 day'` modifiers, the `strftime` format string) passes
-  through to genuine SQLite. **Still out of scope:** `CURRENT_TIMESTAMP` / `CURRENT_TIME` /
-  `CURRENT_DATE` and SQLite column `DEFAULT` timestamps — these are SQL keywords that read
-  SQLite's time directly and would need a custom VFS to freeze; route such time-logic through a
-  shadowed function or the framework helpers if it must be deterministic.
+  through to genuine SQLite. It **also** freezes the SQL keywords `CURRENT_TIMESTAMP` /
+  `CURRENT_TIME` / `CURRENT_DATE` and column `DEFAULT CURRENT_TIMESTAMP` timestamps: those read
+  SQLite's clock through the VFS rather than the SQL-function layer, so (dev builds only)
+  connections open against a wrapping VFS that is a byte-for-byte copy of the default VFS with
+  only its current-time hooks overridden to return the frozen instant — all file I/O still
+  delegates to the genuine OS VFS unchanged. There are no remaining unfrozen `'now'` paths.
 - **The test clock is impossible to enable on a production build.** It is compiled in only when
   the `dev_clock` build option is true (on in `Debug`, off in any release build; the release
   script ships it off). A production binary never reads `ZIGBASE_FAKE_NOW` — the override folds

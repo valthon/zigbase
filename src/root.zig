@@ -201,6 +201,7 @@ test {
     _ = @import("api/webauthn_register.zig");
     _ = @import("clock.zig");
     _ = @import("clock_sql.zig");
+    _ = @import("clock_vfs.zig");
     _ = @import("clock_test.zig");
     _ = @import("ctx.zig");
     _ = @import("session.zig");

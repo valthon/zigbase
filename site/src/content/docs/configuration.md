@@ -70,7 +70,7 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_SMTP_TLS` | — | `auto` | transport security: `none` / `starttls` / `implicit` / `auto` (auto: 465→implicit, 587→starttls, else→none) |
 | `ZIGBASE_SMTP_INSECURE` | — | `false` | skip TLS cert verification (self-signed relays only) |
 | `ZIGBASE_SENDMAIL_COMMAND` | — | `""` (off) | local-MTA command to pipe mail to (e.g. `sendmail -t -i` or `msmtp -t`); when set, **overrides** SMTP. App holds no SMTP creds |
-| `ZIGBASE_FAKE_NOW` | — | _unset_ | **DEV-ONLY test clock.** Freeze "now" to an ISO-8601 UTC instant (e.g. `2029-03-07T16:00:00Z`) for deterministic time-boundary e2e tests. Freezes both the framework's own timestamps and a consumer's raw SQL `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')` (and `date`/`time`/`julianday`). **Ignored entirely on a production build** (compiled out unless built with `-Ddev-clock=true`; off in any release build). See [Known limitations → Testing](./known-limitations) for scope |
+| `ZIGBASE_FAKE_NOW` | — | _unset_ | **DEV-ONLY test clock.** Freeze "now" to an ISO-8601 UTC instant (e.g. `2029-03-07T16:00:00Z`) for deterministic time-boundary e2e tests. Freezes both the framework's own timestamps and a consumer's raw SQL `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')` (and `date`/`time`/`julianday`), plus the `CURRENT_TIMESTAMP` / `CURRENT_TIME` / `CURRENT_DATE` keywords and column `DEFAULT CURRENT_TIMESTAMP` (via a wrapping VFS). **Ignored entirely on a production build** (compiled out unless built with `-Ddev-clock=true`; off in any release build). See [Known limitations → Testing](./known-limitations) for scope |
 
 ## Email delivery
 

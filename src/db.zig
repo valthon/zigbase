@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const clock_sql = @import("clock_sql.zig");
+const clock_vfs = @import("clock_vfs.zig");
 
 /// Returns the linked SQLite library version string, e.g. "3.53.2".
 pub fn libVersion() []const u8 {
@@ -30,7 +31,9 @@ pub const Db = struct {
     pub fn open(path: [:0]const u8) DbError!Db {
         var handle: ?*c.sqlite3 = null;
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX;
-        if (c.sqlite3_open_v2(path.ptr, &handle, flags, null) != c.SQLITE_OK) {
+        // Dev-only: open against the freezing VFS so CURRENT_TIMESTAMP / column DEFAULTs honor
+        // ZIGBASE_FAKE_NOW (#97). comptime-null on a prod build -> the OS default VFS, unchanged.
+        if (c.sqlite3_open_v2(path.ptr, &handle, flags, clock_vfs.vfsName()) != c.SQLITE_OK) {
             if (handle) |h| _ = c.sqlite3_close(h);
             return DbError.OpenFailed;
         }
@@ -403,7 +406,8 @@ pub const Pool = struct {
     pub fn openReader(self: *Pool) DbError!Db {
         var handle: ?*c.sqlite3 = null;
         const flags = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX;
-        if (c.sqlite3_open_v2(self.path.ptr, &handle, flags, null) != c.SQLITE_OK) {
+        // Dev-only freezing VFS (#97); comptime-null on a prod build (default VFS, unchanged).
+        if (c.sqlite3_open_v2(self.path.ptr, &handle, flags, clock_vfs.vfsName()) != c.SQLITE_OK) {
             if (handle) |h| _ = c.sqlite3_close(h);
             return DbError.OpenFailed;
         }
