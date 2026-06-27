@@ -141,6 +141,27 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
             }
         }
         if (@hasField(S, "indexes")) col.indexes = buildIndexes(name, spec.indexes);
+        // TTL: `.ttl_field` names an existing date/autodate field as the row's expiry
+        // timestamp (a framework-internal GC reaps expired rows). Validate at comptime:
+        // the field must exist and be a date/autodate (so it holds an ISO-8601 instant).
+        // The GC normalizes both sides via SQLite `strftime('%Y-%m-%dT%H:%M:%SZ', ...)`
+        // before comparing, so non-canonical `.date` values (timezone offsets, space
+        // separator, date-only) are handled correctly.
+        if (@hasField(S, "ttl_field")) {
+            const tf: []const u8 = spec.ttl_field;
+            var matched: ?schema.FieldType = null;
+            for (frozen_fields) |f| {
+                if (std.mem.eql(u8, f.name, tf)) {
+                    matched = f.fieldType();
+                    break;
+                }
+            }
+            if (matched == null)
+                @compileError("collection '" ++ name ++ "': .ttl_field '" ++ tf ++ "' must name an existing date/autodate field, but no such field exists");
+            if (matched.? != .date and matched.? != .autodate)
+                @compileError("collection '" ++ name ++ "': .ttl_field '" ++ tf ++ "' must name a date/autodate field (got ." ++ @tagName(matched.?) ++ ")");
+            col.options.ttl_field = tf;
+        }
 
         // An encrypted field cannot be indexed (the index would be built over
         // per-row-nonce ciphertext and could never satisfy a lookup). Reject at
@@ -687,6 +708,20 @@ pub fn ensureCollection(
         }
     }
 
+    // TTL: a `.ttl_field` newly added to (or changed on) an EXISTING collection must
+    // be persisted, else the GC never sees it. Compare the spec's ttl_field against
+    // the live one and, if it differs, force an update (narrowly — we only carry the
+    // ttl_field across below, never wholesale-copying spec.options, which would clobber
+    // persisted OAuth secrets).
+    const ttl_differs = blk: {
+        const a = spec.options.ttl_field;
+        const b = live.options.ttl_field;
+        if (a == null and b == null) break :blk false;
+        if (a == null or b == null) break :blk true;
+        break :blk !std.mem.eql(u8, a.?, b.?);
+    };
+    if (ttl_differs) changed = true;
+
     if (!changed) return; // idempotent no-op
 
     // Additive auto-migration: rebuild the table with the union of live + new
@@ -709,6 +744,9 @@ pub fn ensureCollection(
     newdef.createRule = spec.createRule orelse live.createRule;
     newdef.updateRule = spec.updateRule orelse live.updateRule;
     newdef.deleteRule = spec.deleteRule orelse live.deleteRule;
+    // Carry the (possibly newly-set) ttl_field; keep the rest of live.options
+    // (e.g. persisted OAuth secrets) untouched by NOT copying spec.options wholesale.
+    newdef.options.ttl_field = spec.options.ttl_field;
     _ = try collections.update(alloc, io, w, live.id, newdef);
     std.log.info("provision: collection '{s}' added {d} field(s)", .{ spec.name, additions.items.len });
 }
@@ -875,6 +913,28 @@ test "buildCollections lowers a literal into collection/field specs" {
     try std.testing.expectEqual(@as(usize, 8), listings.fields[0].id.len);
 }
 
+test "buildCollection lowers .ttl_field naming a date/autodate field into options" {
+    const specs = comptime buildCollections(.{
+        .sessions = .{ .fields = .{
+            .{ .name = "token", .type = .text },
+            .{ .name = "expires_at", .type = .date },
+        }, .ttl_field = "expires_at" },
+        .events = .{ .fields = .{
+            .{ .name = "kind", .type = .text },
+            .{ .name = "created_at", .type = .autodate },
+        }, .ttl_field = "created_at" },
+        .plain = .{ .fields = .{
+            .{ .name = "title", .type = .text },
+        } },
+    });
+    try std.testing.expect(specs[0].options.ttl_field != null);
+    try std.testing.expectEqualStrings("expires_at", specs[0].options.ttl_field.?);
+    try std.testing.expect(specs[1].options.ttl_field != null);
+    try std.testing.expectEqualStrings("created_at", specs[1].options.ttl_field.?);
+    // a collection without .ttl_field leaves it null
+    try std.testing.expect(specs[2].options.ttl_field == null);
+}
+
 test "buildCollections lowers a large schema without exhausting the comptime branch budget" {
     // Regression: a realistic consumer schema (here 6 collections, ~30 fields)
     // must lower at comptime without tripping Zig's default 1000 backward-branch
@@ -1033,6 +1093,44 @@ test "applySpecs additively adds a new field (auto-migration), preserving data" 
     try std.testing.expect(try st.step());
     try std.testing.expectEqualStrings("hello", st.columnText(0)); // data preserved
     try std.testing.expect(st.isNull(1)); // new column, null for old row
+}
+
+test "applySpecs persists a ttl_field added to an existing collection (then GC reaps)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // v1: a collection with a date field but NO ttl_field.
+    const fields = [_]schema.Field{
+        .{ .id = "f_tok", .name = "token", .options = .{ .text = .{} } },
+        .{ .id = "f_exp", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    const s1 = [_]schema.Collection{.{ .id = "", .name = "sessions", .fields = &fields }};
+    try applySpecs(a, std.testing.io, &d, &s1);
+    try d.exec("INSERT INTO \"sessions\" (\"id\",\"created\",\"updated\",\"token\",\"expires_at\") VALUES ('s1','','','t','2000-01-01T00:00:00Z');");
+
+    // Before: ttl_field not set, GC reaps nothing.
+    try std.testing.expect((try collections.get(a, &d, "sessions")).?.options.ttl_field == null);
+    try std.testing.expectEqual(@as(usize, 0), try @import("records.zig").gcExpiredRecords(a, &d));
+
+    // v2: same fields, now declaring .ttl_field — must be persisted by re-provisioning.
+    const s2 = [_]schema.Collection{.{ .id = "", .name = "sessions", .fields = &fields, .options = .{ .ttl_field = "expires_at" } }};
+    try applySpecs(a, std.testing.io, &d, &s2);
+
+    // The persisted options blob now carries the ttl_field...
+    const live = (try collections.get(a, &d, "sessions")).?;
+    try std.testing.expect(live.options.ttl_field != null);
+    try std.testing.expectEqualStrings("expires_at", live.options.ttl_field.?);
+
+    // ...and the GC now reaps the expired row.
+    try std.testing.expectEqual(@as(usize, 1), try @import("records.zig").gcExpiredRecords(a, &d));
+    var st = try d.prepare("SELECT COUNT(*) FROM \"sessions\";");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
 }
 
 test "applySpecs logs+skips a destructive type change (does not destroy data)" {

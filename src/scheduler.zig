@@ -61,6 +61,24 @@ pub fn buildJobs(comptime specs: anytype) []const RuntimeJob {
     return &Holder.table;
 }
 
+/// Combine two comptime-assembled job tables into one static-lifetime slice. Used to
+/// append the framework's own internal jobs (e.g. the `_ttl_gc` sweep) after the
+/// consumer's `.cron`-derived table. Like `buildJobs`, the result is returned via a
+/// struct-namespace const so it has static lifetime (a plain comptime local would not).
+pub fn concatJobs(comptime a: []const RuntimeJob, comptime b: []const RuntimeJob) []const RuntimeJob {
+    if (a.len == 0) return b;
+    if (b.len == 0) return a;
+    const Holder = struct {
+        const table: [a.len + b.len]RuntimeJob = blk: {
+            var t: [a.len + b.len]RuntimeJob = undefined;
+            for (a, 0..) |j, i| t[i] = j;
+            for (b, 0..) |j, i| t[a.len + i] = j;
+            break :blk t;
+        };
+    };
+    return &Holder.table;
+}
+
 pub const JobState = struct {
     status: enum { idle, running, stopped },
     next_fire: i64, // unix seconds; meaningful when status == .idle
@@ -329,6 +347,31 @@ pub const Scheduler = struct {
         th.detach();
     }
 };
+
+test "concatJobs combines two job tables (lengths + names from both halves)" {
+    const H = struct {
+        fn noop(ctx: *Ctx, ev: *events.JobEvent) anyerror!void {
+            _ = ctx;
+            _ = ev;
+        }
+    };
+    const a = comptime buildJobs(.{
+        .{ .name = "user_a", .schedule = schedule.Schedule{ .cron = "0 3 * * *" }, .handler = H.noop },
+        .{ .name = "user_b", .schedule = schedule.Schedule{ .interval = .hourly }, .handler = H.noop },
+    });
+    const b = comptime buildJobs(.{
+        .{ .name = "_ttl_gc", .schedule = schedule.Schedule{ .interval = .{ .minutes = 5 } }, .handler = H.noop },
+    });
+    const both = comptime concatJobs(a, b);
+    try std.testing.expectEqual(@as(usize, 3), both.len);
+    try std.testing.expectEqualStrings("user_a", both[0].name);
+    try std.testing.expectEqualStrings("user_b", both[1].name);
+    try std.testing.expectEqualStrings("_ttl_gc", both[2].name);
+    // an empty second half is a no-op identity
+    const just_a = comptime concatJobs(a, &.{});
+    try std.testing.expectEqual(@as(usize, 2), just_a.len);
+    try std.testing.expectEqualStrings("user_a", just_a[0].name);
+}
 
 test "buildJobs assembles cron/interval/reactive into a uniform table" {
     const H = struct {
