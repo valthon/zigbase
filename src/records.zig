@@ -1370,6 +1370,7 @@ pub fn gcExpiredRecords(alloc: std.mem.Allocator, w: *db.Db) !usize {
         if (!schema.isValidIdentifier(col.name)) continue;
         if (!schema.isValidIdentifier(tf)) continue;
         const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\") <= strftime('%Y-%m-%dT%H:%M:%SZ','now');", .{ col.name, tf, tf }, 0);
+        defer alloc.free(sql); // no-op for arena callers; protects any future GPA caller
         var st = try w.prepare(sql);
         defer st.finalize();
         _ = try st.step();
