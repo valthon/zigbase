@@ -30,11 +30,13 @@ pub const Ctx = struct {
     request: ?*http_mod.RequestCtx = null,
 
     /// The resolved identity of the authenticated principal for this request.
-    /// `id` and `collection` are empty strings when no auth record is present
-    /// (e.g. a superuser-only token with no associated record, or a job/hook ctx).
+    /// `id` is an empty string when no auth record is present (e.g. a superuser-only
+    /// token with no associated record).
+    ///
+    /// Only `id` + `is_superuser` for now: a `collection` field will be added once
+    /// `RequestContext` carries the auth collection name (a later/Theme-D task).
     pub const User = struct {
         id: []const u8,
-        collection: []const u8,
         is_superuser: bool,
     };
 
@@ -53,7 +55,6 @@ pub const Ctx = struct {
         };
         return .{
             .id = id,
-            .collection = "",
             .is_superuser = self.rctx.is_superuser,
         };
     }
@@ -61,6 +62,8 @@ pub const Ctx = struct {
     /// Mint a session for a known record via the audited seam (`.custom` method tag).
     /// Acquires the DB writer, calls `auth_helpers.issueSession`, releases the writer,
     /// and returns the signed JWT + 2 cookies.
+    ///
+    /// Only valid inside a route handler — panics if `request` is null (job/hook context).
     ///
     /// WARNING: this function acquires the pool writer internally. Do NOT call it while
     /// already holding the writer (e.g. inside `ctx.tx`, from a before-hook, or with a
