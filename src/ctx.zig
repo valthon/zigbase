@@ -91,6 +91,30 @@ pub const Records = struct {
         return result;
     }
 
+    pub fn create(self: Records, collection: []const u8, value: std.json.Value) !std.json.Value {
+        if (self.ctx.bound_conn) |c|
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).create(collection, value);
+        const c = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).create(collection, value);
+    }
+
+    pub fn update(self: Records, collection: []const u8, id: []const u8, value: std.json.Value) !?std.json.Value {
+        if (self.ctx.bound_conn) |c|
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).update(collection, id, value);
+        const c = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).update(collection, id, value);
+    }
+
+    pub fn delete(self: Records, collection: []const u8, id: []const u8) !bool {
+        if (self.ctx.bound_conn) |c|
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).delete(collection, id);
+        const c = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).delete(collection, id);
+    }
+
     /// Resolve the collection and run expand on `rec` in-place.
     /// CRUD operations in Records bypass collection rules (matching Data behaviour);
     /// expand applies the *target* collection's viewRule under the Ctx identity.
@@ -254,6 +278,32 @@ test "Ctx(bound) uses the bound connection and never acquires from the pool" {
     const conn = try ctx.connForRead();
     try std.testing.expect(conn == w);
     try std.testing.expect(ctx.reader == null);
+}
+
+test "ctx.records create/update/delete round-trips and releases the writer" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    defer ctx.deinit();
+
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "title", .{ .string = "draft" });
+    const created = try ctx.records().create("posts", .{ .object = o });
+    const id = created.object.get("id").?.string;
+
+    var u: std.json.ObjectMap = .empty;
+    try u.put(a, "title", .{ .string = "published" });
+    const updated = (try ctx.records().update("posts", id, .{ .object = u })).?;
+    try std.testing.expectEqualStrings("published", updated.object.get("title").?.string);
+
+    try std.testing.expect(try ctx.records().delete("posts", id));
+
+    // Writer was released each time: re-acquiring directly must not deadlock.
+    const w2 = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    _ = w2;
 }
 
 test "ctx.records expand nests the related record under \"expand\"" {
