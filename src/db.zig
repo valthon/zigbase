@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig").c;
+const clock_sql = @import("clock_sql.zig");
 
 /// Returns the linked SQLite library version string, e.g. "3.53.2".
 pub fn libVersion() []const u8 {
@@ -15,6 +16,12 @@ pub const DbError = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, St
 
 pub const Db = struct {
     handle: *c.sqlite3,
+    /// Type-erased pointer to the resolved `field_policy.Cipher` (or null when no
+    /// ZIGBASE_FIELD_KEY is configured). Stamped onto pooled connections at acquire
+    /// time and copied into every Stmt by `prepare`, so the records value layer can
+    /// transparently encrypt/decrypt without threading a cipher through every call.
+    /// Opaque to keep db.zig free of an application import cycle; values.zig casts it.
+    field_cipher: ?*const anyopaque = null,
 
     pub fn openMemory() DbError!Db {
         return open(":memory:");
@@ -27,7 +34,12 @@ pub const Db = struct {
             if (handle) |h| _ = c.sqlite3_close(h);
             return DbError.OpenFailed;
         }
-        return .{ .handle = handle.? };
+        const conn = Db{ .handle = handle.? };
+        // Dev-only: shadow SQLite's date/time builtins so a consumer's raw `datetime('now')`
+        // honors the frozen test clock (#84). comptime no-op on a prod build, so the writer/
+        // any Db.open caller (incl. openMemory) is unchanged in production.
+        clock_sql.register(conn.handle);
+        return conn;
     }
 
     pub fn close(self: *Db) void {
@@ -49,7 +61,7 @@ pub const Db = struct {
         var handle: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &handle, null) != c.SQLITE_OK)
             return DbError.PrepareFailed;
-        return .{ .handle = handle.? };
+        return .{ .handle = handle.?, .field_cipher = self.field_cipher };
     }
 
     pub fn begin(self: *Db) DbError!void {
@@ -88,6 +100,9 @@ extern fn sqlite3_bind_text(stmt: ?*c.sqlite3_stmt, idx: c_int, text: [*c]const 
 
 pub const Stmt = struct {
     handle: *c.sqlite3_stmt,
+    /// Copied from the originating `Db` (see Db.field_cipher). The records value
+    /// layer reads this to decide whether to encrypt/decrypt a field value.
+    field_cipher: ?*const anyopaque = null,
 
     pub fn bindText(self: *Stmt, idx: c_int, val: []const u8) DbError!void {
         if (sqlite3_bind_text(self.handle, idx, val.ptr, @intCast(val.len), SQLITE_TRANSIENT) != c.SQLITE_OK)
@@ -288,6 +303,10 @@ pub const Pool = struct {
     // Per-connection SQLite page-cache budget (KiB), applied to the writer and every
     // reader. Comptime lever `.pools.cache_kib`; defaults to default_cache_kib.
     cache_kib: u32 = default_cache_kib,
+    // Type-erased pointer to the resolved field-encryption cipher (or null). Set once
+    // at startup (serveImpl) and stamped onto every acquired connection so the records
+    // value layer can transparently encrypt/decrypt encrypted fields. See db.Db.field_cipher.
+    field_cipher: ?*const anyopaque = null,
 
     /// Open a pool with the default warm-reader cap (16) and page-cache budget. Thin
     /// wrapper over `initOpts` kept for the many call sites (tests/CLI) that don't tune.
@@ -372,6 +391,7 @@ pub const Pool = struct {
     /// the writer connection. Caller MUST call releaseWriter() when done.
     pub fn acquireWriter(self: *Pool) *Db {
         self.writer_mutex.lockUncancelable(self.io);
+        self.writer.field_cipher = self.field_cipher;
         return &self.writer;
     }
 
@@ -393,6 +413,10 @@ pub const Pool = struct {
         // Match the writer's page-cache budget on every reader (warm + fallback) so the
         // pool's total page-cache footprint is bounded by (1 + reader_cap) * cache_kib.
         try setCacheSize(&db, self.cache_kib);
+        // Dev-only: same date/time-builtin shadowing as the writer (#84). The reader path
+        // opens via raw sqlite3_open_v2 (not Db.open), so register here too. comptime no-op
+        // on a prod build.
+        clock_sql.register(db.handle);
         return db;
     }
 
@@ -407,13 +431,16 @@ pub const Pool = struct {
         while (!self.reader_mutex.tryLock()) std.atomic.spinLoopHint();
         if (self.reader_count > 0) {
             self.reader_count -= 1;
-            const db = self.readers[self.reader_count];
+            var db = self.readers[self.reader_count];
             self.reader_mutex.unlock();
+            db.field_cipher = self.field_cipher;
             return db;
         }
         self.reader_mutex.unlock();
         // Pool empty (cold start or more concurrent readers than slots): open one.
-        return self.openReader();
+        var db = try self.openReader();
+        db.field_cipher = self.field_cipher;
+        return db;
     }
 
     /// Returns a connection obtained from acquireReader() to the warm pool for

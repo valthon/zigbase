@@ -118,7 +118,12 @@ def test_embedded_static_in_plugins_example():
         port = _free_port()
         proc = subprocess.Popen(
             [str(binary), "serve", "--http-port", str(port), "--data-dir", data],
-            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
+            # authors.private_notes is an .encrypted field -> serve requires ZIGBASE_FIELD_KEY.
+            env={
+                **os.environ,
+                "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
+                "ZIGBASE_FIELD_KEY": "plugins-static-test-field-key",
+            },
         )
         try:
             base = f"http://127.0.0.1:{port}"

@@ -85,10 +85,17 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
 | Method | Path | Auth | What it does |
 |--------|------|------|--------------|
-| `POST` | `/api/bookings/:id/confirm` | authed | Host confirms a booking. Multi-hop owner check: booking → listing → simulator → owner. 403 if caller doesn't own the simulator. |
+| `POST` | `/api/bookings/:id/confirm` | authed | Host confirms a booking. Multi-hop owner check: booking → listing → simulator → owner. 403 if caller doesn't own the simulator. Gated by the `bookings_frozen` feature flag (`ctx.flag`) — returns 503 when set. |
 | `POST` | `/api/bookings/:id/cancel` | authed | Guest cancels their own booking. 403 if caller is not the booking's guest. Reads/writes via `req.ctx.records()`. |
 | `GET` | `/api/listings/:id/availability` | authed | Returns all non-cancelled bookings for a listing for availability calendar rendering. Reads via `req.ctx.records()`. |
 | `GET` | `/api/golfsim/health` | public | Smoke endpoint. |
+| `GET` | `/api/golfsim/flags/:name` | public | Public read of one feature flag via `ctx.flag` → `{"name","enabled"}`. Manage values with the superuser settings API (`PUT /api/settings/:key`). |
+
+Feature flags use the built-in KV/settings store (`ctx.kv`/`ctx.flag`, backed by the
+internal `_kv` table). Flags are superuser-managed and not public by default — the
+`flags/:name` route above opts a value into a public read. The kill switch
+`bookings_frozen` lets an operator freeze confirmations instantly with a single
+`PUT /api/settings/bookings_frozen {"value":"true"}` — no redeploy.
 
 The `confirmBooking` route shows the multi-hop imperative owner check (the access
 rule engine does this via traversal for CRUD endpoints; custom routes do it via

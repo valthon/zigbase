@@ -162,6 +162,18 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
                 @compileError("collection '" ++ name ++ "': .ttl_field '" ++ tf ++ "' must name a date/autodate field (got ." ++ @tagName(matched.?) ++ ")");
             col.options.ttl_field = tf;
         }
+
+        // An encrypted field cannot be indexed (the index would be built over
+        // per-row-nonce ciphertext and could never satisfy a lookup). Reject at
+        // compile time once both the field list and indexes are known.
+        for (col.indexes) |ix| {
+            for (ix.fields) |ixf| {
+                for (col.fields) |fld| {
+                    if (std.mem.eql(u8, fld.name, ixf) and fld.encrypted)
+                        @compileError("collection '" ++ name ++ "': index '" ++ ix.name ++ "' references encrypted field '" ++ ixf ++ "' — encrypted fields cannot be indexed");
+                }
+            }
+        }
         return col;
     }
 }
@@ -293,6 +305,18 @@ fn buildField(comptime col_name: []const u8, comptime f: anytype) schema.Field {
         if (@hasField(F, "required")) field.required = f.required;
         if (@hasField(F, "unique")) field.unique = f.unique;
         if (@hasField(F, "hidden")) field.hidden = f.hidden;
+        if (@hasField(F, "encrypted")) field.encrypted = f.encrypted;
+
+        // At-rest encryption (Theme B1) is only meaningful for string-stored types
+        // and is incompatible with uniqueness (a per-row nonce means identical
+        // plaintexts produce different ciphertexts). Index references are checked in
+        // buildCollection once the full field list is known.
+        if (field.encrypted) {
+            if (!schema.isEncryptableType(ftype))
+                @compileError("field '" ++ fname ++ "' in collection '" ++ col_name ++ "': .encrypted is only supported on text/editor/json fields");
+            if (field.unique)
+                @compileError("field '" ++ fname ++ "' in collection '" ++ col_name ++ "': an encrypted field cannot be .unique (encryption uses a per-row nonce, so a uniqueness constraint over ciphertext is meaningless)");
+        }
 
         field.options = buildOptions(col_name, fname, ftype, f);
         return field;

@@ -44,7 +44,9 @@ export async function startPlugins(): Promise<PluginsServer> {
   const port = 20000 + Math.floor(Math.random() * 20000);
   const su = spawnSync(BIN, ["superuser", "create", "--email", "admin@plug.local", "--password", "test-password-123", "--data-dir", dataDir], { stdio: "inherit" });
   if (su.status !== 0) { try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } throw new Error("superuser create failed"); }
-  const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
+  // authors.private_notes is an .encrypted field, so serve requires ZIGBASE_FIELD_KEY
+  // (fail-closed startup otherwise). A fixed dev key is fine for the e2e fixture.
+  const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], { cwd: EXAMPLE_ROOT, stdio: "inherit", env: { ...process.env, ZIGBASE_FIELD_KEY: "plugins-e2e-field-key" } });
   const url = `http://127.0.0.1:${port}`;
   try { await waitForHealth(url); } // health == collections provisioned into the data dir
   catch (err) { proc.kill("SIGKILL"); try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } throw err; }

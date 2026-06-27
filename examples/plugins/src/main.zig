@@ -520,6 +520,12 @@ pub fn main(init: std.process.Init) !void {
                     .{ .name = "name", .type = .text, .required = true },
                     .{ .name = "contact_email", .type = .email },
                     .{ .name = "bio", .type = .text, .max = 500 },
+                    // At-rest encryption (Theme B1): stored AES-256-GCM-encrypted in
+                    // SQLite, transparent plaintext to handlers/API. Requires the
+                    // ZIGBASE_FIELD_KEY env var (the server refuses to start without it
+                    // when an .encrypted field is declared). Encrypted fields cannot be
+                    // indexed / .unique / filtered / sorted.
+                    .{ .name = "private_notes", .type = .text, .encrypted = true },
                 },
                 // webauthn: passkey login for human authors.
                 // custom:   "api_token" slug enables ApiTokenMethod for programmatic auth.

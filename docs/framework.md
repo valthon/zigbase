@@ -78,7 +78,8 @@ error.**
 | `hooks` | Per-collection record lifecycle hooks (before/after create/update/delete). |
 | `onError` | Consumer error handler, runs before the built-in backstop. |
 | `routes` | Custom HTTP routes. |
-| `onAuth` | Fires after a successful login / oauth2. |
+| `onAuth` | Notify-only: fires *after* a session is issued (login / oauth2). |
+| `beforeAuthSuccess` | Writable, transactional, abortable hook that runs *before* the session is issued (claim records on first login; veto a login). |
 | `onFileServe` | Fires before serving a file download (may deny). |
 | `onFileUpload` | Fires after a file upload. |
 | `onBootstrap` | Lifecycle: after bootstrap. |
@@ -544,13 +545,86 @@ new transaction).
 > triggering write. In route and job handlers `ctx.records()` lazily checks out a pooled
 > connection that the framework releases on ctx teardown.
 
+### `ctx.kv()` — built-in key/value settings store
+
+Not every piece of mutable server state deserves its own collection. For small,
+server-managed values — a maintenance toggle, a cached external token, a counter, a
+JSON settings blob — `ctx.kv()` is a built-in key→value store backed by an internal
+`_kv` system table. No schema, no access rules, no ceremony:
+
+```zig
+try ctx.kv().set("welcome_banner", "Closed for maintenance");
+const banner = try ctx.kv().get("welcome_banner"); // ?[]const u8 (null if unset)
+_ = try ctx.kv().delete("welcome_banner");          // bool: did a row exist?
+```
+
+Values are opaque `TEXT`. To store structured data, stringify it yourself (e.g.
+`std.json.Stringify.valueAlloc(ctx.arena, value, .{})`) and parse it back on read.
+`set` is an upsert that preserves the original `created` timestamp and bumps `updated`.
+
+Reads use the read connection; writes use the bound connection inside a `before`-hook
+or `ctx.tx` (so they commit atomically with the surrounding transaction) and otherwise
+acquire/release the pool writer for you — the same lifetime rules as `ctx.records()`.
+
+The same primitive is on the curated `Data` facade as `data.kvGet` / `data.kvSet` /
+`data.kvDelete` (and `data.kvList`) for internal/test consumers.
+
+> **Security:** KV/settings are **superuser-managed and never public by default**. The
+> `_kv` table is not a collection, so it is invisible to the record API, query engine,
+> and access-rule system. To expose a value publicly, write a custom route that returns
+> exactly what you intend (see feature flags below).
+
+### `ctx.flag()` / `ctx.setFlag()` — typed feature flags
+
+A binary on/off toggle is the most common shape of a setting, so it gets a typed view
+over the **same** KV store — no second table:
+
+```zig
+if (try ctx.flag("new_checkout")) {
+    // ... new path
+}
+try ctx.setFlag("new_checkout", true);  // stores "true"/"false"
+```
+
+`flag(name)` returns `false` for an unset flag; `"true"` and `"1"` are truthy, anything
+else is `false`. `setFlag(name, enabled)` stores `"true"`/`"false"`.
+
+Because flags are server-side by default, exposing one publicly is an explicit choice —
+a one-line custom route:
+
+```zig
+fn publicFlag(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const name = ctx.request.?.param("name").?;
+    const on = try ctx.flag(name);
+    const body = try std.fmt.allocPrint(ctx.arena, "{{\"enabled\":{}}}", .{on});
+    return .{ .status = 200, .body = body };
+}
+// .routes = .{ .{ .method = .GET, .path = "/api/public-flags/:name", .handler = publicFlag } }
+```
+
+### Superuser settings HTTP API
+
+For administrative management there is a built-in **superuser-only** HTTP surface over
+the KV store (every endpoint requires a valid superuser token):
+
+| Method & path | Effect |
+|---|---|
+| `GET /api/settings` | List all settings (`[{key,value,created,updated}, …]`). |
+| `GET /api/settings/:key` | Fetch one (`{key,value}`); 404 if absent. |
+| `PUT /api/settings/:key` | Upsert; body `{"value":"…"}`. |
+| `DELETE /api/settings/:key` | Remove; 204, or 404 if absent. |
+
+This is the management plane; the public read plane is whatever custom route you choose
+to expose (above).
+
 ## 6. Auth / file / lifecycle events
 
 One handler each, registered by the matching config key:
 
 | Key | Signature | When |
 | --- | --- | --- |
-| `onAuth` | `fn (ev: *zigbase.events.AuthEvent) void` | After a successful login / oauth2. |
+| `onAuth` | `fn (ev: *zigbase.events.AuthEvent) void` | Notify-only, **after** a session is issued (login / oauth2). |
+| `beforeAuthSuccess` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!void` | Writable + abortable, **before** the session is issued. See [Auth lifecycle](#auth-lifecycle-beforeauthsuccess). |
 | `onFileServe` | `fn (ev: *zigbase.events.FileEvent) anyerror!void` | Before serving a download; **return an error to deny** (framework → `404`). |
 | `onFileUpload` | `fn (ev: *zigbase.events.FileEvent) void` | After a successful upload. |
 | `onBootstrap` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | After bootstrap. |
@@ -560,6 +634,44 @@ One handler each, registered by the matching config key:
 `AuthEvent` carries `app`, `ctx`, `collection`, `record: ?std.json.Value`, and
 `method` (`.password` | `.oauth2` | `.magic_link` | `.otp` | `.webauthn` | `.custom`). `FileEvent` carries `app`, `ctx`,
 `collection`, `record_id`, and `filename`. `LifecycleEvent` carries `app`.
+
+### Auth lifecycle (`beforeAuthSuccess`)
+
+`onAuth` is notify-only and fires **after** a session exists — perfect for logging or
+audit, useless for mutating state as part of the login. `beforeAuthSuccess` is the
+writable, abortable counterpart: it runs **after** the credentials/token are verified
+(and, for magic-link, the link token is consumed) but **before** the session JWT is
+issued, with a `*Ctx` bound to the login's **in-transaction writer**.
+
+```zig
+fn claimGuestPosts(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!void {
+    // ev.record is the just-authenticated record; ev.record_id / ev.method are also set.
+    const email = ev.record.object.get("email").?.string;
+    // ctx.records() reuses the login transaction — this write commits WITH the session.
+    var patch: std.json.ObjectMap = .empty;
+    try patch.put(ctx.arena, "author", .{ .string = ev.record_id });
+    for (try guestPostIds(ctx, email)) |id| _ = try ctx.records().update("posts", id, .{ .object = patch });
+}
+// App(.{ .beforeAuthSuccess = claimGuestPosts, ... })
+```
+
+Guarantees:
+
+- **Transactional & atomic.** The consume path runs in `BEGIN IMMEDIATE … COMMIT`. The
+  hook's `ctx.records()` writes commit together with the login.
+- **Abortable, fail-closed.** Return *any* error to block the login: the transaction rolls
+  back (the hook's side-writes are discarded, and a magic-link token is **un-consumed** so
+  the link still works) and **no session is issued**. Use `ctx.fail(status, msg)` for a
+  chosen status, `error.Forbidden`/`error.Unauthorized` for 403/401; any other error → 500.
+- **Bound connection.** Do **not** call `ctx.tx` inside the hook (you are already in a
+  transaction → `error.NestedTransaction`); use `ctx.records()` directly. `ctx.user()`
+  reflects the just-authenticated principal.
+
+Where it fires: the unified `POST /api/collections/:col/auth/:method/complete` endpoint
+(password / otp / webauthn / oauth2 / custom) and the magic-link
+`GET …/auth/magic_link/consume` link. The legacy `/auth-with-password` and `/auth-refresh`
+endpoints and the register/logout/refresh/password-change phases are not yet covered
+(planned — see the Theme D spec). `onAuth` still fires once, after issuance, as before.
 
 ### Auth methods overview
 
@@ -885,6 +997,11 @@ pub fn verifyLinkToken(
 // Marks the token consumed. Returns error.AlreadyConsumed on replay.
 pub fn consumeLinkToken(conn: *db.Db, claims: jwt.Claims) !void
 
+// Clear the session cookies (logout), mirroring issueSession. Returns arena-owned
+// zb_auth/zb_csrf cookies built from the framework's own cookie policy, so they match
+// the built-in logout exactly. Equivalent to ctx.auth().clearSession() (below).
+pub fn clearSession(ctx: *Ctx) ![]const http.Cookie
+
 // Send auth email via the configured mailer (SMTP or log in dev).
 pub fn deliverAuthMail(
     app: *App, alloc: std.mem.Allocator,
@@ -944,6 +1061,22 @@ fn myConfirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 For a complete, copy-pasteable example (two-route magic-link flow with rate
 limiting, enumeration safety, and single-use token replay protection) see
 [recipes.md → magic-link login](recipes.md#recipe-magic-link-passwordless-login).
+
+#### `ctx.auth()` — session management (`clearSession`)
+
+The `ctx.auth()` namespace is the session-management surface. Its first verb,
+`clearSession`, mirrors `issueSession` for logout: it returns the cleared session cookies
+built from the framework's own cookie policy (the same one the built-in `authLogout` uses),
+arena-owned so they slot straight into `Response.cookies`. A logout handler is one line:
+
+```zig
+fn logout(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
+}
+```
+
+`zigbase.auth.clearSession(ctx)` is the equivalent free-function form. (refresh / rotate /
+list-active / revoke are designed and deferred — see the Theme D spec.)
 
 ## 7. Scheduled jobs (`.cron` + `.jobs`)
 
@@ -1149,6 +1282,54 @@ Semantics:
 - With an `.autodate` ttl field, prefer one whose value you set explicitly to the
   intended expiry (autodate defaults to write-on-create "now", which would expire
   the row immediately).
+
+### Field encryption at rest (`.encrypted`)
+
+Mark a `text`, `editor`, or `json` field `.encrypted = true` to store it
+encrypted at rest. The records layer encrypts on write and decrypts on read, so
+your handlers, the records API, and the HTTP responses always see **plaintext** —
+only the SQLite file holds ciphertext:
+
+```zig
+.fields = .{
+    .{ .name = "ssn",   .type = .text, .encrypted = true },
+    .{ .name = "notes", .type = .json, .encrypted = true },
+},
+```
+
+**Envelope.** AES-256-GCM, versioned: each value is stored as
+`v1:` + base64url(nonce ‖ ciphertext ‖ tag) with a fresh random nonce per write.
+
+**Key (required).** The key comes **only** from the `ZIGBASE_FIELD_KEY`
+environment variable (HKDF-derived; the raw value may be any length). Unlike the
+JWT secret it is **never auto-generated, persisted, or logged** — losing or
+rotating it determines whether the data is recoverable, so you must manage it.
+If any collection declares an `.encrypted` field and `ZIGBASE_FIELD_KEY` is unset,
+**the server refuses to start** (fail-closed — it never silently stores plaintext).
+
+**Constraints (enforced).** Encrypted values are per-row-nonce ciphertext, so they
+cannot be indexed, marked `.unique`, or used in a `?filter`/`?sort`:
+
+- Indexing an encrypted field, marking it `.unique`, or setting `.encrypted` on a
+  non-`text`/`editor`/`json` field is a **compile error**.
+- A request that filters or sorts by an encrypted field gets a **400**.
+- Access rules that compare an encrypted field will compare against ciphertext and
+  effectively never match — don't reference encrypted fields in rules.
+
+**Strict reads / enabling on existing data.** Reads are strict: a stored value
+that is not a valid `v1:` envelope (e.g. legacy plaintext) or that fails
+authentication (wrong key, tamper) **fails closed** — there is no plaintext
+passthrough. Therefore, turning `.encrypted` on for a column that already holds
+plaintext rows requires an explicit rewrap migration first; "encrypted means
+encrypted".
+
+**Rotation.** The `v<N>:` version prefix selects the key generation. v1 ships a
+single key; the format is designed so a future generation can be added (reads
+dispatch on the prefix, writes use the primary) with a lazy/rewrap forward path.
+
+> Note: the envelope hides a value's *contents* but not its *length* — ciphertext
+> length is proportional to plaintext length. A single long-lived key suits typical
+> volumes; for very high write volumes, periodic `v<N>:` key rotation is recommended.
 
 ### Startup provisioning + additive auto-migration
 

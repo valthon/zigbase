@@ -21,6 +21,14 @@ const schema = @import("schema.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
 const registry = @import("auth/registry.zig");
+const field_policy = @import("field_policy.zig");
+
+/// True if any collection declares an `.encrypted` field (Theme B1). Drives the
+/// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
+fn anyEncryptedField(cols: []const schema.Collection) bool {
+    for (cols) |c| if (schema.hasEncryptedField(c)) return true;
+    return false;
+}
 
 // ============================================================================
 // Comptime plugins (storage + mailer)
@@ -162,7 +170,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -180,6 +188,7 @@ pub fn App(comptime cfg: anytype) type {
             if (@hasField(@TypeOf(cfg), "onError")) d.on_error = cfg.onError;
             if (@hasField(@TypeOf(cfg), "routes")) d.routes = events.buildRoutes(cfg.routes);
             if (@hasField(@TypeOf(cfg), "onAuth")) d.on_auth = cfg.onAuth;
+            if (@hasField(@TypeOf(cfg), "beforeAuthSuccess")) d.before_auth_success = cfg.beforeAuthSuccess;
             if (@hasField(@TypeOf(cfg), "onFileServe")) d.on_file_serve = cfg.onFileServe;
             if (@hasField(@TypeOf(cfg), "onFileUpload")) d.on_file_upload = cfg.onFileUpload;
             if (@hasField(@TypeOf(cfg), "onBootstrap")) d.on_bootstrap = cfg.onBootstrap;
@@ -754,6 +763,19 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     }
     var pool = try openPool(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib });
     defer pool.deinit();
+    // Transparent at-rest field encryption (Theme B1). Resolve the cipher ONCE from
+    // ZIGBASE_FIELD_KEY and stamp it onto the pool so every acquired connection carries
+    // it (db.zig). FAIL-CLOSED: if any collection declares an `.encrypted` field but no
+    // key is configured, refuse to start rather than silently storing plaintext. The
+    // cipher is a serveImpl stack var that outlives srv.listen(); pool points at it.
+    var field_cipher: field_policy.Cipher = undefined;
+    if (cfg.field_key.len > 0) {
+        field_cipher = field_policy.Cipher.fromEnv(io, cfg.field_key);
+        pool.field_cipher = @ptrCast(&field_cipher);
+    } else if (anyEncryptedField(schema_collections)) {
+        std.log.err("refusing to start: a collection declares an .encrypted field but ZIGBASE_FIELD_KEY is not set (encrypted data would be unreadable / stored as plaintext)", .{});
+        return error.FieldKeyRequired;
+    }
     {
         const w = pool.acquireWriter();
         defer pool.releaseWriter();
@@ -1224,4 +1246,16 @@ test "App exposes route metadata for codegen" {
     try std.testing.expectEqual(@as(usize, 1), TestApp.routes.len);
     try std.testing.expectEqualStrings("widgetsPoke", TestApp.routes[0].name);
     try std.testing.expect(TestApp.routes[0].Input == In);
+}
+
+test "anyEncryptedField detects an .encrypted field (drives the startup fail-closed guard)" {
+    const none = [_]schema.Collection{.{ .id = "c1", .name = "a", .fields = &[_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+    } }};
+    try std.testing.expect(!anyEncryptedField(&none));
+    const some = [_]schema.Collection{.{ .id = "c2", .name = "b", .fields = &[_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
+    } }};
+    try std.testing.expect(anyEncryptedField(&some));
 }

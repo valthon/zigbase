@@ -139,6 +139,14 @@ fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     // Validate the id before it touches any query (defense-in-depth + consistency).
     if (!isSafeId(id)) return req.fail(400, "Invalid booking id.");
 
+    // Feature-flag kill switch (#88): an operator can freeze all confirmations
+    // instantly by setting the `bookings_frozen` flag (e.g.
+    // `PUT /api/settings/bookings_frozen {"value":"true"}` as a superuser) — no
+    // redeploy, no schema. `ctx.flag` is a typed bool view over the built-in KV
+    // store; an unset flag is false, so the default behavior is unchanged.
+    if (req.ctx.flag("bookings_frozen") catch false)
+        return req.fail(503, "Bookings are temporarily frozen.");
+
     // The caller's auth id (empty string when unauthenticated — the .authed
     // constraint already rejects anonymous callers, but we guard defensively).
     const caller_id = req.auth_id;
@@ -334,6 +342,25 @@ fn calendarFeed(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 }
 
 // ---------------------------------------------------------------------------
+// 6c. Public feature-flag read: GET /api/golfsim/flags/:name
+//
+//    KV/feature flags are superuser-managed and NOT public by default, so a
+//    consumer opts a specific flag into a public read with a one-line custom
+//    route. This returns `{"name":"…","enabled":true|false}` using the typed
+//    `ctx.flag` view over the built-in KV store (#87/#88). Manage the value with
+//    the superuser settings API, e.g. `PUT /api/settings/promo_banner`.
+// ---------------------------------------------------------------------------
+fn flagStatus(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const name = ctx.request.?.param("name") orelse return ctx.errorResponse(ctx.fail(400, "Missing flag name."));
+    const enabled = try ctx.flag(name);
+    var o: std.json.ObjectMap = .empty;
+    try o.put(ctx.arena, "name", .{ .string = name });
+    try o.put(ctx.arena, "enabled", .{ .bool = enabled });
+    const body = try std.json.Stringify.valueAlloc(ctx.arena, std.json.Value{ .object = o }, .{});
+    return .{ .status = 200, .body = body };
+}
+
+// ---------------------------------------------------------------------------
 // 7. File-upload event logger.
 //
 //    Fires after every successful file upload. Signature: fn(*FileEvent) void
@@ -515,6 +542,36 @@ fn isoFromEpoch(alloc: std.mem.Allocator, secs: i64) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Auth lifecycle (#80 + #86)
+// ---------------------------------------------------------------------------
+
+/// `beforeAuthSuccess` hook: runs INSIDE the login transaction, AFTER the
+/// credentials/token are verified but BEFORE the session is issued, with a
+/// writable `*Ctx` bound to the login's writer. Here we bump a per-user login
+/// counter (reading the prior value off `ev.record`) — it commits atomically
+/// with the session. Returning an error would roll this write back AND block the
+/// login (fail closed): the canonical use is "claim anonymous records on first
+/// login" / "deny a banned account".
+fn bumpLoginCount(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!void {
+    const prev: i64 = if (ev.record.object.get("loginCount")) |v| switch (v) {
+        .integer => |i| i,
+        else => 0,
+    } else 0;
+    var patch: std.json.ObjectMap = .empty;
+    try patch.put(ctx.arena, "loginCount", .{ .integer = prev + 1 });
+    // ctx.records() reuses the bound transaction connection (do NOT call ctx.tx here).
+    _ = try ctx.records().update(ev.collection, ev.record_id, .{ .object = patch });
+}
+
+/// One-line logout (#86): `ctx.auth().clearSession()` returns the cleared
+/// `zb_auth`/`zb_csrf` cookies built from the framework's own cookie policy, so a
+/// custom logout matches the built-in `/auth-logout` exactly. `.public` so a stale
+/// or expired cookie can still be cleared.
+fn logout(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
+}
+
+// ---------------------------------------------------------------------------
 // App wiring
 // ---------------------------------------------------------------------------
 pub const App = zigbase.App(.{
@@ -523,13 +580,19 @@ pub const App = zigbase.App(.{
             .reviews = .{ .beforeCreate = prepareReview },
             .holds = .{ .beforeCreate = prepareHold },
         },
+        // #80: increment a per-user login counter on every successful login, transactionally with the session.
+        .beforeAuthSuccess = bumpLoginCount,
         .routes = .{
             .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
             .{ .method = .POST, .path = "/api/bookings/:id/cancel", .handler = cancelBooking, .auth = .authed },
             .{ .method = .GET, .path = "/api/listings/:id/availability", .handler = listingAvailability, .auth = .authed },
             .{ .method = .GET, .path = "/api/golfsim/health", .handler = health, .auth = .public },
+            // #86: custom one-line logout via ctx.auth().clearSession().
+            .{ .method = .POST, .path = "/api/golfsim/logout", .handler = logout, .auth = .public },
             // Untyped raw-response route (text/calendar) — see `calendarFeed`. Not in `zb.rpc.*`.
             .{ .method = .GET, .path = "/api/golfsim/calendar.ics", .handler = calendarFeed, .auth = .public },
+            // Public read of a single feature flag — see `flagStatus`. Untyped (raw JSON).
+            .{ .method = .GET, .path = "/api/golfsim/flags/:name", .handler = flagStatus, .auth = .public },
         },
         .jobs = .{ .pool_size = 2 },
         .cron = .{
@@ -560,6 +623,8 @@ pub const App = zigbase.App(.{
                 .type = .auth,
                 .fields = .{
                     .{ .name = "name", .type = .text, .max = 100 },
+                    // Incremented by the beforeAuthSuccess hook on every login (#80).
+                    .{ .name = "loginCount", .type = .number },
                 },
                 // require_verified: guests must verify their email before a session is minted.
                 // Justified for a booking/payments app — unverified accounts cannot hold slots.

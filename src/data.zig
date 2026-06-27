@@ -76,7 +76,126 @@ pub const Data = struct {
         const col = (try collections.get(self.alloc, self.conn, col_name)) orelse return error.UnknownCollection;
         return records.list(self.alloc, self.conn, col, q);
     }
+
+    // -----------------------------------------------------------------------
+    // Key→value/settings store (#87). Small, mutable, superuser-managed values
+    // over the internal `_kv` table. Values are opaque TEXT — a caller wanting
+    // structured data stringifies/parses JSON itself. Feature flags (#88) are a
+    // typed bool view over this same store (see `Ctx.flag`).
+    // -----------------------------------------------------------------------
+
+    /// Fetch the value for `key`, or `null` if absent. The returned slice is duped
+    /// onto `self.alloc` (the caller-chosen lifetime: the per-invocation arena on
+    /// the ctx path) so it outlives the finalized statement.
+    pub fn kvGet(self: Data, key: []const u8) !?[]const u8 {
+        var st = try self.conn.prepare("SELECT value FROM \"_kv\" WHERE key = ?1;");
+        defer st.finalize();
+        try st.bindText(1, key);
+        if (!(try st.step())) return null;
+        return try self.alloc.dupe(u8, st.columnText(0));
+    }
+
+    /// Upsert `key`→`value`. Preserves the original `created` timestamp across updates
+    /// and bumps `updated`.
+    pub fn kvSet(self: Data, key: []const u8, value: []const u8) !void {
+        var st = try self.conn.prepare(
+            \\INSERT INTO "_kv"(key,value,created,updated)
+            \\VALUES(?1,?2,datetime('now'),datetime('now'))
+            \\ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated=datetime('now');
+        );
+        defer st.finalize();
+        try st.bindText(1, key);
+        try st.bindText(2, value);
+        _ = try st.step();
+    }
+
+    /// Delete `key`. Returns whether a row existed.
+    pub fn kvDelete(self: Data, key: []const u8) !bool {
+        var st = try self.conn.prepare("DELETE FROM \"_kv\" WHERE key = ?1;");
+        defer st.finalize();
+        try st.bindText(1, key);
+        _ = try st.step();
+        return self.conn.changesCount() > 0;
+    }
+
+    /// One entry in the KV/settings store.
+    pub const KvEntry = struct { key: []const u8, value: []const u8, created: []const u8, updated: []const u8 };
+
+    /// List all KV/settings entries (ordered by key). Each field is duped onto
+    /// `self.alloc`. Intended for the superuser settings admin surface.
+    pub fn kvList(self: Data) ![]KvEntry {
+        var out: std.ArrayList(KvEntry) = .empty;
+        var st = try self.conn.prepare("SELECT key, value, created, updated FROM \"_kv\" ORDER BY key;");
+        defer st.finalize();
+        while (try st.step()) {
+            try out.append(self.alloc, .{
+                .key = try self.alloc.dupe(u8, st.columnText(0)),
+                .value = try self.alloc.dupe(u8, st.columnText(1)),
+                .created = try self.alloc.dupe(u8, st.columnText(2)),
+                .updated = try self.alloc.dupe(u8, st.columnText(3)),
+            });
+        }
+        return out.toOwnedSlice(self.alloc);
+    }
 };
+
+test "Data kvSet/kvGet/kvDelete round-trip; upsert preserves created" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var app = App{ .allocator = a, .io = io, .pool = undefined };
+    const d = Data{ .app = &app, .conn = &conn, .io = io, .alloc = a };
+
+    // Missing key -> null.
+    try std.testing.expect((try d.kvGet("missing")) == null);
+
+    // Set then get round-trips.
+    try d.kvSet("greeting", "hello");
+    try std.testing.expectEqualStrings("hello", (try d.kvGet("greeting")).?);
+
+    // Capture created, then update and assert value changed but created preserved.
+    var st = try conn.prepare("SELECT created, updated FROM \"_kv\" WHERE key='greeting';");
+    try std.testing.expect((try st.step()));
+    const created0 = try a.dupe(u8, st.columnText(0));
+    st.finalize();
+
+    try d.kvSet("greeting", "world");
+    try std.testing.expectEqualStrings("world", (try d.kvGet("greeting")).?);
+    var st2 = try conn.prepare("SELECT created FROM \"_kv\" WHERE key='greeting';");
+    defer st2.finalize();
+    try std.testing.expect((try st2.step()));
+    try std.testing.expectEqualStrings(created0, st2.columnText(0)); // created unchanged
+
+    // Delete reports existence, then absence.
+    try std.testing.expect(try d.kvDelete("greeting"));
+    try std.testing.expect((try d.kvGet("greeting")) == null);
+    try std.testing.expect(!(try d.kvDelete("greeting")));
+}
+
+test "Data.kvList returns all entries ordered by key" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = undefined };
+    const d = Data{ .app = &app, .conn = &conn, .io = std.testing.io, .alloc = a };
+
+    try std.testing.expectEqual(@as(usize, 0), (try d.kvList()).len);
+    try d.kvSet("b", "2");
+    try d.kvSet("a", "1");
+    const list = try d.kvList();
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("a", list[0].key);
+    try std.testing.expectEqualStrings("1", list[0].value);
+    try std.testing.expectEqualStrings("b", list[1].key);
+}
 
 test "Data.create then findById round-trips a record" {
     var conn = try db.Db.openMemory();

@@ -13,6 +13,7 @@ const http_client = @import("http_client.zig");
 const error_mod = @import("api/error.zig");
 const http_mod = @import("http.zig");
 const auth_helpers = @import("auth_helpers.zig");
+const session = @import("session.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -99,6 +100,34 @@ pub const Ctx = struct {
     /// Returns a Records namespace bound to this Ctx for read operations.
     pub fn records(self: *Ctx) Records {
         return .{ .ctx = self };
+    }
+
+    /// Returns the session-management namespace (`ctx.auth()`). The first verb is
+    /// `clearSession` (#86); refresh/rotate/revoke arrive in later Theme D slices.
+    pub fn auth(self: *Ctx) AuthApi {
+        return .{ .ctx = self };
+    }
+
+    /// Returns the key→value/settings namespace (#87) bound to this Ctx.
+    /// Reads use the read connection (bound conn wins); writes use the bound
+    /// connection if set, else acquire/release the pool writer — deadlock-safe
+    /// inside `ctx.tx`/before-hooks and self-managing on the route/job path.
+    /// KV/settings are superuser-managed: they are NOT exposed publicly by
+    /// default. To publish a value, write a custom route that calls these.
+    pub fn kv(self: *Ctx) KeyValue {
+        return .{ .ctx = self };
+    }
+
+    /// Typed boolean view over the KV store (#88). Returns `false` for an unset
+    /// flag; `"true"` and `"1"` are truthy, anything else is `false`.
+    pub fn flag(self: *Ctx, name: []const u8) !bool {
+        const v = (try self.kv().get(name)) orelse return false;
+        return std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+    }
+
+    /// Set a feature flag (#88): stores `"true"`/`"false"` in the KV store.
+    pub fn setFlag(self: *Ctx, name: []const u8, enabled: bool) !void {
+        try self.kv().set(name, if (enabled) "true" else "false");
     }
 
     /// Run `f` inside an IMMEDIATE transaction on the writer connection.
@@ -241,6 +270,54 @@ pub const Records = struct {
         const conn = try self.ctx.connForRead();
         const col = (try collections.get(self.ctx.arena, conn, collection)) orelse return;
         try expand_mod.expand(self.ctx.arena, conn, col, rec, s, 0, &self.ctx.rctx);
+    }
+};
+
+/// Session-management namespace (`ctx.auth()`). The first verb mirrors `issueSession`:
+/// `clearSession` returns the cleared session cookies built from the framework's own
+/// cookie policy (`session.zig`), so a logout handler is one line and can never drift
+/// from the built-in `authLogout`. refresh/rotate/list-active/revoke are designed and
+/// deferred (see the Theme D spec).
+pub const AuthApi = struct {
+    ctx: *Ctx,
+
+    /// Clear the `zb_auth` + `zb_csrf` session cookies (logout). Returns arena-owned
+    /// cookies that slot straight into a handler's `Response.cookies`:
+    ///   return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
+    pub fn clearSession(self: AuthApi) ![]const http_mod.Cookie {
+        const cleared = session.clearedCookies(self.ctx.app.cookie_secure);
+        return self.ctx.arena.dupe(http_mod.Cookie, &cleared);
+    }
+};
+
+/// Key→value/settings namespace (#87) bound to a Ctx. A thin ergonomic layer over
+/// `Data.kvGet/kvSet/kvDelete`: reads run on the read connection, writes use the
+/// bound connection if present else the pool writer (mirroring `Records.create`).
+pub const KeyValue = struct {
+    ctx: *Ctx,
+
+    /// Fetch `key`'s value, or null if absent. Result lives on the ctx arena.
+    pub fn get(self: KeyValue, key: []const u8) !?[]const u8 {
+        const data = Data{ .app = self.ctx.app, .conn = try self.ctx.connForRead(), .io = self.ctx.app.io, .alloc = self.ctx.arena };
+        return data.kvGet(key);
+    }
+
+    /// Upsert `key`→`value` (preserves `created`).
+    pub fn set(self: KeyValue, key: []const u8, value: []const u8) !void {
+        if (self.ctx.bound_conn) |c|
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).kvSet(key, value);
+        const c = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).kvSet(key, value);
+    }
+
+    /// Delete `key`. Returns whether a row existed.
+    pub fn delete(self: KeyValue, key: []const u8) !bool {
+        if (self.ctx.bound_conn) |c|
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).kvDelete(key);
+        const c = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).kvDelete(key);
     }
 };
 
@@ -388,6 +465,37 @@ test "ctx.user() reflects the resolved auth identity; anonymous is null" {
     try std.testing.expect(!u.is_superuser);
 }
 
+test "#86 ctx.auth().clearSession returns arena cookies matching the framework's logout policy" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    defer ctx.deinit();
+
+    const cookies = try ctx.auth().clearSession();
+    try std.testing.expectEqual(@as(usize, 2), cookies.len);
+
+    // Identical to the shared session policy that the built-in authLogout uses — so the
+    // one-line consumer logout can never drift from the framework's own clear.
+    const expected = session.clearedCookies(env.app.cookie_secure);
+    for (cookies, 0..) |c, i| {
+        try std.testing.expectEqualStrings(expected[i].name, c.name);
+        try std.testing.expectEqualStrings("", c.value);
+        try std.testing.expect(c.max_age_s < 0);
+        try std.testing.expectEqual(expected[i].http_only, c.http_only);
+        try std.testing.expectEqual(expected[i].secure, c.secure);
+        try std.testing.expect(c.same_site == .strict);
+        try std.testing.expectEqualStrings("/", c.path);
+    }
+    // zb_auth is HttpOnly; zb_csrf is readable by JS (double-submit).
+    try std.testing.expect(cookies[0].http_only and !cookies[1].http_only);
+
+    // The zigbase.auth.clearSession(ctx) re-export delegates to the same policy.
+    const via_helper = try @import("auth_helpers.zig").clearSession(&ctx);
+    try std.testing.expectEqualStrings(cookies[0].name, via_helper[0].name);
+    try std.testing.expectEqualStrings(cookies[1].name, via_helper[1].name);
+}
+
 test "ctx.records.list returns created rows; get fetches one by id" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
@@ -500,6 +608,59 @@ test "ctx.records create/update/delete round-trips and releases the writer" {
     const w2 = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     _ = w2;
+}
+
+test "ctx.kv set/get round-trips; delete removes" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    try std.testing.expect((try ctx.kv().get("k")) == null);
+    try ctx.kv().set("k", "v");
+    try std.testing.expectEqualStrings("v", (try ctx.kv().get("k")).?);
+    try ctx.kv().set("k", "v2");
+    try std.testing.expectEqualStrings("v2", (try ctx.kv().get("k")).?);
+    try std.testing.expect(try ctx.kv().delete("k"));
+    try std.testing.expect((try ctx.kv().get("k")) == null);
+}
+
+test "ctx.flag is a typed bool view; setFlag toggles; unset is false" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    // Unset flag is false.
+    try std.testing.expect(!(try ctx.flag("beta")));
+    // setFlag(true) -> true.
+    try ctx.setFlag("beta", true);
+    try std.testing.expect(try ctx.flag("beta"));
+    // "1" is also truthy.
+    try ctx.kv().set("beta", "1");
+    try std.testing.expect(try ctx.flag("beta"));
+    // setFlag(false) -> false.
+    try ctx.setFlag("beta", false);
+    try std.testing.expect(!(try ctx.flag("beta")));
+    // an arbitrary string is not truthy.
+    try ctx.kv().set("beta", "yes");
+    try std.testing.expect(!(try ctx.flag("beta")));
+}
+
+fn txnSetFlag(t: *Tx) anyerror!void {
+    try t.inner.setFlag("intx", true);
+    try std.testing.expectEqualStrings("true", (try t.inner.kv().get("intx")).?);
+}
+
+test "ctx.kv/setFlag work inside ctx.tx (bound_conn path)" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    try ctx.tx(void, txnSetFlag);
+    // committed and visible after the transaction.
+    try std.testing.expect(try ctx.flag("intx"));
 }
 
 test "ctx.http() returns a client bound to the ctx arena and io" {

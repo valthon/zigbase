@@ -186,7 +186,40 @@ pub const AuthEvent = struct {
     record: ?std.json.Value,
     method: AuthMethod,
 };
+/// Notify-only, post-issuance auth notification. Fires AFTER a session is minted; cannot
+/// abort or transactionally write. For a writable, abortable seam use `beforeAuthSuccess`.
 pub const AuthHandler = *const fn (ev: *AuthEvent) void;
+
+/// Event for the writable, abortable, in-transaction `beforeAuthSuccess` hook (#80).
+/// Fires after credentials/token are verified (and, for magic-link, the link token is
+/// consumed) and the verification gate has passed, but BEFORE the session JWT is issued.
+/// The hook's `ctx` is bound to the login's in-transaction writer, so its
+/// `ctx.records()` writes commit atomically with the login — and roll back, with the
+/// session blocked, if the hook returns an error (fail closed).
+pub const AuthSuccessEvent = struct {
+    app: *App,
+    /// The auth collection name.
+    collection: []const u8,
+    /// The authenticated record's id.
+    record_id: []const u8,
+    /// Which method completed (`.password`/`.magic_link`/`.otp`/`.webauthn`/`.oauth2`/`.custom`).
+    method: AuthMethod,
+    /// The authenticated record (always provided). The hook may also read fresh state
+    /// via `ctx.records().get(collection, record_id, .{})` on the bound connection.
+    record: std.json.Value,
+};
+/// `beforeAuthSuccess` handler: writable + abortable. Returning an error ROLLS BACK the
+/// login transaction (no session issued); use `ctx.fail(status, msg)` for a chosen status,
+/// `error.Forbidden`/`error.Unauthorized` for 403/401, else the response is a generic 500.
+///
+/// WARNING — the hook runs with a request-bound `*Ctx` whose writer connection is ALREADY
+/// HELD inside the login transaction. It MUST NOT call anything that re-acquires the pool
+/// writer or opens a new transaction: `ctx.issueSession()`, `ctx.tx()`, or any helper that
+/// grabs the writer would attempt to take the single non-reentrant writer a second time and
+/// **deadlock permanently** (`ctx.tx` is guarded and returns `error.NestedTransaction`, but
+/// the writer-acquiring helpers are not). For side-writes use `ctx.records()` directly — it
+/// reuses the bound transaction connection, so the writes commit atomically with the login.
+pub const AuthSuccessHandler = *const fn (ctx: *Ctx, ev: *AuthSuccessEvent) anyerror!void;
 
 pub const FileEvent = struct {
     app: *App,
@@ -407,6 +440,7 @@ pub const Dispatch = struct {
     on_error: ?ErrorHandler = null,
     routes: []const RuntimeRoute = &.{},
     on_auth: ?AuthHandler = null,
+    before_auth_success: ?AuthSuccessHandler = null,
     on_file_serve: ?FileServeHandler = null,
     on_file_upload: ?FileUploadHandler = null,
     on_bootstrap: ?LifecycleHandler = null,
