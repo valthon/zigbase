@@ -11,6 +11,14 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 ## Auth & email
 
+- **Per-device session list/revoke requires opt-in `.session_store = .table`.** The default
+  `App(.{ .session_store = .epoch })` revokes per **principal** via the token epoch —
+  `revokeAllSessions()` ("log out everywhere"), `refresh()`, `rotate()` — stateless, with
+  zero extra DB work and unchanged token format. Opting into `App(.{ .session_store = .table })`
+  adds a server-side `_sessions` store enabling `listActiveSessions()` and per-session
+  `revoke(sessionId)` ("log out THIS device"), at the cost of **one extra read per authenticated
+  request** (the documented trade-off). In `.epoch` mode the two per-device verbs return
+  `error.SessionStoreNotEnabled`.
 - **Mailer requires SMTP configuration for production.** Verification and password-reset
   email is delivered when SMTP is configured (`ZIGBASE_SMTP_HOST` + friends; supports `none`
   / `starttls` / `implicit` TLS). **Without SMTP configured, those tokens are logged to the
@@ -111,8 +119,8 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 - **No Windows build** — Linux and macOS only (the embedded HTTP server depends on
   facil.io/zap).
-- **Admin UI:** no logs or settings screens, and the record editor uses a plain textarea (no
-  WYSIWYG rich-text editor) — both deferred.
+- **Admin UI:** no logs screen, and the record editor uses a plain textarea (no WYSIWYG
+  rich-text editor) — both deferred.
 
 ## Other deferred work
 

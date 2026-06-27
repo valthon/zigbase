@@ -36,8 +36,14 @@ with `mise exec zig@0.16.0 --`.
 - **Collections & schema** — define collections with typed fields; schema migrations run on startup.
 - **Records & query API** — typed CRUD with `filter`, `sort`, and `expand` on relations. → [docs/api.md](docs/api.md)
 - **Access rules** — per-collection list / view / create / update / delete rules. → [docs/api.md](docs/api.md)
-- **Auth** — argon2id password auth, JWT tokens, verification and password-reset flows. → [docs/api.md](docs/api.md)
+- **Auth** — argon2id password, magic-link, OTP, and WebAuthn passkey auth; JWT tokens; verification and password-reset flows. → [docs/api.md](docs/api.md)
+- **Session management** — stateless epoch-based revocation (`revokeAllSessions` / `refresh` / `rotate`); opt-in per-device table store (`listActiveSessions` / `revoke(sessionId)`). → [docs/framework.md](docs/framework.md)
+- **Auth lifecycle hooks** — `beforeAuthSuccess` / `beforeRegister` / `afterRegister` hooks intercept and extend the auth pipeline. → [docs/framework.md](docs/framework.md)
 - **OAuth2** — Authorization-Code + PKCE provider login and account linking. → [docs/api.md](docs/api.md)
+- **Field encryption** — per-field AES-256-GCM at-rest encryption; `zigbase rewrap` rotates keys without downtime. → [docs/fields.md](docs/fields.md)
+- **TTL / expiry** — collections with a `.ttl_field` have expired records reaped automatically by an internal GC job. → [docs/framework.md](docs/framework.md)
+- **KV store & feature flags** — lightweight typed key-value store with a built-in flag layer; manageable from the admin Settings UI. → [docs/framework.md](docs/framework.md)
+- **Rate limiting** — global sensitive-auth limiter plus per-method custom limits; configurable window and count. → [docs/api.md](docs/api.md)
 - **Realtime** — subscribe to record changes over WebSocket. → [docs/api.md](docs/api.md)
 - **Files** — local file storage with serving and short-lived file-access tokens. → [docs/api.md](docs/api.md)
 - **TypeScript SDK** — published official client (`@zigbase/client`): auth, records,
@@ -45,8 +51,9 @@ with `mise exec zig@0.16.0 --`.
   generated from your schema (`zig build gen-client`) or from any running instance
   (`npx @zigbase/typegen`). → [docs/typescript-sdk.md](docs/typescript-sdk.md)
 - **Static files** — serve a frontend from the same binary: `--serve-static <dir>` at runtime, or pin/embed it at comptime. → [docs/framework.md](docs/framework.md)
-- **Admin UI** — embedded single-page app served at `/_/`. → [docs/api.md](docs/api.md)
-- **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema (with additive auto-migration), and pluggable storage/mailer backends. → [docs/framework.md](docs/framework.md)
+- **Admin UI** — embedded single-page app served at `/_/`, including a Settings / Feature-Flags screen. → [docs/api.md](docs/api.md)
+- **Framework** — `ctx`-first hooks, routes, and jobs expose a structured capability object (`ctx.records()`, `ctx.auth()`, `ctx.tx()`, `ctx.http()`, `ctx.kv()`) alongside comptime schema, additive auto-migration, and pluggable storage/mailer backends. → [docs/framework.md](docs/framework.md)
+- **Determinism & test seam** — `ZIGBASE_FAKE_NOW` freezes the framework clock and all SQLite `'now'` paths; `ZIGBASE_FAKE_SEED` makes ID/token generation reproducible; `testcapture` intercepts sent mail and outbound HTTP in tests. Compiled out on production builds. → [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
 - **Email** — pluggable SMTP mailer (STARTTLS / implicit TLS / plaintext) delivering verification and password-reset email; logs the tokens in dev when SMTP is unset. → [docs/api.md](docs/api.md)
 
 ## Build an app on ZigBase (use it as a library)
@@ -71,7 +78,8 @@ collection:
 ```zig
 const zigbase = @import("zigbase");
 
-fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
+fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    _ = ctx;
     // mutate ev.record using ev.arena ...
 }
 
