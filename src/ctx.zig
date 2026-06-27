@@ -47,6 +47,23 @@ pub const Ctx = struct {
         return .{ .ctx = self };
     }
 
+    /// Run `f` inside an IMMEDIATE transaction on the writer connection.
+    /// All Records writes inside `f` reuse the bound connection — no deadlock.
+    /// Returns error.NestedTransaction when called from an already-bound Ctx.
+    pub fn tx(self: *Ctx, comptime T: type, f: *const fn (t: *Tx) anyerror!T) !T {
+        if (self.bound_conn != null) return error.NestedTransaction;
+        const conn = self.app.pool.acquireWriter();
+        defer self.app.pool.releaseWriter();
+        try conn.beginImmediate();
+        var t = Tx{ .inner = .{ .app = self.app, .arena = self.arena, .rctx = self.rctx, .bound_conn = conn } };
+        const result = f(&t) catch |e| {
+            conn.rollback() catch {};
+            return e;
+        };
+        try conn.commit();
+        return result;
+    }
+
     /// Returns an outbound HTTP client bound to this Ctx's arena and the app's io.
     pub fn http(self: *Ctx) http_client.HttpClient {
         return .{ .alloc = self.arena, .io = self.app.io };
@@ -166,6 +183,16 @@ pub const Records = struct {
         const conn = try self.ctx.connForRead();
         const col = (try collections.get(self.ctx.app.allocator, conn, collection)) orelse return;
         try expand_mod.expand(self.ctx.app.allocator, conn, col, rec, s, 0, &self.ctx.rctx);
+    }
+};
+
+/// A transaction scope: wraps an inner Ctx whose bound_conn is set so that
+/// all Records writes inside the callback reuse the in-progress transaction.
+pub const Tx = struct {
+    inner: Ctx,
+
+    pub fn records(self: *Tx) Records {
+        return .{ .ctx = &self.inner };
     }
 };
 
@@ -407,4 +434,27 @@ test "ctx.records expand nests the related record under \"expand\"" {
     const post = (try ctx.records().get("posts", post_id, .{ .expand = "author" })).?;
     const exp = post.object.get("expand").?.object;
     try std.testing.expectEqualStrings("Ada", exp.get("author").?.object.get("name").?.string);
+}
+
+fn txnTwoInserts(t: *Tx) anyerror!void {
+    const a = t.inner.arena;
+    var o1: std.json.ObjectMap = .empty;
+    try o1.put(a, "title", .{ .string = "one" });
+    _ = try t.records().create("posts", .{ .object = o1 });
+    var o2: std.json.ObjectMap = .empty;
+    try o2.put(a, "title", .{ .string = "two" });
+    _ = try t.records().create("posts", .{ .object = o2 });
+}
+
+test "ctx.tx commits all writes atomically" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    defer ctx.deinit();
+
+    try ctx.tx(void, txnTwoInserts);
+
+    const page = try ctx.records().list("posts", .{});
+    try std.testing.expectEqual(@as(usize, 2), page.items.len);
 }
