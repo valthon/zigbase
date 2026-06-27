@@ -8,6 +8,7 @@ const records_engine = @import("records.zig");
 const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
 const schema = @import("schema.zig");
+const expand_mod = @import("query/expand.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -61,8 +62,10 @@ pub const Records = struct {
     }
 
     pub fn get(self: Records, collection: []const u8, id: []const u8, opts: GetOptions) !?std.json.Value {
-        _ = opts; // expand wired in Task 3
-        return (try self.dataRead()).findById(collection, id);
+        const data = try self.dataRead();
+        var rec = (try data.findById(collection, id)) orelse return null;
+        try self.applyExpand(collection, &rec, opts.expand);
+        return rec;
     }
 
     pub fn list(self: Records, collection: []const u8, opts: ListOptions) !records_engine.ListResult {
@@ -76,7 +79,28 @@ pub const Records = struct {
             .rctx = &self.ctx.rctx,
             .io = self.ctx.app.io,
         };
-        return (try self.dataRead()).list(collection, q);
+        const result = try (try self.dataRead()).list(collection, q);
+        if (opts.expand) |spec| if (spec.len > 0) {
+            const conn = try self.ctx.connForRead();
+            if (try collections.get(self.ctx.app.allocator, conn, collection)) |col| {
+                for (result.items) |*item| {
+                    try expand_mod.expand(self.ctx.app.allocator, conn, col, item, spec, 0, &self.ctx.rctx);
+                }
+            }
+        };
+        return result;
+    }
+
+    /// Resolve the collection and run expand on `rec` in-place.
+    /// CRUD operations in Records bypass collection rules (matching Data behaviour);
+    /// expand applies the *target* collection's viewRule under the Ctx identity.
+    /// A job ctx with rctx = .{} gets the anonymous view.
+    fn applyExpand(self: Records, collection: []const u8, rec: *std.json.Value, spec: ?[]const u8) !void {
+        const s = spec orelse return;
+        if (s.len == 0) return;
+        const conn = try self.ctx.connForRead();
+        const col = (try collections.get(self.ctx.app.allocator, conn, collection)) orelse return;
+        try expand_mod.expand(self.ctx.app.allocator, conn, col, rec, s, 0, &self.ctx.rctx);
     }
 };
 
@@ -123,6 +147,49 @@ const CtxTestEnv = struct {
                 .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
             };
             _ = try collections.create(a, io, w, .{ .id = "", .name = "posts", .fields = &fields });
+        }
+
+        env.app = App{ .allocator = a, .io = io, .pool = &env.pool };
+        return env;
+    }
+
+    /// Like init(), but also provisions an `authors` collection and a `posts.author`
+    /// single-relation field so expand tests have something to resolve.
+    fn initWithRelation() !*CtxTestEnv {
+        const ga = std.testing.allocator;
+        const env = try ga.create(CtxTestEnv);
+        errdefer ga.destroy(env);
+
+        env.tmp = std.testing.tmpDir(.{});
+        errdefer env.tmp.cleanup();
+
+        const dir_path = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+        defer ga.free(dir_path);
+        env.db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        errdefer ga.free(env.db_path);
+
+        env.pool = try db.Pool.init(ga, std.testing.io, env.db_path);
+        errdefer env.pool.deinit();
+
+        env.arena = std.heap.ArenaAllocator.init(ga);
+        errdefer env.arena.deinit();
+        const a = env.arena.allocator();
+        const io = std.testing.io;
+
+        {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            try w.exec("PRAGMA foreign_keys=ON;");
+            try migrations.run(w);
+            const author_fields = [_]schema.Field{
+                .{ .id = "a1", .name = "name", .options = .{ .text = .{} } },
+            };
+            const authors = try collections.create(a, io, w, .{ .id = "", .name = "authors", .fields = &author_fields, .viewRule = "@public" });
+            const post_fields = [_]schema.Field{
+                .{ .id = "p1", .name = "title", .required = true, .options = .{ .text = .{} } },
+                .{ .id = "p2", .name = "author", .options = .{ .relation = .{ .targetCollectionId = authors.id, .maxSelect = 1 } } },
+            };
+            _ = try collections.create(a, io, w, .{ .id = "", .name = "posts", .fields = &post_fields });
         }
 
         env.app = App{ .allocator = a, .io = io, .pool = &env.pool };
@@ -187,4 +254,32 @@ test "Ctx(bound) uses the bound connection and never acquires from the pool" {
     const conn = try ctx.connForRead();
     try std.testing.expect(conn == w);
     try std.testing.expect(ctx.reader == null);
+}
+
+test "ctx.records expand nests the related record under \"expand\"" {
+    const env = try CtxTestEnv.initWithRelation();
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    const post_id = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const d = Data{ .app = &env.app, .conn = w, .io = env.app.io };
+        var ao: std.json.ObjectMap = .empty;
+        try ao.put(a, "name", .{ .string = "Ada" });
+        const author = try d.create("authors", .{ .object = ao });
+        const aid = try a.dupe(u8, author.object.get("id").?.string);
+        var po: std.json.ObjectMap = .empty;
+        try po.put(a, "title", .{ .string = "p" });
+        try po.put(a, "author", .{ .string = aid });
+        const post = try d.create("posts", .{ .object = po });
+        break :blk try a.dupe(u8, post.object.get("id").?.string);
+    };
+
+    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    defer ctx.deinit();
+
+    const post = (try ctx.records().get("posts", post_id, .{ .expand = "author" })).?;
+    const exp = post.object.get("expand").?.object;
+    try std.testing.expectEqualStrings("Ada", exp.get("author").?.object.get("name").?.string);
 }
