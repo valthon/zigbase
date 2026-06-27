@@ -12,6 +12,7 @@ const expand_mod = @import("query/expand.zig");
 const http_client = @import("http_client.zig");
 const error_mod = @import("api/error.zig");
 const http_mod = @import("http.zig");
+const auth_helpers = @import("auth_helpers.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -24,6 +25,55 @@ pub const Ctx = struct {
     reader: ?events.ReaderData = null,
     /// Stashed error from ctx.fail/ctx.invalid; consumed by errorResponse(error.Handled).
     handled: ?error_mod.ApiError = null,
+    /// The raw HTTP request context. Non-null for route handlers; null for job/hook contexts
+    /// where there is no HTTP request. Required by `issueSession`.
+    request: ?*http_mod.RequestCtx = null,
+
+    /// The resolved identity of the authenticated principal for this request.
+    /// `id` and `collection` are empty strings when no auth record is present
+    /// (e.g. a superuser-only token with no associated record, or a job/hook ctx).
+    pub const User = struct {
+        id: []const u8,
+        collection: []const u8,
+        is_superuser: bool,
+    };
+
+    /// Derive the authenticated identity from the request context.
+    /// Returns null for anonymous contexts (no auth record and not a superuser).
+    pub fn user(self: *Ctx) ?User {
+        if (!self.rctx.is_superuser and self.rctx.auth == null) return null;
+        const id: []const u8 = blk: {
+            const auth_val = self.rctx.auth orelse break :blk "";
+            if (auth_val != .object) break :blk "";
+            const id_field = auth_val.object.get("id") orelse break :blk "";
+            break :blk switch (id_field) {
+                .string => |s| s,
+                else => "",
+            };
+        };
+        return .{
+            .id = id,
+            .collection = "",
+            .is_superuser = self.rctx.is_superuser,
+        };
+    }
+
+    /// Mint a session for a known record via the audited seam (`.custom` method tag).
+    /// Acquires the DB writer, calls `auth_helpers.issueSession`, releases the writer,
+    /// and returns the signed JWT + 2 cookies.
+    ///
+    /// WARNING: this function acquires the pool writer internally. Do NOT call it while
+    /// already holding the writer (e.g. inside `ctx.tx`, from a before-hook, or with a
+    /// bound_conn set) — it would deadlock permanently. In those cases, call
+    /// `zigbase.auth.issueSession(self.request.?, bound_conn, collection, record_id)`
+    /// directly with the connection you already hold.
+    ///
+    /// NOTE: full session verbs (clearSession, refresh, revoke) arrive with Theme D.
+    pub fn issueSession(self: *Ctx, collection: []const u8, record_id: []const u8) !auth_helpers.Issued {
+        const conn = self.app.pool.acquireWriter();
+        defer self.app.pool.releaseWriter();
+        return auth_helpers.issueSession(self.request.?, conn, collection, record_id);
+    }
 
     /// A connection suitable for reads. Bound conn wins; else lazily check out + cache a reader.
     pub fn connForRead(self: *Ctx) !*db.Db {
@@ -301,6 +351,18 @@ const CtxTestEnv = struct {
         ga.destroy(env);
     }
 };
+
+test "ctx.user() reflects the resolved auth identity; anonymous is null" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var anon = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer anon.deinit();
+    try std.testing.expect(anon.user() == null);
+    // A superuser rctx yields a User with is_superuser=true.
+    var su = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{ .is_superuser = true } };
+    defer su.deinit();
+    try std.testing.expect(su.user().?.is_superuser);
+}
 
 test "ctx.records.list returns created rows; get fetches one by id" {
     const env = try CtxTestEnv.init();
