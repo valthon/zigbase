@@ -31,6 +31,13 @@ pub const Config = struct {
     // operator-managed. serveImpl REFUSES to start if any collection declares an
     // `.encrypted` field while this is empty (fail-closed: never silently store plaintext).
     field_key: []const u8 = "",
+    // Generation number of the primary (write) field-encryption key — equals the
+    // envelope version stamped on writes (`v<N>:`). Default 1 = the single-key
+    // build's behavior (writes/reads v1:). Older read-only generations are supplied
+    // via ZIGBASE_FIELD_KEY_V<M> and resolved at startup (see field_policy.Cipher).
+    // Env: ZIGBASE_FIELD_KEY_GENERATION. Bump this (and supply the old key as
+    // ZIGBASE_FIELD_KEY_V<old>) to rotate; then run `zigbase rewrap`.
+    field_key_generation: u16 = 1,
     cookie_secure: bool = true, // secure-by-default; opt out with --insecure-cookies for plain-HTTP local dev
     auth_token_ttl_s: i64 = 14 * 24 * 3600, // 14 days
     verification_ttl_s: i64 = 7 * 24 * 3600, // 7 days
@@ -112,6 +119,7 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_PUBLIC_URL")) |v| cfg.public_url = v;
         if (getter.get("ZIGBASE_JWT_SECRET")) |v| cfg.jwt_secret = v;
         if (getter.get("ZIGBASE_FIELD_KEY")) |v| cfg.field_key = v;
+        if (getter.get("ZIGBASE_FIELD_KEY_GENERATION")) |v| cfg.field_key_generation = try std.fmt.parseInt(u16, v, 10);
         if (getter.get("ZIGBASE_COOKIE_SECURE")) |v| cfg.cookie_secure = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
         if (getter.get("ZIGBASE_AUTH_TOKEN_TTL")) |v| cfg.auth_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter.get("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try std.fmt.parseInt(i64, v, 10);
@@ -286,6 +294,20 @@ test "oauth_state_server defaults ON, opt-out via env" {
         }
     };
     try std.testing.expectEqual(false, (try Config.load(G1{})).oauth_state_server);
+}
+
+test "field_key_generation defaults to 1, overridable via env" {
+    const G0 = struct {
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+    };
+    try std.testing.expectEqual(@as(u16, 1), (try Config.load(G0{})).field_key_generation);
+    const G1 = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_FIELD_KEY_GENERATION")) return "3";
+            return null;
+        }
+    };
+    try std.testing.expectEqual(@as(u16, 3), (try Config.load(G1{})).field_key_generation);
 }
 
 test "realtime origins default empty, overridable" {

@@ -123,6 +123,7 @@ test {
     _ = @import("crypto.zig");
     _ = @import("aead.zig");
     _ = @import("field_policy.zig");
+    _ = @import("rewrap.zig");
     _ = @import("jwt.zig");
     _ = @import("auth.zig");
     _ = @import("id.zig");

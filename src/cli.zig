@@ -17,6 +17,12 @@ pub const SuperuserArgs = struct {
     password: ?[]const u8 = null,
 };
 
+pub const RewrapArgs = struct {
+    data_dir: ?[]const u8 = null,
+    /// --dry-run: report what would change without writing anything.
+    dry_run: bool = false,
+};
+
 pub const TypegenArgs = struct {
     data_dir: ?[]const u8 = null,
     url: ?[]const u8 = null,
@@ -29,7 +35,7 @@ pub const TypegenArgs = struct {
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen };
+pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -40,6 +46,7 @@ pub const Command = union(enum) {
     migrate: ServeArgs,
     superuser_create: SuperuserArgs,
     typegen: TypegenArgs,
+    rewrap: RewrapArgs,
 };
 
 /// True when an arg is a help flag (`--help` or `-h`).
@@ -78,6 +85,23 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             } else return ParseError.UnknownFlag;
         }
         return .{ .migrate = sa };
+    }
+    if (std.mem.eql(u8, args[0], "rewrap")) {
+        var ra = RewrapArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .rewrap };
+            } else if (std.mem.eql(u8, a, "--data-dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ra.data_dir = args[i];
+            } else if (std.mem.eql(u8, a, "--dry-run")) {
+                ra.dry_run = true;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .rewrap = ra };
     }
     if (std.mem.eql(u8, args[0], "superuser")) {
         // `superuser --help` / `superuser -h` -> the superuser-create help screen.
@@ -216,6 +240,21 @@ test "serve with all three flags" {
 test "migrate command parses --data-dir" {
     const cmd = try parse(&.{ "migrate", "--data-dir", "/tmp/zb" }, .{});
     try std.testing.expectEqualStrings("/tmp/zb", cmd.migrate.data_dir.?);
+}
+
+test "rewrap parses --data-dir and --dry-run" {
+    const cmd = try parse(&.{ "rewrap", "--data-dir", "/tmp/zb", "--dry-run" }, .{});
+    try std.testing.expect(std.meta.activeTag(cmd) == .rewrap);
+    try std.testing.expectEqualStrings("/tmp/zb", cmd.rewrap.data_dir.?);
+    try std.testing.expect(cmd.rewrap.dry_run);
+}
+
+test "rewrap --help routes to rewrap help topic" {
+    try std.testing.expectEqual(HelpTopic.rewrap, (try parse(&.{ "rewrap", "--help" }, .{})).help);
+}
+
+test "rewrap rejects unknown flags" {
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "rewrap", "--nope" }, .{}));
 }
 
 test "unknown command errors" {
