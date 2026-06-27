@@ -462,3 +462,29 @@ test "ctx.tx commits all writes atomically" {
     const page = try ctx.records().list("posts", .{});
     try std.testing.expectEqual(@as(usize, 2), page.items.len);
 }
+
+fn txnInsertThenFail(t: *Tx) anyerror!void {
+    const a = t.inner.arena;
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "title", .{ .string = "doomed" });
+    _ = try t.records().create("posts", .{ .object = o });
+    return error.Boom;
+}
+
+fn txnNested(t: *Tx) anyerror!void {
+    // Attempting a tx inside a tx must be rejected.
+    return t.inner.tx(void, txnInsertThenFail);
+}
+
+test "ctx.tx rolls back on error and rejects nesting" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    try std.testing.expectError(error.Boom, ctx.tx(void, txnInsertThenFail));
+    const page = try ctx.records().list("posts", .{});
+    try std.testing.expectEqual(@as(usize, 0), page.items.len); // rolled back
+
+    try std.testing.expectError(error.NestedTransaction, ctx.tx(void, txnNested));
+}
