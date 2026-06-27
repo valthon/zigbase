@@ -1070,7 +1070,11 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .mailer = &mailer_iface,
         .auth_methods = @ptrCast(&am_registry),
         .dispatch = dispatch,
-        .rate_limiter = if (cfg.rate_limit_max == 0) null else &rate_limiter,
+        // Always wire the shared limiter store: the default-scope limiter no-ops when
+        // rate_limit_max==0 (RateLimiter.allow returns true for max==0), but a configured
+        // per-method custom limit must still be honored against this store regardless of
+        // the global default. (null only in tests/CLI that construct App directly.)
+        .rate_limiter = &rate_limiter,
     };
     const Ctx = @import("ctx.zig").Ctx;
     // Each lifecycle hook gets a per-invocation arena owning any ctx.records()

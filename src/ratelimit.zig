@@ -61,17 +61,29 @@ pub const RateLimiter = struct {
     ///
     /// A `max` of 0 means "disabled" — always allow (callers also skip wiring the
     /// limiter entirely when max==0, this is just defensive).
+    ///
+    /// Uses this limiter's configured `max`/`window_s`; for a per-call override (e.g. a
+    /// per-auth-method limit sharing this same store/mutex) use `allowCustom`.
     pub fn allow(self: *RateLimiter, key: []const u8, now_s: i64) bool {
-        if (self.max == 0) return true;
+        return self.allowCustom(key, now_s, self.max, self.window_s);
+    }
+
+    /// Like `allow`, but enforces the caller-supplied `max`/`window_s` against `key`'s
+    /// bucket instead of the limiter's configured defaults. This lets a single shared
+    /// store (one map + one mutex) host independently-budgeted buckets — e.g. per
+    /// auth-method limits whose `key` carries the collection + method slug — without a
+    /// separate limiter instance per configuration. Buckets are isolated purely by `key`.
+    pub fn allowCustom(self: *RateLimiter, key: []const u8, now_s: i64, max: u32, window_s: i64) bool {
+        if (max == 0) return true;
         self.lock();
         defer self.unlock();
 
         if (self.map.getPtr(key)) |e| {
-            if (now_s - e.window_start >= self.window_s) {
+            if (now_s - e.window_start >= window_s) {
                 e.* = .{ .count = 1, .window_start = now_s };
                 return true;
             }
-            if (e.count < self.max) {
+            if (e.count < max) {
                 e.count += 1;
                 return true;
             }
@@ -147,6 +159,30 @@ test "different keys are independent" {
     try std.testing.expect(rl.allow("b", 0)); // separate key, fresh budget
     try std.testing.expect(!rl.allow("a", 1));
     try std.testing.expect(!rl.allow("b", 1));
+}
+
+test "allowCustom honors per-call max/window independent of init defaults" {
+    // Init with deliberately different defaults (max=100, window=1) to prove the
+    // per-call args win and the limiter's own max/window are ignored.
+    var rl = RateLimiter.init(std.testing.allocator, 100, 1);
+    defer rl.deinit();
+    try std.testing.expect(rl.allowCustom("k", 0, 2, 60));
+    try std.testing.expect(rl.allowCustom("k", 10, 2, 60));
+    try std.testing.expect(!rl.allowCustom("k", 20, 2, 60)); // 3rd within window => denied
+    try std.testing.expect(!rl.allowCustom("k", 59, 2, 60)); // still in window
+    try std.testing.expect(rl.allowCustom("k", 60, 2, 60)); // window elapsed => reset
+    try std.testing.expect(rl.allowCustom("k", 61, 2, 60));
+    try std.testing.expect(!rl.allowCustom("k", 62, 2, 60));
+}
+
+test "allowCustom buckets are isolated by key" {
+    var rl = RateLimiter.init(std.testing.allocator, 0, 60); // global disabled (max=0)
+    defer rl.deinit();
+    // Even with the limiter's own max==0 (global off), per-call custom limits apply.
+    try std.testing.expect(rl.allowCustom("a", 0, 1, 60));
+    try std.testing.expect(rl.allowCustom("b", 0, 1, 60)); // separate key, fresh budget
+    try std.testing.expect(!rl.allowCustom("a", 1, 1, 60));
+    try std.testing.expect(!rl.allowCustom("b", 1, 1, 60));
 }
 
 test "max == 0 disables limiting" {

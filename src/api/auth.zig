@@ -69,6 +69,25 @@ pub fn rateLimited(ctx: *http.RequestCtx, scope: []const u8, ident: []const u8) 
     return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator);
 }
 
+/// Per-method variant of `rateLimited`: enforces a method-specific `max`/`window_s`
+/// against its own bucket (the `scope` carries collection + method slug so distinct
+/// methods/collections never share a bucket) using the SAME shared limiter store —
+/// one map + one mutex — as the global limiter. The bucket subject (client IP, else
+/// submitted identity) matches `rateLimited` for consistency. Honored independently of
+/// the global default, so a configured per-method limit applies even when global
+/// limiting is off. No-op (null) when no limiter store is wired (tests/CLI). Fail-safe:
+/// the underlying limiter fails open on any bookkeeping error rather than erroring.
+pub fn rateLimitedCustom(ctx: *http.RequestCtx, scope: []const u8, ident: []const u8, max: u32, window_s: i64) !?http.Response {
+    const app = ctx.app.?;
+    const limiter = app.rate_limiter orelse return null;
+    const key = if (ctx.remote_ip.len > 0)
+        try std.fmt.allocPrint(ctx.allocator, "{s}:ip:{s}", .{ scope, ctx.remote_ip })
+    else
+        try std.fmt.allocPrint(ctx.allocator, "{s}:ident:{s}", .{ scope, ident });
+    if (limiter.allowCustom(key, wallNowUnix(app.io), max, window_s)) return null;
+    return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator);
+}
+
 /// SQL `now` for framework token logic (iat/exp, consumed-token expiry), honoring the
 /// dev-only `ZIGBASE_FAKE_NOW` override so issued tokens agree with the frozen wall clock.
 pub fn nowUnix(conn: *db.Db) db.DbError!i64 {
