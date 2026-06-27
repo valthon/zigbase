@@ -4,6 +4,7 @@ const db = @import("db.zig");
 const request = @import("request.zig");
 const events = @import("events.zig");
 const Data = @import("data.zig").Data;
+const records_engine = @import("records.zig");
 const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
 const schema = @import("schema.zig");
@@ -33,6 +34,49 @@ pub const Ctx = struct {
             r.deinit();
             self.reader = null;
         }
+    }
+
+    /// Returns a Records namespace bound to this Ctx for read operations.
+    pub fn records(self: *Ctx) Records {
+        return .{ .ctx = self };
+    }
+};
+
+pub const GetOptions = struct { expand: ?[]const u8 = null };
+pub const ListOptions = struct {
+    filter: ?[]const u8 = null,
+    sort: ?[]const u8 = null,
+    page: u32 = 1,
+    perPage: u32 = 30,
+    limit: ?u32 = null,
+    cursor: ?[]const u8 = null,
+    expand: ?[]const u8 = null,
+};
+
+pub const Records = struct {
+    ctx: *Ctx,
+
+    fn dataRead(self: Records) !Data {
+        return .{ .app = self.ctx.app, .conn = try self.ctx.connForRead(), .io = self.ctx.app.io };
+    }
+
+    pub fn get(self: Records, collection: []const u8, id: []const u8, opts: GetOptions) !?std.json.Value {
+        _ = opts; // expand wired in Task 3
+        return (try self.dataRead()).findById(collection, id);
+    }
+
+    pub fn list(self: Records, collection: []const u8, opts: ListOptions) !records_engine.ListResult {
+        const q = records_engine.ListQuery{
+            .filter = opts.filter,
+            .sort = opts.sort,
+            .page = opts.page,
+            .perPage = opts.perPage,
+            .limit = opts.limit,
+            .cursor = opts.cursor,
+            .rctx = &self.ctx.rctx,
+            .io = self.ctx.app.io,
+        };
+        return (try self.dataRead()).list(collection, q);
     }
 };
 
@@ -94,6 +138,35 @@ const CtxTestEnv = struct {
         ga.destroy(env);
     }
 };
+
+test "ctx.records.list returns created rows; get fetches one by id" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    // Seed two rows directly on the writer.
+    const id = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const d = Data{ .app = &env.app, .conn = w, .io = env.app.io };
+        var o1: std.json.ObjectMap = .empty;
+        try o1.put(a, "title", .{ .string = "alpha" });
+        const c1 = try d.create("posts", .{ .object = o1 });
+        var o2: std.json.ObjectMap = .empty;
+        try o2.put(a, "title", .{ .string = "beta" });
+        _ = try d.create("posts", .{ .object = o2 });
+        break :blk try a.dupe(u8, c1.object.get("id").?.string);
+    };
+
+    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    defer ctx.deinit();
+
+    const page = try ctx.records().list("posts", .{ .sort = "title" });
+    try std.testing.expectEqual(@as(usize, 2), page.items.len);
+
+    const one = (try ctx.records().get("posts", id, .{})).?;
+    try std.testing.expectEqualStrings("alpha", one.object.get("title").?.string);
+}
 
 test "Ctx(bound) uses the bound connection and never acquires from the pool" {
     const env = try CtxTestEnv.init();
