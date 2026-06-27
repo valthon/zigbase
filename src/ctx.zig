@@ -56,11 +56,15 @@ pub const Ctx = struct {
         defer self.app.pool.releaseWriter();
         try conn.beginImmediate();
         var t = Tx{ .inner = .{ .app = self.app, .arena = self.arena, .rctx = self.rctx, .bound_conn = conn } };
+        defer t.inner.deinit();
         const result = f(&t) catch |e| {
             conn.rollback() catch {};
             return e;
         };
-        try conn.commit();
+        conn.commit() catch |e| {
+            conn.rollback() catch {};
+            return e;
+        };
         return result;
     }
 
