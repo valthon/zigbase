@@ -723,9 +723,15 @@ Semantics, consistent across phases:
 - **After-hooks** run post-commit (post-action for logout) and are notify-only — an error
   is routed to the framework error backstop; it never fails the request.
 - `register` fires only for **auth** collections; `before_register` has no `record_id` yet
-  (the account isn't created), and `ev.record` is the writable to-be-created data.
+  (the account isn't created), and `ev.record` is the writable to-be-created data (edits are
+  persisted).
+- **`ev.record` is read-only for `before_refresh` / `before_password_change`.** It is a
+  snapshot for reading; mutating `ev.record.*` is unsupported — the change is not isolated
+  (the same value backs `onAuth`, the after-hook, and the HTTP response body) and is not
+  persisted. For mutations use a `before*` record hook or the writable register phase. (Only
+  `before_register` exposes a writable record.)
 - `logout` keeps a no-writer fast path: it only resolves the caller and acquires the writer
-  when an `.auth` hook is actually registered.
+  when an `.auth` hook is actually registered (an empty `.auth = .{}` installs nothing).
 
 ```zig
 // Seed a profile row atomically with the new account.

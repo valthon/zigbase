@@ -254,9 +254,12 @@ pub const AuthLifecycleEvent = struct {
     record_id: []const u8,
     phase: AuthLifecyclePhase,
     /// `before_register`: the writable to-be-created record data — mutate via the hook's
-    ///   `ctx.arena` (same contract as a `before_create` RecordEvent).
+    ///   `ctx.arena` (same contract as a `before_create` RecordEvent); edits are persisted.
     /// `after_register`: the persisted record (id populated).
-    /// refresh / password-change: the existing record snapshot (read).
+    /// `before_refresh` / `before_password_change`: a READ-ONLY snapshot of the existing
+    ///   record. Mutating `ev.record.*` is unsupported here — the change is NOT isolated (the
+    ///   same value backs `onAuth`, the after-hook, and the HTTP response body) and is NOT
+    ///   persisted; for mutations use a `before*` record hook or the writable register phase.
     /// logout: null (no record is loaded).
     record: ?*std.json.Value,
 };

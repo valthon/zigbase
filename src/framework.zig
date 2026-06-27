@@ -206,7 +206,11 @@ pub fn App(comptime cfg: anytype) type {
             if (@hasField(@TypeOf(cfg), "routes")) d.routes = events.buildRoutes(cfg.routes);
             if (@hasField(@TypeOf(cfg), "onAuth")) d.on_auth = cfg.onAuth;
             if (@hasField(@TypeOf(cfg), "beforeAuthSuccess")) d.before_auth_success = cfg.beforeAuthSuccess;
-            if (@hasField(@TypeOf(cfg), "auth")) d.auth_lifecycle = events.buildAuthLifecycleDispatcher(cfg.auth);
+            // Only install the lifecycle dispatcher when the `.auth` group has ≥1 hook — an
+            // empty `.auth = .{}` must NOT make `hasAuthLifecycle()` true (that would force
+            // authLogout onto the writer+authenticate path for nothing).
+            if (@hasField(@TypeOf(cfg), "auth") and std.meta.fields(@TypeOf(cfg.auth)).len > 0)
+                d.auth_lifecycle = events.buildAuthLifecycleDispatcher(cfg.auth);
             if (@hasField(@TypeOf(cfg), "onFileServe")) d.on_file_serve = cfg.onFileServe;
             if (@hasField(@TypeOf(cfg), "onFileUpload")) d.on_file_upload = cfg.onFileUpload;
             if (@hasField(@TypeOf(cfg), "onBootstrap")) d.on_bootstrap = cfg.onBootstrap;
@@ -1118,6 +1122,22 @@ test "App(cfg) builds a record dispatcher only when hooks are present" {
     };
     const WithHook = App(.{ .hooks = .{ .posts = .{ .afterCreate = H.f } } });
     try std.testing.expect(WithHook.dispatch.record != null);
+}
+
+test "App(cfg) installs the auth-lifecycle dispatcher only for a non-empty .auth group" {
+    // No `.auth` at all → null (logout keeps its no-writer fast path).
+    try std.testing.expect(App(.{}).dispatch.auth_lifecycle == null);
+    // Empty `.auth = .{}` → still null: an empty group must NOT force authLogout onto the
+    // writer+authenticate path (the #98 fast-path regression this guards against).
+    try std.testing.expect(App(.{ .auth = .{} }).dispatch.auth_lifecycle == null);
+    // A registered hook → installed.
+    const H = struct {
+        fn h(ctx: *@import("ctx.zig").Ctx, ev: *@import("events.zig").AuthLifecycleEvent) anyerror!void {
+            _ = ctx;
+            _ = ev;
+        }
+    };
+    try std.testing.expect(App(.{ .auth = .{ .beforeLogout = H.h } }).dispatch.auth_lifecycle != null);
 }
 
 test "App(cfg) assembles custom routes onto dispatch" {
