@@ -251,6 +251,12 @@ pub const Tx = struct {
     pub fn records(self: *Tx) Records {
         return .{ .ctx = &self.inner };
     }
+
+    /// The transaction's request/invocation arena — use this to allocate values you
+    /// put into records inside the callback.
+    pub fn arena(self: *Tx) std.mem.Allocator {
+        return self.inner.arena;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -544,7 +550,7 @@ test "ctx.records expand nests the related record under \"expand\"" {
 }
 
 fn txnTwoInserts(t: *Tx) anyerror!void {
-    const a = t.inner.arena;
+    const a = t.arena();
     var o1: std.json.ObjectMap = .empty;
     try o1.put(a, "title", .{ .string = "one" });
     _ = try t.records().create("posts", .{ .object = o1 });
@@ -567,7 +573,7 @@ test "ctx.tx commits all writes atomically" {
 }
 
 fn txnInsertThenFail(t: *Tx) anyerror!void {
-    const a = t.inner.arena;
+    const a = t.arena();
     var o: std.json.ObjectMap = .empty;
     try o.put(a, "title", .{ .string = "doomed" });
     _ = try t.records().create("posts", .{ .object = o });

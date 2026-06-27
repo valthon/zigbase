@@ -9,21 +9,20 @@ const App = @import("app.zig").App;
 
 /// Connection-bound, curated record operations. Hooks, custom routes, and jobs
 /// receive a `Data` rather than a raw connection. Ops run on the passed `conn`
-/// and allocate their returned results via `alloc` — the caller picks the
-/// lifetime. On the canonical `ctx.records()` path `alloc` is the per-invocation
-/// arena (request arena for routes, a job/lifecycle arena otherwise), so results
-/// are freed when the invocation ends; internal/test consumers (events.zig,
-/// auth_helpers.zig) pass `app.allocator` to preserve their prior behavior.
+/// and allocate their returned results on `alloc` — the caller picks the lifetime:
 ///
-/// ATOMICITY: on the HTTP write path (`api/records.zig` create/update/delete),
-/// `before*` record hooks now run INSIDE the triggering write's transaction. The
-/// handler opens `BEGIN IMMEDIATE` before the before-hook, performs the row
-/// write + access-rule guard, and only then commits; a before-hook error (or a
-/// denied guard) rolls the WHOLE transaction back — so a side-write a hook issues
-/// via `ctx.records()` commits atomically with the triggering
-/// write and is discarded on abort (fail closed). NOTE: ops issued through a `Data`
-/// still allocate their returned record on the gpa (app.allocator), not a request
-/// arena; hooks that keep a side-write's result should copy what they need.
+/// - `ctx.records()` binds `alloc` to the per-request/per-invocation arena, so
+///   results are freed automatically when the invocation ends (no manual cleanup).
+/// - The lower-level `ev.writer()`/`ev.reader()` handle accessors (WriterData /
+///   ReaderData) bind `alloc` to `app.allocator` (the gpa). Results from THAT
+///   path are NOT arena-freed — callers must manage their lifetimes explicitly.
+///
+/// ATOMICITY: `before*` record hooks run INSIDE the triggering write's transaction
+/// (folded in by the A2 change). The handler opens `BEGIN IMMEDIATE` before the
+/// before-hook, performs the row write + access-rule guard, and commits only on
+/// success; a before-hook error (or a denied guard) rolls the WHOLE transaction
+/// back — so a side-write a hook issues via `ctx.records()` commits atomically with
+/// the triggering write and is discarded on abort (fail closed).
 ///
 /// Unknown-collection contract:
 ///   - `findById` returns `null` for BOTH an unknown collection and a missing

@@ -471,11 +471,11 @@ file-scoped callback and pass it to `ctx.tx`:
 ```zig
 fn transferCredits(t: *zigbase.Tx) anyerror!void {
     var debit: std.json.ObjectMap = .empty;
-    try debit.put(t.inner.arena, "balance", .{ .integer = new_balance });
+    try debit.put(t.arena(), "balance", .{ .integer = new_balance });
     _ = try t.records().update("accounts", from_id, .{ .object = debit });
 
     var credit: std.json.ObjectMap = .empty;
-    try credit.put(t.inner.arena, "balance", .{ .integer = credited });
+    try credit.put(t.arena(), "balance", .{ .integer = credited });
     _ = try t.records().update("accounts", to_id, .{ .object = credit });
 }
 
