@@ -70,6 +70,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     const rctx = request.RequestContext{
         .auth = if (ident) |i| i.record else null,
         .is_superuser = if (ident) |i| i.is_superuser else false,
+        .collection = if (ident) |i| i.collection else "",
         .method = "GET",
     };
     switch (rules.decide(col.viewRule, &rctx)) {

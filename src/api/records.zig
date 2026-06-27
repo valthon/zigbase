@@ -92,10 +92,10 @@ fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value) !http.Res
 fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) request.RequestContext {
     if (ctx.app) |app| {
         if (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null) |a| {
-            return .{ .auth = a.record, .is_superuser = a.is_superuser, .data = data, .method = @tagName(ctx.method) };
+            return .{ .auth = a.record, .is_superuser = a.is_superuser, .collection = a.collection, .data = data, .method = @tagName(ctx.method) };
         }
     }
-    return .{ .auth = null, .is_superuser = false, .data = data, .method = @tagName(ctx.method) };
+    return .{ .auth = null, .is_superuser = false, .collection = "", .data = data, .method = @tagName(ctx.method) };
 }
 
 fn forbidden(ctx: *http.RequestCtx) !http.Response {

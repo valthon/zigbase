@@ -1,19 +1,22 @@
 const std = @import("std");
 
 /// The per-request context rules evaluate against. SP4 builds an empty one (no auth yet);
-/// SP5's auth middleware fills `auth`/`is_superuser`.
+/// SP5's auth middleware fills `auth`/`is_superuser`/`collection`.
 pub const RequestContext = struct {
     auth: ?std.json.Value = null, // authenticated record object; null = unauthenticated
     is_superuser: bool = false,
+    collection: []const u8 = "", // auth collection name; "" = unauthenticated/anonymous
     data: ?std.json.Value = null, // request body (create/update rules)
     method: []const u8 = "",
 
     /// Resolve a `@request.*` macro path to a text value. Returns null for an unknown macro.
     /// `@request.auth.<field>` and `@request.data.<field>` yield "" when absent/unauthenticated.
+    /// `@request.auth.collection` returns the auth collection name (not a record field).
     pub fn resolveMacro(self: *const RequestContext, path: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, path, "@request.method")) return self.method;
         if (std.mem.startsWith(u8, path, "@request.auth.")) {
             const field = path["@request.auth.".len..];
+            if (std.mem.eql(u8, field, "collection")) return self.collection;
             return objField(self.auth, field);
         }
         if (std.mem.startsWith(u8, path, "@request.data.")) {

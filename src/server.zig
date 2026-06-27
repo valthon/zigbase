@@ -185,6 +185,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
             var rctx = request.RequestContext{
                 .auth = if (authed) |a| a.record else null,
                 .is_superuser = if (authed) |a| a.is_superuser else false,
+                .collection = if (authed) |a| a.collection else "",
                 .method = @tagName(ctx.method),
             };
             var cx = Ctx{ .app = app, .arena = ctx.allocator, .rctx = rctx, .request = ctx, .bound_conn = null };

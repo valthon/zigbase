@@ -32,12 +32,12 @@ pub const Ctx = struct {
     /// The resolved identity of the authenticated principal for this request.
     /// `id` is an empty string when no auth record is present (e.g. a superuser-only
     /// token with no associated record).
-    ///
-    /// Only `id` + `is_superuser` for now: a `collection` field will be added once
-    /// `RequestContext` carries the auth collection name (a later/Theme-D task).
+    /// `collection` is the auth collection name (e.g. "users"); empty string when
+    /// anonymous or when the token carries no collection claim.
     pub const User = struct {
         id: []const u8,
         is_superuser: bool,
+        collection: []const u8,
     };
 
     /// Derive the authenticated identity from the request context.
@@ -56,6 +56,7 @@ pub const Ctx = struct {
         return .{
             .id = id,
             .is_superuser = self.rctx.is_superuser,
+            .collection = self.rctx.collection,
         };
     }
 
@@ -371,6 +372,20 @@ test "ctx.user() reflects the resolved auth identity; anonymous is null" {
     var su = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{ .is_superuser = true } };
     defer su.deinit();
     try std.testing.expect(su.user().?.is_superuser);
+    // An authed rctx with a collection forwards the collection name.
+    var auth_obj: std.json.ObjectMap = .empty;
+    try auth_obj.put(std.testing.allocator, "id", .{ .string = "abc123" });
+    defer auth_obj.deinit(std.testing.allocator);
+    var authed = Ctx{
+        .app = &env.app,
+        .arena = env.arena.allocator(),
+        .rctx = .{ .auth = .{ .object = auth_obj }, .is_superuser = false, .collection = "users" },
+    };
+    defer authed.deinit();
+    const u = authed.user().?;
+    try std.testing.expectEqualStrings("abc123", u.id);
+    try std.testing.expectEqualStrings("users", u.collection);
+    try std.testing.expect(!u.is_superuser);
 }
 
 test "ctx.records.list returns created rows; get fetches one by id" {
