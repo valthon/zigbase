@@ -1,3 +1,11 @@
+### Features
+
+- `ctx.tx(T, fn)` runs several record writes in one atomic transaction — all
+  commit, or all roll back on any returned error. The callback receives a `*Tx`
+  whose `t.records()` exposes the full `Records` API; all writes share the
+  in-transaction connection with no deadlock. Nesting is rejected immediately
+  (`error.NestedTransaction`).
+
 ### Changed
 
 - `before*` record hooks now run INSIDE the triggering write's transaction on the

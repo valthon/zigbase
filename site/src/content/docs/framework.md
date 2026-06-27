@@ -452,6 +452,52 @@ return ctx.errorResponse(ctx.invalid(&.{
 }));
 ```
 
+### `ctx.tx()` — multi-write transactions
+
+To write several records atomically — all commit or all roll back — define a
+file-scoped callback and pass it to `ctx.tx`:
+
+```zig
+fn transferCredits(t: *zigbase.Tx) anyerror!void {
+    var debit: std.json.ObjectMap = .empty;
+    try debit.put(t.inner.arena, "balance", .{ .integer = new_balance });
+    _ = try t.records().update("accounts", from_id, .{ .object = debit });
+
+    var credit: std.json.ObjectMap = .empty;
+    try credit.put(t.inner.arena, "balance", .{ .integer = credited });
+    _ = try t.records().update("accounts", to_id, .{ .object = credit });
+}
+
+// in a route / job / hook handler:
+try ctx.tx(void, transferCredits);
+```
+
+The callback receives a `*Tx` — a thin wrapper whose `t.records()` returns the
+same `Records` API as `ctx.records()`. All writes inside the callback reuse the
+single in-transaction writer connection (no second acquire, no deadlock). If the
+callback returns any error the transaction rolls back automatically; on success
+it commits.
+
+The first type parameter is the callback's return type (use `void` when you do
+not need to surface a value from the transaction):
+
+```zig
+fn countAndTag(t: *zigbase.Tx) anyerror!u64 {
+    _ = try t.records().create("tags", value);
+    return 1;
+}
+const n = try ctx.tx(u64, countAndTag);
+```
+
+Attempting to call `ctx.tx` from a callback that is already running inside a
+transaction returns `error.NestedTransaction` immediately (without beginning a
+new transaction).
+
+> **Do not perform long network calls (`ctx.http()`) inside a `tx` callback.**
+> The writer connection is held for the entire duration of the callback. Long
+> I/O stalls all other writes on the server — complete any external HTTP calls
+> before or after the `ctx.tx` block.
+
 > **In a `before*` hook**, `ev.caps()` binds to the hook's in-transaction connection and
 > never acquires from the pool. The hook's `ev.data` facade is still the idiomatic API for
 > data access in hooks; `ev.caps()` shines in route and job handlers.
