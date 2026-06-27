@@ -3,6 +3,7 @@ const schedule = @import("schedule.zig");
 const events = @import("events.zig");
 const clock = @import("clock.zig");
 const App = @import("app.zig").App;
+const Ctx = @import("ctx.zig").Ctx;
 
 /// A registered job after comptime assembly. `run` is a uniform wrapper returning
 /// `?schedule.Reactive`: `null` for cron/interval jobs (next fire computed from `schedule`),
@@ -10,7 +11,7 @@ const App = @import("app.zig").App;
 pub const RuntimeJob = struct {
     name: []const u8,
     schedule: schedule.Schedule,
-    run: *const fn (ev: *events.JobEvent) anyerror!?schedule.Reactive,
+    run: *const fn (ctx: *Ctx, ev: *events.JobEvent) anyerror!?schedule.Reactive,
 };
 
 /// `@compileError` on any job spec missing a required field (`.name`/`.schedule`/
@@ -26,8 +27,8 @@ fn validateJobSpecs(comptime specs: anytype) void {
 }
 
 /// Assemble a comptime tuple of job specs `.{ .name, .schedule, .handler }` into a runtime
-/// table. For `.reactive` schedules the handler must be `fn(*JobEvent) anyerror!Reactive`;
-/// otherwise `fn(*JobEvent) anyerror!void`. Both are unified to `anyerror!?Reactive` via a
+/// table. For `.reactive` schedules the handler must be `fn(*Ctx, *JobEvent) anyerror!Reactive`;
+/// otherwise `fn(*Ctx, *JobEvent) anyerror!void`. Both are unified to `anyerror!?Reactive` via a
 /// per-spec wrapper struct (each spec gets its own `Wrap` type, hence its own `run` fn ptr).
 pub fn buildJobs(comptime specs: anytype) []const RuntimeJob {
     comptime validateJobSpecs(specs);
@@ -43,11 +44,11 @@ pub fn buildJobs(comptime specs: anytype) []const RuntimeJob {
                 const reactive = sched == .reactive;
                 const handler = s.handler;
                 const Wrap = struct {
-                    fn run(ev: *events.JobEvent) anyerror!?schedule.Reactive {
+                    fn run(ctx: *Ctx, ev: *events.JobEvent) anyerror!?schedule.Reactive {
                         if (reactive) {
-                            return try handler(ev);
+                            return try handler(ctx, ev);
                         } else {
-                            try handler(ev);
+                            try handler(ctx, ev);
                             return null;
                         }
                     }
@@ -276,7 +277,12 @@ pub const Scheduler = struct {
             };
             const job = self.jobs[idx];
             var ev = events.JobEvent{ .app = self.app, .name = job.name };
-            if (job.run(&ev)) |result| {
+            // Build a per-invocation Ctx: jobs have no HTTP request and no auth
+            // (anonymous rctx); reads/writes go through ctx.records(), which lazily
+            // acquires from the pool. deinit() releases any cached reader.
+            var cx = Ctx{ .app = self.app, .arena = self.app.allocator, .rctx = .{}, .request = null, .bound_conn = null };
+            defer cx.deinit();
+            if (job.run(&cx, &ev)) |result| {
                 // SUCCESS: resume the normal schedule (resets the backoff counter).
                 const now = unixNow(self.app.io);
                 self.lock();
@@ -299,7 +305,11 @@ pub const Scheduler = struct {
         const Holder = struct {
             fn go(a: *App, n: []const u8, t: events.JobTask) void {
                 var ev = events.JobEvent{ .app = a, .name = n };
-                t(&ev) catch |e| {
+                // The Ctx is built INSIDE the detached thread so its lifetime is the
+                // task's, not the submitting thread's — and never shared across threads.
+                var cx = Ctx{ .app = a, .arena = a.allocator, .rctx = .{}, .request = null, .bound_conn = null };
+                defer cx.deinit();
+                t(&cx, &ev) catch |e| {
                     var err_ev = events.ErrorEvent{ .app = a, .ctx = null, .err = e, .phase = .job, .message = @errorName(e) };
                     events.dispatchError(a, a.dispatch, &err_ev);
                 };
@@ -312,10 +322,12 @@ pub const Scheduler = struct {
 
 test "buildJobs assembles cron/interval/reactive into a uniform table" {
     const H = struct {
-        fn cleanup(ev: *events.JobEvent) anyerror!void {
+        fn cleanup(ctx: *Ctx, ev: *events.JobEvent) anyerror!void {
+            _ = ctx;
             _ = ev;
         }
-        fn backoff(ev: *events.JobEvent) anyerror!schedule.Reactive {
+        fn backoff(ctx: *Ctx, ev: *events.JobEvent) anyerror!schedule.Reactive {
+            _ = ctx;
             _ = ev;
             return .{ .after = .{ .minutes = 5 } };
         }
@@ -333,9 +345,11 @@ test "buildJobs assembles cron/interval/reactive into a uniform table" {
 
     // The wrapped run returns ?Reactive: reactive job returns the handler's Reactive; others null.
     var ev = events.JobEvent{ .app = undefined, .name = "x" };
-    const r2 = try jobs[2].run(&ev);
+    var cx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .request = null, .bound_conn = null };
+    defer cx.deinit();
+    const r2 = try jobs[2].run(&cx, &ev);
     try std.testing.expect(r2 != null and r2.?.after.minutes == 5);
-    const r0 = try jobs[0].run(&ev);
+    const r0 = try jobs[0].run(&cx, &ev);
     try std.testing.expect(r0 == null);
 }
 
@@ -416,7 +430,8 @@ test "reactive job that errors retries with backoff (not retired)" {
 test "Scheduler runs a due reactive job then stops cleanly" {
     const Counter = struct {
         var n: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-        fn run(ev: *events.JobEvent) anyerror!schedule.Reactive {
+        fn run(ctx: *Ctx, ev: *events.JobEvent) anyerror!schedule.Reactive {
+            _ = ctx;
             _ = ev;
             _ = n.fetchAdd(1, .monotonic);
             return .stop; // run exactly once
@@ -449,7 +464,8 @@ test "Scheduler runs a due reactive job then stops cleanly" {
 test "Scheduler initSized clamps a too-small stack to the safe floor and still runs the job" {
     const Counter = struct {
         var n: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-        fn run(ev: *events.JobEvent) anyerror!schedule.Reactive {
+        fn run(ctx: *Ctx, ev: *events.JobEvent) anyerror!schedule.Reactive {
+            _ = ctx;
             _ = ev;
             // Touch a few KiB of stack so a too-small worker stack would fault here.
             var scratch: [4096]u8 = undefined;

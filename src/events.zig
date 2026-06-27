@@ -13,12 +13,14 @@ const schema = @import("schema.zig");
 const route_types = @import("route_types.zig");
 
 // ---------------------------------------------------------------------------
-// RAII DB-access handles for the events that carry only `app` (RouteEvent,
-// JobEvent, LifecycleEvent). Unlike RecordEvent — whose `.data` is already bound
-// to the in-transaction writer for the triggering write — these events have no
-// ambient connection, so a handler that wants DB access must check one out of
-// the pool and (crucially) hand it back. These handles make that lifetime
-// explicit and leak-safe:
+// RAII DB-access handles for `RouteEvent` (the one app-only event that still
+// exposes raw writer()/reader()). JobEvent/LifecycleEvent get DB access through
+// the `*Ctx` parameter their handlers now receive (`ctx.records()`), which
+// lazily checks out a pooled connection and releases it on `ctx.deinit()`.
+// Unlike RecordEvent — whose ctx is bound to the in-transaction writer for the
+// triggering write — RouteEvent has no ambient connection, so a handler that
+// wants raw DB access must check one out of the pool and (crucially) hand it
+// back. These handles make that lifetime explicit and leak-safe:
 //
 //   var w = ev.writer();         // acquires the shared pool writer (mutex-guarded)
 //   defer w.deinit();            // releases it back to the pool — no leak
@@ -205,50 +207,21 @@ pub const FileUploadHandler = *const fn (ev: *FileEvent) void;
 
 pub const LifecycleEvent = struct {
     app: *App,
-
-    /// Acquire the pool writer for create/update/delete:
-    /// `var w = ev.writer(); defer w.deinit(); _ = try w.data().create(...);`.
-    pub fn writer(ev: *LifecycleEvent) WriterData {
-        return acquireWriter(ev.app);
-    }
-    /// Check out a pooled read-only connection for reads:
-    /// `var r = try ev.reader(); defer r.deinit(); _ = try r.data().findById(...);`.
-    pub fn reader(ev: *LifecycleEvent) db.DbError!ReaderData {
-        return acquireReader(ev.app);
-    }
-
-    /// Returns a `Ctx` for this lifecycle handler. Uses the app allocator and an
-    /// anonymous (unauthenticated) request context. `bound_conn` is null — the ctx
-    /// will lazily acquire a reader or writer from the pool as needed.
-    pub fn caps(ev: *LifecycleEvent) Ctx {
-        return .{ .app = ev.app, .arena = ev.app.allocator, .rctx = .{}, .bound_conn = null };
-    }
 };
-pub const LifecycleHandler = *const fn (ev: *LifecycleEvent) void;
+/// Lifecycle handlers (onBootstrap/onBeforeServe/onBeforeTerminate) receive a
+/// `*Ctx` (built by the framework from `app`, anonymous rctx, no request) plus
+/// the event. DB access goes through `ctx.records()`.
+pub const LifecycleHandler = *const fn (ctx: *Ctx, ev: *LifecycleEvent) void;
 
 pub const JobEvent = struct {
     app: *App,
     name: []const u8,
-
-    /// Acquire the pool writer for create/update/delete:
-    /// `var w = ev.writer(); defer w.deinit(); _ = try w.data().create(...);`.
-    pub fn writer(ev: *JobEvent) WriterData {
-        return acquireWriter(ev.app);
-    }
-    /// Check out a pooled read-only connection for reads:
-    /// `var r = try ev.reader(); defer r.deinit(); _ = try r.data().findById(...);`.
-    pub fn reader(ev: *JobEvent) db.DbError!ReaderData {
-        return acquireReader(ev.app);
-    }
-
-    /// Returns a `Ctx` for this job. Uses the app allocator and an anonymous
-    /// (unauthenticated) request context. `bound_conn` is null — the ctx will
-    /// lazily acquire a reader or writer from the pool as needed.
-    pub fn caps(ev: *JobEvent) Ctx {
-        return .{ .app = ev.app, .arena = ev.app.allocator, .rctx = .{}, .bound_conn = null };
-    }
 };
-pub const JobTask = *const fn (ev: *JobEvent) anyerror!void;
+/// Cron/interval/reactive jobs and `app.submit` tasks receive a `*Ctx` (built by
+/// the scheduler per invocation from `app`, anonymous rctx, no request) plus the
+/// event. DB access goes through `ctx.records()`; the ctx lazily checks out a
+/// pooled connection and releases it on `ctx.deinit()`.
+pub const JobTask = *const fn (ctx: *Ctx, ev: *JobEvent) anyerror!void;
 
 /// `@compileError` on any route spec missing a required field (`.method`/`.path`/
 /// `.handler`), mirroring `validateHooks`. `.auth` and `.name` are optional (auth
@@ -853,41 +826,35 @@ test "RouteEvent.writer() create round-trips and releases the writer (no leak)" 
     }
 }
 
-test "JobEvent.reader() sees a committed write and returns the conn to the pool (no leak)" {
+test "job Ctx writes then reads a committed record and releases the conn on deinit (no leak)" {
+    // Mirrors how the scheduler now hands a job its DB capabilities: a Ctx built
+    // from app with anonymous rctx and no bound connection. Writes go through the
+    // pool writer (released immediately); reads lazily check out a pooled reader
+    // that ctx.deinit() returns to the warm pool.
     const env = try TestEnv.init();
     defer env.deinit();
     const a = env.arena.allocator();
 
-    var job = JobEvent{ .app = &env.app, .name = "nightly" };
+    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = null, .bound_conn = null };
+    defer cx.deinit();
 
-    // Write a record via the writer handle first.
-    var id_buf: [64]u8 = undefined;
-    var id_len: usize = 0;
-    {
-        var w = job.writer();
-        defer w.deinit();
-        var obj: std.json.ObjectMap = .empty;
-        try obj.put(a, "title", .{ .string = "world" });
-        const created = try w.data().create("posts", .{ .object = obj });
-        const id = created.object.get("id").?.string;
-        @memcpy(id_buf[0..id.len], id);
-        id_len = id.len;
-    }
-    const id = id_buf[0..id_len];
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "title", .{ .string = "world" });
+    const created = try cx.records().create("posts", .{ .object = obj });
+    const id = created.object.get("id").?.string;
 
-    // The warm pool starts cold; after a reader handle deinit it must hold the
-    // returned connection.
+    // No reader is checked out until the first read.
     try std.testing.expectEqual(@as(usize, 0), env.pool.reader_count);
-    {
-        var r = try job.reader();
-        defer r.deinit();
-        const found = (try r.data().findById("posts", id)).?;
-        try std.testing.expectEqualStrings("world", found.object.get("title").?.string);
-    }
-    // Prove deinit returned the connection to the warm pool (no leak/close).
+    const found = (try cx.records().get("posts", id, .{})).?;
+    try std.testing.expectEqualStrings("world", found.object.get("title").?.string);
+
+    // ctx.deinit() (via defer) returns the cached reader to the warm pool — prove
+    // it by deiniting explicitly here and checking the warm count, then null it so
+    // the deferred deinit is a no-op.
+    cx.deinit();
     try std.testing.expectEqual(@as(usize, 1), env.pool.reader_count);
 
-    // And re-acquiring reuses that exact warm connection.
+    // Re-acquiring reuses that exact warm connection.
     var r2 = try env.pool.acquireReader();
     defer env.pool.releaseReader(&r2);
     try std.testing.expectEqual(@as(usize, 0), env.pool.reader_count);
