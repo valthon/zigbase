@@ -23,6 +23,9 @@ pub const RequestCtx = struct {
     /// X-Forwarded-For / X-Real-IP). "" when unknown (no proxy header); the
     /// limiter then falls back to keying on the submitted identity.
     remote_ip: []const u8 = "",
+    /// User-Agent header (filled by server.zig; "" when absent). Recorded on a Variant B
+    /// `_sessions` row (#99) so the per-device session UI can label each session.
+    user_agent: []const u8 = "",
     /// Request content-type (filled by server.zig). Multipart bodies populate form_fields/files.
     content_type: []const u8 = "",
     /// If-None-Match request header value (filled by server.zig; "" when absent).

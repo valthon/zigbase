@@ -13,6 +13,7 @@ const http_client = @import("http_client.zig");
 const error_mod = @import("api/error.zig");
 const http_mod = @import("http.zig");
 const auth_helpers = @import("auth_helpers.zig");
+const api_auth = @import("api/auth.zig");
 const session = @import("session.zig");
 
 pub const Ctx = struct {
@@ -102,8 +103,9 @@ pub const Ctx = struct {
         return .{ .ctx = self };
     }
 
-    /// Returns the session-management namespace (`ctx.auth()`). The first verb is
-    /// `clearSession` (#86); refresh/rotate/revoke arrive in later Theme D slices.
+    /// Returns the session-management namespace (`ctx.auth()`): `clearSession` (#86),
+    /// plus the #99 session verbs — `revokeAllSessions`/`refresh`/`rotate` (epoch model,
+    /// always available) and the Variant B per-device `listActiveSessions`/`revoke`.
     pub fn auth(self: *Ctx) AuthApi {
         return .{ .ctx = self };
     }
@@ -281,12 +283,168 @@ pub const Records = struct {
 pub const AuthApi = struct {
     ctx: *Ctx,
 
+    /// One active session row (Variant B), as returned by `listActiveSessions`. `is_current`
+    /// marks the session this request is authenticated with.
+    pub const Session = struct {
+        id: []const u8,
+        created: []const u8,
+        last_seen: []const u8,
+        user_agent: []const u8,
+        ip: []const u8,
+        is_current: bool,
+    };
+
     /// Clear the `zb_auth` + `zb_csrf` session cookies (logout). Returns arena-owned
     /// cookies that slot straight into a handler's `Response.cookies`:
     ///   return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
     pub fn clearSession(self: AuthApi) ![]const http_mod.Cookie {
         const cleared = session.clearedCookies(self.ctx.app.cookie_secure);
         return self.ctx.arena.dupe(http_mod.Cookie, &cleared);
+    }
+
+    /// The current authenticated principal (collection + id), or error.Unauthorized.
+    fn principal(self: AuthApi) !Ctx.User {
+        const u = self.ctx.user() orelse return error.Unauthorized;
+        if (u.collection.len == 0 or u.id.len == 0) return error.Unauthorized;
+        return u;
+    }
+
+    /// "Log out everywhere" (#99): bump the principal's `token_epoch` so EVERY outstanding
+    /// `.auth` token immediately stops verifying. Works in BOTH session-store modes. In table
+    /// mode it ALSO clears the principal's `_sessions` rows (so the per-device list empties).
+    /// Uses the bound connection inside a tx/before-hook, else acquires the pool writer.
+    pub fn revokeAllSessions(self: AuthApi) !void {
+        const u = try self.principal();
+        const table = self.ctx.app.session_store == .table;
+        if (self.ctx.bound_conn) |c| {
+            _ = try api_auth.bumpTokenEpoch(self.ctx.arena, c, u.collection, u.id);
+            if (table) try api_auth.deleteSessionsForPrincipal(c, u.collection, u.id);
+            return;
+        }
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
+        if (table) try api_auth.deleteSessionsForPrincipal(w, u.collection, u.id);
+    }
+
+    /// Re-mint a session token for the current principal (new `exp`, SAME epoch) — a sliding
+    /// refresh that leaves the principal's other sessions valid. In table mode this ROTATES
+    /// the current device's `_sessions` row (the old `sid` row is dropped; issuing inserts the
+    /// replacement) so a device keeps exactly one row. Route context only (needs `ctx.request`).
+    pub fn refresh(self: AuthApi) !auth_helpers.Issued {
+        const u = try self.principal();
+        const req = self.ctx.request orelse return error.NoRequestContext;
+        const table = self.ctx.app.session_store == .table;
+        const cur = self.ctx.rctx.session_id;
+        if (self.ctx.bound_conn) |c| {
+            // Carry the old row's `created` forward (session-start time) onto the new row,
+            // whose `lastSeen` is set to now by issue() — see carrySessionCreated.
+            const old_created = if (table and cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, c, cur) else null;
+            const issued = try auth_helpers.issueSession(req, c, u.collection, u.id);
+            if (table) try api_auth.carrySessionCreated(self.ctx.arena, c, issued.token, old_created);
+            return issued;
+        }
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        // Epoch mode does no pre-issue write, so no transaction is needed (issue() just
+        // reads + signs). Table mode performs delete-old + insert-new (in issue) — wrap them
+        // in ONE transaction so a mid-way failure never silently logs the device out.
+        if (!table) return auth_helpers.issueSession(req, w, u.collection, u.id);
+        try w.beginImmediate();
+        errdefer w.rollback() catch {};
+        const old_created = if (cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, w, cur) else null;
+        const issued = try auth_helpers.issueSession(req, w, u.collection, u.id);
+        try api_auth.carrySessionCreated(self.ctx.arena, w, issued.token, old_created);
+        w.commit() catch |e| {
+            w.rollback() catch {};
+            return e;
+        };
+        return issued;
+    }
+
+    /// Rotate: bump the epoch (invalidating ALL prior tokens, including the one on THIS
+    /// request) then mint a fresh token carrying the new epoch — "rotate my credentials,
+    /// keep me signed in here, kill every other session". In table mode it also drops this
+    /// device's old `_sessions` row and (via issue) inserts the replacement. Route context only.
+    pub fn rotate(self: AuthApi) !auth_helpers.Issued {
+        const u = try self.principal();
+        const req = self.ctx.request orelse return error.NoRequestContext;
+        const table = self.ctx.app.session_store == .table;
+        const cur = self.ctx.rctx.session_id;
+        if (self.ctx.bound_conn) |c| {
+            _ = try api_auth.bumpTokenEpoch(self.ctx.arena, c, u.collection, u.id);
+            const old_created = if (table and cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, c, cur) else null;
+            const issued = try auth_helpers.issueSession(req, c, u.collection, u.id);
+            if (table) try api_auth.carrySessionCreated(self.ctx.arena, c, issued.token, old_created);
+            return issued;
+        }
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        // Epoch mode: a single epoch bump (UPDATE) then issue() (read + sign) — no multi-write
+        // to make atomic; a failed issue returns an error the caller sees. Table mode bundles
+        // bump + delete-old + insert-new (in issue) into ONE transaction so a mid-way failure
+        // never leaves the device's row deleted without a replacement (silent logout).
+        if (!table) {
+            _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
+            return auth_helpers.issueSession(req, w, u.collection, u.id);
+        }
+        try w.beginImmediate();
+        errdefer w.rollback() catch {};
+        _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
+        const old_created = if (cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, w, cur) else null;
+        const issued = try auth_helpers.issueSession(req, w, u.collection, u.id);
+        try api_auth.carrySessionCreated(self.ctx.arena, w, issued.token, old_created);
+        w.commit() catch |e| {
+            w.rollback() catch {};
+            return e;
+        };
+        return issued;
+    }
+
+    /// Variant B (`App(.{ .session_store = .table })`): list the current principal's active
+    /// (unexpired) sessions for a per-device UI, newest first, with `is_current` set on the
+    /// session this request is using. Read-only (one indexed SELECT). Returns
+    /// `error.SessionStoreNotEnabled` in the default `.epoch` mode (no per-session inventory).
+    pub fn listActiveSessions(self: AuthApi) ![]const Session {
+        if (self.ctx.app.session_store != .table) return error.SessionStoreNotEnabled;
+        const u = try self.principal();
+        const conn = if (self.ctx.bound_conn) |c| c else try self.ctx.connForRead();
+        const rows = try api_auth.listSessions(self.ctx.arena, conn, u.collection, u.id);
+        const cur = self.ctx.rctx.session_id;
+        const out = try self.ctx.arena.alloc(Session, rows.len);
+        for (rows, 0..) |row, i| out[i] = .{
+            .id = row.id,
+            .created = row.created,
+            .last_seen = row.last_seen,
+            .user_agent = row.user_agent,
+            .ip = row.ip,
+            .is_current = cur.len > 0 and std.mem.eql(u8, row.id, cur),
+        };
+        return out;
+    }
+
+    /// Variant B: revoke ONE session by id ("log out this device"). AUTHORIZED — a
+    /// non-superuser may revoke only a session they OWN. A non-owner gets `error.NotFound`
+    /// whether or not the session id exists (indistinguishable — no existence oracle on other
+    /// users' session ids); a genuinely absent id is also `error.NotFound`.
+    /// `error.SessionStoreNotEnabled` in `.epoch` mode.
+    pub fn revoke(self: AuthApi, session_id: []const u8) !void {
+        if (self.ctx.app.session_store != .table) return error.SessionStoreNotEnabled;
+        const u = try self.principal();
+        if (self.ctx.bound_conn) |c| return self.revokeOn(c, u, session_id);
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return self.revokeOn(w, u, session_id);
+    }
+
+    /// Authorize + delete one session row on `conn`. Owner-or-superuser only (fail closed).
+    /// A non-owner is given the SAME `error.NotFound` as a missing row — collapsing the
+    /// owner-mismatch and absent-row cases so revoke can't probe other users' session ids.
+    fn revokeOn(self: AuthApi, conn: *db.Db, u: Ctx.User, session_id: []const u8) !void {
+        const owner = (try api_auth.sessionOwner(self.ctx.arena, conn, session_id)) orelse return error.NotFound;
+        const is_owner = std.mem.eql(u8, owner.collection, u.collection) and std.mem.eql(u8, owner.record, u.id);
+        if (!u.is_superuser and !is_owner) return error.NotFound; // indistinguishable from absent
+        _ = try api_auth.deleteSession(conn, session_id);
     }
 };
 

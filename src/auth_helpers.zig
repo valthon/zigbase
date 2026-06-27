@@ -58,6 +58,27 @@ pub fn clearSession(ctx: *Ctx) ![]const http.Cookie {
     return ctx.auth().clearSession();
 }
 
+/// "Log out everywhere" (#99 Variant A): bump the current principal's session epoch so
+/// every outstanding `.auth` token stops verifying. Equivalent to
+/// `ctx.auth().revokeAllSessions()`. Pair it with `clearSession` to also drop this
+/// browser's cookie. Works in both `.epoch` and `.table` session-store modes.
+pub fn revokeAllSessions(ctx: *Ctx) !void {
+    return ctx.auth().revokeAllSessions();
+}
+
+/// Re-mint a session token for the current principal (sliding refresh, SAME epoch).
+/// Equivalent to `ctx.auth().refresh()`. Returns the signed JWT + session cookies.
+pub fn refresh(ctx: *Ctx) !Issued {
+    return ctx.auth().refresh();
+}
+
+/// Rotate the current principal's session: bump the epoch (killing all other tokens,
+/// including this request's old one) then mint a fresh token. Equivalent to
+/// `ctx.auth().rotate()`.
+pub fn rotate(ctx: *Ctx) !Issued {
+    return ctx.auth().rotate();
+}
+
 // ---- Link-token lifecycle ------------------------------------------------------
 
 /// Mint a single-use verification token for `record_id` in `collection` with the

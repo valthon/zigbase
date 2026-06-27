@@ -3,6 +3,13 @@ const db = @import("db.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
 
+/// Session-management model (#99). `epoch` (default) is the stateless token-epoch
+/// revocation scheme: cheap, no per-request DB read beyond the existing auth fetch.
+/// `table` opts into the server-side `_sessions` store for per-device list/revoke
+/// (DESIGNED-but-STUBBED — see the session-management design spec); the epoch verbs
+/// (revokeAllSessions/refresh/rotate) work in BOTH modes.
+pub const SessionStore = enum { epoch, table };
+
 /// Shared request-handling state. `io` supplies entropy for id generation;
 /// `pool` is the SQLite connection pool. Config/auth are added in later sub-projects.
 pub const App = struct {
@@ -12,6 +19,9 @@ pub const App = struct {
     jwt_secret: []const u8 = "",
     cookie_secure: bool = true,
     auth_token_ttl_s: i64 = 14 * 24 * 3600,
+    /// Selected session-management model (#99); resolved from the comptime
+    /// `App(.{ .session_store = .epoch | .table })` config. Defaults to `.epoch`.
+    session_store: SessionStore = .epoch,
     verification_ttl_s: i64 = 7 * 24 * 3600,
     password_reset_ttl_s: i64 = 3600,
     /// Server-side OAuth `state` CSRF protection (F11). ON by default: the backend

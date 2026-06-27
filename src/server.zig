@@ -192,6 +192,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 .is_superuser = if (authed) |a| a.is_superuser else false,
                 .collection = if (authed) |a| a.collection else "",
                 .method = @tagName(ctx.method),
+                .session_id = if (authed) |a| a.sid else "",
             };
             var cx = Ctx{ .app = app, .arena = ctx.allocator, .rctx = rctx, .request = ctx, .bound_conn = null };
             defer cx.deinit();
@@ -366,6 +367,7 @@ fn onRequest(r: zap.Request) !void {
     ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
     ctx.content_type = r.getHeader("content-type") orelse "";
     ctx.if_none_match = r.getHeader("if-none-match") orelse "";
+    ctx.user_agent = r.getHeader("user-agent") orelse "";
     // Client IP for rate limiting (F8). Proxy hop headers (X-Forwarded-For / X-Real-IP)
     // are spoofable on direct exposure, so they are honored ONLY when trust_proxy is set.
     // Otherwise "" — the limiter keys on the submitted identity (never header-spoofable).
