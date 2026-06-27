@@ -31,7 +31,8 @@ const zigbase = @import("zigbase");
 /// NOTE: record mutations MUST allocate with `ev.arena` (the request-scoped
 /// allocator that owns `ev.record`), NOT `ev.app.allocator` (the long-lived gpa) —
 /// mixing allocators on the arena-backed JSON map is undefined behavior.
-fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
+fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    _ = ctx;
     if (ev.record.* != .object) return; // framework already guards this; defensive
     if (ev.record.object.get("slug") != null) return;
     const title = if (ev.record.object.get("title")) |t| switch (t) {
@@ -65,7 +66,8 @@ fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
 }
 
 /// Stamp the author field from the authenticated identity.
-fn setAuthor(ev: *zigbase.RecordEvent) anyerror!void {
+fn setAuthor(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    _ = ctx;
     if (ev.record.* != .object) return;
     if (ev.ctx.auth) |auth| if (auth == .object) {
         if (auth.object.get("id")) |idv| if (idv == .string) {
@@ -76,7 +78,8 @@ fn setAuthor(ev: *zigbase.RecordEvent) anyerror!void {
 }
 
 /// Compute reading_time (minutes) from body word count: ceil(words / 200), minimum 1.
-fn computeReadingTime(ev: *zigbase.RecordEvent) anyerror!void {
+fn computeReadingTime(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    _ = ctx;
     if (ev.record.* != .object) return;
     const body_val = ev.record.object.get("body") orelse return;
     if (body_val != .string) return;
@@ -101,10 +104,10 @@ fn computeReadingTime(ev: *zigbase.RecordEvent) anyerror!void {
 
 /// before_create chain for posts: slugify -> setAuthor -> computeReadingTime.
 /// The framework accepts one handler per phase; we compose here.
-fn postsBeforeCreate(ev: *zigbase.RecordEvent) anyerror!void {
-    try slugify(ev);
-    try setAuthor(ev);
-    try computeReadingTime(ev);
+fn postsBeforeCreate(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    try slugify(ctx, ev);
+    try setAuthor(ctx, ev);
+    try computeReadingTime(ctx, ev);
 }
 
 /// GET /api/blog/ping — a public custom route returning a small JSON body.
@@ -138,22 +141,17 @@ fn getPostBySlug(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     // Reject anything that isn't a clean slug before it reaches the filter.
     if (!isSafeSlug(slug)) return req.fail(400, "invalid slug");
 
-    const app: *zigbase.Runtime = @ptrCast(@alignCast(req.app.?));
-
-    // Acquire a pooled, read-only connection; keep `conn` local so its address is
-    // stable for `releaseReader(&conn)` and the Data facade.
-    var conn = app.pool.acquireReader() catch return error.RouteFailed;
-    defer app.pool.releaseReader(&conn);
-    const data = zigbase.Data{ .app = app, .conn = &conn, .io = app.io };
-
-    const filter = std.fmt.allocPrint(req.arena.?, "slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
-    const result = data.list("posts", .{ .filter = filter, .perPage = 1 }) catch return error.RouteFailed;
+    // Read through the per-request capability object — `req.ctx.records()` manages
+    // the pooled connection itself (no manual acquireReader / Data wiring).
+    const filter = std.fmt.allocPrint(req.ctx.arena, "slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
+    const result = req.ctx.records().list("posts", .{ .filter = filter, .perPage = 1 }) catch return error.RouteFailed;
     if (result.items.len == 0) return error.NotFound;
     return result.items[0];
 }
 
 /// An interval job: logs a heartbeat (demonstrates background scheduling).
-fn heartbeat(ev: *zigbase.events.JobEvent) anyerror!void {
+fn heartbeat(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
+    _ = ctx;
     std.log.info("blog heartbeat job '{s}' ran", .{ev.name});
 }
 

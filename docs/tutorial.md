@@ -259,49 +259,45 @@ param, loads the record, and flips its status:
 const std = @import("std");
 const zigbase = @import("zigbase");
 
-fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const a = ev.ctx.allocator;
-    const id = ev.ctx.param("id") orelse
+fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const a = ctx.arena;
+    const id = ctx.request.?.param("id") orelse
         return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
-
-    const w = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = w, .io = ev.app.io };
 
     var patch: std.json.ObjectMap = .empty;
     try patch.put(a, "status", .{ .string = "confirmed" });
-    const updated = (try data.update("bookings", id, .{ .object = patch })) orelse
+    const updated = (try ctx.records().update("bookings", id, .{ .object = patch })) orelse
         return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
 
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, updated, .{}) };
 }
 ```
 
-`RouteEvent` gives you `app`, `ctx` (path params via `ctx.param`), and `rctx` (auth
-identity for finer authorization). It does **not** carry a `Data` facade, so you build
-one from the pool. The full version (with owner authorization) is in
+`ctx` (`*zigbase.Ctx`) is the per-request capability object: the raw request via
+`ctx.request.?` (path params with `ctx.request.?.param`), the authenticated identity
+via `ctx.user()`, and DB access via `ctx.records()` — which checks out and releases a
+pooled connection for you, so there is no manual `acquireWriter` / `Data` wiring. The
+full version (with owner authorization) is in
 [recipes.md → custom business route](recipes.md#recipe-a-custom-business-route-with-a-path-param--db-write).
 
 ---
 
 ## 6. Add a scheduled job
 
-A nightly job cancels stale pending bookings. A `JobEvent` carries only `app` and
-`name`, so — like the route above — you acquire a connection and build `Data`:
+A nightly job cancels stale pending bookings. A `JobEvent` still carries `app` and
+`name`, but the scheduler now hands the job a `*zigbase.Ctx` first — so, like the route
+above, you read and write through `ctx.records()` (which manages the pooled connection
+for you, no manual wiring):
 
 ```zig
-fn expireStaleBookings(ev: *zigbase.JobEvent) anyerror!void {
+fn expireStaleBookings(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     const a = ev.app.allocator;
-    const w = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = w, .io = ev.app.io };
-
-    const stale = try data.list("bookings", .{ .filter = "status = \"pending\"", .perPage = 200 });
+    const stale = try ctx.records().list("bookings", .{ .filter = "status = \"pending\"", .perPage = 200 });
     for (stale.items) |item| {
         const bid = item.object.get("id").?.string;
         var patch: std.json.ObjectMap = .empty;
         try patch.put(a, "status", .{ .string = "cancelled" });
-        _ = try data.update("bookings", bid, .{ .object = patch });
+        _ = try ctx.records().update("bookings", bid, .{ .object = patch });
     }
 }
 ```

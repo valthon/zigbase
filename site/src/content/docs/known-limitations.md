@@ -27,11 +27,11 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 ## Framework / hooks
 
-- **`before`-hook side-writes are atomic with the triggering write, but `ev.data` results are
+- **`before`-hook side-writes are atomic with the triggering write, but `ctx.records()` results are
   gpa-allocated.** On the HTTP create/update/delete path a `before`-hook runs *inside* the
-  triggering write's transaction, so its `ev.data` / `ev.caps().records()` side-writes commit
+  triggering write's transaction, so its `ctx.records()` side-writes commit
   atomically with the primary write and roll back together if the hook errors or the access rule
-  denies (fail closed). The one caveat: values *returned* by `ev.data` (e.g. a `findById` result)
+  denies (fail closed). The one caveat: values *returned* by `ctx.records()` (e.g. a `.get` result)
   are allocated from the app allocator, not `ev.arena` — copy with `ev.arena` before storing one
   into `ev.record`.
 

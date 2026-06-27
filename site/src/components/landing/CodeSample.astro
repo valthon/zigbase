@@ -7,7 +7,8 @@ const zigCode = `const std = @import("std");
 const zigbase = @import("zigbase");
 
 // Derive a URL slug from the post title before it is created.
-fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
+fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    _ = ctx;
     if (ev.record.* != .object) return;
     if (ev.record.object.get("slug") != null) return;
     const title = if (ev.record.object.get("title")) |t| switch (t) {

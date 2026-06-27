@@ -159,14 +159,17 @@ runs.
 Every hook has the signature:
 
 ```zig
-fn (ev: *zigbase.RecordEvent) anyerror!void
+fn (ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void
 ```
+
+The first parameter is the per-request capability object (`ctx.records()` for DB access,
+`ctx.http()` for outbound HTTP, etc. — see [§5b](#handler-capabilities-ctx)). Add `_ = ctx;`
+when a hook doesn't use it.
 
 `zigbase.RecordEvent` fields:
 
 - `app: *Runtime` — the runtime app context.
-- `ctx` — the request context.
-- `data` — the `Data` facade for DB access (see below).
+- `ctx` — the request context; `ev.ctx.auth` is the authenticated record (if any).
 - `arena: std.mem.Allocator` — the **request-scoped** allocator that owns `record`'s JSON
   storage.
 - `collection: []const u8` — the collection name.
@@ -189,7 +192,8 @@ allocators on the arena-backed JSON map is undefined behavior.
 From the worked example's `slugify` (`before_create` on `posts`):
 
 ```zig
-fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
+fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    _ = ctx;
     if (ev.record.* != .object) return;
     if (ev.record.object.get("slug") != null) return;
     const title = if (ev.record.object.get("title")) |t| switch (t) {
@@ -204,26 +208,32 @@ fn slugify(ev: *zigbase.RecordEvent) anyerror!void {
 }
 ```
 
-### The `ev.data` facade
+### DB access from a hook (`ctx.records()`)
 
-`ev.data` (a `zigbase.Data`) gives a hook curated DB access:
+A hook reaches the database through `ctx.records()` (the `Records` handle described in
+[§5b](#handler-capabilities-ctx)). In a `before*` hook it is bound to the triggering write's
+in-transaction connection, so side-writes commit atomically with the triggering write:
 
-- `findById(collection, id) !?std.json.Value` — returns `null` for both an unknown
-  collection and a missing record.
+- `get(collection, id, .{}) !?std.json.Value` — returns `null` for both an unknown
+  collection and a missing record (the 3rd arg is `GetOptions`, e.g. `.{ .expand = "author" }`).
 - `create(collection, value) !std.json.Value`
 - `update(collection, id, value) !?std.json.Value`
 - `delete(collection, id) !bool`
-- `list(collection, query) !ListResult`
+- `list(collection, opts) !ListResult`
 
 `create`/`update`/`delete`/`list` return `error.UnknownCollection` when the collection name
 does not resolve.
 
+> **Result lifetime:** a `std.json.Value` returned by `ctx.records()` is not part of the
+> `ev.arena`-owned `ev.record` map. It is fine to read for the duration of the hook, but do
+> **not** store one *into* `ev.record` without first copying it with `ev.arena` (mixing
+> allocators on the arena-backed JSON map is UB).
+
 > **Atomicity:** on the HTTP create/update/delete path a `before*` hook runs **inside**
-> the triggering write's transaction. Side-writes a hook issues via `ev.data` /
-> `ev.caps().records()` commit atomically with the triggering write, and a before-hook
-> that returns an error — or a denied access rule — rolls the whole transaction back, so a
-> rejected write persists nothing (fail closed). (Values *returned* by `ev.data` are still
-> gpa-allocated, per the result-lifetime note above.)
+> the triggering write's transaction. Side-writes a hook issues via `ctx.records()` commit
+> atomically with the triggering write, and a before-hook that returns an error — or a
+> denied access rule — rolls the whole transaction back, so a rejected write persists
+> nothing (fail closed).
 
 ## 5. Custom HTTP routes (`.routes`)
 
@@ -244,46 +254,48 @@ default) when omitted. The three auth levels are:
 The handler signature is:
 
 ```zig
-fn (ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response
+fn (ctx: *zigbase.Ctx) anyerror!zigbase.http.Response
 ```
 
 ```zig
-fn ping(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    _ = ev;
+fn ping(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    _ = ctx;
     return .{ .status = 200, .body = "{\"pong\":true}" };
 }
 ```
 
-`RouteEvent` carries `app`, `ctx` (the `http.RequestCtx`), and `rctx` — the resolved
-request/auth identity (auth identity, `is_superuser`, method), built by the framework
-before your handler runs. The framework **enforces `.auth` before** calling the handler.
-**Built-in routes always win** over custom routes that would match the same method + path.
+The `*zigbase.Ctx` is the per-request capability object: reach the raw HTTP request via
+`ctx.request.?` (a `*http.RequestCtx`), the authenticated identity via `ctx.user()`, DB
+access via `ctx.records()`, and outbound HTTP via `ctx.http()`. The framework **enforces
+`.auth` before** calling the handler. **Built-in routes always win** over custom routes that
+would match the same method + path.
 
-### DB access from a route (`ev.writer()` / `ev.reader()`)
+### DB access from a route (`ctx.records()`)
 
-Unlike `RecordEvent` (whose `ev.data` is already bound to the in-transaction writer), a
-`RouteEvent` has no ambient connection. Use the RAII accessors to check a connection out of
-the pool and hand it back — both `RouteEvent` and `JobEvent` / `LifecycleEvent` expose
-them:
+An untyped route handler reaches the database through `ctx.records()` — the same `Records`
+handle described in [§5b](#handler-capabilities-ctx). It lazily checks out a pooled reader
+for reads and acquires the pool writer per write call, releasing both when the framework
+tears the ctx down, so there is no manual `acquireReader` / `acquireWriter` + `Data` wiring:
 
 ```zig
-// writes — acquires the shared, mutex-guarded pool writer
-var w = ev.writer();
-defer w.deinit();                 // releases the writer back to the pool (no leak)
-const created = try w.data().create("posts", value);
-
-// reads — checks out a warm pooled read-only connection
-var r = try ev.reader();
-defer r.deinit();                 // returns the connection to the warm pool
-const rec = try r.data().findById("posts", id);
+// reads + writes both go through the same handle
+const created = try ctx.records().create("posts", value);
+const rec = try ctx.records().get("posts", id, .{});
 ```
 
-`ev.writer()` returns a `WriterData` and `ev.reader()` returns `!ReaderData`; each handle's
-`data()` yields a `zigbase.Data` bound to that connection (same facade as `RecordEvent.data`:
-`findById` / `create` / `update` / `delete` / `list`). **Always `defer <handle>.deinit()`**
-— the writer is a single shared connection, so hold it no longer than necessary.
+A **typed** route reaches the identical handle via `req.ctx.records()` (see
+[Typed routes](#typed-routes-and-the-generated-rpc-surface)).
 
-> **Auth collections:** `data().create(collection, fields)` on an auth collection runs
+For raw SQL on a **migration-owned** table (not a collection), acquire the pooled writer
+directly and hand it back:
+
+```zig
+const w = ctx.app.pool.acquireWriter();
+defer ctx.app.pool.releaseWriter();
+try w.exec("INSERT INTO plugin_audit_log(note) VALUES('...');");
+```
+
+> **Auth collections:** `ctx.records().create(collection, fields)` on an auth collection runs
 > the same credential transforms as the HTTP layer (generates the per-record `tokenKey`,
 > forces `verified=false`, and hashes `password` if one is supplied). A `password` is
 > **optional**, so a passwordless flow can provision a credential-less account that
@@ -293,7 +305,7 @@ const rec = try r.data().findById("posts", id);
 
 ### Typed routes and the generated `rpc` surface
 
-For routes that carry a structured input or output, ZigBase supports **typed routes** declared with a `Req(Input)` / `Output` handler signature instead of the raw `RouteEvent` form. A typed route handler looks like:
+For routes that carry a structured input or output, ZigBase supports **typed routes** declared with a `Req(Input)` / `Output` handler signature instead of the raw untyped `fn(*zigbase.Ctx) anyerror!zigbase.http.Response` form. A typed route handler looks like:
 
 ```zig
 // Input and Output are Zig types in the bounded Zig→TS subset: bool, int/float,
@@ -310,6 +322,11 @@ fn handler(req: *zigbase.Req(InputType)) zigbase.RouteError!OutputType {
 }
 ```
 
+A typed handler reaches the per-request capability object through `req.ctx`:
+`req.ctx.records()` for DB access, `req.ctx.http()` for outbound HTTP, `req.ctx.arena` for
+allocations, and `req.ctx.app` for the runtime. (`req.app` / `req.arena` remain as legacy
+aliases; prefer `req.ctx.*`.)
+
 Register typed routes in `.routes` identically to untyped ones (`.method`, `.path`, `.handler`, optional `.auth` defaulting to `.superuser`). The generator (`zig build gen-client`) reads the comptime `App` declaration and emits a `zb.rpc.*` method for each typed route — named by camel-joining the path segments (`:param` segments omitted):
 
 | Path | Method | Generated name |
@@ -325,34 +342,31 @@ The generated TypeScript method signature mirrors the route shape:
 - Output is the TypeScript equivalent of the Zig return type; `std.json.Value` maps to `unknown`.
 - `.auth` defaults to `.superuser` when omitted — typed routes are locked to superusers unless explicitly set.
 
-Untyped routes (the raw `fn(*zigbase.RouteEvent) anyerror!zigbase.http.Response` form) own their full response — status, cookies, redirect, content-type — and carry no typed `Input`/`Output`, so the generator deliberately **skips** them: they do not appear in `zb.rpc.*`. Call them with your own `fetch`/HTTP client. This is what lets an untyped handler set a session cookie, return a `307` redirect, or serve a non-JSON body (e.g. `text/calendar`) that a typed `zb.rpc.*` method could not express.
+Untyped routes (the raw `fn(*zigbase.Ctx) anyerror!zigbase.http.Response` form) own their full response — status, cookies, redirect, content-type — and carry no typed `Input`/`Output`, so the generator deliberately **skips** them: they do not appear in `zb.rpc.*`. Call them with your own `fetch`/HTTP client. This is what lets an untyped handler set a session cookie, return a `307` redirect, or serve a non-JSON body (e.g. `text/calendar`) that a typed `zb.rpc.*` method could not express.
 
 See the [TypeScript SDK docs](./typescript-sdk#typed-rpc--zbrpc) and `examples/golfsim/` for the full worked example.
 
 ## 5b. Handler capabilities (`ctx`) {#handler-capabilities-ctx}
 
-Every handler type — route, hook, and job — exposes `ev.caps()`, which returns a `Ctx`
-capability object. It provides curated DB access, an outbound HTTP client, and a standard
+Every handler type — route, hook, and job — receives a `*zigbase.Ctx` as its first
+parameter. It provides curated DB access, an outbound HTTP client, and a standard
 error model, without manually acquiring connections from the pool.
 
 ### `ctx.records()` — records access
 
-`ev.caps().records()` returns a `Records` handle. For reads it lazily checks out and
-caches a pooled reader (released on `ctx.deinit()`); write methods (`create`/`update`/`delete`)
-acquire the pool writer and release it per-call. Always `defer ctx.deinit()` in the handler.
-This replaces hand-built `pool.acquireWriter()` + `Data` wiring — e.g. a cron job that
-expires stale booking holds (the form used by `examples/golfsim`):
+`ctx.records()` returns a `Records` handle. For reads it lazily checks out and caches a
+pooled reader (released by the framework when the ctx is torn down); write methods
+(`create`/`update`/`delete`) acquire the pool writer and release it per-call. This replaces
+hand-built `pool.acquireWriter()` + `Data` wiring — e.g. a cron job that expires stale
+booking holds (the form used by `examples/golfsim`):
 
 ```zig
-fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
-    var ctx = ev.caps();
-    defer ctx.deinit();
-
+fn expireHolds(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     const stale = try ctx.records().list("bookings", .{
         .filter = "status = \"pending\" && starts_at < @now",
         .perPage = 200,
     });
-    // stale.items: []std.json.Value  |  stale.totalItems: ?u64
+    // stale.items: []std.json.Value  |  stale.totalItems: ?i64 (null in cursor mode)
 
     for (stale.items) |item| {
         const id = item.object.get("id").?.string;
@@ -395,8 +409,6 @@ const page = try ctx.records().list("posts", .{
 Returns an `HttpClient` bound to the Ctx's arena and the app's `io`:
 
 ```zig
-var ctx = ev.caps();
-defer ctx.deinit();
 const client = ctx.http();
 
 const res = try client.get("https://api.example.com/data");
@@ -410,21 +422,20 @@ const res2 = try client.post("https://webhook.example.com/notify", .{
 
 ### Error helpers (`ctx.fail`, `ctx.invalid`, `ctx.errorResponse`)
 
-For untyped `RouteEvent` handlers, use the Ctx helpers to produce standard error responses
+For untyped route handlers, use the Ctx helpers to produce standard error responses
 rather than building raw HTTP error responses by hand:
 
 ```zig
-fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    var ctx = ev.caps();
-    defer ctx.deinit();
+fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const req = ctx.request.?;
 
-    const id = ev.ctx.param("id") orelse
+    const id = req.param("id") orelse
         return ctx.errorResponse(ctx.fail(400, "Missing booking id."));
 
     const booking = (try ctx.records().get("bookings", id, .{})) orelse
         return ctx.errorResponse(error.NotFound);
 
-    if (!isOwner(ev.rctx, booking))
+    if (!isOwner(ctx.user(), booking))
         return ctx.errorResponse(ctx.fail(403, "Not the owner."));
 
     // ... update booking ...
@@ -498,9 +509,10 @@ new transaction).
 > I/O stalls all other writes on the server — complete any external HTTP calls
 > before or after the `ctx.tx` block.
 
-> **In a `before*` hook**, `ev.caps()` binds to the hook's in-transaction connection and
-> never acquires from the pool. The hook's `ev.data` facade is still the idiomatic API for
-> data access in hooks; `ev.caps()` shines in route and job handlers.
+> **In a `before*` hook**, `ctx.records()` is bound to the hook's in-transaction
+> connection and never acquires from the pool, so side-writes commit atomically with the
+> triggering write. In route and job handlers `ctx.records()` lazily checks out a pooled
+> connection that the framework releases on ctx teardown.
 
 ## 6. Auth / file / lifecycle events
 
@@ -511,9 +523,9 @@ One handler each, registered by the matching config key:
 | `onAuth` | `fn (ev: *zigbase.events.AuthEvent) void` | After a successful login / oauth2. |
 | `onFileServe` | `fn (ev: *zigbase.events.FileEvent) anyerror!void` | Before serving a download; **return an error to deny** (framework → `404`). |
 | `onFileUpload` | `fn (ev: *zigbase.events.FileEvent) void` | After a successful upload. |
-| `onBootstrap` | `fn (ev: *zigbase.events.LifecycleEvent) void` | After bootstrap. |
-| `onBeforeServe` | `fn (ev: *zigbase.events.LifecycleEvent) void` | Just before serving starts. |
-| `onBeforeTerminate` | `fn (ev: *zigbase.events.LifecycleEvent) void` | Just before shutdown. |
+| `onBootstrap` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | After bootstrap. |
+| `onBeforeServe` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | Just before serving starts. |
+| `onBeforeTerminate` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | Just before shutdown. |
 
 `AuthEvent` carries `app`, `ctx`, `collection`, `record: ?std.json.Value`, and `method`
 (`.password` | `.oauth2` | `.magic_link` | `.otp` | `.webauthn` | `.custom`). `FileEvent` carries `app`, `ctx`, `collection`,
@@ -532,7 +544,7 @@ There are three tiers:
 |---|---|---|
 | Built-in | `magic_link`, `otp`, `password`, `webauthn` in `.auth.methods` | Most apps — no Zig code needed |
 | Custom plugin | Register a TYPE in `.auth_methods`; reference by slug in `.auth.methods` | Non-standard verification (corp SSO, API keys, etc.) |
-| Escape hatch | Custom routes + `ev.issueSession` / `zigbase.auth` API (see below) | Exotic flows where the two-phase contract doesn't fit |
+| Escape hatch | Custom routes + `ctx.issueSession` / `zigbase.auth` API (see below) | Exotic flows where the two-phase contract doesn't fit |
 
 **Backward compatibility:** an auth collection with no `.auth.methods` config defaults to `password` — existing deployments are unaffected.
 
@@ -801,7 +813,7 @@ For flows where the built-in two-phase `AuthMethod` contract doesn't fit, ZigBas
 a `zigbase.auth` helper surface so you can build custom login flows while staying in the
 same session-issuance seam that built-in logins use.
 
-**The seam guarantee:** every login — including custom flows via `ev.issueSession`
+**The seam guarantee:** every login — including custom flows via `ctx.issueSession`
 — fires your `onAuth` handler. There is no way to mint a session that bypasses it.
 Built-in flows (password, OAuth2) and custom flows both go through the same
 `issueSession`+`emitAuth` path, so the `onAuth` hook is the single, reliable
@@ -816,7 +828,7 @@ pub const Issued    = struct { token: []const u8, cookies: [2]http.Cookie };
 pub const LinkToken = struct { token: []const u8 };
 
 // Issue a full session (sets cookies, fires onAuth).
-// Prefer ev.issueSession (below) from a route — it acquires the writer for you.
+// Prefer ctx.issueSession (below) from a route — it acquires the writer for you.
 pub fn issueSession(
     ctx: *http.RequestCtx, conn: *db.Db,
     collection: []const u8, record_id: []const u8,
@@ -857,26 +869,27 @@ pub fn rateLimit(
 ) !?http.Response
 ```
 
-#### `RouteEvent.issueSession` — the ergonomic route helper
+#### `ctx.issueSession` — the ergonomic route helper
 
-From inside a `RouteEvent` handler, use `ev.issueSession` instead of calling
-`zigbase.auth.issueSession` directly. It acquires and releases the DB writer for you:
+From inside a route handler, use `ctx.issueSession` instead of calling
+`zigbase.auth.issueSession` directly. It acquires and releases the DB writer for you (it is
+only valid in a route — `ctx.request` must be non-null):
 
 ```zig
-// src/events.zig  (re-exported on RouteEvent)
+// src/ctx.zig
 pub fn issueSession(
-    ev: *RouteEvent, collection: []const u8, record_id: []const u8,
+    ctx: *Ctx, collection: []const u8, record_id: []const u8,
 ) !Issued   // acquires+releases the writer, fires onAuth(.custom)
 ```
 
-> **Warning:** `ev.issueSession` acquires the pool writer for you. If your handler already holds the writer (`var w = ev.writer()`), do NOT call `ev.issueSession` — it would deadlock on the single non-reentrant writer. Instead call `zigbase.auth.issueSession(ev.ctx, w.conn, collection, record_id)` with the connection you already hold.
+> **Warning:** `ctx.issueSession` acquires the pool writer for you internally. Do NOT call it while you are already holding the writer — inside `ctx.tx`, from a `before*` hook, or with a bound connection — it would deadlock on the single non-reentrant writer. In those cases call `zigbase.auth.issueSession(ctx.request.?, conn, collection, record_id)` directly with the connection you already hold.
 
 Typical usage in a confirm handler that does NOT separately hold the writer:
 
 ```zig
-fn myConfirm(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+fn myConfirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     // ... verify your token, resolve the record id ...
-    const issued = try ev.issueSession("members", record_id);
+    const issued = try ctx.issueSession("members", record_id);
     return .{ .status = 200, .body = "{\"ok\":true}", .cookies = &issued.cookies };
 }
 ```
@@ -884,12 +897,12 @@ fn myConfirm(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
 When your handler already holds the writer (e.g. for `verifyLinkToken` and `consumeLinkToken`), reuse it:
 
 ```zig
-fn myConfirm(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    var w = ev.writer();
-    defer w.deinit();
-    // ... verifyLinkToken, consumeLinkToken using w.conn ...
-    // Use zigbase.auth.issueSession, NOT ev.issueSession, to avoid double-acquiring the writer.
-    const issued = try zigbase.auth.issueSession(ev.ctx, w.conn, "members", record_id);
+fn myConfirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const w = ctx.app.pool.acquireWriter();
+    defer ctx.app.pool.releaseWriter();
+    // ... verifyLinkToken, consumeLinkToken using w ...
+    // Use zigbase.auth.issueSession, NOT ctx.issueSession, to avoid double-acquiring the writer.
+    const issued = try zigbase.auth.issueSession(ctx.request.?, w, "members", record_id);
     return .{ .status = 200, .body = "{\"ok\":true}", .cookies = &issued.cookies };
 }
 ```
@@ -921,14 +934,15 @@ error). The three schedule modes (`zigbase.schedule.Schedule`):
 .reactive                             // handler decides its own next fire
 ```
 
-**Handler signatures depend on the mode.** Cron and interval jobs use:
+**Handler signatures depend on the mode.** Cron and interval jobs use a ctx-first handler:
 
 ```zig
-fn (ev: *zigbase.events.JobEvent) anyerror!void
+fn (ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void
 ```
 
 ```zig
-fn heartbeat(ev: *zigbase.events.JobEvent) anyerror!void {
+fn heartbeat(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
+    _ = ctx;
     std.log.info("blog heartbeat job '{s}' ran", .{ev.name});
 }
 ```
@@ -936,15 +950,15 @@ fn heartbeat(ev: *zigbase.events.JobEvent) anyerror!void {
 A `.reactive` job's handler instead **returns its next schedule**:
 
 ```zig
-fn (ev: *zigbase.events.JobEvent) anyerror!zigbase.schedule.Reactive
+fn (ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!zigbase.schedule.Reactive
 ```
 
 It returns either `.{ .after = <Interval> }` (re-run after that interval, e.g. `.{ .after =
 .{ .minutes = 5 } }` or `.{ .after = .daily }`) or `.stop` (retire the job). `JobEvent`
-carries `app` and `name`, and exposes the same `ev.writer()` / `ev.reader()` DB accessors
-as `RouteEvent` (see
-[DB access from a route](#db-access-from-a-route-evwriter--evreader)) — use them to touch
-the database from a job rather than hand-building a `Data` from the pool.
+carries `app` and `name`. Touch the database from a job through `ctx.records()` (see
+[DB access from a route](#db-access-from-a-route-ctxrecords)); for raw SQL on a
+migration-owned table acquire the pooled writer via `ctx.app.pool.acquireWriter()` /
+`ctx.app.pool.releaseWriter()`.
 
 ### Caveats
 
@@ -966,8 +980,8 @@ The scheduler is intentionally simple (see [Known limitations](./known-limitatio
 To offload one-off background work from a route or hook onto the worker pool:
 
 ```zig
-try ev.app.submit("reindex", reindexTask);
-// reindexTask: fn (ev: *zigbase.events.JobEvent) anyerror!void
+try ctx.app.submit("reindex", reindexTask);
+// reindexTask: fn (ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void
 ```
 
 `submit` returns `error.SchedulerUnavailable` if no scheduler is running (e.g.
@@ -1294,12 +1308,16 @@ The public surface (from `src/root.zig`):
 - `zigbase.Runtime` — the runtime app context type (the `*App` you receive on events).
 - `zigbase.Config`, `zigbase.Server`.
 - `zigbase.http` — HTTP types (`http.Response`, `http.Method`, ...).
-- `zigbase.Data` — the DB facade.
+- `zigbase.Ctx` — the per-request capability object passed as the first parameter to every
+  route / hook / job / lifecycle handler (`ctx.records()`, `ctx.http()`, `ctx.user()`,
+  `ctx.tx()`, `ctx.issueSession()`, `ctx.fail`/`ctx.invalid`/`ctx.errorResponse`).
 - `zigbase.events` — all event/handler types (`events.AuthEvent`, `events.FileEvent`,
   `events.LifecycleEvent`, `events.JobEvent`, ...).
 - `zigbase.schedule` — `schedule.Schedule`, `schedule.Interval`, `schedule.Reactive`.
-- `zigbase.RecordEvent`, `zigbase.ErrorEvent`, `zigbase.RouteEvent` — re-exported directly
-  for convenience.
+- `zigbase.RecordEvent`, `zigbase.ErrorEvent`, `zigbase.JobEvent` — re-exported directly
+  for convenience (the same types as `zigbase.events.*`); they are the second parameter of
+  hook / job handlers.
+- `zigbase.Req`, `zigbase.RouteError` — the typed-route handler input wrapper and error set.
 - `zigbase.Migration` — the `.migrations` slice element type; `zigbase.Db` — the writer
   connection passed to a migration's `.up`.
 - `zigbase.StaticFile` — the embedded manifest entry type (path, bytes, etag); used by

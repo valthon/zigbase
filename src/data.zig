@@ -16,7 +16,7 @@ const App = @import("app.zig").App;
 /// handler opens `BEGIN IMMEDIATE` before the before-hook, performs the row
 /// write + access-rule guard, and only then commits; a before-hook error (or a
 /// denied guard) rolls the WHOLE transaction back — so a side-write a hook issues
-/// via `ev.data` / `ev.caps().records()` commits atomically with the triggering
+/// via `ctx.records()` commits atomically with the triggering
 /// write and is discarded on abort (fail closed). NOTE: ops issued through a `Data`
 /// still allocate their returned record on the gpa (app.allocator), not a request
 /// arena; hooks that keep a side-write's result should copy what they need.

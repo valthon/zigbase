@@ -41,7 +41,8 @@ pub fn messageForError(e: RouteError) []const u8 {
 
 /// The typed request handed to a route handler. `Input` is the parsed body/query;
 /// `params` are path params; `auth_id` is the caller's id ("" when anonymous).
-/// `app`/`io` give DB access (same handles as RouteEvent today). `failure` is set by `fail`.
+/// DB and other capabilities are reached via `req.ctx` (`req.ctx.records()`,
+/// `req.ctx.http()`, `req.ctx.user()`, ...). `failure` is set by `fail`.
 pub fn Req(comptime InputT: type) type {
     return struct {
         const Self = @This();
