@@ -187,7 +187,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -206,6 +206,7 @@ pub fn App(comptime cfg: anytype) type {
             if (@hasField(@TypeOf(cfg), "routes")) d.routes = events.buildRoutes(cfg.routes);
             if (@hasField(@TypeOf(cfg), "onAuth")) d.on_auth = cfg.onAuth;
             if (@hasField(@TypeOf(cfg), "beforeAuthSuccess")) d.before_auth_success = cfg.beforeAuthSuccess;
+            if (@hasField(@TypeOf(cfg), "auth")) d.auth_lifecycle = events.buildAuthLifecycleDispatcher(cfg.auth);
             if (@hasField(@TypeOf(cfg), "onFileServe")) d.on_file_serve = cfg.onFileServe;
             if (@hasField(@TypeOf(cfg), "onFileUpload")) d.on_file_upload = cfg.onFileUpload;
             if (@hasField(@TypeOf(cfg), "onBootstrap")) d.on_bootstrap = cfg.onBootstrap;
