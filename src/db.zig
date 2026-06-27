@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig").c;
+const clock_sql = @import("clock_sql.zig");
 
 /// Returns the linked SQLite library version string, e.g. "3.53.2".
 pub fn libVersion() []const u8 {
@@ -27,7 +28,12 @@ pub const Db = struct {
             if (handle) |h| _ = c.sqlite3_close(h);
             return DbError.OpenFailed;
         }
-        return .{ .handle = handle.? };
+        const conn = Db{ .handle = handle.? };
+        // Dev-only: shadow SQLite's date/time builtins so a consumer's raw `datetime('now')`
+        // honors the frozen test clock (#84). comptime no-op on a prod build, so the writer/
+        // any Db.open caller (incl. openMemory) is unchanged in production.
+        clock_sql.register(conn.handle);
+        return conn;
     }
 
     pub fn close(self: *Db) void {
@@ -393,6 +399,10 @@ pub const Pool = struct {
         // Match the writer's page-cache budget on every reader (warm + fallback) so the
         // pool's total page-cache footprint is bounded by (1 + reader_cap) * cache_kib.
         try setCacheSize(&db, self.cache_kib);
+        // Dev-only: same date/time-builtin shadowing as the writer (#84). The reader path
+        // opens via raw sqlite3_open_v2 (not Db.open), so register here too. comptime no-op
+        // on a prod build.
+        clock_sql.register(db.handle);
         return db;
     }
 
