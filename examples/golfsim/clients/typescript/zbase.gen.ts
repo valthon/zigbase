@@ -746,6 +746,22 @@ export interface HealthOut {
   status: string;
   app: string;
 }
+
+// ---- Built-in auth method I/O ----
+
+export interface AuthMethodResult {
+  /** Session JWT. Session cookies (zb_auth/zb_csrf) are also set on the response. */
+  token: string;
+}
+export interface OtpInitiateInput {
+  /** Email/identity to send the one-time code to. */
+  identity: string;
+}
+export interface OtpCompleteInput {
+  identity: string;
+  /** The one-time numeric code delivered by email. */
+  code: string;
+}
 export interface ZbClient {
   db: {
     users: UsersService;
@@ -766,9 +782,8 @@ export interface ZbClient {
   auth: {
     users: {
       otp: {
-        // TODO(typed): emit typed Initiate/Complete I/O once methods declare comptime types
-        initiate(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;
-        complete(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;
+        initiate(input: OtpInitiateInput, opts?: SendOptions): Promise<void>;
+        complete(input: OtpCompleteInput, opts?: SendOptions): Promise<AuthMethodResult>;
       };
     };
   };
@@ -823,10 +838,10 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
     auth: {
       users: {
         otp: {
-          initiate: (input: Record<string, unknown>, opts?: SendOptions) =>
-            base.send("POST", `/api/collections/users/auth/otp/initiate`, { body: input, ...opts }),
-          complete: (input: Record<string, unknown>, opts?: SendOptions) =>
-            base.send("POST", `/api/collections/users/auth/otp/complete`, { body: input, ...opts }),
+          initiate: (input: OtpInitiateInput, opts?: SendOptions): Promise<void> =>
+            base.send<void>("POST", `/api/collections/users/auth/otp/initiate`, { body: input, ...opts }),
+          complete: (input: OtpCompleteInput, opts?: SendOptions): Promise<AuthMethodResult> =>
+            base.send<AuthMethodResult>("POST", `/api/collections/users/auth/otp/complete`, { body: input, ...opts }),
         },
       },
     },
