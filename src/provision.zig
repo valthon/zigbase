@@ -143,8 +143,10 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
         if (@hasField(S, "indexes")) col.indexes = buildIndexes(name, spec.indexes);
         // TTL: `.ttl_field` names an existing date/autodate field as the row's expiry
         // timestamp (a framework-internal GC reaps expired rows). Validate at comptime:
-        // the field must exist and store an ISO-8601 UTC string (date/autodate) so the
-        // GC's lexical `<=` comparison against strftime('...Z','now') is correct.
+        // the field must exist and be a date/autodate (so it holds an ISO-8601 instant).
+        // The GC normalizes both sides via SQLite `strftime('%Y-%m-%dT%H:%M:%SZ', ...)`
+        // before comparing, so non-canonical `.date` values (timezone offsets, space
+        // separator, date-only) are handled correctly.
         if (@hasField(S, "ttl_field")) {
             const tf: []const u8 = spec.ttl_field;
             var matched: ?schema.FieldType = null;

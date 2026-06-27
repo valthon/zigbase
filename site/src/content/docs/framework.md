@@ -1093,8 +1093,10 @@ rows whose timestamp is in the past — automatically, with no cron of your own:
 Semantics:
 
 - `.ttl_field` must name a field declared on the **same collection** and of type
-  `.date` or `.autodate` — anything else is a **compile error** (those types store
-  a fixed-width ISO-8601 UTC string that compares correctly with a lexical `<=`).
+  `.date` or `.autodate` — anything else is a **compile error** (those types hold an
+  ISO-8601 instant). The TTL GC normalizes both sides via SQLite `strftime(...)`
+  before comparing, so non-canonical `.date` values (timezone offsets, space
+  separator, date-only) are handled correctly — do not assume lexical comparison.
 - A row is reaped when its ttl value is **non-null and at/before "now"**. A row
   whose ttl field is `null` never expires (so an optional, never-set expiry is a
   permanent row).

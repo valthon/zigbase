@@ -1341,6 +1341,35 @@ test "gcExpiredRecords compares ttl as an instant, not lexically (offsets/date-o
     try std.testing.expectEqual(@as(i64, 0), try C.n(&d, "SELECT COUNT(*) FROM tokens WHERE id IN ('past_offset','past_dateonly','past_space');"));
 }
 
+test "gcExpiredRecords is resilient: a drifted collection does not abort the sweep" {
+    // A TTL collection whose physical table was dropped (but whose `_collections`
+    // metadata remains) must not prevent GC of a second, healthy TTL collection.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "label", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "drifted", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "healthy", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
+    try d.exec("INSERT INTO healthy (id,created,updated,label,expires_at) VALUES ('h1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','x','2000-01-01T00:00:00Z');");
+    // Simulate drift: drop the table out from under the still-present metadata row.
+    try d.exec("DROP TABLE drifted;");
+
+    // The sweep must NOT propagate the drifted collection's error; it logs+skips it
+    // and still reaps the healthy collection's expired row.
+    const deleted = try gcExpiredRecords(a, &d);
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+    var st = try d.prepare("SELECT COUNT(*) FROM healthy;");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
 /// GC: delete rows whose `ttl_field` timestamp is at/before "now" across every
 /// collection that opts into TTL (`options.ttl_field != null`). Returns the total
 /// number of rows deleted. Safe to call periodically (the framework-internal
@@ -1371,9 +1400,18 @@ pub fn gcExpiredRecords(alloc: std.mem.Allocator, w: *db.Db) !usize {
         if (!schema.isValidIdentifier(tf)) continue;
         const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\") <= strftime('%Y-%m-%dT%H:%M:%SZ','now');", .{ col.name, tf, tf }, 0);
         defer alloc.free(sql); // no-op for arena callers; protects any future GPA caller
-        var st = try w.prepare(sql);
+        // Resilient per-collection: a single drifted collection (e.g. the table was
+        // dropped but its `_collections` metadata remains) must not abort the whole
+        // sweep and silence GC for every later collection. Log and skip to the next.
+        var st = w.prepare(sql) catch |err| {
+            std.log.warn("TTL GC: skipping collection '{s}': {s}", .{ col.name, @errorName(err) });
+            continue;
+        };
         defer st.finalize();
-        _ = try st.step();
+        _ = st.step() catch |err| {
+            std.log.warn("TTL GC: step failed for collection '{s}': {s}", .{ col.name, @errorName(err) });
+            continue;
+        };
         total += @intCast(@max(@as(i64, 0), w.changesCount()));
     }
     return total;
