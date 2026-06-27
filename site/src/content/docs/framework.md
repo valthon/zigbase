@@ -103,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
 | `session_store` | Session-management model: `.epoch` (default, stateless token-epoch revocation, zero extra DB work) or `.table` (server-side `_sessions` store for per-device list/revoke, one extra read per request). See [Revoking sessions](#revoking-sessions-99). |
-| `session_gc_cron` | Cadence (UTC cron) for the table-mode expired-`_sessions` GC sweep. Default `"0 * * * *"` (hourly). Only consumed when `.session_store = .table`. |
+| `session_gc_cron` | Cadence (UTC cron) for the table-mode expired-`_sessions` GC sweep. Default `"0 * * * *"` (hourly). Only valid with `.session_store = .table` — setting it otherwise is a `@compileError`. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
 
 ## 3b. The `typegen` gate (`.enable_typegen`) {#the-apptypegen-gate-enable_typegen}

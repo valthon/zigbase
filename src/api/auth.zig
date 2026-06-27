@@ -242,7 +242,7 @@ pub fn gcExpiredSessions(conn: *db.Db) !usize {
         var batch: usize = 0;
         while (try st.step()) batch += 1;
         total += batch;
-        if (batch < session_gc_batch) break; // last (partial) batch drained the backlog
+        if (batch < session_gc_batch) break; // full batch — may be more; a partial (or zero) batch signals done
     }
     return total;
 }

@@ -313,7 +313,14 @@ pub fn App(comptime cfg: anytype) type {
         /// Cadence (UTC, minute-granularity cron) for the table-mode expired-`_sessions` GC
         /// sweep (#114). Default hourly; override with `.session_gc_cron = "..."`. Only consumed
         /// when `.session_store == .table` (otherwise no GC job is installed at all).
-        pub const session_gc_cron: []const u8 = if (@hasField(@TypeOf(cfg), "session_gc_cron")) cfg.session_gc_cron else "0 * * * *";
+        pub const session_gc_cron: []const u8 = blk: {
+            // Fail loudly on misuse: setting the cadence without enabling the table store is a
+            // silent no-op otherwise (the GC job is only installed in table mode). Only triggers
+            // when the user EXPLICITLY set the key — the default-unset case stays fine.
+            if (@hasField(@TypeOf(cfg), "session_gc_cron") and session_store_config != .table)
+                @compileError("session_gc_cron has no effect without session_store = .table");
+            break :blk if (@hasField(@TypeOf(cfg), "session_gc_cron")) cfg.session_gc_cron else "0 * * * *";
+        };
 
         /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
         /// A custom type missing a contract method fails with a contract-specific message.
@@ -1402,6 +1409,11 @@ test "#114 session-GC job installs in table mode only (absent in epoch); cadence
     // `.session_gc_cron` overrides the cadence.
     for (App(.{ .session_store = .table, .session_gc_cron = "*/30 * * * *" }).jobs) |j|
         if (std.mem.eql(u8, j.name, "_session_gc")) try std.testing.expectEqualStrings("*/30 * * * *", j.schedule.cron);
+
+    // Valid combinations compile (the misuse case — session_gc_cron without table — is a
+    // @compileError, which can't be unit-tested): default-unset epoch + table-with-override.
+    try std.testing.expectEqualStrings("0 * * * *", App(.{}).session_gc_cron);
+    try std.testing.expectEqualStrings("*/30 * * * *", App(.{ .session_store = .table, .session_gc_cron = "*/30 * * * *" }).session_gc_cron);
 }
 
 test "App(cfg) resolves the comptime pagination config (defaults + overrides)" {
