@@ -406,11 +406,11 @@ Key points:
   `?i64` — `orelse 0` it) and `items`; the `opts` is a `ListOptions` (`.filter`, `.sort`,
   `.page`, `.perPage`). `ctx.records()` also offers `get`, `create`, `update`, `delete`.
 - **Returning any error rejects** the create with `400` ("Request rejected by a hook.").
-- **Atomicity caveat:** a `before*` hook's own `ctx.records()` writes are **not** atomic with the
-  triggering write (the triggering write's transaction opens after the hook returns). For a
-  pure read-and-validate hook like this, that's fine; avoid relying on a hook-issued
-  side-write rolling back if the main write fails. See
-  [Framework → Atomicity caveat](./framework#the-evdata-facade).
+- **Atomicity:** a `before*` hook's own `ctx.records()` writes **are** atomic with the
+  triggering write — they share its transaction. If the hook returns an error (or the
+  access rule denies the write), the whole transaction rolls back, including the hook's
+  side-writes (fail closed). See
+  [Framework → DB access from a hook](./framework#db-access-from-a-hook-ctxrecords).
 
 ## Recipe: a custom business route with a path param + DB write
 
@@ -491,7 +491,7 @@ defer ctx.app.pool.releaseWriter();
 try w.exec("...");
 ```
 
-(See [Framework → DB access from a job](./framework#db-access-from-a-route-evwriter--evreader).)
+(See [Framework → DB access from a job](./framework#db-access-from-a-route-ctxrecords).)
 
 This nightly job cancels stale `pending` bookings (older than now) by listing them and
 updating each:
