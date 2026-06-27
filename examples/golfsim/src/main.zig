@@ -563,6 +563,18 @@ fn bumpLoginCount(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyer
     _ = try ctx.records().update(ev.collection, ev.record_id, .{ .object = patch });
 }
 
+/// `beforeRegister` hook (#98): runs INSIDE the account-create transaction, before the
+/// row is inserted, with `ev.record` the writable to-be-created account. Here we seed a
+/// default `loginCount = 0` so the field is initialized at signup rather than only on the
+/// first login. Returning an error would abort the registration and fail closed (no
+/// account created) — the canonical use for gating sign-ups.
+fn seedNewUser(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerror!void {
+    const rec = ev.record orelse return;
+    if (rec.* != .object) return;
+    if (rec.object.get("loginCount") == null)
+        try rec.object.put(ctx.arena, "loginCount", .{ .integer = 0 });
+}
+
 /// One-line logout (#86): `ctx.auth().clearSession()` returns the cleared
 /// `zb_auth`/`zb_csrf` cookies built from the framework's own cookie policy, so a
 /// custom logout matches the built-in `/auth-logout` exactly. `.public` so a stale
@@ -582,6 +594,8 @@ pub const App = zigbase.App(.{
         },
         // #80: increment a per-user login counter on every successful login, transactionally with the session.
         .beforeAuthSuccess = bumpLoginCount,
+        // #98: auth lifecycle hooks. Seed loginCount=0 on registration (in the create txn).
+        .auth = .{ .beforeRegister = seedNewUser },
         .routes = .{
             .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
             .{ .method = .POST, .path = "/api/bookings/:id/cancel", .handler = cancelBooking, .auth = .authed },

@@ -83,6 +83,7 @@ error.**
 | `routes` | Custom HTTP routes. |
 | `onAuth` | Notify-only: fires *after* a session is issued (login / oauth2). |
 | `beforeAuthSuccess` | Writable, transactional, abortable hook that runs *before* the session is issued (claim records on first login; veto a login). |
+| `auth` | Auth lifecycle hooks: before/after `register`, `logout`, `refresh`, `password-change`. |
 | `onFileServe` | Fires before serving a file download (may deny). |
 | `onFileUpload` | Fires after a file upload. |
 | `onBootstrap` | Lifecycle: after bootstrap. |
@@ -628,6 +629,7 @@ One handler each, registered by the matching config key:
 | --- | --- | --- |
 | `onAuth` | `fn (ev: *zigbase.events.AuthEvent) void` | Notify-only, **after** a session is issued (login / oauth2). |
 | `beforeAuthSuccess` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!void` | Writable + abortable, **before** the session is issued. See [Auth lifecycle](#auth-lifecycle-beforeauthsuccess). |
+| `auth` | struct of `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerror!void` | before/after `register`/`logout`/`refresh`/`password-change`. See [Auth lifecycle hooks](#auth-lifecycle-hooks-register--logout--refresh--password-change). |
 | `onFileServe` | `fn (ev: *zigbase.events.FileEvent) anyerror!void` | Before serving a download; **return an error to deny** (framework → `404`). |
 | `onFileUpload` | `fn (ev: *zigbase.events.FileEvent) void` | After a successful upload. |
 | `onBootstrap` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | After bootstrap. |
@@ -673,8 +675,72 @@ Guarantees:
 Where it fires: the unified `POST /api/collections/:col/auth/:method/complete` endpoint
 (password / otp / webauthn / oauth2 / custom) and the magic-link
 `GET …/auth/magic_link/consume` link. The legacy `/auth-with-password` and `/auth-refresh`
-endpoints and the register/logout/refresh/password-change phases are not yet covered
-(planned — see the Theme D spec). `onAuth` still fires once, after issuance, as before.
+endpoints do not fire `beforeAuthSuccess`. `onAuth` still fires once, after issuance, as
+before. The surrounding lifecycle phases (register / logout / refresh / password-change)
+have their own before/after hooks — see below.
+
+### Auth lifecycle hooks (register / logout / refresh / password-change)
+
+The `.auth` config group adds **before/after** hooks for the surrounding auth lifecycle,
+all following the `beforeAuthSuccess` discipline. Each handler is
+`fn (ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerror!void`; the event
+carries `.collection`, `.record_id`, `.phase`, and a writable `.record` where applicable.
+
+```zig
+zigbase.App(.{
+    .auth = .{
+        .beforeRegister       = gateSignup,    // validate / gate; abort blocks the account
+        .afterRegister        = seedProfile,    // post-create side effects
+        .beforeLogout         = onBeforeLogout,
+        .afterLogout          = onAfterLogout,
+        .beforeRefresh        = onBeforeRefresh,
+        .afterRefresh         = onAfterRefresh,
+        .beforePasswordChange = onBeforePwChange,
+        .afterPasswordChange  = onAfterPwChange,
+    },
+});
+```
+
+A typo'd hook name (e.g. `.beforeRegsiter`) or a wrong-typed handler is a **compile
+error**, never a silently-dead hook. `beforeAuthSuccess` and `onAuth` are separate keys
+and unchanged.
+
+| Phase | Fires on | before: writable | before: transactional | before: abortable (fail closed) |
+| --- | --- | :-: | :-: | --- |
+| `register` | record create for an **auth** collection (`POST /api/collections/:col/records`) | ✅ (mutate the new account) | ✅ (in the create txn) | abort rolls back → **no account created** |
+| `logout` | `POST /api/collections/:col/auth-logout` | ✅ (bound writer) | — (no write txn) | abort → mapped response, **cookies not cleared** |
+| `refresh` | `POST /api/collections/:col/auth-refresh` | ✅ | ✅ | abort rolls back → **no new session** |
+| `password-change` | `POST /api/collections/:col/confirm-password-reset` | ✅ | ✅ | abort rolls back → **password unchanged, reset token un-consumed** |
+
+Semantics, consistent across phases:
+
+- **Before-hooks** run with a `*Ctx` bound to the action's connection (in-transaction for
+  register/refresh/password-change). `ctx.records()` writes participate in the action's
+  transaction. Returning any error **aborts** the action and fails closed, mapped via the
+  `Ctx` error model (`ctx.fail(status, msg)`, `error.Forbidden`→403, else 500). Where a
+  write transaction exists, the abort rolls it back. Do **not** call `ctx.tx` (you are
+  already in a transaction).
+- **After-hooks** run post-commit (post-action for logout) and are notify-only — an error
+  is routed to the framework error backstop; it never fails the request.
+- `register` fires only for **auth** collections; `before_register` has no `record_id` yet
+  (the account isn't created), and `ev.record` is the writable to-be-created data.
+- `logout` keeps a no-writer fast path: it only resolves the caller and acquires the writer
+  when an `.auth` hook is actually registered.
+
+```zig
+// Seed a profile row atomically with the new account.
+fn seedProfile(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerror!void {
+    if (ev.phase != .after_register) return;
+    var p: std.json.ObjectMap = .empty;
+    try p.put(ctx.arena, "user", .{ .string = ev.record_id });
+    _ = try ctx.records().create("profiles", .{ .object = p });
+}
+```
+
+**Deferred (designed, not wired):** self-service password change via `PATCH /records`
+(use the record `beforeUpdate`/`afterUpdate` hooks on the auth collection), firing
+`beforeAuthSuccess` on the legacy `/auth-with-password` / `/auth-refresh` endpoints, and
+the `ctx.auth()` refresh / rotate / revoke verbs. See the auth-lifecycle-hooks design spec.
 
 ### Auth methods overview
 
