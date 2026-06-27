@@ -642,7 +642,11 @@ pub fn confirmPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
     };
     // Existing record snapshot for the hook (read on the same in-transaction conn).
-    var rec_opt = records.get(ctx.allocator, w, col, claims.id) catch null;
+    // Use `try` (not `catch null`): a genuine DB failure must propagate so the errdefer
+    // rolls back (token un-consumed, password unchanged → clean 500) rather than feeding a
+    // null record/identity to a `before_password_change` authorization hook. `records.get`
+    // returns null only for genuine not-found, so that path is preserved below.
+    var rec_opt = try records.get(ctx.allocator, w, col, claims.id);
     const rec_ptr: ?*std.json.Value = if (rec_opt) |*r| r else null;
     if (try fireAuthLifecycleBefore(ctx, w, col.name, claims.id, .before_password_change, rec_ptr, rec_opt)) |resp| {
         w.rollback() catch {};
