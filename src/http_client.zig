@@ -1,4 +1,5 @@
 const std = @import("std");
+const testcapture = @import("testcapture.zig");
 
 pub const Method = enum { GET, POST, PUT, PATCH, DELETE };
 pub const Header = struct { name: []const u8, value: []const u8 };
@@ -55,6 +56,18 @@ pub const HttpClient = struct {
     }
 
     pub fn request(self: HttpClient, opts: RequestOptions) !HttpResponse {
+        // Dev-only capture/mock seam (#96). Comptime-dead on a prod build, so no runtime
+        // branch and no perf cost there. When a test has enabled capture, this records the
+        // request and (if a mock matches the URL) returns a canned response duped onto our
+        // allocator — no network at all. Mirrors the oauth `Transport` injection.
+        if (testcapture.enabled) {
+            switch (try testcapture.http.intercept(self.alloc, opts)) {
+                .passthrough => {},
+                .response => |r| return r,
+                .blocked => return error.TransportFailed,
+            }
+        }
+
         var client = std.http.Client{ .allocator = self.alloc, .io = self.io };
         defer client.deinit();
 
