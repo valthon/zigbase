@@ -62,11 +62,10 @@ def test_toggle_feature_flag_off_to_on(page):
     page.wait_for_selector('[data-test=flag-beta_feature]', timeout=5000)
     assert not page.is_checked('[data-test=flag-beta_feature]')
 
-    # Toggle on
-    page.click('[data-test=flag-beta_feature]')
-
-    # Wait for the checkbox to reflect the new state (Preact re-renders after API)
-    page.wait_for_function("document.querySelector('[data-test=\"flag-beta_feature\"]').checked === true", timeout=5000)
+    # Toggle on — wait for the PUT round-trip to complete before asserting persistence
+    with page.expect_response(lambda r: '/api/settings/' in r.url and r.request.method == 'PUT') as resp_info:
+        page.click('[data-test=flag-beta_feature]')
+    assert resp_info.value.ok
 
     # Verify persisted
     r = api_request(page, 'GET', '/api/settings/beta_feature')
@@ -83,8 +82,10 @@ def test_toggle_feature_flag_on_to_off(page):
     page.wait_for_selector('[data-test=flag-feature_x]', timeout=5000)
     assert page.is_checked('[data-test=flag-feature_x]')
 
-    page.click('[data-test=flag-feature_x]')
-    page.wait_for_function("document.querySelector('[data-test=\"flag-feature_x\"]').checked === false", timeout=5000)
+    # Toggle off — wait for the PUT round-trip to complete before asserting persistence
+    with page.expect_response(lambda r: '/api/settings/' in r.url and r.request.method == 'PUT') as resp_info:
+        page.click('[data-test=flag-feature_x]')
+    assert resp_info.value.ok
 
     r = api_request(page, 'GET', '/api/settings/feature_x')
     assert r.json()['value'] == 'false'
