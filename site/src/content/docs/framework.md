@@ -1263,7 +1263,8 @@ only the SQLite file holds ciphertext:
 ```
 
 **Envelope.** AES-256-GCM, versioned: each value is stored as
-`v1:` + base64url(nonce ‖ ciphertext ‖ tag) with a fresh random nonce per write.
+`v<N>:` + base64url(nonce ‖ ciphertext ‖ tag) with a fresh random nonce per
+write, where `N` is the key generation (default `1` — see Key rotation below).
 
 **Key (required).** The key comes **only** from the `ZIGBASE_FIELD_KEY`
 environment variable (HKDF-derived; the raw value may be any length). Unlike the
@@ -1286,19 +1287,66 @@ cannot be indexed, marked `.unique`, or used in a `?filter`/`?sort`:
   effectively never match — don't reference encrypted fields in rules.
 
 **Strict reads / enabling on existing data.** Reads are strict: a stored value
-that is not a valid `v1:` envelope (e.g. legacy plaintext) or that fails
-authentication (wrong key, tamper) **fails closed** — there is no plaintext
-passthrough. Therefore, turning `.encrypted` on for a column that already holds
-plaintext rows requires an explicit rewrap migration first; "encrypted means
-encrypted".
+that is not a valid `v<N>:` envelope (e.g. legacy plaintext) or that fails
+authentication (wrong key, tamper, or an unconfigured key generation) **fails
+closed** — there is no plaintext passthrough. Therefore, turning `.encrypted` on
+for a column that already holds plaintext rows requires running `zigbase rewrap`
+first (see below); "encrypted means encrypted".
 
-**Rotation.** The `v<N>:` version prefix selects the key generation. v1 ships a
-single key; the format is designed so a future generation can be added (reads
-dispatch on the prefix, writes use the primary) with a lazy/rewrap forward path.
+#### Key rotation
+
+The `v<N>:` envelope prefix is the **key generation**: a `v<N>:` value is
+decrypted with generation `N`'s key. Writes always use the **primary** generation
+and stamp its version; reads dispatch on the prefix. This lets you write under a
+new key while still reading old data, then migrate the old data forward.
+
+Configuration (env only — keys are never auto-generated, persisted, or logged):
+
+| Env var | Meaning |
+| --- | --- |
+| `ZIGBASE_FIELD_KEY` | The **primary** (current/write) key. Required if any field is encrypted. |
+| `ZIGBASE_FIELD_KEY_GENERATION` | Integer `1..64`, **default `1`** — the generation of the primary key (= the `v<N>:` version written). |
+| `ZIGBASE_FIELD_KEY_V<M>` | A read-only key for an **older** generation `M`, used to decrypt existing `v<M>:` data. |
+
+The default (just `ZIGBASE_FIELD_KEY`, generation `1`) is identical to the
+single-key build — it writes and reads `v1:`. Each generation derives an
+independent key (HKDF, domain-separated by generation), so generations never
+share key material. Setting `ZIGBASE_FIELD_KEY_V<M>` for the primary generation
+`M` is a fatal config error (ambiguous — the primary key already comes from
+`ZIGBASE_FIELD_KEY`).
+
+**To rotate** from generation 1 (key `oldkey`) to generation 2 (key `newkey`):
+
+1. Restart with `ZIGBASE_FIELD_KEY=newkey`, `ZIGBASE_FIELD_KEY_GENERATION=2`,
+   `ZIGBASE_FIELD_KEY_V1=oldkey`. New writes are `v2:`; old `v1:` rows still read.
+2. Run the rewrap command to re-encrypt every `v1:` cell as `v2:`:
+
+   ```sh
+   ZIGBASE_FIELD_KEY=newkey ZIGBASE_FIELD_KEY_GENERATION=2 ZIGBASE_FIELD_KEY_V1=oldkey \
+     zigbase rewrap --data-dir ./zb_data
+   ```
+3. Once rewrap completes, drop `ZIGBASE_FIELD_KEY_V1` — no `v1:` data remains.
+
+**`zigbase rewrap`** walks every `.encrypted` field of every collection, decrypts
+each cell with whichever generation matches its envelope version (or, for legacy
+plaintext, takes it as-is), and re-encrypts it under the primary key. It is the
+supported path both to finish a rotation and to migrate existing plaintext into
+ciphertext when first enabling `.encrypted`. It is **idempotent** (cells already
+at the primary version are skipped), transactional per collection, and
+**fail-closed**: a cell it cannot decrypt (missing generation key, wrong key,
+tamper) aborts the run with the offending row reported and that collection's
+transaction rolled back — no data is lost. `--dry-run` reports counts without
+writing. Run it with the primary key plus every older generation present in your
+data configured.
+
+> Memory note: rewrap buffers a collection's rewritten cells in memory before
+> writing them back, so peak memory is O(rows) in the collection being processed.
+> This is fine for a one-off maintenance command on typical tables; chunked
+> rewrapping for very large encrypted tables is a possible future option.
 
 > Note: the envelope hides a value's *contents* but not its *length* — ciphertext
 > length is proportional to plaintext length. A single long-lived key suits typical
-> volumes; for very high write volumes, periodic `v<N>:` key rotation is recommended.
+> volumes; for very high write volumes, periodic key rotation is recommended.
 
 ### Startup provisioning + additive auto-migration
 

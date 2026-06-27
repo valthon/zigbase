@@ -10,11 +10,12 @@ pub const ValueError = error{ TypeMismatch, TooPrecise, Overflow, BadNumber, Bad
 /// store an encrypted field as plaintext, nor return ciphertext as plaintext.
 pub const EncryptError = error{FieldKeyMissing};
 
-/// Recover the field cipher stamped on the connection (db.Db.field_cipher), or null.
-fn cipherOf(stmt: *db.Stmt) ?field_policy.Cipher {
+/// Recover a pointer to the field cipher (key-ring) stamped on the connection
+/// (db.Db.field_cipher), or null. Returns a pointer so the whole ring is not
+/// copied per value.
+fn cipherOf(stmt: *db.Stmt) ?*const field_policy.Cipher {
     const p = stmt.field_cipher orelse return null;
-    const cph: *const field_policy.Cipher = @ptrCast(@alignCast(p));
-    return cph.*;
+    return @ptrCast(@alignCast(p));
 }
 
 /// Bind a storage string, sealing it into an at-rest envelope first when the field
@@ -22,7 +23,7 @@ fn cipherOf(stmt: *db.Stmt) ?field_policy.Cipher {
 fn bindStorage(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: schema.Field, storage: []const u8) (EncryptError || db.DbError || std.mem.Allocator.Error)!void {
     if (field.encrypted) {
         const cph = cipherOf(stmt) orelse return error.FieldKeyMissing;
-        return stmt.bindText(idx, try field_policy.seal(cph, alloc, storage));
+        return stmt.bindText(idx, try cph.seal(alloc, storage));
     }
     return stmt.bindText(idx, storage);
 }
@@ -33,7 +34,7 @@ fn readStorage(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sche
     const raw = stmt.columnText(idx);
     if (field.encrypted) {
         const cph = cipherOf(stmt) orelse return error.FieldKeyMissing;
-        return field_policy.open(cph, alloc, raw);
+        return cph.open(alloc, raw);
     }
     return alloc.dupe(u8, raw);
 }

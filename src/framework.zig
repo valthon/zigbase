@@ -22,6 +22,7 @@ const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
 const registry = @import("auth/registry.zig");
 const field_policy = @import("field_policy.zig");
+const rewrap = @import("rewrap.zig");
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -440,6 +441,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .top => printUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default),
             .serve => printServeUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default),
             .migrate => printMigrateUsage(init.io, std.Io.File.stdout()),
+            .rewrap => printRewrapUsage(init.io, std.Io.File.stdout()),
             .superuser_create => printSuperuserUsage(init.io, std.Io.File.stdout()),
             .typegen => printTypegenUsage(init.io, std.Io.File.stdout()),
         },
@@ -449,6 +451,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map);
         },
         .migrate => |sa| try migrateImpl(allocator, init.io, init.environ_map, sa),
+        .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
         .typegen => |ta| {
             if (opts.enable_typegen) {
@@ -505,6 +508,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool) void {
         \\COMMANDS:
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
         \\  migrate             Apply database migrations, then exit.
+        \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  superuser create    Create an admin (superuser) account.
         \\  help                Show this help. Also: --help, -h, or no arguments.
         \\  version             Print version + build provenance. Also: --version, -V.
@@ -554,6 +558,11 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool) void {
         \\  ZIGBASE_VERIFICATION_TTL  Email-verification token TTL, seconds. [default 604800 = 7 days]
         \\  ZIGBASE_PASSWORD_RESET_TTL Password-reset token TTL, seconds.    [default 3600 = 1 hour]
         \\  ZIGBASE_FILE_TOKEN_TTL    Short-lived file-access token TTL, seconds. [default 120 = 2 min]
+        \\  ZIGBASE_FIELD_KEY         Key for at-rest field encryption (.encrypted fields). Never
+        \\                           auto-generated/persisted/logged. Required if any field is encrypted.
+        \\  ZIGBASE_FIELD_KEY_GENERATION  Generation of the primary key = envelope version written
+        \\                           (v<N>:). Bump to rotate; then run `zigbase rewrap`. [default 1]
+        \\  ZIGBASE_FIELD_KEY_V<n>    Older read-only key for generation <n> (decrypts existing v<n>: data).
         \\
         \\EXAMPLES:
         \\  # Create the first superuser (admin) account:
@@ -654,6 +663,42 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
     , .{});
 }
 
+fn printRewrapUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase rewrap — re-encrypt every encrypted field under the primary key.
+        \\
+        \\USAGE:
+        \\  zigbase rewrap [--data-dir PATH] [--dry-run]
+        \\
+        \\FLAGS:
+        \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\  --dry-run        Decrypt and report counts, but write nothing.
+        \\
+        \\WHAT IT DOES:
+        \\  For every `.encrypted` field of every collection, decrypts each stored cell
+        \\  with whichever key generation matches its `v<N>:` envelope version (or, for
+        \\  a legacy plaintext cell, takes it as-is) and re-encrypts it under the PRIMARY
+        \\  key. This is how you finish a key rotation and how you migrate existing
+        \\  plaintext into ciphertext when enabling `.encrypted`.
+        \\
+        \\KEYS (env, never persisted/logged):
+        \\  ZIGBASE_FIELD_KEY             The primary (write) key. REQUIRED.
+        \\  ZIGBASE_FIELD_KEY_GENERATION  Generation of the primary key (= envelope
+        \\                                version written). Default 1.
+        \\  ZIGBASE_FIELD_KEY_V<n>        Older read-only key for generation <n>, needed
+        \\                                to decrypt existing v<n>: data.
+        \\
+        \\  Run with the primary key plus every older generation present in your data.
+        \\  A cell it cannot decrypt aborts the run with the row reported (fail-closed,
+        \\  no data loss). The command is idempotent and transactional per collection.
+        \\
+        \\EXAMPLE (rotate from key gen 1 to gen 2):
+        \\  ZIGBASE_FIELD_KEY=newkey ZIGBASE_FIELD_KEY_GENERATION=2 ZIGBASE_FIELD_KEY_V1=oldkey \
+        \\    zigbase rewrap --data-dir ./zb_data
+        \\
+    , .{});
+}
+
 fn printSuperuserUsage(io: std.Io, file: std.Io.File) void {
     emit(io, file,
         \\zigbase superuser create — create an admin (superuser) account.
@@ -703,6 +748,35 @@ fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.pro
     defer pool.releaseWriter();
     try migrations.run(w);
     std.log.info("migrations applied", .{});
+}
+
+/// `zigbase rewrap`: re-encrypt every `.encrypted` cell under the PRIMARY key
+/// generation and migrate legacy plaintext into ciphertext. Must run with the
+/// primary key (ZIGBASE_FIELD_KEY) plus any older generations
+/// (ZIGBASE_FIELD_KEY_V<n>) needed to read existing data configured. Fail-closed:
+/// a cell it cannot decrypt aborts the run with the row reported (no data loss).
+fn rewrapImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, ra: cli.RewrapArgs) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = ra.data_dir });
+    if (cfg.field_key.len == 0) {
+        std.log.err("rewrap: ZIGBASE_FIELD_KEY is not set; the primary key is required to re-encrypt", .{});
+        return error.FieldKeyRequired;
+    }
+    const cipher = field_policy.Cipher.resolve(io, config.EnvGetter{ .environ = environ }, cfg.field_key, cfg.field_key_generation) catch |e| {
+        std.log.err("rewrap: invalid field-encryption key config ({s}); see ZIGBASE_FIELD_KEY_GENERATION / ZIGBASE_FIELD_KEY_V<n>", .{@errorName(e)});
+        return e;
+    };
+    var pool = try openPool(allocator, io, cfg, .{});
+    defer pool.deinit();
+    const w = pool.acquireWriter();
+    defer pool.releaseWriter();
+    // Ensure the system tables (incl. _collections) exist before enumerating.
+    try migrations.run(w);
+    std.log.info("rewrap: writing generation v{d}{s}", .{ cfg.field_key_generation, if (ra.dry_run) " (dry-run: no writes)" else "" });
+    const stats = try rewrap.rewrapAll(allocator, w, &cipher, ra.dry_run);
+    std.log.info(
+        "rewrap {s}: {d} collection(s), {d} field(s); {d} re-encrypted, {d} plaintext migrated, {d} already current",
+        .{ if (ra.dry_run) "dry-run complete" else "complete", stats.collections, stats.fields, stats.rewrapped, stats.plaintext_migrated, stats.skipped },
+    );
 }
 
 /// Minimum acceptable length for an operator-provided JWT secret.
@@ -786,8 +860,13 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     // cipher is a serveImpl stack var that outlives srv.listen(); pool points at it.
     var field_cipher: field_policy.Cipher = undefined;
     if (cfg.field_key.len > 0) {
-        field_cipher = field_policy.Cipher.fromEnv(io, cfg.field_key);
+        field_cipher = field_policy.Cipher.resolve(io, config.EnvGetter{ .environ = environ }, cfg.field_key, cfg.field_key_generation) catch |e| {
+            std.log.err("refusing to start: invalid field-encryption key config ({s}); see ZIGBASE_FIELD_KEY_GENERATION / ZIGBASE_FIELD_KEY_V<n>", .{@errorName(e)});
+            return e;
+        };
         pool.field_cipher = @ptrCast(&field_cipher);
+        if (cfg.field_key_generation != 1)
+            std.log.info("field encryption: primary generation v{d} (writes); older generations read from ZIGBASE_FIELD_KEY_V<n>. Run `zigbase rewrap` to migrate old data forward.", .{cfg.field_key_generation});
     } else if (anyEncryptedField(schema_collections)) {
         std.log.err("refusing to start: a collection declares an .encrypted field but ZIGBASE_FIELD_KEY is not set (encrypted data would be unreadable / stored as plaintext)", .{});
         return error.FieldKeyRequired;
