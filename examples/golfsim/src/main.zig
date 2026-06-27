@@ -496,7 +496,7 @@ pub const App = zigbase.App(.{
             .bookings = .{ .beforeCreate = prepareBooking },
             .reviews = .{ .beforeCreate = prepareReview },
         },
-        // #80: stamp last-seen on every successful login, transactionally with the session.
+        // #80: increment a per-user login counter on every successful login, transactionally with the session.
         .beforeAuthSuccess = bumpLoginCount,
         .routes = .{
             .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
