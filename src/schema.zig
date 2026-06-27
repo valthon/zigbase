@@ -156,6 +156,11 @@ pub const AuthOptions = struct {
 };
 pub const CollectionOptions = struct {
     auth: AuthOptions = .{},
+    /// When set, names an existing `date`/`autodate` field whose value is the row's
+    /// expiry timestamp (ISO-8601 UTC). A framework-internal GC job periodically
+    /// deletes rows whose ttl_field is in the past. Null = no expiry. Validated at
+    /// comptime in `provision.buildCollection` (field must exist and be date/autodate).
+    ttl_field: ?[]const u8 = null,
 };
 
 pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u8 {
@@ -236,6 +241,12 @@ pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u
     try auth.put(alloc, "methods", .{ .object = methods });
 
     try root.put(alloc, "auth", .{ .object = auth });
+
+    if (c.options.ttl_field) |tf| {
+        var ttl: ObjectMap = .empty;
+        try ttl.put(alloc, "field", .{ .string = tf });
+        try root.put(alloc, "ttl", .{ .object = ttl });
+    }
     return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
 }
 
@@ -258,9 +269,14 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return .{};
-    const av = root.object.get("auth") orelse return .{};
-    if (av != .object) return .{};
     var opts = CollectionOptions{};
+    // `ttl` lives at the options root (sibling of `auth`); parse it regardless of
+    // whether the `auth` block is present.
+    if (root.object.get("ttl")) |tv| if (tv == .object) if (tv.object.get("field")) |fv| if (fv == .string) {
+        opts.ttl_field = try alloc.dupe(u8, fv.string);
+    };
+    const av = root.object.get("auth") orelse return opts;
+    if (av != .object) return opts;
     if (av.object.get("identityFields")) |idv| if (idv == .array) {
         var list: std.ArrayList([]const u8) = .empty;
         for (idv.array.items) |it| if (it == .string) try list.append(alloc, try alloc.dupe(u8, it.string));
@@ -1085,6 +1101,23 @@ test "require_verified round-trips through optionsToJson/optionsFromJson" {
     const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .require_verified = true } } };
     const back = try optionsFromJson(a, try optionsToJson(a, c, false));
     try std.testing.expectEqual(true, back.auth.require_verified);
+}
+
+test "ttl_field round-trips through optionsToJson/optionsFromJson" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // default: no ttl_field => omitted from JSON, parses back as null
+    const d = Collection{ .id = "c", .name = "posts", .fields = &.{} };
+    const back_d = try optionsFromJson(a, try optionsToJson(a, d, false));
+    try std.testing.expect(back_d.ttl_field == null);
+    // explicit ttl_field is emitted and parsed back
+    const c = Collection{ .id = "c", .name = "posts", .fields = &.{}, .options = .{ .ttl_field = "expires_at" } };
+    const s = try optionsToJson(a, c, false);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"ttl\"") != null);
+    const back = try optionsFromJson(a, s);
+    try std.testing.expect(back.ttl_field != null);
+    try std.testing.expectEqualStrings("expires_at", back.ttl_field.?);
 }
 
 test "validate rejects an auth collection with a non-identifier identity field" {
