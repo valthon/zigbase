@@ -1252,6 +1252,76 @@ pub fn gcCursorStates(w: *db.Db) db.DbError!void {
     _ = try st.step();
 }
 
+test "gcExpiredRecords deletes past rows, keeps future rows, ignores non-ttl collections" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    // A collection that opts into TTL via a date field.
+    const sfields = [_]schema.Field{
+        .{ .id = "f1", .name = "token", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('future','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
+    // A null ttl value must NOT be treated as expired.
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('never','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','c',NULL);");
+    // A collection WITHOUT a ttl_field must be untouched.
+    const pfields = [_]schema.Field{.{ .id = "f3", .name = "title", .options = .{ .text = .{} } }};
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pfields });
+    try d.exec("INSERT INTO posts (id,created,updated,title) VALUES ('p1','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','keep');");
+
+    const deleted = try gcExpiredRecords(a, &d);
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+
+    const Counter = struct {
+        fn count(dd: *db.Db, sql: [:0]const u8) !i64 {
+            var st = try dd.prepare(sql);
+            defer st.finalize();
+            _ = try st.step();
+            return st.columnInt(0);
+        }
+    };
+    try std.testing.expectEqual(@as(i64, 0), try Counter.count(&d, "SELECT COUNT(*) FROM sessions WHERE id='past';"));
+    try std.testing.expectEqual(@as(i64, 1), try Counter.count(&d, "SELECT COUNT(*) FROM sessions WHERE id='future';"));
+    try std.testing.expectEqual(@as(i64, 1), try Counter.count(&d, "SELECT COUNT(*) FROM sessions WHERE id='never';"));
+    try std.testing.expectEqual(@as(i64, 1), try Counter.count(&d, "SELECT COUNT(*) FROM posts;"));
+}
+
+/// GC: delete rows whose `ttl_field` timestamp is at/before "now" across every
+/// collection that opts into TTL (`options.ttl_field != null`). Returns the total
+/// number of rows deleted. Safe to call periodically (the framework-internal
+/// `_ttl_gc` job) or once at startup. Collections without a ttl_field are untouched.
+///
+/// Security: both the collection name and the ttl_field name are gated through
+/// `schema.isValidIdentifier` before interpolation (the query-string threat model
+/// in docs/security-audit.md requires every interpolated identifier be validated).
+/// The comptime `.collections` path already guarantees valid names, but a
+/// hand-crafted `_collections` row must not be trusted.
+///
+/// The expiry comparison uses `strftime('%Y-%m-%dT%H:%M:%SZ','now')` — byte-identical
+/// to how autodate columns are written — so the lexical `<=` over fixed-width ISO-8601
+/// UTC strings is correct. `IS NOT NULL` keeps an unset (optional) ttl column from
+/// being reaped as if already expired.
+pub fn gcExpiredRecords(alloc: std.mem.Allocator, w: *db.Db) !usize {
+    const cols = try collections.list(alloc, w);
+    var total: usize = 0;
+    for (cols) |col| {
+        const tf = col.options.ttl_field orelse continue;
+        if (!schema.isValidIdentifier(col.name)) continue;
+        if (!schema.isValidIdentifier(tf)) continue;
+        const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND \"{s}\" <= strftime('%Y-%m-%dT%H:%M:%SZ','now');", .{ col.name, tf, tf }, 0);
+        var st = try w.prepare(sql);
+        defer st.finalize();
+        _ = try st.step();
+        total += @intCast(@max(@as(i64, 0), w.changesCount()));
+    }
+    return total;
+}
+
 pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: ListQuery) !ListResult {
     if (q.filter) |fstr| if (fstr.len > max_filter_len) return error.BadFilter;
     if (q.sort) |sstr| if (sstr.len > max_filter_len) return error.BadSort;
