@@ -86,7 +86,22 @@ fn rowToObject(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection)
 
 pub fn get(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) RecordError!?std.json.Value {
     const cols = try columnList(alloc, col);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1;", .{ cols, col.name }, 0);
+    // TTL read-time exclusion: never return an expired row. Mirrors gcExpiredRecords: both
+    // sides are normalised via strftime so non-canonical date values (offsets, space, date-
+    // only) compare correctly as instants, not lexically. The three-clause OR matches the
+    // GC's fail-safe: NULL ttl → no expiry (always shown); strftime(tf) IS NULL means an
+    // unparseable value → fail-safe, keep visible (same as GC which won't delete garbage).
+    // Security: identifiers gated through isValidIdentifier before interpolation.
+    const sql = blk: {
+        if (col.options.ttl_field) |tf| {
+            if (schema.isValidIdentifier(col.name) and schema.isValidIdentifier(tf)) {
+                break :blk try std.fmt.allocPrintSentinel(alloc,
+                    "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1 AND (\"{s}\" IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\") IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\") > strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
+                    .{ cols, col.name, tf, tf, tf }, 0);
+            }
+        }
+        break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1;", .{ cols, col.name }, 0);
+    };
     var st = try r.prepare(sql);
     defer st.finalize();
     try st.bindText(1, id);
@@ -1253,6 +1268,154 @@ pub fn gcCursorStates(w: *db.Db) db.DbError!void {
     _ = try st.step();
 }
 
+// ---------------------------------------------------------------------------
+// TTL read-time exclusion tests
+// ---------------------------------------------------------------------------
+
+test "ttl read-exclusion: get returns null for expired, row for future+null, non-ttl unaffected" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+
+    // TTL collection: expires_at is the ttl_field.
+    const sfields = [_]schema.Field{
+        .{ .id = "f1", .name = "token", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('future','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('never','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','c',NULL);");
+
+    // Non-TTL collection: a past-looking date on a non-ttl_field must not be filtered.
+    const pfields = [_]schema.Field{
+        .{ .id = "f3", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f4", .name = "created_at", .options = .{ .date = .{} } },
+    };
+    const pcol = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pfields });
+    try d.exec("INSERT INTO posts (id,created,updated,title,created_at) VALUES ('p1','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','keep','2000-01-01T00:00:00Z');");
+
+    // get: expired → null; future → returned; null ttl → returned.
+    try std.testing.expect(null == try get(a, &d, col, "past"));
+    try std.testing.expect(null != try get(a, &d, col, "future"));
+    try std.testing.expect(null != try get(a, &d, col, "never"));
+
+    // get: non-ttl collection is unaffected.
+    try std.testing.expect(null != try get(a, &d, pcol, "p1"));
+}
+
+test "ttl read-exclusion: list excludes expired, includes future+null, non-ttl unaffected" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+
+    const sfields = [_]schema.Field{
+        .{ .id = "f1", .name = "token", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('future','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('never','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','c',NULL);");
+
+    const pfields = [_]schema.Field{.{ .id = "f3", .name = "title", .options = .{ .text = .{} } }};
+    const pcol = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pfields });
+    try d.exec("INSERT INTO posts (id,created,updated,title) VALUES ('p1','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','keep');");
+
+    // list: only 2 of the 3 session rows are returned (future + null; past is hidden).
+    const r = try list(a, &d, col, .{});
+    try std.testing.expectEqual(@as(?i64, 2), r.totalItems);
+    try std.testing.expectEqual(@as(usize, 2), r.items.len);
+
+    // Verify the IDs returned are future and never, not past.
+    var saw_future = false;
+    var saw_never = false;
+    for (r.items) |item| {
+        const id_val = item.object.get("id") orelse continue;
+        const id_str = id_val.string;
+        if (std.mem.eql(u8, id_str, "future")) saw_future = true;
+        if (std.mem.eql(u8, id_str, "never")) saw_never = true;
+        try std.testing.expect(!std.mem.eql(u8, id_str, "past"));
+    }
+    try std.testing.expect(saw_future);
+    try std.testing.expect(saw_never);
+
+    // list: non-ttl collection returns all rows unaffected.
+    const pr = try list(a, &d, pcol, .{});
+    try std.testing.expectEqual(@as(?i64, 1), pr.totalItems);
+}
+
+test "ttl read-exclusion: composes with user filter (both predicates ANDed)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+
+    const sfields = [_]schema.Field{
+        .{ .id = "f1", .name = "token", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('past_a','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','tokenA','2000-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('future_a','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','tokenA','2999-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('future_b','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','tokenB','2999-01-01T00:00:00Z');");
+
+    // filter=token='tokenA' should match 2 rows (past_a + future_a), but TTL hides past_a.
+    const r = try list(a, &d, col, .{ .filter = "token='tokenA'" });
+    try std.testing.expectEqual(@as(?i64, 1), r.totalItems);
+    try std.testing.expectEqual(@as(usize, 1), r.items.len);
+    const id_val = r.items[0].object.get("id") orelse return error.MissingId;
+    try std.testing.expectEqualStrings("future_a", id_val.string);
+}
+
+test "ttl read-exclusion: instant comparison not lexical (offset/space/date-only)" {
+    // A future instant stored with a negative-offset literal (e.g. '2026-07-01T10:00:00-05:00',
+    // i.e. 15:00Z) sorts LEXICALLY before '...Z' because '-' < 'Z'. A lexical comparison
+    // would wrongly hide this row. strftime normalises both sides so it is kept.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "label", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tokens", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
+
+    // KEPT — future instant whose literal sorts BEFORE canonical now (negative offset).
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('future_neg','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a', strftime('%Y-%m-%dT%H:%M:%S','now','-1 minute') || '-05:00');");
+    // KEPT — far-future canonical Z.
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('future_z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
+    // KEPT — unparseable garbage: strftime → NULL → NULL > x → NULL → not hidden (fail-safe).
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('garbage','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','c','not-a-date');");
+    // HIDDEN — genuinely past non-canonical forms.
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('past_offset','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','d','2000-01-01T00:00:00+05:00');");
+    try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('past_space','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','e','2000-01-01 00:00:00');");
+
+    const r = try list(a, &d, col, .{});
+    // 3 kept (future_neg, future_z, garbage) + 2 hidden (past_offset, past_space).
+    try std.testing.expectEqual(@as(?i64, 3), r.totalItems);
+
+    // Also verify get: future_neg must be returned; past_offset must not.
+    try std.testing.expect(null != try get(a, &d, col, "future_neg"));
+    try std.testing.expect(null == try get(a, &d, col, "past_offset"));
+    try std.testing.expect(null != try get(a, &d, col, "garbage")); // unparseable → kept
+}
+
 test "gcExpiredRecords deletes past rows, keeps future rows, ignores non-ttl collections" {
     var d = try db.Db.openMemory();
     defer d.close();
@@ -1526,6 +1689,28 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         try merged.appendSlice(alloc, rc.params);
         params = try merged.toOwnedSlice(alloc);
     };
+
+    // TTL read-time exclusion: AND a predicate that hides expired rows. This is the
+    // read-time complement to gcExpiredRecords (which only runs every ~5 min), giving
+    // immediate consistency. Three-clause OR mirrors the GC's fail-safe semantics:
+    //   1. col IS NULL            → no expiry set → always visible
+    //   2. strftime(col) IS NULL  → unparseable value → fail-safe: keep visible (same as
+    //                              GC, which also won't delete a row with garbage ttl)
+    //   3. strftime(col) > now    → genuine future instant → visible
+    // strftime normalises both sides so non-canonical forms (offsets, space, date-only)
+    // compare as instants, not lexically. Table-qualified because JOINs may be present.
+    // Security: both col.name and tf validated through isValidIdentifier (GC pattern).
+    if (col.options.ttl_field) |tf| {
+        if (schema.isValidIdentifier(col.name) and schema.isValidIdentifier(tf)) {
+            const ttl_pred = try std.fmt.allocPrint(alloc,
+                "\"{s}\".\"{s}\" IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\".\"{s}\") IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\".\"{s}\") > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+                .{ col.name, tf, col.name, tf, col.name, tf });
+            where_sql = if (where_sql.len > 0)
+                try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, ttl_pred })
+            else
+                ttl_pred;
+        }
+    }
 
     // Resolve the client sort into structured terms. Cursor mode appends an `id` tiebreaker so the
     // order is strictly total (keyset requires it); OFFSET mode keeps its historical ORDER BY
