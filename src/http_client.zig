@@ -88,8 +88,14 @@ pub const HttpClient = struct {
 /// The listening socket is created (and its port resolved) before the server
 /// thread is spawned, so there is no race between the test issuing a request
 /// and the server being ready to accept.
+///
+/// The listener lives in this struct (NOT the thread). `stop()` closes the
+/// listener first to unblock a thread parked in `accept()`, then joins — so
+/// the test never deadlocks even if `client.get()` errors before connecting.
+/// The thread owns only the accepted stream.
 const TestHttpServer = struct {
     thread: std.Thread,
+    server: std.Io.net.Server,
     port: u16,
 
     fn start(body: []const u8, status_code: u16) !TestHttpServer {
@@ -101,13 +107,18 @@ const TestHttpServer = struct {
         // The resolved port is available immediately after listen().
         const port = srv.socket.address.getPort();
 
-        // Transfer ownership of `srv` to the thread by passing it by value.
-        // The thread will call srv.deinit() when it is done.
+        // The thread receives a by-value copy of the listener purely to call
+        // accept() on the shared fd; it never deinits it. `stop()` owns the
+        // close of the listener (exactly once).
         const thread = try std.Thread.spawn(.{}, serveOne, .{ srv, body, status_code });
-        return .{ .thread = thread, .port = port };
+        return .{ .thread = thread, .server = srv, .port = port };
     }
 
     fn stop(self: *TestHttpServer) void {
+        // Close the listener first: this unblocks the thread if it is still
+        // parked in accept() (e.g. the client errored before connecting),
+        // then join so the thread has fully exited.
+        self.server.deinit(std.testing.io);
         self.thread.join();
     }
 
@@ -116,10 +127,12 @@ const TestHttpServer = struct {
     }
 
     /// Thread function: accept one connection, write the fixed HTTP response, close.
-    /// The server is passed by value; this function takes ownership and calls deinit().
+    /// `srv` is a by-value copy of the listener used only to accept; the thread
+    /// must NOT deinit it (the listener is owned and closed by `stop()`). An
+    /// accept() error (e.g. the listener closed during shutdown) is the normal
+    /// shutdown path — the thread just returns cleanly.
     fn serveOne(srv: std.Io.net.Server, body: []const u8, status_code: u16) void {
         var server = srv;
-        defer server.deinit(std.testing.io);
 
         const stream = server.accept(std.testing.io) catch return;
         defer stream.close(std.testing.io);
