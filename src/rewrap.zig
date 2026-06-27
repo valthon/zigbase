@@ -31,7 +31,10 @@ pub const Error = error{
     /// A stored cell could not be decrypted with the configured key generations.
     /// Details (collection.field rowid version) are logged before returning.
     RewrapDecryptFailed,
-} || db.DbError || std.mem.Allocator.Error;
+    // `collections.EngineError` (which already includes `db.DbError` and
+    // `std.mem.Allocator.Error`) is unioned in so enumerating the collection store
+    // propagates its real error type instead of being masked.
+} || collections.EngineError;
 
 /// Per-column outcome.
 pub const ColStats = struct {
@@ -103,7 +106,12 @@ pub fn rewrapColumn(
             var plaintext: []const u8 = undefined;
             if (ver != null) {
                 // Older-generation envelope: decrypt with that generation's key.
-                plaintext = cipher.open(arena, stored) catch {
+                plaintext = cipher.open(arena, stored) catch |err| {
+                    // `aead.Error` includes `OutOfMemory`; re-raise it as-is so an
+                    // allocation failure is not misreported as a decrypt (bad-key) error.
+                    // (Return the narrowed literal — `return err` would carry the whole
+                    // aead error set, incl. BadEnvelope, which is not in `Error`.)
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
                     if (failure) |fp| fp.* = .{ .table = table, .column = col, .rowid = rowid, .version = ver.? };
                     return error.RewrapDecryptFailed;
                 };
@@ -119,7 +127,9 @@ pub fn rewrapColumn(
         }
     }
 
-    if (dry_run) return stats;
+    // Nothing to write: dry-run, or every cell was already at the primary version
+    // (the common idempotent-rerun path). Skip preparing the UPDATE statement.
+    if (dry_run or updates.items.len == 0) return stats;
 
     const upd = try std.fmt.allocPrintSentinel(arena, "UPDATE {s} SET {s}=?1 WHERE rowid=?2;", .{ tq, cq }, 0);
     var ustmt = try w.prepare(upd);
@@ -148,7 +158,7 @@ pub fn rewrapAll(
     defer list_arena.deinit();
     const cols = collections.list(list_arena.allocator(), w) catch |e| {
         std.log.err("rewrap: could not list collections: {s}", .{@errorName(e)});
-        return error.RewrapDecryptFailed;
+        return e;
     };
 
     for (cols) |c| {
@@ -174,10 +184,16 @@ pub fn rewrapAll(
             defer col_arena.deinit();
             var failure: Failure = .{};
             const cs = rewrapColumn(col_arena.allocator(), w, cipher, c.name, f.name, dry_run, &failure) catch |e| {
-                if (e == error.RewrapDecryptFailed) std.log.err(
-                    "rewrap: cannot decrypt {s}.{s} rowid={d} (envelope v{d}: missing generation key, wrong key, or tampered) — aborting, no rows changed in this collection",
-                    .{ failure.table, failure.column, failure.rowid, failure.version },
-                );
+                if (e == error.RewrapDecryptFailed) {
+                    std.log.err(
+                        "rewrap: cannot decrypt {s}.{s} rowid={d} (envelope v{d}: missing generation key, wrong key, or tampered) — aborting, no rows changed in this collection",
+                        .{ failure.table, failure.column, failure.rowid, failure.version },
+                    );
+                    std.log.err(
+                        "rewrap: configure the missing generation key (ZIGBASE_FIELD_KEY_V{d}) and re-run — rewrap is idempotent, so already-committed collections are not redone",
+                        .{failure.version},
+                    );
+                }
                 return e;
             };
             stats.rewrapped += cs.rewrapped;
@@ -292,6 +308,36 @@ test "rewrapColumn is idempotent: a second pass skips everything" {
     try std.testing.expectEqual(@as(usize, 2), second.skipped);
     try std.testing.expectEqual(@as(usize, 0), second.rewrapped);
     try std.testing.expectEqual(@as(usize, 0), second.plaintext_migrated);
+}
+
+test "rewrapColumn no-op path: all cells already primary -> nothing written" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec("CREATE TABLE t (v TEXT);");
+
+    // Seed two cells already at the primary generation (v2).
+    const ring = rotatedRing();
+    var ins = try d.prepare("INSERT INTO t (v) VALUES (?1);");
+    try ins.bindText(1, try ring.seal(a, "alpha"));
+    _ = try ins.step();
+    ins.reset();
+    try ins.bindText(1, try ring.seal(a, "beta"));
+    _ = try ins.step();
+    ins.finalize();
+
+    // Capture the exact at-rest bytes so we can assert no UPDATE ran (no re-seal,
+    // which would change the nonce/ciphertext even though the version stays v2).
+    const before0 = try cellText(a, &d, "t", 1);
+    const before1 = try cellText(a, &d, "t", 2);
+
+    const cs = try rewrapColumn(a, &d, &ring, "t", "v", false, null);
+    try std.testing.expectEqual(@as(usize, 2), cs.skipped);
+    try std.testing.expectEqual(@as(usize, 0), cs.rewrapped + cs.plaintext_migrated);
+    try std.testing.expectEqualStrings(before0, try cellText(a, &d, "t", 1));
+    try std.testing.expectEqualStrings(before1, try cellText(a, &d, "t", 2));
 }
 
 test "rewrapColumn fails closed on an unknown generation (no rows changed)" {

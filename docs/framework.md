@@ -1370,6 +1370,11 @@ transaction rolled back — no data is lost. `--dry-run` reports counts without
 writing. Run it with the primary key plus every older generation present in your
 data configured.
 
+> Memory note: rewrap buffers a collection's rewritten cells in memory before
+> writing them back, so peak memory is O(rows) in the collection being processed.
+> This is fine for a one-off maintenance command on typical tables; chunked
+> rewrapping for very large encrypted tables is a possible future option.
+
 > Note: the envelope hides a value's *contents* but not its *length* — ciphertext
 > length is proportional to plaintext length. A single long-lived key suits typical
 > volumes; for very high write volumes, periodic key rotation is recommended.

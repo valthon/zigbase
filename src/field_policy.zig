@@ -80,6 +80,9 @@ pub const Cipher = struct {
     /// `get(key) ?[]const u8` method). Fail-closed config validation:
     ///   - `primary_gen` must be in 1..MAX_GENERATION (else `BadGeneration`).
     ///   - `ZIGBASE_FIELD_KEY_V<primary_gen>` set -> `GenerationConflict`.
+    /// An out-of-range `ZIGBASE_FIELD_KEY_V<M>` (M == 0 or M > MAX_GENERATION) is
+    /// ignored (no such generation exists), but a startup WARNING names it so a
+    /// typo like `V65` is not silently unused.
     pub fn resolve(io: std.Io, getter: anytype, field_key: []const u8, primary_gen: u16) ResolveError!Cipher {
         if (primary_gen < 1 or primary_gen > MAX_GENERATION) return error.BadGeneration;
         var c = Cipher{ .io = io, .primary_gen = primary_gen };
@@ -93,7 +96,23 @@ pub const Cipher = struct {
             if (g == primary_gen) return error.GenerationConflict;
             c.keys[g] = deriveGeneration(val, g);
         }
+        // Warn (don't fail) on a set-but-out-of-range generation env var so an
+        // operator typo isn't silently ignored. Probe V0 and a window just above
+        // MAX_GENERATION (covers the common 2-digit fat-finger like V65).
+        warnOutOfRange(getter, 0);
+        var bad: u16 = MAX_GENERATION + 1;
+        while (bad <= MAX_GENERATION + 36) : (bad += 1) warnOutOfRange(getter, bad);
         return c;
+    }
+
+    /// Emit a startup warning if `ZIGBASE_FIELD_KEY_V<gen>` is set for an
+    /// out-of-range generation (it will be ignored).
+    fn warnOutOfRange(getter: anytype, gen: u16) void {
+        var namebuf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&namebuf, "ZIGBASE_FIELD_KEY_V{d}", .{gen}) catch unreachable;
+        const val = getter.get(name) orelse return;
+        if (val.len == 0) return;
+        std.log.warn("{s} is set but generation {d} is out of range (valid generations are 1..{d}); it is IGNORED — check for a typo", .{ name, gen, MAX_GENERATION });
     }
 
     /// Seal a storage string into a `v<primary>:` envelope under the primary key.
