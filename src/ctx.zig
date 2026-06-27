@@ -527,6 +527,7 @@ test "errorResponse maps known errors to status codes, unknown to 500" {
     try std.testing.expectEqual(@as(u16, 403), ctx.errorResponse(error.Forbidden).status);
     try std.testing.expectEqual(@as(u16, 400), ctx.errorResponse(error.BadRequest).status);
     try std.testing.expectEqual(@as(u16, 409), ctx.errorResponse(error.Conflict).status);
+    try std.testing.expectEqual(@as(u16, 401), ctx.errorResponse(error.Unauthorized).status);
     try std.testing.expectEqual(@as(u16, 500), ctx.errorResponse(error.SomethingWeird).status);
 
     // ctx.fail stashes a custom message that errorResponse(error.Handled) renders.
@@ -562,6 +563,38 @@ test "ctx.records expand nests the related record under \"expand\"" {
     const post = (try ctx.records().get("posts", post_id, .{ .expand = "author" })).?;
     const exp = post.object.get("expand").?.object;
     try std.testing.expectEqualStrings("Ada", exp.get("author").?.object.get("name").?.string);
+}
+
+test "ctx.records list expand nests the related record under \"expand\" for each item" {
+    const env = try CtxTestEnv.initWithRelation();
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const d = Data{ .app = &env.app, .conn = w, .io = env.app.io, .alloc = a };
+        var ao: std.json.ObjectMap = .empty;
+        try ao.put(a, "name", .{ .string = "Grace" });
+        const author = try d.create("authors", .{ .object = ao });
+        const aid = try a.dupe(u8, author.object.get("id").?.string);
+        inline for (.{ "Post One", "Post Two" }) |title| {
+            var po: std.json.ObjectMap = .empty;
+            try po.put(a, "title", .{ .string = title });
+            try po.put(a, "author", .{ .string = aid });
+            _ = try d.create("posts", .{ .object = po });
+        }
+    }
+
+    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    defer ctx.deinit();
+
+    const page = try ctx.records().list("posts", .{ .expand = "author" });
+    try std.testing.expect(page.items.len >= 2);
+    for (page.items) |item| {
+        const exp = item.object.get("expand").?.object;
+        try std.testing.expectEqualStrings("Grace", exp.get("author").?.object.get("name").?.string);
+    }
 }
 
 fn txnTwoInserts(t: *Tx) anyerror!void {
