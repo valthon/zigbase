@@ -1151,6 +1151,10 @@ encrypted".
 single key; the format is designed so a future generation can be added (reads
 dispatch on the prefix, writes use the primary) with a lazy/rewrap forward path.
 
+> Note: the envelope hides a value's *contents* but not its *length* — ciphertext
+> length is proportional to plaintext length. A single long-lived key suits typical
+> volumes; for very high write volumes, periodic `v<N>:` key rotation is recommended.
+
 ### Startup provisioning + additive auto-migration
 
 On every startup, ZigBase diffs each declared collection against the live database

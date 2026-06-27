@@ -12,6 +12,7 @@ const ApiError = @import("error.zig").ApiError;
 const FieldError = @import("error.zig").FieldError;
 const secrets = @import("../oauth/secrets.zig");
 const oauth_api = @import("oauth.zig");
+const field_policy = @import("../field_policy.zig");
 
 /// Encrypt any plaintext clientSecret, validate provider endpoints (resolvable + https), and
 /// (on update) preserve a stored secret when the incoming one is empty. Mutates `def.options`.
@@ -84,6 +85,11 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
         return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
+    // Fail-closed: can't create an encrypted field with no field key configured
+    // (the startup guard only inspects comptime collections). Without this, an
+    // encrypted field created at runtime would be unwritable / leak intent.
+    if (schema.hasEncryptedField(def) and app.pool.field_cipher == null)
+        return ApiError.badRequest("Encrypted fields require ZIGBASE_FIELD_KEY to be configured.").toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     var def_mut = def;
@@ -113,6 +119,8 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
         return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
+    if (schema.hasEncryptedField(def) and app.pool.field_cipher == null)
+        return ApiError.badRequest("Encrypted fields require ZIGBASE_FIELD_KEY to be configured.").toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const existing = collections.get(ctx.allocator, w, key) catch null;
@@ -210,6 +218,74 @@ test "create then get then list a collection over handlers" {
     const lres = try list(&lctx);
     try std.testing.expectEqual(@as(u16, 200), lres.status);
     try std.testing.expect(std.mem.indexOf(u8, lres.body, "\"posts\"") != null);
+}
+
+test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+
+    // (4) No field key configured (pool.field_cipher == null): an encrypted field is
+    // rejected BEFORE anything is stored — closes the startup-guard gap for the
+    // runtime collections API.
+    {
+        const body =
+            \\{"name":"vault","fields":[{"id":"","name":"secret","type":"text","encrypted":true,"options":{}}]}
+        ;
+        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        cctx.authorization = auth_hdr;
+        const res = try create(&cctx);
+        try std.testing.expectEqual(@as(u16, 400), res.status);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, "ZIGBASE_FIELD_KEY") != null);
+    }
+
+    // Configure a field key so the remaining cases reach schema validation.
+    var cipher = field_policy.Cipher.fromEnv(std.testing.io, "runtime-test-field-key");
+    env.pool.field_cipher = @ptrCast(&cipher);
+
+    // (1) .encrypted on a NON-STRING type (number) is rejected — without this fix it
+    // would be SILENTLY STORED AS PLAINTEXT. Verify 400 AND that nothing was created.
+    {
+        const body =
+            \\{"name":"nums","fields":[{"id":"","name":"amount","type":"number","encrypted":true,"options":{}}]}
+        ;
+        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        cctx.authorization = auth_hdr;
+        const res = try create(&cctx);
+        try std.testing.expectEqual(@as(u16, 400), res.status);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_encrypted_type") != null);
+        // Nothing stored: the collection does not exist.
+        var gctx = ctxFor(env, a, .GET, "/api/collections/nums", "", &.{.{ .key = "idOrName", .value = "nums" }});
+        gctx.authorization = auth_hdr;
+        try std.testing.expectEqual(@as(u16, 404), (try get(&gctx)).status);
+    }
+
+    // (2) .encrypted + unique is rejected.
+    {
+        const body =
+            \\{"name":"u","fields":[{"id":"","name":"secret","type":"text","unique":true,"encrypted":true,"options":{}}]}
+        ;
+        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        cctx.authorization = auth_hdr;
+        const res = try create(&cctx);
+        try std.testing.expectEqual(@as(u16, 400), res.status);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_encrypted_unique") != null);
+    }
+
+    // (3) An index over an encrypted field is rejected.
+    {
+        const body =
+            \\{"name":"ix","fields":[{"id":"","name":"secret","type":"text","encrypted":true,"options":{}}],"indexes":[{"name":"idx_secret","fields":["secret"]}]}
+        ;
+        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        cctx.authorization = auth_hdr;
+        const res = try create(&cctx);
+        try std.testing.expectEqual(@as(u16, 400), res.status);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_encrypted_index") != null);
+    }
 }
 
 test "create with invalid name returns 400 with field errors" {

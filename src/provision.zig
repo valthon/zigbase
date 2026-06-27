@@ -291,7 +291,7 @@ fn buildField(comptime col_name: []const u8, comptime f: anytype) schema.Field {
         // plaintexts produce different ciphertexts). Index references are checked in
         // buildCollection once the full field list is known.
         if (field.encrypted) {
-            if (ftype != .text and ftype != .editor and ftype != .json)
+            if (!schema.isEncryptableType(ftype))
                 @compileError("field '" ++ fname ++ "' in collection '" ++ col_name ++ "': .encrypted is only supported on text/editor/json fields");
             if (field.unique)
                 @compileError("field '" ++ fname ++ "' in collection '" ++ col_name ++ "': an encrypted field cannot be .unique (encryption uses a per-row nonce, so a uniqueness constraint over ciphertext is meaningless)");

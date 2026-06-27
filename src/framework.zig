@@ -25,9 +25,7 @@ const field_policy = @import("field_policy.zig");
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
 fn anyEncryptedField(cols: []const schema.Collection) bool {
-    for (cols) |c| for (c.fields) |f| {
-        if (f.encrypted) return true;
-    };
+    for (cols) |c| if (schema.hasEncryptedField(c)) return true;
     return false;
 }
 

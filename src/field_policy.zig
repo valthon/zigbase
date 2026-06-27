@@ -34,12 +34,10 @@ pub const Cipher = struct {
     }
 };
 
-/// Field types whose storage representation is a plain string and may therefore
-/// carry an encryption envelope: text, editor, json. (email/url are excluded by
-/// decision; all other types use typed/relational storage and cannot be encrypted.)
-pub fn isEncryptableType(t: schema.FieldType) bool {
-    return t == .text or t == .editor or t == .json;
-}
+/// Field types that may carry an encryption envelope (text/editor/json). Single
+/// source of truth lives in schema.zig so the comptime guards, the runtime
+/// validator, and this value layer never drift.
+pub const isEncryptableType = schema.isEncryptableType;
 
 /// Seal a storage string (the text, or the stringified json) into a v1 envelope.
 pub fn seal(cipher: Cipher, alloc: std.mem.Allocator, plaintext: []const u8) std.mem.Allocator.Error![]u8 {
