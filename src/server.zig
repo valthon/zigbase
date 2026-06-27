@@ -190,17 +190,89 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
             var cx = Ctx{ .app = app, .arena = ctx.allocator, .rctx = rctx, .request = ctx, .bound_conn = null };
             defer cx.deinit();
             return rt.handler(&cx) catch |e| {
-                // Report every handler error to the consumer onError + Sentry/log backstop
-                // (preserves the pre-Ctx behaviour), then map it to a response via A1's
-                // Ctx.errorResponse (error.NotFound -> 404, error.Handled -> stashed, etc.)
-                // instead of the old always-500 mapping.
-                var err_ev = events.ErrorEvent{ .app = app, .ctx = &rctx, .err = e, .phase = .request, .message = @errorName(e) };
-                events.dispatchError(app, app.dispatch, &err_ev);
-                return cx.errorResponse(e);
+                // Map the error to a response via A1's Ctx.errorResponse (error.NotFound -> 404,
+                // error.Forbidden -> 403, error.Handled -> stashed status, etc.) instead of the
+                // old always-500 mapping. Only GENUINE server errors (mapped status >= 500) go to
+                // the consumer onError + Sentry/log backstop: a handler returning a deliberate 4xx
+                // (NotFound/Forbidden/ctx.fail) is ordinary client-error control flow, not an
+                // incident, so it must not emit a Sentry event.
+                const resp = cx.errorResponse(e);
+                if (resp.status >= 500) {
+                    var err_ev = events.ErrorEvent{ .app = app, .ctx = &rctx, .err = e, .phase = .request, .message = @errorName(e) };
+                    events.dispatchError(app, app.dispatch, &err_ev);
+                }
+                return resp;
             };
         }
     }
     return null;
+}
+
+test "dispatchCustom: deliberate 4xx is NOT reported to onError; genuine 5xx is" {
+    const db = @import("db.zig");
+    const App = app_mod.App;
+    const sentry = @import("sentry.zig");
+
+    const H = struct {
+        var on_error_calls: usize = 0;
+        // Untyped handler returning a client-error -> A1 maps to 404 (control flow, no incident).
+        fn notFound(cx: *Ctx) anyerror!http.Response {
+            _ = cx;
+            return error.NotFound;
+        }
+        // Untyped handler returning an unmapped error -> A1 maps to 500 (genuine server error).
+        fn boom(cx: *Ctx) anyerror!http.Response {
+            _ = cx;
+            return error.SomethingWeird;
+        }
+        fn onErr(ev: *events.ErrorEvent) void {
+            _ = ev;
+            on_error_calls += 1;
+        }
+    };
+    H.on_error_calls = 0;
+
+    // A file-backed pool so acquireReader() succeeds; the `.public` routes never query it
+    // (authenticate returns null with no token before touching the DB).
+    const ga = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+    defer ga.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+    defer ga.free(db_path);
+    var pool = try db.Pool.init(ga, std.testing.io, db_path);
+    defer pool.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(ga);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const route_table = [_]events.RuntimeRoute{
+        .{ .method = .GET, .pattern = "/api/nf", .handler = H.notFound, .auth = .public },
+        .{ .method = .GET, .pattern = "/api/boom", .handler = H.boom, .auth = .public },
+    };
+    const dispatch = events.Dispatch{ .routes = &route_table, .on_error = H.onErr };
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &pool, .dispatch = &dispatch };
+
+    // DSN-less backstop logs via std.log.err (which the test runner would count as a
+    // failure); route it to a no-op sink so dispatchError stays observable-but-silent.
+    sentry.log_sink = struct {
+        fn sink(_: []const u8) void {}
+    }.sink;
+    defer sentry.log_sink = null;
+
+    // 1. Deliberate 4xx: 404 response, onError NOT fired.
+    var nf_ctx = http.RequestCtx{ .method = .GET, .path = "/api/nf", .allocator = a, .app = &app };
+    const nf = (try dispatchCustom(&nf_ctx)).?;
+    try std.testing.expectEqual(@as(u16, 404), nf.status);
+    try std.testing.expectEqual(@as(usize, 0), H.on_error_calls);
+
+    // 2. Genuine 5xx: 500 response, onError fired exactly once.
+    var boom_ctx = http.RequestCtx{ .method = .GET, .path = "/api/boom", .allocator = a, .app = &app };
+    const boom = (try dispatchCustom(&boom_ctx)).?;
+    try std.testing.expectEqual(@as(u16, 500), boom.status);
+    try std.testing.expectEqual(@as(usize, 1), H.on_error_calls);
 }
 
 /// Parse a multipart/form-data body into ctx.form_fields/ctx.files.
