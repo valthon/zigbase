@@ -19,6 +19,7 @@ const method_mod = @import("../auth/method.zig");
 const ApiError = @import("error.zig").ApiError;
 const auth = @import("auth.zig");
 const records = @import("../records.zig");
+const ratelimit = @import("../ratelimit.zig");
 const Ctx = @import("../ctx.zig").Ctx;
 
 // ---------------------------------------------------------------------------
@@ -103,14 +104,21 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
     // 4. Rate-limit.
     const rl_opt = rateLimitOptFor(col, slug);
     switch (rl_opt) {
-        .off => {}, // disabled
-        .default, .custom => {
-            // TODO(M3): honor custom RateLimitOpt max/window_s with a per-method limiter; currently falls back to the global limiter.
-            // For .custom we fall back to the global limiter with the default scope;
-            // a dedicated per-method limiter is a later refinement (noted in report).
+        .off => {}, // disabled for this method
+        .default => {
+            // Unconfigured method: keep the prior behavior — the global/default
+            // limiter keyed by method slug (collection-agnostic, as before).
             const ident = identityFromBody(ctx);
             const scope = try std.fmt.allocPrint(ctx.allocator, "auth:{s}", .{slug});
             if (try auth.rateLimited(ctx, scope, ident)) |resp| return resp;
+        },
+        .custom => |c| {
+            // Per-method limiter: a dedicated bucket scoped by collection + method
+            // slug (so different methods/collections never share a budget), honoring
+            // this method's configured max/window_s instead of the global default.
+            const ident = identityFromBody(ctx);
+            const scope = try std.fmt.allocPrint(ctx.allocator, "authm:{s}:{s}", .{ col.name, slug });
+            if (try auth.rateLimitedCustom(ctx, scope, ident, c.max, c.window_s)) |resp| return resp;
         },
     }
 
@@ -580,4 +588,168 @@ test "methodEnabled: backward-compat and explicit opts" {
         .options = .{ .auth = .{ .oauth2 = .{ .enabled = false } } },
     };
     try std.testing.expect(!methodEnabled(auth_oauth2_disabled, "oauth2"));
+}
+
+// ---------------------------------------------------------------------------
+// Per-method rate limiting (M3): honor a method's custom RateLimitOpt
+// ---------------------------------------------------------------------------
+
+/// Create an auth collection whose `password` method carries a custom rate limit.
+/// The limit is persisted in the collection options and re-read by dispatch.
+fn createAuthColWithPwLimit(
+    env: *@import("auth.zig").TestEnv,
+    a: std.mem.Allocator,
+    name: []const u8,
+    max: u32,
+    window_s: i64,
+) !void {
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    _ = try collections.create(a, std.testing.io, w, .{
+        .id = "",
+        .name = name,
+        .type = .auth,
+        .fields = &[_]schema.Field{},
+        .listRule = "",
+        .viewRule = "",
+        .createRule = "",
+        .updateRule = "",
+        .deleteRule = "",
+        .options = .{ .auth = .{ .methods = .{
+            .password = .{ .rate_limit = .{ .custom = .{ .max = max, .window_s = window_s } } },
+        } } },
+    });
+}
+
+/// Build a registry with the default (PasswordMethod) types and bind it to env.app.
+/// The caller keeps the returned `insts` alive (the Registry view points into it) and
+/// must call `registry_mod.deinit(types, insts)`.
+fn bindDefaultRegistry(
+    env: *@import("auth.zig").TestEnv,
+    comptime types: []const type,
+    insts: *registry_mod.Instances(types),
+    views: *[types.len]method_mod.AuthMethod,
+    reg: *registry_mod.Registry,
+) !void {
+    reg.* = try registry_mod.build(types, insts, views, std.testing.allocator, std.testing.io, .{});
+    env.app.auth_methods = @ptrCast(reg);
+}
+
+test "per-method rate limit: custom max rejects after the budget within the window" {
+    const api_auth = @import("auth.zig");
+    var env = try api_auth.TestEnv.initAuth("rl_users"); // base default collection (unused here)
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A long window so all attempts land in one bucket regardless of wall clock.
+    try createAuthColWithPwLimit(env, a, "rl_strict", 2, 3600);
+
+    const types = comptime registry_mod.assembleTypes(.{});
+    var insts: registry_mod.Instances(types) = undefined;
+    var views: [types.len]method_mod.AuthMethod = undefined;
+    var reg: registry_mod.Registry = undefined;
+    try bindDefaultRegistry(env, types, &insts, &views, &reg);
+    defer registry_mod.deinit(types, &insts);
+
+    // Wire a shared limiter store (global default off: max=0). Per-method limit must
+    // still apply against this store.
+    var rl = ratelimit.RateLimiter.init(std.testing.allocator, 0, 60);
+    defer rl.deinit();
+    env.app.rate_limiter = &rl;
+
+    const params = [_]http.Param{
+        .{ .key = "col", .value = "rl_strict" },
+        .{ .key = "method", .value = "password" },
+    };
+    // No such user => method returns 400; the rate-limit gate runs BEFORE the method.
+    const body = "{\"identity\":\"nobody@x.io\",\"password\":\"whatever123\"}";
+
+    var c1 = env.ctx(a, .POST, body, &params);
+    try std.testing.expectEqual(@as(u16, 400), (try complete(&c1)).status);
+    var c2 = env.ctx(a, .POST, body, &params);
+    try std.testing.expectEqual(@as(u16, 400), (try complete(&c2)).status);
+    // 3rd attempt within the window exceeds max=2 => 429.
+    var c3 = env.ctx(a, .POST, body, &params);
+    try std.testing.expectEqual(@as(u16, 429), (try complete(&c3)).status);
+}
+
+test "per-method rate limit: different collections do not share a bucket" {
+    const api_auth = @import("auth.zig");
+    var env = try api_auth.TestEnv.initAuth("rl_users2");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try createAuthColWithPwLimit(env, a, "rl_a", 1, 3600);
+    try createAuthColWithPwLimit(env, a, "rl_b", 1, 3600);
+
+    const types = comptime registry_mod.assembleTypes(.{});
+    var insts: registry_mod.Instances(types) = undefined;
+    var views: [types.len]method_mod.AuthMethod = undefined;
+    var reg: registry_mod.Registry = undefined;
+    try bindDefaultRegistry(env, types, &insts, &views, &reg);
+    defer registry_mod.deinit(types, &insts);
+
+    var rl = ratelimit.RateLimiter.init(std.testing.allocator, 0, 60);
+    defer rl.deinit();
+    env.app.rate_limiter = &rl;
+
+    const body = "{\"identity\":\"nobody@x.io\",\"password\":\"whatever123\"}";
+    const params_a = [_]http.Param{
+        .{ .key = "col", .value = "rl_a" },
+        .{ .key = "method", .value = "password" },
+    };
+    const params_b = [_]http.Param{
+        .{ .key = "col", .value = "rl_b" },
+        .{ .key = "method", .value = "password" },
+    };
+
+    // Exhaust collection A's budget (max=1): 1st OK-ish (400), 2nd => 429.
+    var a1 = env.ctx(a, .POST, body, &params_a);
+    try std.testing.expectEqual(@as(u16, 400), (try complete(&a1)).status);
+    var a2 = env.ctx(a, .POST, body, &params_a);
+    try std.testing.expectEqual(@as(u16, 429), (try complete(&a2)).status);
+
+    // Collection B has its own bucket: its first attempt must NOT be rate limited.
+    var b1 = env.ctx(a, .POST, body, &params_b);
+    try std.testing.expectEqual(@as(u16, 400), (try complete(&b1)).status);
+}
+
+test "unconfigured method uses the global/default limiter (no regression)" {
+    const api_auth = @import("auth.zig");
+    // Default users collection => password rate_limit is .default.
+    var env = try api_auth.TestEnv.initAuth("rl_default");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const types = comptime registry_mod.assembleTypes(.{});
+    var insts: registry_mod.Instances(types) = undefined;
+    var views: [types.len]method_mod.AuthMethod = undefined;
+    var reg: registry_mod.Registry = undefined;
+    try bindDefaultRegistry(env, types, &insts, &views, &reg);
+    defer registry_mod.deinit(types, &insts);
+
+    // Global limiter active (max=2). A .default method must be limited by it.
+    var rl = ratelimit.RateLimiter.init(std.testing.allocator, 2, 3600);
+    defer rl.deinit();
+    env.app.rate_limiter = &rl;
+
+    const params = [_]http.Param{
+        .{ .key = "col", .value = "rl_default" },
+        .{ .key = "method", .value = "password" },
+    };
+    const body = "{\"identity\":\"nobody@x.io\",\"password\":\"whatever123\"}";
+
+    var d1 = env.ctx(a, .POST, body, &params);
+    try std.testing.expectEqual(@as(u16, 400), (try complete(&d1)).status);
+    var d2 = env.ctx(a, .POST, body, &params);
+    try std.testing.expectEqual(@as(u16, 400), (try complete(&d2)).status);
+    // 3rd exceeds the GLOBAL max=2 (proves the default path still routes through it).
+    var d3 = env.ctx(a, .POST, body, &params);
+    try std.testing.expectEqual(@as(u16, 429), (try complete(&d3)).status);
 }

@@ -846,7 +846,7 @@ Each auth collection in `.collections` can declare a `.auth.methods` struct enab
 Each method accepts a `rate_limit` field:
 - `.default` — uses the global env-var rate-limiter (`ZIGBASE_RATE_LIMIT_MAX` / `ZIGBASE_RATE_LIMIT_WINDOW`).
 - `.off` — disables rate-limiting for this method (logged at startup like a `@public` rule).
-- `.{ .custom = .{ .max = 5, .window_s = 60 } }` — per-method override.
+- `.{ .custom = .{ .max = 5, .window_s = 60 } }` — per-method override: the configured `max`/`window_s` are honored against a **dedicated bucket scoped by collection + method**, so different methods (and the same method on different collections) never share a budget. The bucket subject (client IP, else the submitted identity) matches the global limiter. A custom limit applies even when the global limiter is disabled (`ZIGBASE_RATE_LIMIT_MAX=0`).
 
 Example — two collections, each with different methods:
 
