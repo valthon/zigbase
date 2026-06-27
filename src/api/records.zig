@@ -12,6 +12,7 @@ const params_mod = @import("../query/params.zig");
 const expand_mod = @import("../query/expand.zig");
 const rules = @import("../rules.zig");
 const request = @import("../request.zig");
+const Ctx = @import("../ctx.zig").Ctx;
 const auth = @import("../auth.zig");
 const realtime_ws = @import("../realtime/ws.zig");
 const file_plan = @import("../files/plan.zig");
@@ -40,16 +41,21 @@ pub fn emitRecord(
     var ev = events.RecordEvent{
         .app = app,
         .ctx = rctx,
-        .data = .{ .app = app, .conn = conn, .io = app.io },
         .arena = arena,
         .collection = col_name,
         .record = value,
         .phase = phase,
     };
+    // The hook's capabilities (`ctx.records()`) ride on a Ctx bound to the triggering
+    // write's IN-TRANSACTION connection (A2): a before-hook side-write reuses the txn and
+    // commits/rolls back atomically with the primary write — never re-acquiring the pool
+    // writer (which would deadlock, since the handler already holds it).
+    var ctx = Ctx{ .app = app, .arena = arena, .rctx = rctx.*, .bound_conn = conn };
+    defer ctx.deinit();
     if (is_before) {
-        try handler(&ev);
+        try handler(&ctx, &ev);
     } else {
-        handler(&ev) catch |e| {
+        handler(&ctx, &ev) catch |e| {
             var err_ev = events.ErrorEvent{ .app = app, .ctx = rctx, .err = e, .phase = .after_hook, .message = @errorName(e) };
             events.dispatchError(app, app.dispatch, &err_ev);
         };
@@ -86,10 +92,10 @@ fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value) !http.Res
 fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) request.RequestContext {
     if (ctx.app) |app| {
         if (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null) |a| {
-            return .{ .auth = a.record, .is_superuser = a.is_superuser, .data = data, .method = @tagName(ctx.method) };
+            return .{ .auth = a.record, .is_superuser = a.is_superuser, .collection = a.collection, .data = data, .method = @tagName(ctx.method) };
         }
     }
-    return .{ .auth = null, .is_superuser = false, .data = data, .method = @tagName(ctx.method) };
+    return .{ .auth = null, .is_superuser = false, .collection = "", .data = data, .method = @tagName(ctx.method) };
 }
 
 fn forbidden(ctx: *http.RequestCtx) !http.Response {
@@ -205,28 +211,56 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
     const decision = rules.decide(col.createRule, &rctx);
     if (decision == .deny_locked) return forbidden(ctx);
+
+    // A2 KEYSTONE: the handler owns ONE write transaction spanning the before-hook,
+    // the row INSERT, and the access-rule guard. A hook side-write + the primary
+    // write commit atomically; a before-hook error (or a denied guard, or a storage
+    // failure) rolls the WHOLE thing back — fail closed. `errdefer` covers error
+    // returns; the catch-and-return-an-error-RESPONSE paths return a value (not an
+    // error), so each rolls back explicitly before returning.
+    try w.beginImmediate();
+    errdefer w.rollback() catch {};
+
     // A before-hook may `put` NEW keys, which reallocs the map header captured in this
     // local; downstream MUST read the `_mut` binding (here and for rec_mut/ur_mut/ex_mut
     // below), not the original const — the binding is the grow-capturing reference.
     var data_mut = data2;
-    emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_create) catch return hookRejected(ctx);
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_create) catch {
+        w.rollback() catch {};
+        return hookRejected(ctx);
+    };
     // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
     // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
-    const rec = (switch (decision) {
-        .deny_locked => unreachable,
-        .allow => records.create(ctx.allocator, app.io, w, col, data_mut),
-        .check => records.createGuarded(ctx.allocator, app.io, w, col, data_mut, try rules.compileGuard(ctx.allocator, w, col, col.createRule.?, &rctx)),
-    }) catch |e| switch (e) {
-        error.Validation => return validationResponse(ctx),
-        error.NotObject => return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator),
-        error.Forbidden => return forbidden(ctx),
-        else => return e,
+    const rec = records.createInTxn(ctx.allocator, app.io, w, col, data_mut) catch |e| switch (e) {
+        error.Validation => {
+            w.rollback() catch {};
+            return validationResponse(ctx);
+        },
+        error.NotObject => {
+            w.rollback() catch {};
+            return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator);
+        },
+        else => return e, // errdefer rolls back
     };
+    // Access-rule guard evaluated INSIDE the transaction:
+    // a denial rolls the INSERT back so a forbidden write never persists.
+    if (decision == .check) {
+        const guard = try rules.compileGuard(ctx.allocator, w, col, col.createRule.?, &rctx);
+        if (!try records.guardPasses(ctx.allocator, w, col, rec.object.get("id").?.string, guard)) {
+            w.rollback() catch {};
+            return forbidden(ctx);
+        }
+    }
     const rid = rec.object.get("id").?.string;
+    // File bytes are written before commit so a storage failure rolls the row back
+    // (via the explicit rollback below); on commit the files and the row are both durable.
     writeUploads(ctx, col, rid, all.writes, all.deletes) catch {
-        _ = records.delete(ctx.allocator, w, col, rid) catch {};
+        w.rollback() catch {};
         return ApiError.internal().toResponse(ctx.allocator);
     };
+    try w.commit();
+
+    // after-hooks and the realtime broadcast run AFTER commit (side effects).
     emitFileUploads(app, &rctx, col.name, rid, all.writes);
     var rec_mut = rec;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &rec_mut, .after_create) catch {};
@@ -257,8 +291,17 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
     const decision = rules.decide(col.updateRule, &rctx);
     if (decision == .deny_locked) return forbidden(ctx);
+
+    // A2 KEYSTONE: one transaction spanning the before-hook, the UPDATE, and the
+    // access-rule guard (see create() for the errdefer/explicit-rollback rationale).
+    try w.beginImmediate();
+    errdefer w.rollback() catch {};
+
     var data_mut = data2;
-    emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_update) catch return hookRejected(ctx);
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_update) catch {
+        w.rollback() catch {};
+        return hookRejected(ctx);
+    };
 
     // Write new file bytes BEFORE the DB update so a storage failure can't leave dangling refs.
     if (ctx.app.?.storage) |storage| {
@@ -266,6 +309,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         for (all.writes) |wr| {
             storage.put(app.io, col.name, rid, wr.filename, wr.bytes) catch {
                 for (all.writes[0..written]) |dw| storage.delete(app.io, col.name, rid, dw.filename) catch {};
+                w.rollback() catch {};
                 return ApiError.internal().toResponse(ctx.allocator);
             };
             written += 1;
@@ -274,20 +318,39 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
 
     // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
     // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
-    const updated = (switch (decision) {
-        .deny_locked => unreachable,
-        .allow => records.update(ctx.allocator, w, col, rid, data_mut),
-        .check => records.updateGuarded(ctx.allocator, w, col, rid, data_mut, try rules.compileGuard(ctx.allocator, w, col, col.updateRule.?, &rctx)),
-    }) catch |e| switch (e) {
-        error.Validation => return validationResponse(ctx),
-        error.NotObject => return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator),
-        error.Forbidden => return ApiError.notFound().toResponse(ctx.allocator),
-        else => return e,
+    const updated = records.updateInTxn(ctx.allocator, w, col, rid, data_mut) catch |e| switch (e) {
+        error.Validation => {
+            w.rollback() catch {};
+            // Files were written before the UPDATE (above); a validation failure must not
+            // leave them orphaned in storage (mirrors the not-found / guard-miss branches).
+            if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
+            return validationResponse(ctx);
+        },
+        error.NotObject => {
+            w.rollback() catch {};
+            if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
+            return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator);
+        },
+        else => return e, // errdefer rolls back
     };
     const ur = updated orelse {
+        w.rollback() catch {};
         if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
         return ApiError.notFound().toResponse(ctx.allocator);
     };
+    // Access-rule guard evaluated INSIDE the transaction on the UPDATED row:
+    // a denial rolls the UPDATE back. A guard miss maps to 404.
+    if (decision == .check) {
+        const guard = try rules.compileGuard(ctx.allocator, w, col, col.updateRule.?, &rctx);
+        if (!try records.guardPasses(ctx.allocator, w, col, rid, guard)) {
+            w.rollback() catch {};
+            if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
+            return ApiError.notFound().toResponse(ctx.allocator);
+        }
+    }
+    try w.commit();
+
+    // Side effects AFTER commit: drop replaced files, fire file/after-update hooks, broadcast.
     if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch {};
     emitFileUploads(app, &rctx, col.name, rid, all.writes);
     // Capture id BEFORE the after-hook so a hook that mutates/removes "id" can't panic the broadcast.
@@ -306,14 +369,29 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const existing = (try records.get(ctx.allocator, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rctx = buildContext(ctx, w, null);
+    // Gate FIRST (pre-delete authorization): the deleteRule is checked against the live
+    // row before the transaction opens — unchanged semantics.
     switch (rules.decide(col.deleteRule, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => {},
         .check => if (!try rules.matches(ctx.allocator, w, col, rid, col.deleteRule.?, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
     }
+
+    // A2 KEYSTONE: one transaction spanning the before-hook, the DELETE, and the auth
+    // _externalAuths cleanup, so a before-hook side-write + the delete commit atomically
+    // and a hook error rolls the whole thing back (see create() for the rollback rationale).
+    try w.beginImmediate();
+    errdefer w.rollback() catch {};
+
     var ex_mut = existing;
-    emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .before_delete) catch return hookRejected(ctx);
-    if (!try records.delete(ctx.allocator, w, col, rid)) return ApiError.notFound().toResponse(ctx.allocator);
+    emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .before_delete) catch {
+        w.rollback() catch {};
+        return hookRejected(ctx);
+    };
+    if (!try records.deleteInTxn(ctx.allocator, w, col, rid)) {
+        w.rollback() catch {};
+        return ApiError.notFound().toResponse(ctx.allocator);
+    }
     if (col.type == .auth) {
         var st = try w.prepare("DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
         defer st.finalize();
@@ -321,6 +399,9 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         try st.bindText(2, rid);
         _ = try st.step();
     }
+    try w.commit();
+
+    // Side effects AFTER commit.
     if (app.storage) |storage| storage.deleteRecord(app.io, col.name, rid) catch {};
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .after_delete) catch {};
     // F4: pass the deleted row's snapshot so subscribers to an owner/expression-scoped collection
@@ -1008,4 +1089,62 @@ test "creating an auth record without a password is a 400" {
     var cctx = ctxFor(env, a, .POST, "{\"email\":\"u@x.io\"}", &p);
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
+}
+
+// ---------------------------------------------------------------------------
+// A2 Task 5 (KEYSTONE): a `before_create` hook runs INSIDE the triggering
+// write's transaction. A hook that issues a side-write and then returns an
+// error must roll BOTH writes back — neither the primary row nor the hook's
+// side-write may survive. Under the pre-Task-5 ordering the before-hook ran
+// before the handler opened a transaction, so the side-write autocommitted and
+// the `audit` row survived (this test FAILS there) — proof the abort is atomic.
+// ---------------------------------------------------------------------------
+
+fn auditThenRejectHook(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+    if (ev.phase != .before_create) return;
+    if (!std.mem.eql(u8, ev.collection, "posts")) return; // act only on the primary write
+    // Side-write into `audit` on the hook's IN-TRANSACTION connection (ctx.bound_conn).
+    // We call records.create directly with ev.arena rather than ctx.records().create — the
+    // latter would allocate the throwaway record on app.allocator and trip the test's
+    // leak detector; the connection (and thus the shared transaction) is identical.
+    const conn = ctx.bound_conn.?;
+    const acol = (try collections.get(ev.arena, conn, "audit")) orelse return error.AuditMissing;
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(ev.arena, "title", .{ .string = "audit-side-write" });
+    _ = try records.create(ev.arena, ctx.app.io, conn, acol, .{ .object = obj });
+    return error.HookRejected;
+}
+
+fn countRows(env: *TestEnv, table: []const u8) !i64 {
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    const sql = try std.fmt.allocPrintSentinel(std.testing.allocator, "SELECT COUNT(*) FROM \"{s}\";", .{table}, 0);
+    defer std.testing.allocator.free(sql);
+    var st = try r.prepare(sql);
+    defer st.finalize();
+    _ = try st.step();
+    return st.columnInt(0);
+}
+
+test "before-hook side-write rolls back with the triggering write on hook error" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    // A second collection the hook writes into.
+    try seedRuled(env, "audit", "@public", "@public", "@public");
+
+    const disp = events.Dispatch{ .record = auditThenRejectHook };
+    env.app.dispatch = &disp;
+    defer env.app.dispatch = null;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    const res = try create(&cctx);
+
+    // The hook rejected the write -> 400, and BOTH writes rolled back atomically.
+    try std.testing.expectEqual(@as(u16, 400), res.status);
+    try std.testing.expectEqual(@as(i64, 0), try countRows(env, "posts"));
+    try std.testing.expectEqual(@as(i64, 0), try countRows(env, "audit"));
 }

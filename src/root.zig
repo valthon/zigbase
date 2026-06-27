@@ -6,7 +6,6 @@ pub const Runtime = @import("app.zig").App; // runtime app context struct
 pub const Config = @import("config.zig").Config;
 pub const Server = @import("server.zig").Server;
 pub const http = @import("http.zig");
-pub const Data = @import("data.zig").Data;
 pub const events = @import("events.zig");
 pub const schedule = @import("schedule.zig");
 // Pagination: the comptime `.pagination` config types + the cursor token-format selector,
@@ -15,7 +14,6 @@ pub const CursorToken = @import("pagination.zig").CursorToken;
 pub const PaginationConfig = @import("pagination.zig").Config;
 pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
-pub const RouteEvent = events.RouteEvent;
 pub const JobEvent = events.JobEvent; // cron/interval/reactive job + app.submit handlers
 pub const AuthEvent = events.AuthEvent;
 pub const AuthHandler = events.AuthHandler;
@@ -51,6 +49,19 @@ pub const Migration = @import("provision.zig").Migration;
 // Static files: the entry type of a build-generated embedded manifest (see
 // build.zig embedStaticDir) and of `.static_files = .{ .embedded = ... }`.
 pub const StaticFile = @import("static_files.zig").StaticFile;
+
+// ---- Ctx capability object -------------------------------------------------
+pub const Ctx = @import("ctx.zig").Ctx;
+
+// ---- General outbound HTTP client -----------------------------------------
+// HttpMethod/HttpHeader use the Http-prefix to avoid collision with http.zig's
+// Method/Header enums (which are already accessible via `zigbase.http.Method`).
+pub const HttpClient = @import("http_client.zig").HttpClient;
+pub const HttpMethod = @import("http_client.zig").Method;
+pub const HttpHeader = @import("http_client.zig").Header;
+pub const HttpResponse = @import("http_client.zig").HttpResponse;
+pub const HttpRequestOptions = @import("http_client.zig").RequestOptions;
+pub const HttpPostOptions = @import("http_client.zig").PostOptions;
 
 // ---- Auth helper surface (consumer-facing magic-link building blocks) ------
 pub const auth = @import("auth_helpers.zig");
@@ -184,4 +195,6 @@ test {
     _ = @import("api/webauthn_register.zig");
     _ = @import("clock.zig");
     _ = @import("clock_test.zig");
+    _ = @import("ctx.zig");
+    _ = @import("http_client.zig");
 }

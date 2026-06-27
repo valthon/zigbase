@@ -62,10 +62,10 @@ chain function:
 
 ```zig
 /// beforeCreate chain: slugify -> setAuthor -> computeReadingTime
-fn postsBeforeCreate(ev: *zigbase.RecordEvent) anyerror!void {
-    try slugify(ev);
-    try setAuthor(ev);
-    try computeReadingTime(ev);
+fn postsBeforeCreate(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    try slugify(ctx, ev);
+    try setAuthor(ctx, ev);
+    try computeReadingTime(ctx, ev);
 }
 ```
 
@@ -133,18 +133,19 @@ The `NOCASE` collation ensures `Bob@x.com` and `bob@x.com` are treated as the sa
 ## Custom route
 
 ```zig
-fn getPostBySlug(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const slug = ev.ctx.param("slug") orelse return .{ .status = 404, .body = "..." };
-    var r = try ev.reader();
-    defer r.deinit();
-    const result = try r.data().list("posts", .{
-        .filter = try std.fmt.allocPrint(ev.ctx.allocator,
-            "slug = '{s}' && status = 'published'", .{slug}),
-        .perPage = 1,
-    });
-    if (result.items.len == 0) return .{ .status = 404, .body = "..." };
-    const json = try std.json.Stringify.valueAlloc(ev.ctx.allocator, result.items[0], .{});
-    return .{ .status = 200, .body = json };
+// Typed route: `void` input, `std.json.Value` output (a dynamic record). The
+// thunk serializes the returned record to a 200 JSON body.
+fn getPostBySlug(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
+    const slug = req.param("slug") orelse return req.fail(404, "not found");
+    if (!isSafeSlug(slug)) return req.fail(400, "invalid slug");
+
+    // Read through the per-request capability object — `req.ctx.records()` manages
+    // the pooled connection itself (no manual acquireReader / Data wiring).
+    const filter = std.fmt.allocPrint(req.ctx.arena,
+        "slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
+    const result = req.ctx.records().list("posts", .{ .filter = filter, .perPage = 1 }) catch return error.RouteFailed;
+    if (result.items.len == 0) return error.NotFound;
+    return result.items[0];
 }
 ```
 

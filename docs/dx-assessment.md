@@ -32,8 +32,10 @@ full surface. The biggest wins of the design:
 - **The arena-vs-gpa footgun is well-guarded by docs and examples** — both hook
   examples use `ev.arena` correctly and explain why (`examples/blog/src/main.zig:16`,
   `examples/golfsim/src/main.zig:28`).
-- **RAII DB accessors** (`ev.writer()` / `ev.reader()`) make connection lifetime
-  explicit and leak-safe (`src/events.zig:38`–`88`).
+- **DB access is leak-safe by construction** — handlers reach the database through
+  `ctx.records()` (no connection lifetime to manage by hand); raw-SQL callers use
+  `ctx.app.pool.acquireWriter()` / `releaseWriter()` with an explicit paired release
+  (these superseded the older RAII `ev.writer()` / `ev.reader()` accessors).
 
 The friction is concentrated in **the cold-start path and surface discoverability**,
 not the runtime correctness:
@@ -144,8 +146,8 @@ Scale: **A** (ergonomic, discoverable, guarded) · **B** (good, minor papercut) 
 ordering (wildcard then specific) are documented (`framework.md:96`–`118`) and tested
 (`events.zig:340`). The arena footgun is the one real trap and it is *triple-guarded*:
 prose (`framework.md:145`), the slugify example (`blog/src/main.zig:30`,`:49`), and the
-recipe key-points (`recipes.md:402`). `ev.data` ops run on `app.allocator` (the gpa),
-not an arena (`data.zig:9`–`12`) — so a value returned from `ev.data.findById` is
+recipe key-points (`recipes.md:402`). `ctx.records()` ops run on `app.allocator` (the gpa),
+not an arena (`data.zig:9`–`12`) — so a value returned from `ctx.records().get` is
 gpa-allocated and the caller is responsible for it; this lifetime asymmetry vs. the
 arena-owned `ev.record` is subtle and only implied.
 
@@ -201,7 +203,7 @@ against it. Compile-error behaviors below were verified by editing a scratch con
 | # | Footgun | How likely | Guarded? | Evidence |
 |---|---|---|---|---|
 | 1 | Use `ev.app.allocator` instead of `ev.arena` for record mutation | Medium | **Soft** (docs/examples, not the compiler) | `framework.md:145`; `blog:16`,`:30`,`:49`; `events.zig:106` |
-| 2 | Rely on a `before*`-hook `ev.data` side-write being transactional with the main write | Medium | **Soft** (documented, not enforced) | `data.zig:14`–`18`; `framework.md:184`; `KNOWN_LIMITATIONS.md:10` |
+| 2 | Rely on a `before*`-hook `ctx.records()` side-write being transactional with the main write | Medium | **Soft** (documented, not enforced) | `data.zig:14`–`18`; `framework.md:184`; `KNOWN_LIMITATIONS.md:10` |
 | 3 | Typo a top-level `App` key (`.hook`) | High | **Hard** (compile error, names all valid keys) | verified ↓ |
 | 4 | Typo a hook phase (`.beforeCreat`) | High | **Hard** (compile error, lists the six phases) | verified ↓ |
 | 5 | Wrong-typed handler (RecordEvent fn in `.routes`) | Medium | **Hard** (compile error, expected-vs-found signature) | verified ↓ |
@@ -349,10 +351,10 @@ Severity reflects DX impact on a real integrator. **[FIXED]** = done in this PR;
 - **[FIXED] P3-a.** Re-anchored the `KNOWN_LIMITATIONS.md` prose: the header now reads
   "v0.3.0 ... tracked for future releases" and the trailing line "tracked for post-v0.1"
   → "tracked for upcoming releases".
-- **[FIXED] P3-b.** Documented the `ev.data` result-lifetime asymmetry in
-  `docs/framework.md` §4 (the `ev.data` facade): `findById` results are gpa-allocated
-  (per `data.zig`), **not** arena-scoped, so the arena rule applies only to data written
-  *into* `ev.record`.
+- **[FIXED] P3-b.** Documented the data-facade result-lifetime asymmetry in
+  `docs/framework.md` §4 (the facade was `ev.data` at the time, now `ctx.records()`):
+  `.get`/`findById` results are gpa-allocated (per `data.zig`), **not** arena-scoped, so
+  the arena rule applies only to data written *into* `ev.record`.
 
 ---
 
@@ -378,8 +380,9 @@ Severity reflects DX impact on a real integrator. **[FIXED]** = done in this PR;
 Docs/version (turn 1):
 - `README.md` — version `v0.2.0` → `v0.3.0`.
 - `KNOWN_LIMITATIONS.md` — version → `v0.3.0`; "post-v0.1" prose re-anchored.
-- `docs/framework.md` — "Reading the request (`ev.ctx`)" subsection; `ev.data`
-  result-lifetime note; `zigbase.JobEvent` shorthand; custom-`Storage` skeleton + S3
+- `docs/framework.md` — "Reading the request (`ev.ctx`)" subsection; data-facade
+  result-lifetime note (the facade was `ev.data` then, now `ctx.records()`);
+  `zigbase.JobEvent` shorthand; custom-`Storage` skeleton + S3
   pointer; plugin-contract compile-error note.
 - `docs/tutorial.md` — "4.5 Set up the project" embedding section; `zigbase.JobEvent`
   shorthand.

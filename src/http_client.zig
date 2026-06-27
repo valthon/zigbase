@@ -1,0 +1,275 @@
+const std = @import("std");
+
+pub const Method = enum { GET, POST, PUT, PATCH, DELETE };
+pub const Header = struct { name: []const u8, value: []const u8 };
+pub const HttpResponse = struct {
+    status: u16,
+    /// Response headers captured from the server reply.
+    ///
+    /// Each header's `name` and `value` are allocated on the `HttpClient.alloc`
+    /// allocator (duped from the connection buffer before it is torn down), so
+    /// the slice is valid for the lifetime of that allocator.  Standard headers
+    /// like `Content-Type`, `Location`, and `X-*` rate-limit headers are all
+    /// present here.
+    headers: []const Header,
+    body: []const u8,
+};
+
+/// Options for a generic HTTP request.
+///
+/// Note: `timeout_ms` is stored for caller intent but `std.http.Client` in
+/// Zig 0.16 does not expose a per-call timeout on the underlying socket. The
+/// field is preserved here so call-sites can express a desired timeout today;
+/// it will be wired up once the upstream API provides the hook.
+pub const RequestOptions = struct {
+    method: Method = .GET,
+    url: []const u8,
+    headers: []const Header = &.{},
+    body: ?[]const u8 = null,
+    timeout_ms: u32 = 10_000,
+    max_response_bytes: usize = 1 << 20,
+};
+
+pub const PostOptions = struct { headers: []const Header = &.{}, body: ?[]const u8 = null };
+
+/// Lightweight outbound HTTP client.
+///
+/// Create one per request (or reuse across requests sharing the same allocator).
+/// TLS certificate verification is ON by default via `std.http.Client`'s built-in
+/// bundle — do **not** disable it. Pass `io = std.testing.io` in unit tests.
+pub const HttpClient = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+
+    pub fn get(self: HttpClient, url: []const u8) !HttpResponse {
+        return self.request(.{ .method = .GET, .url = url });
+    }
+
+    pub fn post(self: HttpClient, url: []const u8, opts: PostOptions) !HttpResponse {
+        return self.request(.{
+            .method = .POST,
+            .url = url,
+            .headers = opts.headers,
+            .body = opts.body,
+        });
+    }
+
+    pub fn request(self: HttpClient, opts: RequestOptions) !HttpResponse {
+        var client = std.http.Client{ .allocator = self.alloc, .io = self.io };
+        defer client.deinit();
+
+        // Build extra request headers.
+        const extra = try self.alloc.alloc(std.http.Header, opts.headers.len);
+        for (opts.headers, 0..) |h, i| extra[i] = .{ .name = h.name, .value = h.value };
+
+        // Prepare the response body buffer (fixed-size, write-fails on overflow).
+        const resp_buf = try self.alloc.alloc(u8, opts.max_response_bytes);
+        var fw = std.Io.Writer.fixed(resp_buf);
+
+        // Use the lower-level std.http.Client.request() API (instead of the
+        // convenience fetch()) so we can iterate response headers from the
+        // parsed head before they are invalidated when we open the body reader.
+        const uri = std.Uri.parse(opts.url) catch return error.TransportFailed;
+        const method: std.http.Method = switch (opts.method) {
+            .GET => .GET,
+            .POST => .POST,
+            .PUT => .PUT,
+            .PATCH => .PATCH,
+            .DELETE => .DELETE,
+        };
+        // Mirror std.http.Client.fetch: follow up to 3 redirects for bodyless
+        // requests; leave redirect handling to the caller for requests with a body.
+        const redirect_behavior: std.http.Client.Request.RedirectBehavior =
+            if (opts.body == null) @enumFromInt(3) else .unhandled;
+
+        var req = client.request(method, uri, .{
+            .extra_headers = extra,
+            .redirect_behavior = redirect_behavior,
+        }) catch return error.TransportFailed;
+        defer req.deinit();
+
+        if (opts.body) |payload| {
+            req.transfer_encoding = .{ .content_length = payload.len };
+            var bw = req.sendBodyUnflushed(&.{}) catch return error.TransportFailed;
+            bw.writer.writeAll(payload) catch return error.TransportFailed;
+            bw.end() catch return error.TransportFailed;
+            req.connection.?.flush() catch return error.TransportFailed;
+        } else {
+            req.sendBodiless() catch return error.TransportFailed;
+        }
+
+        // RFC 9110 recommends 8 KiB redirect buffer.
+        const redirect_buffer = try self.alloc.alloc(u8, 8 * 1024);
+        var response = req.receiveHead(redirect_buffer) catch return error.TransportFailed;
+
+        // Capture response headers NOW, before readerDecompressing() calls
+        // head.invalidateStrings(), which zeroes out head.bytes and makes all
+        // string slices inside Head dangle.  We dupe each name+value onto
+        // self.alloc so they remain valid after the connection is torn down.
+        var header_list: std.ArrayList(Header) = .empty;
+        var it = response.head.iterateHeaders();
+        while (it.next()) |h| {
+            try header_list.append(self.alloc, .{
+                .name = try self.alloc.dupe(u8, h.name),
+                .value = try self.alloc.dupe(u8, h.value),
+            });
+        }
+        const captured_headers = try header_list.toOwnedSlice(self.alloc);
+
+        // Read and optionally decompress the response body (mirrors fetch()).
+        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+            .identity => &.{},
+            .zstd => try self.alloc.alloc(u8, std.compress.zstd.default_window_len),
+            .deflate, .gzip => try self.alloc.alloc(u8, std.compress.flate.max_window_len),
+            .compress => return error.TransportFailed,
+        };
+        var transfer_buffer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const body_reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+        _ = body_reader.streamRemaining(&fw) catch |err| switch (err) {
+            error.ReadFailed => return error.TransportFailed,
+            error.WriteFailed => return error.ResponseTooLarge,
+        };
+
+        // TLS certificate verification is on by default in std.http.Client;
+        // do not disable it here.
+        return .{
+            .status = @intFromEnum(response.head.status),
+            .headers = captured_headers,
+            .body = fw.buffered(),
+        };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Minimal loopback TCP server that serves exactly one fixed HTTP response.
+/// The listening socket is created (and its port resolved) before the server
+/// thread is spawned, so there is no race between the test issuing a request
+/// and the server being ready to accept.
+///
+/// The listener lives in this struct (NOT the thread). `stop()` closes the
+/// listener first to unblock a thread parked in `accept()`, then joins — so
+/// the test never deadlocks even if `client.get()` errors before connecting.
+/// The thread owns only the accepted stream.
+const TestHttpServer = struct {
+    thread: std.Thread,
+    server: std.Io.net.Server,
+    port: u16,
+
+    /// Start a server that emits `status_code` with `body` and no extra headers.
+    fn start(body: []const u8, status_code: u16) !TestHttpServer {
+        return startFull(body, status_code, "");
+    }
+
+    /// Start a server with additional response headers.
+    ///
+    /// `extra_headers` must be a pre-formatted CRLF-terminated header block,
+    /// e.g. `"X-Foo: bar\r\nX-Baz: qux\r\n"`.  The backing memory must be
+    /// valid for the lifetime of the server thread (string literals are fine).
+    fn startFull(body: []const u8, status_code: u16, extra_headers: []const u8) !TestHttpServer {
+        // Bind to 127.0.0.1:0 — the OS assigns an ephemeral port.
+        var addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var srv = try addr.listen(std.testing.io, .{});
+        errdefer srv.deinit(std.testing.io);
+
+        // The resolved port is available immediately after listen().
+        const port = srv.socket.address.getPort();
+
+        // The thread receives a by-value copy of the listener purely to call
+        // accept() on the shared fd; it never deinits it. `stop()` owns the
+        // close of the listener (exactly once).
+        const thread = try std.Thread.spawn(.{}, serveOne, .{ srv, body, status_code, extra_headers });
+        return .{ .thread = thread, .server = srv, .port = port };
+    }
+
+    fn stop(self: *TestHttpServer) void {
+        // Close the listener first: this unblocks the thread if it is still
+        // parked in accept() (e.g. the client errored before connecting),
+        // then join so the thread has fully exited.
+        self.server.deinit(std.testing.io);
+        self.thread.join();
+    }
+
+    fn url(self: TestHttpServer, alloc: std.mem.Allocator) ![]const u8 {
+        return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/", .{self.port});
+    }
+
+    /// Thread function: accept one connection, write the fixed HTTP response, close.
+    /// `srv` is a by-value copy of the listener used only to accept; the thread
+    /// must NOT deinit it (the listener is owned and closed by `stop()`). An
+    /// accept() error (e.g. the listener closed during shutdown) is the normal
+    /// shutdown path — the thread just returns cleanly.
+    fn serveOne(srv: std.Io.net.Server, body: []const u8, status_code: u16, extra_headers: []const u8) void {
+        var server = srv;
+
+        const stream = server.accept(std.testing.io) catch return;
+        defer stream.close(std.testing.io);
+
+        // Drain the incoming request headers so the client does not see a
+        // connection reset while it is still writing (even though for a small
+        // GET this is usually fine, draining makes the fixture robust).
+        var read_buf: [4096]u8 = undefined;
+        var r = stream.reader(std.testing.io, &read_buf);
+        var total: usize = 0;
+        while (total < read_buf.len) {
+            // peek(total + 1) tries to fill at least one more byte into the
+            // internal buffer; on EndOfStream it returns what is available.
+            const data = r.interface.peek(total + 1) catch break;
+            total = data.len;
+            if (std.mem.indexOf(u8, data, "\r\n\r\n") != null) break;
+            if (total >= read_buf.len) break;
+        }
+
+        // Write the HTTP/1.1 response.  extra_headers is already CRLF-terminated
+        // (or empty), so it slots in before the blank line.
+        var write_buf: [4096]u8 = undefined;
+        var w = stream.writer(std.testing.io, &write_buf);
+        w.interface.print(
+            "HTTP/1.1 {d} OK\r\nContent-Length: {d}\r\n{s}Connection: close\r\n\r\n{s}",
+            .{ status_code, body.len, extra_headers, body },
+        ) catch return;
+        w.interface.flush() catch {};
+    }
+};
+
+test "HttpClient.get returns status and body from a loopback server" {
+    var server = try TestHttpServer.start("HELLO", 200);
+    defer server.stop();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const client = HttpClient{ .alloc = arena.allocator(), .io = std.testing.io };
+    const res = try client.get(try server.url(arena.allocator()));
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqualStrings("HELLO", res.body);
+}
+
+test "HttpClient.get captures response headers" {
+    // The server emits an X-Test header alongside the body.
+    var server = try TestHttpServer.startFull("WORLD", 200, "X-Test: hi\r\n");
+    defer server.stop();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const client = HttpClient{ .alloc = arena.allocator(), .io = std.testing.io };
+    const res = try client.get(try server.url(arena.allocator()));
+
+    // Status and body must still work.
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqualStrings("WORLD", res.body);
+
+    // Find the X-Test header and verify its value.
+    var found = false;
+    for (res.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "X-Test")) {
+            try std.testing.expectEqualStrings("hi", h.value);
+            found = true;
+        }
+    }
+    try std.testing.expect(found); // header must be present
+}

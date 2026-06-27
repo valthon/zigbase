@@ -831,18 +831,33 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .dispatch = dispatch,
         .rate_limiter = if (cfg.rate_limit_max == 0) null else &rate_limiter,
     };
+    const Ctx = @import("ctx.zig").Ctx;
+    // Each lifecycle hook gets a per-invocation arena owning any ctx.records()
+    // results, declared before cx so its deinit runs last (LIFO).
     if (dispatch.on_bootstrap) |h| {
         var ev = events.LifecycleEvent{ .app = &app };
-        h(&ev);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        defer cx.deinit();
+        h(&cx, &ev);
     }
     if (dispatch.on_before_serve) |h| {
         var ev = events.LifecycleEvent{ .app = &app };
-        h(&ev);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        defer cx.deinit();
+        h(&cx, &ev);
     }
     // before_terminate fires when listen() returns (graceful shutdown / error).
     defer if (dispatch.on_before_terminate) |h| {
         var ev = events.LifecycleEvent{ .app = &app };
-        h(&ev);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        defer cx.deinit();
+        h(&cx, &ev);
     };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
@@ -917,7 +932,8 @@ test "App(cfg) builds a record dispatcher only when hooks are present" {
     try std.testing.expect(Empty.dispatch.record == null);
 
     const H = struct {
-        fn f(ev: *@import("events.zig").RecordEvent) anyerror!void {
+        fn f(ctx: *@import("ctx.zig").Ctx, ev: *@import("events.zig").RecordEvent) anyerror!void {
+            _ = ctx;
             _ = ev;
         }
     };
@@ -946,7 +962,8 @@ test "App(.{}) has no routes and null lifecycle/auth/file handlers" {
 
 test "App(cfg) exposes the comptime job table and pool size" {
     const H = struct {
-        fn j(ev: *@import("events.zig").JobEvent) anyerror!void {
+        fn j(ctx: *@import("ctx.zig").Ctx, ev: *@import("events.zig").JobEvent) anyerror!void {
+            _ = ctx;
             _ = ev;
         }
     };

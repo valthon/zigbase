@@ -17,8 +17,9 @@
 //!   4. A custom route `GET /api/listings/:id/availability` that returns all
 //!      non-cancelled bookings for a listing so the frontend can render an
 //!      availability calendar.
-//!   5. A DB-touching interval cron job that opens a `Data` from the pool and
-//!      expires stale pending holds.
+//!   5. A DB-touching interval cron job that expires stale pending holds via the
+//!      `ctx.records()` capability object on the passed-in `*Ctx` (no manual
+//!      pool/Data wiring).
 //!   6. A trivial public smoke route `GET /api/golfsim/health`.
 //!   7. A file-upload logger `onFileUpload` that records every upload.
 //!   8. A validating `before_create` hook on `reviews` that stamps the author
@@ -47,12 +48,13 @@ const zigbase = @import("zigbase");
 // ---------------------------------------------------------------------------
 // 1. Computed + validating before_create hook on `bookings`.
 //
-//    Signature: fn(*zigbase.RecordEvent) anyerror!void. Returning an error
-//    REJECTS the write and surfaces as a 400 to the client. Record mutations
-//    MUST allocate with `ev.arena` (the request-scoped allocator that owns
-//    `ev.record`), never `ev.app.allocator`.
+//    Signature: fn(*zigbase.Ctx, *zigbase.RecordEvent) anyerror!void. Returning an
+//    error REJECTS the write and surfaces as a 400 to the client. DB access is via
+//    `ctx.records()` (bound to the triggering write's in-transaction connection).
+//    Record mutations MUST allocate with `ev.arena` (the request-scoped allocator
+//    that owns `ev.record`), never `ev.app.allocator`.
 // ---------------------------------------------------------------------------
-fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
+fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     if (ev.record.* != .object) return error.InvalidBooking;
     const rec = &ev.record.object;
 
@@ -70,7 +72,7 @@ fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
     // Read RELATED data through the curated facade: the listing must exist and be
     // bookable. `findById` returns null for both an unknown collection and a
     // missing record — either way the booking is invalid.
-    const listing = (try ev.data.findById("listings", listing_id)) orelse return error.ListingNotFound;
+    const listing = (try ctx.records().get("listings", listing_id, .{})) orelse return error.ListingNotFound;
     if (listing != .object) return error.ListingNotFound;
 
     // Only `published` listings may be booked.
@@ -93,7 +95,7 @@ fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
         "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing_id, ends_at, starts_at },
     );
-    const conflicts = try ev.data.list("bookings", .{ .filter = overlap_filter, .perPage = 1 });
+    const conflicts = try ctx.records().list("bookings", .{ .filter = overlap_filter, .perPage = 1 });
     // totalItems is optional (cursor mode may skip COUNT); offset mode always sets it.
     if ((conflicts.totalItems orelse 0) > 0) return error.TimeSlotConflict;
 
@@ -140,15 +142,12 @@ fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     // constraint already rejects anonymous callers, but we guard defensively).
     const caller_id = req.auth_id;
 
-    const app: *zigbase.Runtime = @ptrCast(@alignCast(req.app.?));
-
-    // Build a connection-bound Data facade on the pooled writer.
-    const conn = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = app, .conn = conn, .io = app.io };
+    // Read/write through the per-request capability object — `req.ctx.records()`
+    // manages the pooled connection itself (no manual acquireWriter / Data wiring).
+    const records = req.ctx.records();
 
     // Load the booking; 404 when it does not exist (or the collection is absent).
-    const existing = (data.findById("bookings", id) catch return error.RouteFailed) orelse return error.NotFound;
+    const existing = (records.get("bookings", id, .{}) catch return error.RouteFailed) orelse return error.NotFound;
     if (existing != .object) return error.NotFound;
 
     // Multi-hop owner check: booking.listing -> listings record -> simulator ->
@@ -158,14 +157,14 @@ fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
         .string => |s| s,
         else => return error.NotFound,
     };
-    const listing = (data.findById("listings", listing_id) catch return error.RouteFailed) orelse return error.NotFound;
+    const listing = (records.get("listings", listing_id, .{}) catch return error.RouteFailed) orelse return error.NotFound;
     if (listing != .object) return error.NotFound;
 
     const simulator_id = switch (listing.object.get("simulator") orelse return error.NotFound) {
         .string => |s| s,
         else => return error.NotFound,
     };
-    const simulator = (data.findById("simulators", simulator_id) catch return error.RouteFailed) orelse return error.NotFound;
+    const simulator = (records.get("simulators", simulator_id, .{}) catch return error.RouteFailed) orelse return error.NotFound;
     if (simulator != .object) return error.NotFound;
 
     const owner_id = switch (simulator.object.get("owner") orelse return error.NotFound) {
@@ -179,8 +178,8 @@ fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     // Flip status -> confirmed via a partial update (only the provided field is
     // written). Build the patch in the request arena.
     var patch: std.json.ObjectMap = .empty;
-    patch.put(req.arena.?, "status", .{ .string = "confirmed" }) catch return error.RouteFailed;
-    const updated = (data.update("bookings", id, .{ .object = patch }) catch return error.RouteFailed) orelse return error.NotFound;
+    patch.put(req.ctx.arena, "status", .{ .string = "confirmed" }) catch return error.RouteFailed;
+    const updated = (records.update("bookings", id, .{ .object = patch }) catch return error.RouteFailed) orelse return error.NotFound;
 
     // Return the updated record; the thunk serializes it as the 200 body.
     return updated;
@@ -200,14 +199,11 @@ fn cancelBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 
     const caller_id = req.auth_id;
 
-    const app: *zigbase.Runtime = @ptrCast(@alignCast(req.app.?));
-
-    const conn = app.pool.acquireWriter();
-    defer app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = app, .conn = conn, .io = app.io };
+    // Read/write through the per-request capability object.
+    const records = req.ctx.records();
 
     // Load the booking to verify ownership before mutating.
-    const existing = (data.findById("bookings", id) catch return error.RouteFailed) orelse return error.NotFound;
+    const existing = (records.get("bookings", id, .{}) catch return error.RouteFailed) orelse return error.NotFound;
     if (existing != .object) return error.NotFound;
 
     // Verify the caller is the booking's guest.
@@ -219,8 +215,8 @@ fn cancelBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 
     // Update status -> "cancelled".
     var patch: std.json.ObjectMap = .empty;
-    patch.put(req.arena.?, "status", .{ .string = "cancelled" }) catch return error.RouteFailed;
-    const updated = (data.update("bookings", id, .{ .object = patch }) catch return error.RouteFailed) orelse return error.NotFound;
+    patch.put(req.ctx.arena, "status", .{ .string = "cancelled" }) catch return error.RouteFailed;
+    const updated = (records.update("bookings", id, .{ .object = patch }) catch return error.RouteFailed) orelse return error.NotFound;
 
     // Return the updated record; the thunk serializes it as the 200 body.
     return updated;
@@ -240,47 +236,38 @@ fn listingAvailability(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Valu
     // crafted id cannot inject filter syntax.
     if (!isSafeId(id)) return req.fail(400, "Invalid listing id.");
 
-    const app: *zigbase.Runtime = @ptrCast(@alignCast(req.app.?));
-
-    // Acquire a pooled, read-only connection and build a reader-bound Data facade.
-    // `acquireReader` returns the connection by value; keep it in a local so its
-    // address is stable for `releaseReader(&conn)` and the Data facade.
-    var conn = app.pool.acquireReader() catch return error.RouteFailed;
-    defer app.pool.releaseReader(&conn);
-    const data = zigbase.Data{ .app = app, .conn = &conn, .io = app.io };
-
+    // Read through the per-request capability object — `req.ctx.records()` manages
+    // the pooled read connection itself (no manual acquireReader / Data wiring).
     const filter = std.fmt.allocPrint(
-        req.arena.?,
+        req.ctx.arena,
         "listing = \"{s}\" && status != \"cancelled\"",
         .{id},
     ) catch return error.RouteFailed;
-    const result = data.list("bookings", .{ .filter = filter, .perPage = 200 }) catch return error.RouteFailed;
+    const result = req.ctx.records().list("bookings", .{ .filter = filter, .perPage = 200 }) catch return error.RouteFailed;
 
     // Build the `{"items":[...]}` wrapper as a JSON Value; the thunk serializes it
     // to the 200 body (identical wire shape, including an empty array).
-    var arr = std.json.Array.init(req.arena.?);
+    var arr = std.json.Array.init(req.ctx.arena);
     for (result.items) |item| arr.append(item) catch return error.RouteFailed;
     var obj: std.json.ObjectMap = .empty;
-    obj.put(req.arena.?, "items", .{ .array = arr }) catch return error.RouteFailed;
+    obj.put(req.ctx.arena, "items", .{ .array = arr }) catch return error.RouteFailed;
     return .{ .object = obj };
 }
 
 // ---------------------------------------------------------------------------
 // 5. DB-touching interval cron job: expire stale pending holds.
 //
-//    Signature: fn(*zigbase.events.JobEvent) anyerror!void. The job builds a
-//    `Data` from the pool (acquire the writer, release on exit), lists stale
-//    pending bookings via a filter, and marks them cancelled.
+//    Signature: fn(*zigbase.Ctx, *zigbase.events.JobEvent) anyerror!void. The
+//    scheduler hands the job a `*Ctx` whose `records()` handle reads via a pooled
+//    reader and writes via the pool writer — replacing the manual
+//    `pool.acquireWriter()` + hand-built `Data` this job used to do. The framework
+//    owns the ctx lifetime and releases any lazily-acquired reader on exit.
 // ---------------------------------------------------------------------------
-fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
-    const conn = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = conn, .io = ev.app.io };
-
+fn expireHolds(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     // Holds that are still "pending" but whose slot already started are stale.
     // The filter language compares fields to a literal; `@now` is the current
     // server time. (No-op until the `bookings` collection exists.)
-    const stale = data.list("bookings", .{
+    const stale = ctx.records().list("bookings", .{
         .filter = "status = \"pending\" && starts_at < @now",
         .perPage = 200,
     }) catch |err| switch (err) {
@@ -299,7 +286,7 @@ fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
         var patch: std.json.ObjectMap = .empty;
         defer patch.deinit(ev.app.allocator);
         try patch.put(ev.app.allocator, "status", .{ .string = "cancelled" });
-        _ = data.update("bookings", id, .{ .object = patch }) catch continue;
+        _ = ctx.records().update("bookings", id, .{ .object = patch }) catch continue;
         expired += 1;
     }
     if (expired > 0) std.log.info("expire-holds: cancelled {d} stale hold(s)", .{expired});
@@ -320,15 +307,15 @@ fn health(req: *zigbase.Req(void)) zigbase.RouteError!HealthOut {
 // ---------------------------------------------------------------------------
 // 6b. Untyped route: GET /api/golfsim/calendar.ics
 //
-//    An UNTYPED handler — `fn(*RouteEvent) anyerror!http.Response` — owns the
+//    An UNTYPED handler — `fn(*Ctx) anyerror!http.Response` — owns the
 //    whole response, so it can return a non-JSON `content-type` that a typed
 //    `Req(_)`/`Output` route (always 200/204 JSON) cannot express. Untyped
 //    routes are deliberately left out of the generated `zb.rpc.*` client, so
 //    fetch this URL directly (e.g. subscribe to it from a calendar app). The
 //    body is a static literal, so it safely outlives the handler.
 // ---------------------------------------------------------------------------
-fn calendarFeed(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    _ = ev;
+fn calendarFeed(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    _ = ctx;
     const ics =
         \\BEGIN:VCALENDAR
         \\VERSION:2.0
@@ -358,7 +345,7 @@ fn logFileUpload(ev: *zigbase.events.FileEvent) void {
 // ---------------------------------------------------------------------------
 // 8. Validating before_create hook on `reviews`.
 //
-//    Signature: fn(*zigbase.RecordEvent) anyerror!void. Like `prepareBooking`,
+//    Signature: fn(*zigbase.Ctx, *zigbase.RecordEvent) anyerror!void. Like `prepareBooking`,
 //    record mutations MUST allocate with `ev.arena`. This hook (a) stamps the
 //    review's `author` from the authenticated identity (server-authoritative —
 //    a client cannot review *as* someone else), and (b) enforces the review
@@ -366,7 +353,7 @@ fn logFileUpload(ev: *zigbase.events.FileEvent) void {
 //    the guest), and is already `confirmed` (you can't review a pending hold or
 //    a session that never happened). Any violation returns an error -> HTTP 400.
 // ---------------------------------------------------------------------------
-fn prepareReview(ev: *zigbase.RecordEvent) anyerror!void {
+fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     if (ev.record.* != .object) return error.InvalidReview;
     const rec = &ev.record.object;
 
@@ -387,7 +374,7 @@ fn prepareReview(ev: *zigbase.RecordEvent) anyerror!void {
     const author = author_id orelse return error.Unauthenticated;
 
     // The referenced booking must exist (null = unknown collection or missing).
-    const booking = (try ev.data.findById("bookings", booking_id)) orelse return error.BookingNotFound;
+    const booking = (try ctx.records().get("bookings", booking_id, .{})) orelse return error.BookingNotFound;
     if (booking != .object) return error.BookingNotFound;
 
     // Gate 1: the booking must belong to THIS author (they were the guest).

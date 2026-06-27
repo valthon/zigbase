@@ -41,18 +41,28 @@ pub fn messageForError(e: RouteError) []const u8 {
 
 /// The typed request handed to a route handler. `Input` is the parsed body/query;
 /// `params` are path params; `auth_id` is the caller's id ("" when anonymous).
-/// `app`/`io` give DB access (same handles as RouteEvent today). `failure` is set by `fail`.
+/// DB and other capabilities are reached via `req.ctx` (`req.ctx.records()`,
+/// `req.ctx.http()`, `req.ctx.user()`, ...). `failure` is set by `fail`.
 pub fn Req(comptime InputT: type) type {
     return struct {
         const Self = @This();
         pub const Input = InputT;
+        // Lazy import: `ctx: *Ctx` is a pointer field, so Req's layout does not depend on
+        // Ctx's layout — this avoids the route_types <- events <- ctx import cycle becoming
+        // a comptime layout dependency.
+        const Ctx = @import("ctx.zig").Ctx;
 
         input: InputT,
         params: []const Param,
         auth_id: []const u8,
         failure: ?Failure = null,
-        // Runtime handles wired by the thunk (opaque here to keep route_types import-light;
-        // the thunk sets these from the RouteEvent). Untyped pointers avoid a framework import cycle.
+        /// The per-request capability object (DB/records, http client, auth identity, fail/tx).
+        /// Set by `makeThunk`; typed handlers reach capabilities via `req.ctx.records()`,
+        /// `req.ctx.http()`, `req.ctx.user()`, etc.
+        ctx: *Ctx,
+        // Legacy runtime handles, kept for the example apps (blog/golfsim) which still read
+        // `req.app.?`/`req.arena.?`. Sourced from `ctx` by the thunk; new code uses `req.ctx`.
+        // (Removal is deferred so this single-file task does not break the example builds.)
         app: ?*anyopaque = null,
         arena: ?std.mem.Allocator = null,
 
@@ -160,8 +170,8 @@ fn assertRepresentableField(comptime T: type, comptime route_name: []const u8, c
 }
 
 /// Wrap a typed handler `fn(*Req(I)) RouteError!O` into a RouteHandler thunk
-/// (`fn(*RouteEvent) anyerror!http.Response`). Comptime-specialized per handler.
-/// `events`/`http` are imported lazily inside the function bodies so the rest of
+/// (`fn(*Ctx) anyerror!http.Response`). Comptime-specialized per handler.
+/// `events`/`http`/`Ctx` are imported lazily inside the function so the rest of
 /// route_types.zig (Req/RouteError/reflection) stays free of the framework import
 /// cycle (events.zig imports route_types for Req/RouteError).
 pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
@@ -170,32 +180,33 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
         @compileError("route handler must return RouteError!Output, found a different error set: " ++ @typeName(HandlerErrorSet(H)));
     const In = HandlerInput(H);
     const Out = HandlerOutput(H);
-    const events = @import("events.zig");
     const http = @import("http.zig");
+    const Ctx = @import("ctx.zig").Ctx;
 
     const Thunk = struct {
-        fn run(ev: *events.RouteEvent) anyerror!http.Response {
-            const a = ev.ctx.allocator;
+        fn run(cx: *Ctx) anyerror!http.Response {
+            const a = cx.arena;
+            const rc = cx.request.?; // typed routes always run with an HTTP request
             // 1. Parse input (void -> skip; GET/DELETE -> query; else JSON body).
             // The GET query branch is gated behind a comptime `isQueryParseable(In)`
             // so that complex POST-body types (with nested slices, enums, optional
             // structs) don't instantiate `parseQuery` and hit its @compileError paths.
             const input: In = if (In == void) {} else blk: {
                 if (comptime isQueryParseable(In)) {
-                    if (ev.ctx.method == .GET or ev.ctx.method == .DELETE) {
-                        break :blk parseQuery(In, a, ev.ctx.query) catch
+                    if (rc.method == .GET or rc.method == .DELETE) {
+                        break :blk parseQuery(In, a, rc.query) catch
                             return badRequest(a, "Invalid query parameters.");
                     }
                 }
-                if (ev.ctx.body.len == 0) return badRequest(a, "Missing request body.");
-                break :blk (std.json.parseFromSlice(In, a, ev.ctx.body, .{ .ignore_unknown_fields = true }) catch
+                if (rc.body.len == 0) return badRequest(a, "Missing request body.");
+                break :blk (std.json.parseFromSlice(In, a, rc.body, .{ .ignore_unknown_fields = true }) catch
                     return badRequest(a, "Invalid JSON body.")).value;
             };
-            // 2. Build Req. Map RouteEvent params (http.Param) onto route_types.Param.
-            var params = try a.alloc(Param, ev.ctx.params.len);
-            for (ev.ctx.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
-            const auth_id = ev.rctx.resolveMacro("@request.auth.id") orelse "";
-            var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .app = ev.app, .arena = a };
+            // 2. Build Req. Map request params (http.Param) onto route_types.Param.
+            var params = try a.alloc(Param, rc.params.len);
+            for (rc.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
+            const auth_id = cx.rctx.resolveMacro("@request.auth.id") orelse "";
+            var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .ctx = cx, .app = cx.app, .arena = a };
             // 3. Call handler; map errors -> status+message.
             const out: Out = handler(&req) catch |e| {
                 if (req.failure) |f|
@@ -309,13 +320,16 @@ fn coerceQueryField(comptime F: type, a: std.mem.Allocator, raw: ?[]const u8) !F
 const testing = std.testing;
 
 test "Req carries typed input + records a custom failure" {
+    const Ctx = @import("ctx.zig").Ctx;
     const In = struct { note: []const u8 };
     var ctx_params = [_]Param{.{ .key = "id", .value = "abc" }};
+    var cx = Ctx{ .app = undefined, .arena = undefined, .rctx = .{} };
     var req = Req(In){
         .input = .{ .note = "hi" },
         .params = &ctx_params,
         .auth_id = "user1",
         .failure = null,
+        .ctx = &cx,
     };
     try testing.expectEqualStrings("hi", req.input.note);
     try testing.expectEqualStrings("abc", req.param("id").?);
@@ -389,7 +403,7 @@ test "isRepresentable rejects unsupported types" {
 
 test "makeThunk: parses input, serializes output (200)" {
     const http = @import("http.zig");
-    const events = @import("events.zig");
+    const Ctx = @import("ctx.zig").Ctx;
     const In = struct { guests: u32 };
     const Out = struct { id: []const u8, guests: u32, confirmed: bool };
     const H = struct {
@@ -413,8 +427,9 @@ test "makeThunk: parses input, serializes output (200)" {
         .params = &params,
     };
     const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
-    var ev = events.RouteEvent{ .app = undefined, .ctx = &ctx, .rctx = rctx };
-    const resp = try thunk(&ev);
+    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = rctx, .request = &ctx };
+    defer cx.deinit();
+    const resp = try thunk(&cx);
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"confirmed\":true") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"bk1\"") != null);
@@ -471,9 +486,39 @@ test "isQueryParseable: nested struct returns false; mixed flat struct returns t
     try testing.expect(isQueryParseable(void));
 }
 
+test "makeThunk wires req.ctx with app + arena" {
+    const http = @import("http.zig");
+    const Ctx = @import("ctx.zig").Ctx;
+    // Container-level statics capture what the handler observed via req.ctx.
+    const Observed = struct {
+        var ctx_ptr: ?*Ctx = null;
+        var arena_ptr: ?*anyopaque = null;
+    };
+    Observed.ctx_ptr = null;
+    Observed.arena_ptr = null;
+    const H = struct {
+        fn h(req: *Req(void)) RouteError!void {
+            Observed.ctx_ptr = req.ctx;
+            Observed.arena_ptr = req.ctx.arena.ptr;
+        }
+    }.h;
+    const thunk = makeThunk(H);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = arena.allocator() };
+    const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
+    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = rctx, .request = &ctx };
+    defer cx.deinit();
+    _ = try thunk(&cx);
+    // req.ctx points exactly at the Ctx the thunk received...
+    try testing.expect(Observed.ctx_ptr == &cx);
+    // ...and that Ctx's arena is the request arena.
+    try testing.expect(Observed.arena_ptr == arena.allocator().ptr);
+}
+
 test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
     const http = @import("http.zig");
-    const events = @import("events.zig");
+    const Ctx = @import("ctx.zig").Ctx;
     const H = struct {
         fn h(req: *Req(void)) RouteError!void {
             return req.fail(404, "Booking not found");
@@ -484,8 +529,9 @@ test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
     defer arena.deinit();
     var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = arena.allocator() };
     const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
-    var ev = events.RouteEvent{ .app = undefined, .ctx = &ctx, .rctx = rctx };
-    const resp = try thunk(&ev);
+    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = rctx, .request = &ctx };
+    defer cx.deinit();
+    const resp = try thunk(&cx);
     try testing.expectEqual(@as(u16, 404), resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "Booking not found") != null);
 }

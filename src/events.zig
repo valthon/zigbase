@@ -2,6 +2,7 @@ const std = @import("std");
 
 const App = @import("app.zig").App;
 const request = @import("request.zig");
+const Ctx = @import("ctx.zig").Ctx;
 const Data = @import("data.zig").Data;
 const db = @import("db.zig");
 const sentry = @import("sentry.zig");
@@ -12,12 +13,14 @@ const schema = @import("schema.zig");
 const route_types = @import("route_types.zig");
 
 // ---------------------------------------------------------------------------
-// RAII DB-access handles for the events that carry only `app` (RouteEvent,
-// JobEvent, LifecycleEvent). Unlike RecordEvent — whose `.data` is already bound
-// to the in-transaction writer for the triggering write — these events have no
-// ambient connection, so a handler that wants DB access must check one out of
-// the pool and (crucially) hand it back. These handles make that lifetime
-// explicit and leak-safe:
+// RAII DB-access handles for `RouteEvent` (the one app-only event that still
+// exposes raw writer()/reader()). JobEvent/LifecycleEvent get DB access through
+// the `*Ctx` parameter their handlers now receive (`ctx.records()`), which
+// lazily checks out a pooled connection and releases it on `ctx.deinit()`.
+// Unlike RecordEvent — whose ctx is bound to the in-transaction writer for the
+// triggering write — RouteEvent has no ambient connection, so a handler that
+// wants raw DB access must check one out of the pool and (crucially) hand it
+// back. These handles make that lifetime explicit and leak-safe:
 //
 //   var w = ev.writer();         // acquires the shared pool writer (mutex-guarded)
 //   defer w.deinit();            // releases it back to the pool — no leak
@@ -43,7 +46,7 @@ pub const WriterData = struct {
 
     /// A `Data` bound to the acquired writer connection. Valid until `deinit()`.
     pub fn data(self: *WriterData) Data {
-        return .{ .app = self.app, .conn = self.conn, .io = self.app.io };
+        return .{ .app = self.app, .conn = self.conn, .io = self.app.io, .alloc = self.app.allocator };
     }
 
     /// Release the writer back to the pool. Call exactly once (use `defer`).
@@ -64,7 +67,7 @@ pub const ReaderData = struct {
     /// returned `Data.conn` points at this handle's own (stable) `conn` field
     /// rather than a dangling stack copy; the handle must outlive the `Data`.
     pub fn data(self: *ReaderData) Data {
-        return .{ .app = self.app, .conn = &self.conn, .io = self.app.io };
+        return .{ .app = self.app, .conn = &self.conn, .io = self.app.io, .alloc = self.app.allocator };
     }
 
     /// Return the connection to the pool's warm reader set. Call exactly once
@@ -101,7 +104,6 @@ pub const RecordPhase = enum {
 pub const RecordEvent = struct {
     app: *App,
     ctx: *const request.RequestContext,
-    data: Data,
     /// Request-scoped allocator that owns `record`'s JSON storage. Hooks MUST use
     /// this (not `app.allocator`) for any allocation that becomes part of `record`,
     /// so growth is consistent with the map's backing and is freed with the request.
@@ -109,6 +111,9 @@ pub const RecordEvent = struct {
     collection: []const u8,
     record: *std.json.Value, // mutable in before_*; the persisted record in after_*
     phase: RecordPhase,
+    // DB capabilities are delivered to a record hook via its `*Ctx` parameter
+    // (`ctx.records()`), whose `bound_conn` is the triggering write's in-transaction
+    // connection — so a before-hook's side-write commits/rolls back atomically with it.
 };
 
 pub const ErrorPhase = enum { request, before_hook, after_hook, cron, job, file_serve };
@@ -121,7 +126,7 @@ pub const ErrorEvent = struct {
     message: []const u8,
 };
 
-pub const RecordHandler = *const fn (ev: *RecordEvent) anyerror!void;
+pub const RecordHandler = *const fn (ctx: *Ctx, ev: *RecordEvent) anyerror!void;
 pub const ErrorHandler = *const fn (ev: *ErrorEvent) void;
 
 pub const AuthLevel = enum { public, authed, superuser };
@@ -157,8 +162,9 @@ pub const RouteEvent = struct {
         defer w.deinit();
         return @import("auth_helpers.zig").issueSession(ev.ctx, w.conn, collection, record_id);
     }
+
 };
-pub const RouteHandler = *const fn (ev: *RouteEvent) anyerror!http.Response;
+pub const RouteHandler = *const fn (ctx: *Ctx) anyerror!http.Response;
 
 /// Re-exported for config code that needs to name the rate-limit callback type.
 pub const RateLimitFn = @import("auth_helpers.zig").RateLimitFn;
@@ -195,36 +201,21 @@ pub const FileUploadHandler = *const fn (ev: *FileEvent) void;
 
 pub const LifecycleEvent = struct {
     app: *App,
-
-    /// Acquire the pool writer for create/update/delete:
-    /// `var w = ev.writer(); defer w.deinit(); _ = try w.data().create(...);`.
-    pub fn writer(ev: *LifecycleEvent) WriterData {
-        return acquireWriter(ev.app);
-    }
-    /// Check out a pooled read-only connection for reads:
-    /// `var r = try ev.reader(); defer r.deinit(); _ = try r.data().findById(...);`.
-    pub fn reader(ev: *LifecycleEvent) db.DbError!ReaderData {
-        return acquireReader(ev.app);
-    }
 };
-pub const LifecycleHandler = *const fn (ev: *LifecycleEvent) void;
+/// Lifecycle handlers (onBootstrap/onBeforeServe/onBeforeTerminate) receive a
+/// `*Ctx` (built by the framework from `app`, anonymous rctx, no request) plus
+/// the event. DB access goes through `ctx.records()`.
+pub const LifecycleHandler = *const fn (ctx: *Ctx, ev: *LifecycleEvent) void;
 
 pub const JobEvent = struct {
     app: *App,
     name: []const u8,
-
-    /// Acquire the pool writer for create/update/delete:
-    /// `var w = ev.writer(); defer w.deinit(); _ = try w.data().create(...);`.
-    pub fn writer(ev: *JobEvent) WriterData {
-        return acquireWriter(ev.app);
-    }
-    /// Check out a pooled read-only connection for reads:
-    /// `var r = try ev.reader(); defer r.deinit(); _ = try r.data().findById(...);`.
-    pub fn reader(ev: *JobEvent) db.DbError!ReaderData {
-        return acquireReader(ev.app);
-    }
 };
-pub const JobTask = *const fn (ev: *JobEvent) anyerror!void;
+/// Cron/interval/reactive jobs and `app.submit` tasks receive a `*Ctx` (built by
+/// the scheduler per invocation from `app`, anonymous rctx, no request) plus the
+/// event. DB access goes through `ctx.records()`; the ctx lazily checks out a
+/// pooled connection and releases it on `ctx.deinit()`.
+pub const JobTask = *const fn (ctx: *Ctx, ev: *JobEvent) anyerror!void;
 
 /// `@compileError` on any route spec missing a required field (`.method`/`.path`/
 /// `.handler`), mirroring `validateHooks`. `.auth` and `.name` are optional (auth
@@ -242,7 +233,7 @@ fn validateRouteSpecs(comptime specs: anytype) void {
     }
 }
 
-/// True iff `H` is the UNTYPED route handler form `fn(*RouteEvent) anyerror!http.Response`.
+/// True iff `H` is the UNTYPED route handler form `fn(*Ctx) anyerror!http.Response`.
 /// Untyped handlers own the full response (status, cookies, content-type, redirect, raw
 /// body), so they are stored directly instead of being wrapped in a typed thunk. Anything
 /// else is treated as the typed form `fn(*Req(In)) RouteError!Out`.
@@ -260,7 +251,7 @@ pub fn isUntypedHandler(comptime H: type) bool {
     const p = f.params[0].type orelse return false;
     const pi = @typeInfo(p);
     if (pi != .pointer or pi.pointer.size != .one) return false;
-    return pi.pointer.child == RouteEvent;
+    return pi.pointer.child == Ctx;
 }
 
 /// Comptime route metadata for a typed route spec: the derived method name plus the
@@ -274,7 +265,7 @@ pub const RouteMeta = struct {
     auth: AuthLevel,
     Input: type,
     Output: type,
-    /// True for untyped `fn(*RouteEvent) anyerror!http.Response` handlers, which own the
+    /// True for untyped `fn(*Ctx) anyerror!http.Response` handlers, which own the
     /// raw response and contribute no typed RPC surface. The TS codegen skips these so it
     /// doesn't emit a client method that would mis-handle their non-JSON responses.
     untyped: bool = false,
@@ -474,7 +465,7 @@ fn validateHooks(comptime hooks: anytype) void {
 pub fn buildRecordDispatcher(comptime hooks: anytype) RecordHandler {
     comptime validateHooks(hooks);
     const Gen = struct {
-        fn dispatch(ev: *RecordEvent) anyerror!void {
+        fn dispatch(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
             // Pass 1: wildcard ("any") groups. Pass 2: collection-specific groups.
             inline for (.{ true, false }) |wildcard_pass| {
                 inline for (std.meta.fields(@TypeOf(hooks))) |group| {
@@ -489,7 +480,7 @@ pub fn buildRecordDispatcher(comptime hooks: anytype) RecordHandler {
                                 inline else => |p| {
                                     const fname = comptime phaseFieldName(p);
                                     if (@hasField(@TypeOf(g), fname)) {
-                                        try @field(g, fname)(ev);
+                                        try @field(g, fname)(ctx, ev);
                                     }
                                 },
                             }
@@ -505,11 +496,13 @@ pub fn buildRecordDispatcher(comptime hooks: anytype) RecordHandler {
 test "record dispatcher fires wildcard then specific, in order, and mutations stick" {
     const Trace = struct {
         var seq: std.ArrayListUnmanaged([]const u8) = .empty;
-        fn wild(ev: *RecordEvent) anyerror!void {
+        fn wild(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
+            _ = ctx;
             try seq.append(std.testing.allocator, "wild");
             try ev.record.object.put(std.testing.allocator, "touched", .{ .bool = true });
         }
-        fn specific(ev: *RecordEvent) anyerror!void {
+        fn specific(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
+            _ = ctx;
             try seq.append(std.testing.allocator, "specific");
             _ = ev;
         }
@@ -526,9 +519,11 @@ test "record dispatcher fires wildcard then specific, in order, and mutations st
     defer obj.deinit(std.testing.allocator);
     try obj.put(std.testing.allocator, "touched", .{ .bool = false });
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
+    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
+    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    defer ctx.deinit();
 
-    try dispatch(&ev);
+    try dispatch(&ctx, &ev);
     try std.testing.expectEqual(@as(usize, 2), Trace.seq.items.len);
     try std.testing.expectEqualStrings("wild", Trace.seq.items[0]);
     try std.testing.expectEqualStrings("specific", Trace.seq.items[1]);
@@ -537,7 +532,8 @@ test "record dispatcher fires wildcard then specific, in order, and mutations st
 
 test "before hook error aborts (propagates) and unrelated collection is skipped" {
     const H = struct {
-        fn boom(ev: *RecordEvent) anyerror!void {
+        fn boom(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
+            _ = ctx;
             _ = ev;
             return error.HookRejected;
         }
@@ -547,11 +543,13 @@ test "before hook error aborts (propagates) and unrelated collection is skipped"
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .arena = std.testing.allocator, .collection = "comments", .record = &rec, .phase = .before_create };
-    try dispatch(&ev); // "comments" not registered -> no-op, no error
+    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .arena = std.testing.allocator, .collection = "comments", .record = &rec, .phase = .before_create };
+    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    defer ctx.deinit();
+    try dispatch(&ctx, &ev); // "comments" not registered -> no-op, no error
 
     ev.collection = "posts";
-    try std.testing.expectError(error.HookRejected, dispatch(&ev));
+    try std.testing.expectError(error.HookRejected, dispatch(&ctx, &ev));
 }
 
 /// Route a framework-caught error: run the consumer onError handler (if any),
@@ -598,7 +596,8 @@ test "dispatchError runs consumer handler before the backstop" {
 test "only the matching phase's handler runs" {
     const H = struct {
         var after_calls: usize = 0;
-        fn onAfter(ev: *RecordEvent) anyerror!void {
+        fn onAfter(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
+            _ = ctx;
             _ = ev;
             after_calls += 1;
         }
@@ -608,11 +607,13 @@ test "only the matching phase's handler runs" {
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .data = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
-    try dispatch(&ev); // before_create fired, but only afterCreate is registered -> no call
+    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
+    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    defer ctx.deinit();
+    try dispatch(&ctx, &ev); // before_create fired, but only afterCreate is registered -> no call
     try std.testing.expectEqual(@as(usize, 0), H.after_calls);
     ev.phase = .after_create;
-    try dispatch(&ev);
+    try dispatch(&ctx, &ev);
     try std.testing.expectEqual(@as(usize, 1), H.after_calls);
 }
 
@@ -687,8 +688,8 @@ test "AuthMethod enumerates all method tags" {
 test "isUntypedHandler detects raw-response handlers and routeMeta flags them out of codegen" {
     const H = struct {
         // Untyped: owns the raw http.Response (cookies/redirect/non-JSON body).
-        fn raw(ev: *RouteEvent) anyerror!http.Response {
-            _ = ev;
+        fn raw(ctx: *Ctx) anyerror!http.Response {
+            _ = ctx;
             return error.Unexpected;
         }
         // Typed: reflected into the RPC surface.
@@ -819,41 +820,35 @@ test "RouteEvent.writer() create round-trips and releases the writer (no leak)" 
     }
 }
 
-test "JobEvent.reader() sees a committed write and returns the conn to the pool (no leak)" {
+test "job Ctx writes then reads a committed record and releases the conn on deinit (no leak)" {
+    // Mirrors how the scheduler now hands a job its DB capabilities: a Ctx built
+    // from app with anonymous rctx and no bound connection. Writes go through the
+    // pool writer (released immediately); reads lazily check out a pooled reader
+    // that ctx.deinit() returns to the warm pool.
     const env = try TestEnv.init();
     defer env.deinit();
     const a = env.arena.allocator();
 
-    var job = JobEvent{ .app = &env.app, .name = "nightly" };
+    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = null, .bound_conn = null };
+    defer cx.deinit();
 
-    // Write a record via the writer handle first.
-    var id_buf: [64]u8 = undefined;
-    var id_len: usize = 0;
-    {
-        var w = job.writer();
-        defer w.deinit();
-        var obj: std.json.ObjectMap = .empty;
-        try obj.put(a, "title", .{ .string = "world" });
-        const created = try w.data().create("posts", .{ .object = obj });
-        const id = created.object.get("id").?.string;
-        @memcpy(id_buf[0..id.len], id);
-        id_len = id.len;
-    }
-    const id = id_buf[0..id_len];
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "title", .{ .string = "world" });
+    const created = try cx.records().create("posts", .{ .object = obj });
+    const id = created.object.get("id").?.string;
 
-    // The warm pool starts cold; after a reader handle deinit it must hold the
-    // returned connection.
+    // No reader is checked out until the first read.
     try std.testing.expectEqual(@as(usize, 0), env.pool.reader_count);
-    {
-        var r = try job.reader();
-        defer r.deinit();
-        const found = (try r.data().findById("posts", id)).?;
-        try std.testing.expectEqualStrings("world", found.object.get("title").?.string);
-    }
-    // Prove deinit returned the connection to the warm pool (no leak/close).
+    const found = (try cx.records().get("posts", id, .{})).?;
+    try std.testing.expectEqualStrings("world", found.object.get("title").?.string);
+
+    // ctx.deinit() (via defer) returns the cached reader to the warm pool — prove
+    // it by deiniting explicitly here and checking the warm count, then null it so
+    // the deferred deinit is a no-op.
+    cx.deinit();
     try std.testing.expectEqual(@as(usize, 1), env.pool.reader_count);
 
-    // And re-acquiring reuses that exact warm connection.
+    // Re-acquiring reuses that exact warm connection.
     var r2 = try env.pool.acquireReader();
     defer env.pool.releaseReader(&r2);
     try std.testing.expectEqual(@as(usize, 0), env.pool.reader_count);

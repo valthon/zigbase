@@ -404,7 +404,7 @@ The framework invites custom rules, hooks, routes, and plugins. The sharp edges:
    a custom mailer that reuses `buildMessage` is protected; a *fully custom* backend still must
    sanitize — document this.
 3. **`before`-hook writes are not transactional (KNOWN_LIMITATIONS).** A hook that does a side
-   `ev.data.create(...)` for an "atomic" audit/log row will commit it even if the triggering write
+   `ctx.records().create(...)` for an "atomic" audit/log row will commit it even if the triggering write
    later fails — a correctness footgun that can become a security one (e.g. a "grant" row written
    before an authz failure). *Guardrail:* the docs already warn; consider routing hook writes
    through the request transaction in a later release.

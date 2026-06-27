@@ -35,7 +35,9 @@ fn guardJoinsSql(alloc: std.mem.Allocator, joins: []const []const u8) ![]u8 {
 }
 
 /// SELECT 1 FROM col <joins> WHERE col.id=?1 AND (where) — bound id + guard params.
-fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8, g: Guard) !bool {
+/// Public so an HTTP handler that owns the write transaction can evaluate the
+/// access-rule guard inside that same transaction (see api/records.zig).
+pub fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8, g: Guard) !bool {
     const js = try guardJoinsSql(alloc, g.joins);
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, js, col.name, g.where_sql }, 0);
     var st = try w.prepare(sql);
@@ -503,14 +505,13 @@ test "coerce: non-object data is returned as-is" {
 }
 
 pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value) RecordError!std.json.Value {
-    return createImpl(alloc, io, w, col, data, null);
+    return createInTxn(alloc, io, w, col, data);
 }
 
-pub fn createGuarded(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value, guard: Guard) RecordError!std.json.Value {
-    return createImpl(alloc, io, w, col, data, guard);
-}
-
-fn createImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value, guard: ?Guard) RecordError!std.json.Value {
+/// Insert a record on `w` WITHOUT opening a transaction. The caller must already
+/// be inside one (or accept autocommit). Applies the same column/JSON handling as
+/// the former createImpl but performs no begin/commit/guard.
+pub fn createInTxn(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value) RecordError!std.json.Value {
     last_errors = null;
     if (data != .object) return error.NotObject;
     var errs: std.ArrayList(schema.ValidationError) = .empty;
@@ -555,11 +556,6 @@ fn createImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Colle
     const rcols = try columnList(alloc, col);
     var gen_id = id_gen.collectionId(io);
 
-    if (guard != null) try w.begin();
-    errdefer if (guard != null) {
-        w.rollback() catch {};
-    };
-
     const sql = try std.fmt.allocPrintSentinel(alloc, "INSERT INTO \"{s}\" ({s}) VALUES ({s}) RETURNING {s};", .{ col.name, cols.items, vals.items, rcols }, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
@@ -574,12 +570,6 @@ fn createImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Colle
     if (!try st.step()) return error.NotFound;
     const rec = try rowToObject(alloc, &st, col);
     while (try st.step()) {} // drain to DONE so the statement isn't active at commit time
-    if (guard) |g| {
-        if (!try guardPasses(alloc, w, col, &gen_id, g)) {
-            return error.Forbidden;
-        }
-        try w.commit();
-    }
     return rec;
 }
 
@@ -890,14 +880,12 @@ test "update enforces the same constraints" {
 }
 
 pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
-    return updateImpl(alloc, w, col, id, data, null);
+    return updateInTxn(alloc, w, col, id, data);
 }
 
-pub fn updateGuarded(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value, guard: Guard) RecordError!?std.json.Value {
-    return updateImpl(alloc, w, col, id, data, guard);
-}
-
-fn updateImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value, guard: ?Guard) RecordError!?std.json.Value {
+/// Update a record on `w` WITHOUT opening a transaction. The caller must already
+/// be inside one (or accept autocommit). Returns null if the row does not exist.
+pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
     last_errors = null;
     if (data != .object) return error.NotObject;
     var errs: std.ArrayList(schema.ValidationError) = .empty;
@@ -924,11 +912,6 @@ fn updateImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
 
     const rcols = try columnList(alloc, col);
 
-    if (guard != null) try w.begin();
-    errdefer if (guard != null) {
-        w.rollback() catch {};
-    };
-
     const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ col.name, sets.items, rcols }, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
@@ -940,22 +923,19 @@ fn updateImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
             return error.Validation;
         };
     }
-    if (!try st.step()) {
-        if (guard != null) w.rollback() catch {};
-        return null;
-    }
+    if (!try st.step()) return null;
     const rec = try rowToObject(alloc, &st, col);
     while (try st.step()) {} // drain to DONE so the statement isn't active at commit time
-    if (guard) |g| {
-        if (!try guardPasses(alloc, w, col, id, g)) {
-            return error.Forbidden;
-        }
-        try w.commit();
-    }
     return rec;
 }
 
 pub fn delete(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
+    return deleteInTxn(alloc, w, col, id);
+}
+
+/// Delete a record on `w` WITHOUT opening a transaction. The caller must already
+/// be inside one (or accept autocommit). Returns true if a row was deleted.
+pub fn deleteInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
     const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"id\"=?1 RETURNING \"id\";", .{col.name}, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
@@ -1002,26 +982,6 @@ test "update rejects an over-precise fixed value and leaves the row unchanged" {
     try std.testing.expectEqualStrings("1.00", rec.object.get("price").?.string);
 }
 
-test "updateGuarded rolls back when the guard fails, preserving the original value" {
-    var d = try db.Db.openMemory();
-    defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const col = try seedPosts(&d, a);
-    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','old',100);");
-
-    var data: std.json.ObjectMap = .empty;
-    try data.put(a, "title", .{ .string = "new" });
-    // Guard never matches -> the UPDATE inside the txn is rolled back.
-    const guard = Guard{ .where_sql = "\"posts\".\"title\" = ?", .params = &.{.{ .text = "nope" }} };
-    try std.testing.expectError(error.Forbidden, updateGuarded(a, &d, col, "r1", .{ .object = data }, guard));
-
-    // Rollback worked: the original "old" title persists.
-    const rec = (try get(a, &d, col, "r1")).?;
-    try std.testing.expectEqualStrings("old", rec.object.get("title").?.string);
-}
-
 test "list clamps pagination bounds" {
     var d = try db.Db.openMemory();
     defer d.close();
@@ -1058,6 +1018,27 @@ test "delete removes the row; 404 on missing" {
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','x',1);");
     try std.testing.expect(try delete(a, &d, col, "r1"));
     try std.testing.expect(!try delete(a, &d, col, "r1"));
+}
+
+test "createInTxn inserts without opening its own transaction" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("PRAGMA foreign_keys=ON;");
+    try migrations.run(&conn);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } }};
+    const col = try collections.create(a, io, &conn, .{ .id = "", .name = "posts", .fields = &fields });
+
+    // Caller owns the transaction; createInTxn must participate, not nest.
+    try conn.beginImmediate();
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "title", .{ .string = "x" });
+    const rec = try createInTxn(a, io, &conn, col, .{ .object = o });
+    try conn.rollback(); // caller rolls back -> row must be gone
+    try std.testing.expect((try get(a, &conn, col, rec.object.get("id").?.string)) == null);
 }
 
 pub const ListMode = enum { offset, cursor };
@@ -1492,37 +1473,6 @@ test "list rejects an over-long filter (DoS cap) before lexing" {
     const big = try a.alloc(u8, max_filter_len + 1);
     @memset(big, '(');
     try std.testing.expectError(error.BadFilter, list(a, &d, col, .{ .filter = big }));
-}
-
-test "createGuarded rolls back when the guard fails" {
-    var d = try db.Db.openMemory();
-    defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const col = try seedPosts(&d, a);
-    var data: std.json.ObjectMap = .empty;
-    try data.put(a, "title", .{ .string = "hi" });
-    const guard = Guard{ .where_sql = "\"posts\".\"title\" = ?", .params = &.{.{ .text = "nope" }} };
-    try std.testing.expectError(error.Forbidden, createGuarded(a, std.testing.io, &d, col, .{ .object = data }, guard));
-    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
-    defer st.finalize();
-    _ = try st.step();
-    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
-}
-
-test "createGuarded commits when the guard passes" {
-    var d = try db.Db.openMemory();
-    defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const col = try seedPosts(&d, a);
-    var data: std.json.ObjectMap = .empty;
-    try data.put(a, "title", .{ .string = "hi" });
-    const guard = Guard{ .where_sql = "\"posts\".\"title\" = ?", .params = &.{.{ .text = "hi" }} };
-    const rec = try createGuarded(a, std.testing.io, &d, col, .{ .object = data }, guard);
-    try std.testing.expectEqualStrings("hi", rec.object.get("title").?.string);
 }
 
 test "list applies a rule clause AND-ed with the filter" {

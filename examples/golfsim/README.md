@@ -30,16 +30,18 @@ CLI) comes straight from the framework via the public `zigbase.*` exports.
 #### `prepareBooking` — `beforeCreate` on `bookings`
 
 ```zig
-fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
-    // 1. Validate listing exists and is published.
-    const listing = (try ev.data.findById("listings", listing_id)) orelse
+fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    // 1. Validate listing exists and is published. DB access goes through the
+    //    per-request capability object: `ctx.records()` (bound to the triggering
+    //    write's in-transaction connection).
+    const listing = (try ctx.records().get("listings", listing_id, .{})) orelse
         return error.ListingNotFound;
 
     // 2. Double-booking check — allocate filter with ev.arena (NEVER ev.app.allocator).
     const overlap_filter = try std.fmt.allocPrint(ev.arena,
         "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing_id, ends_at, starts_at });
-    const conflicts = try ev.data.list("bookings", .{ .filter = overlap_filter, .perPage = 1 });
+    const conflicts = try ctx.records().list("bookings", .{ .filter = overlap_filter, .perPage = 1 });
     // totalItems is optional (cursor mode may skip COUNT); offset mode always sets it.
     if ((conflicts.totalItems orelse 0) > 0) return error.TimeSlotConflict; // -> HTTP 400
 
@@ -65,8 +67,8 @@ unless the referenced booking exists, was made by *this* author (they were the
 or a session that hasn't happened:
 
 ```zig
-fn prepareReview(ev: *zigbase.RecordEvent) anyerror!void {
-    const booking = (try ev.data.findById("bookings", booking_id)) orelse
+fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    const booking = (try ctx.records().get("bookings", booking_id, .{})) orelse
         return error.BookingNotFound;
     // gate 1: the booking must be the caller's own
     if (!std.mem.eql(u8, guest, author)) return error.BookingNotYours;     // -> 400
@@ -84,22 +86,25 @@ fn prepareReview(ev: *zigbase.RecordEvent) anyerror!void {
 | Method | Path | Auth | What it does |
 |--------|------|------|--------------|
 | `POST` | `/api/bookings/:id/confirm` | authed | Host confirms a booking. Multi-hop owner check: booking → listing → simulator → owner. 403 if caller doesn't own the simulator. |
-| `POST` | `/api/bookings/:id/cancel` | authed | Guest cancels their own booking. 403 if caller is not the booking's guest. Uses `ev.writer()` RAII helper. |
-| `GET` | `/api/listings/:id/availability` | authed | Returns all non-cancelled bookings for a listing for availability calendar rendering. Uses `ev.reader()` (read-only RAII). |
+| `POST` | `/api/bookings/:id/cancel` | authed | Guest cancels their own booking. 403 if caller is not the booking's guest. Reads/writes via `req.ctx.records()`. |
+| `GET` | `/api/listings/:id/availability` | authed | Returns all non-cancelled bookings for a listing for availability calendar rendering. Reads via `req.ctx.records()`. |
 | `GET` | `/api/golfsim/health` | public | Smoke endpoint. |
 
 The `confirmBooking` route shows the multi-hop imperative owner check (the access
 rule engine does this via traversal for CRUD endpoints; custom routes do it via
-`findById` hops):
+`records.get` hops). It is a typed route — `req.ctx.records()` manages the pooled
+connection itself (no manual acquireWriter / Data wiring):
 
 ```zig
-fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
+fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
+    const records = req.ctx.records();
     // booking.listing -> listings -> listing.simulator -> simulators -> simulator.owner
-    const listing = (try data.findById("listings", listing_id)) orelse return not_found;
-    const simulator = (try data.findById("simulators", simulator_id)) orelse return not_found;
-    const owner_id = /* simulator.owner */;
-    if (!std.mem.eql(u8, owner_id, caller_id)) return forbidden; // 403
-    _ = try data.update("bookings", id, patch);
+    const listing = (records.get("listings", listing_id, .{}) catch return error.RouteFailed) orelse return error.NotFound;
+    const simulator = (records.get("simulators", simulator_id, .{}) catch return error.RouteFailed) orelse return error.NotFound;
+    const owner_id = // simulator.owner
+    if (!std.mem.eql(u8, owner_id, caller_id)) return error.Forbidden; // 403
+    const updated = (records.update("bookings", id, patch) catch return error.RouteFailed) orelse return error.NotFound;
+    return updated; // thunk serializes it to the 200 body
 }
 ```
 
@@ -138,8 +143,8 @@ bookings.list = "@request.auth.id = guest || @request.auth.id = listing.simulato
 
 The rule engine traverses `booking.listing → listing.simulator → simulator.owner`
 at query time for all CRUD endpoints — the application layer doesn't join manually
-for authorization. Custom routes re-implement this imperatively (via `findById`
-hops) to return a proper 403.
+for authorization. Custom routes re-implement this imperatively (via
+`records.get` hops) to return a proper 403.
 
 ---
 
@@ -165,24 +170,23 @@ teardown.
 ### 6. DB-touching cron job
 
 ```zig
-fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
-    const conn = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = conn, .io = ev.app.io };
-
-    const stale = data.list("bookings", .{
+fn expireHolds(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
+    _ = ev;
+    const stale = ctx.records().list("bookings", .{
         .filter = "status = \"pending\" && starts_at < @now",
         .perPage = 200,
     }) catch |err| switch (err) {
         error.UnknownCollection => return, // no-op until provisioning runs
         else => return err,
     };
-    for (stale.items) |item| _ = data.update("bookings", id, /* cancelled */) catch continue;
+    for (stale.items) |item| _ = ctx.records().update("bookings", id, /* cancelled */) catch continue;
 }
 ```
 
-Real DB access inside a background job: acquire the pooled writer, wrap it in a
-`Data`, release on exit.
+Real DB access inside a background job: the scheduler hands the job a `*Ctx` whose
+`records()` handle reads via a pooled reader and writes via the pool writer — no
+manual `pool.acquireWriter()` + hand-built `Data`. The framework owns the ctx
+lifetime and releases any lazily-acquired connection on exit.
 
 ---
 
@@ -207,15 +211,18 @@ raises its own quota in `provision.buildCollections`, so it just works.)
 
 | Feature | Signature |
 |---|---|
-| record hook | `fn(*zigbase.RecordEvent) anyerror!void` |
-| custom route | `fn(*zigbase.RouteEvent) anyerror!zigbase.http.Response` |
-| cron job | `fn(*zigbase.events.JobEvent) anyerror!void` |
+| record hook | `fn(*zigbase.Ctx, *zigbase.RecordEvent) anyerror!void` |
+| typed custom route | `fn(*zigbase.Req(In)) zigbase.RouteError!Out` |
+| untyped custom route | `fn(*zigbase.Ctx) anyerror!zigbase.http.Response` |
+| cron job | `fn(*zigbase.Ctx, *zigbase.events.JobEvent) anyerror!void` |
 | file upload | `fn(*zigbase.events.FileEvent) void` |
 
-Data from the pool (manual): `zigbase.Data{ .app = ev.app, .conn = ev.app.pool.acquireWriter(), .io = ev.app.io }`
-(with `defer ev.app.pool.releaseWriter();`).
+DB access is through the per-request capability object: `ctx.records()` in hooks/
+jobs/untyped routes, `req.ctx.records()` in typed routes — the pooled connection
+is managed for you (`.get` / `.list` / `.create` / `.update` / `.delete`).
 
-RAII helpers in routes: `ev.writer()` (write) / `try ev.reader()` (read-only).
+For raw SQL on a migration-owned table, acquire the pooled writer directly:
+`const w = ctx.app.pool.acquireWriter(); defer ctx.app.pool.releaseWriter();`.
 
 ---
 

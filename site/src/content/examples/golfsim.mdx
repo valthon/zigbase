@@ -33,7 +33,7 @@ parts** of building a real backend on ZigBase *as a library*.
 ## What it proves
 
 1. **A computed + validating `before_create` hook on `bookings`.** It reads
-   **related** data (the target listing) through `ev.data`, **rejects** invalid
+   **related** data (the target listing) through `ctx.records()`, **rejects** invalid
    input (a 400 to the client), stamps a server-authoritative `guest` from the
    authenticated identity, and **computes** a derived `price_total` = booked hours ×
    the listing's `price_per_hour`.
@@ -41,9 +41,9 @@ parts** of building a real backend on ZigBase *as a library*.
    reads the `:id` path param, loads the booking from the DB, flips its `status` to
    `"confirmed"`, and returns the updated record as JSON — or **404** when the
    booking does not exist.
-3. **A DB-touching interval cron job** `expire-holds` (every 15 minutes). It opens a
-   `Data` from the connection pool, lists stale **pending** holds whose slot has
-   already started, and marks them `"cancelled"`.
+3. **A DB-touching interval cron job** `expire-holds` (every 15 minutes). It reads
+   and writes through the passed-in `*Ctx` via `ctx.records()`, lists stale
+   **pending** holds whose slot has already started, and marks them `"cancelled"`.
 4. **A public smoke route** `GET /api/golfsim/health` returning a small JSON literal.
 
 Everything else (HTTP API, SQLite storage, auth, file storage, the admin UI, the
@@ -55,12 +55,13 @@ CLI) comes straight from the framework via the public `zigbase.*` exports.
 ## The computed + validating hook (`before_create` on `bookings`)
 
 ```zig
-fn prepareBooking(ev: *zigbase.RecordEvent) anyerror!void {
+fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     const rec = &ev.record.object;
     const listing_id = /* read the `listing` relation id from rec */;
 
-    // Read RELATED data through the curated facade; reject if it's not bookable.
-    const listing = (try ev.data.findById("listings", listing_id)) orelse return error.ListingNotFound;
+    // Read RELATED data through the per-request capability object; reject if it's
+    // not bookable. `ctx.records()` manages the pooled connection itself.
+    const listing = (try ctx.records().get("listings", listing_id, .{})) orelse return error.ListingNotFound;
 
     // COMPUTE a derived field — note: mutations allocate with ev.arena, NOT ev.app.allocator.
     const price_total = hours * rate;
@@ -79,18 +80,17 @@ allocator that owns `ev.record`), never `ev.app.allocator`.
 ## The business route (path param + DB write)
 
 ```zig
-fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const id = ev.ctx.param("id") orelse return .{ .status = 400, .body = "..." };
+// Typed route: `void` input, `std.json.Value` output (a dynamic record). The
+// thunk serializes the returned record to a 200 JSON body.
+fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
+    const id = req.param("id") orelse return req.fail(400, "Missing booking id.");
 
-    // RouteEvent carries no `Data` — build one from the pool (acquire/release the writer).
-    const conn = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = conn, .io = ev.app.io };
-
-    _ = (try data.findById("bookings", id)) orelse return .{ .status = 404, .body = "..." };
-    const updated = (try data.update("bookings", id, /* { "status": "confirmed" } */)).?;
-    const body = try std.json.Stringify.valueAlloc(ev.ctx.allocator, updated, .{});
-    return .{ .status = 200, .body = body };
+    // Read/write through the per-request capability object — `req.ctx.records()`
+    // manages the pooled connection itself (no manual acquireWriter / Data wiring).
+    const records = req.ctx.records();
+    _ = (records.get("bookings", id, .{}) catch return error.RouteFailed) orelse return error.NotFound;
+    const updated = (records.update("bookings", id, /* { "status": "confirmed" } */) catch return error.RouteFailed) orelse return error.NotFound;
+    return updated; // thunk serializes it to the 200 body
 }
 ```
 
@@ -116,32 +116,31 @@ The frontend's "My bookings" page drives exactly this flow: a held slot starts o
 ## The DB-touching cron job
 
 ```zig
-fn expireHolds(ev: *zigbase.events.JobEvent) anyerror!void {
-    const conn = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = conn, .io = ev.app.io };
-
-    const stale = data.list("bookings", .{
+fn expireHolds(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
+    _ = ev;
+    const stale = ctx.records().list("bookings", .{
         .filter = "status = \"pending\" && starts_at < @now",
         .perPage = 200,
     }) catch |err| switch (err) {
         error.UnknownCollection => return, // no-op until provisioning runs
         else => return err,
     };
-    for (stale.items) |item| _ = try data.update("bookings", /* item.id */, /* cancelled */);
+    for (stale.items) |item| _ = try ctx.records().update("bookings", /* item.id */, /* cancelled */);
 }
 ```
 
-This is the pattern for **real DB access inside a background job**: acquire the
-pooled writer, wrap it in a `Data`, and release on exit.
+This is the pattern for **real DB access inside a background job**: the scheduler
+hands the job a `*Ctx` whose `records()` handle reads and writes through the
+managed pool — the framework releases any lazily-acquired connection on exit.
 
 ## Handler signatures (the contract)
 
 | Feature | Signature |
 | --- | --- |
-| record hook | `fn(*zigbase.RecordEvent) anyerror!void` |
-| custom route | `fn(*zigbase.RouteEvent) anyerror!zigbase.http.Response` |
-| cron job | `fn(*zigbase.events.JobEvent) anyerror!void` |
+| record hook | `fn(*zigbase.Ctx, *zigbase.RecordEvent) anyerror!void` |
+| typed custom route | `fn(*zigbase.Req(In)) zigbase.RouteError!Out` |
+| untyped custom route | `fn(*zigbase.Ctx) anyerror!zigbase.http.Response` |
+| cron job | `fn(*zigbase.Ctx, *zigbase.events.JobEvent) anyerror!void` |
 
 ## Frontend (Astro + React islands)
 
@@ -224,7 +223,7 @@ const health = await zb.rpc.golfsimHealth();
 ### Untyped routes (raw responses)
 
 `golfsim` also registers an **untyped** route — `GET /api/golfsim/calendar.ics` (`calendarFeed`
-in `src/main.zig`). Untyped handlers (`fn(*RouteEvent) anyerror!http.Response`) own the whole
+in `src/main.zig`). Untyped handlers (`fn(*zigbase.Ctx) anyerror!http.Response`) own the whole
 response, so they can set a non-JSON `content-type` (here `text/calendar`), cookies, or a
 redirect — none of which the always-JSON typed thunk can express. Because they carry no typed
 `Input`/`Output`, the generator deliberately leaves them **out** of `zb.rpc.*`; call them

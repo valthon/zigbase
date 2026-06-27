@@ -321,7 +321,8 @@ patterns:
    authenticated identity, so the client can't spoof it:
 
    ```zig
-   fn setOwner(ev: *zigbase.RecordEvent) anyerror!void {
+   fn setOwner(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+       _ = ctx;
        if (ev.record.* != .object) return;
        const uid = ev.ctx.resolveMacro("@request.auth.id") orelse "";
        if (uid.len == 0) return error.Unauthenticated; // reject anonymous creates -> 400
@@ -358,7 +359,7 @@ const zigbase = @import("zigbase");
 
 /// before_create on "bookings": reject overlaps with a confirmed booking and
 /// compute a derived duration field. Allocations that land in ev.record use ev.arena.
-fn validateBooking(ev: *zigbase.RecordEvent) anyerror!void {
+fn validateBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     if (ev.record.* != .object) return; // framework guards non-objects already
 
     const listing = strField(ev.record, "listing") orelse return error.MissingListing;
@@ -366,13 +367,13 @@ fn validateBooking(ev: *zigbase.RecordEvent) anyerror!void {
     const ends = strField(ev.record, "ends_at") orelse return error.MissingEnd;
 
     // 1) Conflict check: any CONFIRMED booking for this listing that overlaps?
-    //    ev.data.list runs a curated query on the request's connection.
+    //    ctx.records().list runs a curated query on the request's connection.
     const filter = try std.fmt.allocPrint(ev.arena,
         "listing = \"{s}\" && status = \"confirmed\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing, ends, starts },
     );
-    const conflicts = try ev.data.list("bookings", .{ .filter = filter, .perPage = 1 });
-    if (conflicts.totalItems > 0) return error.SlotUnavailable; // -> 400, rejects the create
+    const conflicts = try ctx.records().list("bookings", .{ .filter = filter, .perPage = 1 });
+    if ((conflicts.totalItems orelse 0) > 0) return error.SlotUnavailable; // -> 400, rejects the create
 
     // 2) Compute a derived numeric field from the two timestamps (illustrative).
     const minutes = durationMinutes(starts, ends);
@@ -401,15 +402,15 @@ Key points:
 - **Use `ev.arena`** for anything stored into `ev.record` (the request-scoped allocator
   that owns the record's JSON), never `ev.app.allocator`. See
   [Framework → CRITICAL: use ev.arena](./framework#critical-use-evarena-not-evappallocator).
-- **`ev.data.list(collection, query)`** returns a `ListResult` with `totalItems` and
-  `items`; the `query` is a `records.ListQuery` (`.filter`, `.sort`, `.page`, `.perPage`).
-  `ev.data` also offers `findById`, `create`, `update`, `delete`.
+- **`ctx.records().list(collection, opts)`** returns a `ListResult` with `totalItems` (a
+  `?i64` — `orelse 0` it) and `items`; the `opts` is a `ListOptions` (`.filter`, `.sort`,
+  `.page`, `.perPage`). `ctx.records()` also offers `get`, `create`, `update`, `delete`.
 - **Returning any error rejects** the create with `400` ("Request rejected by a hook.").
-- **Atomicity caveat:** a `before*` hook's own `ev.data` writes are **not** atomic with the
-  triggering write (the triggering write's transaction opens after the hook returns). For a
-  pure read-and-validate hook like this, that's fine; avoid relying on a hook-issued
-  side-write rolling back if the main write fails. See
-  [Framework → The ev.data facade](./framework#the-evdata-facade).
+- **Atomicity:** a `before*` hook's own `ctx.records()` writes **are** atomic with the
+  triggering write — they share its transaction. If the hook returns an error (or the
+  access rule denies the write), the whole transaction rolls back, including the hook's
+  side-writes (fail closed). See
+  [Framework → DB access from a hook](./framework#db-access-from-a-hook-ctxrecords).
 
 ## Recipe: a custom business route with a path param + DB write
 
@@ -417,41 +418,40 @@ A `POST /api/bookings/:id/confirm` route that a host calls to confirm a pending 
 reads the `:id` path param, loads the record, mutates it, and returns the standard JSON
 envelope (or `404`/`403`).
 
-`RouteEvent` carries `app`, `ctx` (the `http.RequestCtx`), and `rctx` (the resolved auth
-identity). It does **not** carry a `Data` facade — build one from the pool the same way a
-cron job does.
+The untyped handler receives a `*zigbase.Ctx` — the per-request capability object. DB
+access is via `ctx.records()` (it manages a pooled connection for you), the authenticated
+identity via `ctx.user()`, and the raw request (path params, body) via `ctx.request.?`.
 
 ```zig
 const std = @import("std");
 const zigbase = @import("zigbase");
 
 /// POST /api/bookings/:id/confirm — host confirms a pending booking.
-fn confirmBooking(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const a = ev.ctx.allocator; // request arena
-    const id = ev.ctx.param("id") orelse
+fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const a = ctx.arena; // request arena
+    const id = ctx.request.?.param("id") orelse
         return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
 
-    // Build a Data facade on a writer connection (route events don't carry one).
-    const w = ev.app.pool.acquireWriter();
-    defer ev.app.pool.releaseWriter();
-    const data = zigbase.Data{ .app = ev.app, .conn = w, .io = ev.app.io };
+    // DB access via the capability object — ctx.records() manages the pooled
+    // connection itself (no manual acquireWriter / Data wiring).
+    const records = ctx.records();
 
     // Load the booking (null = unknown collection OR missing record).
-    const booking = (try data.findById("bookings", id)) orelse
+    const booking = (try records.get("bookings", id, .{})) orelse
         return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
 
     // Authorize: only the host who owns the booked listing's simulator may confirm.
-    // (rctx carries the authenticated identity; .auth = .authed on the route spec
+    // (ctx.user() is the authenticated identity; .auth = .authed on the route spec
     // already guarantees a logged-in user.)
-    const uid = ev.rctx.resolveMacro("@request.auth.id") orelse "";
-    _ = booking; // (look up listing.simulator.owner via data.findById and compare to uid)
+    const uid = if (ctx.user()) |u| u.id else "";
+    _ = booking; // (look up listing.simulator.owner via records.get and compare to uid)
     if (uid.len == 0)
         return .{ .status = 403, .body = "{\"code\":403,\"message\":\"Forbidden.\",\"data\":{}}" };
 
     // Mutate: set status = "confirmed".
     var patch: std.json.ObjectMap = .empty;
     try patch.put(a, "status", .{ .string = "confirmed" });
-    const updated = (try data.update("bookings", id, .{ .object = patch })) orelse
+    const updated = (try records.update("bookings", id, .{ .object = patch })) orelse
         return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
 
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, updated, .{}) };
@@ -469,26 +469,29 @@ if omitted is `.superuser`):
 
 Key points:
 
-- **Path params:** `ev.ctx.param("id")` returns the captured `:id` (or `null`).
+- **Path params:** `ctx.request.?.param("id")` returns the captured `:id` (or `null`).
 - **The auth level is enforced by the framework before your handler runs**; inside, use
-  `ev.rctx` for finer authorization (e.g. owner checks).
+  `ctx.user()` for finer authorization (e.g. owner checks).
 - **Built-in routes win** over custom routes matching the same method+path, so namespace
   your routes (`/api/bookings/:id/confirm`, not a path that shadows a built-in).
 - Return any `zigbase.http.Response`; the body is a JSON string you allocate from
-  `ev.ctx.allocator`.
+  `ctx.arena`.
 
 ## Recipe: DB access inside a cron / lifecycle job
 
-A `JobEvent` carries `app` and `name` — but no ambient connection. Use the RAII DB
-accessors it exposes to check a connection out of the pool and hand it back:
+A job handler is `fn(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void` — the
+scheduler hands it a `*Ctx`. `JobEvent` still carries `.app` and `.name`. DB access is via
+`ctx.records()` (`get` / `create` / `update` / `delete` / `list`); it lazily checks out a
+pooled connection that the framework releases when the job's ctx is torn down. For raw SQL
+on a migration-owned table, use the pooled writer directly:
 
-- For **writes**: `var w = ev.writer(); defer w.deinit();` then `w.data()`.
-- For **reads**: `var r = try ev.reader(); defer r.deinit();` then `r.data()`.
+```zig
+const w = ctx.app.pool.acquireWriter();
+defer ctx.app.pool.releaseWriter();
+try w.exec("...");
+```
 
-`w.data()` / `r.data()` each yield a `zigbase.Data` bound to that connection (`findById` /
-`create` / `update` / `delete` / `list`). The same accessors exist on `RouteEvent` and
-`LifecycleEvent`. (See
-[Framework → DB access from a route](./framework#db-access-from-a-route-evwriter--evreader).)
+(See [Framework → DB access from a job](./framework#db-access-from-a-route-ctxrecords).)
 
 This nightly job cancels stale `pending` bookings (older than now) by listing them and
 updating each:
@@ -498,31 +501,29 @@ const std = @import("std");
 const zigbase = @import("zigbase");
 
 /// Nightly: cancel pending bookings whose start time has passed.
-fn expireStaleBookings(ev: *zigbase.events.JobEvent) anyerror!void {
+fn expireStaleBookings(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     const a = ev.app.allocator;
 
-    // Writer handle + Data facade — the accessor checks the writer out of the pool
-    // and deinit() hands it back (no leak).
-    var w = ev.writer();
-    defer w.deinit();
-    const data = w.data();
+    // DB access via the capability object — ctx.records() manages the pooled
+    // connection; the framework releases it when the job's ctx is torn down.
+    const records = ctx.records();
 
     const now = "2026-06-10 00:00:00"; // compute the current timestamp in your format
     const filter = try std.fmt.allocPrint(a,
         "status = \"pending\" && starts_at < \"{s}\"", .{now});
 
-    const stale = try data.list("bookings", .{ .filter = filter, .perPage = 200 });
+    const stale = try records.list("bookings", .{ .filter = filter, .perPage = 200 });
     for (stale.items) |item| {
         const id = item.object.get("id").?.string;
         var patch: std.json.ObjectMap = .empty;
         try patch.put(a, "status", .{ .string = "cancelled" });
-        _ = try data.update("bookings", id, .{ .object = patch });
+        _ = try records.update("bookings", id, .{ .object = patch });
     }
-    std.log.info("job '{s}': cancelled {d} stale bookings", .{ ev.name, stale.totalItems });
+    std.log.info("job '{s}': cancelled {d} stale bookings", .{ ev.name, stale.totalItems orelse 0 });
 }
 ```
 
-Register it on a schedule (cron/interval handlers have the `fn (*JobEvent) anyerror!void`
+Register it on a schedule (cron/interval handlers have the `fn (*Ctx, *JobEvent) anyerror!void`
 signature):
 
 ```zig
@@ -536,9 +537,11 @@ signature):
 
 Key points:
 
-- **Always `defer <handle>.deinit()`** on the writer/reader handle — it releases the writer
-  (or returns the reader connection) to the pool. The writer is a single shared,
-  mutex-guarded connection — holding it blocks all other writes.
+- **`ctx.records()` manages its own connection** — the framework releases any connection it
+  checked out when the job's ctx is torn down, so there is no handle to `deinit`. If you drop
+  to raw SQL via `ctx.app.pool.acquireWriter()`, always `defer ctx.app.pool.releaseWriter()`
+  — the writer is a single shared, mutex-guarded connection, and holding it blocks all other
+  writes.
 - Job allocations can use `ev.app.allocator` (the long-lived gpa) since there is no request
   arena here; free anything large yourself if the job runs often.
 - Scheduling is **single-process, UTC, minute-granularity**; cron is numeric-only. See
@@ -557,28 +560,28 @@ Both routes are registered as `.auth = .public` (no prior session required).
 
 The full `zigbase.auth` surface used here:
 
-- `zigbase.auth.rateLimit(ctx, scope, ident)` — returns a `429 http.Response` when
+- `zigbase.auth.rateLimit(ctx.request.?, scope, ident)` — returns a `429 http.Response` when
   the caller is over the limit, `null` otherwise. Call it first in any public route.
-- `zigbase.auth.mintLinkToken(ctx, conn, collection, record_id, ttl_s, opts)` — mints a
+- `zigbase.auth.mintLinkToken(ctx.request.?, conn, collection, record_id, ttl_s, opts)` — mints a
   signed, single-use JWT and returns `LinkToken{ .token }`. `opts.payload` (default `""`)
   binds a small opaque, signed, tamper-proof string into the token (e.g. a post-login
   redirect path), returned by `verifyLinkToken` as `claims.pl` — carry bound state in the
   one token instead of an unsigned `&next=` URL param.
-- `zigbase.auth.deliverAuthMail(app, alloc, to, subject, body)` — sends the link
+- `zigbase.auth.deliverAuthMail(ctx.app, alloc, to, subject, body)` — sends the link
   via the configured mailer (SMTP or log in dev).
-- `zigbase.auth.verifyLinkToken(ctx, conn, collection, token)` — validates the JWT
+- `zigbase.auth.verifyLinkToken(ctx.request.?, conn, collection, token)` — validates the JWT
   and returns `?jwt.Claims` (`null` → expired / wrong collection / bad signature).
   `claims.id` is the record id.
 - `zigbase.auth.consumeLinkToken(conn, claims)` — marks the token consumed; returns
   `error.AlreadyConsumed` on replay.
-- `ev.issueSession(collection, record_id)` — issues a session from a `RouteEvent`,
-  sets the auth cookies, fires `onAuth(.custom)`, and returns `Issued{ .token, .cookies }`.
+- `ctx.issueSession(collection, record_id)` — issues a session from a route handler's
+  `*Ctx`, sets the auth cookies, fires `onAuth(.custom)`, and returns `Issued{ .token, .cookies }`.
   This is the seam that guarantees **every login fires your `onAuth` handler**,
   including custom flows.
 
 > **Provisioning a new passwordless account.** The request route below resolves an
 > *existing* member. To create one on the fly (passwordless sign-up), call
-> `w.data().create("members", .{ .object = fields })`: on an auth collection `create`
+> `ctx.records().create("members", .{ .object = fields })`: on an auth collection `create`
 > generates the per-record `tokenKey` (and forces `verified=false`) so the new row works
 > with `mintLinkToken` / `issueSession` immediately. `password` is optional, so no
 > credential columns need hand-writing.
@@ -595,39 +598,39 @@ const MagicConfirmBody = struct { token: []const u8 };
 ///
 /// Always returns 204 — enumeration-safe. If the email matches a record, mints a
 /// single-use link token (TTL 900 s) and mails it. Rate-limited per IP/email.
-fn magicRequest(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const a = ev.ctx.allocator;
+fn magicRequest(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const a = ctx.arena;
 
     // 1) Parse the request body first so we can key the rate limit on the parsed
     //    email rather than the raw body (whitespace/key-order variants of the same
     //    email would otherwise dodge the per-identity cap).
-    const parsed = std.json.parseFromSlice(MagicRequestBody, a, ev.ctx.body, .{}) catch
+    const parsed = std.json.parseFromSlice(MagicRequestBody, a, ctx.request.?.body, .{}) catch
         return .{ .status = 204, .body = "" }; // malformed body -> silent 204
     defer parsed.deinit();
     const email = parsed.value.email;
 
     // 2) Rate-limit on the scope "magic-request" keyed on the parsed email.
     //    rateLimit returns a ready-to-return 429 Response when limited.
-    if (try zigbase.auth.rateLimit(ev.ctx, "magic-request", email)) |resp| return resp;
+    if (try zigbase.auth.rateLimit(ctx.request.?, "magic-request", email)) |resp| return resp;
 
-    // 3) Acquire a DB writer connection.
-    var w = ev.writer();
-    defer w.deinit();
+    // 3) Acquire a DB writer connection for the auth-helper calls that need a raw conn.
+    const w = ctx.app.pool.acquireWriter();
+    defer ctx.app.pool.releaseWriter();
 
     // 4) Resolve the member record by email (DB lookup after rate-limit gate).
-    //    data.list returns an empty items slice when nothing matches — we treat both
-    //    "not found" and "found" paths the same way externally (always 204).
-    const results = try w.data().list("members", .{
+    //    ctx.records().list returns an empty items slice when nothing matches — we treat
+    //    both "not found" and "found" paths the same way externally (always 204).
+    const results = try ctx.records().list("members", .{
         .filter = try std.fmt.allocPrint(a, "email = \"{s}\"", .{email}),
         .perPage = 1,
     });
-    if (results.totalItems > 0) {
+    if ((results.totalItems orelse 0) > 0) {
         const record = results.items[0];
         const rid = record.object.get("id").?.string;
 
         // Mint a single-use link token valid for 15 minutes. Pass `.{}` for no bound
         // payload, or `.{ .payload = "/dashboard" }` to carry a signed post-login target.
-        const lt = try zigbase.auth.mintLinkToken(ev.ctx, w.conn, "members", rid, 900, .{});
+        const lt = try zigbase.auth.mintLinkToken(ctx.request.?, w, "members", rid, 900, .{});
 
         // Build the magic-link URL (adapt the base URL to your deployment).
         const link = try std.fmt.allocPrint(a,
@@ -637,7 +640,7 @@ fn magicRequest(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
 
         // Deliver the email. Uses SMTP when configured, logs the token in dev.
         try zigbase.auth.deliverAuthMail(
-            ev.app, a, email, "Your sign-in link", body);
+            ctx.app, a, email, "Your sign-in link", body);
     }
 
     // Always 204 — callers learn nothing about whether the email is registered.
@@ -648,33 +651,33 @@ fn magicRequest(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
 ///
 /// Verifies the single-use link token, consumes it (replay -> 400), issues a
 /// real session, and returns 200 with the auth cookies set. onAuth fires here.
-fn magicConfirm(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    const a = ev.ctx.allocator;
+fn magicConfirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const a = ctx.arena;
 
-    const parsed = std.json.parseFromSlice(MagicConfirmBody, a, ev.ctx.body, .{}) catch
+    const parsed = std.json.parseFromSlice(MagicConfirmBody, a, ctx.request.?.body, .{}) catch
         return .{ .status = 400, .body = "{\"message\":\"Invalid request body.\"}" };
     defer parsed.deinit();
     const token = parsed.value.token;
 
-    var w = ev.writer();
-    defer w.deinit();
+    const w = ctx.app.pool.acquireWriter();
+    defer ctx.app.pool.releaseWriter();
 
     // Verify: null = expired / wrong collection / bad signature.
-    const claims = (try zigbase.auth.verifyLinkToken(ev.ctx, w.conn, "members", token))
+    const claims = (try zigbase.auth.verifyLinkToken(ctx.request.?, w, "members", token))
         orelse return .{ .status = 400, .body = "{\"message\":\"Invalid or expired link.\"}" };
 
     // Consume: error.AlreadyConsumed on replay — the link is single-use.
-    zigbase.auth.consumeLinkToken(w.conn, claims) catch |err| switch (err) {
+    zigbase.auth.consumeLinkToken(w, claims) catch |err| switch (err) {
         error.AlreadyConsumed =>
             return .{ .status = 400, .body = "{\"message\":\"Link already used.\"}" },
         else => return err,
     };
 
     // Issue the session reusing the writer connection already held — do NOT call
-    // ev.issueSession here; it acquires the writer a second time and would deadlock.
+    // ctx.issueSession here; it acquires the writer a second time and would deadlock.
     // zigbase.auth.issueSession takes an explicit conn and fires onAuth(.custom).
-    const issued = try zigbase.auth.issueSession(ev.ctx, w.conn, "members", claims.id);
-    // We mint with `zigbase.auth.issueSession(ev.ctx, w.conn, …)`, reusing the writer we already hold — do **not** call `ev.issueSession(…)` while holding the writer, as it would acquire the single non-reentrant writer a second time and deadlock.
+    const issued = try zigbase.auth.issueSession(ctx.request.?, w, "members", claims.id);
+    // We mint with `zigbase.auth.issueSession(ctx.request.?, w, …)`, reusing the writer we already hold — do **not** call `ctx.issueSession(…)` while holding the writer, as it would acquire the single non-reentrant writer a second time and deadlock.
     return .{ .status = 200, .body = "{\"ok\":true}", .cookies = &issued.cookies };
 }
 ```

@@ -34,8 +34,8 @@
 //!      originated (.request / .cron / .job / .file_serve ...).
 //!
 //!   6. CRON JOB -- a `* * * * *` (every-minute) job that reads the DB via
-//!      `ev.reader()` to count published posts, then writes an audit log row
-//!      via `ev.writer()`. Demonstrates both DB-access handles in one handler.
+//!      `ctx.records()` to count published posts, then writes an audit log row to a
+//!      migration-owned table with raw SQL on the pooled writer (`ctx.app.pool`).
 //!
 //!   7. POOL LEVERS via `.pools` -- reader/job pool sizes + page-cache budget.
 //!
@@ -387,7 +387,8 @@ fn handleAuth(ev: *zigbase.AuthEvent) void {
 //    Allocate with ev.arena (the request-scoped allocator that owns ev.record's
 //    JSON storage) -- never ev.app.allocator.
 // ---------------------------------------------------------------------------
-fn beforeCreateComment(ev: *zigbase.RecordEvent) anyerror!void {
+fn beforeCreateComment(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    _ = ctx;
     // Populate `commenter` from the session identity if not provided by the client.
     if (ev.record.object.get("commenter") == null) {
         const auth = ev.ctx.auth orelse return; // should never be null (rule gated)
@@ -403,23 +404,27 @@ fn beforeCreateComment(ev: *zigbase.RecordEvent) anyerror!void {
 // 6. Cron / interval job: "audit-sweep".
 //
 //    Fires every minute (cron "* * * * *", UTC, numeric 5-field format).
-//    Demonstrates the correct DB-access pattern for job handlers:
-//      - reads  use ev.reader() -- checked out of the warm reader pool.
-//      - writes use ev.writer() -- the single mutex-guarded pool writer.
-//    Both RAII handles must be defer'd to avoid a pool leak.
+//    Signature: fn(*zigbase.Ctx, *zigbase.events.JobEvent) anyerror!void.
+//    Demonstrates the DB-access pattern for ctx-first job handlers:
+//      - collection reads use ctx.records() -- the pooled reader is managed for you.
+//      - raw SQL on a migration-owned table uses the pooled writer via ctx.app.pool
+//        (acquireWriter / releaseWriter), since it is not a comptime collection.
 // ---------------------------------------------------------------------------
-fn auditSweepJob(ev: *zigbase.events.JobEvent) anyerror!void {
-    var r = try ev.reader();
-    defer r.deinit();
-    const result = try r.data().list("posts", .{
+fn auditSweepJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
+    _ = ev;
+    // Collection reads go through the ctx capability object (pooled reader managed
+    // for us); the framework releases the connection when the job's ctx is torn down.
+    const result = try ctx.records().list("posts", .{
         .filter = "status = \"published\"",
         .perPage = 1,
     });
     const published_count = result.totalItems orelse 0;
     std.log.info("[audit-sweep] published_posts={d}", .{published_count});
 
-    var w = ev.writer();
-    defer w.deinit();
+    // `plugin_audit_log` is a migration-owned table (not a comptime collection), so it
+    // is written with raw SQL on the pooled writer rather than via `ctx.records()`.
+    const w = ctx.app.pool.acquireWriter();
+    defer ctx.app.pool.releaseWriter();
 
     var buf: [256]u8 = undefined;
     const insert_sql = std.fmt.bufPrintZ(
@@ -427,7 +432,7 @@ fn auditSweepJob(ev: *zigbase.events.JobEvent) anyerror!void {
         "INSERT INTO plugin_audit_log(note) VALUES('sweep: published_posts={d}');",
         .{published_count},
     ) catch return;
-    w.conn.exec(insert_sql) catch |e| {
+    w.exec(insert_sql) catch |e| {
         std.log.warn("[audit-sweep] audit insert failed: {s}", .{@errorName(e)});
     };
 }
