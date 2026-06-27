@@ -15,6 +15,7 @@ const id_gen = @import("id.zig");
 const scheduler = @import("scheduler.zig");
 const schedule = @import("schedule.zig");
 const clock = @import("clock.zig");
+const entropy_mod = @import("entropy.zig");
 const mail = @import("mail/mailer.zig");
 const provision = @import("provision.zig");
 const schema = @import("schema.zig");
@@ -845,6 +846,10 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     // expiry, scheduling, challenge/cursor TTLs — reads the override. No-op + null on a prod
     // build (the gate is comptime-off; see clock.zig).
     clock.install(cfg.fake_now_unix);
+    // Install the dev-only seeded entropy (ZIGBASE_FAKE_SEED) so ID/token generation uses a
+    // deterministic PRNG seeded from this value for reproducible snapshot tests. No-op + null
+    // on a prod build (the gate is comptime-off; see entropy.zig).
+    entropy_mod.install(cfg.fake_seed);
     if (std.mem.eql(u8, cfg.http_host, "0.0.0.0") or std.mem.eql(u8, cfg.http_host, "::")) {
         std.log.warn("binding to all interfaces ({s}); ensure a firewall/reverse proxy is in front (default is loopback 127.0.0.1)", .{cfg.http_host});
     }

@@ -1655,6 +1655,64 @@ a **fatal startup error** naming the path.
 See [examples/blog/](../examples/blog/) (runtime flag), [examples/golfsim/](../examples/golfsim/)
 (hardcoded dir), and [examples/plugins/](../examples/plugins/) (embedded).
 
+## 14. Test / dev-mode determinism seams
+
+Two env vars (dev builds only) make a test suite reproducible. Both are compiled out
+entirely in production — a release binary never reads either var.
+
+### Freezing time: `ZIGBASE_FAKE_NOW`
+
+Set `ZIGBASE_FAKE_NOW` to an ISO-8601 UTC instant (e.g. `2029-03-07T16:00:00Z`) to
+freeze the framework's clock for the lifetime of the process. Every framework-controlled
+timestamp routes through the seam:
+
+- Token `iat` / `exp` (JWT auth tokens).
+- The scheduler's next-fire math (cron / interval jobs).
+- Auth rate-limiter wall clock.
+- Auth-challenge and keyset-cursor TTL/expiry checks.
+- A consumer's own `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')` /
+  `date('now')` / `time('now')` / `julianday('now')` in raw SQL — those date/time
+  functions are shadowed on every connection and resolve to the frozen instant when a
+  freeze is active.
+
+```sh
+ZIGBASE_FAKE_NOW="2029-03-07T16:00:00Z" ./zigbase serve ...
+```
+
+**Not covered:** `CURRENT_TIMESTAMP` / `CURRENT_TIME` / `CURRENT_DATE` and SQLite
+column `DEFAULT` timestamps — these are SQL keywords that read SQLite's time directly
+and cannot be overridden via a user-defined function.
+
+### Seeding entropy: `ZIGBASE_FAKE_SEED`
+
+Set `ZIGBASE_FAKE_SEED` to a decimal `u64` (e.g. `12345`) to plant a deterministic
+Xoshiro256++ PRNG as the entropy source for ID/token generation. Every record ID,
+field ID, and token key generated in the process comes from that seeded PRNG instead of
+the OS CSPRNG, so two runs with the same seed produce byte-for-byte identical IDs and
+tokens — useful for snapshot tests.
+
+```sh
+ZIGBASE_FAKE_SEED=12345 ./zigbase serve ...
+```
+
+The seam routes through `src/id.generate`, covering:
+- Collection IDs and field IDs (provisioning, record creates).
+- `tokenKey` per auth record and the OAuth2 CSRF state value.
+
+Other randomness (AEAD nonces, OTP digits, WebAuthn challenges) is **not** routed
+through this seam — those are security-critical at runtime and seeding them is unsafe.
+
+### Production gate
+
+Both seams are compiled in ONLY when the `dev_clock` build option is `true` (the
+default in `Debug` builds). The release script forces `-Ddev-clock=false` for all
+shipped binaries, so a production binary has the override code comptime-eliminated:
+
+- `ZIGBASE_FAKE_NOW` is never read; the clock always returns wall time.
+- `ZIGBASE_FAKE_SEED` is never read; ID/token generation always uses the OS CSPRNG.
+
+You can also force the prod-safe behavior explicitly: `zig build -Ddev-clock=false`.
+
 ## Exported names reference
 
 The public surface (from `src/root.zig`):
