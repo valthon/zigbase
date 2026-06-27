@@ -2,6 +2,7 @@ const std = @import("std");
 
 const App = @import("app.zig").App;
 const request = @import("request.zig");
+const Ctx = @import("ctx.zig").Ctx;
 const Data = @import("data.zig").Data;
 const db = @import("db.zig");
 const sentry = @import("sentry.zig");
@@ -109,6 +110,14 @@ pub const RecordEvent = struct {
     collection: []const u8,
     record: *std.json.Value, // mutable in before_*; the persisted record in after_*
     phase: RecordPhase,
+
+    /// Returns a `Ctx` bound to this hook's in-transaction connection. CRITICAL:
+    /// `bound_conn` is set to `ev.data.conn` so all ctx ops reuse the hook's
+    /// connection and never attempt to re-acquire the pool writer (which would
+    /// deadlock, since the hook already holds it).
+    pub fn caps(ev: *RecordEvent) Ctx {
+        return .{ .app = ev.app, .arena = ev.arena, .rctx = ev.ctx.*, .bound_conn = ev.data.conn };
+    }
 };
 
 pub const ErrorPhase = enum { request, before_hook, after_hook, cron, job, file_serve };
@@ -156,6 +165,13 @@ pub const RouteEvent = struct {
         var w = ev.writer();
         defer w.deinit();
         return @import("auth_helpers.zig").issueSession(ev.ctx, w.conn, collection, record_id);
+    }
+
+    /// Returns a `Ctx` for this route handler. Uses the request arena (`ev.ctx.allocator`)
+    /// and carries the resolved auth context (`ev.rctx`). `bound_conn` is null — the
+    /// ctx will lazily acquire a reader or writer from the pool as needed.
+    pub fn caps(ev: *RouteEvent) Ctx {
+        return .{ .app = ev.app, .arena = ev.ctx.allocator, .rctx = ev.rctx, .bound_conn = null };
     }
 };
 pub const RouteHandler = *const fn (ev: *RouteEvent) anyerror!http.Response;
@@ -206,6 +222,13 @@ pub const LifecycleEvent = struct {
     pub fn reader(ev: *LifecycleEvent) db.DbError!ReaderData {
         return acquireReader(ev.app);
     }
+
+    /// Returns a `Ctx` for this lifecycle handler. Uses the app allocator and an
+    /// anonymous (unauthenticated) request context. `bound_conn` is null — the ctx
+    /// will lazily acquire a reader or writer from the pool as needed.
+    pub fn caps(ev: *LifecycleEvent) Ctx {
+        return .{ .app = ev.app, .arena = ev.app.allocator, .rctx = .{}, .bound_conn = null };
+    }
 };
 pub const LifecycleHandler = *const fn (ev: *LifecycleEvent) void;
 
@@ -222,6 +245,13 @@ pub const JobEvent = struct {
     /// `var r = try ev.reader(); defer r.deinit(); _ = try r.data().findById(...);`.
     pub fn reader(ev: *JobEvent) db.DbError!ReaderData {
         return acquireReader(ev.app);
+    }
+
+    /// Returns a `Ctx` for this job. Uses the app allocator and an anonymous
+    /// (unauthenticated) request context. `bound_conn` is null — the ctx will
+    /// lazily acquire a reader or writer from the pool as needed.
+    pub fn caps(ev: *JobEvent) Ctx {
+        return .{ .app = ev.app, .arena = ev.app.allocator, .rctx = .{}, .bound_conn = null };
     }
 };
 pub const JobTask = *const fn (ev: *JobEvent) anyerror!void;
@@ -817,6 +847,22 @@ test "RouteEvent.writer() create round-trips and releases the writer (no leak)" 
         defer env.pool.releaseWriter();
         _ = w2;
     }
+}
+
+test "RecordEvent.caps() binds to the hook's connection (no pool acquisition)" {
+    const env = try TestEnv.init();
+    defer env.deinit();
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+
+    var rec: std.json.Value = .{ .object = .empty };
+    var ev = RecordEvent{
+        .app = &env.app, .ctx = &.{}, .data = .{ .app = &env.app, .conn = w, .io = env.app.io },
+        .arena = env.arena.allocator(), .collection = "posts", .record = &rec, .phase = .before_create,
+    };
+    var ctx = ev.caps();
+    defer ctx.deinit();
+    try std.testing.expect(ctx.bound_conn == w);
 }
 
 test "JobEvent.reader() sees a committed write and returns the conn to the pool (no leak)" {
