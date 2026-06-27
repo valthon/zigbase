@@ -850,6 +850,16 @@ POST /api/collections/staff/auth/webauthn/register/finish (authed)
 
 The dispatch enforces enablement: a disabled or unknown method slug returns `404`.
 
+**Typed TS client.** `zig build gen-client` emits a typed `client.auth.<collection>.<method>` surface for every enabled non-password method (camelCased, e.g. `client.auth.members.magicLink`). For the three **built-in** methods the generated `initiate`/`complete` carry precise input/result types (the server contracts are fixed):
+
+| Method | `initiate(input)` | `initiate` result | `complete(input)` | `complete` result |
+| --- | --- | --- | --- | --- |
+| `magic_link` | `{ identity }` | `void` (204) | `{ token }` | `{ token }` |
+| `otp` | `{ identity }` | `void` (204) | `{ identity, code }` | `{ token }` |
+| `webauthn` | `{ identity? }` | `{ challenge, rpId, ceremonyId, timeout }` | `{ ceremonyId, credentialId, authenticatorData, clientDataJSON, signature }` | `{ token }` |
+
+Every built-in `complete` resolves to `{ token }` (`AuthMethodResult`); the session cookies (`zb_auth`/`zb_csrf`) are also set on the response. **Custom methods** (`.custom` slugs) stay on untyped `Record<string, unknown>` / `unknown` stubs — they carry no comptime type info today (a typed-I/O declaration API for custom methods is a planned follow-up).
+
 ### Custom `AuthMethod` plugin (`.auth_methods`)
 
 For verification logic that the built-ins don't cover, implement an `AuthMethod` plugin type and register it at the app level:

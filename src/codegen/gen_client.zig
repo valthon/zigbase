@@ -150,6 +150,9 @@ fn emitClientFactory(
     if (routes_len > 0) {
         try w.appendSlice(alloc, rpc_section.decls);
     }
+    // Emit the shared built-in auth-method I/O interfaces before the client interface
+    // (only for built-ins actually enabled across the collections).
+    if (has_auth_methods) try emitAuthMethodIODecls(alloc, w, cols);
     // BlogClient-style interface
     try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "export interface {s} {{\n  db: {{\n", .{client_name}));
     for (cols) |c| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: {s};\n", .{ c.name, try ident.serviceName(alloc, c.name) }));
@@ -329,11 +332,148 @@ fn anyNonPasswordAuthMethods(cols: []const schema.Collection) bool {
     return false;
 }
 
+/// Typed I/O descriptor for a built-in auth method. The three built-ins
+/// (magic_link, otp, webauthn) have FIXED server-side request/response contracts
+/// (see src/auth/methods/*.zig + src/api/auth_methods.zig), so the generator can
+/// emit precise TS types. Custom methods (m.custom slugs) carry no type info and
+/// stay on the untyped `Record<string, unknown>`/`unknown` stubs (see below).
+const BuiltinIO = struct {
+    /// camelCase accessor name on `client.auth.<col>.<camel>`.
+    camel: []const u8,
+    /// TS type of the `initiate` input body.
+    init_input: []const u8,
+    /// TS type the `initiate` promise resolves to.
+    init_result: []const u8,
+    /// TS type of the `complete` input body.
+    complete_input: []const u8,
+    /// TS type the `complete` promise resolves to.
+    complete_result: []const u8,
+};
+
+/// Map a built-in slug to its typed I/O contract. Returns null for custom slugs.
+///
+/// Contracts derived directly from the handlers:
+///   - magic_link: initiate reads {identity} → 204 (void); complete reads {token}
+///     → 200 {token} (src/auth/methods/magic_link.zig).
+///   - otp: initiate reads {identity} → 204 (void); complete reads {identity, code}
+///     → 200 {token} (src/auth/methods/otp.zig).
+///   - webauthn: initiate reads optional {identity} → 200
+///     {challenge, rpId, ceremonyId, timeout}; complete reads
+///     {ceremonyId, credentialId, authenticatorData, clientDataJSON, signature}
+///     → 200 {token} (src/auth/methods/webauthn.zig).
+/// All three `complete` paths return `{token}` (AuthMethodResult) — the session is
+/// also set via cookies by src/api/auth_methods.zig's dispatch().
+fn builtinIO(slug: []const u8) ?BuiltinIO {
+    if (std.mem.eql(u8, slug, "magic_link")) return .{
+        .camel = "magicLink",
+        .init_input = "MagicLinkInitiateInput",
+        .init_result = "void",
+        .complete_input = "MagicLinkCompleteInput",
+        .complete_result = "AuthMethodResult",
+    };
+    if (std.mem.eql(u8, slug, "otp")) return .{
+        .camel = "otp",
+        .init_input = "OtpInitiateInput",
+        .init_result = "void",
+        .complete_input = "OtpCompleteInput",
+        .complete_result = "AuthMethodResult",
+    };
+    if (std.mem.eql(u8, slug, "webauthn")) return .{
+        .camel = "webauthn",
+        .init_input = "WebAuthnInitiateInput",
+        .init_result = "WebAuthnInitiateResult",
+        .complete_input = "WebAuthnCompleteInput",
+        .complete_result = "AuthMethodResult",
+    };
+    return null;
+}
+
+/// Emit the shared TS interfaces for the built-in auth-method I/O contracts that
+/// are actually enabled across `cols`. These are global (the contract is the same
+/// regardless of which collection enables the method), so they are emitted once,
+/// just before the client interface. `AuthMethodResult` is shared by every
+/// built-in `complete`.
+fn emitAuthMethodIODecls(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection) !void {
+    var any_ml = false;
+    var any_otp = false;
+    var any_wa = false;
+    for (cols) |c| {
+        if (c.type != .auth) continue;
+        const m = c.options.auth.methods;
+        if (m.magic_link != null) any_ml = true;
+        if (m.otp != null) any_otp = true;
+        if (m.webauthn != null) any_wa = true;
+    }
+    if (!any_ml and !any_otp and !any_wa) return;
+
+    try section(alloc, w, "Built-in auth method I/O");
+    // Shared success result for every built-in `complete` (the session is also set
+    // via zb_auth/zb_csrf cookies on the response).
+    try w.appendSlice(alloc,
+        \\export interface AuthMethodResult {
+        \\  /** Session JWT. Session cookies (zb_auth/zb_csrf) are also set on the response. */
+        \\  token: string;
+        \\}
+        \\
+    );
+    if (any_ml) try w.appendSlice(alloc,
+        \\export interface MagicLinkInitiateInput {
+        \\  /** Email/identity to send the single-use sign-in link to. */
+        \\  identity: string;
+        \\}
+        \\export interface MagicLinkCompleteInput {
+        \\  /** The single-use link token delivered by email. */
+        \\  token: string;
+        \\}
+        \\
+    );
+    if (any_otp) try w.appendSlice(alloc,
+        \\export interface OtpInitiateInput {
+        \\  /** Email/identity to send the one-time code to. */
+        \\  identity: string;
+        \\}
+        \\export interface OtpCompleteInput {
+        \\  identity: string;
+        \\  /** The one-time numeric code delivered by email. */
+        \\  code: string;
+        \\}
+        \\
+    );
+    if (any_wa) try w.appendSlice(alloc,
+        \\export interface WebAuthnInitiateInput {
+        \\  /** Optional identity; omit for a usernameless (discoverable) login. */
+        \\  identity?: string;
+        \\}
+        \\export interface WebAuthnInitiateResult {
+        \\  /** base64url-encoded random challenge to sign. */
+        \\  challenge: string;
+        \\  rpId: string;
+        \\  /** Opaque id correlating this initiate with the matching complete. */
+        \\  ceremonyId: string;
+        \\  /** Ceremony timeout in milliseconds. */
+        \\  timeout: number;
+        \\}
+        \\export interface WebAuthnCompleteInput {
+        \\  ceremonyId: string;
+        \\  /** base64url credential id of the passkey used. */
+        \\  credentialId: string;
+        \\  /** base64url authenticatorData from the assertion. */
+        \\  authenticatorData: string;
+        \\  /** base64url clientDataJSON from the assertion. */
+        \\  clientDataJSON: string;
+        \\  /** base64url signature from the assertion. */
+        \\  signature: string;
+        \\}
+        \\
+    );
+}
+
 /// Emit the `auth` surface for non-password auth methods into both the interface
 /// and factory sections.
 /// Naming: client.auth.<colName>.<methodCamelCase>.initiate / .complete
-/// Posts to /api/collections/<col>/auth/<slug>/initiate|complete (untyped stubs).
-// TODO(typed): emit typed Initiate/Complete I/O once methods declare comptime types
+/// Posts to /api/collections/<col>/auth/<slug>/initiate|complete.
+/// Built-in methods (magic_link/otp/webauthn) get precise typed I/O (see
+/// builtinIO + emitAuthMethodIODecls); custom slugs keep the untyped stubs.
 fn emitAuthMethodEndpoints(
     alloc: std.mem.Allocator,
     w_iface: *W, // receives the auth: { ... } interface body
@@ -369,8 +509,41 @@ fn emitAuthMethodEndpoints(
         // Collect slugs of enabled non-password methods.
         const m = c.options.auth.methods;
 
-        // Helper: emit interface + factory lines for one slug.
-        const emit_slug = struct {
+        // Helper: emit TYPED interface + factory lines for one built-in slug.
+        const emit_builtin = struct {
+            fn emit(
+                a: std.mem.Allocator,
+                wi: *W,
+                wf: *W,
+                col_name: []const u8,
+                slug: []const u8,
+                prefix: []const u8,
+                io: BuiltinIO,
+            ) !void {
+                // Interface member
+                try wi.appendSlice(a, try std.fmt.allocPrint(a,
+                    \\      {0s}: {{
+                    \\        initiate(input: {1s}, opts?: SendOptions): Promise<{2s}>;
+                    \\        complete(input: {3s}, opts?: SendOptions): Promise<{4s}>;
+                    \\      }};
+                    \\
+                , .{ io.camel, io.init_input, io.init_result, io.complete_input, io.complete_result }));
+                // Factory member — explicit send<T> type args so the object literal
+                // is assignable to the typed interface above.
+                try wf.appendSlice(a, try std.fmt.allocPrint(a,
+                    \\        {0s}: {{
+                    \\          initiate: (input: {4s}, opts?: SendOptions): Promise<{5s}> =>
+                    \\            base.send<{5s}>("POST", `{1s}/collections/{2s}/auth/{3s}/initiate`, {{ body: input, ...opts }}),
+                    \\          complete: (input: {6s}, opts?: SendOptions): Promise<{7s}> =>
+                    \\            base.send<{7s}>("POST", `{1s}/collections/{2s}/auth/{3s}/complete`, {{ body: input, ...opts }}),
+                    \\        }},
+                    \\
+                , .{ io.camel, prefix, col_name, slug, io.init_input, io.init_result, io.complete_input, io.complete_result }));
+            }
+        }.emit;
+
+        // Helper: emit UNTYPED interface + factory lines for one custom slug.
+        const emit_custom = struct {
             fn emit(
                 a: std.mem.Allocator,
                 wi: *W,
@@ -383,7 +556,10 @@ fn emitAuthMethodEndpoints(
                 // Interface member
                 try wi.appendSlice(a, try std.fmt.allocPrint(a,
                     \\      {0s}: {{
-                    \\        // TODO(typed): emit typed Initiate/Complete I/O once methods declare comptime types
+                    \\        // TODO(typed): custom auth methods carry no type info (m.custom is bare
+                    \\        // slug strings). Typing these needs a comptime typed-I/O declaration API
+                    \\        // — m.custom entries carrying comptime Input/Output Zig types the generator
+                    \\        // can reflect. Until then these stay untyped.
                     \\        initiate(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;
                     \\        complete(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;
                     \\      }};
@@ -402,10 +578,10 @@ fn emitAuthMethodEndpoints(
             }
         }.emit;
 
-        if (m.magic_link != null) try emit_slug(alloc, w_iface, w_factory, c.name, "magic_link", api_prefix);
-        if (m.otp != null) try emit_slug(alloc, w_iface, w_factory, c.name, "otp", api_prefix);
-        if (m.webauthn != null) try emit_slug(alloc, w_iface, w_factory, c.name, "webauthn", api_prefix);
-        for (m.custom) |slug| try emit_slug(alloc, w_iface, w_factory, c.name, slug, api_prefix);
+        if (m.magic_link != null) try emit_builtin(alloc, w_iface, w_factory, c.name, "magic_link", api_prefix, builtinIO("magic_link").?);
+        if (m.otp != null) try emit_builtin(alloc, w_iface, w_factory, c.name, "otp", api_prefix, builtinIO("otp").?);
+        if (m.webauthn != null) try emit_builtin(alloc, w_iface, w_factory, c.name, "webauthn", api_prefix, builtinIO("webauthn").?);
+        for (m.custom) |slug| try emit_custom(alloc, w_iface, w_factory, c.name, slug, api_prefix);
 
         // Interface: close colName
         try w_iface.appendSlice(alloc, "    };\n");
@@ -617,8 +793,8 @@ test "guards run inside generate: operator-named relation target errors" {
     try std.testing.expectError(guards.GuardError.OperatorNameClash, generate(a, cols, &.{}, true, "", "ZbClient", "/api"));
 }
 
-test "auth-method endpoints: magic_link emits initiate/complete stubs; password emits nothing" {
-    // Verifies that emitAuthMethodEndpoints generates initiate/complete stubs for non-password methods.
+test "auth-method endpoints: magic_link emits TYPED initiate/complete; password emits nothing" {
+    // Verifies that emitAuthMethodEndpoints generates TYPED initiate/complete for built-ins.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -639,6 +815,17 @@ test "auth-method endpoints: magic_link emits initiate/complete stubs; password 
     try std.testing.expect(std.mem.indexOf(u8, out_ml, "/auth/magic_link/complete") != null);
     // Should contain the camelCase method name
     try std.testing.expect(std.mem.indexOf(u8, out_ml, "magicLink") != null);
+    // Typed I/O: shared interfaces emitted + referenced (no untyped Record stub).
+    inline for (.{
+        "export interface AuthMethodResult {",
+        "export interface MagicLinkInitiateInput {",
+        "export interface MagicLinkCompleteInput {",
+        "initiate(input: MagicLinkInitiateInput, opts?: SendOptions): Promise<void>;",
+        "complete(input: MagicLinkCompleteInput, opts?: SendOptions): Promise<AuthMethodResult>;",
+        "base.send<AuthMethodResult>(\"POST\", `/api/collections/members/auth/magic_link/complete`",
+    }) |needle| try std.testing.expect(std.mem.indexOf(u8, out_ml, needle) != null);
+    // Built-ins must NOT carry the untyped stub.
+    try std.testing.expect(std.mem.indexOf(u8, out_ml, "Record<string, unknown>") == null);
 
     // An auth collection with ONLY password — no non-password stubs.
     const pw_cols = try a.dupe(schema.Collection, &.{
@@ -655,4 +842,73 @@ test "auth-method endpoints: magic_link emits initiate/complete stubs; password 
     try std.testing.expect(std.mem.indexOf(u8, out_pw, "/auth/password/") == null);
     // Should NOT contain an auth namespace on the client interface
     try std.testing.expect(std.mem.indexOf(u8, out_pw, "auth: {") == null);
+    // No auth methods ⇒ none of the shared built-in I/O interfaces are emitted.
+    try std.testing.expect(std.mem.indexOf(u8, out_pw, "export interface AuthMethodResult") == null);
+}
+
+test "auth-method endpoints: otp + webauthn emit precise typed I/O" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cols = try a.dupe(schema.Collection, &.{
+        .{
+            .id = "",
+            .name = "users",
+            .type = .auth,
+            .fields = &.{},
+            .options = .{ .auth = .{ .methods = .{
+                .otp = .{},
+                .webauthn = .{ .rp_id = "x.test", .origin = "https://x.test" },
+            } } },
+        },
+    });
+    const out = try generate(a, cols, &.{}, true, "users", "UsersClient", "/api");
+    inline for (.{
+        // OTP typed I/O
+        "export interface OtpInitiateInput {",
+        "export interface OtpCompleteInput {",
+        "initiate(input: OtpInitiateInput, opts?: SendOptions): Promise<void>;",
+        "complete(input: OtpCompleteInput, opts?: SendOptions): Promise<AuthMethodResult>;",
+        "  code: string;",
+        // WebAuthn typed I/O — initiate returns a structured challenge, not void.
+        "export interface WebAuthnInitiateInput {",
+        "export interface WebAuthnInitiateResult {",
+        "export interface WebAuthnCompleteInput {",
+        "initiate(input: WebAuthnInitiateInput, opts?: SendOptions): Promise<WebAuthnInitiateResult>;",
+        "complete(input: WebAuthnCompleteInput, opts?: SendOptions): Promise<AuthMethodResult>;",
+        "  ceremonyId: string;",
+        "  challenge: string;",
+        "  rpId: string;",
+        "  timeout: number;",
+        "  credentialId: string;",
+        "  signature: string;",
+    }) |needle| try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
+    // No built-in carries the untyped stub.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Record<string, unknown>") == null);
+}
+
+test "auth-method endpoints: custom slugs stay untyped with a follow-up TODO" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cols = try a.dupe(schema.Collection, &.{
+        .{
+            .id = "",
+            .name = "users",
+            .type = .auth,
+            .fields = &.{},
+            .options = .{ .auth = .{ .methods = .{ .custom = &.{"my_method"} } } },
+        },
+    });
+    const out = try generate(a, cols, &.{}, true, "users", "UsersClient", "/api");
+    // Custom slug present + camelCased.
+    try std.testing.expect(std.mem.indexOf(u8, out, "/auth/my_method/initiate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "myMethod") != null);
+    // Custom methods keep the untyped stub + the precise follow-up TODO.
+    try std.testing.expect(std.mem.indexOf(u8, out, "initiate(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "comptime typed-I/O declaration API") != null);
+    // No built-in I/O interfaces are emitted when only custom methods exist.
+    try std.testing.expect(std.mem.indexOf(u8, out, "export interface AuthMethodResult") == null);
 }
