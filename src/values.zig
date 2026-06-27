@@ -170,7 +170,12 @@ pub fn readValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
             .fixed => return .{ .string = try scaledIntToDecimal(alloc, stmt.columnInt(idx), o.scale orelse 0) },
         },
         .json => {
-            const txt = try readStorage(alloc, stmt, idx, field);
+            // Fast path: parseFromSlice copies into `alloc` during the parse and the
+            // columnText slice stays valid for that call, so a non-encrypted JSON value
+            // needs no intermediate dup. Only route through readStorage (decrypt) when
+            // the field is encrypted. (The text/string branch still MUST dup —
+            // columnText is invalidated on the next stmt.step.)
+            const txt = if (field.encrypted) try readStorage(alloc, stmt, idx, field) else stmt.columnText(idx);
             return (try std.json.parseFromSlice(std.json.Value, alloc, txt, .{})).value;
         },
         .select, .relation, .file => {
