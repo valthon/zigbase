@@ -832,22 +832,30 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .rate_limiter = if (cfg.rate_limit_max == 0) null else &rate_limiter,
     };
     const Ctx = @import("ctx.zig").Ctx;
+    // Each lifecycle hook gets a per-invocation arena owning any ctx.records()
+    // results, declared before cx so its deinit runs last (LIFO).
     if (dispatch.on_bootstrap) |h| {
         var ev = events.LifecycleEvent{ .app = &app };
-        var cx = Ctx{ .app = &app, .arena = allocator, .rctx = .{}, .request = null, .bound_conn = null };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
         h(&cx, &ev);
     }
     if (dispatch.on_before_serve) |h| {
         var ev = events.LifecycleEvent{ .app = &app };
-        var cx = Ctx{ .app = &app, .arena = allocator, .rctx = .{}, .request = null, .bound_conn = null };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
         h(&cx, &ev);
     }
     // before_terminate fires when listen() returns (graceful shutdown / error).
     defer if (dispatch.on_before_terminate) |h| {
         var ev = events.LifecycleEvent{ .app = &app };
-        var cx = Ctx{ .app = &app, .arena = allocator, .rctx = .{}, .request = null, .bound_conn = null };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
         h(&cx, &ev);
     };

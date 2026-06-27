@@ -173,7 +173,7 @@ pub const Records = struct {
     ctx: *Ctx,
 
     fn dataRead(self: Records) !Data {
-        return .{ .app = self.ctx.app, .conn = try self.ctx.connForRead(), .io = self.ctx.app.io };
+        return .{ .app = self.ctx.app, .conn = try self.ctx.connForRead(), .io = self.ctx.app.io, .alloc = self.ctx.arena };
     }
 
     pub fn get(self: Records, collection: []const u8, id: []const u8, opts: GetOptions) !?std.json.Value {
@@ -197,9 +197,9 @@ pub const Records = struct {
         const result = try (try self.dataRead()).list(collection, q);
         if (opts.expand) |spec| if (spec.len > 0) {
             const conn = try self.ctx.connForRead();
-            if (try collections.get(self.ctx.app.allocator, conn, collection)) |col| {
+            if (try collections.get(self.ctx.arena, conn, collection)) |col| {
                 for (result.items) |*item| {
-                    try expand_mod.expand(self.ctx.app.allocator, conn, col, item, spec, 0, &self.ctx.rctx);
+                    try expand_mod.expand(self.ctx.arena, conn, col, item, spec, 0, &self.ctx.rctx);
                 }
             }
         };
@@ -208,26 +208,26 @@ pub const Records = struct {
 
     pub fn create(self: Records, collection: []const u8, value: std.json.Value) !std.json.Value {
         if (self.ctx.bound_conn) |c|
-            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).create(collection, value);
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).create(collection, value);
         const c = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).create(collection, value);
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).create(collection, value);
     }
 
     pub fn update(self: Records, collection: []const u8, id: []const u8, value: std.json.Value) !?std.json.Value {
         if (self.ctx.bound_conn) |c|
-            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).update(collection, id, value);
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).update(collection, id, value);
         const c = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).update(collection, id, value);
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).update(collection, id, value);
     }
 
     pub fn delete(self: Records, collection: []const u8, id: []const u8) !bool {
         if (self.ctx.bound_conn) |c|
-            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).delete(collection, id);
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).delete(collection, id);
         const c = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io }).delete(collection, id);
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).delete(collection, id);
     }
 
     /// Resolve the collection and run expand on `rec` in-place.
@@ -238,8 +238,8 @@ pub const Records = struct {
         const s = spec orelse return;
         if (s.len == 0) return;
         const conn = try self.ctx.connForRead();
-        const col = (try collections.get(self.ctx.app.allocator, conn, collection)) orelse return;
-        try expand_mod.expand(self.ctx.app.allocator, conn, col, rec, s, 0, &self.ctx.rctx);
+        const col = (try collections.get(self.ctx.arena, conn, collection)) orelse return;
+        try expand_mod.expand(self.ctx.arena, conn, col, rec, s, 0, &self.ctx.rctx);
     }
 };
 
@@ -376,7 +376,7 @@ test "ctx.records.list returns created rows; get fetches one by id" {
     const id = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        const d = Data{ .app = &env.app, .conn = w, .io = env.app.io };
+        const d = Data{ .app = &env.app, .conn = w, .io = env.app.io, .alloc = a };
         var o1: std.json.ObjectMap = .empty;
         try o1.put(a, "title", .{ .string = "alpha" });
         const c1 = try d.create("posts", .{ .object = o1 });
@@ -394,6 +394,44 @@ test "ctx.records.list returns created rows; get fetches one by id" {
 
     const one = (try ctx.records().get("posts", id, .{})).?;
     try std.testing.expectEqualStrings("alpha", one.object.get("title").?.string);
+}
+
+test "ctx.records() allocates results on the ctx arena, not app.allocator (no GPA leak)" {
+    // Regression: ctx.records() used to allocate results on app.allocator (the GPA),
+    // leaking them on the job/route path. Prove results now land on the per-invocation
+    // ctx arena: point app.allocator at the leak-checked testing allocator, run records
+    // ops through a job-style ctx whose arena is a SEPARATE arena, then deinit ONLY that
+    // arena. If any result allocated on app.allocator, std.testing.allocator would flag a
+    // leak at test end; the clean exit proves nothing escaped to the GPA.
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const seed_a = env.arena.allocator();
+
+    const id = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const d = Data{ .app = &env.app, .conn = w, .io = env.app.io, .alloc = seed_a };
+        var o1: std.json.ObjectMap = .empty;
+        try o1.put(seed_a, "title", .{ .string = "alpha" });
+        const c1 = try d.create("posts", .{ .object = o1 });
+        break :blk try seed_a.dupe(u8, c1.object.get("id").?.string);
+    };
+
+    // From here, app.allocator is the raw leak-checked testing allocator: any result that
+    // leaks to it (instead of the ctx arena) is caught.
+    env.app.allocator = std.testing.allocator;
+
+    var job_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var ctx = Ctx{ .app = &env.app, .arena = job_arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+    {
+        defer ctx.deinit(); // releases the pooled reader first
+        const page = try ctx.records().list("posts", .{ .sort = "title" });
+        try std.testing.expectEqual(@as(usize, 1), page.items.len);
+        try std.testing.expectEqualStrings("alpha", page.items[0].object.get("title").?.string);
+        const one = (try ctx.records().get("posts", id, .{})).?;
+        try std.testing.expectEqualStrings("alpha", one.object.get("title").?.string);
+    }
+    job_arena.deinit(); // frees all result memory; nothing should remain on app.allocator
 }
 
 test "Ctx(bound) uses the bound connection and never acquires from the pool" {
@@ -485,7 +523,7 @@ test "ctx.records expand nests the related record under \"expand\"" {
     const post_id = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        const d = Data{ .app = &env.app, .conn = w, .io = env.app.io };
+        const d = Data{ .app = &env.app, .conn = w, .io = env.app.io, .alloc = a };
         var ao: std.json.ObjectMap = .empty;
         try ao.put(a, "name", .{ .string = "Ada" });
         const author = try d.create("authors", .{ .object = ao });

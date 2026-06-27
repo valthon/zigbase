@@ -279,8 +279,13 @@ pub const Scheduler = struct {
             var ev = events.JobEvent{ .app = self.app, .name = job.name };
             // Build a per-invocation Ctx: jobs have no HTTP request and no auth
             // (anonymous rctx); reads/writes go through ctx.records(), which lazily
-            // acquires from the pool. deinit() releases any cached reader.
-            var cx = Ctx{ .app = self.app, .arena = self.app.allocator, .rctx = .{}, .request = null, .bound_conn = null };
+            // acquires from the pool. A per-invocation arena owns the results
+            // ctx.records() allocates so they're freed when the job returns (no
+            // GPA leak). Declared before cx so arena.deinit runs AFTER cx.deinit
+            // (LIFO): cx.deinit only releases the pooled reader, arena frees results.
+            var arena = std.heap.ArenaAllocator.init(self.app.allocator);
+            defer arena.deinit();
+            var cx = Ctx{ .app = self.app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
             defer cx.deinit();
             if (job.run(&cx, &ev)) |result| {
                 // SUCCESS: resume the normal schedule (resets the backoff counter).
@@ -305,9 +310,14 @@ pub const Scheduler = struct {
         const Holder = struct {
             fn go(a: *App, n: []const u8, t: events.JobTask) void {
                 var ev = events.JobEvent{ .app = a, .name = n };
-                // The Ctx is built INSIDE the detached thread so its lifetime is the
-                // task's, not the submitting thread's — and never shared across threads.
-                var cx = Ctx{ .app = a, .arena = a.allocator, .rctx = .{}, .request = null, .bound_conn = null };
+                // The Ctx (and its per-invocation arena) is built INSIDE the detached
+                // thread so its lifetime is the task's, not the submitting thread's —
+                // and never shared across threads. The arena owns ctx.records()
+                // results; declared before cx so its deinit runs last (frees results
+                // after cx.deinit releases the pooled reader).
+                var arena = std.heap.ArenaAllocator.init(a.allocator);
+                defer arena.deinit();
+                var cx = Ctx{ .app = a, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
                 defer cx.deinit();
                 t(&cx, &ev) catch |e| {
                     var err_ev = events.ErrorEvent{ .app = a, .ctx = null, .err = e, .phase = .job, .message = @errorName(e) };

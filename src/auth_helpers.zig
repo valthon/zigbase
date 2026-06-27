@@ -162,7 +162,7 @@ test "data.create provisions a usable auth row: mintLinkToken + issueSession suc
     // with the test arena rather than the leak-checked testing allocator.
     var app = h.app;
     app.allocator = a;
-    const d = Data{ .app = &app, .conn = w, .io = app.io };
+    const d = Data{ .app = &app, .conn = w, .io = app.io, .alloc = a };
     var fields: std.json.ObjectMap = .empty;
     try fields.put(a, "email", .{ .string = "pw-less@x.io" });
     const created = try d.create("members", .{ .object = fields });
@@ -203,7 +203,7 @@ test "data.create on a non-auth collection inserts plainly (no provisioning)" {
     });
 
     var app = app_mod.App{ .allocator = a, .io = io, .pool = undefined };
-    const d = Data{ .app = &app, .conn = &conn, .io = io };
+    const d = Data{ .app = &app, .conn = &conn, .io = io, .alloc = a };
     var fields: std.json.ObjectMap = .empty;
     try fields.put(a, "title", .{ .string = "hi" });
     // Non-auth: plain insert, no tokenKey transform — the value is stored as given.

@@ -46,7 +46,7 @@ pub const WriterData = struct {
 
     /// A `Data` bound to the acquired writer connection. Valid until `deinit()`.
     pub fn data(self: *WriterData) Data {
-        return .{ .app = self.app, .conn = self.conn, .io = self.app.io };
+        return .{ .app = self.app, .conn = self.conn, .io = self.app.io, .alloc = self.app.allocator };
     }
 
     /// Release the writer back to the pool. Call exactly once (use `defer`).
@@ -67,7 +67,7 @@ pub const ReaderData = struct {
     /// returned `Data.conn` points at this handle's own (stable) `conn` field
     /// rather than a dangling stack copy; the handle must outlive the `Data`.
     pub fn data(self: *ReaderData) Data {
-        return .{ .app = self.app, .conn = &self.conn, .io = self.app.io };
+        return .{ .app = self.app, .conn = &self.conn, .io = self.app.io, .alloc = self.app.allocator };
     }
 
     /// Return the connection to the pool's warm reader set. Call exactly once
