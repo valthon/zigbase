@@ -163,12 +163,6 @@ pub const RouteEvent = struct {
         return @import("auth_helpers.zig").issueSession(ev.ctx, w.conn, collection, record_id);
     }
 
-    /// Returns a `Ctx` for this route handler. Uses the request arena (`ev.ctx.allocator`)
-    /// and carries the resolved auth context (`ev.rctx`). `bound_conn` is null — the
-    /// ctx will lazily acquire a reader or writer from the pool as needed.
-    pub fn caps(ev: *RouteEvent) Ctx {
-        return .{ .app = ev.app, .arena = ev.ctx.allocator, .rctx = ev.rctx, .bound_conn = null };
-    }
 };
 pub const RouteHandler = *const fn (ctx: *Ctx) anyerror!http.Response;
 

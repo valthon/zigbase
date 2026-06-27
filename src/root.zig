@@ -6,7 +6,6 @@ pub const Runtime = @import("app.zig").App; // runtime app context struct
 pub const Config = @import("config.zig").Config;
 pub const Server = @import("server.zig").Server;
 pub const http = @import("http.zig");
-pub const Data = @import("data.zig").Data;
 pub const events = @import("events.zig");
 pub const schedule = @import("schedule.zig");
 // Pagination: the comptime `.pagination` config types + the cursor token-format selector,
@@ -15,7 +14,6 @@ pub const CursorToken = @import("pagination.zig").CursorToken;
 pub const PaginationConfig = @import("pagination.zig").Config;
 pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
-pub const RouteEvent = events.RouteEvent;
 pub const JobEvent = events.JobEvent; // cron/interval/reactive job + app.submit handlers
 pub const AuthEvent = events.AuthEvent;
 pub const AuthHandler = events.AuthHandler;
