@@ -78,7 +78,9 @@ fn ensureInstalled() void {
     State.wrapper.zName = vfs_name.ptr;
     State.wrapper.pNext = null; // sqlite3_vfs_register manages the linked list.
     State.wrapper.xCurrentTimeInt64 = xCurrentTimeInt64;
-    State.wrapper.xCurrentTime = xCurrentTime;
+    // Only override xCurrentTime if the real VFS provides one; otherwise leave it null so
+    // SQLite uses xCurrentTimeInt64 exclusively and the delegation in xCurrentTime() is safe.
+    if (def.*.xCurrentTime != null) State.wrapper.xCurrentTime = xCurrentTime;
     if (c.sqlite3_vfs_register(&State.wrapper, 0) == c.SQLITE_OK) State.installed = true;
 }
 
@@ -94,7 +96,7 @@ fn xCurrentTimeInt64(_: [*c]c.sqlite3_vfs, out: [*c]c.sqlite3_int64) callconv(.c
     // Defensive: an iVersion-1 base VFS has no xCurrentTimeInt64; derive it from xCurrentTime.
     var r: f64 = 0;
     const rc = real.*.xCurrentTime.?(real, &r);
-    out.* = @intFromFloat(r * @as(f64, @floatFromInt(@as(i64, 86400000))));
+    if (rc == c.SQLITE_OK) out.* = @intFromFloat(r * 86400000.0);
     return rc;
 }
 
