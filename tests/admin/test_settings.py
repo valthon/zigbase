@@ -3,7 +3,6 @@ Admin UI tests for the Settings / Feature Flags section (issue #101).
 
 Covers: navigation, KV create/edit/list, boolean flag toggle, delete.
 """
-import json
 from conftest import login, api_request
 
 
