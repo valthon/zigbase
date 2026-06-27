@@ -138,6 +138,14 @@ fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     // Validate the id before it touches any query (defense-in-depth + consistency).
     if (!isSafeId(id)) return req.fail(400, "Invalid booking id.");
 
+    // Feature-flag kill switch (#88): an operator can freeze all confirmations
+    // instantly by setting the `bookings_frozen` flag (e.g.
+    // `PUT /api/settings/bookings_frozen {"value":"true"}` as a superuser) — no
+    // redeploy, no schema. `ctx.flag` is a typed bool view over the built-in KV
+    // store; an unset flag is false, so the default behavior is unchanged.
+    if (req.ctx.flag("bookings_frozen") catch false)
+        return req.fail(503, "Bookings are temporarily frozen.");
+
     // The caller's auth id (empty string when unauthenticated — the .authed
     // constraint already rejects anonymous callers, but we guard defensively).
     const caller_id = req.auth_id;
@@ -333,6 +341,25 @@ fn calendarFeed(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 }
 
 // ---------------------------------------------------------------------------
+// 6c. Public feature-flag read: GET /api/golfsim/flags/:name
+//
+//    KV/feature flags are superuser-managed and NOT public by default, so a
+//    consumer opts a specific flag into a public read with a one-line custom
+//    route. This returns `{"name":"…","enabled":true|false}` using the typed
+//    `ctx.flag` view over the built-in KV store (#87/#88). Manage the value with
+//    the superuser settings API, e.g. `PUT /api/settings/promo_banner`.
+// ---------------------------------------------------------------------------
+fn flagStatus(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const name = ctx.request.?.param("name") orelse return ctx.errorResponse(ctx.fail(400, "Missing flag name."));
+    const enabled = try ctx.flag(name);
+    var o: std.json.ObjectMap = .empty;
+    try o.put(ctx.arena, "name", .{ .string = name });
+    try o.put(ctx.arena, "enabled", .{ .bool = enabled });
+    const body = try std.json.Stringify.valueAlloc(ctx.arena, std.json.Value{ .object = o }, .{});
+    return .{ .status = 200, .body = body };
+}
+
+// ---------------------------------------------------------------------------
 // 7. File-upload event logger.
 //
 //    Fires after every successful file upload. Signature: fn(*FileEvent) void
@@ -507,6 +534,8 @@ pub const App = zigbase.App(.{
             .{ .method = .POST, .path = "/api/golfsim/logout", .handler = logout, .auth = .public },
             // Untyped raw-response route (text/calendar) — see `calendarFeed`. Not in `zb.rpc.*`.
             .{ .method = .GET, .path = "/api/golfsim/calendar.ics", .handler = calendarFeed, .auth = .public },
+            // Public read of a single feature flag — see `flagStatus`. Untyped (raw JSON).
+            .{ .method = .GET, .path = "/api/golfsim/flags/:name", .handler = flagStatus, .auth = .public },
         },
         .jobs = .{ .pool_size = 2 },
         .cron = .{

@@ -22,9 +22,13 @@
 //! - The auth rate-limiter wall clock (`api/auth.wallNowUnix`).
 //! - SQL `now` the framework issues for its OWN logic: token `iat`/`exp` (`api/auth`,
 //!   `auth`), the auth-challenge TTL/expiry checks, the records keyset-cursor `now`.
-//! NOT honored (documented in KNOWN_LIMITATIONS.md): a `datetime('now')`/`unixepoch('now')`
-//! a *consumer* embeds in their own custom SQL, or SQLite column DEFAULTs — those still read
-//! the OS clock. The override governs the framework's clock, not SQLite's global clock.
+//! - A *consumer's* raw `datetime('now')`/`unixepoch('now')`/`strftime(…, 'now')` (and
+//!   `date`/`time`/`julianday`) in their own SQL: `clock_sql.zig` shadows those date/time
+//!   builtins on every reader/writer connection so they resolve to the frozen instant
+//!   (#84). Gated by the same `enabled` comptime flag — no-op on a prod build.
+//! NOT honored (documented in KNOWN_LIMITATIONS.md): `CURRENT_TIMESTAMP`/`CURRENT_TIME`/
+//! `CURRENT_DATE` and SQLite column DEFAULTs — those are SQL keywords that read SQLite's
+//! clock directly and would need a custom VFS to freeze.
 
 const std = @import("std");
 const builtin = @import("builtin");

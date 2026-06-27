@@ -38,6 +38,11 @@ configures in code:
    | Collection  | Type | Auth methods                   | Relations                           | Access rules |
    |-------------|------|-------------------------------|-------------------------------------|---|
    | `authors`   | auth | webauthn (passkey) + api_token | —                                   | list/view: public |
+
+   `authors.private_notes` is an **encrypted-at-rest** field (`.encrypted = true`):
+   stored AES-256-GCM-encrypted in SQLite, transparent plaintext to the API. It
+   requires the `ZIGBASE_FIELD_KEY` env var (see Build & run) — the server refuses
+   to start without it. Encrypted fields can't be indexed/`unique`/filtered/sorted.
    | `commenters`| auth | magic_link (auto_create=true)  | —                                   | list: public; view: authed |
    | `posts`     | base | —                              | `author → authors` (cascade-delete) | list: `status = "published"` |
    | `comments`  | base | —                              | `post → posts`, `commenter → commenters` | list/view: `approved=true`; create: authed |
@@ -176,6 +181,10 @@ mise exec zig@0.16.0 -- zig build
 # --insecure-cookies: local dev over plain HTTP (auth cookies are Secure by default).
 # ZIGBASE_PUBLIC_URL makes magic-link emails contain a real clickable URL.
 # In local dev the token also appears in the server log (look for "magic_link token=").
+# ZIGBASE_FIELD_KEY is REQUIRED here because authors.private_notes is .encrypted —
+# the server refuses to start without it. Use a strong, persistent value in prod
+# (losing it makes the encrypted data unrecoverable); it is never auto-generated.
+ZIGBASE_FIELD_KEY=dev-only-field-key \
 ZIGBASE_PUBLIC_URL=http://localhost:8090 ./zig-out/bin/plugins serve --insecure-cookies
 # open http://127.0.0.1:8090/  (admin UI at /_/)
 ```

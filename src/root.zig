@@ -121,6 +121,8 @@ test {
     _ = @import("migrations.zig");
     _ = @import("rules.zig");
     _ = @import("crypto.zig");
+    _ = @import("aead.zig");
+    _ = @import("field_policy.zig");
     _ = @import("jwt.zig");
     _ = @import("auth.zig");
     _ = @import("id.zig");
@@ -133,6 +135,7 @@ test {
     _ = @import("api/auth.zig");
     _ = @import("api/oauth.zig");
     _ = @import("api/files.zig");
+    _ = @import("api/settings.zig");
     _ = @import("oauth/secrets.zig");
     _ = @import("oauth/providers.zig");
     _ = @import("oauth/client.zig");
@@ -196,6 +199,7 @@ test {
     _ = @import("auth/methods/webauthn.zig");
     _ = @import("api/webauthn_register.zig");
     _ = @import("clock.zig");
+    _ = @import("clock_sql.zig");
     _ = @import("clock_test.zig");
     _ = @import("ctx.zig");
     _ = @import("session.zig");

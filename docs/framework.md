@@ -545,6 +545,78 @@ new transaction).
 > triggering write. In route and job handlers `ctx.records()` lazily checks out a pooled
 > connection that the framework releases on ctx teardown.
 
+### `ctx.kv()` — built-in key/value settings store
+
+Not every piece of mutable server state deserves its own collection. For small,
+server-managed values — a maintenance toggle, a cached external token, a counter, a
+JSON settings blob — `ctx.kv()` is a built-in key→value store backed by an internal
+`_kv` system table. No schema, no access rules, no ceremony:
+
+```zig
+try ctx.kv().set("welcome_banner", "Closed for maintenance");
+const banner = try ctx.kv().get("welcome_banner"); // ?[]const u8 (null if unset)
+_ = try ctx.kv().delete("welcome_banner");          // bool: did a row exist?
+```
+
+Values are opaque `TEXT`. To store structured data, stringify it yourself (e.g.
+`std.json.Stringify.valueAlloc(ctx.arena, value, .{})`) and parse it back on read.
+`set` is an upsert that preserves the original `created` timestamp and bumps `updated`.
+
+Reads use the read connection; writes use the bound connection inside a `before`-hook
+or `ctx.tx` (so they commit atomically with the surrounding transaction) and otherwise
+acquire/release the pool writer for you — the same lifetime rules as `ctx.records()`.
+
+The same primitive is on the curated `Data` facade as `data.kvGet` / `data.kvSet` /
+`data.kvDelete` (and `data.kvList`) for internal/test consumers.
+
+> **Security:** KV/settings are **superuser-managed and never public by default**. The
+> `_kv` table is not a collection, so it is invisible to the record API, query engine,
+> and access-rule system. To expose a value publicly, write a custom route that returns
+> exactly what you intend (see feature flags below).
+
+### `ctx.flag()` / `ctx.setFlag()` — typed feature flags
+
+A binary on/off toggle is the most common shape of a setting, so it gets a typed view
+over the **same** KV store — no second table:
+
+```zig
+if (try ctx.flag("new_checkout")) {
+    // ... new path
+}
+try ctx.setFlag("new_checkout", true);  // stores "true"/"false"
+```
+
+`flag(name)` returns `false` for an unset flag; `"true"` and `"1"` are truthy, anything
+else is `false`. `setFlag(name, enabled)` stores `"true"`/`"false"`.
+
+Because flags are server-side by default, exposing one publicly is an explicit choice —
+a one-line custom route:
+
+```zig
+fn publicFlag(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const name = ctx.request.?.param("name").?;
+    const on = try ctx.flag(name);
+    const body = try std.fmt.allocPrint(ctx.arena, "{{\"enabled\":{}}}", .{on});
+    return .{ .status = 200, .body = body };
+}
+// .routes = .{ .{ .method = .GET, .path = "/api/public-flags/:name", .handler = publicFlag } }
+```
+
+### Superuser settings HTTP API
+
+For administrative management there is a built-in **superuser-only** HTTP surface over
+the KV store (every endpoint requires a valid superuser token):
+
+| Method & path | Effect |
+|---|---|
+| `GET /api/settings` | List all settings (`[{key,value,created,updated}, …]`). |
+| `GET /api/settings/:key` | Fetch one (`{key,value}`); 404 if absent. |
+| `PUT /api/settings/:key` | Upsert; body `{"value":"…"}`. |
+| `DELETE /api/settings/:key` | Remove; 204, or 404 if absent. |
+
+This is the management plane; the public read plane is whatever custom route you choose
+to expose (above).
+
 ## 6. Auth / file / lifecycle events
 
 One handler each, registered by the matching config key:
@@ -1167,6 +1239,54 @@ A collection may declare `.indexes` — a tuple of index literals provisioned as
 `.where` is an optional partial-index predicate emitted verbatim as `WHERE <where>`.
 The index `.name` and `.fields` are validated as identifiers; the `.where` predicate
 is raw SQL authored in the schema. Index `.fields` reference fields by their declared name (not an internal id); `.name` and each field are validated as identifiers at compile time.
+
+### Field encryption at rest (`.encrypted`)
+
+Mark a `text`, `editor`, or `json` field `.encrypted = true` to store it
+encrypted at rest. The records layer encrypts on write and decrypts on read, so
+your handlers, the records API, and the HTTP responses always see **plaintext** —
+only the SQLite file holds ciphertext:
+
+```zig
+.fields = .{
+    .{ .name = "ssn",   .type = .text, .encrypted = true },
+    .{ .name = "notes", .type = .json, .encrypted = true },
+},
+```
+
+**Envelope.** AES-256-GCM, versioned: each value is stored as
+`v1:` + base64url(nonce ‖ ciphertext ‖ tag) with a fresh random nonce per write.
+
+**Key (required).** The key comes **only** from the `ZIGBASE_FIELD_KEY`
+environment variable (HKDF-derived; the raw value may be any length). Unlike the
+JWT secret it is **never auto-generated, persisted, or logged** — losing or
+rotating it determines whether the data is recoverable, so you must manage it.
+If any collection declares an `.encrypted` field and `ZIGBASE_FIELD_KEY` is unset,
+**the server refuses to start** (fail-closed — it never silently stores plaintext).
+
+**Constraints (enforced).** Encrypted values are per-row-nonce ciphertext, so they
+cannot be indexed, marked `.unique`, or used in a `?filter`/`?sort`:
+
+- Indexing an encrypted field, marking it `.unique`, or setting `.encrypted` on a
+  non-`text`/`editor`/`json` field is a **compile error**.
+- A request that filters or sorts by an encrypted field gets a **400**.
+- Access rules that compare an encrypted field will compare against ciphertext and
+  effectively never match — don't reference encrypted fields in rules.
+
+**Strict reads / enabling on existing data.** Reads are strict: a stored value
+that is not a valid `v1:` envelope (e.g. legacy plaintext) or that fails
+authentication (wrong key, tamper) **fails closed** — there is no plaintext
+passthrough. Therefore, turning `.encrypted` on for a column that already holds
+plaintext rows requires an explicit rewrap migration first; "encrypted means
+encrypted".
+
+**Rotation.** The `v<N>:` version prefix selects the key generation. v1 ships a
+single key; the format is designed so a future generation can be added (reads
+dispatch on the prefix, writes use the primary) with a lazy/rewrap forward path.
+
+> Note: the envelope hides a value's *contents* but not its *length* — ciphertext
+> length is proportional to plaintext length. A single long-lived key suits typical
+> volumes; for very high write volumes, periodic `v<N>:` key rotation is recommended.
 
 ### Startup provisioning + additive auto-migration
 

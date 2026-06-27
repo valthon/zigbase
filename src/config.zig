@@ -25,6 +25,12 @@ pub const Config = struct {
     // it thereafter. An operator-provided secret must be >= 32 bytes; the old shared
     // "dev-insecure-secret-change-me" default is gone.
     jwt_secret: []const u8 = "",
+    // Operator-supplied key for transparent at-rest field encryption (Theme B1). Env:
+    // ZIGBASE_FIELD_KEY. "" = unset. Unlike the JWT secret it is NEVER auto-generated or
+    // persisted — losing/rotating it determines data recoverability, so it must be
+    // operator-managed. serveImpl REFUSES to start if any collection declares an
+    // `.encrypted` field while this is empty (fail-closed: never silently store plaintext).
+    field_key: []const u8 = "",
     cookie_secure: bool = true, // secure-by-default; opt out with --insecure-cookies for plain-HTTP local dev
     auth_token_ttl_s: i64 = 14 * 24 * 3600, // 14 days
     verification_ttl_s: i64 = 7 * 24 * 3600, // 7 days
@@ -105,6 +111,7 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_DATA_DIR")) |v| cfg.data_dir = v;
         if (getter.get("ZIGBASE_PUBLIC_URL")) |v| cfg.public_url = v;
         if (getter.get("ZIGBASE_JWT_SECRET")) |v| cfg.jwt_secret = v;
+        if (getter.get("ZIGBASE_FIELD_KEY")) |v| cfg.field_key = v;
         if (getter.get("ZIGBASE_COOKIE_SECURE")) |v| cfg.cookie_secure = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
         if (getter.get("ZIGBASE_AUTH_TOKEN_TTL")) |v| cfg.auth_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter.get("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try std.fmt.parseInt(i64, v, 10);

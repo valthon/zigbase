@@ -17,6 +17,7 @@ const keyset = @import("query/keyset.zig");
 const pagination = @import("pagination.zig");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
+const field_policy = @import("field_policy.zig");
 
 /// A compiled rule constraint enforced atomically on create/update.
 pub const Guard = struct {
@@ -1250,6 +1251,87 @@ pub fn gcCursorStates(w: *db.Db) db.DbError!void {
     defer st.finalize();
     try st.bindInt(1, now);
     _ = try st.step();
+}
+
+fn rawCell(d: *db.Db, alloc: std.mem.Allocator, sql: [:0]const u8) ![]const u8 {
+    var st = try d.prepare(sql);
+    defer st.finalize();
+    _ = try st.step();
+    return alloc.dupe(u8, st.columnText(0));
+}
+
+test "encrypted field: round-trip through records, ciphertext-at-rest, strict fail-closed" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    try migrations.run(&d);
+
+    // Stamp a field cipher on the connection (as the pool does in serveImpl).
+    var cipher = field_policy.Cipher.fromEnv(io, "operator-field-key");
+    d.field_cipher = @ptrCast(&cipher);
+
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "blob", .encrypted = true, .options = .{ .json = .{} } },
+        .{ .id = "f3", .name = "plain", .options = .{ .text = .{} } },
+    };
+    const col = try collections.create(a, io, &d, .{ .id = "", .name = "vault", .fields = &fields });
+
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "secret", .{ .string = "topsecret" });
+    var jblob: std.json.ObjectMap = .empty;
+    try jblob.put(a, "pin", .{ .integer = 1234 });
+    try obj.put(a, "blob", .{ .object = jblob });
+    try obj.put(a, "plain", .{ .string = "visible" });
+    const created = try create(a, io, &d, col, .{ .object = obj });
+    const id = created.object.get("id").?.string;
+
+    // (a) Read-back through the records API returns PLAINTEXT (transparent).
+    const got = (try get(a, &d, col, id)).?;
+    try std.testing.expectEqualStrings("topsecret", got.object.get("secret").?.string);
+    try std.testing.expectEqual(@as(i64, 1234), got.object.get("blob").?.object.get("pin").?.integer);
+    try std.testing.expectEqualStrings("visible", got.object.get("plain").?.string);
+
+    // (b) Ciphertext-at-rest: the raw SQLite cells hold a v1 envelope, NOT the plaintext.
+    const raw_secret = try rawCell(&d, a, "SELECT secret FROM vault;");
+    try std.testing.expect(std.mem.startsWith(u8, raw_secret, "v1:"));
+    try std.testing.expect(std.mem.indexOf(u8, raw_secret, "topsecret") == null);
+    const raw_blob = try rawCell(&d, a, "SELECT blob FROM vault;");
+    try std.testing.expect(std.mem.startsWith(u8, raw_blob, "v1:"));
+    try std.testing.expect(std.mem.indexOf(u8, raw_blob, "1234") == null);
+    // The non-encrypted field is stored as plaintext.
+    const raw_plain = try rawCell(&d, a, "SELECT plain FROM vault;");
+    try std.testing.expectEqualStrings("visible", raw_plain);
+
+    // (c) Strict fail-closed: decrypting the real envelope with the WRONG key fails.
+    var wrong = field_policy.Cipher.fromEnv(io, "a-totally-different-key");
+    d.field_cipher = @ptrCast(&wrong);
+    try std.testing.expectError(error.BadEnvelope, get(a, &d, col, id));
+
+    // A legacy/plaintext stored value (no envelope) also fails closed — no passthrough.
+    d.field_cipher = @ptrCast(&cipher);
+    try d.exec("UPDATE vault SET secret='legacy-plaintext';");
+    try std.testing.expectError(error.BadEnvelope, get(a, &d, col, id));
+}
+
+test "encrypted field with no cipher fails closed (never plaintext)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    try migrations.run(&d);
+    // No cipher stamped: d.field_cipher == null.
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "secret", .encrypted = true, .options = .{ .text = .{} } }};
+    const col = try collections.create(a, io, &d, .{ .id = "", .name = "vault2", .fields = &fields });
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "secret", .{ .string = "x" });
+    // Write to an encrypted field with no key configured must fail (not store plaintext).
+    try std.testing.expectError(error.Validation, create(a, io, &d, col, .{ .object = obj }));
 }
 
 pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: ListQuery) !ListResult {

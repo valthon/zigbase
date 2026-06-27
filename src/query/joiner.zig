@@ -3,7 +3,7 @@ const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
 
-pub const JoinError = error{ UnknownField, NotARelation, MultiRelationTraversal } || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".return_type.?).error_union.error_set;
+pub const JoinError = error{ UnknownField, NotARelation, MultiRelationTraversal, EncryptedField } || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".return_type.?).error_union.error_set;
 
 pub const ColumnRef = struct { sql: []const u8, field: ?schema.Field };
 
@@ -33,6 +33,9 @@ pub const Joiner = struct {
             if (nxt == null) {
                 const field = schema.fieldByName(cur_col, seg);
                 if (field == null and !isSystemCol(seg)) return error.UnknownField;
+                // Encrypted fields are stored as per-row-nonce ciphertext, so a
+                // filter/sort over them can never match correctly — reject closed.
+                if (field) |fl| if (fl.encrypted) return error.EncryptedField;
                 const ref = try std.fmt.allocPrint(self.alloc, "{s}.\"{s}\"", .{ cur_alias, seg });
                 return .{ .sql = ref, .field = field };
             }
@@ -91,4 +94,23 @@ test "joiner rejects traversal through non-relation and multi-relation fields" {
     try std.testing.expectError(error.NotARelation, j.resolve("title.x"));
     // Traversing THROUGH a multi-value relation is unsupported.
     try std.testing.expectError(error.MultiRelationTraversal, j.resolve("tags.name"));
+}
+
+test "joiner rejects filtering/sorting on an encrypted field" {
+    const migrations = @import("../migrations.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
+    };
+    const docs = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "docs", .fields = &fields });
+    var j = Joiner.init(a, &d, docs);
+    // A normal field resolves; an encrypted field is rejected closed.
+    _ = try j.resolve("title");
+    try std.testing.expectError(error.EncryptedField, j.resolve("secret"));
 }
