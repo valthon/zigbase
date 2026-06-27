@@ -55,6 +55,9 @@ pub const StaticFile = @import("static_files.zig").StaticFile;
 // ---- Ctx capability object -------------------------------------------------
 pub const Ctx = @import("ctx.zig").Ctx;
 
+// ---- General outbound HTTP client -----------------------------------------
+pub const HttpResponse = @import("http_client.zig").HttpResponse;
+
 // ---- Auth helper surface (consumer-facing magic-link building blocks) ------
 pub const auth = @import("auth_helpers.zig");
 
@@ -188,4 +191,5 @@ test {
     _ = @import("clock.zig");
     _ = @import("clock_test.zig");
     _ = @import("ctx.zig");
+    _ = @import("http_client.zig");
 }
