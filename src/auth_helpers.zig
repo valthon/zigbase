@@ -9,6 +9,7 @@ const api_auth = @import("api/auth.zig");
 const collections = @import("collections.zig");
 const app_mod = @import("app.zig");
 const Data = @import("data.zig").Data;
+const Ctx = @import("ctx.zig").Ctx;
 
 // ---- Re-exports ----------------------------------------------------------------
 
@@ -47,6 +48,14 @@ pub fn issueSession(
     record_id: []const u8,
 ) !Issued {
     return api_auth.issueSession(ctx, conn, collection, record_id, .custom);
+}
+
+/// Clear the session cookies (logout), mirroring `issueSession`. Returns the cleared
+/// `zb_auth`/`zb_csrf` cookies built from the framework's own cookie policy (the same
+/// one the built-in `authLogout` uses), arena-owned so they slot into `Response.cookies`.
+/// Equivalent to `ctx.auth().clearSession()`.
+pub fn clearSession(ctx: *Ctx) ![]const http.Cookie {
+    return ctx.auth().clearSession();
 }
 
 // ---- Link-token lifecycle ------------------------------------------------------

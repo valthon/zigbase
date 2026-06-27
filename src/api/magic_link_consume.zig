@@ -130,32 +130,57 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
     const token = qp.get("token") orelse
         return (ApiError.badRequest("token is required.")).toResponse(ctx.allocator);
 
-    // Verify + consume must be atomic against the single-use guard, so they run
-    // under ONE writer held across both calls (same contract as `complete`).
+    // Verify + consume + the beforeAuthSuccess hook + session issuance all run under ONE
+    // writer inside a single transaction. Token consumption is the single-use guard; the
+    // transaction makes the whole login atomic, so an aborting hook ROLLS BACK the token
+    // consumption (the link stays usable) and its own side-writes, and blocks the session.
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
+    try w.beginImmediate();
 
-    const claims = (try auth_helpers.verifyLinkToken(ctx, w, col.name, token)) orelse
+    const claims = (try auth_helpers.verifyLinkToken(ctx, w, col.name, token)) orelse {
+        w.rollback() catch {};
         return (ApiError.badRequest("Invalid or expired link.")).toResponse(ctx.allocator);
+    };
     // Only a genuine replay (the token's jti is already recorded) is a 400. Any
     // other failure (DB prepare/step, I/O) must propagate to the 500 backstop
     // rather than masquerading as "Link already used."
     auth_helpers.consumeLinkToken(w, claims) catch |err| switch (err) {
-        error.AlreadyConsumed => return (ApiError.badRequest("Link already used.")).toResponse(ctx.allocator),
-        else => return err,
+        error.AlreadyConsumed => {
+            w.rollback() catch {};
+            return (ApiError.badRequest("Link already used.")).toResponse(ctx.allocator);
+        },
+        else => {
+            w.rollback() catch {};
+            return err;
+        },
     };
 
+    // Fetch the record once for the verification gate, the hook, and session issuance.
+    const rec = (try records.get(ctx.allocator, w, col, claims.id)) orelse {
+        w.rollback() catch {};
+        return (ApiError.notFound()).toResponse(ctx.allocator);
+    };
     // Optional verification gate: refuse to mint a session for an unverified
     // record when the collection requires it (parity with `complete`).
-    const rec: ?std.json.Value = if (col.options.auth.require_verified) blk: {
-        const r = (try records.get(ctx.allocator, w, col, claims.id)) orelse
-            return (ApiError.notFound()).toResponse(ctx.allocator);
-        if (!auth.recordVerified(r))
-            return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
-        break :blk r;
-    } else null;
+    if (col.options.auth.require_verified and !auth.recordVerified(rec)) {
+        w.rollback() catch {};
+        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
+    }
 
-    const issued = try auth.issueSessionExt(ctx, w, col.name, claims.id, .magic_link, rec);
+    if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, claims.id, .magic_link, rec)) |resp| {
+        w.rollback() catch {};
+        return resp;
+    }
+
+    const issued = auth.issueSessionExt(ctx, w, col.name, claims.id, .magic_link, rec) catch |e| {
+        w.rollback() catch {};
+        return e;
+    };
+    w.commit() catch |e| {
+        w.rollback() catch {};
+        return e;
+    };
 
     const cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
     const headers = try ctx.allocator.dupe(http.Header, &[_]http.Header{
@@ -331,6 +356,67 @@ test "consume: valid token → 302 with session cookies + allowed redirect; repl
     var ctx2 = consumeCtx(env, a, "mlconsume1", q2);
     const res2 = try consume(&ctx2);
     try std.testing.expectEqual(@as(u16, 400), res2.status);
+}
+
+test "#80 consume: aborting beforeAuthSuccess blocks session AND leaves the link token unconsumed" {
+    const events = @import("../events.zig");
+    const Ctx = @import("../ctx.zig").Ctx;
+
+    var env = try setupConsumeEnv("mlconsume80", &.{}, "/home");
+    defer env.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try env.createUser(a, "mlconsume80", "u@x.io", "longenough");
+
+    // Mint a single magic-link token; the same token is reused after the abort to prove
+    // the consumption rolled back (the link is still usable).
+    var mint_ctx = consumeCtx(env, a, "mlconsume80", "");
+    const token = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const col = (try collections.get(a, w, "mlconsume80")).?;
+        const rid = (try api_auth.findByIdentity(a, w, col, "u@x.io")).?;
+        break :blk (try auth_helpers.mintLinkToken(&mint_ctx, w, "mlconsume80", rid, 900, .{})).token;
+    };
+
+    // Aborting hook: vetoes the login. The transaction must roll back the token
+    // consumption so the link stays redeemable on retry.
+    const Hook = struct {
+        fn abort(ctx: *Ctx, ev: *events.AuthSuccessEvent) anyerror!void {
+            _ = ev;
+            return ctx.fail(403, "blocked");
+        }
+    };
+    var disp = events.Dispatch{ .before_auth_success = Hook.abort };
+    env.app.dispatch = &disp;
+
+    const q1 = try std.fmt.allocPrint(a, "token={s}", .{token});
+    var ctx1 = consumeCtx(env, a, "mlconsume80", q1);
+    const res1 = try consume(&ctx1);
+    try std.testing.expectEqual(@as(u16, 403), res1.status); // fail closed
+    try std.testing.expectEqual(@as(usize, 0), res1.cookies.len); // no session
+
+    // Retry with the SAME token now that the hook permits the login: the token was NOT
+    // burned by the aborted attempt, so the consume succeeds (302 + session).
+    env.app.dispatch = null;
+    const q2 = try std.fmt.allocPrint(a, "token={s}", .{token});
+    var ctx2 = consumeCtx(env, a, "mlconsume80", q2);
+    const res2 = try consume(&ctx2);
+    try std.testing.expectEqual(@as(u16, 302), res2.status);
+    var saw_auth = false;
+    for (res2.cookies) |c| {
+        if (std.mem.eql(u8, c.name, "zb_auth")) saw_auth = true;
+    }
+    try std.testing.expect(saw_auth);
+
+    // And now the single-use guard holds: a third attempt with the same token is rejected.
+    const q3 = try std.fmt.allocPrint(a, "token={s}", .{token});
+    var ctx3 = consumeCtx(env, a, "mlconsume80", q3);
+    const res3 = try consume(&ctx3);
+    try std.testing.expectEqual(@as(u16, 400), res3.status);
 }
 
 test "consume: non-whitelisted redirect falls back to default (no open redirect)" {
