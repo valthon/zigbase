@@ -202,6 +202,7 @@ test {
     _ = @import("clock.zig");
     _ = @import("clock_sql.zig");
     _ = @import("clock_test.zig");
+    _ = @import("entropy.zig");
     _ = @import("ctx.zig");
     _ = @import("session.zig");
     _ = @import("http_client.zig");

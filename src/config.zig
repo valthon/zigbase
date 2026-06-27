@@ -1,5 +1,6 @@
 const std = @import("std");
 const clock = @import("clock.zig");
+const entropy = @import("entropy.zig");
 
 /// SMTP transport security mode (config-driven).
 ///   none     — plaintext SMTP (MailHog / local relays; current behavior).
@@ -97,6 +98,14 @@ pub const Config = struct {
     // so a prod binary ignores the env var entirely (see clock.zig). null = wall-clock.
     fake_now_unix: ?i64 = null,
 
+    // DEV-ONLY seeded entropy (`ZIGBASE_FAKE_SEED`, a decimal u64). When set, ID/token
+    // generation (record IDs, field IDs, token keys) uses a deterministic Xoshiro256++ PRNG
+    // seeded from this value instead of the OS CSPRNG, making snapshot tests reproducible.
+    // ALWAYS null on a production build — `entropy.resolveFromEnv` is comptime-gated off
+    // when the `dev_clock` build option is false, so a prod binary ignores the env var
+    // entirely. null = real OS CSPRNG (the always-correct default).
+    fake_seed: ?u64 = null,
+
     /// Resolve `auto` to a concrete TLS mode from the port:
     ///   465 → implicit (SMTPS), 587 → starttls, anything else → none.
     /// `none`/`starttls`/`implicit` are returned unchanged.
@@ -151,6 +160,8 @@ pub const Config = struct {
         // Dev-only frozen clock. resolveFromEnv is comptime-gated off on a prod build, so this
         // is always null there regardless of the env var.
         cfg.fake_now_unix = clock.resolveFromEnv(getter.get(clock.env_var));
+        // Dev-only seeded entropy. resolveFromEnv is comptime-gated off on a prod build.
+        cfg.fake_seed = entropy.resolveFromEnv(getter.get(entropy.env_var));
         return cfg;
     }
 };

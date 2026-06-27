@@ -1,0 +1,2 @@
+### Features
+- **Seeded entropy for deterministic IDs/tokens in test mode (`ZIGBASE_FAKE_SEED`)** — set `ZIGBASE_FAKE_SEED` to a decimal `u64` on a dev build to make record/field ID and token key generation reproducible across runs with the same seed, enabling stable snapshot tests. Gated by the same `dev_clock` build option as `ZIGBASE_FAKE_NOW`: compiled out on production builds, so a production binary always uses the OS CSPRNG and cannot be seeded. Closes #95.
