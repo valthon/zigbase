@@ -117,6 +117,26 @@ pub const Data = struct {
         _ = try st.step();
         return self.conn.changesCount() > 0;
     }
+
+    /// One entry in the KV/settings store.
+    pub const KvEntry = struct { key: []const u8, value: []const u8, created: []const u8, updated: []const u8 };
+
+    /// List all KV/settings entries (ordered by key). Each field is duped onto
+    /// `self.alloc`. Intended for the superuser settings admin surface.
+    pub fn kvList(self: Data) ![]KvEntry {
+        var out: std.ArrayList(KvEntry) = .empty;
+        var st = try self.conn.prepare("SELECT key, value, created, updated FROM \"_kv\" ORDER BY key;");
+        defer st.finalize();
+        while (try st.step()) {
+            try out.append(self.alloc, .{
+                .key = try self.alloc.dupe(u8, st.columnText(0)),
+                .value = try self.alloc.dupe(u8, st.columnText(1)),
+                .created = try self.alloc.dupe(u8, st.columnText(2)),
+                .updated = try self.alloc.dupe(u8, st.columnText(3)),
+            });
+        }
+        return out.toOwnedSlice(self.alloc);
+    }
 };
 
 test "Data kvSet/kvGet/kvDelete round-trip; upsert preserves created" {
@@ -155,6 +175,26 @@ test "Data kvSet/kvGet/kvDelete round-trip; upsert preserves created" {
     try std.testing.expect(try d.kvDelete("greeting"));
     try std.testing.expect((try d.kvGet("greeting")) == null);
     try std.testing.expect(!(try d.kvDelete("greeting")));
+}
+
+test "Data.kvList returns all entries ordered by key" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = undefined };
+    const d = Data{ .app = &app, .conn = &conn, .io = std.testing.io, .alloc = a };
+
+    try std.testing.expectEqual(@as(usize, 0), (try d.kvList()).len);
+    try d.kvSet("b", "2");
+    try d.kvSet("a", "1");
+    const list = try d.kvList();
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("a", list[0].key);
+    try std.testing.expectEqualStrings("1", list[0].value);
+    try std.testing.expectEqualStrings("b", list[1].key);
 }
 
 test "Data.create then findById round-trips a record" {

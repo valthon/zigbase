@@ -12,6 +12,7 @@ const magic_link_consume_api = @import("api/magic_link_consume.zig");
 const webauthn_register_api = @import("api/webauthn_register.zig");
 const oauth_api = @import("api/oauth.zig");
 const files_api = @import("api/files.zig");
+const settings_api = @import("api/settings.zig");
 const realtime_ws = @import("realtime/ws.zig");
 const files_multipart = @import("files/multipart.zig");
 const admin = @import("admin.zig");
@@ -54,6 +55,10 @@ const routes = [_]router.Route{
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
     .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
     .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
+    .{ .method = .GET, .pattern = "/api/settings", .handler = settings_api.list },
+    .{ .method = .GET, .pattern = "/api/settings/:key", .handler = settings_api.get },
+    .{ .method = .PUT, .pattern = "/api/settings/:key", .handler = settings_api.put },
+    .{ .method = .DELETE, .pattern = "/api/settings/:key", .handler = settings_api.delete },
 };
 
 pub const Server = struct {
