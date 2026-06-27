@@ -312,6 +312,9 @@ pub const Authed = struct {
     record: std.json.Value, // the auth record with hidden fields stripped
     collection: []const u8,
     is_superuser: bool,
+    /// Server-side session id (Variant B, #99); "" in epoch mode or when the token carries
+    /// no `sid`. Lets logout/refresh target the exact `_sessions` row for this request.
+    sid: []const u8 = "",
 };
 
 pub const Verified = struct {
@@ -319,6 +322,8 @@ pub const Verified = struct {
     collection: []const u8,
     is_superuser: bool,
     exp: i64,
+    /// See `Authed.sid`.
+    sid: []const u8 = "",
 };
 
 /// Resolve a JWT string to a verified identity (no HTTP ctx, no CSRF — the caller owns transport).
@@ -354,13 +359,31 @@ pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, 
     // `.auth` session tokens are gated; short-lived `.file` tokens are minted separately and
     // carry no epoch, so a stale-epoch check must not strand a fresh file download token.
     if (verified.type == .auth and verified.token_epoch != ke.epoch) return null;
+    // Variant B session gate (#99): in TABLE mode only, an `.auth` token carrying a `sid`
+    // must reference a live `_sessions` row (present + unexpired) — per-device revocation.
+    // Absent/expired/error → reject (fail closed, same discipline as the epoch check). In
+    // epoch mode this whole block is skipped, so the verify hot path does ZERO extra work.
+    const sid: []const u8 = verified.sid orelse "";
+    if (app.session_store == .table and verified.type == .auth and sid.len > 0) {
+        if (!(sessionActive(conn, sid, now) catch return null)) return null;
+    }
     const rec = if (is_super)
         (superuserRecord(alloc, conn, claims.id) catch return null) orelse return null
     else blk: {
         const records = @import("records.zig");
         break :blk (records.get(alloc, conn, col_or_null.?, claims.id) catch return null) orelse return null;
     };
-    return .{ .record = rec, .collection = claims.collection, .is_superuser = is_super, .exp = claims.exp };
+    return .{ .record = rec, .collection = claims.collection, .is_superuser = is_super, .exp = claims.exp, .sid = sid };
+}
+
+/// Variant B: true iff session `sid` exists and is unexpired (`expires IS NULL OR expires > now`).
+/// Table-mode verify only — never called in epoch mode (gated by `session_store == .table`).
+fn sessionActive(conn: *db.Db, sid: []const u8, now: i64) !bool {
+    var st = try conn.prepare("SELECT 1 FROM \"_sessions\" WHERE \"id\" = ?1 AND (\"expires\" IS NULL OR \"expires\" > ?2);");
+    defer st.finalize();
+    try st.bindText(1, sid);
+    try st.bindInt(2, now);
+    return try st.step();
 }
 
 pub fn nowUnixPub(conn: *db.Db) db.DbError!i64 {
@@ -431,7 +454,7 @@ pub fn authenticate(io: std.Io, alloc: std.mem.Allocator, app: anytype, ctx: *co
         if (!ctEqlSlices(claims.csrf, ctx.csrf_token)) return null;
     }
     const v = verifyToken(alloc, app, conn, token) orelse return null;
-    return Authed{ .record = v.record, .collection = v.collection, .is_superuser = v.is_superuser };
+    return Authed{ .record = v.record, .collection = v.collection, .is_superuser = v.is_superuser, .sid = v.sid };
 }
 
 test "authenticate resolves a valid bearer token to its record" {

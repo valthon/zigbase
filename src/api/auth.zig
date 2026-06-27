@@ -11,6 +11,7 @@ const clock = @import("../clock.zig");
 const events = @import("../events.zig");
 const request = @import("../request.zig");
 const session = @import("../session.zig");
+const id_gen = @import("../id.zig");
 const Ctx = @import("../ctx.zig").Ctx;
 const ApiError = @import("error.zig").ApiError;
 
@@ -129,24 +130,125 @@ pub fn bumpTokenEpoch(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8,
     return (try tokenEpochFor(alloc, conn, table, rid)) orelse error.NotFound;
 }
 
+// ----------------------------------------------------------------------------
+// Variant B (#99): server-side `_sessions` store — per-device list/revoke.
+// ALL of this runs only in `app.session_store == .table`; epoch mode never touches it.
+// ----------------------------------------------------------------------------
+
+/// One active session as surfaced to `listActiveSessions` (sans owner refs).
+pub const SessionRow = struct {
+    id: []const u8,
+    created: []const u8,
+    last_seen: []const u8,
+    user_agent: []const u8,
+    ip: []const u8,
+};
+
+/// Insert a `_sessions` row for a freshly minted table-mode token and return its id (the
+/// token's `sid`). `conn` must be the WRITER. `exp` is the session expiry (unix secs; the
+/// token's own exp). UA/IP are captured from the request. A single INSERT — atomic under the
+/// writer's autocommit, or joined to an enclosing txn (refresh/oauth) where one is open.
+pub fn recordSession(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: []const u8, exp: i64) ![]const u8 {
+    const app = ctx.app.?;
+    var idbuf: [15]u8 = undefined;
+    id_gen.generate(app.io, &idbuf);
+    const sid = try ctx.allocator.dupe(u8, &idbuf);
+    var st = try conn.prepare(
+        \\INSERT INTO "_sessions" ("id","collectionRef","recordRef","created","lastSeen","expires","userAgent","ip")
+        \\ VALUES (?1,?2,?3,datetime('now'),datetime('now'),?4,?5,?6);
+    );
+    defer st.finalize();
+    try st.bindText(1, sid);
+    try st.bindText(2, collection);
+    try st.bindText(3, rid);
+    try st.bindInt(4, exp);
+    try st.bindText(5, ctx.user_agent);
+    try st.bindText(6, ctx.remote_ip);
+    _ = try st.step();
+    return sid;
+}
+
+/// Delete one session row by id. Returns whether a row existed. Writer required.
+pub fn deleteSession(conn: *db.Db, sid: []const u8) !bool {
+    var st = try conn.prepare("DELETE FROM \"_sessions\" WHERE \"id\" = ?1 RETURNING \"id\";");
+    defer st.finalize();
+    try st.bindText(1, sid);
+    return try st.step();
+}
+
+/// Delete EVERY session row for a principal (revoke-all cleanliness). Writer required.
+pub fn deleteSessionsForPrincipal(conn: *db.Db, collection: []const u8, rid: []const u8) !void {
+    var st = try conn.prepare("DELETE FROM \"_sessions\" WHERE \"collectionRef\" = ?1 AND \"recordRef\" = ?2;");
+    defer st.finalize();
+    try st.bindText(1, collection);
+    try st.bindText(2, rid);
+    _ = try st.step();
+}
+
+/// The (collection, record) owner of a session row, or null if absent. Used to AUTHORIZE
+/// `revoke(sid)`: a non-superuser may only revoke a session they own.
+pub fn sessionOwner(alloc: std.mem.Allocator, conn: *db.Db, sid: []const u8) !?struct { collection: []const u8, record: []const u8 } {
+    var st = try conn.prepare("SELECT \"collectionRef\", \"recordRef\" FROM \"_sessions\" WHERE \"id\" = ?1;");
+    defer st.finalize();
+    try st.bindText(1, sid);
+    if (!try st.step()) return null;
+    return .{ .collection = try alloc.dupe(u8, st.columnText(0)), .record = try alloc.dupe(u8, st.columnText(1)) };
+}
+
+/// List a principal's active (unexpired) sessions, newest first. Caller adds `is_current`.
+pub fn listSessions(alloc: std.mem.Allocator, conn: *db.Db, collection: []const u8, rid: []const u8) ![]SessionRow {
+    const now = try nowUnix(conn);
+    var st = try conn.prepare(
+        \\SELECT "id","created","lastSeen","userAgent","ip" FROM "_sessions"
+        \\ WHERE "collectionRef" = ?1 AND "recordRef" = ?2 AND ("expires" IS NULL OR "expires" > ?3)
+        \\ ORDER BY "created" DESC;
+    );
+    defer st.finalize();
+    try st.bindText(1, collection);
+    try st.bindText(2, rid);
+    try st.bindInt(3, now);
+    var out: std.ArrayList(SessionRow) = .empty;
+    while (try st.step()) {
+        try out.append(alloc, .{
+            .id = try alloc.dupe(u8, st.columnText(0)),
+            .created = try alloc.dupe(u8, st.columnText(1)),
+            .last_seen = try alloc.dupe(u8, st.columnText(2)),
+            .user_agent = try alloc.dupe(u8, st.columnText(3)),
+            .ip = try alloc.dupe(u8, st.columnText(4)),
+        });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 pub const Issued = struct { token: []const u8, cookies: [2]http.Cookie };
 
 pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: []const u8, token_key: []const u8) !Issued {
     const app = ctx.app.?;
     const csrf = try crypto.genToken(app.io, ctx.allocator, 32);
     const now = try nowUnix(conn);
+    const exp = now + app.auth_token_ttl_s;
     // Embed the record's current session epoch (#99) so verify can reject the token once
     // the epoch is bumped ("revoke all sessions"). 0 when the column is NULL/absent —
     // matching the default claim, so pre-epoch behavior is preserved.
     const epoch = (try tokenEpochFor(ctx.allocator, conn, collection, rid)) orelse 0;
+    // Variant B: in TABLE mode only, record a server-side session row and bind its id into
+    // the token as `sid`. In epoch mode `sid` stays null — NO session row is written and the
+    // token serializes byte-identically (the user's zero-overhead requirement). `conn` must be
+    // the writer in table mode (every login path that reaches here holds it; password login
+    // upgrades to the writer specifically for this).
+    const sid: ?[]const u8 = if (app.session_store == .table)
+        try recordSession(ctx, conn, collection, rid, exp)
+    else
+        null;
     const claims = jwt.Claims{
         .id = rid,
         .collection = collection,
         .type = .auth,
         .csrf = csrf,
         .token_epoch = epoch,
+        .sid = sid,
         .iat = now,
-        .exp = now + app.auth_token_ttl_s,
+        .exp = exp,
     };
     const key = crypto.deriveKey(app.jwt_secret, token_key);
     const token = try jwt.sign(ctx.allocator, claims, &key);
@@ -379,9 +481,22 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     // Optional verification gate: refuse to mint a session for an unverified record.
     if (col.options.auth.require_verified and !recordVerified(rec))
         return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
-    const issued = issueSessionExt(ctx, &r, col.name, rid, .password, rec) catch |err| switch (err) {
-        error.NotFound => return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator),
-        else => return err,
+    // Epoch mode issues on the READER (no write, zero overhead — unchanged). Table mode must
+    // INSERT a `_sessions` row, so it acquires the WRITER now — AFTER the costly argon2 verify,
+    // so logins still don't serialize on argon2. The reader stays held (independent resource).
+    const issued = blk: {
+        if (app.session_store == .table) {
+            const w = app.pool.acquireWriter();
+            defer app.pool.releaseWriter();
+            break :blk issueSessionExt(ctx, w, col.name, rid, .password, rec) catch |err| switch (err) {
+                error.NotFound => return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator),
+                else => return err,
+            };
+        }
+        break :blk issueSessionExt(ctx, &r, col.name, rid, .password, rec) catch |err| switch (err) {
+            error.NotFound => return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator),
+            else => return err,
+        };
     };
 
     var root: std.json.ObjectMap = .empty;
@@ -415,6 +530,10 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return resp;
     }
+    // Table mode: rotate the session row — drop this token's old `sid` row before issue()
+    // inserts the replacement, so a device keeps exactly ONE row across refreshes (no leak).
+    // In txn: an error trips the errdefer rollback above (fail closed, session not reissued).
+    if (app.session_store == .table and authed.sid.len > 0) _ = try deleteSession(w, authed.sid);
     const issued = issueSessionNoEmit(ctx, w, col_name, rid) catch |err| switch (err) {
         error.NotFound => {
             w.rollback() catch {};
@@ -449,31 +568,37 @@ fn recordId(rec: std.json.Value) []const u8 {
 pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
 
-    // #98: auth-lifecycle hooks. Logout performs no DB write, so a `beforeLogout` hook is
-    // writable (bound to the writer) and abortable but NOT transactional — an abort returns
-    // the mapped response and the session cookies are NOT cleared (nothing to roll back).
-    // Only taken when a hook is registered, so the common case keeps the no-writer fast path.
-    if (hasAuthLifecycle(app)) {
+    // The writer path is taken when a `beforeLogout`/`afterLogout` hook is registered (#98) OR
+    // in table mode (#99), where logout must DELETE this device's `_sessions` row. The common
+    // epoch-mode, hook-free case keeps the no-writer fast path below (zero overhead).
+    if (hasAuthLifecycle(app) or app.session_store == .table) {
         const w = app.pool.acquireWriter();
         defer app.pool.releaseWriter();
         var lc_col = ctx.param("col") orelse "";
         // Best-effort identity: an invalid/expired/absent token logs out anonymously (rid="").
         var rid: []const u8 = "";
         var identity: ?std.json.Value = null;
+        var sid: []const u8 = "";
         if (auth.authenticate(app.io, ctx.allocator, app, ctx, w) catch null) |a| {
             rid = recordId(a.record);
             identity = a.record;
+            sid = a.sid;
             if (lc_col.len == 0) lc_col = a.collection;
         }
+        // Logout performs no transactional write, so a `beforeLogout` hook is writable +
+        // abortable but NOT transactional — an abort returns the mapped response and the
+        // cookies are NOT cleared (and the session row is left intact).
         if (try fireAuthLifecycleBefore(ctx, w, lc_col, rid, .before_logout, null, identity)) |resp| return resp;
+        // Table mode: drop this token's server-side session row (per-device logout).
+        if (app.session_store == .table and sid.len > 0) _ = try deleteSession(w, sid);
         const cleared = session.clearedCookies(app.cookie_secure);
         const cookies = try ctx.allocator.dupe(http.Cookie, &cleared);
         emitAuthLifecycle(ctx, w, lc_col, rid, .after_logout, null, identity);
         return .{ .status = 204, .body = "", .cookies = cookies };
     }
 
-    // Fast path (no lifecycle hook): just clear the session cookies. Shared policy: the
-    // cleared cookies match what `issue()`/`clearSession` produce.
+    // Fast path (no lifecycle hook, epoch mode): just clear the session cookies. Shared
+    // policy: the cleared cookies match what `issue()`/`clearSession` produce.
     const cleared = session.clearedCookies(app.cookie_secure);
     const cookies = try ctx.allocator.dupe(http.Cookie, &cleared);
     return .{ .status = 204, .body = "", .cookies = cookies };
@@ -1211,7 +1336,269 @@ test "#99 ctx.auth().refresh keeps other sessions valid; rotate kills them" {
     }
 }
 
-test "#99 per-device verbs are stubbed: epoch mode reports SessionStoreNotEnabled" {
+// --- #99: Variant B server-side session store (.table mode) ---
+
+/// COUNT(*) of `_sessions` rows (optionally for one principal).
+fn sessionCount(env: *TestEnv) !i64 {
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    var st = try r.prepare("SELECT COUNT(*) FROM \"_sessions\";");
+    defer st.finalize();
+    _ = try st.step();
+    return st.columnInt(0);
+}
+
+test "#99 epoch mode writes NO _sessions row and the token carries no sid (zero overhead)" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "z@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "z@x.io");
+    // Default mode is .epoch.
+    try std.testing.expectEqual(@import("../app.zig").SessionStore.epoch, env.app.session_store);
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    const issued = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+    // No session row was written, and the token has no sid claim.
+    try std.testing.expectEqual(@as(i64, 0), try sessionCount(env));
+    const claims = try jwt.peekClaims(a, issued.token);
+    try std.testing.expect(claims.sid == null);
+}
+
+test "#99 table mode: login writes a row, token has sid, verify accepts; revoke -> fail closed" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    env.app.session_store = .table;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "t@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "t@x.io");
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    const issued = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+    // A session row exists and the token carries its sid.
+    try std.testing.expectEqual(@as(i64, 1), try sessionCount(env));
+    const claims = try jwt.peekClaims(a, issued.token);
+    const sid = claims.sid.?;
+    try std.testing.expect(sid.len > 0);
+
+    // Verify accepts (session present + unexpired).
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, issued.token) != null);
+    }
+    // Revoke the row -> verify now rejects (fail closed) even though epoch is unchanged.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try std.testing.expect(try deleteSession(w, sid));
+    }
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, issued.token) == null);
+    }
+}
+
+test "#99 table mode: authWithPassword (reader->writer) records a session + token carries sid" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    env.app.session_store = .table;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "pw@x.io", "longenough");
+
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    var login = env.ctx(a, .POST, "{\"identity\":\"pw@x.io\",\"password\":\"longenough\"}", &p);
+    const res = try authWithPassword(&login);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    // The full login path (reader for argon2, writer for the session INSERT) wrote one row.
+    try std.testing.expectEqual(@as(i64, 1), try sessionCount(env));
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, res.body, .{});
+    const token = parsed.value.object.get("token").?.string;
+    try std.testing.expect((try jwt.peekClaims(a, token)).sid != null);
+
+    // A follow-up write still succeeds — the writer was released after the login INSERT.
+    const w = env.pool.acquireWriter();
+    env.pool.releaseWriter();
+    _ = w;
+}
+
+test "#99 table mode: an expired session row is rejected by verify" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    env.app.session_store = .table;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "exp@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "exp@x.io");
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    const issued = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+    const sid = (try jwt.peekClaims(a, issued.token)).sid.?;
+    // Force the session row to be expired.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var st = try w.prepare("UPDATE \"_sessions\" SET \"expires\" = 1 WHERE \"id\" = ?1;");
+        defer st.finalize();
+        try st.bindText(1, sid);
+        _ = try st.step();
+    }
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    try std.testing.expect(auth.verifyToken(a, &env.app, &r, issued.token) == null);
+}
+
+test "#99 table mode: listActiveSessions + is_current; revoke authorizes owner-or-superuser" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    env.app.session_store = .table;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "owner@x.io", "longenough");
+    try env.createUser(a, "users", "other@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "owner@x.io");
+    const other_rid = try ridOf(env, a, "users", "other@x.io");
+    const rec = try loadRecord(env, a, "users", rid);
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    // Two sessions for the owner.
+    const s1 = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+    _ = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+    const sid1 = (try jwt.peekClaims(a, s1.token)).sid.?;
+
+    // ctx for the owner, authenticated with session s1.
+    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users", .session_id = sid1 }, .request = &hctx };
+    defer cx.deinit();
+
+    const list = try cx.auth().listActiveSessions();
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    var current_seen = false;
+    for (list) |s| if (std.mem.eql(u8, s.id, sid1)) {
+        current_seen = true;
+        try std.testing.expect(s.is_current);
+    } else try std.testing.expect(!s.is_current);
+    try std.testing.expect(current_seen);
+
+    // A DIFFERENT user may not revoke the owner's session (fail closed).
+    const other_rec = try loadRecord(env, a, "users", other_rid);
+    var other_cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = other_rec, .collection = "users" }, .request = &hctx };
+    defer other_cx.deinit();
+    try std.testing.expectError(error.Forbidden, other_cx.auth().revoke(sid1));
+    try std.testing.expectEqual(@as(i64, 2), try sessionCount(env)); // nothing deleted
+
+    // The owner CAN revoke their own session.
+    try cx.auth().revoke(sid1);
+    try std.testing.expectEqual(@as(i64, 1), try sessionCount(env));
+}
+
+test "#99 table mode: logout deletes the current device's session row" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    env.app.session_store = .table;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "lo@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "lo@x.io");
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    const issued = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+    try std.testing.expectEqual(@as(i64, 1), try sessionCount(env));
+
+    // Logout with this token (bearer) deletes the row.
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    var lo = env.ctx(a, .POST, "", &p);
+    lo.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{issued.token});
+    try std.testing.expectEqual(@as(u16, 204), (try authLogout(&lo)).status);
+    try std.testing.expectEqual(@as(i64, 0), try sessionCount(env));
+}
+
+test "#99 table mode: revokeAllSessions clears the principal's rows + bumps epoch" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    env.app.session_store = .table;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "ra@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "ra@x.io");
+    const rec = try loadRecord(env, a, "users", rid);
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var n: usize = 0;
+    while (n < 3) : (n += 1) {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        _ = try issueSession(&hctx, w, "users", rid, .password);
+    }
+    try std.testing.expectEqual(@as(i64, 3), try sessionCount(env));
+
+    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
+    defer cx.deinit();
+    try cx.auth().revokeAllSessions();
+    try std.testing.expectEqual(@as(i64, 0), try sessionCount(env)); // all rows cleared
+}
+
+test "#99 table mode: an unauthorized revoke (error path) does not poison the writer" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    env.app.session_store = .table;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "wl@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "wl@x.io");
+    const rec = try loadRecord(env, a, "users", rid);
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
+    defer cx.deinit();
+
+    // Error path: revoking a non-existent session id returns NotFound (acquires + releases
+    // the writer). It must NOT leave the writer locked/poisoned.
+    try std.testing.expectError(error.NotFound, cx.auth().revoke("no-such-session"));
+
+    // A follow-up write must still succeed — proving the writer was released cleanly.
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const issued = try issueSession(&hctx, w, "users", rid, .password);
+    try std.testing.expect(issued.token.len > 0);
+}
+
+test "#99 epoch-mode per-device verbs report SessionStoreNotEnabled" {
     var env = try TestEnv.initAuth("users");
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1220,13 +1607,9 @@ test "#99 per-device verbs are stubbed: epoch mode reports SessionStoreNotEnable
     var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
     var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &hctx };
     defer cx.deinit();
-    // Default app.session_store == .epoch -> per-device inventory is unavailable.
+    // Default app.session_store == .epoch -> no per-session inventory.
     try std.testing.expectError(error.SessionStoreNotEnabled, cx.auth().listActiveSessions());
     try std.testing.expectError(error.SessionStoreNotEnabled, cx.auth().revoke("s1"));
-    // In table mode the verbs report the not-yet-implemented store instead.
-    env.app.session_store = .table;
-    try std.testing.expectError(error.SessionTableNotImplemented, cx.auth().listActiveSessions());
-    try std.testing.expectError(error.SessionTableNotImplemented, cx.auth().revoke("s1"));
 }
 
 test "issueSession is the mint+emit seam: emits onAuth once with the method tag" {

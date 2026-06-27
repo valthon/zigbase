@@ -102,7 +102,7 @@ pub fn main(init: std.process.Init) !void {
 | `auth_methods` | Register custom `AuthMethod` plugin TYPES (comptime, like `.storage`/`.mailer`). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
-| `session_store` | Session-management model: `.epoch` (default, stateless token-epoch revocation) or `.table` (per-device `_sessions` store — designed/stubbed). See [Revoking sessions](#revoking-sessions-99). |
+| `session_store` | Session-management model: `.epoch` (default, stateless token-epoch revocation, zero extra DB work) or `.table` (server-side `_sessions` store for per-device list/revoke, one extra read per request). See [Revoking sessions](#revoking-sessions-99). |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
 
 ## 3b. The `typegen` gate (`.enable_typegen`) {#the-apptypegen-gate-enable_typegen}
@@ -1215,12 +1215,23 @@ Back-compat is total: tokens minted before the epoch existed (no claim) and fres
 records (NULL column) both read as epoch `0`, so all existing valid tokens keep working.
 
 **Per-device sessions (Variant B, `.session_store = .table`).** Opting into the table model
-maintains a server-side `_sessions` row per session, enabling `ctx.auth().listActiveSessions()`
-and per-session `ctx.auth().revoke(sessionId)` ("log out THIS device") at the cost of one DB
-read per request. This variant is **designed but not yet implemented** — the comptime config
-key and the `_sessions` table ship now; the two per-device verbs return
-`error.SessionTableNotImplemented` (and `error.SessionStoreNotEnabled` in the default `.epoch`
-mode). `revokeAllSessions`/`refresh`/`rotate` work in **both** modes.
+maintains a server-side `_sessions` row per session, enabling a full per-device UI:
+
+| verb (table mode only) | effect |
+|---|---|
+| `ctx.auth().listActiveSessions()` | the current principal's active sessions (`id`, `created`, `last_seen`, `user_agent`, `ip`, `is_current`), newest first. |
+| `ctx.auth().revoke(sessionId)` | "log out THIS device" — delete one session row. Authorized: only the owning user (or a superuser) may revoke a given session; others get `error.Forbidden`. |
+
+In table mode, login/refresh/oauth issuance records a session row and embeds its id in the
+token (`sid` claim); **verify checks the row exists and is unexpired** (one extra indexed read
+per authenticated request — the accepted cost of this mode). Logout and `revoke` delete the
+row; `revokeAllSessions` clears all of the principal's rows (and bumps the epoch). `refresh`/
+`rotate` rotate the current device's row (no accumulation).
+
+**`.epoch` is the default and is unchanged: it issues ZERO session-table queries, and its
+tokens are byte-identical to before this feature** (the `sid` claim is omitted when absent). In
+`.epoch` mode `listActiveSessions`/`revoke` return `error.SessionStoreNotEnabled` (there is no
+per-session inventory); `revokeAllSessions`/`refresh`/`rotate` work in **both** modes.
 
 ## 7. Scheduled jobs (`.cron` + `.jobs`)
 

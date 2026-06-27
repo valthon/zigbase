@@ -205,24 +205,24 @@ fn isSafeIdent(s: []const u8) bool {
 fn init_0011_sessions(w: *db.Db) db.DbError!void {
     // Variant B session store (#99), populated only when App(.{ .session_store = .table }).
     // One row per issued session enables per-device listActiveSessions()/revoke(sessionId)
-    // on top of revoke-all. In the default `.epoch` mode this table is created but unused
-    // (revocation runs via the token epoch). The table shape is locked here so enabling the
-    // table variant later needs no further migration. "revoked"/"expires" gate verification;
-    // "lastSeen" supports an idle-timeout sweep. See the session-management design spec.
+    // on top of revoke-all. In the default `.epoch` mode this table is created but stays empty
+    // (revocation runs via the token epoch, zero session-table work). Owner = (collectionRef,
+    // recordRef) — the auth collection NAME + record id, matching `_externalAuths`. `expires`
+    // is nullable (NULL = no expiry); verify accepts `expires IS NULL OR expires > now`.
+    // Revocation DELETEs the row. `lastSeen`/`userAgent`/`ip` feed the per-device UI.
     try w.exec(
         \\CREATE TABLE IF NOT EXISTS "_sessions" (
         \\  "id" TEXT PRIMARY KEY,
         \\  "collectionRef" TEXT NOT NULL,
         \\  "recordRef" TEXT NOT NULL,
-        \\  "csrf" TEXT NOT NULL DEFAULT '',
-        \\  "userAgent" TEXT NOT NULL DEFAULT '',
         \\  "created" TEXT NOT NULL,
         \\  "lastSeen" TEXT NOT NULL DEFAULT '',
-        \\  "revoked" INTEGER NOT NULL DEFAULT 0,
-        \\  "expires" INTEGER NOT NULL DEFAULT 0
+        \\  "expires" INTEGER,
+        \\  "userAgent" TEXT NOT NULL DEFAULT '',
+        \\  "ip" TEXT NOT NULL DEFAULT ''
         \\);
     );
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_sessions_principal\" ON \"_sessions\" (\"collectionRef\",\"recordRef\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_sessions_owner\" ON \"_sessions\" (\"collectionRef\",\"recordRef\");");
     try w.exec("CREATE INDEX IF NOT EXISTS \"idx_sessions_expires\" ON \"_sessions\" (\"expires\");");
 }
 
@@ -402,11 +402,17 @@ test "0011 creates the _sessions store with its indexes" {
     var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('_sessions');");
     defer t.finalize();
     _ = try t.step();
-    try std.testing.expectEqual(@as(i64, 9), t.columnInt(0));
-    var idx = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_sessions_principal','idx_sessions_expires');");
+    try std.testing.expectEqual(@as(i64, 8), t.columnInt(0));
+    var idx = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_sessions_owner','idx_sessions_expires');");
     defer idx.finalize();
     _ = try idx.step();
     try std.testing.expectEqual(@as(i64, 2), idx.columnInt(0));
+    // expires is nullable (NULL = no expiry); a row may omit it.
+    try d.exec("INSERT INTO \"_sessions\" (\"id\",\"collectionRef\",\"recordRef\",\"created\") VALUES ('s1','users','u1',datetime('now'));");
+    var e = try d.prepare("SELECT expires FROM \"_sessions\" WHERE id='s1';");
+    defer e.finalize();
+    _ = try e.step();
+    try std.testing.expect(e.isNull(0));
 }
 
 test "0003 creates _externalAuths with unique provider/providerId and per-record indexes" {

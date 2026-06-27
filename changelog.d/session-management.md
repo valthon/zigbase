@@ -9,10 +9,13 @@
   epoch is read alongside the signing key). Existing valid tokens keep working: tokens
   minted before the epoch existed and freshly created records both read as epoch 0.
 - New comptime config key `.session_store` (`.epoch` default, or `.table`). The `.table`
-  variant (a server-side `_sessions` store for per-device `listActiveSessions()` /
-  `revoke(sessionId)`) is **designed but not yet implemented**: the config seam and the
-  `_sessions` table ship now, and the two per-device verbs return
-  `error.SessionTableNotImplemented` (or `error.SessionStoreNotEnabled` in `.epoch` mode).
+  variant adds a server-side `_sessions` store for full **per-device** management:
+  `ctx.auth().listActiveSessions()` (with `is_current`) and `ctx.auth().revoke(sessionId)`
+  ("log out THIS device", owner-or-superuser authorized). In table mode each token carries an
+  opaque `sid` and verification additionally requires a live (unexpired) session row — one
+  extra indexed read per authenticated request. `.epoch` stays the default and is unchanged:
+  **zero extra DB work and byte-identical tokens** (the `sid` claim is omitted entirely). In
+  `.epoch` mode the per-device verbs return `error.SessionStoreNotEnabled`.
 
 ### Security
 
@@ -20,3 +23,6 @@
   bumped token epoch causes verification to reject every prior `.auth` token for that
   principal (fail closed — the epoch is trusted only after signature verification). Use it
   on password change, suspected compromise, or an explicit "sign out of all devices".
+- With `.session_store = .table`, a revoked or expired per-device session is rejected at
+  verify time (fail closed), and per-session `revoke` is authorized to the owning user or a
+  superuser (a user cannot revoke another user's session).

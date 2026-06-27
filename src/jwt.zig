@@ -27,6 +27,13 @@ pub const Claims = struct {
     /// Defaults to 0 so pre-epoch tokens (no claim) and fresh records (NULL column) agree
     /// — preserving back-compat. Not meaningful on non-`.auth` token types.
     token_epoch: i64 = 0,
+    /// Server-side session id (Variant B, #99). Set ONLY when a token is issued under
+    /// `App(.{ .session_store = .table })`; it keys the `_sessions` row that verify checks
+    /// for existence + non-expiry (per-device revocation). OPTIONAL and omitted from the JSON
+    /// when null (`sign` uses `emit_null_optional_fields = false`), so epoch-mode tokens are
+    /// byte-identical to pre-#99-Variant-B tokens — the zero-overhead requirement. A missing
+    /// `sid` on parse falls back to null.
+    sid: ?[]const u8 = null,
     iat: i64,
     exp: i64,
 };
@@ -49,7 +56,11 @@ fn b64dec(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 
 /// Produce a compact JWS (header.payload.signature), HS256-signed with `key`.
 pub fn sign(alloc: std.mem.Allocator, claims: Claims, key: []const u8) ![]u8 {
-    const payload_json = try std.json.Stringify.valueAlloc(alloc, claims, .{});
+    // `emit_null_optional_fields = false` omits a null `sid` entirely, so an epoch-mode token
+    // (sid == null) serializes EXACTLY as it did before the `sid` claim existed — required so
+    // enabling Variant B never changes the default mode's token format. Only `sid` is optional;
+    // the other default-empty claims (csrf/jti/pl) are non-optional and still emit as "".
+    const payload_json = try std.json.Stringify.valueAlloc(alloc, claims, .{ .emit_null_optional_fields = false });
     const p = try b64enc(alloc, payload_json);
     const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ header_b64, p });
     var sig: [32]u8 = undefined;
@@ -109,6 +120,36 @@ test "sign then verify round-trips claims" {
     try std.testing.expectEqualStrings("users", out.collection);
     try std.testing.expectEqual(TokenType.auth, out.type);
     try std.testing.expectEqualStrings("c1", out.csrf);
+}
+
+test "#99 sid claim: omitted when null (epoch token unchanged), present + round-trips when set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = crypto.deriveKey("secret", "tk1");
+
+    // Epoch-mode token (sid == null): the JSON must NOT contain "sid" at all, so the token is
+    // byte-identical to a pre-Variant-B token. Prove it equals a token signed by a Claims type
+    // that never had a sid field by checking the serialized payload omits the key entirely.
+    const epoch_claims = Claims{ .id = "u1", .collection = "users", .type = .auth, .csrf = "c1", .iat = 1000, .exp = 2000 };
+    const epoch_token = try sign(a, epoch_claims, &key);
+    // decode payload segment and assert "sid" is absent.
+    var it = std.mem.splitScalar(u8, epoch_token, '.');
+    _ = it.next();
+    const payload_json = try b64dec(a, it.next().?);
+    try std.testing.expect(std.mem.indexOf(u8, payload_json, "\"sid\"") == null);
+    const epoch_out = try verify(a, epoch_token, &key, 1500);
+    try std.testing.expect(epoch_out.sid == null);
+
+    // Table-mode token (sid set): present in JSON + round-trips through verify.
+    const tbl_claims = Claims{ .id = "u1", .collection = "users", .type = .auth, .sid = "sess123", .iat = 1000, .exp = 2000 };
+    const tbl_token = try sign(a, tbl_claims, &key);
+    var it2 = std.mem.splitScalar(u8, tbl_token, '.');
+    _ = it2.next();
+    const tbl_payload = try b64dec(a, it2.next().?);
+    try std.testing.expect(std.mem.indexOf(u8, tbl_payload, "\"sid\":\"sess123\"") != null);
+    const tbl_out = try verify(a, tbl_token, &key, 1500);
+    try std.testing.expectEqualStrings("sess123", tbl_out.sid.?);
 }
 
 test "pl claim round-trips, empty and set" {

@@ -61,44 +61,56 @@ epoch-gated.
 Per-device revoke is **not** possible in Variant A (the epoch is per-principal, not
 per-session) — documented.
 
-## Variant B — server-side `_sessions` table (comptime opt-in; DESIGNED, STUBBED)
+## Variant B — server-side `_sessions` table (comptime opt-in; IMPLEMENTED)
 
-`App(.{ .session_store = .table })` selects a model where each issued session is a row in a
+`App(.{ .session_store = .table })` selects a model where each issued session is a row in the
 `_sessions` system table (migration `0011_sessions`: `id`, `collectionRef`, `recordRef`,
-`csrf`, `userAgent`, `created`, `lastSeen`, `revoked`, `expires`). Issue records a row keyed by
-a random session id embedded in the JWT (`sid` claim); verify checks the row exists + not
-revoked + not expired (one DB read per request — the accepted cost). This enables
-`listActiveSessions()` and per-session `revoke(sessionId)` ("log out THIS device") on top of
-revoke-all.
+`created`, `lastSeen`, `expires` (nullable), `userAgent`, `ip`; indexed on the owner ref).
+`issue()` records a row keyed by a random session id (the record id generator) and embeds it in
+the JWT as the optional `sid` claim; verify, **table mode only**, checks the row exists +
+unexpired (`expires IS NULL OR expires > now`) — one extra indexed read per authenticated
+request, the accepted cost. This enables `listActiveSessions()` and per-session
+`revoke(sessionId)` ("log out THIS device") on top of revoke-all.
 
-### Why STUBBED (the specific blocker)
-The current login path (`authWithPassword`) intentionally runs on a **reader** connection so
-the expensive argon2 verify never serializes behind the single global writer lock. Variant B's
-issue-time `INSERT INTO _sessions` requires the **writer**. Wiring B correctly means
-restructuring login's connection model (or adding a second writer hop) on a security-critical
-path — exactly the kind of subtle interaction #99 says to stop and flag rather than guess. So:
+### Zero epoch-mode overhead (the user's hard constraint)
+Everything table-mode is gated on `if (app.session_store == .table)`:
+- `issue()` records a row and sets `sid` ONLY in table mode; in `.epoch` mode `sid` stays
+  null and `sign()` (with `emit_null_optional_fields = false`) **omits it**, so an epoch token
+  is byte-identical to a pre-Variant-B token (no format change).
+- The verify session lookup is added AFTER the existing epoch read, behind the same gate — so
+  `.epoch` mode issues exactly the queries it did before (the existing single `tokenKey,
+  token_epoch` read). A test asserts an epoch-mode login writes **no** `_sessions` row.
 
-- The comptime seam ships: `.session_store` config key → `App.session_store: SessionStore`.
-- The table ships: migration `0011_sessions` (schema locked in).
-- The verbs ship as **stubs**: `listActiveSessions()` / `revoke(sessionId)` return
-  `error.SessionTableNotImplemented` (and `error.SessionStoreNotEnabled` when called in
-  `.epoch` mode). `revokeAllSessions`/`refresh`/`rotate` work in **both** modes via the epoch
-  mechanism (epoch is always active).
+### Writer-on-login (the constraint flagged in the prior pass)
+`issue()` is the single mint seam, and it does the INSERT using its `conn`. Every login path
+except password already holds the **writer** (refresh / unified `complete` (otp/webauthn/
+oauth2/magic-link) / `ctx.issueSession` / `ctx.auth()` verbs), so they "just work". Password
+login keeps the **reader** for the costly argon2 verify, then — table mode only — acquires the
+**writer** AFTER verification, purely for the session-row INSERT, so logins still never
+serialize on argon2. INSERT/DELETE are single statements (writer autocommit), or joined to an
+existing transaction (refresh) that already carries `errdefer w.rollback()`.
 
-Completing B = (1) `sid` claim + issue-time row insert on the writer (login restructure),
-(2) per-request session lookup in `verifyTokenOfTypes` gated on `app.session_store == .table`,
-(3) implement the two stubbed verbs against `_sessions`, (4) a GC sweep for expired rows.
+### Fail-closed verify + authz
+Verify rejects a table-mode `.auth` token whose `sid` row is absent/expired (same discipline as
+the epoch mismatch). `revoke(sessionId)` is owner-or-superuser only (`error.Forbidden`
+otherwise; `error.NotFound` for an absent row). Logout deletes the current `sid` row;
+`revokeAllSessions` clears all the principal's rows (and still bumps the epoch); `refresh`/
+`rotate` rotate the current device's row (delete-old-then-insert-new — no accumulation).
+
+### Deferred (small)
+A periodic GC sweep of expired `_sessions` rows (verify already ignores them; they are inert).
 
 ## Surface summary
 
-| verb | epoch mode (default) | table mode (stub) |
+| verb | epoch mode (default) | table mode |
 |---|---|---|
-| `clearSession()` | clears cookies (existing) | same |
-| `revokeAllSessions()` | bump epoch | bump epoch (works) |
-| `refresh()` | re-mint, same epoch | same |
-| `rotate()` | bump epoch + re-mint | same |
-| `listActiveSessions()` | `error.SessionStoreNotEnabled` | `error.SessionTableNotImplemented` |
-| `revoke(sessionId)` | `error.SessionStoreNotEnabled` | `error.SessionTableNotImplemented` |
+| `clearSession()` | clears cookies | same |
+| `revokeAllSessions()` | bump epoch | bump epoch + delete the principal's rows |
+| `refresh()` | re-mint, same epoch | + rotate this device's row |
+| `rotate()` | bump epoch + re-mint | + rotate this device's row |
+| `listActiveSessions()` | `error.SessionStoreNotEnabled` | the principal's active sessions (`is_current` set) |
+| `revoke(sessionId)` | `error.SessionStoreNotEnabled` | delete one row (owner/superuser only) |
+| login / logout | epoch token, cookie clear | + write / delete the session row |
 
 ## Tests (Variant A, must-have)
 - token rejected after `revokeAllSessions`/epoch bump (revoke-all works);

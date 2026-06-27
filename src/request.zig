@@ -8,6 +8,10 @@ pub const RequestContext = struct {
     collection: []const u8 = "", // auth collection name; "" = unauthenticated/anonymous
     data: ?std.json.Value = null, // request body (create/update rules)
     method: []const u8 = "",
+    /// Server-side session id of the current request's token (Variant B, #99); "" in epoch
+    /// mode or when the token carries no `sid`. Lets `ctx.auth()` target THIS device's row
+    /// (logout/revoke) and mark it `is_current` in `listActiveSessions`.
+    session_id: []const u8 = "",
 
     /// Resolve a `@request.*` macro path to a text value. Returns null for an unknown macro.
     /// `@request.auth.<field>` and `@request.data.<field>` yield "" when absent/unauthenticated.
