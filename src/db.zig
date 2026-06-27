@@ -61,6 +61,9 @@ pub const Db = struct {
     pub fn rollback(self: *Db) DbError!void {
         try self.exec("ROLLBACK;");
     }
+    pub fn beginImmediate(self: *Db) DbError!void {
+        return self.exec("BEGIN IMMEDIATE;");
+    }
 
     /// Number of rows changed/inserted/deleted by the most recent DML statement on this
     /// connection. Wraps `sqlite3_changes64`. Safe to call immediately after a Stmt.step()
@@ -217,6 +220,18 @@ test "commit persists writes" {
     defer sel.finalize();
     try std.testing.expect((try sel.step()) == true);
     try std.testing.expectEqual(@as(i64, 1), sel.columnInt(0));
+}
+
+test "beginImmediate starts a write transaction that can be committed" {
+    var conn = try Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE t(x INTEGER);");
+    try conn.beginImmediate();
+    try conn.exec("INSERT INTO t(x) VALUES (1);");
+    try conn.commit();
+    // A second begin/commit proves the first fully closed.
+    try conn.beginImmediate();
+    try conn.commit();
 }
 
 /// Number of read-only connections kept warm for reuse. SQLite connection open
