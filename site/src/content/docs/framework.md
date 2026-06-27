@@ -456,7 +456,10 @@ try expect(tc.mail.find("Verify") != null);
 
 `mail.enable(suppress)`: `suppress = true` records and skips real delivery; `false` records
 **and** still delivers (assert against a live MailHog/log run). `from` is the backend's
-configured sender (empty for `LogMailer`, which has none).
+configured sender (empty for `LogMailer`, which has none). Beyond the indexed accessors,
+`mail.entries()` returns the whole captured slice (`[]const MailEntry`), `mail.disable()`
+stops capturing while keeping already-captured entries readable, and `mail.reset()` clears
++ frees.
 
 **HTTP capture / mock.** `HttpClient.request` (what `ctx.http()` returns) consults the
 capture before touching the network — recording the request and, if a mock matches the URL
@@ -481,7 +484,9 @@ try expectEqual(zigbase.HttpMethod.POST, rq.method);
 `http.enable(block_unmocked)`: with `block_unmocked = true` (recommended) a request to an
 un-mocked URL fails with `error.TransportFailed` rather than silently hitting the network;
 `false` lets un-mocked URLs pass through to the real network. Mocked responses are matched
-newest-registration-first on URL substring.
+newest-registration-first on URL substring. Beyond the indexed accessors, `http.requests()`
+returns the whole captured slice (`[]const HttpRequest`), `http.disable()` stops capturing
+while keeping recorded requests + mocks readable, and `http.reset()` clears + frees.
 
 ### Error helpers (`ctx.fail`, `ctx.invalid`, `ctx.errorResponse`)
 
@@ -774,9 +779,10 @@ fn seedProfile(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerr
 ```
 
 **Deferred (designed, not wired):** self-service password change via `PATCH /records`
-(use the record `beforeUpdate`/`afterUpdate` hooks on the auth collection), firing
-`beforeAuthSuccess` on the legacy `/auth-with-password` / `/auth-refresh` endpoints, and
-the `ctx.auth()` refresh / rotate / revoke verbs. See the auth-lifecycle-hooks design spec.
+(use the record `beforeUpdate`/`afterUpdate` hooks on the auth collection), and firing
+`beforeAuthSuccess` on the legacy `/auth-with-password` / `/auth-refresh` endpoints. (The
+`ctx.auth()` refresh / rotate / revoke session verbs **are** wired — see [§6 Session
+verbs](#ctxauth--session-management).) See the auth-lifecycle-hooks design spec.
 
 ### Auth methods overview
 
@@ -1810,15 +1816,19 @@ timestamp routes through the seam:
 - A consumer's own `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')` /
   `date('now')` / `time('now')` / `julianday('now')` in raw SQL — those date/time
   functions are shadowed on every connection and resolve to the frozen instant when a
-  freeze is active.
+  freeze is active, **including their zero-argument implicit-`'now'` forms** (e.g.
+  `date()`). Every other input passes through to genuine SQLite unfrozen: explicit
+  datetimes, `'+1 day'` / `'start of month'` modifiers, and the `strftime` format string.
+- The SQL keywords `CURRENT_TIMESTAMP` / `CURRENT_TIME` / `CURRENT_DATE` and column
+  `DEFAULT CURRENT_TIMESTAMP` timestamps. These read SQLite's clock through the VFS, not
+  the SQL-function layer, so (dev builds only) connections open against the `zigbase_frozen`
+  wrapping VFS — a byte-for-byte copy of the default VFS with only its current-time hooks
+  overridden to the frozen instant; all file I/O still delegates to the genuine OS VFS
+  unchanged (`src/clock_vfs.zig`). There are no remaining unfrozen `'now'` paths.
 
 ```sh
 ZIGBASE_FAKE_NOW="2029-03-07T16:00:00Z" ./zigbase serve ...
 ```
-
-**Not covered:** `CURRENT_TIMESTAMP` / `CURRENT_TIME` / `CURRENT_DATE` and SQLite
-column `DEFAULT` timestamps — these are SQL keywords that read SQLite's time directly
-and cannot be overridden via a user-defined function.
 
 ### Seeding entropy: `ZIGBASE_FAKE_SEED`
 
