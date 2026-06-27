@@ -15,9 +15,11 @@ pub const csrf_cookie = "zb_csrf";
 /// Returns a fixed `[2]` array; callers that need a slice for `Response.cookies`
 /// dupe it onto their arena (see `clearedCookies` callers / `Issued`).
 pub fn sessionCookies(secure: bool, token: []const u8, csrf: []const u8, max_age_s: i32) [2]http.Cookie {
+    // `.path` is set explicitly (not left to http.Cookie's default) so this module is the
+    // authoritative source for EVERY attribute — and the cleared variant matches it exactly.
     return .{
-        .{ .name = auth_cookie, .value = token, .max_age_s = max_age_s, .http_only = true, .secure = secure, .same_site = .strict },
-        .{ .name = csrf_cookie, .value = csrf, .max_age_s = max_age_s, .http_only = false, .secure = secure, .same_site = .strict },
+        .{ .name = auth_cookie, .value = token, .max_age_s = max_age_s, .http_only = true, .secure = secure, .same_site = .strict, .path = "/" },
+        .{ .name = csrf_cookie, .value = csrf, .max_age_s = max_age_s, .http_only = false, .secure = secure, .same_site = .strict, .path = "/" },
     };
 }
 

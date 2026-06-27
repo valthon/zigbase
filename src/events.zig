@@ -211,8 +211,14 @@ pub const AuthSuccessEvent = struct {
 /// `beforeAuthSuccess` handler: writable + abortable. Returning an error ROLLS BACK the
 /// login transaction (no session issued); use `ctx.fail(status, msg)` for a chosen status,
 /// `error.Forbidden`/`error.Unauthorized` for 403/401, else the response is a generic 500.
-/// Do NOT call `ctx.tx` (already in a transaction — `error.NestedTransaction`); use
-/// `ctx.records()` directly, which reuses the bound transaction connection.
+///
+/// WARNING — the hook runs with a request-bound `*Ctx` whose writer connection is ALREADY
+/// HELD inside the login transaction. It MUST NOT call anything that re-acquires the pool
+/// writer or opens a new transaction: `ctx.issueSession()`, `ctx.tx()`, or any helper that
+/// grabs the writer would attempt to take the single non-reentrant writer a second time and
+/// **deadlock permanently** (`ctx.tx` is guarded and returns `error.NestedTransaction`, but
+/// the writer-acquiring helpers are not). For side-writes use `ctx.records()` directly — it
+/// reuses the bound transaction connection, so the writes commit atomically with the login.
 pub const AuthSuccessHandler = *const fn (ctx: *Ctx, ev: *AuthSuccessEvent) anyerror!void;
 
 pub const FileEvent = struct {
