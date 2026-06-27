@@ -174,7 +174,7 @@ pub const RouteEvent = struct {
         return .{ .app = ev.app, .arena = ev.ctx.allocator, .rctx = ev.rctx, .bound_conn = null };
     }
 };
-pub const RouteHandler = *const fn (ev: *RouteEvent) anyerror!http.Response;
+pub const RouteHandler = *const fn (ctx: *Ctx) anyerror!http.Response;
 
 /// Re-exported for config code that needs to name the rate-limit callback type.
 pub const RateLimitFn = @import("auth_helpers.zig").RateLimitFn;
@@ -272,7 +272,7 @@ fn validateRouteSpecs(comptime specs: anytype) void {
     }
 }
 
-/// True iff `H` is the UNTYPED route handler form `fn(*RouteEvent) anyerror!http.Response`.
+/// True iff `H` is the UNTYPED route handler form `fn(*Ctx) anyerror!http.Response`.
 /// Untyped handlers own the full response (status, cookies, content-type, redirect, raw
 /// body), so they are stored directly instead of being wrapped in a typed thunk. Anything
 /// else is treated as the typed form `fn(*Req(In)) RouteError!Out`.
@@ -290,7 +290,7 @@ pub fn isUntypedHandler(comptime H: type) bool {
     const p = f.params[0].type orelse return false;
     const pi = @typeInfo(p);
     if (pi != .pointer or pi.pointer.size != .one) return false;
-    return pi.pointer.child == RouteEvent;
+    return pi.pointer.child == Ctx;
 }
 
 /// Comptime route metadata for a typed route spec: the derived method name plus the
@@ -304,7 +304,7 @@ pub const RouteMeta = struct {
     auth: AuthLevel,
     Input: type,
     Output: type,
-    /// True for untyped `fn(*RouteEvent) anyerror!http.Response` handlers, which own the
+    /// True for untyped `fn(*Ctx) anyerror!http.Response` handlers, which own the
     /// raw response and contribute no typed RPC surface. The TS codegen skips these so it
     /// doesn't emit a client method that would mis-handle their non-JSON responses.
     untyped: bool = false,
@@ -717,8 +717,8 @@ test "AuthMethod enumerates all method tags" {
 test "isUntypedHandler detects raw-response handlers and routeMeta flags them out of codegen" {
     const H = struct {
         // Untyped: owns the raw http.Response (cookies/redirect/non-JSON body).
-        fn raw(ev: *RouteEvent) anyerror!http.Response {
-            _ = ev;
+        fn raw(ctx: *Ctx) anyerror!http.Response {
+            _ = ctx;
             return error.Unexpected;
         }
         // Typed: reflected into the RPC surface.

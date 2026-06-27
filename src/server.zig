@@ -20,6 +20,7 @@ const ApiError = @import("api/error.zig").ApiError;
 const auth = @import("auth.zig");
 const events = @import("events.zig");
 const request = @import("request.zig");
+const Ctx = @import("ctx.zig").Ctx;
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
     return health.handle(ctx);
@@ -186,11 +187,16 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 .is_superuser = if (authed) |a| a.is_superuser else false,
                 .method = @tagName(ctx.method),
             };
-            var ev = events.RouteEvent{ .app = app, .ctx = ctx, .rctx = rctx };
-            return rt.handler(&ev) catch |e| {
+            var cx = Ctx{ .app = app, .arena = ctx.allocator, .rctx = rctx, .request = ctx, .bound_conn = null };
+            defer cx.deinit();
+            return rt.handler(&cx) catch |e| {
+                // Report every handler error to the consumer onError + Sentry/log backstop
+                // (preserves the pre-Ctx behaviour), then map it to a response via A1's
+                // Ctx.errorResponse (error.NotFound -> 404, error.Handled -> stashed, etc.)
+                // instead of the old always-500 mapping.
                 var err_ev = events.ErrorEvent{ .app = app, .ctx = &rctx, .err = e, .phase = .request, .message = @errorName(e) };
                 events.dispatchError(app, app.dispatch, &err_ev);
-                return try ApiError.internal().toResponse(ctx.allocator);
+                return cx.errorResponse(e);
             };
         }
     }

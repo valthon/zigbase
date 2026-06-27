@@ -321,15 +321,15 @@ fn health(req: *zigbase.Req(void)) zigbase.RouteError!HealthOut {
 // ---------------------------------------------------------------------------
 // 6b. Untyped route: GET /api/golfsim/calendar.ics
 //
-//    An UNTYPED handler — `fn(*RouteEvent) anyerror!http.Response` — owns the
+//    An UNTYPED handler — `fn(*Ctx) anyerror!http.Response` — owns the
 //    whole response, so it can return a non-JSON `content-type` that a typed
 //    `Req(_)`/`Output` route (always 200/204 JSON) cannot express. Untyped
 //    routes are deliberately left out of the generated `zb.rpc.*` client, so
 //    fetch this URL directly (e.g. subscribe to it from a calendar app). The
 //    body is a static literal, so it safely outlives the handler.
 // ---------------------------------------------------------------------------
-fn calendarFeed(ev: *zigbase.RouteEvent) anyerror!zigbase.http.Response {
-    _ = ev;
+fn calendarFeed(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    _ = ctx;
     const ics =
         \\BEGIN:VCALENDAR
         \\VERSION:2.0

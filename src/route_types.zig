@@ -160,8 +160,8 @@ fn assertRepresentableField(comptime T: type, comptime route_name: []const u8, c
 }
 
 /// Wrap a typed handler `fn(*Req(I)) RouteError!O` into a RouteHandler thunk
-/// (`fn(*RouteEvent) anyerror!http.Response`). Comptime-specialized per handler.
-/// `events`/`http` are imported lazily inside the function bodies so the rest of
+/// (`fn(*Ctx) anyerror!http.Response`). Comptime-specialized per handler.
+/// `events`/`http`/`Ctx` are imported lazily inside the function so the rest of
 /// route_types.zig (Req/RouteError/reflection) stays free of the framework import
 /// cycle (events.zig imports route_types for Req/RouteError).
 pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
@@ -170,32 +170,33 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
         @compileError("route handler must return RouteError!Output, found a different error set: " ++ @typeName(HandlerErrorSet(H)));
     const In = HandlerInput(H);
     const Out = HandlerOutput(H);
-    const events = @import("events.zig");
     const http = @import("http.zig");
+    const Ctx = @import("ctx.zig").Ctx;
 
     const Thunk = struct {
-        fn run(ev: *events.RouteEvent) anyerror!http.Response {
-            const a = ev.ctx.allocator;
+        fn run(cx: *Ctx) anyerror!http.Response {
+            const a = cx.arena;
+            const rc = cx.request.?; // typed routes always run with an HTTP request
             // 1. Parse input (void -> skip; GET/DELETE -> query; else JSON body).
             // The GET query branch is gated behind a comptime `isQueryParseable(In)`
             // so that complex POST-body types (with nested slices, enums, optional
             // structs) don't instantiate `parseQuery` and hit its @compileError paths.
             const input: In = if (In == void) {} else blk: {
                 if (comptime isQueryParseable(In)) {
-                    if (ev.ctx.method == .GET or ev.ctx.method == .DELETE) {
-                        break :blk parseQuery(In, a, ev.ctx.query) catch
+                    if (rc.method == .GET or rc.method == .DELETE) {
+                        break :blk parseQuery(In, a, rc.query) catch
                             return badRequest(a, "Invalid query parameters.");
                     }
                 }
-                if (ev.ctx.body.len == 0) return badRequest(a, "Missing request body.");
-                break :blk (std.json.parseFromSlice(In, a, ev.ctx.body, .{ .ignore_unknown_fields = true }) catch
+                if (rc.body.len == 0) return badRequest(a, "Missing request body.");
+                break :blk (std.json.parseFromSlice(In, a, rc.body, .{ .ignore_unknown_fields = true }) catch
                     return badRequest(a, "Invalid JSON body.")).value;
             };
-            // 2. Build Req. Map RouteEvent params (http.Param) onto route_types.Param.
-            var params = try a.alloc(Param, ev.ctx.params.len);
-            for (ev.ctx.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
-            const auth_id = ev.rctx.resolveMacro("@request.auth.id") orelse "";
-            var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .app = ev.app, .arena = a };
+            // 2. Build Req. Map request params (http.Param) onto route_types.Param.
+            var params = try a.alloc(Param, rc.params.len);
+            for (rc.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
+            const auth_id = cx.rctx.resolveMacro("@request.auth.id") orelse "";
+            var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .app = cx.app, .arena = a };
             // 3. Call handler; map errors -> status+message.
             const out: Out = handler(&req) catch |e| {
                 if (req.failure) |f|
@@ -389,7 +390,7 @@ test "isRepresentable rejects unsupported types" {
 
 test "makeThunk: parses input, serializes output (200)" {
     const http = @import("http.zig");
-    const events = @import("events.zig");
+    const Ctx = @import("ctx.zig").Ctx;
     const In = struct { guests: u32 };
     const Out = struct { id: []const u8, guests: u32, confirmed: bool };
     const H = struct {
@@ -413,8 +414,9 @@ test "makeThunk: parses input, serializes output (200)" {
         .params = &params,
     };
     const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
-    var ev = events.RouteEvent{ .app = undefined, .ctx = &ctx, .rctx = rctx };
-    const resp = try thunk(&ev);
+    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = rctx, .request = &ctx };
+    defer cx.deinit();
+    const resp = try thunk(&cx);
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"confirmed\":true") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"bk1\"") != null);
@@ -473,7 +475,7 @@ test "isQueryParseable: nested struct returns false; mixed flat struct returns t
 
 test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
     const http = @import("http.zig");
-    const events = @import("events.zig");
+    const Ctx = @import("ctx.zig").Ctx;
     const H = struct {
         fn h(req: *Req(void)) RouteError!void {
             return req.fail(404, "Booking not found");
@@ -484,8 +486,9 @@ test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
     defer arena.deinit();
     var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = arena.allocator() };
     const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
-    var ev = events.RouteEvent{ .app = undefined, .ctx = &ctx, .rctx = rctx };
-    const resp = try thunk(&ev);
+    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = rctx, .request = &ctx };
+    defer cx.deinit();
+    const resp = try thunk(&cx);
     try testing.expectEqual(@as(u16, 404), resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "Booking not found") != null);
 }
