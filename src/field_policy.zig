@@ -11,26 +11,109 @@ const schema = @import("schema.zig");
 // `.encrypted = true`. Handlers, the records API, and the HTTP layer always see
 // plaintext; only the SQLite file holds the ciphertext envelope.
 //
-// The cipher is resolved once at startup from ZIGBASE_FIELD_KEY and stamped onto
-// pooled DB connections (db.zig), so it reaches `values.zig` via the prepared
-// statement with no changes to the records function signatures. A null cipher
-// (no key configured / direct test connections) leaves every value untouched.
+// The cipher is resolved once at startup from ZIGBASE_FIELD_KEY (+ optional older
+// generations) and stamped onto pooled DB connections (db.zig), so it reaches
+// `values.zig` via the prepared statement with no changes to the records function
+// signatures. A null cipher (no key configured / direct test connections) leaves
+// every value untouched.
+//
+// Key rotation: the cipher is a generation-indexed key-ring. Writes use the
+// PRIMARY generation's key and stamp `v<primary>:`; reads parse the version `N`
+// out of the envelope and decrypt with generation `N`'s key. An envelope whose
+// generation has no configured key fails closed. See
+// docs/superpowers/specs/2026-06-27-encryption-rotation-design.md.
 // ---------------------------------------------------------------------------
 
-/// Domain separator for the field-encryption key space (distinct from the
-/// OAuth-secret domain so the key spaces never collide).
-pub const FIELD_KEY_DOMAIN = "zigbase-field-encryption-v1";
+/// Domain-separation prefix for the field-encryption key space. Each generation
+/// derives an independent key with domain `FIELD_KEY_DOMAIN_PREFIX ++ "<gen>"`,
+/// e.g. generation 1 -> "zigbase-field-encryption-v1" (the constant the
+/// single-key build used, so existing v1: data decrypts unchanged).
+pub const FIELD_KEY_DOMAIN_PREFIX = "zigbase-field-encryption-v";
 
-/// Resolved field cipher: a derived AES-256 key plus the io used to source a
-/// fresh nonce per write. Constructed once at startup; pointed at by db.Db.
+/// Generation 1's domain, preserved as a named constant for clarity / back-compat.
+pub const FIELD_KEY_DOMAIN = FIELD_KEY_DOMAIN_PREFIX ++ "1";
+
+/// Highest supported key generation (== highest envelope version). A generation
+/// outside 1..MAX_GENERATION is a config error; a stored envelope version above
+/// it has no key and fails closed.
+pub const MAX_GENERATION: u16 = 64;
+
+/// Config-resolution errors for the multi-generation key-ring.
+pub const ResolveError = error{
+    /// `ZIGBASE_FIELD_KEY_GENERATION` was outside 1..MAX_GENERATION.
+    BadGeneration,
+    /// `ZIGBASE_FIELD_KEY_V<M>` was set for the primary generation, which already
+    /// gets its key from `ZIGBASE_FIELD_KEY` (ambiguous — two sources).
+    GenerationConflict,
+};
+
+/// Derive generation `gen`'s 32-byte key from the raw secret via HKDF. The raw
+/// key material is never stored. `gen` must be in 1..MAX_GENERATION.
+pub fn deriveGeneration(secret: []const u8, gen: u16) [32]u8 {
+    var buf: [FIELD_KEY_DOMAIN_PREFIX.len + 8]u8 = undefined;
+    const domain = std.fmt.bufPrint(&buf, "{s}{d}", .{ FIELD_KEY_DOMAIN_PREFIX, gen }) catch unreachable;
+    return aead.deriveKey(secret, domain);
+}
+
+/// Resolved field cipher: a generation-indexed key-ring plus the io used to
+/// source a fresh nonce per write. Constructed once at startup; pointed at by
+/// db.Db (type-erased). `values.zig` holds a `*const Cipher` (no per-value copy).
 pub const Cipher = struct {
-    key: [32]u8,
+    /// keys[g] = derived key for generation g (1..MAX_GENERATION), null if that
+    /// generation is not configured. Index 0 is unused.
+    keys: [MAX_GENERATION + 1]?[32]u8 = @splat(null),
+    /// The generation used for all writes; `keys[primary_gen]` is always set.
+    primary_gen: u16 = 1,
     io: std.Io,
 
-    /// Derive the cipher from the raw `ZIGBASE_FIELD_KEY` value via HKDF (so the
-    /// env value may be any length/format). The raw key is never stored.
+    /// Single-generation cipher (generation 1) from the raw `ZIGBASE_FIELD_KEY`.
+    /// Backward-compatible shorthand used by tests and the single-key path.
     pub fn fromEnv(io: std.Io, field_key: []const u8) Cipher {
-        return .{ .key = aead.deriveKey(field_key, FIELD_KEY_DOMAIN), .io = io };
+        var c = Cipher{ .io = io, .primary_gen = 1 };
+        c.keys[1] = deriveGeneration(field_key, 1);
+        return c;
+    }
+
+    /// Resolve the full key-ring from config: the primary key (`field_key`) at
+    /// `primary_gen`, plus any older read-only generations supplied via
+    /// `ZIGBASE_FIELD_KEY_V<M>` (read through `getter`, which has a
+    /// `get(key) ?[]const u8` method). Fail-closed config validation:
+    ///   - `primary_gen` must be in 1..MAX_GENERATION (else `BadGeneration`).
+    ///   - `ZIGBASE_FIELD_KEY_V<primary_gen>` set -> `GenerationConflict`.
+    pub fn resolve(io: std.Io, getter: anytype, field_key: []const u8, primary_gen: u16) ResolveError!Cipher {
+        if (primary_gen < 1 or primary_gen > MAX_GENERATION) return error.BadGeneration;
+        var c = Cipher{ .io = io, .primary_gen = primary_gen };
+        c.keys[primary_gen] = deriveGeneration(field_key, primary_gen);
+        var g: u16 = 1;
+        while (g <= MAX_GENERATION) : (g += 1) {
+            var namebuf: [32]u8 = undefined;
+            const name = std.fmt.bufPrint(&namebuf, "ZIGBASE_FIELD_KEY_V{d}", .{g}) catch unreachable;
+            const val = getter.get(name) orelse continue;
+            if (val.len == 0) continue;
+            if (g == primary_gen) return error.GenerationConflict;
+            c.keys[g] = deriveGeneration(val, g);
+        }
+        return c;
+    }
+
+    /// Seal a storage string into a `v<primary>:` envelope under the primary key.
+    pub fn seal(self: *const Cipher, alloc: std.mem.Allocator, plaintext: []const u8) std.mem.Allocator.Error![]u8 {
+        const key = self.keys[self.primary_gen].?;
+        return aead.seal(self.io, alloc, key, self.primary_gen, plaintext);
+    }
+
+    /// Open a stored value back to its plaintext storage string. STRICT /
+    /// fail-closed: the stored value MUST be a valid `v<N>:` envelope whose
+    /// generation `N` has a configured key. A non-envelope (legacy plaintext), an
+    /// unknown/unconfigured generation, a wrong key, or tamper all return
+    /// `error.BadEnvelope`. Enabling `.encrypted` on a column that already holds
+    /// plaintext therefore requires an explicit `zigbase rewrap` first; there is
+    /// no silent plaintext passthrough.
+    pub fn open(self: *const Cipher, alloc: std.mem.Allocator, stored: []const u8) aead.Error![]u8 {
+        const ver = aead.parseVersion(stored) orelse return error.BadEnvelope;
+        if (ver < 1 or ver > MAX_GENERATION) return error.BadEnvelope;
+        const key = self.keys[ver] orelse return error.BadEnvelope;
+        return aead.open(alloc, key, stored);
     }
 };
 
@@ -39,29 +122,25 @@ pub const Cipher = struct {
 /// validator, and this value layer never drift.
 pub const isEncryptableType = schema.isEncryptableType;
 
-/// Seal a storage string (the text, or the stringified json) into a v1 envelope.
-pub fn seal(cipher: Cipher, alloc: std.mem.Allocator, plaintext: []const u8) std.mem.Allocator.Error![]u8 {
-    return aead.sealV1(cipher.io, alloc, cipher.key, plaintext);
-}
-
-/// Open a stored value back to its plaintext storage string. STRICT / fail-closed:
-/// the stored value MUST be a valid v1 envelope — a non-envelope (e.g. legacy
-/// plaintext) or an undecryptable blob returns `error.BadEnvelope`. Enabling
-/// `.encrypted` on a column that already holds plaintext therefore requires an
-/// explicit rewrap migration first; there is no silent plaintext passthrough.
-pub fn open(cipher: Cipher, alloc: std.mem.Allocator, stored: []const u8) aead.Error![]u8 {
-    return aead.openV1(alloc, cipher.key, stored);
-}
+/// Test getter with a `get(key) ?[]const u8` method backed by a fixed list.
+const MapGetter = struct {
+    pairs: []const [2][]const u8,
+    fn get(self: MapGetter, key: []const u8) ?[]const u8 {
+        for (self.pairs) |p| if (std.mem.eql(u8, p[0], key)) return p[1];
+        return null;
+    }
+};
 
 test "seal/open round-trips a storage string and ciphertext-at-rest holds" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const cph = Cipher.fromEnv(std.testing.io, "operator-field-key");
-    const blob = try seal(cph, a, "sensitive-value");
+    const blob = try cph.seal(a, "sensitive-value");
     try std.testing.expect(aead.isEnvelope(blob));
+    try std.testing.expect(std.mem.startsWith(u8, blob, "v1:"));
     try std.testing.expect(std.mem.indexOf(u8, blob, "sensitive-value") == null);
-    try std.testing.expectEqualStrings("sensitive-value", try open(cph, a, blob));
+    try std.testing.expectEqualStrings("sensitive-value", try cph.open(a, blob));
 }
 
 test "open is strict: legacy plaintext fails closed" {
@@ -69,7 +148,62 @@ test "open is strict: legacy plaintext fails closed" {
     defer arena.deinit();
     const a = arena.allocator();
     const cph = Cipher.fromEnv(std.testing.io, "k");
-    try std.testing.expectError(error.BadEnvelope, open(cph, a, "legacy-plaintext"));
+    try std.testing.expectError(error.BadEnvelope, cph.open(a, "legacy-plaintext"));
+}
+
+test "multi-gen: writes use primary version; old generations still decrypt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Old single-key deployment: write v1: with "oldkey".
+    const old = Cipher.fromEnv(std.testing.io, "oldkey");
+    const v1_blob = try old.seal(a, "secret-payload");
+    try std.testing.expect(std.mem.startsWith(u8, v1_blob, "v1:"));
+
+    // Rotate: primary = generation 2 ("newkey"), generation 1 = "oldkey" (read-only).
+    const getter = MapGetter{ .pairs = &.{.{ "ZIGBASE_FIELD_KEY_V1", "oldkey" }} };
+    const ring = try Cipher.resolve(std.testing.io, getter, "newkey", 2);
+
+    // Writes now stamp v2:.
+    const v2_blob = try ring.seal(a, "secret-payload");
+    try std.testing.expect(std.mem.startsWith(u8, v2_blob, "v2:"));
+    // Both the legacy v1 blob and the new v2 blob decrypt under the ring.
+    try std.testing.expectEqualStrings("secret-payload", try ring.open(a, v1_blob));
+    try std.testing.expectEqualStrings("secret-payload", try ring.open(a, v2_blob));
+}
+
+test "multi-gen open fails closed on an unconfigured generation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A v1 blob, but the ring only knows generation 2 (no V1 supplied).
+    const old = Cipher.fromEnv(std.testing.io, "oldkey");
+    const v1_blob = try old.seal(a, "x");
+    const getter = MapGetter{ .pairs = &.{} };
+    const ring = try Cipher.resolve(std.testing.io, getter, "newkey", 2);
+    try std.testing.expectError(error.BadEnvelope, ring.open(a, v1_blob));
+}
+
+test "resolve: bad generation and primary conflict are rejected" {
+    const empty = MapGetter{ .pairs = &.{} };
+    try std.testing.expectError(error.BadGeneration, Cipher.resolve(std.testing.io, empty, "k", 0));
+    try std.testing.expectError(error.BadGeneration, Cipher.resolve(std.testing.io, empty, "k", MAX_GENERATION + 1));
+    // Setting V<primary> alongside ZIGBASE_FIELD_KEY is ambiguous.
+    const conflict = MapGetter{ .pairs = &.{.{ "ZIGBASE_FIELD_KEY_V2", "dup" }} };
+    try std.testing.expectError(error.GenerationConflict, Cipher.resolve(std.testing.io, conflict, "k", 2));
+}
+
+test "generation 1 domain matches the legacy single-key domain (back-compat)" {
+    // A v1 blob written by the pre-rotation build must decrypt when generation 1
+    // is configured with the same raw key.
+    const legacy_key = aead.deriveKey("rawkey", FIELD_KEY_DOMAIN);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const blob = try aead.sealV1(std.testing.io, a, legacy_key, "legacy");
+    const cph = Cipher.fromEnv(std.testing.io, "rawkey");
+    try std.testing.expectEqualStrings("legacy", try cph.open(a, blob));
 }
 
 test "isEncryptableType allows only text/editor/json" {
