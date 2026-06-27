@@ -343,10 +343,17 @@ pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, 
     // record fetch — avoids a redundant collections.get on every authenticated request.
     const col_or_null = if (is_super) null else (collections.get(alloc, conn, claims.collection) catch return null) orelse return null;
     const table = if (is_super) "_superusers" else col_or_null.?.name;
-    const tk = (tokenKeyFor(alloc, conn, table, claims.id) catch return null) orelse return null;
-    const key = crypto.deriveKey(app.jwt_secret, tk);
+    // One SELECT fetches BOTH the signing-key material AND the current session epoch (#99),
+    // so epoch revocation adds no extra query on the hot verify path.
+    const ke = (tokenKeyEpochFor(alloc, conn, table, claims.id) catch return null) orelse return null;
+    const key = crypto.deriveKey(app.jwt_secret, ke.token_key);
     const now = nowUnix(conn) catch return null;
-    _ = jwt.verify(alloc, token, &key, now) catch return null;
+    const verified = jwt.verify(alloc, token, &key, now) catch return null;
+    // Session-epoch gate: reject a token whose (signature-verified) epoch no longer matches
+    // the record's current epoch — i.e. "revoke all sessions" was issued. Fail closed. Only
+    // `.auth` session tokens are gated; short-lived `.file` tokens are minted separately and
+    // carry no epoch, so a stale-epoch check must not strand a fresh file download token.
+    if (verified.type == .auth and verified.token_epoch != ke.epoch) return null;
     const rec = if (is_super)
         (superuserRecord(alloc, conn, claims.id) catch return null) orelse return null
     else blk: {
@@ -366,14 +373,17 @@ fn nowUnix(conn: *db.Db) db.DbError!i64 {
     return clock.sqlNowUnix(conn);
 }
 
-/// Fetch an auth record's tokenKey by id from `table`. Null if absent.
-fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\" FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+const KeyEpoch = struct { token_key: []const u8, epoch: i64 };
+
+/// Fetch an auth record's `tokenKey` AND its session `token_epoch` (#99) in one SELECT.
+/// A NULL/absent epoch column reads as 0 (back-compat). Null when the row is absent.
+fn tokenKeyEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?KeyEpoch {
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
     var st = try conn.prepare(sql);
     defer st.finalize();
     try st.bindText(1, rid);
     if (!try st.step()) return null;
-    return try alloc.dupe(u8, st.columnText(0));
+    return .{ .token_key = try alloc.dupe(u8, st.columnText(0)), .epoch = st.columnInt(1) };
 }
 
 fn isUnsafe(m: http.Method) bool {

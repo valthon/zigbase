@@ -104,17 +104,46 @@ pub fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, ri
     return try alloc.dupe(u8, st.columnText(0));
 }
 
+/// Read the record's current session epoch (#99), treating a NULL/absent column as 0.
+/// `table` is the physical auth table (collection name, or "_superusers"). Returns null
+/// only when no such row exists.
+pub fn tokenEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?i64 {
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    var st = try conn.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, rid);
+    if (!try st.step()) return null;
+    return st.columnInt(0);
+}
+
+/// Bump the record's session epoch by 1 — invalidating EVERY outstanding `.auth` token
+/// for the principal ("revoke all sessions"/"log out everywhere", #99 Variant A). Must
+/// run under the writer lock. `table` is the physical auth table. Returns the new epoch.
+pub fn bumpTokenEpoch(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !i64 {
+    const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET \"token_epoch\" = COALESCE(\"token_epoch\", 0) + 1 WHERE \"id\" = ?1;", .{table}, 0);
+    var st = try conn.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, rid);
+    _ = try st.step();
+    return (try tokenEpochFor(alloc, conn, table, rid)) orelse error.NotFound;
+}
+
 pub const Issued = struct { token: []const u8, cookies: [2]http.Cookie };
 
 pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: []const u8, token_key: []const u8) !Issued {
     const app = ctx.app.?;
     const csrf = try crypto.genToken(app.io, ctx.allocator, 32);
     const now = try nowUnix(conn);
+    // Embed the record's current session epoch (#99) so verify can reject the token once
+    // the epoch is bumped ("revoke all sessions"). 0 when the column is NULL/absent —
+    // matching the default claim, so pre-epoch behavior is preserved.
+    const epoch = (try tokenEpochFor(ctx.allocator, conn, collection, rid)) orelse 0;
     const claims = jwt.Claims{
         .id = rid,
         .collection = collection,
         .type = .auth,
         .csrf = csrf,
+        .token_epoch = epoch,
         .iat = now,
         .exp = now + app.auth_token_ttl_s,
     };
@@ -1045,6 +1074,158 @@ test "RouteEvent.issueSession mints a session and fires onAuth(custom)" {
     try std.testing.expectEqual(@as(usize, 2), issued.cookies.len);
     try std.testing.expectEqual(@as(usize, 1), Counter.seen);
     try std.testing.expectEqual(events.AuthMethod.custom, Counter.m);
+}
+
+// --- #99: session epoch revocation (Variant A) ---
+
+/// Resolve a user's row id in `col_name`.
+fn ridOf(env: *TestEnv, a: std.mem.Allocator, col_name: []const u8, email: []const u8) ![]const u8 {
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const col = (try collections.get(a, w, col_name)).?;
+    return (try findByIdentity(a, w, col, email)).?;
+}
+
+test "#99 epoch bump invalidates outstanding tokens; a freshly issued token verifies (revoke-all)" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "ep@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "ep@x.io");
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+
+    // Issue a session token at epoch 0; it verifies.
+    const issued0 = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, issued0.token) != null);
+    }
+
+    // "Revoke all sessions": bump the record's epoch (0 -> 1).
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try std.testing.expectEqual(@as(i64, 1), try bumpTokenEpoch(a, w, "users", rid));
+    }
+
+    // The previously valid token now FAILS verification (fail closed).
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, issued0.token) == null);
+    }
+
+    // A token issued AFTER the bump carries epoch 1 and verifies again.
+    const issued1 = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, issued1.token) != null);
+    }
+}
+
+fn loadRecord(env: *TestEnv, a: std.mem.Allocator, col_name: []const u8, rid: []const u8) !std.json.Value {
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const col = (try collections.get(a, w, col_name)).?;
+    return (try records.get(a, w, col, rid)).?;
+}
+
+test "#99 ctx.auth().revokeAllSessions invalidates the principal's tokens" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "rv@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "rv@x.io");
+    const rec = try loadRecord(env, a, "users", rid);
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    const issued = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+
+    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
+    defer cx.deinit();
+    try cx.auth().revokeAllSessions(); // acquires the writer internally
+
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    try std.testing.expect(auth.verifyToken(a, &env.app, &r, issued.token) == null);
+}
+
+test "#99 ctx.auth().refresh keeps other sessions valid; rotate kills them" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "rr@x.io", "longenough");
+    const rid = try ridOf(env, a, "users", "rr@x.io");
+    const rec = try loadRecord(env, a, "users", rid);
+
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    // An existing session token (epoch 0).
+    const existing = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try issueSession(&hctx, w, "users", rid, .password);
+    };
+
+    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
+    defer cx.deinit();
+
+    // refresh: a new token is minted AND the existing one stays valid (same epoch).
+    const refreshed = try cx.auth().refresh();
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, refreshed.token) != null);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, existing.token) != null);
+    }
+
+    // rotate: returns a fresh valid token, but every PRIOR token (existing + refreshed) dies.
+    const rotated = try cx.auth().rotate();
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, rotated.token) != null);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, existing.token) == null);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, refreshed.token) == null);
+    }
+}
+
+test "#99 per-device verbs are stubbed: epoch mode reports SessionStoreNotEnabled" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &hctx };
+    defer cx.deinit();
+    // Default app.session_store == .epoch -> per-device inventory is unavailable.
+    try std.testing.expectError(error.SessionStoreNotEnabled, cx.auth().listActiveSessions());
+    try std.testing.expectError(error.SessionStoreNotEnabled, cx.auth().revoke("s1"));
+    // In table mode the verbs report the not-yet-implemented store instead.
+    env.app.session_store = .table;
+    try std.testing.expectError(error.SessionTableNotImplemented, cx.auth().listActiveSessions());
+    try std.testing.expectError(error.SessionTableNotImplemented, cx.auth().revoke("s1"));
 }
 
 test "issueSession is the mint+emit seam: emits onAuth once with the method tag" {

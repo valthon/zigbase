@@ -151,6 +151,76 @@ fn init_0009_kv(w: *db.Db) db.DbError!void {
     );
 }
 
+fn init_0010_token_epoch(w: *db.Db) db.DbError!void {
+    // Session epoch column for Variant A revocation (#99). A per-auth-record integer,
+    // default 0, embedded in issued `.auth` tokens; "revoke all sessions" bumps it so
+    // every outstanding token for the principal stops verifying. Added here for tables
+    // that predate the `token_epoch` auth system field (fresh auth collections get the
+    // column from `schema.authSystemFields()` at create time). `NOT NULL DEFAULT 0` so
+    // existing rows + omitted inserts read as epoch 0, matching the default JWT claim.
+    w.exec("ALTER TABLE \"_superusers\" ADD COLUMN \"token_epoch\" INTEGER NOT NULL DEFAULT 0;") catch {};
+
+    // Collect user auth-collection names FIRST: an ALTER TABLE bumps SQLite's schema
+    // version and invalidates any open statement, so we cannot ALTER while iterating the
+    // _collections cursor. page_allocator (one-shot, startup) keeps this dependency-free.
+    const a = std.heap.page_allocator;
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |n| a.free(n);
+        names.deinit(a);
+    }
+    {
+        var st = try w.prepare("SELECT \"name\" FROM \"_collections\" WHERE \"type\"='auth' AND \"name\" != '_superusers';");
+        defer st.finalize();
+        while (try st.step()) {
+            const nm = a.dupe(u8, st.columnText(0)) catch return error.ExecFailed;
+            names.append(a, nm) catch {
+                a.free(nm);
+                return error.ExecFailed;
+            };
+        }
+    }
+    for (names.items) |nm| {
+        if (!isSafeIdent(nm)) continue; // defensive: never interpolate an unvalidated name
+        var buf: [320]u8 = undefined;
+        const sql = std.fmt.bufPrintZ(&buf, "ALTER TABLE \"{s}\" ADD COLUMN \"token_epoch\" INTEGER NOT NULL DEFAULT 0;", .{nm}) catch return error.ExecFailed;
+        w.exec(sql) catch {}; // ignore "duplicate column" when the column already exists
+    }
+}
+
+/// Local identifier guard for migration 0010's dynamic ALTER (avoids importing schema.zig).
+/// Mirrors `schema.isValidIdentifier`: first char a letter, rest alphanumeric/underscore.
+fn isSafeIdent(s: []const u8) bool {
+    if (s.len == 0 or s.len > 250) return false;
+    if (!std.ascii.isAlphabetic(s[0])) return false;
+    for (s) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
+    return true;
+}
+
+fn init_0011_sessions(w: *db.Db) db.DbError!void {
+    // Variant B session store (#99), populated only when App(.{ .session_store = .table }).
+    // One row per issued session enables per-device listActiveSessions()/revoke(sessionId)
+    // on top of revoke-all. In the default `.epoch` mode this table is created but unused
+    // (revocation runs via the token epoch). The table shape is locked here so enabling the
+    // table variant later needs no further migration. "revoked"/"expires" gate verification;
+    // "lastSeen" supports an idle-timeout sweep. See the session-management design spec.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_sessions" (
+        \\  "id" TEXT PRIMARY KEY,
+        \\  "collectionRef" TEXT NOT NULL,
+        \\  "recordRef" TEXT NOT NULL,
+        \\  "csrf" TEXT NOT NULL DEFAULT '',
+        \\  "userAgent" TEXT NOT NULL DEFAULT '',
+        \\  "created" TEXT NOT NULL,
+        \\  "lastSeen" TEXT NOT NULL DEFAULT '',
+        \\  "revoked" INTEGER NOT NULL DEFAULT 0,
+        \\  "expires" INTEGER NOT NULL DEFAULT 0
+        \\);
+    );
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_sessions_principal\" ON \"_sessions\" (\"collectionRef\",\"recordRef\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_sessions_expires\" ON \"_sessions\" (\"expires\");");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -161,6 +231,8 @@ pub const all = [_]Migration{
     .{ .name = "0007_auth_challenges", .up = init_0007 },
     .{ .name = "0008_webauthn_credentials", .up = init_0008 },
     .{ .name = "0009_kv", .up = init_0009_kv },
+    .{ .name = "0010_token_epoch", .up = init_0010_token_epoch },
+    .{ .name = "0011_sessions", .up = init_0011_sessions },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {
@@ -241,6 +313,69 @@ test "0009 creates _kv settings table with key/value/created/updated columns" {
     defer pk.finalize();
     _ = try pk.step();
     try std.testing.expectEqual(@as(i64, 1), pk.columnInt(0));
+}
+
+test "0010 adds token_epoch to _superusers (default 0, idempotent)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try run(&d);
+    var c = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('_superusers') WHERE name='token_epoch';");
+    defer c.finalize();
+    _ = try c.step();
+    try std.testing.expectEqual(@as(i64, 1), c.columnInt(0));
+    // A row inserted without token_epoch reads back as 0 (NOT NULL DEFAULT 0).
+    try d.exec("INSERT INTO \"_superusers\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('s1','','','a@b.c');");
+    var e = try d.prepare("SELECT token_epoch FROM \"_superusers\" WHERE id='s1';");
+    defer e.finalize();
+    _ = try e.step();
+    try std.testing.expectEqual(@as(i64, 0), e.columnInt(0));
+    // Re-running migrations does not fail on the already-present column.
+    try run(&d);
+}
+
+test "0010 backfills token_epoch onto a pre-existing user auth table" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    // Simulate an OLD database: the migrations table is current up to 0009 but a user auth
+    // collection's physical table predates the token_epoch column.
+    try d.exec(
+        \\CREATE TABLE "_migrations" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT UNIQUE NOT NULL, "applied_at" TEXT NOT NULL);
+    );
+    inline for (.{ "0001_init", "0002_auth", "0003_external_auths", "0004_consumed_tokens", "0005_oauth_states", "0006_cursor_states", "0007_auth_challenges", "0008_webauthn_credentials", "0009_kv" }) |name| {
+        try d.exec("INSERT INTO \"_migrations\" (\"name\",\"applied_at\") VALUES ('" ++ name ++ "', datetime('now'));");
+    }
+    try d.exec("CREATE TABLE \"_collections\" (\"id\" TEXT PRIMARY KEY, \"name\" TEXT UNIQUE NOT NULL, \"type\" TEXT NOT NULL DEFAULT 'base');");
+    try d.exec("CREATE TABLE \"_superusers\" (\"id\" TEXT PRIMARY KEY, \"email\" TEXT);");
+    try d.exec("INSERT INTO \"_collections\" (\"id\",\"name\",\"type\") VALUES ('c1','members','auth');");
+    try d.exec("CREATE TABLE \"members\" (\"id\" TEXT PRIMARY KEY, \"email\" TEXT, \"tokenKey\" TEXT);");
+    try d.exec("INSERT INTO \"members\" (\"id\",\"email\",\"tokenKey\") VALUES ('m1','m@x.io','tk');");
+
+    try run(&d); // applies 0010 + 0011
+
+    var c = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('members') WHERE name='token_epoch';");
+    defer c.finalize();
+    _ = try c.step();
+    try std.testing.expectEqual(@as(i64, 1), c.columnInt(0));
+    // The pre-existing row gets epoch 0 (data preserved).
+    var e = try d.prepare("SELECT token_epoch, tokenKey FROM \"members\" WHERE id='m1';");
+    defer e.finalize();
+    _ = try e.step();
+    try std.testing.expectEqual(@as(i64, 0), e.columnInt(0));
+    try std.testing.expectEqualStrings("tk", e.columnText(1));
+}
+
+test "0011 creates the _sessions store with its indexes" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try run(&d);
+    var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('_sessions');");
+    defer t.finalize();
+    _ = try t.step();
+    try std.testing.expectEqual(@as(i64, 9), t.columnInt(0));
+    var idx = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_sessions_principal','idx_sessions_expires');");
+    defer idx.finalize();
+    _ = try idx.step();
+    try std.testing.expectEqual(@as(i64, 2), idx.columnInt(0));
 }
 
 test "0003 creates _externalAuths with unique provider/providerId and per-record indexes" {

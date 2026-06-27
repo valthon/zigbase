@@ -21,6 +21,12 @@ pub const Claims = struct {
     /// serialized as `"pl":""` like the other default-empty claims; on parse a missing `pl`
     /// (e.g. a non-magic-link token) falls back to this default.
     pl: []const u8 = "",
+    /// Session epoch (Variant A revocation, #99). Embedded in `.auth` tokens at issue
+    /// time from the auth record's `token_epoch` column; verify rejects the token when it
+    /// no longer matches the record's current epoch (bumped by "revoke all sessions").
+    /// Defaults to 0 so pre-epoch tokens (no claim) and fresh records (NULL column) agree
+    /// — preserving back-compat. Not meaningful on non-`.auth` token types.
+    token_epoch: i64 = 0,
     iat: i64,
     exp: i64,
 };
@@ -183,6 +189,30 @@ test "peekClaims decodes the payload without checking the signature" {
     try std.testing.expectEqualStrings("u1", peeked.id);
     try std.testing.expectEqualStrings("users", peeked.collection);
     try std.testing.expectError(error.Malformed, peekClaims(a, "nope"));
+}
+
+test "#99 token_epoch claim round-trips; a pre-epoch token (no claim) parses as 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = crypto.deriveKey("secret", "tk1");
+
+    // Round-trip: a non-zero epoch survives sign -> verify.
+    const claims = Claims{ .id = "u1", .collection = "users", .type = .auth, .token_epoch = 7, .iat = 1000, .exp = 2000 };
+    const out = try verify(a, try sign(a, claims, &key), &key, 1500);
+    try std.testing.expectEqual(@as(i64, 7), out.token_epoch);
+
+    // Back-compat: a token minted BEFORE #99 carries no "token_epoch" key. Build such a
+    // payload by hand and confirm verify() fills the struct default (0), not an error.
+    const legacy_json = "{\"id\":\"u1\",\"collection\":\"users\",\"type\":\"auth\",\"csrf\":\"\",\"jti\":\"\",\"pl\":\"\",\"iat\":1000,\"exp\":2000}";
+    const p = try b64enc(a, legacy_json);
+    const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ header_b64, p });
+    var sig: [32]u8 = undefined;
+    HmacSha256.create(&sig, signing_input, &key);
+    const s = try b64enc(a, &sig);
+    const legacy_token = try std.fmt.allocPrint(a, "{s}.{s}", .{ signing_input, s });
+    const legacy = try verify(a, legacy_token, &key, 1500);
+    try std.testing.expectEqual(@as(i64, 0), legacy.token_epoch);
 }
 
 test "verify rejects a token with a foreign header" {

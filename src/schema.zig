@@ -421,7 +421,7 @@ test "fieldByName finds and misses" {
 /// Names reserved by the engine (base + auth system columns); user fields may not use them.
 pub fn isSystemFieldName(name: []const u8) bool {
     // case-insensitive: SQLite column names collide case-insensitively
-    const reserved = [_][]const u8{ "id", "created", "updated", "email", "username", "passwordHash", "tokenKey", "verified" };
+    const reserved = [_][]const u8{ "id", "created", "updated", "email", "username", "passwordHash", "tokenKey", "verified", "token_epoch" };
     for (reserved) |r| if (std.ascii.eqlIgnoreCase(name, r)) return true;
     return false;
 }
@@ -436,6 +436,10 @@ pub fn authSystemFields() []const Field {
             .{ .id = "_pwhash", .name = "passwordHash", .hidden = true, .options = .{ .text = .{} } },
             .{ .id = "_tokkey", .name = "tokenKey", .hidden = true, .options = .{ .text = .{} } },
             .{ .id = "_verified", .name = "verified", .options = .{ .@"bool" = .{} } },
+            // Session epoch for Variant A revocation (#99). Hidden (never serialized);
+            // an INTEGER counter bumped by "revoke all sessions" and embedded in issued
+            // `.auth` tokens. A NULL value (fresh row / pre-migration) is read as 0.
+            .{ .id = "_tokepoch", .name = "token_epoch", .hidden = true, .options = .{ .number = .{ .mode = .int } } },
         };
     };
     return &S.fields;
@@ -454,15 +458,17 @@ pub fn injectAuthFields(alloc: std.mem.Allocator, col: Collection) !Collection {
     return c;
 }
 
-test "injectAuthFields prepends the 5 auth fields for auth collections only" {
+test "injectAuthFields prepends the auth system fields for auth collections only" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const user = [_]Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
     const auth_col = try injectAuthFields(a, .{ .id = "c", .name = "users", .type = .auth, .fields = &user });
-    try std.testing.expectEqual(@as(usize, 6), auth_col.fields.len);
+    try std.testing.expectEqual(@as(usize, 7), auth_col.fields.len); // 6 system + 1 user
     try std.testing.expectEqualStrings("email", auth_col.fields[0].name);
     try std.testing.expect(fieldByName(auth_col, "passwordHash").?.hidden);
+    // token_epoch is a hidden system field (#99 session epoch).
+    try std.testing.expect(fieldByName(auth_col, "token_epoch").?.hidden);
     const base_col = try injectAuthFields(a, .{ .id = "c", .name = "posts", .type = .base, .fields = &user });
     try std.testing.expectEqual(@as(usize, 1), base_col.fields.len);
 }

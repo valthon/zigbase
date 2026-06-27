@@ -99,6 +99,7 @@ error.**
 | `auth_methods` | Register custom `AuthMethod` plugin TYPES (comptime, like `.storage`/`.mailer`). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
+| `session_store` | Session-management model: `.epoch` (default, stateless token-epoch revocation) or `.table` (per-device `_sessions` store — designed/stubbed). See [Revoking sessions](#revoking-sessions-99). |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
 
 ## 3b. The `typegen` gate (`.enable_typegen`)
@@ -1135,6 +1136,11 @@ pub fn consumeLinkToken(conn: *db.Db, claims: jwt.Claims) !void
 // the built-in logout exactly. Equivalent to ctx.auth().clearSession() (below).
 pub fn clearSession(ctx: *Ctx) ![]const http.Cookie
 
+// Session revocation (#99). Equivalent to the ctx.auth() verbs below.
+pub fn revokeAllSessions(ctx: *Ctx) !void   // "log out everywhere" (bump epoch)
+pub fn refresh(ctx: *Ctx) !Issued           // re-mint, same epoch (sliding refresh)
+pub fn rotate(ctx: *Ctx) !Issued            // bump epoch + re-mint (kill other sessions)
+
 // Send auth email via the configured mailer (SMTP or log in dev).
 pub fn deliverAuthMail(
     app: *App, alloc: std.mem.Allocator,
@@ -1195,10 +1201,11 @@ For a complete, copy-pasteable example (two-route magic-link flow with rate
 limiting, enumeration safety, and single-use token replay protection) see
 [recipes.md → magic-link login](recipes.md#recipe-magic-link-passwordless-login).
 
-#### `ctx.auth()` — session management (`clearSession`)
+#### `ctx.auth()` — session management
 
-The `ctx.auth()` namespace is the session-management surface. Its first verb,
-`clearSession`, mirrors `issueSession` for logout: it returns the cleared session cookies
+The `ctx.auth()` namespace is the session-management surface.
+
+`clearSession` mirrors `issueSession` for logout: it returns the cleared session cookies
 built from the framework's own cookie policy (the same one the built-in `authLogout` uses),
 arena-owned so they slot straight into `Response.cookies`. A logout handler is one line:
 
@@ -1208,8 +1215,43 @@ fn logout(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 }
 ```
 
-`zigbase.auth.clearSession(ctx)` is the equivalent free-function form. (refresh / rotate /
-list-active / revoke are designed and deferred — see the Theme D spec.)
+`zigbase.auth.clearSession(ctx)` is the equivalent free-function form.
+
+##### Revoking sessions (#99)
+
+Sessions are stateless JWTs, but they are still **revocable** via a per-auth-record
+**token epoch**. Each `.auth` token embeds the record's `token_epoch`; verification rejects
+a token whose epoch no longer matches the record's current value (fail closed). This is the
+**default** model (`App(.{ .session_store = .epoch })`) and costs no extra query — the epoch
+is read alongside the signing key on the existing verify lookup.
+
+| verb | effect |
+|---|---|
+| `ctx.auth().revokeAllSessions()` | bump the epoch → **every** outstanding token for the principal stops verifying ("log out everywhere"). Pair with `clearSession` to also drop this browser's cookie. |
+| `ctx.auth().refresh()` | re-mint a token (new `exp`, **same** epoch) — a sliding refresh that leaves other sessions valid. Returns `Issued` (JWT + cookies). |
+| `ctx.auth().rotate()` | bump the epoch **then** re-mint — keep this session, kill every other. Returns `Issued`. |
+
+```zig
+fn changePassword(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    // ... verify + update the password ...
+    const issued = try ctx.auth().rotate();           // invalidate all old sessions, keep this one
+    return .{ .status = 200, .body = body, .cookies = try ctx.arena.dupe(zigbase.http.Cookie, &issued.cookies) };
+}
+```
+
+Free-function forms: `zigbase.auth.revokeAllSessions(ctx)` / `refresh(ctx)` / `rotate(ctx)`.
+
+Back-compat is total: tokens minted before the epoch existed (no claim) and freshly created
+records (NULL column) both read as epoch `0`, so all existing valid tokens keep working.
+
+**Per-device sessions (Variant B, `.session_store = .table`).** Opting into the table model
+maintains a server-side `_sessions` row per session, enabling `ctx.auth().listActiveSessions()`
+and per-session `ctx.auth().revoke(sessionId)` ("log out THIS device") at the cost of one DB
+read per request. This variant is **designed but not yet implemented** — the comptime config
+key and the `_sessions` table ship now; the two per-device verbs return
+`error.SessionTableNotImplemented` (and `error.SessionStoreNotEnabled` in the default `.epoch`
+mode). `revokeAllSessions`/`refresh`/`rotate` work in **both** modes. See the
+[session-management design spec](superpowers/specs/2026-06-27-session-management-design.md).
 
 ## 7. Scheduled jobs (`.cron` + `.jobs`)
 

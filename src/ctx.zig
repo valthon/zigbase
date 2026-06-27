@@ -13,6 +13,7 @@ const http_client = @import("http_client.zig");
 const error_mod = @import("api/error.zig");
 const http_mod = @import("http.zig");
 const auth_helpers = @import("auth_helpers.zig");
+const api_auth = @import("api/auth.zig");
 const session = @import("session.zig");
 
 pub const Ctx = struct {
@@ -102,8 +103,9 @@ pub const Ctx = struct {
         return .{ .ctx = self };
     }
 
-    /// Returns the session-management namespace (`ctx.auth()`). The first verb is
-    /// `clearSession` (#86); refresh/rotate/revoke arrive in later Theme D slices.
+    /// Returns the session-management namespace (`ctx.auth()`): `clearSession` (#86),
+    /// plus the #99 session verbs — `revokeAllSessions`/`refresh`/`rotate` (epoch model,
+    /// always available) and the Variant B per-device `listActiveSessions`/`revoke`.
     pub fn auth(self: *Ctx) AuthApi {
         return .{ .ctx = self };
     }
@@ -281,12 +283,93 @@ pub const Records = struct {
 pub const AuthApi = struct {
     ctx: *Ctx,
 
+    /// One active session row (Variant B). Returned by `listActiveSessions` once the
+    /// server-side `_sessions` store lands; the shape is fixed now so the verb's type is
+    /// stable. See the session-management design spec.
+    pub const Session = struct {
+        id: []const u8,
+        created: []const u8,
+        last_seen: []const u8,
+        user_agent: []const u8,
+        revoked: bool,
+    };
+
     /// Clear the `zb_auth` + `zb_csrf` session cookies (logout). Returns arena-owned
     /// cookies that slot straight into a handler's `Response.cookies`:
     ///   return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
     pub fn clearSession(self: AuthApi) ![]const http_mod.Cookie {
         const cleared = session.clearedCookies(self.ctx.app.cookie_secure);
         return self.ctx.arena.dupe(http_mod.Cookie, &cleared);
+    }
+
+    /// The current authenticated principal (collection + id), or error.Unauthorized.
+    fn principal(self: AuthApi) !Ctx.User {
+        const u = self.ctx.user() orelse return error.Unauthorized;
+        if (u.collection.len == 0 or u.id.len == 0) return error.Unauthorized;
+        return u;
+    }
+
+    /// "Log out everywhere" (#99 Variant A): bump the principal's `token_epoch` so EVERY
+    /// outstanding `.auth` token for this principal immediately stops verifying. Works in
+    /// both session-store modes. Uses the bound connection inside a tx/before-hook, else
+    /// acquires the pool writer (deadlock-safe, mirroring `ctx.kv().set`).
+    pub fn revokeAllSessions(self: AuthApi) !void {
+        const u = try self.principal();
+        if (self.ctx.bound_conn) |c| {
+            _ = try api_auth.bumpTokenEpoch(self.ctx.arena, c, u.collection, u.id);
+            return;
+        }
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
+    }
+
+    /// Re-mint a session token for the current principal (new `exp`, SAME epoch) — a
+    /// sliding refresh that leaves the principal's other sessions valid. Returns the
+    /// signed JWT + 2 cookies. Route context only (needs `ctx.request`).
+    pub fn refresh(self: AuthApi) !auth_helpers.Issued {
+        const u = try self.principal();
+        const req = self.ctx.request orelse return error.NoRequestContext;
+        if (self.ctx.bound_conn) |c|
+            return auth_helpers.issueSession(req, c, u.collection, u.id);
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return auth_helpers.issueSession(req, w, u.collection, u.id);
+    }
+
+    /// Rotate: bump the epoch (invalidating ALL prior tokens, including the one on THIS
+    /// request) then mint a fresh token carrying the new epoch — "rotate my credentials,
+    /// keep me signed in here, kill every other session". Returns the replacement token +
+    /// cookies. Route context only.
+    pub fn rotate(self: AuthApi) !auth_helpers.Issued {
+        const u = try self.principal();
+        const req = self.ctx.request orelse return error.NoRequestContext;
+        if (self.ctx.bound_conn) |c| {
+            _ = try api_auth.bumpTokenEpoch(self.ctx.arena, c, u.collection, u.id);
+            return auth_helpers.issueSession(req, c, u.collection, u.id);
+        }
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
+        return auth_helpers.issueSession(req, w, u.collection, u.id);
+    }
+
+    /// Variant B (`App(.{ .session_store = .table })`): list this principal's active
+    /// sessions for a per-device UI. DESIGNED-but-STUBBED — returns
+    /// `error.SessionStoreNotEnabled` in the default `.epoch` mode (no per-session
+    /// inventory exists) and `error.SessionTableNotImplemented` in `.table` mode until the
+    /// server-side store is wired. See the session-management design spec.
+    pub fn listActiveSessions(self: AuthApi) ![]const Session {
+        if (self.ctx.app.session_store != .table) return error.SessionStoreNotEnabled;
+        return error.SessionTableNotImplemented;
+    }
+
+    /// Variant B: revoke ONE session by id ("log out this device"). STUBBED, same status
+    /// as `listActiveSessions` (use `revokeAllSessions` for per-principal revoke today).
+    pub fn revoke(self: AuthApi, session_id: []const u8) !void {
+        _ = session_id;
+        if (self.ctx.app.session_store != .table) return error.SessionStoreNotEnabled;
+        return error.SessionTableNotImplemented;
     }
 };
 

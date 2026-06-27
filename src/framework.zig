@@ -188,7 +188,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -283,6 +283,20 @@ pub fn App(comptime cfg: anytype) type {
         /// stateless tokens). `@compileError`s on an unknown sub-field or both modes disabled.
         pub const pagination_config: pagination.Config = pagination.resolve(cfg);
 
+        /// Comptime session-management model resolved from `.session_store` (#99). Defaults
+        /// to `.epoch` (stateless token-epoch revocation). `.table` opts into the server-side
+        /// `_sessions` store for per-device list/revoke (DESIGNED-but-STUBBED). An unknown
+        /// value is a `@compileError`.
+        pub const session_store_config: app_mod.SessionStore = blk: {
+            if (!@hasField(@TypeOf(cfg), "session_store")) break :blk .epoch;
+            const ss = cfg.session_store;
+            if (@TypeOf(ss) != @TypeOf(.enum_literal))
+                @compileError("session_store: expected the enum literal .epoch or .table");
+            if (std.mem.eql(u8, @tagName(ss), "epoch")) break :blk .epoch;
+            if (std.mem.eql(u8, @tagName(ss), "table")) break :blk .table;
+            @compileError("session_store: unknown value '." ++ @tagName(ss) ++ "'; expected .epoch or .table");
+        };
+
         /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
         /// A custom type missing a contract method fails with a contract-specific message.
         pub const MailerPlugin: type = blk: {
@@ -374,6 +388,7 @@ pub fn App(comptime cfg: anytype) type {
             .cache_kib = cache_kib,
             .static_mode = static_mode,
             .pagination = pagination_config,
+            .session_store = session_store_config,
             .enable_typegen = enable_typegen,
             .has_ttl = has_ttl_collection,
         };
@@ -416,6 +431,8 @@ pub const ServeOpts = struct {
     cache_kib: u32 = db.default_cache_kib,
     static_mode: static_files.Mode = .default,
     pagination: pagination.Config = .{},
+    /// Selected session-management model (#99); threaded into `App.session_store`.
+    session_store: app_mod.SessionStore = .epoch,
     /// When true, compiles the `typegen` CLI subcommand into the binary.
     /// Off by default so production builds carry no codegen.
     enable_typegen: bool = false,
@@ -998,6 +1015,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .public_url = cfg.public_url,
         .cookie_secure = cfg.cookie_secure,
         .auth_token_ttl_s = cfg.auth_token_ttl_s,
+        .session_store = opts.session_store,
         .verification_ttl_s = cfg.verification_ttl_s,
         .password_reset_ttl_s = cfg.password_reset_ttl_s,
         .oauth_state_server = cfg.oauth_state_server,
@@ -1329,6 +1347,12 @@ test "App(.{}) has no comptime collections and no provision migrations" {
     const A = App(.{});
     try std.testing.expectEqual(@as(usize, 0), A.collections.len);
     try std.testing.expectEqual(@as(usize, 0), A.provision_migrations.len);
+}
+
+test "App(cfg) resolves the comptime session_store config (#99; defaults to .epoch)" {
+    try std.testing.expectEqual(app_mod.SessionStore.epoch, App(.{}).session_store_config);
+    try std.testing.expectEqual(app_mod.SessionStore.epoch, App(.{ .session_store = .epoch }).session_store_config);
+    try std.testing.expectEqual(app_mod.SessionStore.table, App(.{ .session_store = .table }).session_store_config);
 }
 
 test "App(cfg) resolves the comptime pagination config (defaults + overrides)" {
