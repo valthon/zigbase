@@ -508,16 +508,6 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Colle
     return createInTxn(alloc, io, w, col, data);
 }
 
-pub fn createGuarded(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value, guard: Guard) RecordError!std.json.Value {
-    try w.begin();
-    errdefer w.rollback() catch {};
-    const rec = try createInTxn(alloc, io, w, col, data);
-    const rid = rec.object.get("id").?.string;
-    if (!try guardPasses(alloc, w, col, rid, guard)) return error.Forbidden;
-    try w.commit();
-    return rec;
-}
-
 /// Insert a record on `w` WITHOUT opening a transaction. The caller must already
 /// be inside one (or accept autocommit). Applies the same column/JSON handling as
 /// the former createImpl but performs no begin/commit/guard.
@@ -893,18 +883,6 @@ pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
     return updateInTxn(alloc, w, col, id, data);
 }
 
-pub fn updateGuarded(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value, guard: Guard) RecordError!?std.json.Value {
-    try w.begin();
-    errdefer w.rollback() catch {};
-    const rec = try updateInTxn(alloc, w, col, id, data) orelse {
-        w.rollback() catch {};
-        return null;
-    };
-    if (!try guardPasses(alloc, w, col, id, guard)) return error.Forbidden;
-    try w.commit();
-    return rec;
-}
-
 /// Update a record on `w` WITHOUT opening a transaction. The caller must already
 /// be inside one (or accept autocommit). Returns null if the row does not exist.
 pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
@@ -955,19 +933,6 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
     return deleteInTxn(alloc, w, col, id);
 }
 
-pub fn deleteGuarded(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, guard: Guard) RecordError!bool {
-    try w.begin();
-    errdefer w.rollback() catch {};
-    if (!try guardPasses(alloc, w, col, id, guard)) return error.Forbidden;
-    const found = try deleteInTxn(alloc, w, col, id);
-    if (!found) {
-        w.rollback() catch {};
-        return false;
-    }
-    try w.commit();
-    return true;
-}
-
 /// Delete a record on `w` WITHOUT opening a transaction. The caller must already
 /// be inside one (or accept autocommit). Returns true if a row was deleted.
 pub fn deleteInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
@@ -1015,26 +980,6 @@ test "update rejects an over-precise fixed value and leaves the row unchanged" {
     const rec = (try get(a, &d, col, "r1")).?;
     try std.testing.expectEqualStrings("keep", rec.object.get("title").?.string);
     try std.testing.expectEqualStrings("1.00", rec.object.get("price").?.string);
-}
-
-test "updateGuarded rolls back when the guard fails, preserving the original value" {
-    var d = try db.Db.openMemory();
-    defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const col = try seedPosts(&d, a);
-    try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','old',100);");
-
-    var data: std.json.ObjectMap = .empty;
-    try data.put(a, "title", .{ .string = "new" });
-    // Guard never matches -> the UPDATE inside the txn is rolled back.
-    const guard = Guard{ .where_sql = "\"posts\".\"title\" = ?", .params = &.{.{ .text = "nope" }} };
-    try std.testing.expectError(error.Forbidden, updateGuarded(a, &d, col, "r1", .{ .object = data }, guard));
-
-    // Rollback worked: the original "old" title persists.
-    const rec = (try get(a, &d, col, "r1")).?;
-    try std.testing.expectEqualStrings("old", rec.object.get("title").?.string);
 }
 
 test "list clamps pagination bounds" {
@@ -1528,37 +1473,6 @@ test "list rejects an over-long filter (DoS cap) before lexing" {
     const big = try a.alloc(u8, max_filter_len + 1);
     @memset(big, '(');
     try std.testing.expectError(error.BadFilter, list(a, &d, col, .{ .filter = big }));
-}
-
-test "createGuarded rolls back when the guard fails" {
-    var d = try db.Db.openMemory();
-    defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const col = try seedPosts(&d, a);
-    var data: std.json.ObjectMap = .empty;
-    try data.put(a, "title", .{ .string = "hi" });
-    const guard = Guard{ .where_sql = "\"posts\".\"title\" = ?", .params = &.{.{ .text = "nope" }} };
-    try std.testing.expectError(error.Forbidden, createGuarded(a, std.testing.io, &d, col, .{ .object = data }, guard));
-    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
-    defer st.finalize();
-    _ = try st.step();
-    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
-}
-
-test "createGuarded commits when the guard passes" {
-    var d = try db.Db.openMemory();
-    defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const col = try seedPosts(&d, a);
-    var data: std.json.ObjectMap = .empty;
-    try data.put(a, "title", .{ .string = "hi" });
-    const guard = Guard{ .where_sql = "\"posts\".\"title\" = ?", .params = &.{.{ .text = "hi" }} };
-    const rec = try createGuarded(a, std.testing.io, &d, col, .{ .object = data }, guard);
-    try std.testing.expectEqualStrings("hi", rec.object.get("title").?.string);
 }
 
 test "list applies a rule clause AND-ed with the filter" {

@@ -242,7 +242,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         },
         else => return e, // errdefer rolls back
     };
-    // Access-rule guard evaluated INSIDE the transaction (replicating createGuarded):
+    // Access-rule guard evaluated INSIDE the transaction:
     // a denial rolls the INSERT back so a forbidden write never persists.
     if (decision == .check) {
         const guard = try rules.compileGuard(ctx.allocator, w, col, col.createRule.?, &rctx);
@@ -334,9 +334,8 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
         return ApiError.notFound().toResponse(ctx.allocator);
     };
-    // Access-rule guard evaluated INSIDE the transaction on the UPDATED row (replicating
-    // updateGuarded): a denial rolls the UPDATE back. A guard miss maps to 404, matching
-    // the prior updateGuarded -> error.Forbidden -> notFound behavior.
+    // Access-rule guard evaluated INSIDE the transaction on the UPDATED row:
+    // a denial rolls the UPDATE back. A guard miss maps to 404.
     if (decision == .check) {
         const guard = try rules.compileGuard(ctx.allocator, w, col, col.updateRule.?, &rctx);
         if (!try records.guardPasses(ctx.allocator, w, col, rid, guard)) {
