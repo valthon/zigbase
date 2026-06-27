@@ -54,7 +54,14 @@ pub const StaticFile = @import("static_files.zig").StaticFile;
 pub const Ctx = @import("ctx.zig").Ctx;
 
 // ---- General outbound HTTP client -----------------------------------------
+// HttpMethod/HttpHeader use the Http-prefix to avoid collision with http.zig's
+// Method/Header enums (which are already accessible via `zigbase.http.Method`).
+pub const HttpClient = @import("http_client.zig").HttpClient;
+pub const HttpMethod = @import("http_client.zig").Method;
+pub const HttpHeader = @import("http_client.zig").Header;
 pub const HttpResponse = @import("http_client.zig").HttpResponse;
+pub const HttpRequestOptions = @import("http_client.zig").RequestOptions;
+pub const HttpPostOptions = @import("http_client.zig").PostOptions;
 
 // ---- Auth helper surface (consumer-facing magic-link building blocks) ------
 pub const auth = @import("auth_helpers.zig");

@@ -2,7 +2,17 @@ const std = @import("std");
 
 pub const Method = enum { GET, POST, PUT, PATCH, DELETE };
 pub const Header = struct { name: []const u8, value: []const u8 };
-pub const HttpResponse = struct { status: u16, headers: []const Header, body: []const u8 };
+pub const HttpResponse = struct {
+    status: u16,
+    /// Response headers.
+    ///
+    /// **Known limitation:** always empty in the current implementation.
+    /// `std.http.Client.fetch` does not yet expose response headers in the
+    /// `FetchResult`; this field is reserved for when that API lands upstream.
+    /// Do not read or rely on it today.
+    headers: []const Header,
+    body: []const u8,
+};
 
 /// Options for a generic HTTP request.
 ///
