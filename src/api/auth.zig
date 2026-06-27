@@ -232,11 +232,14 @@ pub fn gcExpiredSessions(conn: *db.Db) !usize {
     const now = try nowUnix(conn);
     var total: usize = 0;
     while (true) {
-        var st = try conn.prepare(
+        // `session_gc_batch` is the single source of truth for the batch size: it is the SQL
+        // LIMIT (interpolated at comptime — a comptime int constant, no injection surface) AND
+        // the loop-termination threshold below, so the two can never desync.
+        var st = try conn.prepare(comptime std.fmt.comptimePrint(
             \\DELETE FROM "_sessions"
-            \\ WHERE "id" IN (SELECT "id" FROM "_sessions" WHERE "expires" IS NOT NULL AND "expires" <= ?1 LIMIT 1000)
+            \\ WHERE "id" IN (SELECT "id" FROM "_sessions" WHERE "expires" IS NOT NULL AND "expires" <= ?1 LIMIT {d})
             \\ RETURNING "id";
-        );
+        , .{session_gc_batch}));
         defer st.finalize();
         try st.bindInt(1, now);
         var batch: usize = 0;
