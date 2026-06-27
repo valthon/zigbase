@@ -218,6 +218,38 @@ pub fn carrySessionCreated(alloc: std.mem.Allocator, conn: *db.Db, new_token: []
     _ = try st.step();
 }
 
+/// Batch size for the expired-session GC sweep (#114): bound each DELETE so a large backlog
+/// never holds the single writer for one long statement.
+pub const session_gc_batch: usize = 1000;
+
+/// Garbage-collect expired `_sessions` rows (#114), table-mode only. Deletes in bounded
+/// batches (`session_gc_batch`) — each batch is its own autocommit `DELETE … RETURNING`, so the
+/// writer is never held across the whole sweep. Rows with NULL `expires` (no expiry) or a
+/// future `expires` survive. `expires` is unix-seconds (matches `issue()`/`recordSession`), so
+/// the cutoff is the parameter-bound `nowUnix(conn)`. Returns the total rows deleted. Writer
+/// required (the recurring job acquires it; verify never writes, so GC is the only sweeper).
+pub fn gcExpiredSessions(conn: *db.Db) !usize {
+    const now = try nowUnix(conn);
+    var total: usize = 0;
+    while (true) {
+        // `session_gc_batch` is the single source of truth for the batch size: it is the SQL
+        // LIMIT (interpolated at comptime — a comptime int constant, no injection surface) AND
+        // the loop-termination threshold below, so the two can never desync.
+        var st = try conn.prepare(comptime std.fmt.comptimePrint(
+            \\DELETE FROM "_sessions"
+            \\ WHERE "id" IN (SELECT "id" FROM "_sessions" WHERE "expires" IS NOT NULL AND "expires" <= ?1 LIMIT {d})
+            \\ RETURNING "id";
+        , .{session_gc_batch}));
+        defer st.finalize();
+        try st.bindInt(1, now);
+        var batch: usize = 0;
+        while (try st.step()) batch += 1;
+        total += batch;
+        if (batch < session_gc_batch) break; // full batch — may be more; a partial (or zero) batch signals done
+    }
+    return total;
+}
+
 /// Delete EVERY session row for a principal (revoke-all cleanliness). Writer required.
 pub fn deleteSessionsForPrincipal(conn: *db.Db, collection: []const u8, rid: []const u8) !void {
     var st = try conn.prepare("DELETE FROM \"_sessions\" WHERE \"collectionRef\" = ?1 AND \"recordRef\" = ?2;");
@@ -1691,6 +1723,74 @@ test "#99 table mode: an unauthorized revoke (error path) does not poison the wr
     defer env.pool.releaseWriter();
     const issued = try issueSession(&hctx, w, "users", rid, .password);
     try std.testing.expect(issued.token.len > 0);
+}
+
+// --- #114: expired-session GC sweep ---
+
+/// Insert a bare `_sessions` row with a chosen `expires` (null = no expiry). Writer-acquiring.
+fn insertSessionRow(env: *TestEnv, id: []const u8, expires: ?i64) !void {
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var st = try w.prepare(
+        \\INSERT INTO "_sessions" ("id","collectionRef","recordRef","created","lastSeen","expires","userAgent","ip")
+        \\ VALUES (?1,'users','u1',datetime('now'),datetime('now'),?2,'','');
+    );
+    defer st.finalize();
+    try st.bindText(1, id);
+    if (expires) |e| try st.bindInt(2, e) else try st.bindNull(2);
+    _ = try st.step();
+}
+
+test "#114 gcExpiredSessions deletes expired rows; NULL/future survive" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try insertSessionRow(env, "past", 1); // long-expired (unix secs)
+    try insertSessionRow(env, "noexp", null); // never expires
+    try insertSessionRow(env, "future", 9_999_999_999); // far future
+    try std.testing.expectEqual(@as(i64, 3), try sessionCount(env));
+
+    const deleted = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try gcExpiredSessions(w);
+    };
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+    try std.testing.expectEqual(@as(i64, 2), try sessionCount(env)); // NULL + future remain
+
+    // Confirm exactly the right rows survived.
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    var st = try r.prepare("SELECT COUNT(*) FROM \"_sessions\" WHERE \"id\" IN ('noexp','future');");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
+}
+
+test "#114 gcExpiredSessions drains a backlog larger than the batch size" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const total: usize = session_gc_batch + 50; // forces >1 batch
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        const id = try std.fmt.allocPrint(a, "s{d}", .{i});
+        try insertSessionRow(env, id, 1); // all expired
+    }
+    try std.testing.expectEqual(@as(i64, @intCast(total)), try sessionCount(env));
+
+    const deleted = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try gcExpiredSessions(w);
+    };
+    try std.testing.expectEqual(total, deleted);
+    try std.testing.expectEqual(@as(i64, 0), try sessionCount(env)); // backlog fully drained
 }
 
 test "#99 epoch-mode per-device verbs report SessionStoreNotEnabled" {

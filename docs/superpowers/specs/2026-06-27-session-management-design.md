@@ -115,8 +115,14 @@ folded into the single `tokenKey` SELECT every mint path already runs (`tokenKey
 it no longer runs a separate `tokenEpochFor` query. So epoch-mode login keeps the same query
 count as before #99.
 
-### Deferred (small)
-A periodic GC sweep of expired `_sessions` rows (verify already ignores them; they are inert).
+### Expired-session GC (#114, implemented)
+A framework-internal recurring job (`_session_gc`) deletes expired `_sessions` rows in bounded
+batches (`session_gc_batch = 1000`, each its own autocommit `DELETE … RETURNING`) on the writer.
+Auto-installed ONLY in table mode (gated like the `_ttl_gc` internal job); nothing is installed
+in `.epoch` mode (no job/timer). Cadence: `.session_gc_cron`, default hourly (`"0 * * * *"`).
+Expired rows are inert before collection (verify already rejects them), so GC is housekeeping,
+not a correctness gate. See `src/api/auth.zig` `gcExpiredSessions` + `framework.zig`
+`sessionGcJob`.
 
 ## Surface summary
 
