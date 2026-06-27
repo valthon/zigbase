@@ -47,8 +47,9 @@ There are two ways to use ZigBase:
 - **Session management** — token-epoch revocation (`revokeAllSessions`), optional
   per-device session table (`listActiveSessions` / `revoke`), and auth lifecycle hooks
   (`beforeAuthSuccess`, `beforeRegister`). → [Framework](./framework)
-- **Rate limiting** — global rate limiter plus per-auth-method limits; configurable at
-  comptime or at runtime via `ctx.rateLimit()`.
+- **Rate limiting** — global rate limiter plus per-auth-method limits; set each method's
+  `.rate_limit` option at comptime, or call `ac.rateLimit()` from a custom auth method at
+  runtime.
 - **Field encryption** — mark any text/JSON field `encrypted` for AES-256-GCM at rest;
   rotate keys live with `zigbase rewrap`. → [Framework](./framework)
 - **TTL / expiry** — declare `.ttl_field` on a collection and the framework GC's expired

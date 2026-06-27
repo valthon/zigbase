@@ -88,7 +88,7 @@ import FeatureCard from '../FeatureCard.astro';
         <circle cx="12" cy="12" r="9" />
         <path d="M12 7v5l3 3" />
       </svg>
-      Global rate limiter plus per-auth-method limits configurable at comptime or at runtime via <code>ctx.rateLimit()</code>.
+      Global rate limiter plus per-auth-method limits — set each method's <code>.rate_limit</code> option at comptime, or call <code>ac.rateLimit()</code> from a custom auth method at runtime.
     </FeatureCard>
 
     <FeatureCard title="Field encryption">
