@@ -552,6 +552,69 @@ const res2 = try client.post("https://webhook.example.com/notify", .{
 });
 ```
 
+### `ctx.verifyCaptcha()` — CAPTCHA verification (#140)
+
+Verify a browser-submitted CAPTCHA token against one of four supported providers:
+`recaptcha_v2`, `recaptcha_v3`, `hcaptcha`, `turnstile`.
+
+**Configure the provider + secret** in `App(cfg)`:
+
+```zig
+pub const app = zigbase.App(.{
+    .captcha = .{
+        .provider = .recaptcha_v3,   // .recaptcha_v2 | .recaptcha_v3 | .hcaptcha | .turnstile
+        .secret   = "6LeXXXXXXXXX",  // server-side site-verify secret
+    },
+    // ...
+});
+```
+
+**Verify in a route handler:**
+
+```zig
+fn submitHandler(ctx: *zigbase.Ctx, ev: *zigbase.events.RouteEvent) anyerror!http.Response {
+    const token = ev.request.body_param("g-recaptcha-response") orelse "";
+    const r = try ctx.verifyCaptcha(.recaptcha_v3, token);
+    if (!r.ok) return ctx.jsonError(403, "captcha_required");
+    // reCAPTCHA v3: score 0.0 (bot) → 1.0 (human); block suspicious traffic.
+    if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request");
+    // ... proceed with the submission ...
+}
+```
+
+**`CaptchaResult` fields:**
+
+| Field      | Type              | Present              | Notes                               |
+|-----------|-------------------|----------------------|-------------------------------------|
+| `ok`      | `bool`            | always               | `true` = token accepted             |
+| `score`   | `?f32`            | reCAPTCHA v3 only    | 0.0 = bot, 1.0 = human              |
+| `action`  | `?[]const u8`     | reCAPTCHA v3 only    | Action name from the frontend call  |
+| `hostname`| `?[]const u8`     | all except hCaptcha  | Domain that issued the token        |
+| `errors`  | `[]const []const u8` | when `ok=false`   | Provider error codes                |
+
+**Provider URL mapping:**
+
+| Provider      | Verify URL                                                          |
+|--------------|---------------------------------------------------------------------|
+| `recaptcha_v2` | `https://www.google.com/recaptcha/api/siteverify`                 |
+| `recaptcha_v3` | `https://www.google.com/recaptcha/api/siteverify`                 |
+| `hcaptcha`     | `https://hcaptcha.com/siteverify`                                 |
+| `turnstile`    | `https://challenges.cloudflare.com/turnstile/v0/siteverify`       |
+
+**Dev-bypass:** when `app.captcha_secret` is empty (the default when `.captcha` is not
+configured), `ctx.verifyCaptcha` returns `.{.ok = true}` immediately — no network call,
+no live key needed. This lets local development and unit tests work without a real provider.
+
+**Network errors** propagate as a Zig error; the handler decides fail-open vs fail-closed:
+
+```zig
+const r = ctx.verifyCaptcha(.turnstile, token) catch |e| {
+    std.log.warn("captcha provider unreachable: {s}", .{@errorName(e)});
+    // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable") to fail-closed
+    return process(ctx, ev);
+};
+```
+
 ### Test-mode capture — assert sent mail + mock outbound HTTP (`zigbase.testcapture`)
 
 For deterministic e2e/integration tests, the framework can capture what it *sent* — an

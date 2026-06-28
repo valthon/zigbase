@@ -30,6 +30,7 @@ const queue = @import("queue/queue.zig");
 const queue_config = @import("queue/config.zig");
 const queue_durable = @import("queue/durable.zig");
 const mail_send = @import("mail/send.zig");
+const captcha = @import("captcha.zig");
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -199,7 +200,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -652,6 +653,43 @@ pub fn App(comptime cfg: anytype) type {
             break :blk cfg.migrations;
         };
 
+        // ── CAPTCHA (#140 PR6) ────────────────────────────────────────────────
+        // Lower `.captcha = .{ .provider = .<provider>, .secret = "..." }` into the
+        // serve opts. The only required sub-key is `.provider`; `.secret` defaults to
+        // `""` which activates the dev-bypass in `ctx.verifyCaptcha`. Unknown sub-keys
+        // are a `@compileError` (mirror the `.features` guard). The `"captcha"` key
+        // in `allowed` (above) lets the guard accept it; here we do the actual lowering.
+
+        /// The comptime-lowered CAPTCHA provider (null when `.captcha` is absent).
+        pub const captcha_provider: ?captcha.Provider = blk: {
+            if (!@hasField(@TypeOf(cfg), "captcha")) break :blk null;
+            const cc = cfg.captcha;
+            const CT = @TypeOf(cc);
+            if (@typeInfo(CT) != .@"struct")
+                @compileError(".captcha must be a struct, e.g. '.captcha = .{ .provider = .recaptcha_v3, .secret = \"...\" }'");
+            for (std.meta.fields(CT)) |f| {
+                const ok = blk2: {
+                    for (.{ "provider", "secret" }) |k| {
+                        if (std.mem.eql(u8, f.name, k)) break :blk2 true;
+                    }
+                    break :blk2 false;
+                };
+                if (!ok) @compileError(".captcha: unknown key '." ++ f.name ++ "' (recognized: .provider, .secret)");
+            }
+            if (!@hasField(CT, "provider"))
+                @compileError(".captcha: missing required key .provider — set e.g. .provider = .recaptcha_v3");
+            break :blk cc.provider;
+        };
+
+        /// The comptime-lowered CAPTCHA secret (`""` = dev-bypass, no network call).
+        pub const captcha_secret: []const u8 = blk: {
+            if (!@hasField(@TypeOf(cfg), "captcha")) break :blk "";
+            const cc = cfg.captcha;
+            const CT = @TypeOf(cc);
+            if (@typeInfo(CT) != .@"struct") break :blk "";
+            break :blk if (@hasField(CT, "secret")) cc.secret else "";
+        };
+
         /// Bundle of comptime-resolved knobs threaded into the serve path: the
         /// selected storage/mailer plugin TYPES, the auth method type list,
         /// and the reader-pool cap.
@@ -671,6 +709,8 @@ pub fn App(comptime cfg: anytype) type {
             .experiment_assignment_ttl = experiment_assignment_ttl,
             .features_public_route = features_public_route,
             .queues = &queue_registry,
+            .captcha_provider = captcha_provider,
+            .captcha_secret = captcha_secret,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -792,6 +832,12 @@ pub const ServeOpts = struct {
     /// `app.queues` by serveImpl so `ctx.enqueue`/`App.enqueue` can route by backend.
     /// Static lifetime (a comptime-lowered const). null = no registry wired.
     queues: ?*const queue.Registry = null,
+    /// Captcha provider (#140 PR6), threaded into `app.captcha_provider`.
+    /// null = no `.captcha` config (ctx.verifyCaptcha activates the dev-bypass).
+    captcha_provider: ?captcha.Provider = null,
+    /// Captcha site-verify secret (#140 PR6), threaded into `app.captcha_secret`.
+    /// `""` = dev-bypass (ctx.verifyCaptcha returns .{.ok=true} without a network call).
+    captcha_secret: []const u8 = "",
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -1391,6 +1437,8 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .experiment_assignment_ttl = opts.experiment_assignment_ttl,
         .features_public_route = opts.features_public_route,
         .queues = if (opts.queues) |r| @as(?*const anyopaque, @ptrCast(r)) else null,
+        .captcha_provider = opts.captcha_provider,
+        .captcha_secret = opts.captcha_secret,
         // Always wire the shared limiter store: the default-scope limiter no-ops when
         // rate_limit_max==0 (RateLimiter.allow returns true for max==0), but a configured
         // per-method custom limit must still be honored against this store regardless of
