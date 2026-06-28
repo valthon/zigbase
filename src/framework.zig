@@ -200,7 +200,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -230,6 +230,24 @@ pub fn App(comptime cfg: anytype) type {
             if (@hasField(@TypeOf(cfg), "onBeforeServe")) d.on_before_serve = cfg.onBeforeServe;
             if (@hasField(@TypeOf(cfg), "onBeforeTerminate")) d.on_before_terminate = cfg.onBeforeTerminate;
             if (@hasField(@TypeOf(cfg), "onFeatureExposure")) d.on_feature_exposure = cfg.onFeatureExposure;
+            // Consumer realtime broadcast guard (#143). `.realtime = .{ .canSubscribe = fn }`
+            // installs a predicate gating subscription to NON-collection custom topics; an
+            // unknown sub-key fails loudly (mirrors the `.features` guard). Absent → custom
+            // topics default to public signal channels (the historical `__features` behavior).
+            if (@hasField(@TypeOf(cfg), "realtime")) {
+                const rcfg = cfg.realtime;
+                if (@typeInfo(@TypeOf(rcfg)) != .@"struct")
+                    @compileError(".realtime must be a struct, e.g. '.{ .canSubscribe = fn }'");
+                for (std.meta.fields(@TypeOf(rcfg))) |f| {
+                    if (!std.mem.eql(u8, f.name, "canSubscribe"))
+                        @compileError(".realtime: unknown key '." ++ f.name ++ "' (recognized: .canSubscribe)");
+                }
+                if (@hasField(@TypeOf(rcfg), "canSubscribe")) {
+                    const _coerce: events.RealtimeCanSubscribeFn = rcfg.canSubscribe;
+                    _ = _coerce;
+                    d.realtime_can_subscribe = rcfg.canSubscribe;
+                }
+            }
             break :blk d;
         };
 
@@ -1632,6 +1650,21 @@ test "App(cfg) installs the auth-lifecycle dispatcher only for a non-empty .auth
         }
     };
     try std.testing.expect(App(.{ .auth = .{ .beforeLogout = H.h } }).dispatch.auth_lifecycle != null);
+}
+
+test "App(cfg) wires the realtime canSubscribe guard onto dispatch (#143)" {
+    // No `.realtime` → null: custom topics default to PUBLIC signal channels.
+    try std.testing.expect(App(.{}).dispatch.realtime_can_subscribe == null);
+    // Empty `.realtime = .{}` is allowed and still leaves the guard unset.
+    try std.testing.expect(App(.{ .realtime = .{} }).dispatch.realtime_can_subscribe == null);
+    // A configured predicate is installed.
+    const H = struct {
+        fn canSub(ctx: *@import("ctx.zig").Ctx, topic: []const u8) bool {
+            _ = topic;
+            return ctx.rctx.is_superuser;
+        }
+    };
+    try std.testing.expect(App(.{ .realtime = .{ .canSubscribe = H.canSub } }).dispatch.realtime_can_subscribe != null);
 }
 
 test "App(cfg) assembles custom routes onto dispatch" {

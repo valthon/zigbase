@@ -107,6 +107,7 @@ error.**
 | `experiments` | Declared A/B/n experiments (variants + weights, optional `.sticky`). See [Feature flags + experiments](#feature-flags--experiments-declared). |
 | `experiment_assignment_ttl` | TTL in **days** for sticky `_experiment_assignments` rows (default `90`). Only valid when a `.sticky` experiment is declared — setting it otherwise is a `@compileError`. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
+| `realtime` | Realtime broadcast guard: `.{ .canSubscribe = fn }` gates who may subscribe to a custom (non-collection) topic (default: custom topics are public). See [`ctx.realtime()`](#ctxrealtime--broadcast-on-custom-channels). |
 
 ## 3b. The `typegen` gate (`.enable_typegen`)
 
@@ -681,6 +682,72 @@ const r = ctx.verifyCaptcha(.turnstile, token) catch |e| {
     return process(ctx, ev);
 };
 ```
+
+### `ctx.realtime()` — broadcast on custom channels
+
+The realtime layer auto-publishes record-change events on `<collection>` / `<collection>/<id>`
+topics. `ctx.realtime()` lets a handler — a route **or** a background job — publish its own
+events on **custom** (non-record) channels over the same WebSocket, using the same
+subscribe/unsubscribe protocol clients already use:
+
+```zig
+// Signal-only (no payload). Subscribers receive {"type":"signal","topic":"availability"}
+// and should re-fetch over an authenticated GET. The recommended default for private /
+// per-subject state, since the channel carries nothing sensitive.
+ctx.realtime().signal("availability");
+
+// Payload-carrying. Subscribers receive
+// {"type":"message","topic":"orders","data":{"type":"order.shipped","id":"REC1"}} verbatim.
+try ctx.realtime().broadcast("orders", .{ .type = "order.shipped", .id = id });
+```
+
+A client subscribes to a custom topic exactly like a collection topic:
+
+```js
+const ws = new WebSocket(`ws://${location.host}/api/realtime`);
+ws.onopen = () => ws.send(JSON.stringify({ action: "subscribe", topic: "availability" }));
+ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.topic === "availability") refreshSlots(); };
+```
+
+Both publish entry points are a **no-op when the realtime reactor isn't running** (tests/CLI),
+so they are safe to call unconditionally and from a background job (`ctx.app.submit` / a queue
+handler) where there is no HTTP request.
+
+**A custom topic is any topic name that is not a collection.** Subscribing to a *collection*
+name always goes through that collection's normal record-channel authorization (per-record
+`viewRule`); the custom-topic path can never be used to reach a collection's records.
+
+#### Who may subscribe (`.realtime = .{ .canSubscribe = fn }`)
+
+By **default, custom topics are public signal channels** — anyone, including an anonymous
+socket, may subscribe (exactly the framework's own `__features` signal). To gate a private
+channel, supply a predicate:
+
+```zig
+const App = zigbase.App(.{
+    .realtime = .{
+        // Return true to allow the subscription, false to deny it. `ctx` carries the
+        // socket's resolved identity (ctx.user() / ctx.rctx); `topic` is the requested
+        // custom channel name.
+        .canSubscribe = struct {
+            fn f(ctx: *zigbase.Ctx, topic: []const u8) bool {
+                if (std.mem.startsWith(u8, topic, "admin:")) {
+                    const u = ctx.user() orelse return false;
+                    return u.is_superuser;
+                }
+                return true; // other custom topics stay public
+            }
+        }.f,
+    },
+});
+```
+
+**Security guidance.** Because a custom topic's frame is delivered verbatim to every
+subscriber (no per-record `viewRule`), keep private/per-subject state **signal-only**:
+`signal(topic)` carries no data, so a subscriber learns only that *something* changed and
+must re-fetch the actual state over an authenticated GET. Use the payload-carrying
+`broadcast(topic, payload)` only for data that is safe for **every** subscriber of that
+topic, and use `.canSubscribe` to restrict who may join a private channel.
 
 ### Test-mode capture — assert sent mail + mock outbound HTTP (`zigbase.testcapture`)
 
