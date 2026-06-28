@@ -1,6 +1,6 @@
 .{
     .name = .zigbase,
-    .version = "0.7.0",
+    .version = "0.7.1",
     .fingerprint = 0x306d84a90c011454,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
