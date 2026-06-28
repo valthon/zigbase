@@ -302,11 +302,25 @@ pub fn App(comptime cfg: anytype) type {
             .{ .kind = "mail", .handler = mail_send.jobHandler },
         };
 
+        /// Names of the reserved built-in kinds, derived from `builtin_job_regs` so the
+        /// collision guard below automatically covers every current AND future built-in.
+        const reserved_job_kinds: []const []const u8 = blk: {
+            var names: [builtin_job_regs.len][]const u8 = undefined;
+            for (builtin_job_regs, 0..) |r, i| names[i] = r.kind;
+            const frozen = names;
+            break :blk &frozen;
+        };
+
         /// Declared job-kind → handler registry: the built-in kinds followed by the consumer
         /// `.jobs` bindings (the reserved `.jobs.pool_size` key is skipped). `jobByKind`
-        /// resolves built-ins first so `"mail"` always reaches the framework handler.
-        pub const job_regs: []const queue.JobReg =
-            builtin_job_regs ++ queue_config.jobsMeta(if (@hasField(@TypeOf(cfg), "jobs")) cfg.jobs else .{});
+        /// resolves built-ins first so `"mail"` always reaches the framework handler — and the
+        /// `assertNoReservedJobKinds` guard rejects a consumer `.jobs` entry that would collide
+        /// with a built-in kind (it would be dead config, never dispatched).
+        pub const job_regs: []const queue.JobReg = blk: {
+            const consumer_jobs = if (@hasField(@TypeOf(cfg), "jobs")) cfg.jobs else .{};
+            queue_config.assertNoReservedJobKinds(consumer_jobs, reserved_job_kinds);
+            break :blk builtin_job_regs ++ queue_config.jobsMeta(consumer_jobs);
+        };
 
         /// Enum of declared queue names — the compile-checked key for `App.enqueue`.
         pub const Queue = queue_config.QueueEnum(if (@hasField(@TypeOf(cfg), "queues")) cfg.queues else .{});

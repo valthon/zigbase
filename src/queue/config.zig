@@ -208,6 +208,28 @@ pub fn jobsMeta(comptime jobs_cfg: anytype) []const JobReg {
     }
 }
 
+/// Loud comptime guard: a consumer `.jobs` field name may not collide with a
+/// framework-reserved built-in job kind (e.g. `"mail"`, and the upcoming `"webhook"`).
+/// A collision is dead config — `Registry.jobByKind` resolves the built-in first, so the
+/// consumer's handler would never run while still minting a misleading `Job.<kind>` enum
+/// member. We reject it instead (matching the subsystem's loud-`@compileError` philosophy
+/// for unknown keys / undeclared queues / the reserved `pool_size` key). `reserved` is the
+/// list of built-in kinds (derive it from `builtin_job_regs` so this stays general as more
+/// built-ins are added). The reserved `pool_size` key is skipped (it is not a job kind).
+pub fn assertNoReservedJobKinds(comptime jobs_cfg: anytype, comptime reserved: []const []const u8) void {
+    comptime {
+        const T = @TypeOf(jobs_cfg);
+        if (@typeInfo(T) != .@"struct") return; // jobsMeta validates shape; nothing to check here
+        for (std.meta.fields(T)) |f| {
+            if (std.mem.eql(u8, f.name, reserved_pool_size_key)) continue;
+            for (reserved) |r| {
+                if (std.mem.eql(u8, f.name, r))
+                    @compileError("job kind '" ++ f.name ++ "' is reserved by the framework (use ctx." ++ f.name ++ "().enqueue) — rename your .jobs entry");
+            }
+        }
+    }
+}
+
 /// Build an exhaustive enum whose members are the declared queue names (plus the
 /// synthesized `default`). Order-independent: `App.enqueue` maps the enum to a name
 /// via `@tagName`, so this is purely a compile-time spelling check.
@@ -331,6 +353,14 @@ test "jobsMeta lowers kind=handler bindings" {
     try testing.expectEqual(@as(usize, 2), regs.len);
     try testing.expectEqualStrings("resize", regs[0].kind);
     try testing.expectEqualStrings("reindex", regs[1].kind);
+}
+
+test "assertNoReservedJobKinds passes for non-colliding kinds (incl. pool_size + empty)" {
+    // Non-colliding consumer kinds compile; the reserved pool_size key is ignored; an
+    // empty `.jobs` is fine. (The collision case is a @compileError, not unit-testable.)
+    const reserved: []const []const u8 = &.{ "mail", "webhook" };
+    comptime assertNoReservedJobKinds(.{ .resize = testHandler, .pool_size = 3 }, reserved);
+    comptime assertNoReservedJobKinds(.{}, reserved);
 }
 
 test "QueueEnum includes synthesized default + declared queues" {
