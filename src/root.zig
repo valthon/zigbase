@@ -24,6 +24,12 @@ pub const ExposureKind = events.ExposureKind;
 pub const ExposureHandler = events.ExposureHandler;
 pub const Req = @import("route_types.zig").Req;
 pub const RouteError = @import("route_types.zig").RouteError;
+// Route-guard pipeline (#139/#142): a consumer writes the guard inline as an anonymous
+// literal (`.auth = .{ .path_secret = .{ … } }`, `.rate_limit = .{ .custom = … }`), but these
+// re-exports let one name the lowered types (e.g. for a helper that builds route specs).
+pub const RouteAuthGuard = events.RouteAuthGuard;
+pub const PathSecretGuard = events.PathSecretGuard;
+pub const RateLimitKeyFn = events.RateLimitKeyFn;
 
 // ---- Plugin / schema / migration consumer types ---------------------------
 // Types an external consumer must be able to NAME to write a custom storage or

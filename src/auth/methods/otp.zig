@@ -7,6 +7,7 @@ const Resolution = method_mod.Resolution;
 const challenge_store = @import("../challenge_store.zig");
 const ChallengeStore = challenge_store.ChallengeStore;
 const api_auth = @import("../../api/auth.zig");
+const crypto = @import("../../crypto.zig");
 
 // ---------------------------------------------------------------------------
 // OtpMethod — email one-time numeric codes via ChallengeStore
@@ -50,23 +51,6 @@ fn generateCode(io: std.Io, buf: []u8) void {
         buf[i] = '0' + (b[0] % 10);
         i += 1;
     }
-}
-
-/// Constant-time comparison of two byte slices.
-/// Returns true only if both slices have the same length AND every byte is identical.
-///
-/// Approach: first do a non-constant-time length check (length mismatch is not secret —
-/// codes are always `length` digits on both sides, so length equality is expected). Then
-/// XOR-accumulate all byte differences into a single `diff` value. If any byte differs,
-/// `diff` is nonzero. This loop always runs to completion regardless of where a mismatch
-/// occurs, so no timing signal leaks the position of a mismatch.
-fn timingSafeEqlSlices(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var diff: u8 = 0;
-    for (a, b) |x, y| {
-        diff |= x ^ y;
-    }
-    return diff == 0;
 }
 
 fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
@@ -158,8 +142,9 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         email,
     )) orelse return Resolution{ .fail = .{ .status = 400, .message = "Invalid or expired code." } };
 
-    // Constant-time compare: XOR-accumulate all byte differences; never early-exit on mismatch
-    if (!timingSafeEqlSlices(submitted_code, stored)) {
+    // Constant-time compare (shared `crypto.timingSafeEql`): XOR-accumulate all byte
+    // differences; never early-exit on mismatch, so no position-timing oracle leaks.
+    if (!crypto.timingSafeEql(submitted_code, stored)) {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid or expired code." } };
     }
 
@@ -211,14 +196,8 @@ test "OtpMethod: generateCode produces length digits, all 0-9" {
     }
 }
 
-test "OtpMethod: timingSafeEqlSlices is correct" {
-    try std.testing.expect(timingSafeEqlSlices("123456", "123456"));
-    try std.testing.expect(!timingSafeEqlSlices("123456", "123457")); // last char differs
-    try std.testing.expect(!timingSafeEqlSlices("123456", "000000")); // all chars differ
-    try std.testing.expect(!timingSafeEqlSlices("12345", "123456")); // length mismatch
-    try std.testing.expect(!timingSafeEqlSlices("123456", "12345")); // length mismatch
-    try std.testing.expect(timingSafeEqlSlices("", "")); // empty slices equal
-}
+// The constant-time comparison used by `completeImpl` is now the shared
+// `crypto.timingSafeEql`; its correctness is covered by the ported test in `src/crypto.zig`.
 
 test "OtpMethod: complete with known code resolves to record id" {
     const http = @import("../../http.zig");

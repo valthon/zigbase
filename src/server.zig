@@ -24,6 +24,8 @@ const auth = @import("auth.zig");
 const events = @import("events.zig");
 const request = @import("request.zig");
 const Ctx = @import("ctx.zig").Ctx;
+const crypto = @import("crypto.zig");
+const clock = @import("clock.zig");
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
     return health.handle(ctx);
@@ -137,6 +139,20 @@ test "clientIpFrom ignores X-Forwarded-For/X-Real-IP unless trust_proxy is set (
     try std.testing.expectEqualStrings("", clientIpFrom(true, null, null));
 }
 
+/// Live header lookup-by-name for `RequestCtx.header` (the route-guard `.header` source).
+/// facil.io normalizes header names to lowercase, so the requested name is lowercased into a
+/// bounded stack buffer before the lookup (header names are short; an over-long name falls
+/// back to the raw name, which simply won't match).
+fn zapHeaderLookup(p: *anyopaque, name: []const u8) ?[]const u8 {
+    const req: *zap.Request = @ptrCast(@alignCast(p));
+    var buf: [256]u8 = undefined;
+    if (name.len <= buf.len) {
+        const lower = std.ascii.lowerString(buf[0..name.len], name);
+        return req.getHeader(lower);
+    }
+    return req.getHeader(name);
+}
+
 /// Map an HTTP status code to zap's `StatusCode` enum.
 ///
 /// `zap.http.StatusCode` is non-exhaustive, so `std.enums.fromInt`/`std.meta.intToEnum`
@@ -196,6 +212,74 @@ fn mergePending(alloc: std.mem.Allocator, cx: *Ctx, resp: http.Response) !http.R
     return out;
 }
 
+/// The ordered, declarative route-guard chain (#139/#142), run for a matched custom route
+/// AFTER the AuthLevel check and BEFORE the handler. Returns the FIRST guard's deny Response,
+/// or null to proceed. New guard kinds slot in as additional ordered steps here, keeping the
+/// chain extensible without touching `dispatchCustom`'s control flow.
+///   1. AuthLevel — enforced by the caller (the existing switch in `dispatchCustom`).
+///   2. path_secret — constant-time secret check; bare-404 on miss (no existence oracle).
+///   3. rate_limit — per-route bucket; 429 + Retry-After on deny.
+fn runRouteGuards(cx: *Ctx, ctx: *http.RequestCtx, rt: events.RuntimeRoute) !?http.Response {
+    if (rt.auth_guard) |g| {
+        if (try guardPathSecret(cx, ctx, g)) |deny| return deny;
+    }
+    if (try guardRateLimit(cx, ctx, rt)) |deny| return deny;
+    return null;
+}
+
+/// Guard step (2): resolve the stored secret (kv/settings via `ctx.kv().get`, config static),
+/// read the submitted value from the configured location (path/query/header), and compare in
+/// CONSTANT TIME (`crypto.timingSafeEql`). On any mismatch (including an empty/absent stored
+/// secret — fail closed) return a BARE 404 by default so a wrong secret is indistinguishable
+/// from a non-existent route (no oracle); `.on_mismatch = .forbidden` opts into an explicit 403.
+fn guardPathSecret(cx: *Ctx, ctx: *http.RequestCtx, g: events.RouteAuthGuard) !?http.Response {
+    switch (g) {
+        .path_secret => |ps| {
+            const stored: []const u8 = switch (ps.source) {
+                .config => |s| s,
+                // kv/settings live in the same `_kv` store; a read error/absence ⇒ "" (fail closed).
+                .kv => |k| (cx.kv().get(k) catch null) orelse "",
+                .settings => |k| (cx.kv().get(k) catch null) orelse "",
+            };
+            const submitted: []const u8 = switch (ps.in) {
+                .path => ctx.param(ps.param) orelse "",
+                .query => (try cx.query()).get(ps.param) orelse "",
+                .header => ctx.header(ps.param) orelse "",
+            };
+            // Empty stored secret never matches; constant-time compare otherwise.
+            if (stored.len > 0 and crypto.timingSafeEql(submitted, stored)) return null;
+            return switch (ps.on_mismatch) {
+                .not_found => try ApiError.notFound().toResponse(ctx.allocator),
+                .forbidden => try forbiddenResp(ctx),
+            };
+        },
+    }
+}
+
+/// Guard step (3): per-route rate limit (#142). Only `.custom` engages a bucket — `.default`
+/// and `.off` leave the route unthrottled (routes are opt-in for limiting). The bucket is
+/// keyed `route:<pattern>:…` by the app-supplied `rate_limit_key(ctx)` when present, else by
+/// the client IP (`ctx.remote_ip`, which honors `ZIGBASE_TRUST_PROXY` via `clientIpFrom` — a
+/// spoofed X-Forwarded-For yields "" when proxies are untrusted, so it cannot evade/poison a
+/// per-IP bucket). On deny: 429 + `Retry-After: <window_s>`.
+fn guardRateLimit(cx: *Ctx, ctx: *http.RequestCtx, rt: events.RuntimeRoute) !?http.Response {
+    const c = switch (rt.rate_limit) {
+        .custom => |c| c,
+        else => return null, // .default / .off ⇒ no per-route bucket
+    };
+    const app = ctx.app orelse return null;
+    const limiter = app.rate_limiter orelse return null;
+    const key = if (rt.rate_limit_key) |kf| blk: {
+        if (kf(cx)) |subject| break :blk try std.fmt.allocPrint(ctx.allocator, "route:{s}:key:{s}", .{ rt.pattern, subject });
+        break :blk try std.fmt.allocPrint(ctx.allocator, "route:{s}:ip:{s}", .{ rt.pattern, ctx.remote_ip });
+    } else try std.fmt.allocPrint(ctx.allocator, "route:{s}:ip:{s}", .{ rt.pattern, ctx.remote_ip });
+    if (limiter.allowCustom(key, clock.nowUnix(app.io), c.max, c.window_s)) return null;
+    const retry = try std.fmt.allocPrint(ctx.allocator, "{d}", .{c.window_s});
+    var resp = try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator);
+    resp.extra_headers = try ctx.allocator.dupe(http.Header, &.{.{ .name = "Retry-After", .value = retry }});
+    return resp;
+}
+
 /// Try the consumer's custom routes (after built-ins). Resolves auth on a fresh reader,
 /// enforces the route's AuthLevel, then calls the handler. Returns null if no custom route
 /// matches the path+method. A handler error routes to the error backstop and yields 500.
@@ -225,6 +309,10 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
             };
             var cx = Ctx{ .app = app, .arena = ctx.allocator, .rctx = rctx, .request = ctx, .bound_conn = null };
             defer cx.deinit();
+            // Ordered route-guard chain (#139/#142): path-secret + per-route rate limit, run
+            // AFTER the AuthLevel check above and BEFORE the handler. The first guard to deny
+            // returns its response (bare-404 / 403 / 429) and the handler never runs.
+            if (try runRouteGuards(&cx, ctx, rt)) |deny| return deny;
             // One chokepoint for typed thunks + untyped handlers: any cookies/headers a
             // handler accumulated via `ctx.setCookie`/`ctx.addHeader` (e.g. `ctx.subjectCookie`)
             // are merged onto the Response in BOTH the success and the error path, so a
@@ -435,6 +523,249 @@ test "applyMultipart: valid multipart populates ctx and returns null; non-multip
     try std.testing.expect(jctx.form_fields == null);
 }
 
+// ---------------------------------------------------------------------------
+// Route-guard pipeline (#139 path-secret + #142 per-route rate limit) tests.
+// ---------------------------------------------------------------------------
+
+/// Minimal file-backed pool + arena harness for the guard tests. `migrate=true` runs
+/// migrations so `_kv` exists (kv/settings source); config-source/rate-limit tests don't need it.
+const GuardEnv = struct {
+    const db = @import("db.zig");
+    const migrations = @import("migrations.zig");
+
+    tmp: std.testing.TmpDir,
+    db_path: [:0]u8,
+    pool: db.Pool,
+    arena: std.heap.ArenaAllocator,
+
+    fn init(migrate: bool) !GuardEnv {
+        const ga = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+        defer ga.free(dir_path);
+        const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        errdefer ga.free(db_path);
+        var pool = try db.Pool.init(ga, std.testing.io, db_path);
+        errdefer pool.deinit();
+        if (migrate) {
+            const w = pool.acquireWriter();
+            defer pool.releaseWriter();
+            try migrations.run(w);
+        }
+        return .{ .tmp = tmp, .db_path = db_path, .pool = pool, .arena = std.heap.ArenaAllocator.init(ga) };
+    }
+
+    fn deinit(self: *GuardEnv) void {
+        const ga = std.testing.allocator;
+        self.arena.deinit();
+        self.pool.deinit();
+        ga.free(self.db_path);
+        self.tmp.cleanup();
+    }
+};
+
+test "guard path_secret: correct config secret -> handler runs (200); wrong/missing -> bare 404" {
+    const App = app_mod.App;
+    const H = struct {
+        fn ok(cx: *Ctx) anyerror!http.Response {
+            _ = cx;
+            return .{ .status = 200, .body = "{\"ok\":true}" };
+        }
+    };
+    var env = try GuardEnv.init(false);
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    const table = [_]events.RuntimeRoute{
+        .{ .method = .GET, .pattern = "/api/s/:token", .handler = H.ok, .auth = .public, .auth_guard = .{ .path_secret = .{ .param = "token", .source = .{ .config = "s3cr3t" } } } },
+    };
+    const dispatch = events.Dispatch{ .routes = &table };
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool, .dispatch = &dispatch };
+
+    // Correct secret: 200.
+    var ok_ctx = http.RequestCtx{ .method = .GET, .path = "/api/s/s3cr3t", .allocator = a, .app = &app };
+    const ok = (try dispatchCustom(&ok_ctx)).?;
+    try std.testing.expectEqual(@as(u16, 200), ok.status);
+
+    // Wrong secret: a BARE 404 (the canonical not-found envelope — no oracle, no 403/401).
+    var bad_ctx = http.RequestCtx{ .method = .GET, .path = "/api/s/nope", .allocator = a, .app = &app };
+    const bad = (try dispatchCustom(&bad_ctx)).?;
+    try std.testing.expectEqual(@as(u16, 404), bad.status);
+    try std.testing.expect(std.mem.indexOf(u8, bad.body, "Not found.") != null);
+}
+
+test "guard path_secret: on_mismatch=.forbidden -> 403; query and header sources" {
+    const App = app_mod.App;
+    const H = struct {
+        fn ok(cx: *Ctx) anyerror!http.Response {
+            _ = cx;
+            return .{ .status = 200, .body = "{}" };
+        }
+    };
+    var env = try GuardEnv.init(false);
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    const table = [_]events.RuntimeRoute{
+        .{ .method = .GET, .pattern = "/api/forbid", .handler = H.ok, .auth = .public, .auth_guard = .{ .path_secret = .{ .param = "s", .source = .{ .config = "open" }, .in = .query, .on_mismatch = .forbidden } } },
+        .{ .method = .GET, .pattern = "/api/q", .handler = H.ok, .auth = .public, .auth_guard = .{ .path_secret = .{ .param = "k", .source = .{ .config = "qsecret" }, .in = .query } } },
+        .{ .method = .GET, .pattern = "/api/h", .handler = H.ok, .auth = .public, .auth_guard = .{ .path_secret = .{ .param = "x-secret", .source = .{ .config = "hsecret" }, .in = .header } } },
+    };
+    const dispatch = events.Dispatch{ .routes = &table };
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool, .dispatch = &dispatch };
+
+    // Forbidden mode: a mismatch is an explicit 403, not a 404.
+    var f_ctx = http.RequestCtx{ .method = .GET, .path = "/api/forbid", .query = "s=wrong", .allocator = a, .app = &app };
+    try std.testing.expectEqual(@as(u16, 403), (try dispatchCustom(&f_ctx)).?.status);
+
+    // Query source: correct value passes (200), wrong 404.
+    var q_ok = http.RequestCtx{ .method = .GET, .path = "/api/q", .query = "k=qsecret", .allocator = a, .app = &app };
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchCustom(&q_ok)).?.status);
+    var q_bad = http.RequestCtx{ .method = .GET, .path = "/api/q", .query = "k=nah", .allocator = a, .app = &app };
+    try std.testing.expectEqual(@as(u16, 404), (try dispatchCustom(&q_bad)).?.status);
+
+    // Header source (case-insensitive name match via RequestCtx.headers).
+    const hdrs = [_]http.Param{.{ .key = "X-Secret", .value = "hsecret" }};
+    var h_ok = http.RequestCtx{ .method = .GET, .path = "/api/h", .allocator = a, .app = &app, .headers = &hdrs };
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchCustom(&h_ok)).?.status);
+    var h_bad = http.RequestCtx{ .method = .GET, .path = "/api/h", .allocator = a, .app = &app };
+    try std.testing.expectEqual(@as(u16, 404), (try dispatchCustom(&h_bad)).?.status);
+}
+
+test "guard path_secret: kv source reads the stored secret (#139)" {
+    const App = app_mod.App;
+    const Data = @import("data.zig").Data;
+    const H = struct {
+        fn ok(cx: *Ctx) anyerror!http.Response {
+            _ = cx;
+            return .{ .status = 200, .body = "{}" };
+        }
+    };
+    var env = try GuardEnv.init(true); // migrate -> _kv exists
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    // Seed the kv secret.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try (Data{ .app = &app, .conn = w, .io = app.io, .alloc = a }).kvSet("deploy_secret", "kv-value");
+    }
+
+    const table = [_]events.RuntimeRoute{
+        .{ .method = .GET, .pattern = "/api/kv/:tok", .handler = H.ok, .auth = .public, .auth_guard = .{ .path_secret = .{ .param = "tok", .source = .{ .kv = "deploy_secret" } } } },
+    };
+    const dispatch = events.Dispatch{ .routes = &table };
+    app.dispatch = &dispatch;
+
+    var ok_ctx = http.RequestCtx{ .method = .GET, .path = "/api/kv/kv-value", .allocator = a, .app = &app };
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchCustom(&ok_ctx)).?.status);
+    var bad_ctx = http.RequestCtx{ .method = .GET, .path = "/api/kv/stale", .allocator = a, .app = &app };
+    try std.testing.expectEqual(@as(u16, 404), (try dispatchCustom(&bad_ctx)).?.status);
+
+    // Rotation: overwrite the secret -> the old value now 404s (old links break).
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try (Data{ .app = &app, .conn = w, .io = app.io, .alloc = a }).kvSet("deploy_secret", "rotated");
+    }
+    var stale = http.RequestCtx{ .method = .GET, .path = "/api/kv/kv-value", .allocator = a, .app = &app };
+    try std.testing.expectEqual(@as(u16, 404), (try dispatchCustom(&stale)).?.status);
+    var fresh = http.RequestCtx{ .method = .GET, .path = "/api/kv/rotated", .allocator = a, .app = &app };
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchCustom(&fresh)).?.status);
+}
+
+test "guard rate_limit: per-route bucket, 429 + Retry-After, IP keying, key fn (#142)" {
+    const App = app_mod.App;
+    const ratelimit = @import("ratelimit.zig");
+    const H = struct {
+        fn ok(cx: *Ctx) anyerror!http.Response {
+            _ = cx;
+            return .{ .status = 200, .body = "{}" };
+        }
+        var key_val: ?[]const u8 = null;
+        fn keyFn(cx: *Ctx) ?[]const u8 {
+            _ = cx;
+            return key_val;
+        }
+    };
+    var env = try GuardEnv.init(false);
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    var rl = ratelimit.RateLimiter.init(std.testing.allocator, 0, 60); // global off; per-route via allowCustom
+    defer rl.deinit();
+
+    const table = [_]events.RuntimeRoute{
+        .{ .method = .GET, .pattern = "/api/lim", .handler = H.ok, .auth = .public, .rate_limit = .{ .custom = .{ .max = 2, .window_s = 30 } } },
+        .{ .method = .GET, .pattern = "/api/keyed", .handler = H.ok, .auth = .public, .rate_limit = .{ .custom = .{ .max = 1, .window_s = 30 } }, .rate_limit_key = H.keyFn },
+    };
+    const dispatch = events.Dispatch{ .routes = &table };
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool, .dispatch = &dispatch, .rate_limiter = &rl };
+
+    // Two allowed for IP 1.1.1.1, the third denied with 429 + Retry-After: 30.
+    const ip1 = "1.1.1.1";
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/lim", ip1)).status);
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/lim", ip1)).status);
+    const denied = try dispatchIp(a, &app, "/api/lim", ip1);
+    try std.testing.expectEqual(@as(u16, 429), denied.status);
+    try std.testing.expectEqual(@as(usize, 1), denied.extra_headers.len);
+    try std.testing.expectEqualStrings("Retry-After", denied.extra_headers[0].name);
+    try std.testing.expectEqualStrings("30", denied.extra_headers[0].value);
+
+    // A DIFFERENT IP has its own bucket (isolation) — immediately allowed.
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/lim", "2.2.2.2")).status);
+
+    // rate_limit_key wins over IP: same key from different IPs shares ONE bucket (max=1).
+    H.key_val = "tenant-A";
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/keyed", "9.9.9.9")).status);
+    try std.testing.expectEqual(@as(u16, 429), (try dispatchIp(a, &app, "/api/keyed", "8.8.8.8")).status);
+    // A different key -> fresh budget despite the shared route.
+    H.key_val = "tenant-B";
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/keyed", "8.8.8.8")).status);
+}
+
+/// Dispatch a GET to `path` with a given remote_ip (already resolved as server.zig would,
+/// post trust_proxy) and return the response. Distinct IPs prove per-IP bucket isolation; ""
+/// proves the untrusted-proxy fallback (a spoofed XFF resolves to "" so it cannot evade or
+/// poison another IP's bucket).
+fn dispatchIp(a: std.mem.Allocator, app: *app_mod.App, path: []const u8, ip: []const u8) !http.Response {
+    var c = http.RequestCtx{ .method = .GET, .path = path, .allocator = a, .app = app, .remote_ip = ip };
+    return (try dispatchCustom(&c)).?;
+}
+
+test "guard chain: path_secret AND rate_limit composed on one route" {
+    const App = app_mod.App;
+    const ratelimit = @import("ratelimit.zig");
+    const H = struct {
+        fn ok(cx: *Ctx) anyerror!http.Response {
+            _ = cx;
+            return .{ .status = 200, .body = "{}" };
+        }
+    };
+    var env = try GuardEnv.init(false);
+    defer env.deinit();
+    const a = env.arena.allocator();
+    var rl = ratelimit.RateLimiter.init(std.testing.allocator, 0, 60);
+    defer rl.deinit();
+
+    const table = [_]events.RuntimeRoute{
+        .{ .method = .GET, .pattern = "/api/both/:tok", .handler = H.ok, .auth = .public, .auth_guard = .{ .path_secret = .{ .param = "tok", .source = .{ .config = "open" } } }, .rate_limit = .{ .custom = .{ .max = 1, .window_s = 30 } } },
+    };
+    const dispatch = events.Dispatch{ .routes = &table };
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool, .dispatch = &dispatch, .rate_limiter = &rl };
+
+    // Wrong secret 404s BEFORE the rate limiter is consulted (secret guard is ordered first):
+    // it must not consume the budget, so a subsequent correct call still succeeds.
+    try std.testing.expectEqual(@as(u16, 404), (try dispatchIp(a, &app, "/api/both/wrong", "5.5.5.5")).status);
+    // Correct secret + within budget: 200.
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/both/open", "5.5.5.5")).status);
+    // Correct secret but over the per-route budget: 429.
+    try std.testing.expectEqual(@as(u16, 429), (try dispatchIp(a, &app, "/api/both/open", "5.5.5.5")).status);
+}
+
 /// Last-resort raw error envelope, used only when even building the normal ApiError
 /// response fails (allocation failure). Sends a fixed JSON body bypassing the arena.
 fn sendRawEnvelope(r: zap.Request, status: u16, body: []const u8) void {
@@ -465,6 +796,11 @@ fn onRequest(r: zap.Request) !void {
     // are spoofable on direct exposure, so they are honored ONLY when trust_proxy is set.
     // Otherwise "" — the limiter keys on the submitted identity (never header-spoofable).
     ctx.remote_ip = clientIp(r, self.app.trust_proxy);
+    // Generic header lookup for the route-guard `.header` source (#139). `r` lives on this
+    // frame for the whole request, so a pointer to it is valid for the lookup thunk's life.
+    var zap_req = r;
+    ctx.raw_header_ctx = &zap_req;
+    ctx.raw_header_fn = zapHeaderLookup;
     const multipart_err = try applyMultipart(&ctx);
     const resp = blk: {
         if (multipart_err) |er| break :blk er;

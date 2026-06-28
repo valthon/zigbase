@@ -50,6 +50,24 @@ pub fn dummyVerify(io: std.Io, alloc: std.mem.Allocator) void {
     _ = verifyPassword(io, alloc, dummy_password_hash, "zigbase-login-timing-dummy-mismatch");
 }
 
+/// Constant-time byte-slice equality. Returns true only if both slices have the same
+/// length AND every byte is identical.
+///
+/// The length check short-circuits (a length mismatch is not secret — a presented secret
+/// is compared against a server-side value of known, fixed length). Once the lengths match,
+/// the comparison XOR-accumulates every byte difference into a single value and NEVER
+/// early-exits, so no timing signal leaks the position of the first differing byte. Use this
+/// whenever comparing a secret (auth code, shared path secret, HMAC tag) against
+/// attacker-supplied input — a plain `std.mem.eql` returns early on the first mismatch and so
+/// leaks a byte-position timing oracle. `std.crypto.timing_safe.eql` only takes fixed-size
+/// arrays; this is the slice-shaped counterpart used across the codebase.
+pub fn timingSafeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
+}
+
 /// Per-record JWT signing key = HMAC-SHA256(app_secret, token_key). Rotating token_key
 /// (on password change) changes the key, invalidating all prior tokens for that record.
 pub fn deriveKey(app_secret: []const u8, token_key: []const u8) [32]u8 {
@@ -84,6 +102,20 @@ pub fn genHex(io: std.Io, alloc: std.mem.Allocator, len: usize) ![]u8 {
         out[i] = hexchars[nib];
     }
     return out;
+}
+
+test "timingSafeEql is correct (ported from otp.zig)" {
+    try std.testing.expect(timingSafeEql("123456", "123456"));
+    try std.testing.expect(!timingSafeEql("123456", "123457")); // last char differs
+    try std.testing.expect(!timingSafeEql("123456", "000000")); // all chars differ
+    try std.testing.expect(!timingSafeEql("12345", "123456")); // length mismatch
+    try std.testing.expect(!timingSafeEql("123456", "12345")); // length mismatch
+    try std.testing.expect(timingSafeEql("", "")); // empty slices equal
+    // A longer, mixed-byte secret round-trips and rejects a single-byte flip anywhere.
+    const secret = "s3cr3t-deploy-key-9f2a";
+    try std.testing.expect(timingSafeEql(secret, "s3cr3t-deploy-key-9f2a"));
+    try std.testing.expect(!timingSafeEql(secret, "S3cr3t-deploy-key-9f2a")); // first byte
+    try std.testing.expect(!timingSafeEql(secret, "s3cr3t-deploy-key-9f2b")); // last byte
 }
 
 test "password hash verifies the right password and rejects the wrong one" {

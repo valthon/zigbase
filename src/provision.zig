@@ -262,30 +262,10 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
     }
 }
 
-fn buildRateLimitOpt(comptime rl: anytype) schema.RateLimitOpt {
-    const T = @TypeOf(rl);
-    // The struct form `.{ .custom = .{ .max = …, .window_s = … } }`: an anonymous struct
-    // (NOT an enum/union), so `@tagName` would fail — match on the `custom` field instead.
-    if (T != @TypeOf(.enum_literal)) {
-        if (@hasField(T, "custom")) {
-            const cv = rl.custom;
-            return .{ .custom = .{ .max = cv.max, .window_s = cv.window_s } };
-        }
-        // A struct without a `custom` field is a misshaped config (e.g. forgetting the
-        // `.custom` wrapper: `.{ .max = 5, .window_s = 60 }`). Fail at comptime rather than
-        // silently applying `.default`.
-        @compileError("rate_limit: unrecognized struct shape; expected " ++
-            ".rate_limit = .{ .custom = .{ .max = N, .window_s = S } } " ++
-            "(or the enum-literals .default / .off)");
-    }
-    // The enum-literal form `.default` / `.off`. An unknown literal (e.g. `.on`, a typo) is
-    // a comptime error, not a silent `.default`.
-    const tag = @tagName(rl);
-    if (std.mem.eql(u8, tag, "off")) return .off;
-    if (std.mem.eql(u8, tag, "default")) return .default;
-    @compileError("rate_limit: unknown value '." ++ tag ++ "'; expected " ++
-        ".default, .off, or .{ .custom = .{ .max = N, .window_s = S } }");
-}
+/// `.rate_limit` lowering now lives in `schema.buildRateLimitOpt` (shared with the
+/// per-route guard pipeline in `events.buildRoutes`). Kept as a thin local alias so the
+/// existing call sites below read unchanged.
+const buildRateLimitOpt = schema.buildRateLimitOpt;
 
 fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
     const M = @TypeOf(m);
