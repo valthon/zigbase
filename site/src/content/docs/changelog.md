@@ -13,6 +13,26 @@ All notable changes to ZigBase are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-28
+
+### Breaking
+
+- **Feature flags are now declared-only.** Flags must be declared in the `App(.{ .flags = .{ … } })` literal; only declared flags resolve. The v0.7 runtime-string API `ctx.flag("arbitrary")` (KV-or-false) has been **removed** — use the typed `App.flag(ctx, .name)` for known flags, or `ctx.flagByName("name")` (returns `?bool`, null when undeclared) for dynamic names.
+- **`ctx.setFlag` now writes a declared-flag override.** It writes the `flag:<name>` override key for a DECLARED flag and errors `error.UndeclaredFlag` otherwise (the typed, compile-checked form is `App.setFlag(ctx, .name, enabled)`). Previously it set an arbitrary `<name>` KV value.
+
+### Features
+
+- **Comptime feature-flag + experiment registry (#128/#129/#130).** Declare `.flags` (bare-bool default or `.{ .default, .description }`) and `.experiments` (`.{ .variants, .weights, .sticky, .description }`) in the `App(cfg)` literal. Malformed declarations (unknown sub-key, non-bool flag, variants/weights length mismatch, empty/duplicate variants, all-zero weights) are loud `@compileError`s.
+- **Typed, compile-checked accessors.** `App.flag(ctx, .name) bool`, `App.setFlag(ctx, .name, enabled) !void`, and `App.experiment(ctx, .name, subject) ![]const u8` — a typo'd flag/experiment name is a compile error (generated `App.Flag` / `App.Experiment` enums).
+- **Runtime resolution.** `ctx.flagByName(name) ?bool` (dynamic read), `ctx.flags().resolveAll(subject)` resolves every declared flag + experiment in a single batched `_kv` scan, and deterministic experiment bucketing (`FNV1a-64(name ++ 0x00 ++ subject)` over cumulative weights) gives a stable variant per `(name, subject)`. Per-flag overrides live in `_kv` under `flag:<name>`; experiment weight overrides under `exp:<name>:weights` (JSON).
+- Admin UI gains a **Feature Flags & Experiments** screen (`/_/#/features`) showing every declared flag (name, default, description, effective value) with a toggle to set/clear the `flag:<name>` override, and each declared experiment's variants with editable weight sliders that write the `exp:<name>:weights` override; a "Reset to declared" action clears the override. Superuser-only; backed by the new `GET /api/features` endpoint.
+- New `GET /api/features` endpoint (superuser) returns the comptime-declared flag + experiment registry alongside each entry's current `_kv` override — useful for custom admin tooling.
+- Feature exposure events: register `.onFeatureExposure` to receive an `ExposureEvent` (`{ kind: .flag | .experiment, name, subject, value, variant }`) each time a declared flag or experiment is resolved. The hook is notify-only and zero-cost when unregistered (the resolver never builds the event without a handler).
+- Realtime feature signal: any flag/experiment override change (`ctx.setFlag`/`App.setFlag` or an admin `PUT`/`DELETE` of a `flag:<name>` / `exp:<name>:weights` setting) broadcasts a signal-only `{"type":"features.changed"}` frame on the public `__features` channel. Clients may subscribe anonymously and re-`GET /api/state` on receipt; no per-subject state or experiment assignment is ever pushed over the socket.
+- **Public feature-state endpoint (#130).** `GET /api/state?subject=<id>` is an **unauthenticated**, read-only projection of resolved flags + experiments: `{ "flags": { "<name>": <bool>, … }, "experiments": { "<name>": "<variant>", … } }`. It exposes resolved values ONLY — never the `_kv` keys, defaults, weights, timestamps, or any superuser settings verb (those stay behind `requireSuperuser`). A `.sticky` experiment returns its persisted assignment here too (agreeing with `App.experiment`), resolved **reader-first** so a caller-supplied subject can't storm the writer lock. Auto-mounts at `/api/state`; configure with `.features = .{ .public_route = "/state" }` to remap or `.{ .public_route = .disabled }` to turn off.
+- **Typed `zb.flags.resolveAll(subject)` in the TypeScript SDK.** `zig build gen-client` now emits a fully-typed feature-state surface from your `App(.{ .flags, .experiments })`: flags as named `boolean`s and each experiment as a string-literal union of its declared variants (`FeatureState`). `await zb.flags.resolveAll("user-42")` calls `GET /api/state` and returns `{ flags: { … }, experiments: { … } }` with no `any`. Emitted only when flags/experiments are declared; the runtime-introspection tier omits it (no comptime metadata), matching typed routes and custom auth methods.
+- Sticky experiment assignments (#129): declare an experiment `.sticky = true` to persist a subject's first variant in `_experiment_assignments` so it **survives later weight changes** (new subjects still follow the current weights; empty subjects are never persisted). A framework-internal `_experiment_gc` job — installed only when a `.sticky` experiment is declared — reaps assignments older than the new `.experiment_assignment_ttl` config (in days, default `90`) hourly in bounded batches.
+
 ## [0.7.1] - 2026-06-28
 
 ### Features
