@@ -731,10 +731,30 @@ KV store (every endpoint requires a valid superuser token):
 | `PUT /api/settings/:key` | Upsert; body `{"value":"…"}`. |
 | `DELETE /api/settings/:key` | Remove; 204, or 404 if absent. |
 
-The embedded admin UI also exposes these endpoints as a "Settings / Feature Flags" section where superusers can view, create, edit, delete entries, and toggle boolean flags with a checkbox — no API client required.
+The embedded admin UI exposes these endpoints as a "Settings" section where superusers can view, create, edit, delete entries, and toggle boolean flags with a checkbox — no API client required.
 
 This is the management plane; the public read plane is whatever custom route you choose to
 expose (above).
+
+### Admin UI
+
+The embedded admin UI (`/_/`) has a dedicated **Feature Flags & Experiments** screen
+(`/_/#/features`) that exposes the comptime-declared registry to superusers without
+any API calls:
+
+- **Declared flags table** — every declared flag with its name, default, description,
+  current effective value, and source (override vs default). A checkbox sets or clears
+  the `flag:<name>` override; a **Use default** button appears when an override is active
+  and removes it on click.
+- **Declared experiments panel** — one card per experiment showing variants and weight
+  inputs. Edit the weights and click **Save weights** to write the `exp:<name>:weights`
+  override; **Reset to declared** deletes it. When no override is active the inputs show
+  the declared weights.
+
+The screen reads the declared registry via `GET /api/features` (superuser-only) and
+all mutations go through the existing `PUT`/`DELETE /api/settings/:key` verbs, so the
+raw **Settings** screen (also in the sidebar) shows the same override rows if you need
+lower-level inspection.
 
 ## 6. Auth / file / lifecycle events
 
