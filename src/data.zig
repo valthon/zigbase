@@ -163,6 +163,7 @@ pub const Data = struct {
         defer st.finalize();
         for (prefixes, 0..) |p, i| {
             const pat = try std.fmt.allocPrint(self.alloc, "{s}*", .{p});
+            defer self.alloc.free(pat); // bindText binds SQLITE_TRANSIENT (copies at bind time)
             try st.bindText(@intCast(i + 1), pat);
         }
 

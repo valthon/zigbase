@@ -652,7 +652,7 @@ const variant = try App.experiment(ctx, .checkout_layout, user_id); // []const u
 `App.flag` returns the `flag:<name>` override from the KV store if one is set, otherwise the
 declared default (so a default-ON kill switch stays on until an override sets `"false"`); it
 swallows read errors back to the default so a check never fails the request. `App.experiment`
-buckets `subject` deterministically over the weights (`FNV1a-64(name ++ subject)`), so the
+buckets `subject` deterministically over the weights (`FNV1a-64(name ++ 0x00 ++ subject)`), so the
 same `(name, subject)` always lands on the same variant; an empty subject maps to the first
 variant. A weight override in `_kv` under `exp:<name>:weights` (JSON, e.g. `[90,10]`) changes
 the split without a redeploy.
