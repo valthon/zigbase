@@ -263,12 +263,18 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
 }
 
 fn buildRateLimitOpt(comptime rl: anytype) schema.RateLimitOpt {
+    // The struct form `.{ .custom = .{ .max = …, .window_s = … } }`: an anonymous struct
+    // (NOT an enum/union), so `@tagName` would fail — match on the `custom` field instead.
+    if (@TypeOf(rl) != @TypeOf(.enum_literal)) {
+        if (@hasField(@TypeOf(rl), "custom")) {
+            const cv = rl.custom;
+            return .{ .custom = .{ .max = cv.max, .window_s = cv.window_s } };
+        }
+        return .default;
+    }
+    // The enum-literal form `.default` / `.off`.
     const tag = @tagName(rl);
     if (std.mem.eql(u8, tag, "off")) return .off;
-    if (std.mem.eql(u8, tag, "custom")) {
-        const cv = rl.custom;
-        return .{ .custom = .{ .max = cv.max, .window_s = cv.window_s } };
-    }
     return .default;
 }
 
@@ -1453,6 +1459,23 @@ test "buildCollection lowers .auth.methods into collection options" {
     try std.testing.expectEqualStrings("accounts", accounts.name);
     try std.testing.expect(accounts.options.auth.methods.magic_link != null);
     try std.testing.expect(accounts.options.auth.methods.password == null);
+}
+
+test "buildCollection lowers a per-method comptime rate_limit (.default and .{ .custom })" {
+    const specs = comptime buildCollections(.{
+        .accounts = .{ .type = .auth, .fields = .{}, .auth = .{ .methods = .{
+            // The struct form must lower without `@tagName`-on-a-struct failing.
+            .magic_link = .{ .rate_limit = .{ .custom = .{ .max = 5, .window_s = 60 } } },
+            // The enum-literal form coexists.
+            .otp = .{ .rate_limit = .off },
+        } } },
+    });
+    const ml = specs[0].options.auth.methods.magic_link.?;
+    try std.testing.expect(ml.rate_limit == .custom);
+    try std.testing.expectEqual(@as(u32, 5), ml.rate_limit.custom.max);
+    try std.testing.expectEqual(@as(i64, 60), ml.rate_limit.custom.window_s);
+    const otp = specs[0].options.auth.methods.otp.?;
+    try std.testing.expect(otp.rate_limit == .off);
 }
 
 test "buildCollection plumbs magic_link redirect_default/redirect_allow" {

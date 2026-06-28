@@ -19,6 +19,9 @@ pub const Section = struct {
 /// Ordered ":segment" names (colon stripped) from a path.
 pub fn pathParams(comptime path: []const u8) []const []const u8 {
     comptime {
+        // A larger route table (e.g. golfsim's) accumulates comptime branches across the
+        // shared evaluation; raise the per-evaluation quota above the default 1000.
+        @setEvalBranchQuota(10_000);
         var out: []const []const u8 = &.{};
         var it = std.mem.tokenizeScalar(u8, path, '/');
         while (it.next()) |seg| {
