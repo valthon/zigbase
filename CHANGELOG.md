@@ -6,6 +6,173 @@ All notable changes to ZigBase are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-28
+
+### Breaking
+
+- Custom handler/hook/job signatures now receive a unified per-request `*Ctx`:
+  - Untyped routes are `fn(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response` (was `fn(*RouteEvent)`).
+  - Record hooks are `fn(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void` (was one-arg `fn(*RecordEvent)`).
+  - Jobs are `fn(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void` (was one-arg `fn(*JobEvent)`).
+  - Lifecycle hooks are `fn(ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void`.
+  - Typed routes keep `fn(req: *zigbase.Req(In)) zigbase.RouteError!Out`, but reach capabilities via `req.ctx` (`req.ctx.records()`, `req.ctx.http()`, `req.ctx.arena`, `req.ctx.app`).
+- DB access is now uniform through the `Ctx` capability object: `ctx.records()` (list/get/create/update/delete), `ctx.tx()` (atomic writes), and `ctx.http()` (outbound client). In a `before*` hook, `ctx.records()` is bound to the triggering write's in-transaction connection, so a side-write commits/rolls back atomically with it.
+- Removed `RecordEvent.data`, `JobEvent.reader()`/`JobEvent.writer()`, `ev.caps()`, and the public `zigbase.Data` re-export. Migrate hook/job DB access to `ctx.records()`; for raw SQL on a migration-owned table use the pooled writer via `ctx.app.pool.acquireWriter()`.
+
+### Features
+
+- `ctx.tx(T, fn)` runs several record writes in one atomic transaction — all
+  commit, or all roll back on any returned error. The callback receives a `*Tx`
+  whose `t.records()` exposes the full `Records` API; all writes share the
+  in-transaction connection with no deadlock. Nesting is rejected immediately
+  (`error.NestedTransaction`).
+- Admin UI now includes a "Settings / Feature Flags" section (`#/settings`) where
+  superusers can list, create, edit, and delete KV entries, and toggle boolean feature
+  flags with a checkbox — backed by the existing `/api/settings` REST surface.
+- Auth lifecycle hooks (#98): a new `.auth` config group adds **before/after** hooks for
+  `register`, `logout`, `refresh`, and `password-change`, extending the Theme D
+  `beforeAuthSuccess` discipline into a uniform lifecycle. Before-hooks run with a `*Ctx`
+  bound to the action's connection (in-transaction for register / refresh /
+  password-change), so `ctx.records()` writes commit atomically with the action; returning
+  an error aborts and fails closed (rolling back where a write transaction exists — e.g. an
+  aborting `beforePasswordChange` leaves the password unchanged and the reset token
+  un-consumed, an aborting `beforeRegister` creates no account). After-hooks are notify-only.
+  Hooks fire on `register` (auth-collection record create), `POST …/auth-logout`,
+  `POST …/auth-refresh`, and `POST …/confirm-password-reset`. A typo'd hook name or a
+  wrong-typed handler is a compile error. The existing `beforeAuthSuccess` and `onAuth`
+  hooks are unchanged.
+- Handler/hook/job capability object: handlers, hooks, and jobs now receive a
+  `*Ctx` directly, exposing `ctx.records()` (filtered/sorted/paginated list +
+  get/create/update/delete, with `expand`/relations), an outbound `ctx.http()`
+  client, and a standard error model (`ctx.fail`/`ctx.invalid`, error→status
+  mapping over the existing `{code,message,data}` envelope). Custom handlers no
+  longer need to drop to raw SQL or vendor an HTTP stack.
+- **Encryption key rotation** — at-rest field encryption now supports a primary (write) key plus older read-only key generations. The primary key is `ZIGBASE_FIELD_KEY` at generation `ZIGBASE_FIELD_KEY_GENERATION` (default 1, = the `v<N>:` envelope version written); older generations are supplied via `ZIGBASE_FIELD_KEY_V<n>`. Writes use the primary generation; reads dispatch on each value's envelope version. The single-key default is unchanged and fully backward compatible.
+- **`zigbase rewrap` command** — re-encrypts every `.encrypted` field across all collections under the primary key, and migrates legacy plaintext into ciphertext (the supported way to enable `.encrypted` on a column that already holds plaintext). Idempotent, transactional per collection, with `--dry-run`.
+- **`ZIGBASE_FAKE_NOW` now also freezes `CURRENT_TIMESTAMP` and column DEFAULTs.** The dev-only test clock previously froze the framework's own timestamps and a consumer's raw `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')`, but the SQL keywords `CURRENT_TIMESTAMP` / `CURRENT_TIME` / `CURRENT_DATE` and column `DEFAULT CURRENT_TIMESTAMP` still read the OS clock (they go through SQLite's VFS, not the SQL-function layer). On dev builds, connections now open against a wrapping VFS — a byte-for-byte copy of the default VFS with only its current-time hooks overridden — so those keywords and defaults honor the frozen instant too, making tables with timestamp defaults deterministically snapshot-testable. All file I/O still delegates to the genuine OS VFS unchanged, and the wrapper is compiled out entirely on a production build (`-Ddev-clock=false`).
+- **Seeded entropy for deterministic IDs/tokens in test mode (`ZIGBASE_FAKE_SEED`)** — set `ZIGBASE_FAKE_SEED` to a decimal `u64` on a dev build to make record/field ID and token key generation reproducible across runs with the same seed, enabling stable snapshot tests. Gated by the same `dev_clock` build option as `ZIGBASE_FAKE_NOW`: compiled out on production builds, so a production binary always uses the OS CSPRNG and cannot be seeded. Closes #95.
+- Expired-session garbage collection for `.session_store = .table` (#114). Enabling the
+  table-mode session store now auto-installs a framework-internal recurring job that deletes
+  expired `_sessions` rows in bounded batches on the writer — no opt-in required. The default
+  cadence is hourly; override it with `App(.{ .session_store = .table, .session_gc_cron = "…" })`
+  (UTC, minute-granularity cron syntax). Nothing is installed in the default `.epoch` mode (no
+  job, no timer — the zero-overhead guarantee is preserved).
+- Session management verbs on `ctx.auth()` (#99): `revokeAllSessions()` ("log out
+  everywhere"), `refresh()` (sliding re-mint, other sessions stay valid), and `rotate()`
+  (bump + re-mint, keep this session and kill every other). Free-function forms
+  `zigbase.auth.revokeAllSessions/refresh/rotate(ctx)`. Sessions remain stateless JWTs but
+  are now **revocable** via a per-auth-record token epoch (the default
+  `App(.{ .session_store = .epoch })` model) — **no extra query on either the verify hot path
+  or login**: the epoch is folded into the single `tokenKey` SELECT each already performs.
+  Existing valid tokens keep working: tokens minted before the epoch existed and freshly
+  created records both read as epoch 0.
+- New comptime config key `.session_store` (`.epoch` default, or `.table`). The `.table`
+  variant adds a server-side `_sessions` store for full **per-device** management:
+  `ctx.auth().listActiveSessions()` (with `is_current`) and `ctx.auth().revoke(sessionId)`
+  ("log out THIS device", owner-or-superuser authorized). In table mode each token carries an
+  opaque `sid` and verification additionally requires a live (unexpired) session row — one
+  extra indexed read per authenticated request. `.epoch` stays the default and is unchanged:
+  **zero extra DB work, and enabling `.table` does not alter the `.epoch`-mode token shape**
+  (the `sid` claim is simply omitted when absent). In `.epoch` mode the per-device verbs
+  return `error.SessionStoreNotEnabled`.
+- **Field/collection policy pipeline** — a value-transform seam at the records read/write path, applied transparently with the field schema in hand. Its first behavior ships below.
+- **Transparent at-rest field encryption** — mark a `text`/`editor`/`json` field `.encrypted = true` to store it encrypted (AES-256-GCM) in SQLite while handlers, the records API, and HTTP responses see plaintext. Encrypted fields cannot be indexed, marked `.unique`, or used in a `?filter`/`?sort` (compile error / 400). Key rotation is designed into the versioned `v<N>:` envelope.
+- **TTL records.** A collection may declare `.ttl_field = "<field>"` naming an existing `date`/`autodate` field as the row's expiry timestamp. A framework-internal GC reaps expired rows automatically — once at startup and then on a 5-minute interval — across every TTL-enabled collection. Opt-in and additive; collections without `.ttl_field` are untouched.
+- **Framework-internal scheduled jobs.** Added an internal scheduled-job mechanism (`scheduler.concatJobs`) so the framework can run its own jobs (such as the new `_ttl_gc` sweep) alongside consumer `.cron` jobs. The scheduler now starts whenever a TTL collection is declared, even with no user cron configured.
+- Built-in key→value/settings store (#87): `ctx.kv().get/set/delete` (and the curated `data.kvGet`/`kvSet`/`kvDelete`/`kvList`) over a new internal `_kv` table — small server-managed values with no collection, schema, or access rules. Superuser-managed and not public by default.
+- Typed feature flags (#88): `ctx.flag(name) -> bool` and `ctx.setFlag(name, enabled)`, a typed boolean view over the same KV store (`"true"`/`"1"` truthy, unset = false).
+- Superuser-only settings HTTP API: `GET /api/settings`, `GET/PUT/DELETE /api/settings/:key` for managing KV/settings values.
+- The `ZIGBASE_FAKE_NOW` dev test clock now also freezes a **consumer's own raw SQL**
+  `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')` (and `date`/`time`/
+  `julianday`, including their zero-argument implicit-`'now'` forms). SQLite's date/time
+  builtins are shadowed on every reader and writer connection so they resolve to the frozen
+  instant, while explicit datetimes and modifiers (`'+1 day'`, the `strftime` format string)
+  pass through to genuine SQLite. This makes e2e/snapshot tests of consumer routes that use
+  raw time SQL fully deterministic (#84). Like the rest of the test clock it is **compiled
+  out of production builds** (`dev_clock` build option; off in any release build) — a prod
+  binary is byte-for-byte unaffected and never reads the env var.
+- **Dev-only test-mode capture for outbound mail + HTTP (`zigbase.testcapture`)** — for
+  deterministic e2e/integration tests, the framework can now capture what it *sent* and
+  inject canned responses: an in-memory mail **outbox** (`testcapture.mail`) records every
+  `Mailer.send` (from/to/subject/body, optionally suppressing real delivery), and an HTTP
+  **capture/mock** seam (`testcapture.http`) records every outbound `ctx.http()` call and
+  returns canned responses matched by URL substring — with no network — mirroring the OAuth
+  `Transport` injection. Tests read/assert the captures via a small API (`mail.count/get/
+  find`, `http.mock/requestAt/requests`). Like the test clock, it shares the **same comptime
+  gate** (`dev_clock` build option; on in `Debug`, off in any release build): on a production
+  build `testcapture.enabled` is `comptime false`, both seams fold away, and the binary is
+  byte-for-byte unaffected with no runtime branch or perf cost (#96).
+- Auth lifecycle hook `beforeAuthSuccess` (#80): a writable, transactional, abortable hook
+  that runs after credentials/token verification and **before** the session is issued, with
+  a `*Ctx` bound to the login's in-transaction writer. Its `ctx.records()` writes commit
+  atomically with the login; returning an error rolls them back (and, for magic-link,
+  un-consumes the link token) and blocks the session (fail closed). Fires on the unified
+  `POST /api/collections/:col/auth/:method/complete` endpoint (password / otp / webauthn /
+  oauth2 / custom) and the magic-link `consume` link. The existing notify-only `onAuth` is
+  unchanged and still fires once, after issuance. Motivating use case: claim anonymous
+  records on a user's first login.
+- Session management surface `ctx.auth()` with `clearSession` (#86): `ctx.auth().clearSession()`
+  and `zigbase.auth.clearSession(ctx)` return the cleared `zb_auth`/`zb_csrf` cookies built
+  from the framework's own cookie policy, so a logout handler is one line and can never drift
+  from the built-in logout.
+- TTL collections (`.ttl_field`) now exclude expired rows from **every read** (list, get, expand, `ctx.records()`). The predicate is ANDed with any filter, access rule, and keyset cursor automatically — no manual `expires_at > @now` filter needed. Semantics match the GC: `NULL` ttl = never expired; unparseable ttl = fail-safe visible; non-canonical date forms (offsets, space separator, date-only) compared correctly as instants via `strftime`.
+- Typed TypeScript client for built-in auth methods: `zig build gen-client` now emits
+  precise input/result types for the `client.auth.<collection>.<method>.initiate/complete`
+  surface of the three built-in non-password methods, replacing the previous untyped
+  `Record<string, unknown>` / `unknown` stubs. `magic_link` initiate takes `{ identity }`
+  and resolves `void` (204); `otp` initiate takes `{ identity }` (→ `void`) and complete
+  takes `{ identity, code }`; `webauthn` initiate takes `{ identity? }` and resolves
+  `{ challenge, rpId, ceremonyId, timeout }`, complete takes
+  `{ ceremonyId, credentialId, authenticatorData, clientDataJSON, signature }`. Every
+  built-in `complete` resolves to `{ token }` (`AuthMethodResult`). Custom methods
+  (`.custom` slugs) remain on the untyped stubs for now (a typed-I/O declaration API for
+  custom methods is a planned follow-up).
+
+### Fixes
+
+- `before*` record hooks now run INSIDE the triggering write's transaction on the
+  HTTP create/update/delete path. A before-hook's own `ctx.records()` side-writes
+  and the primary row write now commit atomically, and a before-hook that returns
+  an error — or a denied access-rule guard — rolls the whole transaction back, so
+  a rejected write persists nothing (fail closed). Previously a before-hook
+  side-write committed independently, before the triggering write.
+- `ctx.records()` now allocates its results on a per-invocation arena instead of
+  the long-lived process allocator. This fixes a heap leak that grew per request
+  on routes and unboundedly for per-minute cron jobs. Route results live on the
+  request arena; job, `App.submit`, and lifecycle-hook results live on a
+  per-invocation arena freed when the invocation ends. No API change.
+- **Unknown collection/field keys now fail the build.** A typo'd key in a comptime `.collections` spec — collection-level (e.g. `.ttl_filed`), under `.rules`/`.auth` (e.g. `.viewRul`), or on a field (e.g. `.requied`, `.encrypte`) — was silently ignored; it is now a `@compileError` that lists the recognized keys for that spec.
+- `onError` / Sentry integration now fires only for server-side (5xx) errors; client errors (4xx) no longer trigger the error handler or Sentry reports.
+- Auth methods configured with a custom `rate_limit` (`.{ .custom = .{ .max, .window_s } }`) now actually honor that `max`/`window_s` instead of silently falling back to the global limiter. Each method gets a dedicated bucket scoped by collection + method slug (keyed on the same IP/identity subject as the global limiter), so distinct methods and collections never share a budget, and a custom limit applies even when the global limiter is disabled (`ZIGBASE_RATE_LIMIT_MAX=0`).
+- Uploaded files are now cleaned up when a record update fails validation, preventing orphaned files from accumulating in storage.
+
+### Performance
+
+- Skipped a redundant buffer duplication on the non-encrypted JSON field read path, reducing per-request allocations for records with JSON fields.
+
+### Security
+
+- Each key generation derives an independent AES-256 key via domain-separated HKDF (`zigbase-field-encryption-v<n>`), so generations never share key material; generation 1 keeps the original domain for backward compatibility. Reads remain strict and fail-closed: a value whose envelope version has no configured key (unknown/missing generation), a wrong key, or a tampered/malformed value never yields plaintext. `rewrap` is fail-closed too — a cell it cannot decrypt aborts the run with the offending row reported and that collection's transaction rolled back, so no data is lost. Rotation keys come only from the environment and are never persisted or logged.
+- **Startup now fails closed for runtime-created encrypted fields.** A server with an `.encrypted` field added at runtime (via the collections API while a key was set) would previously start on a later restart *without* `ZIGBASE_FIELD_KEY`. Startup now scans the live database schema after provisioning and refuses to start (`error.FieldKeyRequired`) if any DB-resident collection declares an encrypted field while no key is configured — matching the existing comptime guard. (The value layer already failed closed on read/write, so plaintext never leaked; this just turns a silently half-broken server into a loud refusal.)
+- Outstanding session tokens can now be invalidated server-side before they expire. A
+  bumped token epoch causes verification to reject every prior `.auth` token for that
+  principal (fail closed — the epoch is trusted only after signature verification). Use it
+  on password change, suspected compromise, or an explicit "sign out of all devices".
+- With `.session_store = .table`, a revoked or expired per-device session is rejected at
+  verify time (fail closed), and per-session `revoke` is authorized to the owning user or a
+  superuser (a user cannot revoke another user's session).
+- Field encryption uses an authenticated AES-256-GCM envelope (`v1:` + base64url(nonce‖ciphertext‖tag)) with a fresh per-write nonce, sharing one audited primitive with OAuth-secret encryption via domain-separated key derivation. The key comes only from `ZIGBASE_FIELD_KEY` (HKDF-derived, never persisted or logged); the server refuses to start if an `.encrypted` field is declared without it. Reads are strict and fail-closed: a non-envelope (legacy plaintext), wrong key, or tampered value never yields plaintext.
+
+### Internal
+
+- Remove the deferred legacy `app`/`arena` fields from `Req(Input)` in `route_types.zig`
+  (Theme A cleanup: examples/blog and examples/golfsim both already read `req.ctx.arena` /
+  `req.ctx.app`; the fields were never needed and the migration comment is now moot).
+- Update the stale `AuthApi` doc comment in `ctx.zig` that called `refresh`, `rotate`,
+  `listActiveSessions`, and `revoke` "deferred" — all four were shipped in PRs #111/#112
+  (session management, Variant B); the comment now documents the full surface including
+  the `session_store = .table` requirement for per-device verbs.
+
 ## [0.6.0] - 2026-06-23
 
 ### Features
