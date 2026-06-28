@@ -152,11 +152,21 @@ pub const Ctx = struct {
     /// weights, then deterministic bucketing. Used by the typed `App.experiment`
     /// accessor.
     pub fn resolveDeclaredExperiment(self: *Ctx, def: features.ExperimentDef, subject: []const u8) ![]const u8 {
-        const conn = try self.connForRead();
-        const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena };
         const key = try std.fmt.allocPrint(self.arena, "exp:{s}:weights", .{def.name});
+        // A sticky experiment with a non-empty subject persists its first assignment, so
+        // the miss path INSERTs — it needs the writer. Non-sticky resolution (and an empty
+        // subject, which is never persisted) stays read-only. Reuse the bound writer inside
+        // a `ctx.tx`; otherwise acquire it just for this resolve.
+        const sticky = def.sticky and subject.len > 0;
+        const need_writer = sticky and self.bound_conn == null;
+        const conn = if (sticky)
+            (self.bound_conn orelse self.app.pool.acquireWriter())
+        else
+            try self.connForRead();
+        defer if (need_writer) self.app.pool.releaseWriter();
+        const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena };
         const ov = try data.kvGet(key);
-        return features_resolver.resolveExperiment(self.arena, ov, def, subject);
+        return features_resolver.resolveExperiment(self.arena, if (sticky) conn else null, ov, def, subject);
     }
 
     /// Write a `flag:<name>` override (`"true"`/`"false"`) into `_kv`. Used by the
@@ -960,6 +970,38 @@ test "ctx.setFlag works inside ctx.tx (bound_conn path)" {
     try ctx.tx(void, txnSetFlag);
     // committed and visible after the transaction.
     try std.testing.expect(ctx.flagByName("intx").?);
+}
+
+test "#129 ctx sticky experiment persists + survives a weight change (writer path)" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    env.app.features = &flag_test_registry;
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    const sticky_def = features.ExperimentDef{
+        .name = "checkout_layout",
+        .variants = &.{ "control", "compact" },
+        .weights = &.{ 50, 50 },
+        .sticky = true,
+    };
+
+    // First resolve persists the assignment (acquires the writer internally).
+    const first = try ctx.resolveDeclaredExperiment(sticky_def, "user-42");
+
+    // A weight override that would force the OTHER variant must not move the subject.
+    const opposite = if (std.mem.eql(u8, first, "control")) "[0,100]" else "[100,0]";
+    try ctx.kv().set("exp:checkout_layout:weights", opposite);
+    const after = try ctx.resolveDeclaredExperiment(sticky_def, "user-42");
+    try std.testing.expectEqualStrings(first, after);
+
+    // An empty subject still resolves (variant 0) and is never persisted.
+    try std.testing.expectEqualStrings("control", try ctx.resolveDeclaredExperiment(sticky_def, ""));
+    const conn = try ctx.connForRead();
+    var st = try conn.prepare("SELECT COUNT(*) FROM \"_experiment_assignments\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
 }
 
 test "ctx.http() returns a client bound to the ctx arena and io" {

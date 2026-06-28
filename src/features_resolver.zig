@@ -10,11 +10,14 @@
 //!   - `flag:<name>`         = `"true"` / `"false"` (a per-flag override)
 //!   - `exp:<name>:weights`  = JSON array, e.g. `[90,10]` (a weight override)
 //!
-//! PR1 resolves experiments by PURE deterministic hash only. Sticky persistence
-//! (the `.sticky` flag → `_experiment_assignments`) arrives in PR2.
+//! Experiments resolve by PURE deterministic hash by default. An experiment declared
+//! `.sticky = true` instead PERSISTS its first assignment in `_experiment_assignments`
+//! (keyed by `(experiment, subject)`) so the variant SURVIVES later weight changes
+//! (#129) — `resolveExperiment` reads/writes that row when handed a writer connection.
 
 const std = @import("std");
 const features = @import("features.zig");
+const db = @import("db.zig");
 
 pub const FlagDef = features.FlagDef;
 pub const ExperimentDef = features.ExperimentDef;
@@ -81,11 +84,17 @@ fn parseWeightOverride(alloc: std.mem.Allocator, json: []const u8, expect_len: u
 }
 
 /// Resolve an experiment to a variant. `override_weights_json` (the `exp:<name>:weights`
-/// value, or null) replaces the declared weights when valid. Resolution is a pure hash
-/// bucket (PR1 — no sticky storage). The returned slice is one of `def.variants`
-/// (static), so it outlives `alloc`.
+/// value, or null) replaces the declared weights when valid. The returned slice is one
+/// of `def.variants` (static), so it outlives `alloc`.
+///
+/// Resolution is a pure deterministic hash bucket UNLESS the experiment is `.sticky` and
+/// a non-empty `subject` and a (writer) `conn` are supplied — then the first assignment
+/// is persisted in `_experiment_assignments` and re-read on subsequent resolves, so the
+/// variant SURVIVES a later weight change (#129). Passing `conn == null` (or an empty
+/// subject) always takes the pure path; an empty subject is never persisted.
 pub fn resolveExperiment(
     alloc: std.mem.Allocator,
+    conn: ?*db.Db,
     override_weights_json: ?[]const u8,
     def: ExperimentDef,
     subject: []const u8,
@@ -104,8 +113,91 @@ pub fn resolveExperiment(
         }
         break :blk def.weights;
     };
+
+    // Sticky: a previously-stored assignment wins over a fresh bucket, so the variant
+    // is stable across weight changes. Needs a writer (the miss path INSERTs). An empty
+    // subject always maps to variant 0 and is never persisted.
+    if (def.sticky and subject.len > 0) {
+        if (conn) |c| return stickyVariant(c, def, subject, weights);
+    }
+
     const idx = bucket(def.name, subject, weights);
     return def.variants[idx];
+}
+
+/// Sticky resolution against `_experiment_assignments`. On a hit, return the STORED
+/// variant (mapped back to the static `def.variants` slice so it outlives the row
+/// buffer). On a miss, `bucket` + `INSERT OR IGNORE` the assignment, then return the
+/// freshly-computed variant. Requires the WRITER connection (the single-writer model
+/// means the read+insert pair is exclusive, so the computed variant is what is stored).
+/// SQLITE_TRANSIENT copies the bound subject/variant text at bind time. A stored variant
+/// that is no longer declared (the variant set changed) is ignored and recomputed.
+fn stickyVariant(conn: *db.Db, def: ExperimentDef, subject: []const u8, weights: []const u16) ![]const u8 {
+    {
+        var st = try conn.prepare(
+            \\SELECT "variant" FROM "_experiment_assignments"
+            \\ WHERE "experiment" = ?1 AND "subject" = ?2;
+        );
+        defer st.finalize();
+        try st.bindText(1, def.name);
+        try st.bindText(2, subject);
+        if (try st.step()) {
+            const stored = st.columnText(0);
+            for (def.variants) |v| {
+                if (std.mem.eql(u8, v, stored)) return v;
+            }
+            // Stored variant no longer declared → fall through and recompute.
+        }
+    }
+
+    const idx = bucket(def.name, subject, weights);
+    const variant = def.variants[idx];
+    var ins = try conn.prepare(
+        \\INSERT OR IGNORE INTO "_experiment_assignments" ("experiment","subject","variant","created")
+        \\ VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ','now'));
+    );
+    defer ins.finalize();
+    try ins.bindText(1, def.name);
+    try ins.bindText(2, subject);
+    try ins.bindText(3, variant);
+    _ = try ins.step();
+    return variant;
+}
+
+/// Batch size for the sticky-assignment GC sweep: bound each DELETE so a large backlog
+/// never holds the single writer for one long statement (mirrors `session_gc_batch`).
+pub const assignment_gc_batch: usize = 1000;
+
+/// Garbage-collect `_experiment_assignments` rows older than `ttl_days`, in bounded
+/// batches (mirrors `gcExpiredSessions`). Each batch is its own autocommit
+/// `DELETE … RETURNING`, so the writer is never held across the whole sweep. The cutoff
+/// is `strftime(…, 'now', '-<ttl_days> days')`; both sides are normalized via strftime so
+/// a non-canonical `created` compares correctly and an unparseable one (strftime → NULL)
+/// is kept (fail-safe). Returns the total rows deleted. Writer required.
+pub fn gcExpiredAssignments(conn: *db.Db, ttl_days: u32) !usize {
+    var buf: [32]u8 = undefined;
+    // "-<u32> days" is at most "-4294967295 days" (16 chars) — never overflows buf.
+    const modifier = std.fmt.bufPrint(&buf, "-{d} days", .{ttl_days}) catch unreachable;
+    var total: usize = 0;
+    while (true) {
+        var st = try conn.prepare(comptime std.fmt.comptimePrint(
+            \\DELETE FROM "_experiment_assignments"
+            \\ WHERE rowid IN (
+            \\   SELECT rowid FROM "_experiment_assignments"
+            \\    WHERE strftime('%Y-%m-%dT%H:%M:%SZ', "created") IS NOT NULL
+            \\      AND strftime('%Y-%m-%dT%H:%M:%SZ', "created") <= strftime('%Y-%m-%dT%H:%M:%SZ','now',?1)
+            \\    LIMIT {d}
+            \\ )
+            \\ RETURNING "experiment";
+        , .{assignment_gc_batch}));
+        defer st.finalize();
+        try st.bindText(1, modifier);
+        var batch: usize = 0;
+        while (try st.step()) batch += 1;
+        total += batch;
+        if (batch < assignment_gc_batch) break; // partial (or zero) batch → done
+    }
+    return total;
 }
 
 /// Resolve every declared flag and experiment for `subject` from a single batched
@@ -142,7 +234,11 @@ pub fn resolveAll(
                 break;
             }
         }
-        exps_out[i] = .{ .name = def.name, .variant = try resolveExperiment(alloc, ov, def, subject) };
+        // The batch projection resolves by pure hash (conn == null). The sticky read/
+        // write path runs only through the single-experiment `App.experiment` accessor,
+        // which hands a writer connection; the public `/api/state` projection threads
+        // its own connection in a later PR.
+        exps_out[i] = .{ .name = def.name, .variant = try resolveExperiment(alloc, null, ov, def, subject) };
     }
 
     return .{ .flags = flags_out, .experiments = exps_out };
@@ -218,8 +314,8 @@ test "weight override changes the split" {
     var buf: [32]u8 = undefined;
     while (i < 1000) : (i += 1) {
         const subj = std.fmt.bufPrint(&buf, "u{d}", .{i}) catch unreachable;
-        if (std.mem.eql(u8, try resolveExperiment(a, null, def, subj), "control")) control_default += 1;
-        if (std.mem.eql(u8, try resolveExperiment(a, "[100,0]", def, subj), "control")) control_override += 1;
+        if (std.mem.eql(u8, try resolveExperiment(a, null, null, def, subj), "control")) control_default += 1;
+        if (std.mem.eql(u8, try resolveExperiment(a, null, "[100,0]", def, subj), "control")) control_override += 1;
     }
     // 50/50 ≈ half control; the [100,0] override forces ALL to control.
     try std.testing.expect(control_default < 1000);
@@ -236,9 +332,9 @@ test "resolveExperiment falls back to declared weights on a bad override" {
     defer arena.deinit();
     const a = arena.allocator();
     // Malformed / wrong-length / all-zero overrides all fall back to declared.
-    try std.testing.expectEqualStrings("control", try resolveExperiment(a, "not json", def, "x"));
-    try std.testing.expectEqualStrings("control", try resolveExperiment(a, "[1,2,3]", def, "x"));
-    try std.testing.expectEqualStrings("control", try resolveExperiment(a, "[0,0]", def, "x"));
+    try std.testing.expectEqualStrings("control", try resolveExperiment(a, null, "not json", def, "x"));
+    try std.testing.expectEqualStrings("control", try resolveExperiment(a, null, "[1,2,3]", def, "x"));
+    try std.testing.expectEqualStrings("control", try resolveExperiment(a, null, "[0,0]", def, "x"));
 }
 
 test "resolveAll returns every declared flag + experiment via the batched scan" {
@@ -272,4 +368,135 @@ test "resolveAll returns every declared flag + experiment via the batched scan" 
     try std.testing.expectEqual(@as(usize, 1), resolved.experiments.len);
     try std.testing.expectEqualStrings("layout", resolved.experiments[0].name);
     try std.testing.expectEqualStrings("compact", resolved.experiments[0].variant);
+}
+
+// ---------------------------------------------------------------------------
+// Sticky-assignment tests (#129) — exercise the real `_experiment_assignments`
+// table on an in-memory db.
+// ---------------------------------------------------------------------------
+
+const assignments_ddl =
+    \\CREATE TABLE "_experiment_assignments" (
+    \\  "experiment" TEXT NOT NULL,
+    \\  "subject" TEXT NOT NULL,
+    \\  "variant" TEXT NOT NULL,
+    \\  "created" TEXT NOT NULL,
+    \\  PRIMARY KEY ("experiment","subject")
+    \\);
+;
+
+test "sticky experiment SURVIVES a weight change (#129)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(assignments_ddl);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const def = ExperimentDef{
+        .name = "checkout_layout",
+        .variants = &.{ "control", "compact" },
+        .weights = &.{ 50, 50 },
+        .sticky = true,
+    };
+
+    // First resolve under the declared 50/50 weights persists an assignment.
+    const first = try resolveExperiment(a, &d, null, def, "user-42");
+
+    // A later weight override that would otherwise force EVERYONE to the other
+    // variant must NOT move an already-assigned subject.
+    const opposite = if (std.mem.eql(u8, first, "control")) "[0,100]" else "[100,0]";
+    const after = try resolveExperiment(a, &d, opposite, def, "user-42");
+    try std.testing.expectEqualStrings(first, after);
+
+    // And a brand-new subject under the override DOES follow the new weights.
+    const newcomer = try resolveExperiment(a, &d, opposite, def, "newcomer-1");
+    const forced = if (std.mem.eql(u8, first, "control")) "compact" else "control";
+    try std.testing.expectEqualStrings(forced, newcomer);
+
+    // Exactly one row for the sticky subject was persisted.
+    var st = try d.prepare("SELECT COUNT(*) FROM \"_experiment_assignments\" WHERE \"subject\" = ?1;");
+    defer st.finalize();
+    try st.bindText(1, "user-42");
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
+}
+
+test "non-sticky experiment FOLLOWS the new weights (no persistence)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(assignments_ddl);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const def = ExperimentDef{
+        .name = "layout",
+        .variants = &.{ "control", "compact" },
+        .weights = &.{ 50, 50 },
+        .sticky = false,
+    };
+
+    // Even with a writer connection, a non-sticky experiment ignores the table and
+    // honors the override on every resolve.
+    try std.testing.expectEqualStrings("control", try resolveExperiment(a, &d, "[100,0]", def, "user-42"));
+    try std.testing.expectEqualStrings("compact", try resolveExperiment(a, &d, "[0,100]", def, "user-42"));
+
+    // Nothing was persisted.
+    var st = try d.prepare("SELECT COUNT(*) FROM \"_experiment_assignments\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "sticky never persists an empty-subject assignment" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(assignments_ddl);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const def = ExperimentDef{
+        .name = "layout",
+        .variants = &.{ "control", "compact" },
+        .weights = &.{ 50, 50 },
+        .sticky = true,
+    };
+
+    // Empty subject → variant 0, and NO row is written.
+    try std.testing.expectEqualStrings("control", try resolveExperiment(a, &d, null, def, ""));
+    var st = try d.prepare("SELECT COUNT(*) FROM \"_experiment_assignments\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "gcExpiredAssignments reaps rows older than the TTL and keeps newer ones" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(assignments_ddl);
+
+    // One ancient row (well past any TTL) and one fresh row (created now).
+    try d.exec(
+        \\INSERT INTO "_experiment_assignments" ("experiment","subject","variant","created")
+        \\ VALUES ('layout','old','control','2000-01-01T00:00:00Z');
+    );
+    try d.exec(
+        \\INSERT INTO "_experiment_assignments" ("experiment","subject","variant","created")
+        \\ VALUES ('layout','new','compact', strftime('%Y-%m-%dT%H:%M:%SZ','now'));
+    );
+
+    // TTL 90 days → the 2000 row is reaped, the fresh one survives.
+    const reaped = try gcExpiredAssignments(&d, 90);
+    try std.testing.expectEqual(@as(usize, 1), reaped);
+
+    var st = try d.prepare("SELECT \"subject\" FROM \"_experiment_assignments\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("new", st.columnText(0));
+    try std.testing.expect(!try st.step()); // exactly one row left
 }

@@ -226,6 +226,26 @@ fn init_0011_sessions(w: *db.Db) db.DbError!void {
     try w.exec("CREATE INDEX IF NOT EXISTS \"idx_sessions_expires\" ON \"_sessions\" (\"expires\");");
 }
 
+fn init_0012_experiment_assignments(w: *db.Db) db.DbError!void {
+    // Sticky experiment assignments (#129): one row per (experiment, subject) persists
+    // the FIRST variant the subject was bucketed into, so a later weight change never
+    // re-buckets an already-assigned subject (the survive-weight-change guarantee).
+    // Populated only for experiments declared `.sticky = true`; pure-hash experiments
+    // never touch this table. `created` is an ISO-8601 UTC string (matches the records
+    // autodate format); the index on it lets the comptime-gated `_experiment_gc` job
+    // reap rows older than `.experiment_assignment_ttl` in bounded batches.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_experiment_assignments" (
+        \\  "experiment" TEXT NOT NULL,
+        \\  "subject" TEXT NOT NULL,
+        \\  "variant" TEXT NOT NULL,
+        \\  "created" TEXT NOT NULL,
+        \\  PRIMARY KEY ("experiment","subject")
+        \\);
+    );
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_experiment_assignments_created\" ON \"_experiment_assignments\" (\"created\");");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -238,6 +258,7 @@ pub const all = [_]Migration{
     .{ .name = "0009_kv", .up = init_0009_kv },
     .{ .name = "0010_token_epoch", .up = init_0010_token_epoch },
     .{ .name = "0011_sessions", .up = init_0011_sessions },
+    .{ .name = "0012_experiment_assignments", .up = init_0012_experiment_assignments },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {

@@ -57,6 +57,11 @@ pub const App = struct {
     /// Drives `ctx.flagByName` / `ctx.flags().resolveAll` and the typed `App.flag`/`App.experiment`
     /// accessors. null = no registry wired (tests/CLI constructing App directly).
     features: ?*const features.Registry = null,
+    /// TTL in DAYS for sticky `_experiment_assignments` rows (#129); read by the
+    /// comptime-gated `_experiment_gc` job. Set by serveImpl from the comptime config
+    /// (`.experiment_assignment_ttl`, default 90). Only consulted when a `.sticky`
+    /// experiment is declared (otherwise the GC job is never installed).
+    experiment_assignment_ttl: u32 = 90,
     /// In-memory rate limiter for sensitive auth endpoints; null = disabled
     /// (rate_limit_max == 0, or tests/CLI that don't wire it). Set in serveImpl.
     rate_limiter: ?*ratelimit.RateLimiter = null,
