@@ -412,8 +412,9 @@ See the [TypeScript SDK docs](./typescript-sdk#typed-rpc--zbrpc) and `examples/g
 ## 5b. Handler capabilities (`ctx`) {#handler-capabilities-ctx}
 
 Every handler type — route, hook, and job — receives a `*zigbase.Ctx` as its first
-parameter. It provides curated DB access, an outbound HTTP client, and a standard
-error model, without manually acquiring connections from the pool.
+parameter. It provides curated DB access, an outbound HTTP client, outbound mail
+(`ctx.mail()`), and a standard error model, without manually acquiring connections from
+the pool.
 
 ### `ctx.records()` — records access
 
@@ -466,6 +467,44 @@ const page = try ctx.records().list("posts", .{
     .expand = "author",
 });
 ```
+
+### `ctx.mail()` — send application mail
+
+`ctx.mail()` sends outbound application email from any route, hook, or job. The framework
+owns the security-critical parts so a consumer never re-rolls them: recipient (and
+`reply_to`) **address validation** and **CRLF / control-char header-injection rejection**
+in `to` / `subject` / `reply_to` happen before any byte reaches a backend or a queue row.
+
+A `MailMessage` is `{ to, subject, text?, html?, reply_to? }` — supply `text`, `html`, or
+both (at least one is required). When both are present the message is built as
+`multipart/alternative` (plain-text part first, HTML last) so capable clients render the
+HTML and the rest fall back to text.
+
+```zig
+// Synchronous: build + deliver through the configured mailer right now.
+try ctx.mail().send(.{
+    .to       = "user@example.com",
+    .subject  = "Welcome",
+    .text     = "Thanks for signing up!",
+    .html     = "<h1>Thanks for signing up!</h1>",
+    .reply_to = "support@example.com",
+});
+
+// Background: hand it to the queue (the built-in "mail" job kind). Routed to the
+// queue's backend — durable (survives restart) or memory (in-process). Pick the queue
+// by name; defaults to the always-present "default" queue.
+try ctx.mail().enqueue(.{ .to = "user@example.com", .subject = "Digest", .html = "<p>…</p>" }, .{ .queue = "emails" });
+```
+
+`send` delivers through the same `Mailer.send` vtable seam every backend (Log / SMTP /
+Command / a custom `.mailer` plugin) routes through — including the dev-only
+`testcapture.mail` outbox, so consumer mail is assertable in tests exactly like the
+framework's own auth mail (see [Test-mode capture](#test-mode-capture--assert-sent-mail--mock-outbound-http-zigbasetestcapture)).
+When no mailer is wired (CLI/tests), `send` logs a fallback line. `enqueue` validates the
+message **up front**, so a malformed or injection-bearing message fails at the call site
+rather than later inside a worker; it requires a wired queue (see [§7b Background jobs &
+queues](#7b-background-jobs--queues-queues--workers--jobs)). Errors: `error.InvalidAddress`,
+`error.HeaderInjection`, `error.EmptyBody`.
 
 ### `ctx.http()` — outbound HTTP client
 
@@ -1629,6 +1668,12 @@ try ctx.enqueue(.emails, .resize_image, .{ .id = "abc123" });
 `payload` is JSON-serialized (a `[]const u8` is treated as raw JSON and passed through
 unchanged), and the job is routed to the queue's backend.
 
+The framework registers one **built-in job kind** on the same engine: `"mail"`, which backs
+[`ctx.mail().enqueue`](#ctxmail--send-application-mail) (it deserializes a `MailMessage`
+payload and delivers it). It is reached via that helper (or `ctx.enqueueByName(queue,
+"mail", msg)`), not the compile-checked `Job` enum, which reflects only your declared
+`.jobs`.
+
 ### Backends, priority, and reliability
 
 - **Backend `memory`** (default): the job runs in-process on a detached thread with backoff
@@ -2202,6 +2247,8 @@ The public surface (from `src/root.zig`):
   vtable types; `zigbase.DefaultStoragePlugin` / `zigbase.DefaultMailerPlugin` — the
   built-in defaults; `zigbase.LocalStorage`, `zigbase.LogMailer`, `zigbase.SmtpMailer`,
   `zigbase.CommandMailer`, `zigbase.SmtpTls` — the concrete backends.
+- `zigbase.MailMessage` — the `{ to, subject, text?, html?, reply_to? }` message type taken
+  by [`ctx.mail().send` / `.enqueue`](#ctxmail--send-application-mail).
 - `zigbase.QueueDef` / `zigbase.WorkerDef` / `zigbase.RetryPolicy` / `zigbase.Backend` /
   `zigbase.Priority` / `zigbase.Backoff` / `zigbase.QueueRegistry` — the background-jobs
   config types named when declaring `.queues` / `.workers`. The compile-checked enqueue

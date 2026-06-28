@@ -3,12 +3,22 @@ const config = @import("../config.zig");
 const testcapture = @import("../testcapture.zig");
 const SmtpTls = config.SmtpTls;
 
-/// A single outbound email. Text-only for now (no `html_body`) to keep the
-/// message builder simple; add an optional `html_body` later for multipart.
+/// A single outbound email. `text_body` is the plain-text part (always present —
+/// keep it for clients that can't render HTML). The optional `html_body` and
+/// `reply_to` are ADDITIVE with `null` defaults (#141): existing `Mailer`
+/// implementations and `Email` literals compile unchanged, and `buildMessage`
+/// emits a `multipart/alternative` body only when `html_body` is set.
 pub const Email = struct {
     to: []const u8,
     subject: []const u8,
     text_body: []const u8,
+    /// Optional HTML alternative. When set, `buildMessage` produces a
+    /// `multipart/alternative` message (text part first, then HTML) so capable
+    /// clients render the HTML while others fall back to `text_body`.
+    html_body: ?[]const u8 = null,
+    /// Optional `Reply-To` address. CRLF/control chars are rejected like the
+    /// other header fields (header-injection backstop).
+    reply_to: ?[]const u8 = null,
 };
 
 /// Pluggable, backend-agnostic mailer. Mirrors the `Storage` vtable pattern in
@@ -478,16 +488,64 @@ fn checkHeaderField(s: []const u8) HeaderError!void {
 /// Build the RFC5322 message bytes (headers + blank line + body). Pure: no I/O,
 /// so it can be unit-tested by asserting the produced bytes. The dot-stuffing
 /// terminator (\r\n.\r\n) is appended by the DATA send path, not here.
-/// Returns error.HeaderInjection if `from`/`to`/`subject` contain CR, LF, or NUL.
+/// Returns error.HeaderInjection if `from`/`to`/`subject`/`reply_to` contain a
+/// CR, LF, NUL, or any other ASCII control char.
+///
+/// Body shape:
+///   - `html_body == null`           → `text/plain` (the original single-part form).
+///   - `html_body` set, text empty   → `text/html` single part.
+///   - `html_body` set, text present → `multipart/alternative` (text part, then HTML),
+///                                     so clients pick the richest part they can render.
 pub fn buildMessage(alloc: std.mem.Allocator, from: []const u8, email: Email, now_unix: i64) ![]u8 {
     try checkHeaderField(from);
     try checkHeaderField(email.to);
     try checkHeaderField(email.subject);
+    if (email.reply_to) |rt| try checkHeaderField(rt);
     const date = rfc5322Date(now_unix);
+
+    // Common headers shared by every body shape. `Reply-To` is emitted only when set.
+    const reply_hdr = if (email.reply_to) |rt|
+        try std.fmt.allocPrint(alloc, "Reply-To: {s}\r\n", .{rt})
+    else
+        "";
+    defer if (email.reply_to != null) alloc.free(reply_hdr);
+    const head = try std.fmt.allocPrint(
+        alloc,
+        "From: {s}\r\nTo: {s}\r\n{s}Subject: {s}\r\nDate: {s}\r\nMIME-Version: 1.0\r\n",
+        .{ from, email.to, reply_hdr, email.subject, date },
+    );
+    defer alloc.free(head);
+
+    const html = email.html_body;
+    if (html == null) {
+        // Original single-part text/plain form (byte-compatible with pre-#141 output).
+        return std.fmt.allocPrint(
+            alloc,
+            "{s}Content-Type: text/plain; charset=utf-8\r\n\r\n{s}",
+            .{ head, email.text_body },
+        );
+    }
+    if (email.text_body.len == 0) {
+        // HTML-only: a single text/html part.
+        return std.fmt.allocPrint(
+            alloc,
+            "{s}Content-Type: text/html; charset=utf-8\r\n\r\n{s}",
+            .{ head, html.? },
+        );
+    }
+    // Both parts: multipart/alternative, text first (least-rich), HTML last (most-rich),
+    // per RFC 2046 §5.1.4 (clients render the LAST part they understand). The boundary
+    // is derived from `now_unix`; control chars can't reach the body, so it can't be
+    // forged to break the structure.
+    var bbuf: [40]u8 = undefined;
+    const boundary = std.fmt.bufPrint(&bbuf, "=_zigbase_{x}_part", .{@as(u64, @bitCast(now_unix))}) catch unreachable;
     return std.fmt.allocPrint(
         alloc,
-        "From: {s}\r\nTo: {s}\r\nSubject: {s}\r\nDate: {s}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{s}",
-        .{ from, email.to, email.subject, date, email.text_body },
+        "{s}Content-Type: multipart/alternative; boundary=\"{s}\"\r\n\r\n" ++
+            "--{s}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{s}\r\n" ++
+            "--{s}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{s}\r\n" ++
+            "--{s}--\r\n",
+        .{ head, boundary, boundary, email.text_body, boundary, html.?, boundary },
     );
 }
 
@@ -587,6 +645,50 @@ test "buildMessage rejects CRLF header injection in to/subject/from" {
     }, 0);
     defer a.free(ok);
     try std.testing.expect(std.mem.endsWith(u8, ok, "\r\n\r\nline1\r\nline2"));
+}
+
+test "buildMessage emits multipart/alternative with text + html parts and Reply-To" {
+    const a = std.testing.allocator;
+    const msg = try buildMessage(a, "noreply@zigbase.dev", .{
+        .to = "user@example.com",
+        .subject = "Hi",
+        .text_body = "plain version",
+        .html_body = "<b>html version</b>",
+        .reply_to = "support@zigbase.dev",
+    }, 1704067200);
+    defer a.free(msg);
+
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\r\nReply-To: support@zigbase.dev\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Content-Type: multipart/alternative; boundary=\"") != null);
+    // Both parts present, text part declared before the html part.
+    const text_part = std.mem.indexOf(u8, msg, "Content-Type: text/plain; charset=utf-8\r\n\r\nplain version").?;
+    const html_part = std.mem.indexOf(u8, msg, "Content-Type: text/html; charset=utf-8\r\n\r\n<b>html version</b>").?;
+    try std.testing.expect(text_part < html_part);
+    // Closing boundary terminates the body.
+    try std.testing.expect(std.mem.endsWith(u8, msg, "--\r\n"));
+}
+
+test "buildMessage with html only emits a single text/html part" {
+    const a = std.testing.allocator;
+    const msg = try buildMessage(a, "noreply@zigbase.dev", .{
+        .to = "user@example.com",
+        .subject = "Hi",
+        .text_body = "",
+        .html_body = "<p>only html</p>",
+    }, 0);
+    defer a.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "multipart") == null);
+    try std.testing.expect(std.mem.endsWith(u8, msg, "\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>only html</p>"));
+}
+
+test "buildMessage rejects CRLF in reply_to" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
+        .to = "user@example.com",
+        .subject = "Hi",
+        .text_body = "body",
+        .reply_to = "ok@x.io\r\nBcc: spam@evil.com",
+    }, 0));
 }
 
 test "rfc5322Date formats a known epoch" {

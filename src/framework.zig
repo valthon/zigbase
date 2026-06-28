@@ -29,6 +29,7 @@ const ctx_mod = @import("ctx.zig");
 const queue = @import("queue/queue.zig");
 const queue_config = @import("queue/config.zig");
 const queue_durable = @import("queue/durable.zig");
+const mail_send = @import("mail/send.zig");
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -293,9 +294,19 @@ pub fn App(comptime cfg: anytype) type {
         pub const worker_defs: []const queue.WorkerDef =
             queue_config.workerMeta(if (@hasField(@TypeOf(cfg), "workers")) cfg.workers else .{}, queue_defs);
 
-        /// Declared job-kind → handler registry (the reserved `.jobs.pool_size` key is skipped).
+        /// Framework-owned built-in job kinds, prepended to the consumer `.jobs` registry
+        /// below. `"mail"` (#141) backs `ctx.mail().enqueue` — a `"mail"` job deserializes
+        /// the `MailMessage` payload and delivers it via `mail/send.zig`. Kept as its own
+        /// const so sibling PRs (e.g. webhook, #144) can add their built-ins self-contained.
+        const builtin_job_regs: []const queue.JobReg = &.{
+            .{ .kind = "mail", .handler = mail_send.jobHandler },
+        };
+
+        /// Declared job-kind → handler registry: the built-in kinds followed by the consumer
+        /// `.jobs` bindings (the reserved `.jobs.pool_size` key is skipped). `jobByKind`
+        /// resolves built-ins first so `"mail"` always reaches the framework handler.
         pub const job_regs: []const queue.JobReg =
-            queue_config.jobsMeta(if (@hasField(@TypeOf(cfg), "jobs")) cfg.jobs else .{});
+            builtin_job_regs ++ queue_config.jobsMeta(if (@hasField(@TypeOf(cfg), "jobs")) cfg.jobs else .{});
 
         /// Enum of declared queue names — the compile-checked key for `App.enqueue`.
         pub const Queue = queue_config.QueueEnum(if (@hasField(@TypeOf(cfg), "queues")) cfg.queues else .{});
@@ -1509,8 +1520,10 @@ test "App(cfg) lowers .queues/.workers/.jobs and installs durable poller + GC jo
         .jobs = .{ .send = qTestHandler },
     });
     try std.testing.expect(A.has_durable_queue);
-    try std.testing.expectEqual(@as(usize, 1), A.job_regs.len);
-    try std.testing.expectEqualStrings("send", A.job_regs[0].kind);
+    // job_regs = built-in "mail" (#141) ++ consumer kinds; "mail" is first.
+    try std.testing.expectEqual(@as(usize, 2), A.job_regs.len);
+    try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
+    try std.testing.expectEqualStrings("send", A.job_regs[1].kind);
     try std.testing.expectEqualStrings("send", @tagName(@as(A.Job, .send)));
     try std.testing.expectEqualStrings("emails", @tagName(@as(A.Queue, .emails)));
 
@@ -1528,8 +1541,12 @@ test "App(cfg) keeps legacy .jobs.pool_size working alongside the job registry" 
     // `.jobs.pool_size` is the legacy scheduler-pool lever; it must NOT become a job kind.
     const A = App(.{ .jobs = .{ .pool_size = 3, .resize = qTestHandler } });
     try std.testing.expectEqual(@as(usize, 3), A.job_pool_size);
-    try std.testing.expectEqual(@as(usize, 1), A.job_regs.len);
-    try std.testing.expectEqualStrings("resize", A.job_regs[0].kind);
+    // job_regs = built-in "mail" (#141) ++ consumer "resize"; pool_size is skipped.
+    try std.testing.expectEqual(@as(usize, 2), A.job_regs.len);
+    try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
+    try std.testing.expectEqualStrings("resize", A.job_regs[1].kind);
+    // The compile-checked Job enum still reflects ONLY the consumer kinds (mail is a
+    // built-in reached via ctx.mail().enqueue / ctx.enqueueByName, not the typed enum).
     try std.testing.expectEqual(@as(usize, 1), std.meta.fields(A.Job).len);
 }
 
