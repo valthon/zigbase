@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const id = @import("id.zig");
+const entropy = @import("entropy.zig");
 
 const argon2 = std.crypto.pwhash.argon2;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -64,6 +65,27 @@ pub fn genToken(io: std.Io, alloc: std.mem.Allocator, len: usize) ![]u8 {
     return buf;
 }
 
+/// A random lowercase-hex string of `len` chars. Draws ceil(len/2) random bytes from the
+/// same entropy seam `genToken` uses and hex-encodes them, truncating to `len`. Useful
+/// where a strictly `[0-9a-f]` alphabet is wanted (e.g. opaque ids in URLs/headers).
+pub fn genHex(io: std.Io, alloc: std.mem.Allocator, len: usize) ![]u8 {
+    const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out); // only fires on an error path below; the success `return out` leaves it owned by the caller
+    if (len == 0) return out;
+    const nbytes = (len + 1) / 2;
+    const raw = try alloc.alloc(u8, nbytes);
+    defer alloc.free(raw);
+    entropy.fill(io, raw);
+    const hexchars = "0123456789abcdef";
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const byte = raw[i / 2];
+        const nib: u4 = @intCast(if (i % 2 == 0) byte >> 4 else byte & 0x0f);
+        out[i] = hexchars[nib];
+    }
+    return out;
+}
+
 test "password hash verifies the right password and rejects the wrong one" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -89,6 +111,17 @@ test "genToken produces a string of the requested length" {
     defer arena.deinit();
     const t = try genToken(std.testing.io, arena.allocator(), 32);
     try std.testing.expectEqual(@as(usize, 32), t.len);
+}
+
+test "genHex produces a lowercase-hex string of the requested length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    inline for (.{ 0, 1, 7, 32 }) |n| {
+        const h = try genHex(std.testing.io, a, n);
+        try std.testing.expectEqual(@as(usize, n), h.len);
+        for (h) |c| try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+    }
 }
 
 test "dummy login-timing hash is a well-formed argon2id PHC string" {

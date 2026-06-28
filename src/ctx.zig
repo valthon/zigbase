@@ -18,6 +18,8 @@ const session = @import("session.zig");
 const features = @import("features.zig");
 const features_resolver = @import("features_resolver.zig");
 const realtime_ws = @import("realtime/ws.zig");
+const crypto = @import("crypto.zig");
+const query_params = @import("query/params.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -33,6 +35,18 @@ pub const Ctx = struct {
     /// The raw HTTP request context. Non-null for route handlers; null for job/hook contexts
     /// where there is no HTTP request. Required by `issueSession`.
     request: ?*http_mod.RequestCtx = null,
+
+    // --- Wave 2 ergonomics (#138/#137): deferred response mutation + builders -------------
+    // These are a SELF-CONTAINED section (fields + methods + tests) so sibling Wave-2 PRs
+    // that also append to ctx.zig rebase cleanly. See `setCookie`/`addHeader`/`json`/etc.
+    /// Cookies accumulated via `ctx.setCookie` (e.g. by `ctx.subjectCookie`). `server.zig`'s
+    /// `dispatchCustom` merges these onto the handler's Response on BOTH the success and the
+    /// error path, so a deferred Set-Cookie survives even when the handler returns an error.
+    pending_cookies: std.ArrayListUnmanaged(http_mod.Cookie) = .empty,
+    /// Extra response headers accumulated via `ctx.addHeader`; merged like `pending_cookies`.
+    pending_headers: std.ArrayListUnmanaged(http_mod.Header) = .empty,
+    /// Lazily parsed + cached decoded query string (see `ctx.query`).
+    query_cache: ?query_params.Params = null,
 
     /// The resolved identity of the authenticated principal for this request.
     /// `id` is an empty string when no auth record is present (e.g. a superuser-only
@@ -276,7 +290,144 @@ pub const Ctx = struct {
         return ae.toResponse(self.arena) catch
             error_mod.ApiError.internal().toResponse(self.arena) catch unreachable;
     }
+
+    // =======================================================================
+    // Wave 2 ergonomics (#138 + #137): deferred response mutation, response
+    // builders, request reads, and the read-or-mint subject cookie.
+    //
+    // SELF-CONTAINED SECTION — keep methods together to ease sibling-PR rebases.
+    // The raw `http.Response` literal remains fully usable; these are additive
+    // conveniences, and the deferred accumulators are merged at ONE chokepoint
+    // (`server.zig dispatchCustom`) on both the success and error paths.
+    // =======================================================================
+
+    /// Default length (chars) of a freshly-minted `subjectCookie` id.
+    pub const subject_token_len: usize = 32;
+
+    /// Deferred response mutation: queue a cookie to be set on whatever Response this
+    /// handler ultimately returns (success OR error). Allocated/owned by the ctx arena.
+    pub fn setCookie(self: *Ctx, cookie: http_mod.Cookie) !void {
+        try self.pending_cookies.append(self.arena, cookie);
+    }
+
+    /// Deferred response mutation: queue an extra response header (merged like cookies).
+    pub fn addHeader(self: *Ctx, header: http_mod.Header) !void {
+        try self.pending_headers.append(self.arena, header);
+    }
+
+    /// Build a `200`/`status` JSON response by serializing `value` (any std.json-encodable
+    /// value, incl. a `std.json.Value`) onto the ctx arena.
+    pub fn json(self: *Ctx, status: u16, value: anytype) !http_mod.Response {
+        const body = try std.json.Stringify.valueAlloc(self.arena, value, .{});
+        return .{ .status = status, .content_type = "application/json", .body = body };
+    }
+
+    /// Build a JSON error response shaped `{"error":"<code>"}` (#138). NOTE: this is a
+    /// deliberately terse shape distinct from the framework's `{code,message,data}`
+    /// envelope (`ctx.errorResponse`) — use it for machine-readable code-only errors.
+    pub fn jsonError(self: *Ctx, status: u16, code: []const u8) !http_mod.Response {
+        var obj: std.json.ObjectMap = .empty;
+        try obj.put(self.arena, "error", .{ .string = code });
+        const body = try std.json.Stringify.valueAlloc(self.arena, std.json.Value{ .object = obj }, .{});
+        return .{ .status = status, .content_type = "application/json", .body = body };
+    }
+
+    /// Build an HTML response (`text/html; charset=utf-8`). `body` must outlive the handler
+    /// return (a literal, or arena-allocated — see `ctx.arena`).
+    pub fn html(self: *Ctx, status: u16, body: []const u8) http_mod.Response {
+        _ = self;
+        return .{ .status = status, .content_type = "text/html; charset=utf-8", .body = body };
+    }
+
+    /// Build a redirect response (e.g. `302`/`307`) with a `Location` header pointing at
+    /// `location`. The header slice is arena-owned.
+    pub fn redirect(self: *Ctx, status: u16, location: []const u8) !http_mod.Response {
+        const headers = try self.arena.dupe(http_mod.Header, &.{.{ .name = "Location", .value = location }});
+        return .{ .status = status, .content_type = "text/html; charset=utf-8", .body = "", .extra_headers = headers };
+    }
+
+    /// Build the canonical `404 Not found.` JSON envelope (a shortcut for the common case).
+    pub fn notFound(self: *Ctx) !http_mod.Response {
+        return error_mod.ApiError.notFound().toResponse(self.arena);
+    }
+
+    /// The request's URL query string, lazily parsed (and cached on the Ctx) into decoded
+    /// key/value pairs: `+` → space, `%XX` percent-decoded (see `query/params.zig`). Returns
+    /// an empty `Params` in a job/hook context (no request). `q.get("k")` is `?[]const u8`.
+    pub fn query(self: *Ctx) !query_params.Params {
+        if (self.query_cache) |q| return q;
+        const raw = if (self.request) |r| r.query else "";
+        const parsed = try query_params.parse(self.arena, raw);
+        self.query_cache = parsed;
+        return parsed;
+    }
+
+    /// A random base36 token of `n` chars (`[0-9a-z]`), arena-owned. Wraps `crypto.genToken`.
+    pub fn randomToken(self: *Ctx, n: usize) ![]const u8 {
+        return crypto.genToken(self.app.io, self.arena, n);
+    }
+
+    /// A random lowercase-hex token of `n` chars (`[0-9a-f]`), arena-owned. Wraps `crypto.genHex`.
+    pub fn randomHex(self: *Ctx, n: usize) ![]const u8 {
+        return crypto.genHex(self.app.io, self.arena, n);
+    }
+
+    /// Read-or-mint an opaque per-visitor "subject" id stored in cookie `name` (#137).
+    /// If the incoming request already carries a well-formed value, it is returned verbatim
+    /// (no Set-Cookie). Otherwise a fresh `randomToken` is minted and a single Set-Cookie is
+    /// QUEUED via `setCookie` (applied on the response at the dispatch chokepoint). Idempotent
+    /// within a request: repeat calls for the same `name` return the same id and never queue a
+    /// second cookie. The id is opaque (NOT signed) — a stable handle, not an authenticator.
+    ///
+    /// Anonymous-friendly: works without an authenticated identity. An explicit `?subject=`
+    /// query param still wins downstream (resolved in `api/state.zig`, left untouched here).
+    pub fn subjectCookie(self: *Ctx, name: []const u8, opts: SubjectCookieOpts) ![]const u8 {
+        // An incoming, well-formed cookie wins (read path — no mint, no Set-Cookie).
+        if (self.request) |r| {
+            if (r.cookie(name)) |existing| {
+                if (isWellFormedSubject(existing)) return existing;
+            }
+        }
+        // Idempotent within a request: reuse an id already minted for this name.
+        for (self.pending_cookies.items) |c| {
+            if (std.mem.eql(u8, c.name, name)) return c.value;
+        }
+        const minted = try self.randomToken(subject_token_len);
+        try self.setCookie(.{
+            .name = name,
+            .value = minted,
+            .max_age_s = opts.max_age_s,
+            .secure = opts.secure,
+            .same_site = opts.same_site,
+            .http_only = opts.http_only,
+            .domain = opts.domain,
+            .path = opts.path,
+        });
+        return minted;
+    }
 };
+
+/// Options for `ctx.subjectCookie` (#137). Defaults are a secure, lax, http-only, root-path
+/// session cookie. `max_age_s = 0` is a session cookie; set it for a persistent id.
+pub const SubjectCookieOpts = struct {
+    max_age_s: i32 = 0,
+    secure: bool = true,
+    same_site: http_mod.SameSite = .lax,
+    http_only: bool = true,
+    domain: ?[]const u8 = null,
+    path: []const u8 = "/",
+};
+
+/// A minted subject id is base36 (`crypto.genToken`); treat any non-empty, all-base36
+/// incoming value as well-formed and reuse it. A malformed/empty value is re-minted.
+fn isWellFormedSubject(v: []const u8) bool {
+    if (v.len == 0 or v.len > 128) return false;
+    for (v) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'z');
+        if (!ok) return false;
+    }
+    return true;
+}
 
 pub const GetOptions = struct { expand: ?[]const u8 = null };
 pub const ListOptions = struct {
@@ -1243,4 +1394,148 @@ test "ctx.tx rolls back on error and rejects nesting" {
     try std.testing.expectEqual(@as(usize, 0), page.items.len); // rolled back
 
     try std.testing.expectError(error.NestedTransaction, ctx.tx(void, txnNested));
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2 ergonomics (#138/#137) tests.
+// ---------------------------------------------------------------------------
+
+test "#138 ctx response builders: shapes + content-types" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    // json: serialized body + application/json.
+    const j = try ctx.json(201, .{ .ok = true, .n = 7 });
+    try std.testing.expectEqual(@as(u16, 201), j.status);
+    try std.testing.expectEqualStrings("application/json", j.content_type);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"n\":7}", j.body);
+
+    // jsonError: {"error":"<code>"} (#138 shape, distinct from the {code,message} envelope).
+    const e = try ctx.jsonError(400, "bad_token");
+    try std.testing.expectEqual(@as(u16, 400), e.status);
+    try std.testing.expectEqualStrings("application/json", e.content_type);
+    try std.testing.expectEqualStrings("{\"error\":\"bad_token\"}", e.body);
+
+    // html: text/html passthrough body.
+    const h = ctx.html(200, "<h1>hi</h1>");
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", h.content_type);
+    try std.testing.expectEqualStrings("<h1>hi</h1>", h.body);
+
+    // redirect: status + Location header, empty body.
+    const r = try ctx.redirect(302, "/login");
+    try std.testing.expectEqual(@as(u16, 302), r.status);
+    try std.testing.expectEqual(@as(usize, 1), r.extra_headers.len);
+    try std.testing.expectEqualStrings("Location", r.extra_headers[0].name);
+    try std.testing.expectEqualStrings("/login", r.extra_headers[0].value);
+    try std.testing.expectEqualStrings("", r.body);
+
+    // notFound: canonical 404 envelope.
+    const nf = try ctx.notFound();
+    try std.testing.expectEqual(@as(u16, 404), nf.status);
+    try std.testing.expect(std.mem.indexOf(u8, nf.body, "Not found.") != null);
+}
+
+test "#138 ctx.setCookie/addHeader accumulate on the Ctx" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    try ctx.setCookie(.{ .name = "a", .value = "1" });
+    try ctx.setCookie(.{ .name = "b", .value = "2" });
+    try ctx.addHeader(.{ .name = "X-One", .value = "y" });
+    try std.testing.expectEqual(@as(usize, 2), ctx.pending_cookies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pending_headers.items.len);
+    try std.testing.expectEqualStrings("a", ctx.pending_cookies.items[0].name);
+    try std.testing.expectEqualStrings("X-One", ctx.pending_headers.items[0].name);
+}
+
+test "#138 ctx.query() lazily decodes (+ and %XX) and caches" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+    var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .query = "q=a+b&pct=%41&n=2" };
+    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &req };
+    defer ctx.deinit();
+
+    const q = try ctx.query();
+    try std.testing.expectEqualStrings("a b", q.get("q").?); // '+' -> space
+    try std.testing.expectEqualStrings("A", q.get("pct").?); // %41 -> 'A'
+    try std.testing.expectEqualStrings("2", q.get("n").?);
+    try std.testing.expect(q.get("missing") == null);
+
+    // Cached: a second call returns the same parsed pairs (same backing slice).
+    const q2 = try ctx.query();
+    try std.testing.expect(q.pairs.ptr == q2.pairs.ptr);
+
+    // No request -> empty params, no error.
+    var jobctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    defer jobctx.deinit();
+    try std.testing.expect((try jobctx.query()).get("q") == null);
+}
+
+test "#138 ctx.randomToken length + base36 charset; randomHex hex charset" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    const t = try ctx.randomToken(24);
+    try std.testing.expectEqual(@as(usize, 24), t.len);
+    for (t) |c| try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'z'));
+
+    const hx = try ctx.randomHex(16);
+    try std.testing.expectEqual(@as(usize, 16), hx.len);
+    for (hx) |c| try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+}
+
+test "#137 ctx.subjectCookie mints once, is idempotent, and reads back an existing value" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    // Mint path: no incoming cookie -> a fresh id + exactly one queued Set-Cookie.
+    {
+        var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = a };
+        var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &req };
+        defer ctx.deinit();
+
+        const id1 = try ctx.subjectCookie("sid", .{});
+        try std.testing.expectEqual(Ctx.subject_token_len, id1.len);
+        for (id1) |c| try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'z'));
+        try std.testing.expectEqual(@as(usize, 1), ctx.pending_cookies.items.len);
+        const ck = ctx.pending_cookies.items[0];
+        try std.testing.expectEqualStrings("sid", ck.name);
+        try std.testing.expectEqualStrings(id1, ck.value);
+        // Default opts: secure, lax, http-only, root path.
+        try std.testing.expect(ck.secure and ck.http_only and ck.same_site == .lax);
+        try std.testing.expectEqualStrings("/", ck.path);
+
+        // Idempotent within the request: same id, no second cookie queued.
+        const id2 = try ctx.subjectCookie("sid", .{});
+        try std.testing.expectEqualStrings(id1, id2);
+        try std.testing.expectEqual(@as(usize, 1), ctx.pending_cookies.items.len);
+    }
+
+    // Read-back path: a well-formed incoming cookie wins (no mint, no Set-Cookie).
+    {
+        var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .cookie_header = "sid=abc123xyz" };
+        var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &req };
+        defer ctx.deinit();
+        const id = try ctx.subjectCookie("sid", .{});
+        try std.testing.expectEqualStrings("abc123xyz", id);
+        try std.testing.expectEqual(@as(usize, 0), ctx.pending_cookies.items.len);
+    }
+
+    // Malformed incoming value (contains a space) -> re-mint.
+    {
+        var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .cookie_header = "sid=bad value" };
+        var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &req };
+        defer ctx.deinit();
+        const id = try ctx.subjectCookie("sid", .{});
+        try std.testing.expectEqual(Ctx.subject_token_len, id.len);
+        try std.testing.expectEqual(@as(usize, 1), ctx.pending_cookies.items.len);
+    }
 }

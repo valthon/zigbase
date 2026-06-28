@@ -70,6 +70,10 @@ pub const Ctx = @import("ctx.zig").Ctx;
 /// runs writes on the in-transaction connection and `t.arena()` is the invocation arena.
 /// See the `ctx.tx()` section of docs/framework.md.
 pub const Tx = @import("ctx.zig").Tx;
+/// Decoded URL query string returned by `ctx.query()` — `q.get("k") -> ?[]const u8`.
+pub const QueryParams = @import("query/params.zig").Params;
+/// Options for `ctx.subjectCookie(name, opts)` (read-or-mint opaque visitor id, #137).
+pub const SubjectCookieOpts = @import("ctx.zig").SubjectCookieOpts;
 
 // ---- General outbound HTTP client -----------------------------------------
 // HttpMethod/HttpHeader use the Http-prefix to avoid collision with http.zig's
