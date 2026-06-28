@@ -150,10 +150,14 @@ pub const Data = struct {
         for (prefixes, 0..) |_, i| {
             if (i > 0) try sql.appendSlice(self.alloc, " OR ");
             const clause = try std.fmt.allocPrint(self.alloc, "key GLOB ?{d}", .{i + 1});
+            defer self.alloc.free(clause); // copied by appendSlice; only a build-time temporary
             try sql.appendSlice(self.alloc, clause);
         }
         try sql.appendSlice(self.alloc, " ORDER BY key;");
+        // sqlite copies the SQL text at prepare time, so the duped buffer is just a
+        // build-time temporary — free it once the function returns.
         const sql_z = try self.alloc.dupeZ(u8, sql.items);
+        defer self.alloc.free(sql_z);
 
         var st = try self.conn.prepare(sql_z);
         defer st.finalize();

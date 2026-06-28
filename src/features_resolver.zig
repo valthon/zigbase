@@ -90,9 +90,17 @@ pub fn resolveExperiment(
     def: ExperimentDef,
     subject: []const u8,
 ) ![]const u8 {
+    // An override parse dupes its own []u16 onto `alloc`; the declared weights are
+    // static. Track + free the duped copy so the function is leak-free under a
+    // general-purpose allocator (and a no-op under the arena it gets on the ctx path).
+    var owned_weights: ?[]const u16 = null;
+    defer if (owned_weights) |w| alloc.free(w);
     const weights: []const u16 = blk: {
         if (override_weights_json) |j| {
-            if (parseWeightOverride(alloc, j, def.variants.len)) |w| break :blk w;
+            if (parseWeightOverride(alloc, j, def.variants.len)) |w| {
+                owned_weights = w;
+                break :blk w;
+            }
         }
         break :blk def.weights;
     };
@@ -112,6 +120,7 @@ pub fn resolveAll(
     const flags_out = try alloc.alloc(ResolvedFlag, reg.flags.len);
     for (reg.flags, 0..) |def, i| {
         const key = try std.fmt.allocPrint(alloc, "flag:{s}", .{def.name});
+        defer alloc.free(key);
         var ov: ?[]const u8 = null;
         for (entries) |e| {
             if (std.mem.eql(u8, e.key, key)) {
@@ -125,6 +134,7 @@ pub fn resolveAll(
     const exps_out = try alloc.alloc(ResolvedExperiment, reg.experiments.len);
     for (reg.experiments, 0..) |def, i| {
         const key = try std.fmt.allocPrint(alloc, "exp:{s}:weights", .{def.name});
+        defer alloc.free(key);
         var ov: ?[]const u8 = null;
         for (entries) |e| {
             if (std.mem.eql(u8, e.key, key)) {
