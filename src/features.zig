@@ -157,6 +157,15 @@ pub fn experimentMeta(comptime exps_cfg: anytype) []const ExperimentDef {
                 @compileError("experiment '" ++ name ++ "': .weights must be a tuple of integers");
             for (std.meta.fields(WT)) |wf| {
                 const w = @field(spec.weights, wf.name);
+                // Loud-comptime: a malformed weight (non-integer, negative, or >65535)
+                // would otherwise produce a raw Zig coercion error. Name the experiment,
+                // the offending value, and the valid range instead.
+                switch (@typeInfo(@TypeOf(w))) {
+                    .comptime_int, .int => {},
+                    else => @compileError("experiment '" ++ name ++ "': every weight must be an integer in [0, 65535]"),
+                }
+                if (w < 0 or w > 65535)
+                    @compileError(std.fmt.comptimePrint("experiment '{s}': weight {d} out of range (must be an integer in [0, 65535])", .{ name, w }));
                 weights = weights ++ &[_]u16{@as(u16, w)};
             }
 
