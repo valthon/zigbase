@@ -20,6 +20,10 @@ const features_resolver = @import("features_resolver.zig");
 const realtime_ws = @import("realtime/ws.zig");
 const crypto = @import("crypto.zig");
 const query_params = @import("query/params.zig");
+const clock = @import("clock.zig");
+const queue_mod = @import("queue/queue.zig");
+const queue_memory = @import("queue/memory.zig");
+const queue_durable = @import("queue/durable.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -258,6 +262,55 @@ pub const Ctx = struct {
     /// Returns an outbound HTTP client bound to this Ctx's arena and the app's io.
     pub fn http(self: *Ctx) http_client.HttpClient {
         return .{ .alloc = self.arena, .io = self.app.io };
+    }
+
+    // -----------------------------------------------------------------------
+    // Background jobs & queues (#137 PR2).
+    //
+    // `enqueue` is the generic public API: serialize `payload` to JSON and route
+    // it to the named queue's backend (memory → in-process detached retry; durable
+    // → persisted to `_queue_jobs`, drained by a worker poller). `q`/`job` are enum
+    // literals (`.queue`, `.kind`). The typed, compile-checked `App.enqueue(ctx,
+    // .queue, .kind, payload)` (mirroring `App.flag`) is the preferred call site — a
+    // typo'd queue/kind is a compile error there; this method validates at runtime.
+    // Callable from background jobs (the handler receives a fresh `*Ctx`).
+    // -----------------------------------------------------------------------
+
+    /// Enqueue a background job. `q` and `job` are enum literals; for compile-checked
+    /// names use `App.enqueue(ctx, .queue, .kind, payload)`.
+    pub fn enqueue(self: *Ctx, comptime q: anytype, comptime job: anytype, payload: anytype) !void {
+        return self.enqueueByName(@tagName(q), @tagName(job), payload);
+    }
+
+    /// Generic, runtime-validated enqueue by string names. `error.QueuesUnavailable`
+    /// when no registry is wired (tests/CLI), `error.UnknownQueue` / `error.UnknownJobKind`
+    /// on a miss. `payload` is JSON-serialized (a `[]const u8`/`[]u8` is taken as raw JSON
+    /// and passed through unchanged); the kind handler receives that JSON text.
+    pub fn enqueueByName(self: *Ctx, queue_name: []const u8, kind: []const u8, payload: anytype) !void {
+        const reg = queue_mod.registryFromApp(self.app) orelse return error.QueuesUnavailable;
+        const q = reg.queueByName(queue_name) orelse return error.UnknownQueue;
+        const j = reg.jobByKind(kind) orelse return error.UnknownJobKind;
+        const payload_json = try self.serializePayload(payload);
+        switch (q.backend) {
+            .memory => try queue_memory.enqueue(self.app, q, j.handler, payload_json),
+            .durable => {
+                const now = clock.nowUnix(self.app.io);
+                if (self.bound_conn) |c| {
+                    try queue_durable.enqueue(c, self.app.io, q, kind, payload_json, now);
+                } else {
+                    const w = self.app.pool.acquireWriter();
+                    defer self.app.pool.releaseWriter();
+                    try queue_durable.enqueue(w, self.app.io, q, kind, payload_json, now);
+                }
+            },
+        }
+    }
+
+    fn serializePayload(self: *Ctx, payload: anytype) ![]const u8 {
+        const T = @TypeOf(payload);
+        // Already-serialized JSON text passes through unchanged.
+        if (T == []const u8 or T == []u8) return payload;
+        return std.json.Stringify.valueAlloc(self.arena, payload, .{});
     }
 
     /// Sentinel error type returned by fail/invalid so callers can propagate.
@@ -1538,4 +1591,95 @@ test "#137 ctx.subjectCookie mints once, is idempotent, and reads back an existi
         try std.testing.expectEqual(Ctx.subject_token_len, id.len);
         try std.testing.expectEqual(@as(usize, 1), ctx.pending_cookies.items.len);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Background jobs & queues (#137 PR2) — ctx.enqueue round-trips.
+// ---------------------------------------------------------------------------
+
+const queue_test = struct {
+    var mem_runs: usize = 0;
+    var mem_payload_buf: [256]u8 = undefined;
+    var mem_payload_len: usize = 0;
+
+    fn durableHandler(c: *Ctx, payload: []const u8) anyerror!void {
+        _ = c;
+        _ = payload;
+    }
+    fn memHandler(c: *Ctx, payload: []const u8) anyerror!void {
+        _ = c;
+        @memcpy(mem_payload_buf[0..payload.len], payload);
+        mem_payload_len = payload.len;
+        mem_runs += 1;
+    }
+};
+
+test "ctx.enqueue durable round-trips: serializes payload into a _queue_jobs row" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{.{ .kind = "echo", .handler = queue_test.durableHandler }},
+    };
+    env.app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    try ctx.enqueue(.default, .echo, .{ .n = 7 });
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var st = try w.prepare("SELECT queue, kind, payload, status FROM \"_queue_jobs\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("default", st.columnText(0));
+    try std.testing.expectEqualStrings("echo", st.columnText(1));
+    try std.testing.expectEqualStrings("{\"n\":7}", st.columnText(2));
+    try std.testing.expectEqualStrings("pending", st.columnText(3));
+}
+
+test "ctx.enqueue memory round-trips: runs the handler in-process" {
+    // Use the thread-safe GPA (not an arena) because the memory backend runs on a
+    // DETACHED thread that allocs/frees its own per-attempt arena + the job context.
+    queue_test.mem_runs = 0;
+    queue_test.mem_payload_len = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .memory, .retry = .{ .base_ms = 0, .jitter = false } }},
+        .jobs = &.{.{ .kind = "echo", .handler = queue_test.memHandler }},
+    };
+    app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    try ctx.enqueueByName("default", "echo", .{ .v = "hi" });
+
+    // The memory backend runs on a detached thread; spin-wait for the handler, then a
+    // short settle so the thread's defer-frees complete before the leak check.
+    var spins: usize = 0;
+    while (queue_test.mem_runs == 0 and spins < 500) : (spins += 1) {
+        app.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake) catch {};
+    }
+    app.io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 1), queue_test.mem_runs);
+    try std.testing.expectEqualStrings("{\"v\":\"hi\"}", queue_test.mem_payload_buf[0..queue_test.mem_payload_len]);
+}
+
+test "ctx.enqueue errors on unknown queue / kind / no registry" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    // No registry wired.
+    try std.testing.expectError(error.QueuesUnavailable, ctx.enqueueByName("default", "echo", .{}));
+
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{.{ .kind = "echo", .handler = queue_test.durableHandler }},
+    };
+    env.app.queues = @ptrCast(&reg);
+    try std.testing.expectError(error.UnknownQueue, ctx.enqueueByName("nope", "echo", .{}));
+    try std.testing.expectError(error.UnknownJobKind, ctx.enqueueByName("default", "nope", .{}));
 }
