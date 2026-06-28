@@ -6,4 +6,5 @@
 ### Security
 
 - Webhook bodies can be HMAC-SHA256 signed (`WebhookOpts.sign`): the receiver verifies authenticity by recomputing `hex(HMAC-SHA256(secret, "<timestamp>.<body>"))` against the `X-Signature` header (timestamp in `X-Webhook-Timestamp`), and the signed timestamp limits replay.
-- Each webhook delivery carries a stable `Idempotency-Key` header generated once at enqueue and reused across every retry/replay, so receivers can dedupe at-least-once deliveries. TLS certificate verification stays on for all webhook requests.
+- Each webhook delivery carries a stable 128-bit `Idempotency-Key` header generated once at enqueue and reused across every retry/replay, so receivers can dedupe at-least-once deliveries. TLS certificate verification stays on for all webhook requests.
+- Retry backoff (including a server-supplied `Retry-After`) is capped at the queue's `max_ms`, so a hostile or misconfigured receiver cannot park a worker thread indefinitely (e.g. via a huge `Retry-After`) and starve the background pool.

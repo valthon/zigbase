@@ -115,13 +115,15 @@ const Disposition = union(enum) {
 /// JSON-serialized `WebhookJob`. Always returns success (the handler owns retries and the
 /// terminal `.onError`), except when the payload itself cannot be parsed.
 pub fn webhookJobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
-    const parsed = std.json.parseFromSlice(WebhookJob, ctx.arena, payload, .{}) catch {
+    // `…Leaky` parses directly into `ctx.arena` (which owns every allocation and is freed
+    // wholesale at job end) — no nested `Parsed(T)` arena to `deinit`.
+    const job = std.json.parseFromSliceLeaky(WebhookJob, ctx.arena, payload, .{}) catch {
         // A malformed payload is a programmer error, not a transient delivery failure:
         // surface it on the webhook phase and do not retry.
         fireOnError(ctx, error.WebhookPayloadInvalid, "webhook job payload is not valid JSON");
         return;
     };
-    return deliver(ctx, parsed.value);
+    return deliver(ctx, job);
 }
 
 /// Run the full delivery lifecycle for `job`: attempt, classify, back off, retry, and on a
@@ -144,7 +146,12 @@ pub fn deliver(ctx: *Ctx, job: WebhookJob) !void {
                     fireOnError(ctx, error.WebhookDeliveryFailed, msg);
                     return;
                 }
-                const delay_ms = retry_after_ms orelse queue.backoffMs(pol, attempt, randomU64(ctx.app.io));
+                // Cap the wait at the policy's `max_ms`: a delivery target controls the
+                // `Retry-After` header, and these backoff sleeps occupy the worker thread —
+                // an unbounded value (e.g. `Retry-After: 86400`) would otherwise let a hostile
+                // or misconfigured receiver park a worker for hours and starve the pool.
+                const raw_delay = retry_after_ms orelse queue.backoffMs(pol, attempt, randomU64(ctx.app.io));
+                const delay_ms = @min(raw_delay, job.max_ms);
                 if (delay_ms > 0)
                     ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
             },
@@ -214,7 +221,7 @@ fn retryAfterMs(headers: []const http_client.Header) ?u32 {
 }
 
 fn fireOnError(ctx: *Ctx, err: anyerror, message: []const u8) void {
-    var ev = events.ErrorEvent{ .app = ctx.app, .ctx = null, .err = err, .phase = .webhook, .message = message };
+    var ev = events.ErrorEvent{ .app = ctx.app, .ctx = &ctx.rctx, .err = err, .phase = .webhook, .message = message };
     events.dispatchError(ctx.app, ctx.app.dispatch, &ev);
 }
 

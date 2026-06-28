@@ -293,7 +293,8 @@ pub const Ctx = struct {
     /// (`error.QueuesUnavailable` otherwise).
     pub fn webhook(self: *Ctx, url: []const u8, payload: anytype, opts: WebhookOpts) !void {
         const body = try self.serializePayload(payload);
-        const idem: ?[]const u8 = if (opts.idempotency) try self.randomHex(16) else null;
+        // 32 hex chars = 16 bytes / 128 bits — UUID-grade, collision-free at any volume.
+        const idem: ?[]const u8 = if (opts.idempotency) try self.randomHex(32) else null;
         const job = webhook_mod.WebhookJob{
             .url = url,
             .body = body,
