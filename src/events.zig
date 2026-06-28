@@ -155,6 +155,14 @@ pub const ExposureEvent = struct {
 };
 pub const ExposureHandler = *const fn (ev: *ExposureEvent) void;
 
+/// Consumer realtime subscribe predicate (#143). Consulted ONLY for a NON-collection
+/// custom topic when a socket tries to subscribe (real collection topics keep their
+/// own per-record viewRule authorization). `ctx` carries the socket's resolved identity
+/// (`ctx.user()` / `ctx.rctx`); `topic` is the requested custom channel name. Return
+/// `true` to allow the subscription, `false` to deny it. With NO predicate configured,
+/// custom topics default to PUBLIC signal channels (the historical `__features` behavior).
+pub const RealtimeCanSubscribeFn = *const fn (ctx: *Ctx, topic: []const u8) bool;
+
 pub const AuthLevel = enum { public, authed, superuser };
 
 pub const RouteEvent = struct {
@@ -640,6 +648,9 @@ pub const Dispatch = struct {
     on_before_terminate: ?LifecycleHandler = null,
     /// Generated from `cfg.onFeatureExposure`; null = no subscribers (zero-cost).
     on_feature_exposure: ?ExposureHandler = null,
+    /// Consumer realtime subscribe guard (#143), from `.realtime = .{ .canSubscribe = fn }`.
+    /// null = custom topics are PUBLIC signal channels (the historical `__features` default).
+    realtime_can_subscribe: ?RealtimeCanSubscribeFn = null,
 };
 
 /// Map a comptime RecordPhase to its hook-config field name.

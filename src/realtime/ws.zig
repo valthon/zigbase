@@ -11,6 +11,8 @@ const id = @import("../id.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 const hub = @import("hub.zig");
+const request = @import("../request.zig");
+const Ctx = @import("../ctx.zig").Ctx;
 
 /// Set true by the server just before `zap.start`; gates `broadcast` so it is a no-op when the
 /// facil.io reactor isn't running (tests/CLI), avoiding "facil.io cluster inactive" noise + UB.
@@ -68,6 +70,37 @@ fn releaseConnectionSlot() void {
 fn subscribeAuthorized(view_rule: ?[]const u8, authed: bool, is_superuser: bool) bool {
     if (rules.isPublic(view_rule)) return true;
     return authed or is_superuser;
+}
+
+/// The result of authorizing a subscribe request: deliver, unknown-collection error, or
+/// authentication-required error.
+const SubscribeOutcome = enum { ok, unknown, auth_required };
+
+/// Pure subscribe-authorization decision (#143, F5), factored out so the security PRECEDENCE
+/// is testable in one place: a REAL collection topic (`col != null`) ALWAYS uses per-collection
+/// authz (`subscribeAuthorized`) — the custom-topic predicate is NEVER consulted for it, so a
+/// custom subscribe can't reach a collection's records. Only a NON-collection custom topic
+/// (`col == null`) is gated by `custom_allowed` (the `canSubscribe` result; default true).
+fn subscribeDecision(col: ?schema.Collection, authed: bool, is_superuser: bool, custom_allowed: bool) SubscribeOutcome {
+    if (col) |c| {
+        return if (subscribeAuthorized(c.viewRule, authed, is_superuser)) .ok else .auth_required;
+    }
+    return if (custom_allowed) .ok else .auth_required;
+}
+
+/// #143: may a socket subscribe to a NON-collection custom topic? Consulted ONLY after the
+/// topic is confirmed NOT to be a collection (collection topics keep their own per-record
+/// authz). DEFAULT — no `.realtime = .{ .canSubscribe = fn }` configured — is to ALLOW any
+/// named custom topic, i.e. custom topics are PUBLIC signal channels (exactly the historical
+/// `__features` behavior). A configured predicate gates private channels: returning false
+/// denies. The predicate receives a lightweight `Ctx` carrying the socket's resolved identity
+/// (`ctx.user()` / `ctx.rctx`); it may acquire its own reader for richer checks.
+fn canSubscribeTopic(app: *App, arena: std.mem.Allocator, rctx: request.RequestContext, topic: []const u8) bool {
+    const d = app.dispatch orelse return true;
+    const predicate = d.realtime_can_subscribe orelse return true;
+    var cx = Ctx{ .app = app, .arena = arena, .rctx = rctx };
+    defer cx.deinit();
+    return predicate(&cx, topic);
 }
 
 /// Live per-connection state: the pure 7a `Conn` plus the zap handle / settings / app.
@@ -202,24 +235,29 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
                 WS.write(handle, try protocol.errorFrame(fa, "subscription limit reached"), true) catch {};
                 return;
             }
-            var r = lc.app.pool.acquireReader() catch return;
-            const Outcome = enum { ok, unknown, auth_required };
-            const outcome: Outcome = blk: {
-                defer lc.app.pool.releaseReader(&r);
+            const outcome: SubscribeOutcome = blk: {
                 const t = protocol.parseTopic(m.topic);
                 // The feature-management signal channel is PUBLIC and is not a collection:
                 // anyone (incl. anonymous) may subscribe; delivery forwards the signal frame
                 // verbatim (no per-record authorization).
                 if (std.mem.eql(u8, t.collection, FEATURES_CHANNEL)) break :blk .ok;
-                const col = (collections.get(fa, &r, t.collection) catch break :blk .unknown) orelse break :blk .unknown;
-                // F5: a socket may subscribe anonymously ONLY to a public (@public viewRule)
-                // collection. For any other collection require a live (non-expired) auth first, so
-                // an unauthenticated socket cannot subscribe to (and tie up resources on) gated data.
+                var r = lc.app.pool.acquireReader() catch break :blk .unknown;
                 const now = auth.nowUnixPub(&r) catch 0;
                 const rctx = lc.conn.requestContext(now);
-                if (!subscribeAuthorized(col.viewRule, rctx.auth != null, rctx.is_superuser))
-                    break :blk .auth_required;
-                break :blk .ok;
+                const lookup = collections.get(fa, &r, t.collection) catch {
+                    lc.app.pool.releaseReader(&r);
+                    break :blk .unknown;
+                };
+                // Release the reader now: `lookup` (and `col.viewRule`) live on the frame arena, and
+                // the canSubscribe predicate is handed a Ctx that may acquire its own reader.
+                lc.app.pool.releaseReader(&r);
+                // A REAL collection topic ALWAYS goes through normal per-collection authz, so the
+                // custom-topic predicate can never be used to reach a collection's records: the
+                // canSubscribe guard (#143) is consulted ONLY when `lookup == null` (a non-collection
+                // custom topic). DEFAULT (no `.realtime.canSubscribe`) allows any custom topic, i.e.
+                // custom topics are PUBLIC signal channels — exactly today's `__features` behavior.
+                const custom_allowed = lookup == null and canSubscribeTopic(lc.app, fa, rctx, m.topic);
+                break :blk subscribeDecision(lookup, rctx.auth != null, rctx.is_superuser, custom_allowed);
             };
             switch (outcome) {
                 .ok => {},
@@ -270,6 +308,20 @@ fn onChannelMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, channe
     _ = lc.frame.reset(.retain_capacity);
     const a = lc.frame.allocator();
 
+    const t = protocol.parseTopic(channel);
+    var r = lc.app.pool.acquireReader() catch return;
+    defer lc.app.pool.releaseReader(&r);
+
+    // Resolve the topic to a collection FIRST. A non-collection topic is a consumer CUSTOM
+    // channel (#143): forward its frame VERBATIM with NO per-record viewRule — subscription
+    // was already authorized at subscribe time via `canSubscribe`. This mirrors the
+    // `__features` precedent and is strictly scoped to topics that are NOT collections, so a
+    // custom-topic delivery can never leak a collection's records.
+    const col = (collections.get(a, &r, t.collection) catch return) orelse {
+        WS.write(handle, message, true) catch {};
+        return;
+    };
+
     const parsed = std.json.parseFromSlice(std.json.Value, a, message, .{}) catch return;
     if (parsed.value != .object) return;
     const obj = parsed.value.object;
@@ -290,10 +342,6 @@ fn onChannelMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, channe
     // private key. Pull it out for per-subscriber authz, then strip it so the client frame is id-only.
     const delete_snapshot: ?std.json.Value = if (action == .delete) rv.object.get(hub.delete_snapshot_key) else null;
 
-    const t = protocol.parseTopic(channel);
-    var r = lc.app.pool.acquireReader() catch return;
-    defer lc.app.pool.releaseReader(&r);
-    const col = (collections.get(a, &r, t.collection) catch return) orelse return;
     const now = auth.nowUnixPub(&r) catch return;
     const filter_ptr = lc.conn.subFilter(channel);
     const sub_filter: ?[]const u8 = if (filter_ptr) |p| p.* else null;
@@ -346,6 +394,34 @@ pub fn broadcastFeaturesChanged() void {
     WS.publish(.{ .channel = FEATURES_CHANNEL, .message = FEATURES_CHANGED_FRAME });
 }
 
+/// #143: consumer broadcast. Publish an already-serialized `message` VERBATIM to every
+/// subscriber of a custom `topic`. There is NO per-record viewRule on delivery — subscription
+/// authorization is enforced once, at subscribe time, by `canSubscribeTopic`. EXPLICIT opt-in:
+/// `message` must be safe for every subscriber of `topic` (gate private channels with a
+/// `.realtime = .{ .canSubscribe = fn }` predicate; prefer `signalTopic` + an authenticated
+/// re-fetch for per-subject state). A no-op when the reactor isn't running (tests/CLI), like
+/// `broadcast`. `topic` is a consumer channel name, not a collection name. Callable from any
+/// thread (incl. a background job): `fio_publish` is a non-blocking enqueue that copies `message`.
+pub fn broadcastTopic(topic: []const u8, message: []const u8) void {
+    if (!active) return; // reactor not running (tests/CLI): no-op
+    WS.publish(.{ .channel = topic, .message = message });
+}
+
+/// #143: signal-only consumer push. Publish `{"type":"signal","topic":"<topic>"}` on a custom
+/// `topic` so subscribers re-fetch over an authenticated GET — the recommended default for
+/// private/per-subject state (carries NO payload). A no-op when the reactor isn't running.
+pub fn signalTopic(topic: []const u8) void {
+    if (!active) return; // reactor not running (tests/CLI): no-op
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var o: std.json.ObjectMap = .empty;
+    o.put(a, "type", .{ .string = "signal" }) catch return;
+    o.put(a, "topic", .{ .string = topic }) catch return;
+    const frame = std.json.Stringify.valueAlloc(a, std.json.Value{ .object = o }, .{}) catch return;
+    WS.publish(.{ .channel = topic, .message = frame });
+}
+
 test "originAllowed: empty allowlist denies cross-origin browser upgrades (F12); same-origin + CSV allowed" {
     // Secure-by-default: an empty allowlist DENIES a cross-origin browser upgrade...
     try std.testing.expect(!originAllowed("", "https://anything", "myhost:8090"));
@@ -390,6 +466,74 @@ test "F5: anonymous subscribe allowed only on @public; gated collections require
     // owner/expression rule: anonymous rejected, authed allowed to subscribe.
     try std.testing.expect(!subscribeAuthorized("owner = @request.auth.id", false, false));
     try std.testing.expect(subscribeAuthorized("owner = @request.auth.id", true, false));
+}
+
+test "broadcastTopic/signalTopic are no-ops when inactive (#143)" {
+    // Like broadcast/broadcastFeaturesChanged, the consumer publish entry points must early-return
+    // when the reactor isn't running so ctx.realtime() is safe to call from tests/CLI/background jobs.
+    try std.testing.expect(!active);
+    broadcastTopic("orders", "{\"type\":\"message\",\"topic\":\"orders\"}"); // would touch the inactive cluster (UB) otherwise
+    signalTopic("availability"); // builds + would publish a signal frame; must early-return
+}
+
+test "subscribeDecision: collection topics ALWAYS use collection authz, custom topics use the predicate (#143)" {
+    // A REAL collection topic is authorized by its viewRule REGARDLESS of the custom predicate:
+    // even with custom_allowed=true, a LOCKED collection denies an anonymous socket. This is the
+    // security guarantee that a custom subscribe can't reach a collection's records.
+    const locked = schema.Collection{ .id = "c1", .name = "secrets", .fields = &.{}, .viewRule = null };
+    try std.testing.expectEqual(SubscribeOutcome.auth_required, subscribeDecision(locked, false, false, true));
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(locked, true, false, true)); // authed
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(locked, false, true, true)); // superuser
+    // A @public collection is open to anonymous (the custom predicate is irrelevant either way).
+    const pub_col = schema.Collection{ .id = "c2", .name = "posts", .fields = &.{}, .viewRule = "@public" };
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(pub_col, false, false, false));
+    // A NON-collection custom topic (col == null) is gated solely by custom_allowed.
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(null, false, false, true)); // default public
+    try std.testing.expectEqual(SubscribeOutcome.auth_required, subscribeDecision(null, false, false, false)); // guard denied
+}
+
+test "canSubscribeTopic: default allows any custom topic (public signal channel) (#143)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var app: App = undefined;
+    const anon = request.RequestContext{};
+    // No dispatch wired (tests/CLI): custom topics default to PUBLIC signal channels.
+    app.dispatch = null;
+    try std.testing.expect(canSubscribeTopic(&app, a, anon, "availability"));
+    // Dispatch present but NO predicate -> still public by default.
+    var d = @import("../events.zig").Dispatch{};
+    app.dispatch = &d;
+    try std.testing.expect(canSubscribeTopic(&app, a, anon, "orders"));
+}
+
+test "canSubscribeTopic: a canSubscribe guard returning false denies (#143)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Guard = struct {
+        fn deny(ctx: *Ctx, topic: []const u8) bool {
+            _ = ctx;
+            _ = topic;
+            return false;
+        }
+        fn onlyAuthed(ctx: *Ctx, topic: []const u8) bool {
+            _ = topic;
+            return ctx.rctx.auth != null or ctx.rctx.is_superuser;
+        }
+    };
+    var app: App = undefined;
+    var d = @import("../events.zig").Dispatch{ .realtime_can_subscribe = Guard.deny };
+    app.dispatch = &d;
+    const anon = request.RequestContext{};
+    try std.testing.expect(!canSubscribeTopic(&app, a, anon, "private"));
+    // A guard gating on auth: anonymous denied, authenticated allowed.
+    d.realtime_can_subscribe = Guard.onlyAuthed;
+    try std.testing.expect(!canSubscribeTopic(&app, a, anon, "private"));
+    var rec: std.json.ObjectMap = .empty;
+    try rec.put(a, "id", .{ .string = "u1" });
+    const authed = request.RequestContext{ .auth = .{ .object = rec }, .is_superuser = false };
+    try std.testing.expect(canSubscribeTopic(&app, a, authed, "private"));
 }
 
 test "F9: global connection cap reserves/releases and rejects past MAX_CONNECTIONS" {

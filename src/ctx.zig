@@ -366,6 +366,21 @@ pub const Ctx = struct {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Consumer realtime broadcast (#143). SELF-CONTAINED section (accessor + the
+    // RealtimeApi struct below) so sibling Wave-2 PRs that also append to ctx.zig
+    // rebase cleanly. Publishes on CUSTOM (non-collection) topics; subscription is
+    // gated at subscribe time by `.realtime = .{ .canSubscribe = fn }` (default:
+    // custom topics are PUBLIC signal channels). Callable from a background job
+    // (no HTTP request needed). A no-op when the realtime reactor isn't running.
+    // -----------------------------------------------------------------------
+
+    /// Returns the realtime publish namespace (`ctx.realtime()`): `signal(topic)` and
+    /// `broadcast(topic, payload)`.
+    pub fn realtime(self: *Ctx) RealtimeApi {
+        return .{ .ctx = self };
+    }
+
     fn serializePayload(self: *Ctx, payload: anytype) ![]const u8 {
         const T = @TypeOf(payload);
         // Already-serialized JSON text passes through unchanged.
@@ -908,6 +923,41 @@ pub const MailApi = struct {
     pub fn enqueue(self: MailApi, msg: Message, opts: EnqueueOpts) !void {
         try mail_send.validate(msg);
         return self.ctx.enqueueByName(opts.queue, "mail", msg);
+    }
+};
+
+/// Consumer realtime publish namespace (`ctx.realtime()`, #143). Both verbs publish on a
+/// CUSTOM (non-collection) `topic`; who may subscribe is decided at subscribe time by the
+/// `.realtime = .{ .canSubscribe = fn }` guard (default: custom topics are PUBLIC signal
+/// channels). No-op when the realtime reactor isn't running (tests/CLI). Callable from a
+/// background job (the handler's `*Ctx` has `request == null`).
+pub const RealtimeApi = struct {
+    ctx: *Ctx,
+
+    /// Signal-only push: subscribers of `topic` receive `{"type":"signal","topic":"<topic>"}`
+    /// and should re-fetch over an authenticated GET. The RECOMMENDED default for private or
+    /// per-subject state — it carries NO payload, so nothing sensitive is pushed to a channel
+    /// any subscriber can join.
+    pub fn signal(self: RealtimeApi, topic: []const u8) void {
+        _ = self;
+        realtime_ws.signalTopic(topic);
+    }
+
+    /// Payload-carrying broadcast (EXPLICIT opt-in): subscribers of `topic` receive
+    /// `{"type":"message","topic":"<topic>","data":<payload>}` VERBATIM. `payload` is any
+    /// JSON-serializable value. Only broadcast data that is safe for EVERY subscriber of
+    /// `topic`; gate private channels with `.realtime = .{ .canSubscribe = fn }`, or prefer
+    /// `signal` + an authenticated re-fetch for per-subject state.
+    pub fn broadcast(self: RealtimeApi, topic: []const u8, payload: anytype) !void {
+        const a = self.ctx.arena;
+        const data_json = try std.json.Stringify.valueAlloc(a, payload, .{});
+        const data_val = (try std.json.parseFromSlice(std.json.Value, a, data_json, .{})).value;
+        var o: std.json.ObjectMap = .empty;
+        try o.put(a, "type", .{ .string = "message" });
+        try o.put(a, "topic", .{ .string = topic });
+        try o.put(a, "data", data_val);
+        const frame = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = o }, .{});
+        realtime_ws.broadcastTopic(topic, frame);
     }
 };
 
