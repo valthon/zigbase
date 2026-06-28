@@ -49,12 +49,26 @@ pub const QueueDef = struct {
     backend: Backend = .memory,
     priority: Priority = .normal,
     retry: RetryPolicy = .{},
+    /// Reclaim threshold (durable only): a `claimed` row whose `claimed_at` is older
+    /// than this many seconds is reset to `pending` (a crashed worker stranded it — OR
+    /// a handler that legitimately runs this long is presumed dead and replayed). Set
+    /// this to comfortably EXCEED this queue's LONGEST job runtime to avoid
+    /// double-dispatch. Must be >= 1.
+    visibility_timeout_s: i64 = 300,
+    /// GC threshold (durable only): `done`/`failed` rows older than this many seconds
+    /// are deleted by the `_queue_gc` sweep. Default 7 days.
+    done_ttl_s: i64 = 7 * 24 * 3600,
 };
 
 /// One declared worker (lowered from a `.workers` entry, or the implicit
 /// all-queues worker). `queues` is the set of queue NAMES this worker drains, in
-/// strict priority order; `concurrency` is the max jobs it claims+processes per
-/// poll cycle.
+/// strict priority order.
+///
+/// `concurrency` is the per-poll-cycle BATCH SIZE: how many ready jobs this worker
+/// claims and then processes **serially** within one cycle. It is NOT a count of
+/// parallel handler threads — true parallelism comes from declaring MULTIPLE workers
+/// (each is its own scheduler job and runs on its own pool thread). Raise it to lift
+/// throughput per cycle; add workers to run handlers concurrently.
 pub const WorkerDef = struct {
     name: []const u8,
     queues: []const []const u8,
@@ -78,11 +92,6 @@ pub const Registry = struct {
     queues: []const QueueDef = &.{},
     workers: []const WorkerDef = &.{},
     jobs: []const JobReg = &.{},
-    /// Reclaim sweep threshold: a `claimed` row whose `claimed_at` is older than
-    /// this many seconds is reset to `pending` (a crashed worker stranded it).
-    visibility_timeout_s: i64 = 300,
-    /// GC threshold: `done`/`failed` rows older than this many seconds are deleted.
-    done_ttl_s: i64 = 7 * 24 * 3600,
 
     pub fn queueByName(self: Registry, name: []const u8) ?QueueDef {
         for (self.queues) |q| if (std.mem.eql(u8, q.name, name)) return q;

@@ -1616,11 +1616,18 @@ App(.{
             .backend  = .durable,   // .memory (default) | .durable
             .priority = .high,      // .high | .normal (default) | .low
             .retry    = .{ .max_attempts = 5, .backoff = .exponential, .base_ms = 1000, .max_ms = 300_000, .jitter = true },
+            // Durable-only reliability knobs (defaults shown). Set the visibility timeout
+            // ABOVE this queue's longest job runtime so the reclaim sweep never
+            // double-dispatches a still-running job:
+            .visibility_timeout_s = 300,       // reclaim a claim older than this (>= 1)
+            .done_ttl_s           = 604_800,   // GC done/failed rows older than this (7d)
         },
         .reports = .{ .backend = .durable, .priority = .low },
     },
     // Named workers, each draining a subset of queues in STRICT priority order.
     // OMIT `.workers` entirely → ONE implicit worker drains ALL queues, strict priority.
+    // `concurrency` = per-poll-cycle BATCH SIZE processed SERIALLY (NOT parallel handler
+    // threads); run handlers in parallel by declaring MULTIPLE workers.
     .workers = .{
         .mailer  = .{ .queues = .{"emails"}, .concurrency = 4 },
         .general = .{ .queues = .{ "reports", "default" } },
@@ -1667,13 +1674,19 @@ unchanged), and the job is routed to the queue's backend.
   per-worker poller. **At-least-once** — a crash after a side effect but before the row is
   marked done replays the job, so durable consumers must tolerate replays (idempotency keys
   are the antidote). A **reclaim sweep** resets jobs stranded by a crashed worker (claimed
-  longer than the visibility timeout), and a GC sweep reaps old done/failed rows. The poller
-  and GC jobs are installed **only when a durable queue is declared** — pure-memory and
-  no-queue apps install nothing (zero overhead).
+  longer than that queue's `visibility_timeout_s`), and a GC sweep reaps done/failed rows
+  older than its `done_ttl_s` — **both are per-queue** (set `visibility_timeout_s` above the
+  queue's longest job runtime, or a long job gets reclaimed mid-flight and re-dispatched).
+  The poller and GC jobs are installed **only when a durable queue is declared** —
+  pure-memory and no-queue apps install nothing (zero overhead).
 - **Priority** (`high`/`normal`/`low`) is a per-queue property. A worker bound to several
   queues drains them in strict priority order: all ready `high`-priority jobs first, then
   `normal`, then `low`. There is no weighted-fair scheduler — priority plus the
   worker/`concurrency` topology is the throughput and anti-starvation lever.
+- **Throughput vs. parallelism:** a worker's `concurrency` is the per-poll-cycle **batch
+  size** processed **serially** within that worker — it is NOT a count of parallel handler
+  threads. To run handlers concurrently, declare **multiple workers** (each is its own
+  scheduler job on its own pool thread).
 - **Retry/backoff**: on a retryable failure the durable job's `attempts` is bumped and its
   next run is pushed out by the queue's backoff (`fixed` or `exponential`, with optional
   jitter, capped at `max_ms`); exhausting `max_attempts` marks it `failed` and fires your

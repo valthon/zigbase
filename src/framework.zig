@@ -711,16 +711,21 @@ fn queueWorkerRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!?schedule.Re
     return schedule.Reactive{ .after = .{ .minutes = 0 } };
 }
 
-/// The framework-internal `_queue_gc` job (#137 PR2): reclaims stale claims and reaps
-/// done/failed rows older than the registry TTL, in bounded batches. Registered only when a
-/// durable queue is declared (see `App.queue_gc_jobs`).
+/// The framework-internal `_queue_gc` job (#137 PR2): per durable queue, reclaims stale
+/// claims (using that queue's `visibility_timeout_s`) and reaps done/failed rows older than
+/// that queue's `done_ttl_s`, in bounded batches. Registered only when a durable queue is
+/// declared (see `App.queue_gc_jobs`).
 fn queueGcJob(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
     _ = ev;
     const reg = queue.registryFromApp(ctx.app) orelse return;
+    const now = clock.nowUnix(ctx.app.io);
     const w = ctx.app.pool.acquireWriter();
     defer ctx.app.pool.releaseWriter();
-    _ = queue_durable.reclaimStale(w, clock.nowUnix(ctx.app.io), reg.visibility_timeout_s) catch {};
-    _ = try queue_durable.gcDoneJobs(w, reg.done_ttl_s);
+    for (reg.queues) |q| {
+        if (q.backend != .durable) continue;
+        _ = queue_durable.reclaimStale(w, q.name, now, q.visibility_timeout_s) catch {};
+        _ = queue_durable.gcDoneJobs(w, q.name, q.done_ttl_s) catch {};
+    }
 }
 
 /// Comptime knobs threaded from `App(cfg)` into the serve path: which storage /

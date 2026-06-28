@@ -143,27 +143,29 @@ pub fn markFailed(w: *db.Db, job_id: []const u8, new_attempts: i64, last_error: 
     _ = try st.step();
 }
 
-/// Reclaim sweep: any `claimed` row whose `claimed_at` is older than `visibility_timeout_s`
-/// (relative to `now`) is reset to `pending` so a crashed worker doesn't strand it.
-/// Returns the number reclaimed. Writer held by caller.
-pub fn reclaimStale(w: *db.Db, now: i64, visibility_timeout_s: i64) !usize {
+/// Reclaim sweep for ONE queue: any `claimed` row of `queue_name` whose `claimed_at` is
+/// older than `visibility_timeout_s` (relative to `now`) is reset to `pending` so a crashed
+/// worker (or a handler that overran its timeout) doesn't strand it. The threshold is
+/// per-queue (`QueueDef.visibility_timeout_s`). Returns the number reclaimed. Writer held by caller.
+pub fn reclaimStale(w: *db.Db, queue_name: []const u8, now: i64, visibility_timeout_s: i64) !usize {
     const cutoff = now - visibility_timeout_s;
     var st = try w.prepare(
         \\UPDATE "_queue_jobs" SET "status"='pending', "claimed_at"=NULL, "claimed_by"=''
-        \\ WHERE "status"='claimed' AND "claimed_at" IS NOT NULL AND "claimed_at" <= ?1
+        \\ WHERE "status"='claimed' AND "queue"=?1 AND "claimed_at" IS NOT NULL AND "claimed_at" <= ?2
         \\ RETURNING "id";
     );
     defer st.finalize();
-    try st.bindInt(1, cutoff);
+    try st.bindText(1, queue_name);
+    try st.bindInt(2, cutoff);
     var n: usize = 0;
     while (try st.step()) n += 1;
     return n;
 }
 
-/// GC sweep: delete `done`/`failed` rows whose `created` is older than `ttl_s` seconds, in
-/// bounded batches (mirrors `features_resolver.gcExpiredAssignments`). Returns rows deleted.
-/// Writer held by caller.
-pub fn gcDoneJobs(w: *db.Db, ttl_s: i64) !usize {
+/// GC sweep for ONE queue: delete `done`/`failed` rows of `queue_name` whose `created` is
+/// older than `ttl_s` seconds, in bounded batches (mirrors `features_resolver.gcExpiredAssignments`).
+/// The TTL is per-queue (`QueueDef.done_ttl_s`). Returns rows deleted. Writer held by caller.
+pub fn gcDoneJobs(w: *db.Db, queue_name: []const u8, ttl_s: i64) !usize {
     var buf: [32]u8 = undefined;
     const modifier = std.fmt.bufPrint(&buf, "-{d} seconds", .{ttl_s}) catch unreachable;
     var total: usize = 0;
@@ -172,15 +174,16 @@ pub fn gcDoneJobs(w: *db.Db, ttl_s: i64) !usize {
             \\DELETE FROM "_queue_jobs"
             \\ WHERE rowid IN (
             \\   SELECT rowid FROM "_queue_jobs"
-            \\    WHERE "status" IN ('done','failed')
+            \\    WHERE "status" IN ('done','failed') AND "queue"=?1
             \\      AND strftime('%Y-%m-%dT%H:%M:%SZ', "created") IS NOT NULL
-            \\      AND strftime('%Y-%m-%dT%H:%M:%SZ', "created") <= strftime('%Y-%m-%dT%H:%M:%SZ','now',?1)
+            \\      AND strftime('%Y-%m-%dT%H:%M:%SZ', "created") <= strftime('%Y-%m-%dT%H:%M:%SZ','now',?2)
             \\    LIMIT {d}
             \\ )
             \\ RETURNING "id";
         , .{gc_batch}));
         defer st.finalize();
-        try st.bindText(1, modifier);
+        try st.bindText(1, queue_name);
+        try st.bindText(2, modifier);
         var batch: usize = 0;
         while (try st.step()) batch += 1;
         total += batch;
@@ -211,8 +214,12 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
     const claimed = blk: {
         const w = app.pool.acquireWriter();
         defer app.pool.releaseWriter();
-        _ = reclaimStale(w, now, reg.visibility_timeout_s) catch |e|
-            std.log.warn("queue reclaim sweep failed: {s}", .{@errorName(e)});
+        // Reclaim each durable queue with ITS OWN visibility timeout before claiming.
+        for (durable_qs.items) |qn| {
+            const vt = if (reg.queueByName(qn)) |q| q.visibility_timeout_s else 300;
+            _ = reclaimStale(w, qn, now, vt) catch |e|
+                std.log.warn("queue '{s}' reclaim sweep failed: {s}", .{ qn, @errorName(e) });
+        }
         break :blk try claimBatch(pa, w, durable_qs.items, worker.name, worker.concurrency, now);
     };
 
@@ -324,20 +331,27 @@ test "durable claimBatch drains queues in strict priority order" {
     try testing.expectEqualStrings("lo", c3[0].payload);
 }
 
-test "durable reclaimStale resets only timed-out claimed rows" {
+test "durable reclaimStale honors the per-queue timeout and queue scope" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
     const now: i64 = 1_000_000;
 
-    // Stale claim (claimed_at far in the past) and a fresh claim (just now).
+    // Stale + fresh claims on 'default'; a same-age stale claim on a DIFFERENT queue.
     try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"run_at\",\"status\",\"claimed_at\",\"created\") VALUES ('stale','default','k',5,0,'claimed',900000,datetime('now'));");
     try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"run_at\",\"status\",\"claimed_at\",\"created\") VALUES ('fresh','default','k',5,0,'claimed',999990,datetime('now'));");
+    try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"run_at\",\"status\",\"claimed_at\",\"created\") VALUES ('other','slow','k',5,0,'claimed',900000,datetime('now'));");
 
-    const reclaimed = try reclaimStale(&d, now, 300); // cutoff = 999700
+    // Reclaim 'default' with a 300s timeout (cutoff 999700): only 'stale' qualifies; the
+    // other-queue row is untouched (queue scope) and 'fresh' is too young (timeout honored).
+    const reclaimed = try reclaimStale(&d, "default", now, 300);
     try testing.expectEqual(@as(usize, 1), reclaimed);
-    try testing.expectEqual(@as(i64, 1), try countStatus(&d, "pending")); // stale
-    try testing.expectEqual(@as(i64, 1), try countStatus(&d, "claimed")); // fresh
+    try testing.expectEqual(@as(i64, 1), try countStatus(&d, "pending")); // stale only
+    try testing.expectEqual(@as(i64, 2), try countStatus(&d, "claimed")); // fresh + other
+
+    // A LONGER per-queue timeout (200000s -> cutoff 800000) would NOT reclaim 'stale'.
+    try d.exec("UPDATE \"_queue_jobs\" SET \"status\"='claimed', \"claimed_at\"=900000 WHERE id='stale';");
+    try testing.expectEqual(@as(usize, 0), try reclaimStale(&d, "default", now, 200000));
 }
 
 test "durable markRetry / markFailed update attempts + state" {
@@ -378,7 +392,7 @@ test "durable gcDoneJobs reaps old done/failed rows, keeps fresh + pending" {
     try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('c','q','k',5,'done',datetime('now'));");
     try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('d','q','k',5,'pending',datetime('now'));");
 
-    const deleted = try gcDoneJobs(&d, 30 * 24 * 3600); // 30-day TTL
+    const deleted = try gcDoneJobs(&d, "q", 30 * 24 * 3600); // 30-day TTL
     try testing.expectEqual(@as(usize, 2), deleted);
     var st = try d.prepare("SELECT COUNT(*) FROM \"_queue_jobs\";");
     defer st.finalize();
@@ -469,6 +483,41 @@ test "pollOnce: claim -> dispatch -> done (success)" {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         try testing.expectEqual(@as(i64, 1), try countStatus(w, "done"));
+    }
+}
+
+test "pollOnce honors a CONFIGURED per-queue visibility timeout (reclaims stale, keeps fresh)" {
+    const env = try PollTestEnv.init();
+    defer env.deinit();
+    th_runs = 0;
+    // Queue configured with a 10s visibility timeout (the substantive config gap).
+    const reg = Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable, .visibility_timeout_s = 10 }},
+        .jobs = &.{.{ .kind = "ok", .handler = okHandler }},
+    };
+    const now = clock.nowUnix(env.app.io);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        // A stale claim (aged 20s > 10s timeout) and a fresh one (aged 5s < timeout).
+        var s1 = try w.prepare("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"run_at\",\"status\",\"claimed_at\",\"created\") VALUES ('stale','default','ok',5,0,'claimed',?1,datetime('now'));");
+        try s1.bindInt(1, now - 20);
+        _ = try s1.step();
+        s1.finalize();
+        var s2 = try w.prepare("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"run_at\",\"status\",\"claimed_at\",\"created\") VALUES ('fresh','default','ok',5,0,'claimed',?1,datetime('now'));");
+        try s2.bindInt(1, now - 5);
+        _ = try s2.step();
+        s2.finalize();
+    }
+    const worker = WorkerDef{ .name = "w1", .queues = &.{"default"}, .concurrency = 5 };
+    _ = try pollOnce(&env.app, &reg, worker);
+    // The stale row was reclaimed -> claimed -> dispatched -> done; the fresh row is untouched.
+    try testing.expectEqual(@as(usize, 1), th_runs);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try testing.expectEqual(@as(i64, 1), try countStatus(w, "done")); // stale
+        try testing.expectEqual(@as(i64, 1), try countStatus(w, "claimed")); // fresh, still held
     }
 }
 

@@ -45,8 +45,10 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
             for (std.meta.fields(ST)) |sf| {
                 if (!std.mem.eql(u8, sf.name, "backend") and
                     !std.mem.eql(u8, sf.name, "priority") and
-                    !std.mem.eql(u8, sf.name, "retry"))
-                    @compileError("queue '" ++ f.name ++ "': unknown key '." ++ sf.name ++ "' (recognized keys: .backend, .priority, .retry)");
+                    !std.mem.eql(u8, sf.name, "retry") and
+                    !std.mem.eql(u8, sf.name, "visibility_timeout_s") and
+                    !std.mem.eql(u8, sf.name, "done_ttl_s"))
+                    @compileError("queue '" ++ f.name ++ "': unknown key '." ++ sf.name ++ "' (recognized keys: .backend, .priority, .retry, .visibility_timeout_s, .done_ttl_s)");
             }
             var def = QueueDef{ .name = f.name };
             if (@hasField(ST, "backend")) {
@@ -58,6 +60,12 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
                 def.priority = pr;
             }
             if (@hasField(ST, "retry")) def.retry = retryMeta(f.name, spec.retry);
+            if (@hasField(ST, "visibility_timeout_s")) {
+                if (spec.visibility_timeout_s <= 0)
+                    @compileError("queue '" ++ f.name ++ "': .visibility_timeout_s must be >= 1 (set it above the queue's longest job runtime)");
+                def.visibility_timeout_s = spec.visibility_timeout_s;
+            }
+            if (@hasField(ST, "done_ttl_s")) def.done_ttl_s = spec.done_ttl_s;
             list = list ++ &[_]QueueDef{def};
         }
         if (!has_default)
@@ -247,6 +255,20 @@ test "queueMeta synthesizes a default queue when absent" {
     try testing.expectEqual(queue.Backend.memory, defs[0].backend);
     try testing.expectEqual(queue.Priority.normal, defs[0].priority);
     try testing.expectEqual(@as(u16, 5), defs[0].retry.max_attempts);
+    // Timeout defaults.
+    try testing.expectEqual(@as(i64, 300), defs[0].visibility_timeout_s);
+    try testing.expectEqual(@as(i64, 7 * 24 * 3600), defs[0].done_ttl_s);
+}
+
+test "queueMeta lowers per-queue visibility_timeout_s / done_ttl_s" {
+    const defs = comptime queueMeta(.{
+        .slow = .{ .backend = .durable, .visibility_timeout_s = 1800, .done_ttl_s = 86400 },
+    });
+    // defs[0] is the synthesized default (defaults intact); defs[1] is 'slow'.
+    try testing.expectEqual(@as(i64, 300), defs[0].visibility_timeout_s);
+    try testing.expectEqualStrings("slow", defs[1].name);
+    try testing.expectEqual(@as(i64, 1800), defs[1].visibility_timeout_s);
+    try testing.expectEqual(@as(i64, 86400), defs[1].done_ttl_s);
 }
 
 test "queueMeta lowers backend/priority/retry and keeps an explicit default" {
