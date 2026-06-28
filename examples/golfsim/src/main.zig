@@ -190,24 +190,40 @@ fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     patch.put(req.ctx.arena, "status", .{ .string = "confirmed" }) catch return error.RouteFailed;
     const updated = (records.update("bookings", id, .{ .object = patch }) catch return error.RouteFailed) orelse return error.NotFound;
 
-    // Fire a booking-confirmation webhook (outbound HTTP via `ctx.http()`). The target
-    // URL is operator-configured in the KV store under `booking_webhook_url` (seeded at
-    // startup from the GOLFSIM_BOOKING_WEBHOOK_URL env var — see seedConfig). The call is
-    // BEST-EFFORT: any failure (unset URL, unreachable endpoint, non-2xx) is logged and
-    // swallowed so a flaky webhook never blocks a confirmation or fails the request. On a
-    // dev build it is interceptable via `zigbase.testcapture.http`.
+    // Fire a booking-confirmation webhook (outbound HTTP via `ctx.http()`). This is the
+    // recommended production pattern: rather than blocking the request thread on an outbound
+    // call, OFFLOAD it to the background worker pool with `ctx.app.submit` so the confirm
+    // response returns immediately even if the webhook endpoint is slow. The job reads the
+    // operator-configured URL from KV (`booking_webhook_url`, seeded at startup from the
+    // GOLFSIM_BOOKING_WEBHOOK_URL env var — see seedConfig) and is BEST-EFFORT: any failure
+    // is logged and swallowed so a flaky webhook can never break a confirmation.
     notifyBookingConfirmed(req.ctx, id);
 
     // Return the updated record; the thunk serializes it as the 200 body.
     return updated;
 }
 
-/// Best-effort booking-confirmation webhook. Reads the configured URL from KV and POSTs a
-/// small JSON payload via `ctx.http()`. NEVER propagates an error — a webhook is a
-/// notification, not part of the transaction — so an unreachable endpoint can't break a
-/// confirmation. (Outbound HTTP is deliberately OUTSIDE any `ctx.tx`: a long network stall
-/// must not hold the DB writer.)
+/// Offload the booking-confirmation webhook onto the background worker pool so the request
+/// thread is never blocked on an outbound call. `JobTask` is a bare `*const fn(*Ctx, *JobEvent)`
+/// that can't capture, and `submit` does not copy the name, so we hand the booking id to the
+/// job as its `name` on the long-lived `app.allocator` (the job frees it — see `webhookJob`).
+/// Entirely best-effort: if the scheduler is unavailable we just log and drop the notification.
 fn notifyBookingConfirmed(ctx: *zigbase.Ctx, booking_id: []const u8) void {
+    const id = ctx.app.allocator.dupe(u8, booking_id) catch return;
+    ctx.app.submit(id, webhookJob) catch |err| {
+        ctx.app.allocator.free(id); // submit failed -> nothing will free it; do it here.
+        std.log.warn("could not offload booking webhook: {s}", .{@errorName(err)});
+    };
+}
+
+/// Background job (runs off the request thread) that POSTs the booking-confirmation webhook.
+/// Reads the configured URL from KV and the booking id from `ev.name` (which this app set in
+/// `notifyBookingConfirmed`). Owns and frees `ev.name`. NEVER propagates an error that matters:
+/// a webhook is a notification, not part of the booking, so an unreachable endpoint is logged
+/// and swallowed. On a dev build the call is interceptable via `zigbase.testcapture.http`.
+fn webhookJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
+    const booking_id = ev.name;
+    defer ctx.app.allocator.free(booking_id); // we own the name we submitted.
     const url = (ctx.kv().get("booking_webhook_url") catch return) orelse return;
     if (url.len == 0) return;
     const body = std.fmt.allocPrint(

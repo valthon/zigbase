@@ -87,7 +87,7 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
 | Method | Path | Auth | What it does |
 |--------|------|------|--------------|
-| `POST` | `/api/bookings/:id/confirm` | authed | Host confirms a booking. Multi-hop owner check: booking → listing → simulator → owner. 403 if caller doesn't own the simulator. Gated by the `bookings_frozen` feature flag (`ctx.flag`) — returns 503 when set. On success fires a best-effort booking-confirmation webhook via `ctx.http()`. |
+| `POST` | `/api/bookings/:id/confirm` | authed | Host confirms a booking. Multi-hop owner check: booking → listing → simulator → owner. 403 if caller doesn't own the simulator. Gated by the `bookings_frozen` feature flag (`ctx.flag`) — returns 503 when set. On success offloads a best-effort booking-confirmation webhook (`ctx.http()`) to the background worker pool via `ctx.app.submit` so the response isn't blocked. |
 | `POST` | `/api/bookings/:id/cancel` | authed | Guest cancels their own booking. 403 if caller is not the booking's guest. Reads/writes via `req.ctx.records()`. |
 | `GET` | `/api/listings/:id/availability` | authed | Returns all non-cancelled bookings for a listing for availability calendar rendering. Reads via `req.ctx.records()`. |
 | `POST` | `/api/holds/:id/convert` | authed | Promotes the caller's `hold` into a pending `booking` for a chosen window. Runs the booking-create + hold-delete **atomically in one `ctx.tx()`**. 403 if caller is not the hold's guest. |
@@ -270,13 +270,29 @@ return req.ctx.tx(std.json.Value, convertHoldTxn) catch return error.RouteFailed
 
 ---
 
-### 9. Outbound HTTP — `ctx.http()` (booking-confirmation webhook)
+### 9. Outbound HTTP — `ctx.http()`, offloaded via `ctx.app.submit` (booking webhook)
 
 When a host confirms a booking, `confirmBooking` fires a best-effort webhook via
-`ctx.http()`:
+`ctx.http()`. The **recommended production pattern** is to NOT block the request thread on
+an outbound call — instead offload it to the background worker pool with `ctx.app.submit`,
+so the confirm response returns immediately even if the webhook endpoint is slow:
 
 ```zig
+// In the route: offload, don't block. `JobTask` is a bare fn that can't capture and
+// `submit` doesn't copy `name`, so we hand the booking id to the job as its `name` on a
+// long-lived allocator (the job frees it).
 fn notifyBookingConfirmed(ctx: *zigbase.Ctx, booking_id: []const u8) void {
+    const id = ctx.app.allocator.dupe(u8, booking_id) catch return;
+    ctx.app.submit(id, webhookJob) catch |err| {
+        ctx.app.allocator.free(id);
+        std.log.warn("could not offload booking webhook: {s}", .{@errorName(err)});
+    };
+}
+
+// The background job (off the request thread): reads the URL from KV, POSTs via ctx.http().
+fn webhookJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
+    const booking_id = ev.name;
+    defer ctx.app.allocator.free(booking_id);       // we own the name we submitted
     const url = (ctx.kv().get("booking_webhook_url") catch return) orelse return;
     const body = std.fmt.allocPrint(ctx.arena,
         "{{\"event\":\"booking.confirmed\",\"booking\":\"{s}\"}}", .{booking_id}) catch return;
@@ -287,10 +303,11 @@ fn notifyBookingConfirmed(ctx: *zigbase.Ctx, booking_id: []const u8) void {
 }
 ```
 
-The call **never propagates an error** — a webhook is a notification, not part of the
-transaction, so an unreachable endpoint can't break a confirmation. The target URL is
-read from the KV store (`booking_webhook_url`), seeded at startup by the `onBootstrap`
-handler from the `GOLFSIM_BOOKING_WEBHOOK_URL` env var:
+The job **never propagates an error that matters** — a webhook is a notification, not part
+of the transaction, so an unreachable endpoint can't break a confirmation. (Submitted
+ad-hoc tasks run on a detached thread; see `App.submit`'s doc comment for the shutdown
+caveat.) The target URL is read from the KV store (`booking_webhook_url`), seeded at
+startup by the `onBootstrap` handler from the `GOLFSIM_BOOKING_WEBHOOK_URL` env var:
 
 ```zig
 // onBootstrap: the WRITE side of the KV store from app code (routes only read it).

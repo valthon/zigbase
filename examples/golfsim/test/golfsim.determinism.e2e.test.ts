@@ -117,10 +117,11 @@ describe("golfsim determinism seam + ctx.tx + ctx.http (frozen clock)", () => {
     });
 
     const before = captured.length;
-    // The host confirms; confirmBooking POSTs to the configured webhook via ctx.http().
+    // The host confirms; confirmBooking OFFLOADS the webhook to the background worker pool
+    // (ctx.app.submit), so the POST arrives shortly AFTER the confirm response — poll for it.
     await host.rpc.bookingsConfirm({ id: booking.id });
 
-    const ours = captured.slice(before).find((c) => c.body.includes(booking.id));
+    const ours = await poll(() => captured.slice(before).find((c) => c.body.includes(booking.id)), 2000);
     expect(ours).toBeDefined();
     expect(ours!.method).toBe("POST");
     const payload = JSON.parse(ours!.body);
@@ -128,3 +129,14 @@ describe("golfsim determinism seam + ctx.tx + ctx.http (frozen clock)", () => {
     expect(payload.booking).toBe(booking.id);
   });
 });
+
+/** Poll `fn` until it returns a truthy value or the timeout elapses (50ms interval). */
+async function poll<T>(fn: () => T | undefined, timeoutMs: number): Promise<T | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const v = fn();
+    if (v) return v;
+    if (Date.now() > deadline) return undefined;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
