@@ -75,4 +75,38 @@ describe("golfsim generated client (live golfsim server)", () => {
     const reviews = await anon.db.reviews.getList({ where: { rating: { gte: 4 } } });
     expect(reviews.items.some((r) => r.id === review.id)).toBe(true);
   });
+
+  /**
+   * Session management (#99). golfsim enables `.session_store = .table`, so each login
+   * records a per-device session row. This exercises the full surface:
+   *   - GET  /api/golfsim/sessions            -> ctx.auth().listActiveSessions()
+   *   - POST /api/golfsim/sessions/:id/revoke -> ctx.auth().revoke(id)  (owner-only)
+   *   - POST /api/golfsim/logout-everywhere   -> ctx.auth().revokeAllSessions()
+   */
+  it("per-device sessions: list, revoke one, then logout-everywhere", async () => {
+    // One user, signed in from TWO clients == two device sessions.
+    const { zb: c1 } = await host("sessions@golf.app");
+    const c2 = createClient(server.url, { WebSocket: globalThis.WebSocket });
+    await c2.db.users.authWithPassword("sessions@golf.app", "member-pass-1");
+
+    // c1 sees both sessions; exactly one is flagged is_current (this device).
+    const listed = (await c1.rpc.golfsimSessions()) as { items: Array<{ id: string; is_current: boolean }> };
+    expect(listed.items.length).toBe(2);
+    expect(listed.items.filter((s) => s.is_current).length).toBe(1);
+
+    // Revoke the OTHER device's session (owner-authorized), keeping c1 signed in. After
+    // it, only c1's own (current) session remains.
+    const other = listed.items.find((s) => !s.is_current)!;
+    await c1.rpc.golfsimSessionsRevoke({ id: other.id });
+    const afterRevoke = (await c1.rpc.golfsimSessions()) as { items: Array<{ is_current: boolean }> };
+    expect(afterRevoke.items.length).toBe(1);
+    expect(afterRevoke.items[0]!.is_current).toBe(true);
+
+    // "Log out everywhere" bumps the token epoch + wipes every session row; the calling
+    // client's own token is now invalid, so a follow-up authed call is rejected.
+    // (`fetch` returns the raw Response so we can assert the 204 status.)
+    const res = await c1.fetch("POST", "/api/golfsim/logout-everywhere");
+    expect(res.status).toBe(204);
+    await expect(c1.rpc.golfsimSessions()).rejects.toThrow();
+  });
 });

@@ -51,7 +51,19 @@ async function waitForHealth(url: string, timeoutMs = 20_000): Promise<void> {
   }
 }
 
-export async function startGolfsim(): Promise<GolfServer> {
+/**
+ * Options for {@link startGolfsim}.
+ *
+ * `env` injects extra environment variables into the spawned server process — used by the
+ * determinism e2e to freeze time (`ZIGBASE_FAKE_NOW`) and point the booking webhook at a
+ * loopback capture server (`GOLFSIM_BOOKING_WEBHOOK_URL`). The determinism seam is compiled
+ * in only on a dev-clock build (the default Debug build used here).
+ */
+export interface StartOptions {
+  env?: Record<string, string>;
+}
+
+export async function startGolfsim(opts: StartOptions = {}): Promise<GolfServer> {
   // A prebuilt binary supplied via ZIGBASE_TEST_GOLFSIM_BINARY skips the zig build
   // entirely — no Zig toolchain needed in that job.
   if (!process.env.ZIGBASE_TEST_GOLFSIM_BINARY) {
@@ -69,7 +81,11 @@ export async function startGolfsim(): Promise<GolfServer> {
   // is resolved relative to the server's working directory.
   // stderr is piped so captureVerificationToken() can read LogMailer output;
   // stdout (facil.io startup banner) is inherited for visibility.
-  const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], { cwd: EXAMPLE_ROOT, stdio: ["inherit", "inherit", "pipe"] });
+  const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], {
+    cwd: EXAMPLE_ROOT,
+    stdio: ["inherit", "inherit", "pipe"],
+    env: { ...process.env, ...(opts.env ?? {}) },
+  });
   const url = `http://127.0.0.1:${port}`;
 
   // Accumulate all server stderr text for token extraction; mirror to process stderr.

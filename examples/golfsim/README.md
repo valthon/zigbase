@@ -12,8 +12,10 @@ slots. This is the **middle rung** of a three-example ladder:
 `golfsim` covers the **hard parts** of building a real backend on ZigBase *as a
 library*: multi-collection relations with cascadeDelete, invariant-enforcing hooks
 (double-booking prevention), access rules with relation traversal, file uploads,
-WebSocket realtime, and multiple custom business routes — all with a working
-Astro + React frontend.
+WebSocket realtime, per-device session management (`ctx.auth()`), atomic multi-write
+transactions (`ctx.tx()`), outbound webhooks (`ctx.http()`), and multiple custom
+business routes — all with a working Astro + React frontend, plus a deterministic e2e
+suite that freezes time (`ZIGBASE_FAKE_NOW`) and captures the outbound webhook.
 
 Everything else (HTTP API, SQLite storage, auth, file storage, the admin UI, the
 CLI) comes straight from the framework via the public `zigbase.*` exports.
@@ -85,9 +87,13 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
 | Method | Path | Auth | What it does |
 |--------|------|------|--------------|
-| `POST` | `/api/bookings/:id/confirm` | authed | Host confirms a booking. Multi-hop owner check: booking → listing → simulator → owner. 403 if caller doesn't own the simulator. Gated by the `bookings_frozen` feature flag (`ctx.flag`) — returns 503 when set. |
+| `POST` | `/api/bookings/:id/confirm` | authed | Host confirms a booking. Multi-hop owner check: booking → listing → simulator → owner. 403 if caller doesn't own the simulator. Gated by the `bookings_frozen` feature flag (`ctx.flag`) — returns 503 when set. On success fires a best-effort booking-confirmation webhook via `ctx.http()`. |
 | `POST` | `/api/bookings/:id/cancel` | authed | Guest cancels their own booking. 403 if caller is not the booking's guest. Reads/writes via `req.ctx.records()`. |
 | `GET` | `/api/listings/:id/availability` | authed | Returns all non-cancelled bookings for a listing for availability calendar rendering. Reads via `req.ctx.records()`. |
+| `POST` | `/api/holds/:id/convert` | authed | Promotes the caller's `hold` into a pending `booking` for a chosen window. Runs the booking-create + hold-delete **atomically in one `ctx.tx()`**. 403 if caller is not the hold's guest. |
+| `POST` | `/api/golfsim/logout-everywhere` | authed | "Log out everywhere" via `ctx.auth().revokeAllSessions()` — bumps the token epoch and (in table mode) wipes the principal's session rows; also clears this device's cookies. |
+| `GET` | `/api/golfsim/sessions` | authed | "Active devices": `ctx.auth().listActiveSessions()` → `{"items":[…]}`, each session flagged `is_current`. Requires `.session_store = .table`. |
+| `POST` | `/api/golfsim/sessions/:id/revoke` | authed | "Log out this device": `ctx.auth().revoke(id)`. Owner-authorized — a non-owner or absent id is `404`. |
 | `GET` | `/api/golfsim/health` | public | Smoke endpoint. |
 | `GET` | `/api/golfsim/flags/:name` | public | Public read of one feature flag via `ctx.flag` → `{"name","enabled"}`. Manage values with the superuser settings API (`PUT /api/settings/:key`). |
 | `POST` | `/api/golfsim/logout` | public | Clears the `zb_auth`/`zb_csrf` session cookies via `ctx.auth().clearSession()`. Works even with a stale or expired cookie. |
@@ -199,6 +205,110 @@ lifetime and releases any lazily-acquired connection on exit.
 
 ---
 
+### 7. Per-device session management (`.session_store = .table`)
+
+golfsim opts into **per-device sessions** with `App(.{ ..., .session_store = .table })`.
+Each login records a row in the internal `_sessions` table (the default `.epoch` mode
+keeps only a token-epoch counter and has no per-session inventory), and the framework
+installs a periodic session-GC sweep. The three routes expose the full `ctx.auth()`
+surface (#99):
+
+```zig
+// "Log out everywhere": invalidate every outstanding token + wipe session rows.
+fn logoutEverywhere(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    ctx.auth().revokeAllSessions() catch |e| return ctx.errorResponse(e);
+    return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
+}
+
+// "Active devices": the caller's unexpired sessions, newest first, is_current flagged.
+fn activeDevices(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
+    const sessions = req.ctx.auth().listActiveSessions() catch return error.RouteFailed;
+    // ... serialize { id, created, last_seen, user_agent, ip, is_current } into {"items":[…]} ...
+}
+
+// "Log out this device": revoke ONE session by id. Owner-only (404 for a non-owner).
+fn revokeDevice(req: *zigbase.Req(void)) zigbase.RouteError!RevokeOut {
+    const id = req.param("id") orelse return req.fail(400, "Missing session id.");
+    req.ctx.auth().revoke(id) catch |e| switch (e) {
+        error.NotFound => return error.NotFound,
+        else => return error.RouteFailed,
+    };
+    return .{ .revoked = true };
+}
+```
+
+`listActiveSessions` / `revoke` return `error.SessionStoreNotEnabled` in the default
+`.epoch` mode. `revokeAllSessions` / `refresh` / `rotate` work in both modes.
+
+---
+
+### 8. Atomic multi-write — `ctx.tx()` (hold → booking convert)
+
+`POST /api/holds/:id/convert` promotes a guest's soft `hold` into a real `booking`. The
+booking INSERT and the hold DELETE **must commit or roll back together** — never a
+booking with a live hold (double reservation), never a deleted hold with no booking
+(lost slot). That is exactly what `ctx.tx()` is for:
+
+```zig
+// ctx.tx takes a bare `*const fn(*Tx)` that cannot capture, so dynamic inputs travel
+// through a thread-local (safe: one request per worker thread at a time).
+fn convertHoldTxn(t: *zigbase.Tx) anyerror!std.json.Value {
+    const p = convert_params orelse return error.MissingTxnParams;
+    const created = try t.records().create("bookings", p.booking);
+    if (!try t.records().delete("holds", p.hold_id)) return error.HoldVanished; // rolls back the booking
+    return created;
+}
+
+// in the route handler, after validating + pricing the booking:
+return req.ctx.tx(std.json.Value, convertHoldTxn) catch return error.RouteFailed;
+```
+
+> Note: record `beforeCreate` hooks (like `prepareBooking`) do **not** fire on the
+> `Data`/`ctx.records()` create path, so this server-authoritative route prices the
+> booking itself. Outbound HTTP (the webhook below) stays **outside** any `ctx.tx` — a
+> network stall must never hold the single DB writer.
+
+---
+
+### 9. Outbound HTTP — `ctx.http()` (booking-confirmation webhook)
+
+When a host confirms a booking, `confirmBooking` fires a best-effort webhook via
+`ctx.http()`:
+
+```zig
+fn notifyBookingConfirmed(ctx: *zigbase.Ctx, booking_id: []const u8) void {
+    const url = (ctx.kv().get("booking_webhook_url") catch return) orelse return;
+    const body = std.fmt.allocPrint(ctx.arena,
+        "{{\"event\":\"booking.confirmed\",\"booking\":\"{s}\"}}", .{booking_id}) catch return;
+    _ = ctx.http().post(url, .{
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .body = body,
+    }) catch |err| { std.log.warn("booking webhook POST failed: {s}", .{@errorName(err)}); return; };
+}
+```
+
+The call **never propagates an error** — a webhook is a notification, not part of the
+transaction, so an unreachable endpoint can't break a confirmation. The target URL is
+read from the KV store (`booking_webhook_url`), seeded at startup by the `onBootstrap`
+handler from the `GOLFSIM_BOOKING_WEBHOOK_URL` env var:
+
+```zig
+// onBootstrap: the WRITE side of the KV store from app code (routes only read it).
+fn seedConfig(ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void {
+    const raw = std.c.getenv("GOLFSIM_BOOKING_WEBHOOK_URL") orelse return;
+    ctx.kv().set("booking_webhook_url", std.mem.span(raw)) catch return;
+}
+```
+
+Run with a webhook configured:
+
+```sh
+GOLFSIM_BOOKING_WEBHOOK_URL="https://example.com/hooks/booking" \
+  ./zig-out/bin/golfsim serve --insecure-cookies --data-dir ./data
+```
+
+---
+
 ## Collections
 
 | Collection | Type | Key fields |
@@ -222,7 +332,9 @@ A "hold" is an ephemeral soft-reservation a guest places while paying. Declaring
 `_ttl_gc` job to sweep and delete expired rows automatically (once at startup, then
 every 5 minutes) — no cron required. The `prepareHold` `beforeCreate` hook stamps
 `expires_at = now + 15m` server-side; any client-supplied value is ignored, so a
-caller cannot pin a hold forever.
+caller cannot pin a hold forever. "now" is read from the **database clock**
+(`strftime('%s','now')`) rather than the OS clock, so it honors the `ZIGBASE_FAKE_NOW`
+determinism seam on a dev build (see the determinism e2e below).
 
 ---
 
@@ -299,8 +411,26 @@ npm install && npm run typecheck && npm run test:e2e
 ```
 
 The e2e suite (`test/`) drives the generated typed client (`clients/typescript/zbase.gen.ts`)
-against a live `golfsim` binary — covering CRUD, filtering, auth, and realtime with
-full TypeScript type-checking via `vitest`.
+against a live `golfsim` binary — covering CRUD, filtering, auth, realtime, and the
+session-management routes (`golfsim.e2e.test.ts`), plus the determinism seam, `ctx.tx`,
+and `ctx.http` (`golfsim.determinism.e2e.test.ts`) — all with full TypeScript
+type-checking via `vitest`.
+
+### Determinism e2e — frozen time + captured webhook
+
+`test/golfsim.determinism.e2e.test.ts` starts a golfsim server with `ZIGBASE_FAKE_NOW`
+set (so the whole process clock is frozen) and `GOLFSIM_BOOKING_WEBHOOK_URL` pointed at
+an in-process Node capture server, then asserts:
+
+- A hold's server-stamped `expires_at` equals the frozen instant + 15 min (the
+  `ZIGBASE_FAKE_NOW` seam reaches consumer hook code via the DB clock).
+- `POST /api/holds/:id/convert` creates the booking **and** deletes the hold atomically.
+- Confirming a booking POSTs the `booking.confirmed` webhook to the capture server.
+
+The determinism seam (`ZIGBASE_FAKE_NOW`, test-capture) is compiled in only on a
+`dev_clock` build — the default Debug build the harness produces — and is comptime-
+eliminated from any release binary. See [docs/framework.md](../../docs/framework.md)
+(the determinism + `zigbase.testcapture` sections).
 
 ### Using `zb.rpc.*`
 

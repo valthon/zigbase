@@ -742,6 +742,13 @@ export type HoldsRealtime = RawTypedRealtime<Hold, HoldWhere>;
 
 // ---- createClient ----
 
+export interface ConvertIn {
+  starts_at: string;
+  ends_at: string;
+}
+export interface RevokeOut {
+  revoked: boolean;
+}
 export interface HealthOut {
   status: string;
   app: string;
@@ -792,6 +799,9 @@ export interface ZbClient {
     bookingsConfirm(params: { id: string }, opts?: SendOptions): Promise<unknown>;
     bookingsCancel(params: { id: string }, opts?: SendOptions): Promise<unknown>;
     listingsAvailability(params: { id: string }, opts?: SendOptions): Promise<unknown>;
+    holdsConvert(params: { id: string }, input: ConvertIn, opts?: SendOptions): Promise<unknown>;
+    golfsimSessions(opts?: SendOptions): Promise<unknown>;
+    golfsimSessionsRevoke(params: { id: string }, opts?: SendOptions): Promise<RevokeOut>;
     golfsimHealth(opts?: SendOptions): Promise<HealthOut>;
   };
   authStore: Client["authStore"];
@@ -855,6 +865,15 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       },
       listingsAvailability(params, opts) {
         return base.send("GET", `/api/listings/${encodeURIComponent(String(params.id))}/availability`, opts);
+      },
+      holdsConvert(params, input, opts) {
+        return base.send("POST", `/api/holds/${encodeURIComponent(String(params.id))}/convert`, { body: input, ...opts });
+      },
+      golfsimSessions(opts) {
+        return base.send("GET", `/api/golfsim/sessions`, opts);
+      },
+      golfsimSessionsRevoke(params, opts) {
+        return base.send("POST", `/api/golfsim/sessions/${encodeURIComponent(String(params.id))}/revoke`, opts);
       },
       golfsimHealth(opts) {
         return base.send("GET", `/api/golfsim/health`, opts);

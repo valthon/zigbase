@@ -190,8 +190,39 @@ fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     patch.put(req.ctx.arena, "status", .{ .string = "confirmed" }) catch return error.RouteFailed;
     const updated = (records.update("bookings", id, .{ .object = patch }) catch return error.RouteFailed) orelse return error.NotFound;
 
+    // Fire a booking-confirmation webhook (outbound HTTP via `ctx.http()`). The target
+    // URL is operator-configured in the KV store under `booking_webhook_url` (seeded at
+    // startup from the GOLFSIM_BOOKING_WEBHOOK_URL env var — see seedConfig). The call is
+    // BEST-EFFORT: any failure (unset URL, unreachable endpoint, non-2xx) is logged and
+    // swallowed so a flaky webhook never blocks a confirmation or fails the request. On a
+    // dev build it is interceptable via `zigbase.testcapture.http`.
+    notifyBookingConfirmed(req.ctx, id);
+
     // Return the updated record; the thunk serializes it as the 200 body.
     return updated;
+}
+
+/// Best-effort booking-confirmation webhook. Reads the configured URL from KV and POSTs a
+/// small JSON payload via `ctx.http()`. NEVER propagates an error — a webhook is a
+/// notification, not part of the transaction — so an unreachable endpoint can't break a
+/// confirmation. (Outbound HTTP is deliberately OUTSIDE any `ctx.tx`: a long network stall
+/// must not hold the DB writer.)
+fn notifyBookingConfirmed(ctx: *zigbase.Ctx, booking_id: []const u8) void {
+    const url = (ctx.kv().get("booking_webhook_url") catch return) orelse return;
+    if (url.len == 0) return;
+    const body = std.fmt.allocPrint(
+        ctx.arena,
+        "{{\"event\":\"booking.confirmed\",\"booking\":\"{s}\"}}",
+        .{booking_id},
+    ) catch return;
+    const res = ctx.http().post(url, .{
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .body = body,
+    }) catch |err| {
+        std.log.warn("booking webhook POST failed: {s}", .{@errorName(err)});
+        return;
+    };
+    std.log.info("booking webhook POST -> {d}", .{res.status});
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +292,135 @@ fn listingAvailability(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Valu
     var obj: std.json.ObjectMap = .empty;
     obj.put(req.ctx.arena, "items", .{ .array = arr }) catch return error.RouteFailed;
     return .{ .object = obj };
+}
+
+// ---------------------------------------------------------------------------
+// 4b. Custom route: POST /api/holds/:id/convert  (auth required).
+//
+//    Promote a guest's soft `hold` into a real (pending) `booking` for a chosen time
+//    window. This is the canonical MULTI-WRITE use of `ctx.tx()`: the booking INSERT and
+//    the hold DELETE must be ATOMIC — never a booking with the hold still live (a double
+//    reservation), never a deleted hold with no booking (a lost slot). If either write
+//    fails the whole transaction rolls back.
+//
+//    `ctx.tx` takes a bare `*const fn(*Tx)` callback that cannot capture, so the dynamic
+//    inputs (the hold id + the prepared booking object) travel to the callback through a
+//    thread-local. That is safe here because each facil.io worker thread handles one
+//    request at a time, and we set/read/clear it within this single call.
+// ---------------------------------------------------------------------------
+const ConvertIn = struct { starts_at: []const u8, ends_at: []const u8 };
+
+/// Inputs handed to `convertHoldTxn` (see the thread-local note above).
+const ConvertParams = struct { hold_id: []const u8, booking: std.json.Value };
+threadlocal var convert_params: ?*const ConvertParams = null;
+
+/// The atomic unit run by `ctx.tx`: create the booking AND delete the hold on ONE
+/// in-transaction connection. Returning any error rolls BOTH writes back.
+fn convertHoldTxn(t: *zigbase.Tx) anyerror!std.json.Value {
+    const p = convert_params orelse return error.MissingTxnParams;
+    const created = try t.records().create("bookings", p.booking);
+    // A hold that vanished mid-flight (e.g. TTL-reaped) means we must NOT keep the booking
+    // we just inserted — returning an error rolls it back.
+    if (!try t.records().delete("holds", p.hold_id)) return error.HoldVanished;
+    return created;
+}
+
+fn convertHold(req: *zigbase.Req(ConvertIn)) zigbase.RouteError!std.json.Value {
+    const id = req.param("id") orelse return req.fail(400, "Missing hold id.");
+    if (!isSafeId(id)) return req.fail(400, "Invalid hold id.");
+
+    const records = req.ctx.records();
+
+    // Load the hold; 404 when absent. Verify the caller is the hold's guest (403 otherwise).
+    const hold = (records.get("holds", id, .{}) catch return error.RouteFailed) orelse return error.NotFound;
+    if (hold != .object) return error.NotFound;
+    const guest_id = switch (hold.object.get("guest") orelse return error.Forbidden) {
+        .string => |s| s,
+        else => return error.Forbidden,
+    };
+    if (!std.mem.eql(u8, guest_id, req.auth_id)) return error.Forbidden;
+
+    const listing_id = switch (hold.object.get("listing") orelse return error.NotFound) {
+        .string => |s| s,
+        else => return error.NotFound,
+    };
+    if (!isSafeId(listing_id)) return req.fail(400, "Invalid listing on hold.");
+
+    // Validate the requested window and price it off the listing's rate (the prepareBooking
+    // hook does NOT fire on this server-authoritative create path, so we compute here).
+    const hours = durationHours(req.input.starts_at, req.input.ends_at) catch return req.fail(400, "Invalid time window.");
+    const listing = (records.get("listings", listing_id, .{}) catch return error.RouteFailed) orelse return error.NotFound;
+    if (listing != .object) return error.NotFound;
+    const rate = numberField(listing.object, "price_per_hour") orelse return req.fail(400, "Listing has no rate.");
+
+    // Build the booking object on the request arena (reused by the tx — same arena).
+    var b: std.json.ObjectMap = .empty;
+    const a = req.ctx.arena;
+    b.put(a, "listing", .{ .string = listing_id }) catch return error.RouteFailed;
+    b.put(a, "guest", .{ .string = guest_id }) catch return error.RouteFailed;
+    b.put(a, "starts_at", .{ .string = req.input.starts_at }) catch return error.RouteFailed;
+    b.put(a, "ends_at", .{ .string = req.input.ends_at }) catch return error.RouteFailed;
+    b.put(a, "price_total", .{ .float = hours * rate }) catch return error.RouteFailed;
+    b.put(a, "status", .{ .string = "pending" }) catch return error.RouteFailed;
+
+    const params = ConvertParams{ .hold_id = id, .booking = .{ .object = b } };
+    convert_params = &params;
+    defer convert_params = null;
+
+    // Atomic booking-create + hold-delete. NestedTransaction can't happen here (route ctx).
+    return req.ctx.tx(std.json.Value, convertHoldTxn) catch return error.RouteFailed;
+}
+
+// ---------------------------------------------------------------------------
+// 4c. Session management (#99). golfsim enables `.session_store = .table`, so every
+//     login records a per-DEVICE session row and these routes expose the full surface:
+//       - logout-everywhere  -> ctx.auth().revokeAllSessions()
+//       - sessions (list)    -> ctx.auth().listActiveSessions()
+//       - sessions/:id/revoke-> ctx.auth().revoke(id)   (owner-authorized)
+// ---------------------------------------------------------------------------
+
+/// POST /api/golfsim/logout-everywhere — "log out everywhere": bump the principal's token
+/// epoch so EVERY outstanding token (on every device) immediately stops verifying, and (in
+/// table mode) wipe their session rows. Also clears THIS device's cookies since the current
+/// token is now invalid too.
+fn logoutEverywhere(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    ctx.auth().revokeAllSessions() catch |e| return ctx.errorResponse(e);
+    return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
+}
+
+/// GET /api/golfsim/sessions — "active devices": the caller's unexpired sessions, newest
+/// first, each flagged `is_current`. Requires `.session_store = .table` (else 500). Returns
+/// `{"items":[ {id,created,last_seen,user_agent,ip,is_current}, ... ]}`.
+fn activeDevices(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
+    const sessions = req.ctx.auth().listActiveSessions() catch return error.RouteFailed;
+    const a = req.ctx.arena;
+    var arr = std.json.Array.init(a);
+    for (sessions) |s| {
+        var o: std.json.ObjectMap = .empty;
+        o.put(a, "id", .{ .string = s.id }) catch return error.RouteFailed;
+        o.put(a, "created", .{ .string = s.created }) catch return error.RouteFailed;
+        o.put(a, "last_seen", .{ .string = s.last_seen }) catch return error.RouteFailed;
+        o.put(a, "user_agent", .{ .string = s.user_agent }) catch return error.RouteFailed;
+        o.put(a, "ip", .{ .string = s.ip }) catch return error.RouteFailed;
+        o.put(a, "is_current", .{ .bool = s.is_current }) catch return error.RouteFailed;
+        arr.append(.{ .object = o }) catch return error.RouteFailed;
+    }
+    var wrap: std.json.ObjectMap = .empty;
+    wrap.put(a, "items", .{ .array = arr }) catch return error.RouteFailed;
+    return .{ .object = wrap };
+}
+
+/// POST /api/golfsim/sessions/:id/revoke — "log out this device": revoke ONE session by id.
+/// OWNER-AUTHORIZED — a caller may revoke only a session they own; a non-owner or absent id
+/// is indistinguishable (404). Requires `.session_store = .table`.
+const RevokeOut = struct { revoked: bool };
+fn revokeDevice(req: *zigbase.Req(void)) zigbase.RouteError!RevokeOut {
+    const id = req.param("id") orelse return req.fail(400, "Missing session id.");
+    req.ctx.auth().revoke(id) catch |e| switch (e) {
+        error.NotFound => return error.NotFound,
+        else => return error.RouteFailed,
+    };
+    return .{ .revoked = true };
 }
 
 // ---------------------------------------------------------------------------
@@ -442,11 +602,28 @@ fn prepareHold(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     try rec.put(ev.arena, "guest", .{ .string = try ev.arena.dupe(u8, guest) });
 
     // Server-stamped expiry (now + 15m), ignoring any client-supplied expires_at.
-    // Wall-clock "now" comes from the app's std.Io (Zig 0.16 has no std.time.timestamp()).
-    const ts = std.Io.Timestamp.now(ctx.app.io, .real);
-    const now_s: i64 = @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+    // "now" is read from the DATABASE clock (`strftime('%s','now')`) rather than the OS
+    // clock so it honors the determinism seam: under a `dev_clock` build with
+    // `ZIGBASE_FAKE_NOW` set, SQLite's `'now'` is shadowed to the frozen instant
+    // (clock_sql.zig), so a hold's `expires_at` is deterministic in e2e tests
+    // (see test/golfsim.determinism.e2e.test.ts). A production build never reads
+    // the env var, so this is plain wall-clock there.
+    const now_s = try dbNowUnix(ctx);
     const expires_at = try isoFromEpoch(ev.arena, now_s + hold_ttl_seconds);
     try rec.put(ev.arena, "expires_at", .{ .string = expires_at });
+}
+
+/// Read the current time (unix seconds) from the DATABASE clock via `strftime('%s','now')`.
+/// Routing "now" through SQLite — rather than the OS clock — means it honors the
+/// `ZIGBASE_FAKE_NOW` determinism seam on a dev build (SQLite's `'now'` is shadowed to
+/// the frozen instant), while staying real wall-clock on a production build. `ctx`
+/// supplies the connection: the bound writer inside a hook, else a pooled reader.
+fn dbNowUnix(ctx: *zigbase.Ctx) !i64 {
+    const conn = try ctx.connForRead();
+    var st = try conn.prepare("SELECT CAST(strftime('%s','now') AS INTEGER);");
+    defer st.finalize();
+    if (!try st.step()) return error.ClockUnavailable;
+    return st.columnInt(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +715,13 @@ fn isoFromEpoch(alloc: std.mem.Allocator, secs: i64) ![]u8 {
     const day = doy - @divFloor(153 * mp + 2, 5) + 1; // 1..31
     const month = if (mp < 10) mp + 3 else mp - 9; // 1..12
     const year = if (month <= 2) y + 1 else y;
-    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{ year, month, day, hour, minute, second });
+    // Cast to unsigned before formatting: Zig 0.16's `{d:0>N}` zero-pad emits a `+` sign for
+    // SIGNED integers (e.g. "+2030-+6-..."), which datetime validators then reject. All six
+    // fields are non-negative for an in-range instant. (Mirrors datetime.formatUtc.)
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        @as(u64, @intCast(year)),   @as(u64, @intCast(month)),  @as(u64, @intCast(day)),
+        @as(u64, @intCast(hour)),   @as(u64, @intCast(minute)), @as(u64, @intCast(second)),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +766,24 @@ fn logout(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
 }
 
+/// `onBootstrap` lifecycle handler: seed mutable server config into the KV store at startup.
+/// Here we read the optional `GOLFSIM_BOOKING_WEBHOOK_URL` env var and, when set, persist it
+/// as the `booking_webhook_url` setting — the WRITE side of the KV store from app code (the
+/// flag/confirm routes only READ it). Routes then read the URL via `ctx.kv().get(...)`, so an
+/// operator can also change it live through the superuser settings API without a redeploy.
+fn seedConfig(ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void {
+    _ = ev;
+    // golfsim links libc (build.zig: link_libc = true), so std.c.getenv is available.
+    const raw = std.c.getenv("GOLFSIM_BOOKING_WEBHOOK_URL") orelse return;
+    const url = std.mem.span(raw);
+    if (url.len == 0) return;
+    ctx.kv().set("booking_webhook_url", url) catch |e| {
+        std.log.warn("seedConfig: could not persist booking_webhook_url: {s}", .{@errorName(e)});
+        return;
+    };
+    std.log.info("seedConfig: booking webhook configured", .{});
+}
+
 // ---------------------------------------------------------------------------
 // App wiring
 // ---------------------------------------------------------------------------
@@ -596,10 +797,23 @@ pub const App = zigbase.App(.{
         .beforeAuthSuccess = bumpLoginCount,
         // #98: auth lifecycle hooks. Seed loginCount=0 on registration (in the create txn).
         .auth = .{ .beforeRegister = seedNewUser },
+        // Per-device sessions (#99): every login records a row in the internal `_sessions`
+        // table, enabling the `listActiveSessions` / `revoke(id)` per-device surface below
+        // (and installing the periodic session-GC sweep). The default `.epoch` mode keeps
+        // only a token-epoch counter and has no per-session inventory.
+        .session_store = .table,
+        // Seed mutable config (the booking webhook URL) from the environment into KV at boot.
+        .onBootstrap = seedConfig,
         .routes = .{
             .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
             .{ .method = .POST, .path = "/api/bookings/:id/cancel", .handler = cancelBooking, .auth = .authed },
             .{ .method = .GET, .path = "/api/listings/:id/availability", .handler = listingAvailability, .auth = .authed },
+            // Atomic hold->booking convert (ctx.tx): create booking + delete hold together.
+            .{ .method = .POST, .path = "/api/holds/:id/convert", .handler = convertHold, .auth = .authed },
+            // Session management (#99) — per-device, via ctx.auth().
+            .{ .method = .POST, .path = "/api/golfsim/logout-everywhere", .handler = logoutEverywhere, .auth = .authed },
+            .{ .method = .GET, .path = "/api/golfsim/sessions", .handler = activeDevices, .auth = .authed },
+            .{ .method = .POST, .path = "/api/golfsim/sessions/:id/revoke", .handler = revokeDevice, .auth = .authed },
             .{ .method = .GET, .path = "/api/golfsim/health", .handler = health, .auth = .public },
             // #86: custom one-line logout via ctx.auth().clearSession().
             .{ .method = .POST, .path = "/api/golfsim/logout", .handler = logout, .auth = .public },
