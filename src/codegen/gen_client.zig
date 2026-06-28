@@ -6,6 +6,7 @@
 const std = @import("std");
 const schema = @import("../schema.zig");
 const events = @import("../events.zig");
+const features = @import("../features.zig");
 const emit = @import("emit.zig");
 const guards = @import("guards.zig");
 const ident = @import("identifiers.zig");
@@ -55,6 +56,11 @@ pub fn generate(
     cols: []const schema.Collection,
     comptime routes: []const events.RouteMeta,
     comptime custom_auth: []const events.CustomAuthMeta,
+    // Declared feature-flag + experiment metadata (#130). Plain data (no `type`
+    // fields), so these are runtime params; the runtime-introspection path passes
+    // empty (`&.{}`), exactly the asymmetry of routes/custom_auth.
+    flags: []const features.FlagDef,
+    experiments: []const features.ExperimentDef,
     in_repo: bool,
     auth_collection: []const u8,
     client_name: []const u8,
@@ -133,7 +139,7 @@ pub fn generate(
     defer seen.deinit();
     const rpc_section = try rpc.renderShared(routes, alloc, &seen);
     // rpc_section slices are owned by the arena (alloc), freed on arena deinit.
-    try emitClientFactory(alloc, &w, cols, client_name, auth_collection, rpc_section, routes.len, api_prefix, custom_auth, &seen);
+    try emitClientFactory(alloc, &w, cols, client_name, auth_collection, rpc_section, routes.len, api_prefix, custom_auth, &seen, flags, experiments);
 
     return w.toOwnedSlice(alloc);
 }
@@ -150,7 +156,12 @@ fn emitClientFactory(
     api_prefix: []const u8,
     comptime custom_auth: []const events.CustomAuthMeta,
     seen: *rpc_ts.SeenMap,
+    flags: []const features.FlagDef,
+    experiments: []const features.ExperimentDef,
 ) !void {
+    // The typed feature-state surface (`zb.flags.resolveAll`) is emitted only when the
+    // app declares at least one flag or experiment (otherwise the snapshot is unchanged).
+    const has_features = flags.len > 0 or experiments.len > 0;
     // Pre-build the auth iface + factory sections (empty if no non-password methods).
     // `auth_decls` receives the named `export interface`/`export type` declarations for
     // any TYPED custom auth methods (deduped through the shared `seen` map).
@@ -176,6 +187,12 @@ fn emitClientFactory(
         try section(alloc, w, "Custom auth method I/O");
         try w.appendSlice(alloc, auth_decls_s);
     }
+    // Named FeatureState type for the public `zb.flags.resolveAll` surface (#130):
+    // flags as named booleans, experiments as string-literal unions of their variants.
+    if (has_features) {
+        try section(alloc, w, "Feature state");
+        try emitFeatureState(alloc, w, flags, experiments);
+    }
     // BlogClient-style interface
     try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "export interface {s} {{\n  db: {{\n", .{client_name}));
     for (cols) |c| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: {s};\n", .{ c.name, try ident.serviceName(alloc, c.name) }));
@@ -184,6 +201,12 @@ fn emitClientFactory(
     // auth method stubs (non-password methods only; password stays on db.<col>.authWithPassword)
     try w.appendSlice(alloc, "  };\n");
     if (has_auth_methods) try w.appendSlice(alloc, auth_iface_s);
+    if (has_features) try w.appendSlice(alloc,
+        \\  flags: {
+        \\    resolveAll(subject: string): Promise<FeatureState>;
+        \\  };
+        \\
+    );
     if (routes_len > 0) {
         try w.appendSlice(alloc,
             \\  files: FilesService;
@@ -294,10 +317,20 @@ fn emitClientFactory(
     if (has_auth_methods) {
         try w.appendSlice(alloc, "    },\n");
         try w.appendSlice(alloc, auth_factory_s);
-        try w.appendSlice(alloc, "    files: base.files,\n");
     } else {
-        try w.appendSlice(alloc, "    },\n    files: base.files,\n");
+        try w.appendSlice(alloc, "    },\n");
     }
+    // Typed feature-state surface (#130): GET <prefix>/state?subject=<id>.
+    if (has_features) {
+        try w.appendSlice(alloc, try std.fmt.allocPrint(alloc,
+            \\    flags: {{
+            \\      resolveAll: (subject: string): Promise<FeatureState> =>
+            \\        base.send<FeatureState>("GET", `{s}/state?subject=${{encodeURIComponent(subject)}}`),
+            \\    }},
+            \\
+        , .{api_prefix}));
+    }
+    try w.appendSlice(alloc, "    files: base.files,\n");
     if (routes_len > 0) {
         try w.appendSlice(alloc, "    rpc: {\n");
         try w.appendSlice(alloc, rpc_section.factory_member);
@@ -311,6 +344,42 @@ fn emitClientFactory(
         \\}
         \\
     );
+}
+
+/// Emit `export interface FeatureState { … }` for the public `zb.flags.resolveAll`
+/// surface (#130): each declared flag is a named `boolean`; each experiment is a
+/// string-literal union of its declared variants. Empty groups map to
+/// `Record<string, never>` (the precise empty-object type the server returns).
+/// Flag/experiment names are Zig identifiers, so they need no quoting.
+fn emitFeatureState(
+    alloc: std.mem.Allocator,
+    w: *W,
+    flags: []const features.FlagDef,
+    experiments: []const features.ExperimentDef,
+) !void {
+    try w.appendSlice(alloc, "export interface FeatureState {\n");
+    if (flags.len == 0) {
+        try w.appendSlice(alloc, "  flags: Record<string, never>;\n");
+    } else {
+        try w.appendSlice(alloc, "  flags: {\n");
+        for (flags) |f| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: boolean;\n", .{f.name}));
+        try w.appendSlice(alloc, "  };\n");
+    }
+    if (experiments.len == 0) {
+        try w.appendSlice(alloc, "  experiments: Record<string, never>;\n");
+    } else {
+        try w.appendSlice(alloc, "  experiments: {\n");
+        for (experiments) |e| {
+            try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: ", .{e.name}));
+            for (e.variants, 0..) |v, i| {
+                if (i > 0) try w.appendSlice(alloc, " | ");
+                try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\"", .{v}));
+            }
+            try w.appendSlice(alloc, ";\n");
+        }
+        try w.appendSlice(alloc, "  };\n");
+    }
+    try w.appendSlice(alloc, "}\n");
 }
 
 fn emit_hasRelations(c: schema.Collection) bool {
@@ -774,7 +843,7 @@ fn authCollectionName(cols: []const schema.Collection) []const u8 {
 /// as named modules) and call mainWithCollections() here. This keeps gen_client.zig
 /// as a self-contained library file usable by the zigbase test suite WITHOUT being
 /// a module root.
-pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collection, comptime routes: []const events.RouteMeta, comptime custom_auth: []const events.CustomAuthMeta) !void {
+pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collection, comptime routes: []const events.RouteMeta, comptime custom_auth: []const events.CustomAuthMeta, flags: []const features.FlagDef, experiments: []const features.ExperimentDef) !void {
     const io = init.io;
     // Use an arena for all temporary allocations during the generator run.
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
@@ -794,7 +863,7 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
     const in_repo = init.environ_map.contains("ZBASE_INREPO");
     const client_name = "ZbClient";
 
-    const text = generate(a, cols, routes, custom_auth, in_repo, authCollectionName(cols), client_name, args.api_prefix) catch |e| {
+    const text = generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix) catch |e| {
         // guard messages are printed via the report; re-run path for the message:
         var report = guards.GuardReport{ .message = "" };
         guards.checkOperatorNames(a, cols, &report) catch {};
@@ -831,7 +900,7 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
 /// the Zig 0.16 "file exists in multiple modules" error (see note above).
 pub fn main(init: std.process.Init) !void {
     const app = @import("app");
-    return mainWithCollections(init, app.App.collections, app.App.routes, app.App.custom_auth);
+    return mainWithCollections(init, app.App.collections, app.App.routes, app.App.custom_auth, app.App.flags, app.App.experiments);
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +929,7 @@ test "generate emits a parseable file with the expected top-level constructs" {
     defer arena.deinit();
     const a = arena.allocator();
     const cols = try miniBlog(a);
-    const out = try generate(a, cols, &.{}, &.{}, true, "users", "BlogClient", "/api");
+    const out = try generate(a, cols, &.{}, &.{}, &.{}, &.{}, true, "users", "BlogClient", "/api");
     try std.testing.expect(std.mem.startsWith(u8, out, "// generated by zigbase — do not edit\n// schema-hash: "));
     inline for (.{
         "export interface Post {",        "export type PostStatus =",
@@ -893,7 +962,7 @@ test "--check diff: stale buffer differs from fresh output" {
     defer arena.deinit();
     const a = arena.allocator();
     const cols = try miniBlog(a);
-    const fresh = try generate(a, cols, &.{}, &.{}, true, "users", "BlogClient", "/api");
+    const fresh = try generate(a, cols, &.{}, &.{}, &.{}, &.{}, true, "users", "BlogClient", "/api");
     const stale = try std.fmt.allocPrint(a, "{s}\n// drift\n", .{fresh});
     try std.testing.expect(!std.mem.eql(u8, fresh, stale)); // --check would exit non-zero
     try std.testing.expect(std.mem.eql(u8, fresh, fresh));   // --check would exit zero
@@ -909,7 +978,7 @@ test "guards run inside generate: operator-named relation target errors" {
         .{ .id = "", .name = "tags", .fields = tag_f },
         .{ .id = "", .name = "posts", .fields = post_f },
     });
-    try std.testing.expectError(guards.GuardError.OperatorNameClash, generate(a, cols, &.{}, &.{}, true, "", "ZbClient", "/api"));
+    try std.testing.expectError(guards.GuardError.OperatorNameClash, generate(a, cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api"));
 }
 
 test "auth-method endpoints: magic_link emits TYPED initiate/complete; password emits nothing" {
@@ -928,7 +997,7 @@ test "auth-method endpoints: magic_link emits TYPED initiate/complete; password 
             .options = .{ .auth = .{ .methods = .{ .magic_link = .{} } } },
         },
     });
-    const out_ml = try generate(a, members_cols, &.{}, &.{}, true, "members", "MembersClient", "/api");
+    const out_ml = try generate(a, members_cols, &.{}, &.{}, &.{}, &.{}, true, "members", "MembersClient", "/api");
     // Should contain magic_link initiate + complete paths
     try std.testing.expect(std.mem.indexOf(u8, out_ml, "/auth/magic_link/initiate") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_ml, "/auth/magic_link/complete") != null);
@@ -956,7 +1025,7 @@ test "auth-method endpoints: magic_link emits TYPED initiate/complete; password 
             .options = .{ .auth = .{ .methods = .{ .password = .{} } } },
         },
     });
-    const out_pw = try generate(a, pw_cols, &.{}, &.{}, true, "users", "UsersClient", "/api");
+    const out_pw = try generate(a, pw_cols, &.{}, &.{}, &.{}, &.{}, true, "users", "UsersClient", "/api");
     // Should NOT contain any /auth/password/ URL stubs
     try std.testing.expect(std.mem.indexOf(u8, out_pw, "/auth/password/") == null);
     // Should NOT contain an auth namespace on the client interface
@@ -982,7 +1051,7 @@ test "auth-method endpoints: otp + webauthn emit precise typed I/O" {
             } } },
         },
     });
-    const out = try generate(a, cols, &.{}, &.{}, true, "users", "UsersClient", "/api");
+    const out = try generate(a, cols, &.{}, &.{}, &.{}, &.{}, true, "users", "UsersClient", "/api");
     inline for (.{
         // OTP typed I/O
         "export interface OtpInitiateInput {",
@@ -1023,7 +1092,7 @@ test "auth-method endpoints: custom slugs stay untyped with a follow-up TODO" {
     });
     // Back-compat: a bare-string slug stays UNTYPED even with the comptime custom-auth
     // channel present (here empty) — exactly the pre-#119 behavior.
-    const out = try generate(a, cols, &.{}, &.{}, true, "users", "UsersClient", "/api");
+    const out = try generate(a, cols, &.{}, &.{}, &.{}, &.{}, true, "users", "UsersClient", "/api");
     // Custom slug present + camelCased.
     try std.testing.expect(std.mem.indexOf(u8, out, "/auth/my_method/initiate") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "myMethod") != null);
@@ -1065,7 +1134,7 @@ test "auth-method endpoints: custom methods with declared I/O emit typed interfa
         .CompleteInput = SsoCompleteReq,
         .CompleteOutput = SsoCompleteResp,
     }};
-    const out = try generate(a, cols, &.{}, &custom_auth, true, "users", "UsersClient", "/api");
+    const out = try generate(a, cols, &.{}, &custom_auth, &.{}, &.{}, true, "users", "UsersClient", "/api");
 
     // Named interfaces emitted (by the Zig type's own short name).
     inline for (.{
@@ -1107,7 +1176,7 @@ test "auth-method endpoints: custom method void I/O omits input arg and returns 
         .slug = "api_token",
         .CompleteOutput = TokenResp,
     }};
-    const out = try generate(a, cols, &.{}, &custom_auth, true, "users", "UsersClient", "/api");
+    const out = try generate(a, cols, &.{}, &custom_auth, &.{}, &.{}, true, "users", "UsersClient", "/api");
 
     // void input → no `input` arg; void output → Promise<void>.
     try std.testing.expect(std.mem.indexOf(u8, out, "initiate(opts?: SendOptions): Promise<void>;") != null);
@@ -1116,6 +1185,55 @@ test "auth-method endpoints: custom method void I/O omits input arg and returns 
     try std.testing.expect(std.mem.indexOf(u8, out, "export interface TokenResp {") != null);
     // Typed method must NOT fall back to the untyped Record stub.
     try std.testing.expect(std.mem.indexOf(u8, out, "Record<string, unknown>") == null);
+}
+
+test "feature state: typed zb.flags.resolveAll emits named booleans + variant unions (#130)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try miniBlog(a);
+
+    const flags = [_]features.FlagDef{
+        .{ .name = "checkout_enabled", .default = true },
+        .{ .name = "new_dashboard", .default = false },
+    };
+    const experiments = [_]features.ExperimentDef{
+        .{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 } },
+    };
+    const out = try generate(a, cols, &.{}, &.{}, &flags, &experiments, true, "users", "ZbClient", "/api");
+
+    // Named FeatureState type: flags as booleans, experiment as a string-literal union.
+    inline for (.{
+        "export interface FeatureState {",
+        "    checkout_enabled: boolean;",
+        "    new_dashboard: boolean;",
+        "    checkout_layout: \"control\" | \"compact\";",
+        // Client interface member + factory member targeting GET <prefix>/state.
+        "  flags: {",
+        "    resolveAll(subject: string): Promise<FeatureState>;",
+        "base.send<FeatureState>(\"GET\", `/api/state?subject=${encodeURIComponent(subject)}`)",
+    }) |needle| try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
+}
+
+test "feature state: surface is omitted when no flags/experiments are declared" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try miniBlog(a);
+    const out = try generate(a, cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api");
+    try std.testing.expect(std.mem.indexOf(u8, out, "FeatureState") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "resolveAll(subject") == null);
+}
+
+test "feature state: flags-only app yields Record<string, never> experiments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try miniBlog(a);
+    const flags = [_]features.FlagDef{.{ .name = "promo_banner", .default = false }};
+    const out = try generate(a, cols, &.{}, &.{}, &flags, &.{}, true, "users", "ZbClient", "/api");
+    try std.testing.expect(std.mem.indexOf(u8, out, "    promo_banner: boolean;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "  experiments: Record<string, never>;") != null);
 }
 
 test "customAuthMeta reflects struct entries and skips bare strings" {
