@@ -372,6 +372,20 @@ pub const CustomAuthMeta = struct {
     CompleteOutput: type = void,
 };
 
+/// Comptime guard for a custom-auth `.Initiate`/`.Complete` sub-struct: it must be a
+/// struct whose only keys are `.Input`/`.Output`. A typo'd key would otherwise be
+/// silently ignored and the type would default to `void` (loud-comptime convention).
+fn validateFlowKeys(comptime Flow: type, comptime col_name: []const u8, comptime which: []const u8) void {
+    comptime {
+        if (@typeInfo(Flow) != .@"struct")
+            @compileError("collection '" ++ col_name ++ "' custom auth entry ." ++ which ++ " must be a struct of the form .{ .Input = T, .Output = U }");
+        for (std.meta.fields(Flow)) |kf| {
+            if (!std.mem.eql(u8, kf.name, "Input") and !std.mem.eql(u8, kf.name, "Output"))
+                @compileError("collection '" ++ col_name ++ "' custom auth entry ." ++ which ++ ": unknown key '." ++ kf.name ++ "' (recognized keys: .Input, .Output)");
+        }
+    }
+}
+
 /// Reflect a raw `.collections` config literal into `[]const CustomAuthMeta`, one
 /// entry per STRUCT custom-auth method across all collections. Walks each
 /// collection's `.auth.methods.custom` tuple; bare-string elements are skipped
@@ -420,13 +434,18 @@ pub fn customAuthMeta(comptime cols_cfg: anytype) []const CustomAuthMeta {
                                 @compileError("collection '" ++ col_name ++ "' custom auth entry: unknown key '." ++ kf.name ++ "' (recognized keys: .slug, .Initiate, .Complete)");
                         }
                         var meta = CustomAuthMeta{ .col_name = col_name, .slug = elem.slug };
+                        // Loud-comptime: an `.Initiate`/`.Complete` sub-struct must be a
+                        // struct whose only keys are `.Input`/`.Output` — otherwise a typo
+                        // like `.input`/`.ouput` would SILENTLY fall back to `void`.
                         if (@hasField(E, "Initiate")) {
                             const ini = elem.Initiate;
+                            validateFlowKeys(@TypeOf(ini), col_name, "Initiate");
                             if (@hasField(@TypeOf(ini), "Input")) meta.InitiateInput = ini.Input;
                             if (@hasField(@TypeOf(ini), "Output")) meta.InitiateOutput = ini.Output;
                         }
                         if (@hasField(E, "Complete")) {
                             const cmp = elem.Complete;
+                            validateFlowKeys(@TypeOf(cmp), col_name, "Complete");
                             if (@hasField(@TypeOf(cmp), "Input")) meta.CompleteInput = cmp.Input;
                             if (@hasField(@TypeOf(cmp), "Output")) meta.CompleteOutput = cmp.Output;
                         }

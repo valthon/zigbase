@@ -10,6 +10,7 @@ const emit = @import("emit.zig");
 const guards = @import("guards.zig");
 const ident = @import("identifiers.zig");
 const rpc_ts = @import("rpc_ts.zig");
+const rpc = @import("rpc.zig");
 
 const W = std.ArrayList(u8);
 
@@ -130,7 +131,7 @@ pub fn generate(
     // ambiguous client (Decision E).
     var seen = rpc_ts.SeenMap.init(alloc);
     defer seen.deinit();
-    const rpc_section = try @import("rpc.zig").renderShared(routes, alloc, &seen);
+    const rpc_section = try rpc.renderShared(routes, alloc, &seen);
     // rpc_section slices are owned by the arena (alloc), freed on arena deinit.
     try emitClientFactory(alloc, &w, cols, client_name, auth_collection, rpc_section, routes.len, api_prefix, custom_auth, &seen);
 
@@ -144,7 +145,7 @@ fn emitClientFactory(
     cols: []const schema.Collection,
     client_name: []const u8,
     auth_collection: []const u8,
-    rpc_section: @import("rpc.zig").Section,
+    rpc_section: rpc.Section,
     routes_len: usize,
     api_prefix: []const u8,
     comptime custom_auth: []const events.CustomAuthMeta,
