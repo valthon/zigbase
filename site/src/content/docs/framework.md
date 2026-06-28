@@ -333,6 +333,13 @@ the route on a shared secret the caller presents (think unguessable webhook/depl
 - Both guards **compose** on one route — the path-secret check is ordered first, so a wrong
   secret 404s without consuming the rate-limit budget.
 
+> **Ordering caveat.** Because `path_secret` runs *before* `rate_limit`, a `.rate_limit` on a
+> path-secret route throttles **authorized** traffic (requests that pass the secret check) — it
+> does **not** throttle secret-*guessing*, since a wrong secret 404s before reaching the limiter.
+> This ordering is intentional (a flood of bad guesses can't exhaust a legitimate caller's
+> budget). Rely on a **high-entropy secret** for brute-force resistance — the constant-time
+> compare already makes guessing infeasible — not on the per-route rate limit.
+
 ### Response builders + deferred cookies/headers (`ctx`)
 
 The raw `http.Response` literal is always available — but for the common shapes the `ctx`
