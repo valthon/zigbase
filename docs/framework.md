@@ -2143,7 +2143,7 @@ shipped binaries, so a production binary has the override code comptime-eliminat
 
 You can also force the prod-safe behavior explicitly: `zig build -Ddev-clock=false`.
 
-CI runs both passes: the default `Debug` pass (dev features on, prod-gate assertions skipped) and a `-Ddev-clock=false` prod-gate pass (dev features off, prod-gate assertions executed) that verifies the compiled-out guarantee on every push.
+CI runs both passes: the default `Debug` pass (dev features on, prod-gate assertions skipped) and a `-Ddev-clock=false` prod-gate pass (dev features off, prod-gate assertions executed) to verify the compiled-out guarantee.
 
 ## Exported names reference
 
