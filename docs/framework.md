@@ -589,7 +589,7 @@ fn submitHandler(ctx: *zigbase.Ctx, ev: *zigbase.events.RouteEvent) anyerror!htt
 | `ok`      | `bool`            | always               | `true` = token accepted             |
 | `score`   | `?f32`            | reCAPTCHA v3 only    | 0.0 = bot, 1.0 = human              |
 | `action`  | `?[]const u8`     | reCAPTCHA v3 only    | Action name from the frontend call  |
-| `hostname`| `?[]const u8`     | all except hCaptcha  | Domain that issued the token        |
+| `hostname`| `?[]const u8`     | all providers        | Domain that issued the token        |
 | `errors`  | `[]const []const u8` | when `ok=false`   | Provider error codes                |
 
 **Provider URL mapping:**
@@ -604,8 +604,14 @@ fn submitHandler(ctx: *zigbase.Ctx, ev: *zigbase.events.RouteEvent) anyerror!htt
 **Dev-bypass:** when `app.captcha_secret` is empty (the default when `.captcha` is not
 configured), `ctx.verifyCaptcha` returns `.{.ok = true}` immediately — no network call,
 no live key needed. This lets local development and unit tests work without a real provider.
+A configured-provider-with-empty-secret logs a loud startup warning.
 
-**Network errors** propagate as a Zig error; the handler decides fail-open vs fail-closed:
+> **Never deploy with an empty secret** — every `verifyCaptcha` call returns `ok=true`
+> without contacting the provider.
+
+**Errors** propagate as a Zig error so the handler can tell a verdict (`ok=false`) apart from a
+non-verdict (an error) and decide fail-open vs fail-closed: `error.TransportFailed` (network),
+`error.CaptchaProviderError` (non-2xx reply), `error.CaptchaParseError` (malformed/non-object JSON):
 
 ```zig
 const r = ctx.verifyCaptcha(.turnstile, token) catch |e| {

@@ -1445,6 +1445,12 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         // the global default. (null only in tests/CLI that construct App directly.)
         .rate_limiter = &rate_limiter,
     };
+    // Loud startup warning for the captcha dev-bypass: a configured provider with an empty
+    // secret silently passes EVERY verifyCaptcha (the dev-bypass), a prod footgun. Mirrors
+    // the `@public`-rule startup warning so operators catch it before deploying.
+    if (opts.captcha_provider != null and opts.captcha_secret.len == 0) {
+        std.log.warn("captcha: provider configured but secret is empty — dev-bypass active, ALL captchas will pass; set the secret before deploying", .{});
+    }
     const Ctx = @import("ctx.zig").Ctx;
     // Each lifecycle hook gets a per-invocation arena owning any ctx.records()
     // results, declared before cx so its deinit runs last (LIFO).

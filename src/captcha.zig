@@ -11,7 +11,7 @@
 //! |---------------|--------------------------------------------------------------------------|--------|---------|-----------|
 //! | recaptcha_v2  | https://www.google.com/recaptcha/api/siteverify                          | no     | no      | yes       |
 //! | recaptcha_v3  | https://www.google.com/recaptcha/api/siteverify                          | yes    | yes     | yes       |
-//! | hcaptcha      | https://hcaptcha.com/siteverify                                           | no     | no      | no        |
+//! | hcaptcha      | https://hcaptcha.com/siteverify                                           | no     | no      | yes       |
 //! | turnstile     | https://challenges.cloudflare.com/turnstile/v0/siteverify                 | no     | no      | yes       |
 //!
 //! All providers accept a POST with `application/x-www-form-urlencoded` body
@@ -46,7 +46,9 @@ pub const Result = struct {
     score: ?f32 = null,
     /// reCAPTCHA v3 only: the action name submitted with the token. Null for all other providers.
     action: ?[]const u8 = null,
-    /// The hostname of the site where the token was generated (reCAPTCHA + Turnstile; null for hCaptcha).
+    /// The hostname of the site where the token was generated. Returned by all four
+    /// providers; null only when the provider omitted it from the response. Use it for the
+    /// recommended `hostname == expected_domain` cross-site-reuse check.
     hostname: ?[]const u8 = null,
     /// Provider error codes (e.g. `"timeout-or-duplicate"`, `"invalid-input-response"`).
     /// Empty slice when success is true or when the provider returned no error-codes.
@@ -94,18 +96,26 @@ fn formEncode(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
 ///   "success": bool,
 ///   "score": float,        // reCAPTCHA v3 only
 ///   "action": "...",       // reCAPTCHA v3 only
-///   "hostname": "...",     // reCAPTCHA + Turnstile
+///   "hostname": "...",     // all providers
 ///   "error-codes": [...]   // present when success is false
 /// }
 /// ```
+///
+/// A malformed / non-object response is NOT silently treated as a failed CAPTCHA — it
+/// propagates as `error.CaptchaParseError` so a caller can distinguish "the provider said
+/// no" (`ok=false`) from "we could not reach a verdict" (an error, like the non-2xx and
+/// transport-failure paths) and choose fail-open vs fail-closed accordingly.
 fn parseResponse(alloc: std.mem.Allocator, body: []const u8, provider: Provider) !Result {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, alloc, body, .{}) catch |e| {
         std.log.warn("captcha: failed to parse provider response: {s}", .{@errorName(e)});
-        return .{ .ok = false, .errors = &.{} };
+        return error.CaptchaParseError;
     };
     const root = switch (parsed) {
         .object => |o| o,
-        else => return .{ .ok = false, .errors = &.{} },
+        else => {
+            std.log.warn("captcha: provider response was not a JSON object", .{});
+            return error.CaptchaParseError;
+        },
     };
 
     const ok: bool = blk: {
@@ -139,15 +149,15 @@ fn parseResponse(alloc: std.mem.Allocator, body: []const u8, provider: Provider)
         else => null,
     };
 
-    const hostname: ?[]const u8 = switch (provider) {
-        .hcaptcha => null,
-        else => blk: {
-            const sv = root.get("hostname") orelse break :blk null;
-            break :blk switch (sv) {
-                .string => |s| s,
-                else => null,
-            };
-        },
+    // All four providers (reCAPTCHA v2/v3, hCaptcha, Turnstile) return `hostname` on a
+    // successful verify; parse it generically so consumers can do the recommended
+    // `hostname == expected_domain` cross-site-reuse check.
+    const hostname: ?[]const u8 = blk: {
+        const sv = root.get("hostname") orelse break :blk null;
+        break :blk switch (sv) {
+            .string => |s| s,
+            else => null,
+        };
     };
 
     // Parse "error-codes" (a JSON array of strings). Use an empty slice on success.
@@ -187,8 +197,11 @@ fn parseResponse(alloc: std.mem.Allocator, body: []const u8, provider: Provider)
 /// result slices are owned by it). `client` is an `HttpClient` bound to the
 /// same allocator.
 ///
-/// Network / transport errors propagate as a Zig error (the app chooses
-/// fail-open vs fail-closed in its route handler).
+/// Errors propagate as a Zig error so the caller can distinguish a verdict from a
+/// non-verdict and choose fail-open vs fail-closed: a transport failure surfaces as
+/// `error.TransportFailed`, a non-2xx provider reply as `error.CaptchaProviderError`,
+/// and a malformed / non-object JSON body as `error.CaptchaParseError`. A reachable
+/// provider that simply rejects the token returns `.{ .ok = false, .errors = ... }`.
 ///
 /// **Dev-bypass**: `ctx.verifyCaptcha` (the normal call site) returns
 /// `.{.ok = true}` immediately when `app.captcha_secret` is empty — this
@@ -316,23 +329,24 @@ test "parseResponse: success=false + error-codes" {
     try std.testing.expectEqual(@as(usize, 2), r.errors.len);
     try std.testing.expectEqualStrings("timeout-or-duplicate", r.errors[0]);
     try std.testing.expectEqualStrings("invalid-input-response", r.errors[1]);
-    try std.testing.expect(r.hostname == null); // hcaptcha: no hostname
 }
 
-test "parseResponse: hcaptcha sets hostname=null even when JSON has it" {
+test "parseResponse: hcaptcha parses hostname (its schema returns it)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const body = "{\"success\":true,\"hostname\":\"example.com\"}";
     const r = try parseResponse(arena.allocator(), body, .hcaptcha);
-    try std.testing.expect(r.hostname == null);
+    try std.testing.expect(r.ok);
+    try std.testing.expectEqualStrings("example.com", r.hostname.?);
 }
 
-test "parseResponse: malformed JSON returns ok=false, no panic" {
+test "parseResponse: malformed JSON propagates error.CaptchaParseError" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const r = try parseResponse(arena.allocator(), "not-json", .turnstile);
-    try std.testing.expect(!r.ok);
-    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    // Non-JSON body.
+    try std.testing.expectError(error.CaptchaParseError, parseResponse(arena.allocator(), "not-json", .turnstile));
+    // Valid JSON but not an object.
+    try std.testing.expectError(error.CaptchaParseError, parseResponse(arena.allocator(), "[1,2,3]", .turnstile));
 }
 
 test "verify: mock reCAPTCHA v3 success via testcapture.http" {
