@@ -106,6 +106,8 @@ jobs:
             zig-local-unit-${{ runner.os }}-zig0.16.0-
       - name: Unit tests
         run: mise exec zig@0.16.0 -- zig build test --summary all
+      - name: "Unit tests (prod gate: -Ddev-clock=false)"
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-clock=false
 
   browser:
     runs-on: ubuntu-latest
