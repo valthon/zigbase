@@ -16,6 +16,17 @@ const hub = @import("hub.zig");
 /// facil.io reactor isn't running (tests/CLI), avoiding "facil.io cluster inactive" noise + UB.
 pub var active: bool = false;
 
+/// Fixed PUBLIC realtime channel for the feature-management "changed" signal
+/// (#128/#129/#130). It is signal-only: a frame `{"type":"features.changed"}` is
+/// published whenever any flag/experiment override changes; clients re-`GET /api/state`
+/// on receipt. No per-subject state or experiment assignment is ever pushed. It is NOT
+/// a collection — the subscribe path allows anonymous subscription to it explicitly and
+/// the delivery path forwards its frames verbatim.
+pub const FEATURES_CHANNEL = "__features";
+
+/// The exact signal frame published on `FEATURES_CHANNEL`.
+const FEATURES_CHANGED_FRAME = "{\"type\":\"features.changed\"}";
+
 /// Max concurrent subscriptions per connection (bounds per-conn facil.io subscription state).
 const MAX_SUBS = 256;
 
@@ -196,6 +207,10 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
             const outcome: Outcome = blk: {
                 defer lc.app.pool.releaseReader(&r);
                 const t = protocol.parseTopic(m.topic);
+                // The feature-management signal channel is PUBLIC and is not a collection:
+                // anyone (incl. anonymous) may subscribe; delivery forwards the signal frame
+                // verbatim (no per-record authorization).
+                if (std.mem.eql(u8, t.collection, FEATURES_CHANNEL)) break :blk .ok;
                 const col = (collections.get(fa, &r, t.collection) catch break :blk .unknown) orelse break :blk .unknown;
                 // F5: a socket may subscribe anonymously ONLY to a public (@public viewRule)
                 // collection. For any other collection require a live (non-expired) auth first, so
@@ -246,6 +261,12 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
 fn onChannelMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, channel: []const u8, message: []const u8) anyerror!void {
     const lc = context orelse return;
     if (!lc.conn.hasSub(channel)) return; // keep BEFORE reset/alloc so dead channels cost nothing
+    // The public feature-signal channel carries a fixed, non-record frame: forward it
+    // verbatim (no per-record viewRule authorization, no collection lookup).
+    if (std.mem.eql(u8, channel, FEATURES_CHANNEL)) {
+        WS.write(handle, message, true) catch {};
+        return;
+    }
     _ = lc.frame.reset(.retain_capacity);
     const a = lc.frame.allocator();
 
@@ -315,6 +336,16 @@ pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, rec
     WS.publish(.{ .channel = ef.record_channel, .message = ef.frame_record });
 }
 
+/// Signal-only feature-management push (#128/#129/#130): publish `{"type":"features.changed"}`
+/// on the public `FEATURES_CHANNEL` so subscribed clients re-`GET /api/state`. Called from
+/// every override write path (`ctx.setFlag`/`App.setFlag` and the admin settings verbs).
+/// A no-op when the reactor isn't running (tests/CLI). NEVER pushes per-subject state or
+/// experiment assignments — those stay behind the authenticated `/api/state` projection.
+pub fn broadcastFeaturesChanged() void {
+    if (!active) return; // reactor not running (tests/CLI): no-op
+    WS.publish(.{ .channel = FEATURES_CHANNEL, .message = FEATURES_CHANGED_FRAME });
+}
+
 test "originAllowed: empty allowlist denies cross-origin browser upgrades (F12); same-origin + CSV allowed" {
     // Secure-by-default: an empty allowlist DENIES a cross-origin browser upgrade...
     try std.testing.expect(!originAllowed("", "https://anything", "myhost:8090"));
@@ -337,6 +368,13 @@ test "broadcast is a no-op when inactive" {
     try std.testing.expect(!active);
     var app: App = undefined;
     broadcast(&app, undefined, .create, "rec1", null); // would crash if it didn't early-return
+}
+
+test "broadcastFeaturesChanged is a no-op when inactive" {
+    // Like broadcast, the feature signal must early-return when the reactor isn't running
+    // so the override write paths (ctx.setFlag / admin settings) are safe in tests/CLI.
+    try std.testing.expect(!active);
+    broadcastFeaturesChanged(); // would touch the inactive cluster (UB) if it didn't early-return
 }
 
 test "F5: anonymous subscribe allowed only on @public; gated collections require auth" {

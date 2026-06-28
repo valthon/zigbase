@@ -219,6 +219,7 @@ pub fn App(comptime cfg: anytype) type {
             if (@hasField(@TypeOf(cfg), "onBootstrap")) d.on_bootstrap = cfg.onBootstrap;
             if (@hasField(@TypeOf(cfg), "onBeforeServe")) d.on_before_serve = cfg.onBeforeServe;
             if (@hasField(@TypeOf(cfg), "onBeforeTerminate")) d.on_before_terminate = cfg.onBeforeTerminate;
+            if (@hasField(@TypeOf(cfg), "onFeatureExposure")) d.on_feature_exposure = cfg.onFeatureExposure;
             break :blk d;
         };
 

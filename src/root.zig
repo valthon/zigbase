@@ -19,6 +19,9 @@ pub const AuthEvent = events.AuthEvent;
 pub const AuthHandler = events.AuthHandler;
 pub const AuthSuccessEvent = events.AuthSuccessEvent; // beforeAuthSuccess hook (writable, abortable)
 pub const AuthSuccessHandler = events.AuthSuccessHandler;
+pub const ExposureEvent = events.ExposureEvent; // .onFeatureExposure analytics hook
+pub const ExposureKind = events.ExposureKind;
+pub const ExposureHandler = events.ExposureHandler;
 pub const Req = @import("route_types.zig").Req;
 pub const RouteError = @import("route_types.zig").RouteError;
 
