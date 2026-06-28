@@ -14,6 +14,7 @@ const oauth_api = @import("api/oauth.zig");
 const files_api = @import("api/files.zig");
 const settings_api = @import("api/settings.zig");
 const features_api = @import("api/features.zig");
+const state_api = @import("api/state.zig");
 const realtime_ws = @import("realtime/ws.zig");
 const files_multipart = @import("files/multipart.zig");
 const admin = @import("admin.zig");
@@ -56,6 +57,10 @@ const routes = [_]router.Route{
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
     .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
     .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
+    // Public, UNAUTHENTICATED feature-state projection (#130). Mounted at the default
+    // "/api/state"; the handler 404s when disabled or remapped (a custom path is
+    // dispatched dynamically in onRequest). NEVER exposes the superuser settings verbs.
+    .{ .method = .GET, .pattern = "/api/state", .handler = state_api.handle },
     .{ .method = .GET, .pattern = "/api/settings", .handler = settings_api.list },
     .{ .method = .GET, .pattern = "/api/settings/:key", .handler = settings_api.get },
     .{ .method = .PUT, .pattern = "/api/settings/:key", .handler = settings_api.put },
@@ -387,6 +392,21 @@ fn onRequest(r: zap.Request) !void {
             };
         };
         if (builtin) |hit| break :blk hit;
+        // Public feature-state projection at a CUSTOM-configured path. The default
+        // "/api/state" is already in the static table above; this covers a remapped
+        // `.features = .{ .public_route = "/custom" }`. Reserved ahead of custom routes
+        // so a consumer route cannot shadow it. Disabled (null) → skipped entirely.
+        if (self.app.features_public_route) |fp| {
+            if ((ctx.method == .GET or ctx.method == .HEAD) and
+                !std.mem.eql(u8, fp, "/api/state") and
+                std.mem.eql(u8, ctx.path, fp))
+            {
+                break :blk state_api.handle(&ctx) catch ApiError.internal().toResponse(arena.allocator()) catch {
+                    sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
+                    return;
+                };
+            }
+        }
         if (dispatchCustom(&ctx) catch null) |hit| break :blk hit;
         // The whole /api namespace stays JSON — including the bare "/api" path
         // (mirrors the exact-"/_" handling in the admin guard above).

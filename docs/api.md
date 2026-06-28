@@ -777,6 +777,47 @@ The embedded admin UI exposes this as the **Feature Flags & Experiments** screen
 
 ---
 
+## Feature state (public)
+
+The **read-only** public projection of resolved feature flags + experiments. Unlike the
+superuser `/api/settings` surface above, this endpoint is **unauthenticated** and exposes
+**only resolved values** — never the raw `_kv` keys, timestamps, declared defaults, or any
+admin verb.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/api/state?subject=<id>` | Resolve every declared flag + experiment for `subject`. |
+
+`subject` is the caller-supplied bucketing key (a user id, session id, or any stable
+string) used for deterministic experiment assignment; omit it (or pass empty) to get the
+stable "anonymous" assignment. The response is exactly:
+
+```json
+// GET /api/state?subject=user-42   (no Authorization header)
+{
+  "flags": { "checkout_enabled": true, "new_dashboard": false },
+  "experiments": { "checkout_layout": "compact" }
+}
+```
+
+`flags` maps each **declared** flag name to its resolved boolean (override else declared
+default); `experiments` maps each declared experiment name to its resolved variant. Apps
+that declare no flags/experiments get `{ "flags": {}, "experiments": {} }`.
+
+A `.sticky` experiment returns its **persisted** assignment here (the same value
+`App.experiment` resolves), so the public projection survives later weight changes. The
+lookup is **reader-first** — a repeat call for a known `subject` is served from a pooled
+reader, and only a subject's *first-ever* resolve briefly takes the writer to persist it —
+so this unauthenticated, caller-supplied-`subject` endpoint never storms the writer lock.
+
+**Mount + disable.** The route auto-mounts at `/api/state`. Configure it with the
+`.features` knob: `.features = .{ .public_route = "/state" }` remaps it, and
+`.features = .{ .public_route = .disabled }` turns it off (then it `404`s). The typed
+TypeScript SDK exposes this as `zb.flags.resolveAll(subject)` — see
+[TypeScript SDK → Typed feature state](typescript-sdk.md#typed-feature-state--zbflags).
+
+---
+
 ## Files
 
 File-type fields hold uploaded files.

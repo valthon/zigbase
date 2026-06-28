@@ -896,6 +896,18 @@ export interface DeviceLinkCompleteReq {
 export interface DeviceLinkSession {
   token: string;
 }
+
+// ---- Feature state ----
+
+export interface FeatureState {
+  flags: {
+    device_link_v2: boolean;
+    verbose_winks: boolean;
+  };
+  experiments: {
+    discovery_ranking: "recency" | "affinity" | "hybrid";
+  };
+}
 export interface ZbClient {
   db: {
     profiles: ProfilesService;
@@ -922,6 +934,9 @@ export interface ZbClient {
         complete(input: DeviceLinkCompleteReq, opts?: SendOptions): Promise<DeviceLinkSession>;
       };
     };
+  };
+  flags: {
+    resolveAll(subject: string): Promise<FeatureState>;
   };
   files: FilesService;
   rpc: {
@@ -997,6 +1012,10 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
             base.send<DeviceLinkSession>("POST", `/api/collections/profiles/auth/device_link/complete`, { body: input, ...opts }),
         },
       },
+    },
+    flags: {
+      resolveAll: (subject: string): Promise<FeatureState> =>
+        base.send<FeatureState>("GET", `/api/state?subject=${encodeURIComponent(subject)}`),
     },
     files: base.files,
     rpc: {

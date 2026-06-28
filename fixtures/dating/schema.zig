@@ -96,6 +96,20 @@ const DeviceLinkMethod = struct {
 pub const App = zigbase.App(.{
     .enable_typegen = true,
     .auth_methods = .{DeviceLinkMethod},
+    // Feature flags + experiments (#130): exercise the typed `zb.flags.resolveAll`
+    // surface (named booleans + a variant string-union) and the public GET /api/state.
+    .flags = .{
+        .device_link_v2 = false, // bare-bool shorthand default
+        .verbose_winks = .{ .default = true, .description = "Send richer wink payloads" },
+    },
+    .experiments = .{
+        .discovery_ranking = .{
+            .variants = .{ "recency", "affinity", "hybrid" },
+            .weights = .{ 34, 33, 33 },
+            .sticky = true, // persist assignments so they survive weight changes (#129)
+            .description = "Profile discovery ordering",
+        },
+    },
     .routes = .{
         .{ .method = .POST, .path = "/api/echo/:id/ping", .handler = echoPing, .auth = .public },
         .{ .method = .POST, .path = "/api/winks/send", .handler = winksSend, .auth = .public },

@@ -536,6 +536,59 @@ auth: {
 > [Auth + stores](#auth--stores)). The `zb.auth.*` namespace covers only the pluggable
 > non-password methods.
 
+## Typed feature state — `zb.flags`
+
+When the app declares feature flags or experiments
+(`App(.{ .flags = …, .experiments = … })`), the generator emits a typed
+`zb.flags.resolveAll(subject)` that calls the public, unauthenticated
+[`GET /api/state`](./api#feature-state-public) and returns a fully-typed `FeatureState`:
+
+```ts
+// App(.{ .flags = .{ .checkout_enabled = true, .new_dashboard = false },
+//        .experiments = .{ .checkout_layout = .{ .variants = .{ "control", "compact" }, … } } })
+const state = await zb.flags.resolveAll("user-42");
+state.flags.checkout_enabled;      // boolean
+state.flags.new_dashboard;         // boolean
+state.experiments.checkout_layout; // "control" | "compact"
+```
+
+The emitted shape is precise — flags become **named booleans** and each experiment a
+**string-literal union** of its declared variants:
+
+```ts
+export interface FeatureState {
+  flags: {
+    checkout_enabled: boolean;
+    new_dashboard: boolean;
+  };
+  experiments: {
+    checkout_layout: "control" | "compact";
+  };
+}
+// on the client:
+flags: {
+  resolveAll(subject: string): Promise<FeatureState>;
+};
+```
+
+- `subject` is the bucketing key for deterministic experiment assignment (a user/session
+  id, or any stable string); the same subject always resolves to the same variant.
+- A flag with no `_kv` override resolves to its declared default; an `exp:<name>:weights`
+  override (or the declared weights) drives the bucket. The endpoint returns **resolved
+  values only** — never keys, defaults, or weights.
+- A `.sticky` experiment returns its **persisted** assignment (the same value the server's
+  `App.experiment` resolves), so it survives later weight changes. Resolution is
+  reader-first, so repeated `resolveAll` calls for a known `subject` don't contend the
+  writer.
+- A group with no declarations is typed `Record<string, never>` (the server returns `{}`).
+- **Comptime-only:** the typed surface is emitted by `zig build gen-client`, which reads
+  your Zig `.flags`/`.experiments`. The runtime-introspection tier
+  (`typegen --data-dir/--url`) cannot see them, so it omits `zb.flags` — exactly how typed
+  routes and custom auth methods behave. (You can still call `GET /api/state` directly via
+  `zb.send("GET", "/api/state?subject=…")`.)
+- If you remap the route with `.features = .{ .public_route = "/state" }`, the typed helper
+  still targets the default `/api/state`; use the configured path via `zb.send` instead.
+
 ## Realtime + live store
 
 Realtime ships behind a **dedicated entry point**, `@zigbase/client/realtime`, so a REST-only

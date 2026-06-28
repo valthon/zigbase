@@ -88,13 +88,16 @@ fn parseWeightOverride(alloc: std.mem.Allocator, json: []const u8, expect_len: u
 /// of `def.variants` (static), so it outlives `alloc`.
 ///
 /// Resolution is a pure deterministic hash bucket UNLESS the experiment is `.sticky` and
-/// a non-empty `subject` and a (writer) `conn` are supplied — then the first assignment
+/// a non-empty `subject` and `sticky` connections are supplied — then the first assignment
 /// is persisted in `_experiment_assignments` and re-read on subsequent resolves, so the
-/// variant SURVIVES a later weight change (#129). Passing `conn == null` (or an empty
-/// subject) always takes the pure path; an empty subject is never persisted.
+/// variant SURVIVES a later weight change (#129). Resolution is **reader-first**: a stored
+/// assignment is read on `sticky.read` (a pooled reader, or the bound writer inside a tx)
+/// with NO writer involvement; only a MISS briefly borrows the writer to persist + read
+/// back the authoritative variant (see `StickyConns`). Passing `sticky == null` (or an
+/// empty subject) always takes the pure path; an empty subject is never persisted.
 pub fn resolveExperiment(
     alloc: std.mem.Allocator,
-    conn: ?*db.Db,
+    sticky: ?StickyConns,
     override_weights_json: ?[]const u8,
     def: ExperimentDef,
     subject: []const u8,
@@ -115,53 +118,82 @@ pub fn resolveExperiment(
     };
 
     // Sticky: a previously-stored assignment wins over a fresh bucket, so the variant
-    // is stable across weight changes. Needs a writer (the miss path INSERTs). An empty
-    // subject always maps to variant 0 and is never persisted.
+    // is stable across weight changes. An empty subject always maps to variant 0 and is
+    // never persisted; a non-sticky experiment always follows the live weights.
     if (def.sticky and subject.len > 0) {
-        if (conn) |c| return stickyVariant(c, def, subject, weights);
+        if (sticky) |sc| return stickyVariant(sc, def, subject, weights);
     }
 
     const idx = bucket(def.name, subject, weights);
     return def.variants[idx];
 }
 
-/// Sticky resolution against `_experiment_assignments`. On a hit, return the STORED
-/// variant (mapped back to the static `def.variants` slice so it outlives the row
-/// buffer). On a miss, `bucket` + `INSERT OR IGNORE` the assignment, then return the
-/// freshly-computed variant. Requires the WRITER connection (the single-writer model
-/// means the read+insert pair is exclusive, so the computed variant is what is stored).
-/// SQLITE_TRANSIENT copies the bound subject/variant text at bind time. A stored variant
-/// that is no longer declared (the variant set changed) is ignored and recomputed.
-fn stickyVariant(conn: *db.Db, def: ExperimentDef, subject: []const u8, weights: []const u16) ![]const u8 {
-    {
-        var st = try conn.prepare(
-            \\SELECT "variant" FROM "_experiment_assignments"
-            \\ WHERE "experiment" = ?1 AND "subject" = ?2;
-        );
-        defer st.finalize();
-        try st.bindText(1, def.name);
-        try st.bindText(2, subject);
-        if (try st.step()) {
-            const stored = st.columnText(0);
-            for (def.variants) |v| {
-                if (std.mem.eql(u8, v, stored)) return v;
-            }
-            // Stored variant no longer declared → fall through and recompute.
-        }
-    }
+/// Connections for **reader-first** sticky resolution. `read` is used for the assignment
+/// lookup (a pooled reader on the public/route/job path, or the bound writer inside a
+/// `ctx.tx`). `pool`, when set, is the source of the single writer borrowed *only on a
+/// miss* to persist the assignment — so a steady-state sticky HIT never contends the
+/// writer lock. `pool == null` means `read` IS the writer (a bound transaction): the
+/// miss-path insert reuses it directly, taking/releasing no pool writer.
+pub const StickyConns = struct {
+    read: *db.Db,
+    pool: ?*db.Pool = null,
+};
+
+/// Reader-first sticky resolution against `_experiment_assignments`.
+///   1. READ (`sc.read`): a stored, still-declared assignment wins → returned with NO
+///      writer involvement (the common steady-state path).
+///   2. MISS: borrow the writer (`sc.pool.acquireWriter()`, or reuse the bound `sc.read`
+///      when `pool == null`), `INSERT OR IGNORE` the bucketed variant, then read the row
+///      BACK on the writer — so a concurrent winner that inserted first is honored — and
+///      release the writer. The returned slice is mapped back to the static `def.variants`
+///      so it outlives any row buffer; a stored variant no longer declared is recomputed.
+fn stickyVariant(sc: StickyConns, def: ExperimentDef, subject: []const u8, weights: []const u16) ![]const u8 {
+    // 1. Reader-first: a stored assignment short-circuits without touching the writer.
+    if (try stickyLookup(sc.read, def, subject)) |hit| return hit;
+
+    // 2. Miss: briefly take the writer (or reuse the bound writer) to persist + read back.
+    const writer = if (sc.pool) |p| p.acquireWriter() else sc.read;
+    defer if (sc.pool) |p| p.releaseWriter();
 
     const idx = bucket(def.name, subject, weights);
-    const variant = def.variants[idx];
-    var ins = try conn.prepare(
+    const computed = def.variants[idx];
+    var ins = try writer.prepare(
         \\INSERT OR IGNORE INTO "_experiment_assignments" ("experiment","subject","variant","created")
         \\ VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ','now'));
     );
     defer ins.finalize();
     try ins.bindText(1, def.name);
     try ins.bindText(2, subject);
-    try ins.bindText(3, variant);
+    try ins.bindText(3, computed);
     _ = try ins.step();
-    return variant;
+
+    // Read back the AUTHORITATIVE variant on the writer: under `INSERT OR IGNORE`, a row
+    // another request persisted first (between our reader miss and acquiring the writer)
+    // is the one that wins, and we must return it for consistency with `App.experiment`.
+    if (try stickyLookup(writer, def, subject)) |stored| return stored;
+    return computed; // unreachable in practice (we just inserted), but a safe fallback.
+}
+
+/// SELECT the stored, still-declared variant for `(experiment, subject)` on `conn`,
+/// mapped back to the static `def.variants` slice (so it outlives the row buffer), or
+/// null on a miss / a stored variant that is no longer declared (the variant set changed).
+/// Pure read — no writes — so it is safe on a pooled reader.
+fn stickyLookup(conn: *db.Db, def: ExperimentDef, subject: []const u8) !?[]const u8 {
+    var st = try conn.prepare(
+        \\SELECT "variant" FROM "_experiment_assignments"
+        \\ WHERE "experiment" = ?1 AND "subject" = ?2;
+    );
+    defer st.finalize();
+    try st.bindText(1, def.name);
+    try st.bindText(2, subject);
+    if (try st.step()) {
+        const stored = st.columnText(0);
+        for (def.variants) |v| {
+            if (std.mem.eql(u8, v, stored)) return v;
+        }
+        // Stored variant no longer declared → treat as a miss and recompute.
+    }
+    return null;
 }
 
 /// Batch size for the sticky-assignment GC sweep: bound each DELETE so a large backlog
@@ -208,6 +240,7 @@ pub fn resolveAll(
     reg: Registry,
     entries: []const KvPair,
     subject: []const u8,
+    sticky: ?StickyConns,
 ) !Resolved {
     const flags_out = try alloc.alloc(ResolvedFlag, reg.flags.len);
     for (reg.flags, 0..) |def, i| {
@@ -234,11 +267,11 @@ pub fn resolveAll(
                 break;
             }
         }
-        // The batch projection resolves by pure hash (conn == null). The sticky read/
-        // write path runs only through the single-experiment `App.experiment` accessor,
-        // which hands a writer connection; the public `/api/state` projection threads
-        // its own connection in a later PR.
-        exps_out[i] = .{ .name = def.name, .variant = try resolveExperiment(alloc, null, ov, def, subject) };
+        // Sticky experiments honor their PERSISTED assignment (reader-first; only a miss
+        // briefly takes the writer), so the public `/api/state` projection agrees with the
+        // single-accessor `App.experiment`. Non-sticky experiments ignore `sticky` and
+        // resolve by pure hash. `sticky == null` forces the pure path for every experiment.
+        exps_out[i] = .{ .name = def.name, .variant = try resolveExperiment(alloc, sticky, ov, def, subject) };
     }
 
     return .{ .flags = flags_out, .experiments = exps_out };
@@ -356,7 +389,7 @@ test "resolveAll returns every declared flag + experiment via the batched scan" 
     defer arena.deinit();
     const a = arena.allocator();
 
-    const resolved = try resolveAll(a, reg, &entries, "user-7");
+    const resolved = try resolveAll(a, reg, &entries, "user-7", null);
     try std.testing.expectEqual(@as(usize, 2), resolved.flags.len);
     // checkout_enabled has no override → declared default true.
     try std.testing.expectEqualStrings("checkout_enabled", resolved.flags[0].name);
@@ -402,16 +435,16 @@ test "sticky experiment SURVIVES a weight change (#129)" {
     };
 
     // First resolve under the declared 50/50 weights persists an assignment.
-    const first = try resolveExperiment(a, &d, null, def, "user-42");
+    const first = try resolveExperiment(a, .{ .read = &d }, null, def, "user-42");
 
     // A later weight override that would otherwise force EVERYONE to the other
     // variant must NOT move an already-assigned subject.
     const opposite = if (std.mem.eql(u8, first, "control")) "[0,100]" else "[100,0]";
-    const after = try resolveExperiment(a, &d, opposite, def, "user-42");
+    const after = try resolveExperiment(a, .{ .read = &d }, opposite, def, "user-42");
     try std.testing.expectEqualStrings(first, after);
 
     // And a brand-new subject under the override DOES follow the new weights.
-    const newcomer = try resolveExperiment(a, &d, opposite, def, "newcomer-1");
+    const newcomer = try resolveExperiment(a, .{ .read = &d }, opposite, def, "newcomer-1");
     const forced = if (std.mem.eql(u8, first, "control")) "compact" else "control";
     try std.testing.expectEqualStrings(forced, newcomer);
 
@@ -441,8 +474,8 @@ test "non-sticky experiment FOLLOWS the new weights (no persistence)" {
 
     // Even with a writer connection, a non-sticky experiment ignores the table and
     // honors the override on every resolve.
-    try std.testing.expectEqualStrings("control", try resolveExperiment(a, &d, "[100,0]", def, "user-42"));
-    try std.testing.expectEqualStrings("compact", try resolveExperiment(a, &d, "[0,100]", def, "user-42"));
+    try std.testing.expectEqualStrings("control", try resolveExperiment(a, .{ .read = &d }, "[100,0]", def, "user-42"));
+    try std.testing.expectEqualStrings("compact", try resolveExperiment(a, .{ .read = &d }, "[0,100]", def, "user-42"));
 
     // Nothing was persisted.
     var st = try d.prepare("SELECT COUNT(*) FROM \"_experiment_assignments\";");
@@ -468,11 +501,80 @@ test "sticky never persists an empty-subject assignment" {
     };
 
     // Empty subject → variant 0, and NO row is written.
-    try std.testing.expectEqualStrings("control", try resolveExperiment(a, &d, null, def, ""));
+    try std.testing.expectEqualStrings("control", try resolveExperiment(a, .{ .read = &d }, null, def, ""));
     var st = try d.prepare("SELECT COUNT(*) FROM \"_experiment_assignments\";");
     defer st.finalize();
     try std.testing.expect(try st.step());
     try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "sticky HIT is reader-first: resolves with NO write (#129/#130)" {
+    // Reader-first invariant: once an assignment is persisted, resolving it again must
+    // touch NO writer. Prove it deterministically by setting `PRAGMA query_only=ON` on
+    // the connection — any write (the miss-path INSERT) would then fail with SQLITE_READONLY,
+    // so a clean resolve guarantees only the SELECT ran.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(assignments_ddl);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const def = ExperimentDef{
+        .name = "checkout_layout",
+        .variants = &.{ "control", "compact" },
+        .weights = &.{ 50, 50 },
+        .sticky = true,
+    };
+
+    // First resolve persists the assignment (writes are still allowed here).
+    const first = try resolveExperiment(a, .{ .read = &d }, null, def, "user-42");
+
+    // Forbid writes, then resolve again under a weight override that WOULD re-bucket: a
+    // reader-first HIT returns the stored variant via a pure SELECT and never writes.
+    try d.exec("PRAGMA query_only=ON;");
+    const opposite = if (std.mem.eql(u8, first, "control")) "[0,100]" else "[100,0]";
+    const again = try resolveExperiment(a, .{ .read = &d, .pool = null }, opposite, def, "user-42");
+    try std.testing.expectEqualStrings(first, again);
+}
+
+test "resolveAll honors a sticky PERSISTED variant across a weight override (#129/#130)" {
+    // The public `/api/state` projection goes through resolveAll; it must agree with the
+    // single-accessor `App.experiment` and return the persisted sticky variant — not a
+    // fresh re-bucket — after a weight override that would otherwise move the subject.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(assignments_ddl);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const reg = Registry{
+        .flags = &.{},
+        .experiments = &.{
+            .{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true },
+        },
+    };
+    const sc = StickyConns{ .read = &d, .pool = null }; // single conn doubles as reader + writer
+
+    // First projection persists the assignment under the declared 50/50 weights.
+    const r1 = try resolveAll(a, reg, &.{}, "user-42", sc);
+    const persisted = r1.experiments[0].variant;
+
+    // Now apply a weight override that would force EVERYONE to the opposite variant.
+    const opposite = if (std.mem.eql(u8, persisted, "control")) "[0,100]" else "[100,0]";
+    const entries = [_]KvPair{.{ .key = "exp:checkout_layout:weights", .value = opposite }};
+    const r2 = try resolveAll(a, reg, &entries, "user-42", sc);
+    // Sticky → the projection still reports the persisted variant.
+    try std.testing.expectEqualStrings(persisted, r2.experiments[0].variant);
+
+    // A brand-new subject under the override DOES follow the new weights (proves the
+    // override is live for the unseen subject, so the stickiness above is real).
+    const forced = if (std.mem.eql(u8, persisted, "control")) "compact" else "control";
+    const r3 = try resolveAll(a, reg, &entries, "newcomer-9", sc);
+    try std.testing.expectEqualStrings(forced, r3.experiments[0].variant);
 }
 
 test "gcExpiredAssignments reaps rows older than the TTL and keeps newer ones" {

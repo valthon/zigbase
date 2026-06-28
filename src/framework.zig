@@ -461,6 +461,42 @@ pub fn App(comptime cfg: anytype) type {
             break :blk if (@hasField(@TypeOf(cfg), "experiment_assignment_ttl")) cfg.experiment_assignment_ttl else 90;
         };
 
+        /// Mount path for the public feature-state projection (`GET <path>?subject=`,
+        /// served by `api/state.zig`); null = disabled. Lowered from the `.features`
+        /// config knob: `.features = .{ .public_route = "/api/state" }` (custom path)
+        /// or `.features = .{ .public_route = .disabled }` (off). Default "/api/state"
+        /// (auto-mounted). Loud-comptime on an unknown sub-key or a non-string,
+        /// non-`.disabled` value.
+        pub const features_public_route: ?[]const u8 = blk: {
+            if (!@hasField(@TypeOf(cfg), "features")) break :blk "/api/state";
+            const fcfg = cfg.features;
+            if (@typeInfo(@TypeOf(fcfg)) != .@"struct")
+                @compileError(".features must be a struct, e.g. '.{ .public_route = \"/api/state\" }' or '.{ .public_route = .disabled }'");
+            for (std.meta.fields(@TypeOf(fcfg))) |f| {
+                if (!std.mem.eql(u8, f.name, "public_route"))
+                    @compileError(".features: unknown key '." ++ f.name ++ "' (recognized: .public_route)");
+            }
+            if (!@hasField(@TypeOf(fcfg), "public_route")) break :blk "/api/state";
+            const pr = fcfg.public_route;
+            const PRT = @TypeOf(pr);
+            if (@typeInfo(PRT) == .enum_literal) {
+                if (pr != .disabled)
+                    @compileError(".features.public_route must be a path string (e.g. \"/api/state\") or .disabled");
+                break :blk null;
+            }
+            const is_str = switch (@typeInfo(PRT)) {
+                .pointer => |p| switch (p.size) {
+                    .slice => p.child == u8,
+                    .one => @typeInfo(p.child) == .array and @typeInfo(p.child).array.child == u8,
+                    else => false,
+                },
+                else => false,
+            };
+            if (!is_str)
+                @compileError(".features.public_route must be a path string (e.g. \"/api/state\") or .disabled");
+            break :blk pr;
+        };
+
         /// Resolve a DECLARED flag (the `flag:<name>` override from `_kv` if present,
         /// else the declared default). Typo'd `.name` → compile error. Swallows read
         /// errors back to the default, so a kill-switch check never fails the request.
@@ -517,6 +553,7 @@ pub fn App(comptime cfg: anytype) type {
             .has_ttl = has_ttl_collection,
             .features = &features_registry,
             .experiment_assignment_ttl = experiment_assignment_ttl,
+            .features_public_route = features_public_route,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -593,6 +630,9 @@ pub const ServeOpts = struct {
     /// TTL in DAYS for sticky `_experiment_assignments` rows (#129); threaded into
     /// `app.experiment_assignment_ttl` for the comptime-gated `_experiment_gc` job.
     experiment_assignment_ttl: u32 = 90,
+    /// Public feature-state route (`api/state.zig`) mount path; null = disabled.
+    /// Lowered from the `.features` knob; threaded into `app.features_public_route`.
+    features_public_route: ?[]const u8 = "/api/state",
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -1190,6 +1230,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .dispatch = dispatch,
         .features = opts.features,
         .experiment_assignment_ttl = opts.experiment_assignment_ttl,
+        .features_public_route = opts.features_public_route,
         // Always wire the shared limiter store: the default-scope limiter no-ops when
         // rate_limit_max==0 (RateLimiter.allow returns true for max==0), but a configured
         // per-method custom limit must still be honored against this store regardless of

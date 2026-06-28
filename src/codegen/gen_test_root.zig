@@ -24,6 +24,6 @@ test "golden: in-process generate matches the committed dating snapshot" {
         a,
         .limited(64 * 1024 * 1024),
     ) catch return; // absent during earlier tasks -> skip
-    const text = try gen_client.generate(a, app.App.collections, app.App.routes, app.App.custom_auth, true, "profiles", "ZbClient", "/api");
+    const text = try gen_client.generate(a, app.App.collections, app.App.routes, app.App.custom_auth, app.App.flags, app.App.experiments, true, "profiles", "ZbClient", "/api");
     try std.testing.expectEqualStrings(committed, text);
 }

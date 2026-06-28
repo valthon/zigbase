@@ -769,6 +769,16 @@ export interface OtpCompleteInput {
   /** The one-time numeric code delivered by email. */
   code: string;
 }
+
+// ---- Feature state ----
+
+export interface FeatureState {
+  flags: {
+    bookings_frozen: boolean;
+    promo_banner: boolean;
+  };
+  experiments: Record<string, never>;
+}
 export interface ZbClient {
   db: {
     users: UsersService;
@@ -793,6 +803,9 @@ export interface ZbClient {
         complete(input: OtpCompleteInput, opts?: SendOptions): Promise<AuthMethodResult>;
       };
     };
+  };
+  flags: {
+    resolveAll(subject: string): Promise<FeatureState>;
   };
   files: FilesService;
   rpc: {
@@ -854,6 +867,10 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
             base.send<AuthMethodResult>("POST", `/api/collections/users/auth/otp/complete`, { body: input, ...opts }),
         },
       },
+    },
+    flags: {
+      resolveAll: (subject: string): Promise<FeatureState> =>
+        base.send<FeatureState>("GET", `/api/state?subject=${encodeURIComponent(subject)}`),
     },
     files: base.files,
     rpc: {
