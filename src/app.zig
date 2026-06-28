@@ -3,6 +3,7 @@ const db = @import("db.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
 const features = @import("features.zig");
+const captcha = @import("captcha.zig");
 
 /// Session-management model (#99). `epoch` (default) is the stateless token-epoch
 /// revocation scheme: cheap, no per-request DB read beyond the existing auth fetch.
@@ -80,6 +81,12 @@ pub const App = struct {
     /// Cast to `*const @import("auth/registry.zig").Registry` to read slugs. Stored as opaque
     /// to avoid an import cycle: app.zig must NOT import registry.zig or auth/method.zig.
     auth_methods: ?*const anyopaque = null,
+    /// The CAPTCHA provider configured via `App(.{ .captcha = .{ .provider = ..., .secret = "..." } })`.
+    /// null = captcha not configured (ctx.verifyCaptcha uses the dev-bypass — ok=true — when secret is "").
+    captcha_provider: ?captcha.Provider = null,
+    /// The configured CAPTCHA site-verify secret (the server-side key sent to the provider).
+    /// Empty string = dev-bypass mode: ctx.verifyCaptcha returns .{.ok=true} without any network call.
+    captcha_secret: []const u8 = "",
     /// Type-erased pointer to the running Scheduler (set by Scheduler.start); null = not running.
     scheduler: ?*anyopaque = null,
     /// Submit an ad-hoc job task for async execution; set by Scheduler.start. Task 5 wires App.submit().

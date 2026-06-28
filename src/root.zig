@@ -66,6 +66,13 @@ pub const FlagDef = @import("features.zig").FlagDef;
 pub const ExperimentDef = @import("features.zig").ExperimentDef;
 pub const FeatureRegistry = @import("features.zig").Registry;
 
+// ---- CAPTCHA verification (#140) ------------------------------------------
+// Consumer-facing types for `ctx.verifyCaptcha(provider, token)`.
+// The provider and result are the only externally-named types; the verify
+// function is internal (reached via ctx).
+pub const CaptchaProvider = @import("captcha.zig").Provider;
+pub const CaptchaResult = @import("captcha.zig").Result;
+
 // ---- Background jobs & queues (#137) ---------------------------------------
 // Types a consumer names when declaring `.queues`/`.workers`/`.jobs`. The typed,
 // compile-checked accessor (App.enqueue) and the generated Queue/Job enums live on
@@ -258,4 +265,5 @@ test {
     _ = @import("session.zig");
     _ = @import("http_client.zig");
     _ = @import("testcapture.zig");
+    _ = @import("captcha.zig");
 }

@@ -10,6 +10,7 @@ const collections = @import("collections.zig");
 const schema = @import("schema.zig");
 const expand_mod = @import("query/expand.zig");
 const http_client = @import("http_client.zig");
+const captcha_mod = @import("captcha.zig");
 const error_mod = @import("api/error.zig");
 const http_mod = @import("http.zig");
 const auth_helpers = @import("auth_helpers.zig");
@@ -271,6 +272,56 @@ pub const Ctx = struct {
     /// header-injection rejection + recipient address validation — see `MailApi`.
     pub fn mail(self: *Ctx) MailApi {
         return .{ .ctx = self };
+    }
+
+    // -----------------------------------------------------------------------
+    // CAPTCHA verification (#140, PR6).
+    //
+    // `verifyCaptcha(provider, token)` POSTs the token to the provider's
+    // siteverify endpoint using `app.captcha_secret`, parsing the JSON
+    // response into a typed `CaptchaResult`.
+    //
+    // Dev-bypass: when `app.captcha_secret` is empty (default), returns
+    // `.{.ok = true}` immediately — no network call. This lets local
+    // development and tests work without a live CAPTCHA key. Document this
+    // clearly in the handler so consumers are not surprised.
+    //
+    // Network / HTTP errors propagate as a Zig error. The caller chooses
+    // whether to fail-open (return ok=true) or fail-closed (return 403)
+    // on a transient network failure.
+    // -----------------------------------------------------------------------
+
+    /// Verify a CAPTCHA token via the given `provider`'s siteverify API.
+    ///
+    /// `token` is the string received from the browser (e.g. the value of
+    /// `g-recaptcha-response`, `h-captcha-response`, or `cf-turnstile-response`).
+    ///
+    /// **Dev-bypass:** when `app.captcha_secret` is empty (the default when
+    /// `.captcha` is not configured) this returns `.{.ok = true}` immediately
+    /// without any network call, so local dev/tests do not need a live key.
+    ///
+    /// **Network errors** (transport failures, non-2xx from the provider) propagate
+    /// as a Zig error — the handler decides whether to fail-open or fail-closed.
+    ///
+    /// **Provider mismatch:** the secret is configured for ONE provider (`app.captcha_provider`).
+    /// Calling with a different `provider` would send that secret to the wrong endpoint, so it
+    /// fails fast with `error.CaptchaProviderMismatch` rather than silently failing the check.
+    /// (The check is skipped when no provider is configured — e.g. tests that set only a secret.)
+    ///
+    /// ```zig
+    /// const r = try ctx.verifyCaptcha(.recaptcha_v3, token);
+    /// if (!r.ok) return ctx.jsonError(403, "captcha_required");
+    /// if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request");
+    /// ```
+    pub fn verifyCaptcha(self: *Ctx, provider: captcha_mod.Provider, token: []const u8) !captcha_mod.Result {
+        if (self.app.captcha_secret.len == 0) return .{ .ok = true };
+        if (self.app.captcha_provider) |expected| {
+            if (provider != expected) {
+                std.log.warn("captcha: provider mismatch (configured {s}, called with {s})", .{ @tagName(expected), @tagName(provider) });
+                return error.CaptchaProviderMismatch;
+            }
+        }
+        return captcha_mod.verify(provider, self.app.captcha_secret, token, self.arena, self.http());
     }
 
     // -----------------------------------------------------------------------
@@ -1861,4 +1912,92 @@ test "#141 ctx.mail().enqueue memory round-trips: built-in handler delivers + is
     app.io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};
     try std.testing.expectEqual(@as(usize, 1), testcapture.mail.count());
     try std.testing.expectEqualStrings("queued@example.com", testcapture.mail.get(0).?.to);
+}
+
+// ---------------------------------------------------------------------------
+// CAPTCHA (#140, PR6) — ctx.verifyCaptcha tests.
+// ---------------------------------------------------------------------------
+
+test "#140 ctx.verifyCaptcha dev-bypass: empty captcha_secret returns ok=true without network" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    // Default app has captcha_secret = "" (dev-bypass active).
+    try std.testing.expectEqualStrings("", env.app.captcha_secret);
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    // All four providers bypass when secret is empty — no network, no error.
+    const r1 = try ctx.verifyCaptcha(.recaptcha_v2, "any-token");
+    try std.testing.expect(r1.ok);
+    const r2 = try ctx.verifyCaptcha(.recaptcha_v3, "any-token");
+    try std.testing.expect(r2.ok);
+    const r3 = try ctx.verifyCaptcha(.hcaptcha, "any-token");
+    try std.testing.expect(r3.ok);
+    const r4 = try ctx.verifyCaptcha(.turnstile, "any-token");
+    try std.testing.expect(r4.ok);
+}
+
+test "#140 ctx.verifyCaptcha with mock: uses app.captcha_secret and forwards to provider" {
+    if (!@import("testcapture.zig").enabled) return error.SkipZigTest;
+    @import("testcapture.zig").http.reset();
+    defer @import("testcapture.zig").http.reset();
+
+    @import("testcapture.zig").http.enable(true);
+    @import("testcapture.zig").http.mock("google.com/recaptcha", .{
+        .status = 200,
+        .body = "{\"success\":true,\"score\":0.7,\"action\":\"submit\",\"hostname\":\"test.example.com\"}",
+    });
+
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    env.app.captcha_secret = "my-server-secret";
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    const r = try ctx.verifyCaptcha(.recaptcha_v3, "user-token");
+    try std.testing.expect(r.ok);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), r.score.?, 0.001);
+    try std.testing.expectEqualStrings("submit", r.action.?);
+    try std.testing.expectEqualStrings("test.example.com", r.hostname.?);
+
+    // Verify secret was sent in the POST body.
+    const req = @import("testcapture.zig").http.requestAt(0).?;
+    const body = req.body.?;
+    try std.testing.expect(std.mem.indexOf(u8, body, "secret=my-server-secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "response=user-token") != null);
+}
+
+test "#140 ctx.verifyCaptcha network error propagates (fails-closed by default)" {
+    if (!@import("testcapture.zig").enabled) return error.SkipZigTest;
+    @import("testcapture.zig").http.reset();
+    defer @import("testcapture.zig").http.reset();
+
+    // Capture with block_unmocked=true so all requests fail.
+    @import("testcapture.zig").http.enable(true);
+
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    env.app.captcha_secret = "real-secret";
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    // Network failure propagates — handler can catch and decide fail-open vs fail-closed.
+    try std.testing.expectError(error.TransportFailed, ctx.verifyCaptcha(.turnstile, "token"));
+}
+
+test "#140 ctx.verifyCaptcha errors on a provider that differs from the configured one" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    // Both a secret AND a provider are configured: a mismatched call must fail fast.
+    env.app.captcha_secret = "real-secret";
+    env.app.captcha_provider = .recaptcha_v3;
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    try std.testing.expectError(error.CaptchaProviderMismatch, ctx.verifyCaptcha(.hcaptcha, "token"));
+
+    // The dev-bypass wins even over a mismatch: an empty secret never verifies, so no error.
+    env.app.captcha_secret = "";
+    const r = try ctx.verifyCaptcha(.hcaptcha, "token");
+    try std.testing.expect(r.ok);
 }
