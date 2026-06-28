@@ -174,6 +174,28 @@ fn forbiddenResp(ctx: *http.RequestCtx) !http.Response {
     return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
 }
 
+/// Merge a Ctx's deferred `pending_cookies`/`pending_headers` onto a handler's Response.
+/// Returns `resp` untouched when nothing was accumulated; otherwise arena-dups the UNION
+/// of the handler-set values and the deferred ones (handler-set first, deferred appended),
+/// keeping the raw `http.Response` literal fully usable alongside the ergonomic accumulators.
+fn mergePending(alloc: std.mem.Allocator, cx: *Ctx, resp: http.Response) !http.Response {
+    if (cx.pending_cookies.items.len == 0 and cx.pending_headers.items.len == 0) return resp;
+    var out = resp;
+    if (cx.pending_cookies.items.len > 0) {
+        const merged = try alloc.alloc(http.Cookie, resp.cookies.len + cx.pending_cookies.items.len);
+        @memcpy(merged[0..resp.cookies.len], resp.cookies);
+        @memcpy(merged[resp.cookies.len..], cx.pending_cookies.items);
+        out.cookies = merged;
+    }
+    if (cx.pending_headers.items.len > 0) {
+        const merged = try alloc.alloc(http.Header, resp.extra_headers.len + cx.pending_headers.items.len);
+        @memcpy(merged[0..resp.extra_headers.len], resp.extra_headers);
+        @memcpy(merged[resp.extra_headers.len..], cx.pending_headers.items);
+        out.extra_headers = merged;
+    }
+    return out;
+}
+
 /// Try the consumer's custom routes (after built-ins). Resolves auth on a fresh reader,
 /// enforces the route's AuthLevel, then calls the handler. Returns null if no custom route
 /// matches the path+method. A handler error routes to the error backstop and yields 500.
@@ -203,20 +225,25 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
             };
             var cx = Ctx{ .app = app, .arena = ctx.allocator, .rctx = rctx, .request = ctx, .bound_conn = null };
             defer cx.deinit();
-            return rt.handler(&cx) catch |e| {
+            // One chokepoint for typed thunks + untyped handlers: any cookies/headers a
+            // handler accumulated via `ctx.setCookie`/`ctx.addHeader` (e.g. `ctx.subjectCookie`)
+            // are merged onto the Response in BOTH the success and the error path, so a
+            // deferred Set-Cookie survives even when the handler returns an error.
+            const resp = rt.handler(&cx) catch |e| {
                 // Map the error to a response via A1's Ctx.errorResponse (error.NotFound -> 404,
                 // error.Forbidden -> 403, error.Handled -> stashed status, etc.) instead of the
                 // old always-500 mapping. Only GENUINE server errors (mapped status >= 500) go to
                 // the consumer onError + Sentry/log backstop: a handler returning a deliberate 4xx
                 // (NotFound/Forbidden/ctx.fail) is ordinary client-error control flow, not an
                 // incident, so it must not emit a Sentry event.
-                const resp = cx.errorResponse(e);
-                if (resp.status >= 500) {
+                const er = cx.errorResponse(e);
+                if (er.status >= 500) {
                     var err_ev = events.ErrorEvent{ .app = app, .ctx = &rctx, .err = e, .phase = .request, .message = @errorName(e) };
                     events.dispatchError(app, app.dispatch, &err_ev);
                 }
-                return resp;
+                return try mergePending(ctx.allocator, &cx, er);
             };
+            return try mergePending(ctx.allocator, &cx, resp);
         }
     }
     return null;
@@ -287,6 +314,65 @@ test "dispatchCustom: deliberate 4xx is NOT reported to onError; genuine 5xx is"
     const boom = (try dispatchCustom(&boom_ctx)).?;
     try std.testing.expectEqual(@as(u16, 500), boom.status);
     try std.testing.expectEqual(@as(usize, 1), H.on_error_calls);
+}
+
+test "dispatchCustom merges ctx.setCookie/addHeader on success AND error paths (non-exclusive)" {
+    const db = @import("db.zig");
+    const App = app_mod.App;
+
+    const H = struct {
+        // Success: queue a deferred cookie+header AND set a cookie on the Response literal.
+        fn ok(cx: *Ctx) anyerror!http.Response {
+            try cx.setCookie(.{ .name = "sid", .value = "minted", .secure = false });
+            try cx.addHeader(.{ .name = "X-Test", .value = "1" });
+            return .{ .status = 200, .body = "{}", .cookies = &.{.{ .name = "handler", .value = "set" }} };
+        }
+        // Error: a deferred cookie must still reach the mapped error Response.
+        fn err(cx: *Ctx) anyerror!http.Response {
+            try cx.setCookie(.{ .name = "sid", .value = "on-error", .secure = false });
+            return error.NotFound;
+        }
+    };
+
+    const ga = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+    defer ga.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+    defer ga.free(db_path);
+    var pool = try db.Pool.init(ga, std.testing.io, db_path);
+    defer pool.deinit();
+    var arena = std.heap.ArenaAllocator.init(ga);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const route_table = [_]events.RuntimeRoute{
+        .{ .method = .GET, .pattern = "/api/ok", .handler = H.ok, .auth = .public },
+        .{ .method = .GET, .pattern = "/api/err", .handler = H.err, .auth = .public },
+    };
+    const dispatch = events.Dispatch{ .routes = &route_table };
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &pool, .dispatch = &dispatch };
+
+    // Success path: the handler's own cookie is kept, the deferred cookie is appended, and
+    // the deferred header lands in extra_headers (union; raw Response stays usable).
+    var ok_ctx = http.RequestCtx{ .method = .GET, .path = "/api/ok", .allocator = a, .app = &app };
+    const ok = (try dispatchCustom(&ok_ctx)).?;
+    try std.testing.expectEqual(@as(u16, 200), ok.status);
+    try std.testing.expectEqual(@as(usize, 2), ok.cookies.len);
+    try std.testing.expectEqualStrings("handler", ok.cookies[0].name);
+    try std.testing.expectEqualStrings("sid", ok.cookies[1].name);
+    try std.testing.expectEqualStrings("minted", ok.cookies[1].value);
+    try std.testing.expectEqual(@as(usize, 1), ok.extra_headers.len);
+    try std.testing.expectEqualStrings("X-Test", ok.extra_headers[0].name);
+
+    // Error path: the mapped 404 still carries the deferred Set-Cookie.
+    var err_ctx = http.RequestCtx{ .method = .GET, .path = "/api/err", .allocator = a, .app = &app };
+    const er = (try dispatchCustom(&err_ctx)).?;
+    try std.testing.expectEqual(@as(u16, 404), er.status);
+    try std.testing.expectEqual(@as(usize, 1), er.cookies.len);
+    try std.testing.expectEqualStrings("sid", er.cookies[0].name);
+    try std.testing.expectEqualStrings("on-error", er.cookies[0].value);
 }
 
 /// Parse a multipart/form-data body into ctx.form_fields/ctx.files.
@@ -430,6 +516,7 @@ fn onRequest(r: zap.Request) !void {
             .name = c.name,
             .value = c.value,
             .path = c.path,
+            .domain = c.domain,
             .max_age_s = @intCast(c.max_age_s),
             .secure = c.secure,
             .http_only = c.http_only,

@@ -71,6 +71,10 @@ pub const Cookie = struct {
     secure: bool = true,
     same_site: SameSite = .strict,
     path: []const u8 = "/",
+    /// Cookie `Domain` attribute. null (the default) scopes the cookie to the exact
+    /// host that set it (no `Domain=` emitted); set it to share a cookie across
+    /// subdomains (e.g. ".example.com").
+    domain: ?[]const u8 = null,
 };
 
 pub const Header = struct { name: []const u8, value: []const u8 };

@@ -309,6 +309,57 @@ fn confirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 See [recipes.md → a custom business route with a path param](recipes.md#recipe-a-custom-business-route-with-a-path-param--db-write)
 for a full worked route.
 
+### Response builders + deferred cookies/headers (`ctx`)
+
+The raw `http.Response` literal is always available — but for the common shapes the `ctx`
+carries builders (all allocating on `ctx.arena`) and a deferred-mutation accumulator. They
+are conveniences layered over the same `http.Response`; mixing them with a hand-built
+literal is fine.
+
+**Response builders:**
+
+- `ctx.json(status, value)` — serialize any JSON-encodable value (incl. a `std.json.Value`)
+  into an `application/json` response.
+- `ctx.jsonError(status, code)` — a terse `{"error":"<code>"}` JSON body (distinct from the
+  framework's `{code,message,data}` envelope; use `ctx.errorResponse` for that one).
+- `ctx.html(status, body)` — a `text/html; charset=utf-8` response.
+- `ctx.redirect(status, location)` — a redirect with a `Location` header.
+- `ctx.notFound()` — the canonical `404 Not found.` envelope.
+
+**Reading the request:**
+
+- `ctx.query()` — the URL query string, lazily parsed (and cached) into **decoded**
+  key/value pairs: `+` → space, `%XX` percent-decoded. `q.get("k")` returns `?[]const u8`.
+  In a job/hook context (no request) it is empty rather than an error.
+- `ctx.randomToken(n)` / `ctx.randomHex(n)` — arena-owned random tokens (base36 / hex).
+
+**Deferred response mutation** — `ctx.setCookie(cookie)` and `ctx.addHeader(header)` queue a
+cookie/header that the framework merges onto whatever response the handler returns. Crucially
+this happens on **both** the success and the error path, so a Set-Cookie you queue still
+reaches the client even if the handler then returns `error.NotFound` / `ctx.fail(...)`:
+
+```zig
+fn track(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    // Read-or-mint an opaque, anonymous-friendly visitor id (one Set-Cookie, idempotent
+    // within the request). An existing well-formed cookie is returned verbatim.
+    const visitor = try ctx.subjectCookie("zb_subject", .{ .max_age_s = 60 * 60 * 24 * 365 });
+    const q = try ctx.query();
+    if (q.get("ref")) |ref| {
+        // ... record the referral for `visitor` ...
+        _ = ref;
+    }
+    return ctx.json(200, .{ .visitor = visitor });
+}
+```
+
+`ctx.subjectCookie(name, opts)` reads `name` from the incoming request; if present and
+well-formed it returns that value (no Set-Cookie), otherwise it mints a fresh opaque id and
+queues a single Set-Cookie. It is **not** a signed/authenticated identity — just a stable
+handle for anonymous attribution. `SubjectCookieOpts` defaults to a secure, `SameSite=Lax`,
+http-only, root-path cookie (`max_age_s = 0` is a session cookie); set `max_age_s`/`domain`
+for a persistent or cross-subdomain id. An explicit `?subject=` query param still wins where
+the framework consumes it.
+
 ### DB access from a route (`ctx.records()`)
 
 An untyped route handler reaches the database through `ctx.records()` — the same
