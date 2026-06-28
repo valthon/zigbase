@@ -146,12 +146,8 @@ pub fn deliver(ctx: *Ctx, job: WebhookJob) !void {
                     fireOnError(ctx, error.WebhookDeliveryFailed, msg);
                     return;
                 }
-                // Cap the wait at the policy's `max_ms`: a delivery target controls the
-                // `Retry-After` header, and these backoff sleeps occupy the worker thread —
-                // an unbounded value (e.g. `Retry-After: 86400`) would otherwise let a hostile
-                // or misconfigured receiver park a worker for hours and starve the pool.
                 const raw_delay = retry_after_ms orelse queue.backoffMs(pol, attempt, randomU64(ctx.app.io));
-                const delay_ms = @min(raw_delay, job.max_ms);
+                const delay_ms = cappedDelayMs(raw_delay, job.max_ms);
                 if (delay_ms > 0)
                     ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
             },
@@ -183,6 +179,16 @@ fn attemptOnce(ctx: *Ctx, job: WebhookJob) !Disposition {
         return .{ .retryable = null };
     };
     return classify(res.status, retryAfterMs(res.headers));
+}
+
+/// Cap a retry wait at the policy's `max_ms`. The delivery TARGET controls the
+/// `Retry-After` header AND these backoff sleeps occupy the worker thread, so an
+/// unbounded server value (e.g. `Retry-After: 999999`) would otherwise let a hostile or
+/// misconfigured receiver park a worker for days and starve the background pool. The
+/// `backoffMs` path is already capped at `max_ms`; this clamps the `Retry-After` override
+/// to the same ceiling. (Pure + separated for direct testing.)
+fn cappedDelayMs(raw_delay_ms: u32, max_ms: u32) u32 {
+    return @min(raw_delay_ms, max_ms);
 }
 
 /// Pure status classifier (separated for direct testing).
@@ -283,6 +289,16 @@ test "retryAfterMs parses integer seconds, ignores garbage/HTTP-date" {
     try testing.expectEqual(@as(?u32, 0), retryAfterMs(&.{.{ .name = "retry-after", .value = " 0 " }}));
     try testing.expectEqual(@as(?u32, null), retryAfterMs(&.{.{ .name = "Retry-After", .value = "Wed, 21 Oct 2015 07:28:00 GMT" }}));
     try testing.expectEqual(@as(?u32, null), retryAfterMs(&.{.{ .name = "X-Other", .value = "5" }}));
+}
+
+test "cappedDelayMs clamps a huge Retry-After to max_ms (worker-stall DoS guard)" {
+    // A hostile/misconfigured Retry-After far above the ceiling is clamped to max_ms…
+    try testing.expectEqual(@as(u32, 300_000), cappedDelayMs(999_999_000, 300_000));
+    try testing.expectEqual(@as(u32, 5_000), cappedDelayMs(std.math.maxInt(u32), 5_000));
+    // …while a value at/under the ceiling passes through unchanged.
+    try testing.expectEqual(@as(u32, 2_000), cappedDelayMs(2_000, 300_000));
+    try testing.expectEqual(@as(u32, 300_000), cappedDelayMs(300_000, 300_000));
+    try testing.expectEqual(@as(u32, 0), cappedDelayMs(0, 300_000));
 }
 
 // --- Loopback integration ---------------------------------------------------
