@@ -702,18 +702,30 @@ const all = try ctx.flags().resolveAll(user_id); // every declared flag + experi
 // all.flags: []{ name, value: bool }   all.experiments: []{ name, variant: []const u8 }
 ```
 
-Because flags are server-side by default, exposing one publicly is an explicit choice — a
-one-line custom route over `ctx.flagByName` (or `ctx.flags().resolveAll` for the whole set):
+**Public read plane (`GET /api/state`).** A built-in, **unauthenticated** projection
+returns every declared flag + experiment resolved for a caller-supplied `subject`:
+
+```json
+// GET /api/state?subject=user-42   (no auth)
+{ "flags": { "checkout_enabled": true }, "experiments": { "checkout_layout": "compact" } }
+```
+
+It serves **resolved values only** (never the `_kv` keys, defaults, weights, or the
+superuser settings verbs). It auto-mounts at `/api/state`; the `.features` knob remaps or
+disables it:
 
 ```zig
-fn publicFlag(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
-    const name = ctx.request.?.param("name").?;
-    const on = ctx.flagByName(name) orelse return ctx.errorResponse(ctx.fail(404, "Unknown flag."));
-    const body = try std.fmt.allocPrint(ctx.arena, "{{\"enabled\":{}}}", .{on});
-    return .{ .status = 200, .body = body };
-}
-// .routes = .{ .{ .method = .GET, .path = "/api/public-flags/:name", .handler = publicFlag } }
+App(.{
+    .features = .{ .public_route = "/state" },   // remap (default "/api/state")
+    // .features = .{ .public_route = .disabled }, // turn off entirely (404)
+});
 ```
+
+The typed TypeScript SDK surfaces this as `zb.flags.resolveAll(subject)` (named-boolean
+flags + variant string-unions) — see
+[TypeScript SDK → Typed feature state](./typescript-sdk#typed-feature-state--zbflags).
+For a bespoke shape you can still write your own custom route over `ctx.flagByName` /
+`ctx.flags().resolveAll`.
 
 **Migrating from 0.7:** declare each flag you used in `.flags`, then replace
 `try ctx.flag("x")` with `App.flag(ctx, .x)` (compile-checked) or `ctx.flagByName("x")`
@@ -773,8 +785,8 @@ KV store (every endpoint requires a valid superuser token):
 
 The embedded admin UI exposes these endpoints as a "Settings" section where superusers can view, create, edit, delete entries, and toggle boolean flags with a checkbox — no API client required.
 
-This is the management plane; the public read plane is whatever custom route you choose to
-expose (above).
+This is the management plane; the public read plane is the built-in `GET /api/state`
+endpoint (above), or a custom route if you need a bespoke shape.
 
 ### Admin UI
 
