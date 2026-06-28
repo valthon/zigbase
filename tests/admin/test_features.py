@@ -153,6 +153,26 @@ def test_save_experiment_weights_writes_override(page):
     assert r.json()['value'] == '[90,10]'
 
 
+def test_experiment_weight_input_clamps_to_u16_range(page):
+    """Weights are u16 server-side (max 65535); the onInput handler clamps out-of-range
+    values so an over-large or negative entry can never be saved."""
+    login(page)
+    page.click('[data-test=nav-features]')
+    page.wait_for_selector('[data-test=weight-onboarding_flow-control]', timeout=5000)
+
+    # Type an over-large value: it should clamp to 65535 in the input state.
+    page.fill('[data-test=weight-onboarding_flow-control]', '70000')
+    assert page.input_value('[data-test=weight-onboarding_flow-control]') == '65535'
+
+    # Save and verify the persisted override carries the clamped value, not 70000.
+    with page.expect_response(lambda r: '/api/settings/' in r.url and r.request.method == 'PUT') as resp_info:
+        page.click('[data-test=exp-save-onboarding_flow]')
+    assert resp_info.value.ok
+    r = api_request(page, 'GET', '/api/settings/exp:onboarding_flow:weights')
+    assert r.status == 200
+    assert r.json()['value'] == '[65535,30]'
+
+
 def test_experiment_reset_clears_weight_override(page):
     """'Reset to declared' button deletes the weight override from _kv."""
     login(page)

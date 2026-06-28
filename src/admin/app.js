@@ -496,12 +496,12 @@ function FeaturesView() {
 function FlagsSection({ flags, onReload }) {
   const [err, setErr] = useState('');
   async function setOverride(name, enabled) {
-    try { await API.flagOverridePut(name, enabled ? 'true' : 'false'); onReload(); }
+    try { await API.flagOverridePut(name, enabled ? 'true' : 'false'); setErr(''); onReload(); }
     catch (x) { setErr((x.data && x.data.message) || 'Failed to update flag'); }
   }
   async function clearOverride(name) {
-    try { await API.flagOverrideDel(name); onReload(); }
-    catch (x) { if (x.status === 404) { onReload(); return; } setErr((x.data && x.data.message) || 'Failed to clear override'); }
+    try { await API.flagOverrideDel(name); setErr(''); onReload(); }
+    catch (x) { if (x.status === 404) { setErr(''); onReload(); return; } setErr((x.data && x.data.message) || 'Failed to clear override'); }
   }
   const effective = (f) => f.override !== null ? f.override === 'true' : f.default;
   return html`
@@ -587,7 +587,7 @@ function ExperimentPanel({ exp, onReload }) {
             <td><input type="number" min="0" max="65535" style="width:80px"
               data-test=${'weight-' + exp.name + '-' + v}
               value=${weights[i] ?? exp.weights[i]}
-              onInput=${e => setWeight(i, parseInt(e.target.value, 10) || 0)}
+              onInput=${e => setWeight(i, Math.max(0, Math.min(65535, parseInt(e.target.value, 10) || 0)))}
             /></td>
           </tr>`)}
         </tbody>

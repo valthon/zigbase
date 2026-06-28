@@ -224,10 +224,14 @@ test "GET /api/features returns declared flags with overrides" {
     try std.testing.expect(std.mem.indexOf(u8, r1.body, "\"dark_mode\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, r1.body, "\"override\":null") != null);
 
-    // Seed an override.
-    const d = Data{ .app = &env.app, .conn = env.pool.acquireWriter(), .io = std.testing.io, .alloc = a };
-    try d.kvSet("flag:dark_mode", "true");
-    env.pool.releaseWriter();
+    // Seed an override. Release the writer via defer so a kvSet error can't leak the
+    // mutex (which would deadlock a later acquire).
+    {
+        const conn = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const d = Data{ .app = &env.app, .conn = conn, .io = std.testing.io, .alloc = a };
+        try d.kvSet("flag:dark_mode", "true");
+    }
 
     // Now override should be "true".
     var ctx2 = ctxFor(env, a, .GET, "/api/features", &.{});
@@ -264,10 +268,14 @@ test "GET /api/features returns declared experiments with weight_override" {
     try std.testing.expect(std.mem.indexOf(u8, r1.body, "\"onboarding\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, r1.body, "\"weight_override\":null") != null);
 
-    // Seed a weight override.
-    const d = Data{ .app = &env.app, .conn = env.pool.acquireWriter(), .io = std.testing.io, .alloc = a };
-    try d.kvSet("exp:onboarding:weights", "[90,10]");
-    env.pool.releaseWriter();
+    // Seed a weight override. Release the writer via defer so a kvSet error can't leak
+    // the mutex (which would deadlock a later acquire).
+    {
+        const conn = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const d = Data{ .app = &env.app, .conn = conn, .io = std.testing.io, .alloc = a };
+        try d.kvSet("exp:onboarding:weights", "[90,10]");
+    }
 
     var ctx2 = ctxFor(env, a, .GET, "/api/features", &.{});
     ctx2.authorization = auth_hdr;
