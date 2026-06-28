@@ -1,3 +1,0 @@
-### Features
-- Admin UI gains a **Feature Flags & Experiments** screen (`/_/#/features`) showing every declared flag (name, default, description, effective value) with a toggle to set/clear the `flag:<name>` override, and each declared experiment's variants with editable weight sliders that write the `exp:<name>:weights` override; a "Reset to declared" action clears the override. Superuser-only; backed by the new `GET /api/features` endpoint.
-- New `GET /api/features` endpoint (superuser) returns the comptime-declared flag + experiment registry alongside each entry's current `_kv` override — useful for custom admin tooling.
