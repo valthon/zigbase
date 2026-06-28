@@ -271,6 +271,10 @@ fn lowerSecretSource(comptime src: anytype, comptime path: []const u8) PathSecre
         const ok = std.mem.eql(u8, f.name, "kv") or std.mem.eql(u8, f.name, "settings") or std.mem.eql(u8, f.name, "config");
         if (!ok) @compileError("route '" ++ path ++ "': unknown .path_secret.source variant '." ++ f.name ++ "' (recognized: .kv, .settings, .config)");
     }
+    // Exactly one source variant — `.{ .kv = "a", .settings = "b" }` would otherwise compile
+    // and silently use only `.kv`, dropping the rest (loud-comptime convention).
+    if (std.meta.fields(S).len != 1)
+        @compileError("route '" ++ path ++ "': .path_secret.source must have exactly one field (.kv, .settings, or .config)");
     if (@hasField(S, "kv")) return .{ .kv = src.kv };
     if (@hasField(S, "settings")) return .{ .settings = src.settings };
     if (@hasField(S, "config")) return .{ .config = src.config };
@@ -1307,11 +1311,29 @@ test "buildRoutes lowers a per-route rate_limit + rate_limit_key (#142)" {
     try std.testing.expect(table[0].rate_limit_key != null);
 }
 
-// NOTE: a malformed `.path_secret` (missing `.param`/`.source`, an unknown key, or an
-// unknown `.source` variant) is rejected at COMPILE time by `lowerRouteAuthGuard`/
-// `lowerSecretSource` — e.g. `.auth = .{ .path_secret = .{ .source = .{ .kv = "k" } } }`
-// (no `.param`) is a `@compileError`. It cannot be asserted at runtime (it would fail the
-// build), matching the loud-comptime convention used for hooks and `.rate_limit`.
+test "buildRoutes accepts a pre-lowered RateLimitOpt for .rate_limit" {
+    const H = struct {
+        fn h(ctx: *Ctx) anyerror!http.Response {
+            _ = ctx;
+            return .{ .status = 200, .body = "{}" };
+        }
+    };
+    // A consumer may pass a const `RateLimitOpt` straight through (it must not re-enter the
+    // struct-lowering branch — see schema.buildRateLimitOpt's passthrough guard).
+    const limit: schema.RateLimitOpt = .{ .custom = .{ .max = 4, .window_s = 120 } };
+    const table = buildRoutes(.{
+        .{ .method = .POST, .path = "/api/pre", .handler = H.h, .auth = .public, .rate_limit = limit },
+    });
+    try std.testing.expect(table[0].rate_limit == .custom);
+    try std.testing.expectEqual(@as(u32, 4), table[0].rate_limit.custom.max);
+}
+
+// NOTE: a malformed `.path_secret` (missing `.param`/`.source`, an unknown key, an unknown
+// `.source` variant, or MORE THAN ONE `.source` variant) is rejected at COMPILE time by
+// `lowerRouteAuthGuard`/`lowerSecretSource` — e.g. `.auth = .{ .path_secret = .{ .source =
+// .{ .kv = "k" } } }` (no `.param`) and `.source = .{ .kv = "a", .config = "b" }` (two
+// variants) are both `@compileError`s. They cannot be asserted at runtime (they would fail
+// the build), matching the loud-comptime convention used for hooks and `.rate_limit`.
 
 test "AuthMethod enumerates all method tags" {
     try std.testing.expectEqualStrings("magic_link", @tagName(AuthMethod.magic_link));
