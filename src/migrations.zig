@@ -246,6 +246,37 @@ fn init_0012_experiment_assignments(w: *db.Db) db.DbError!void {
     try w.exec("CREATE INDEX IF NOT EXISTS \"idx_experiment_assignments_created\" ON \"_experiment_assignments\" (\"created\");");
 }
 
+fn init_0013_queue_jobs(w: *db.Db) db.DbError!void {
+    // Durable background-job queue (#137 PR2). One row per enqueued durable job; the
+    // memory backend never touches this table. A per-worker poller claims ready rows
+    // (status='pending' AND run_at<=now) for its queues, ORDER BY priority,run_at,
+    // marking them 'claimed' (claimed_at/claimed_by) — at-least-once: a crashed worker's
+    // 'claimed' row is reclaimed to 'pending' once claimed_at is older than the visibility
+    // timeout. On success → 'done'; a retryable failure bumps attempts and pushes run_at
+    // out by the backoff; exhausting max_attempts → 'failed' (last_error + .onError). The
+    // (status,run_at,priority) index serves the claim query; (created) serves the GC sweep
+    // that reaps old done/failed rows in bounded batches (mirrors _experiment_assignments).
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_queue_jobs" (
+        \\  "id" TEXT PRIMARY KEY,
+        \\  "queue" TEXT NOT NULL,
+        \\  "kind" TEXT NOT NULL,
+        \\  "payload" TEXT NOT NULL DEFAULT '',
+        \\  "priority" INTEGER NOT NULL DEFAULT 1,
+        \\  "attempts" INTEGER NOT NULL DEFAULT 0,
+        \\  "max_attempts" INTEGER NOT NULL DEFAULT 5,
+        \\  "run_at" INTEGER NOT NULL DEFAULT 0,
+        \\  "claimed_at" INTEGER,
+        \\  "claimed_by" TEXT NOT NULL DEFAULT '',
+        \\  "status" TEXT NOT NULL DEFAULT 'pending',
+        \\  "last_error" TEXT NOT NULL DEFAULT '',
+        \\  "created" TEXT NOT NULL
+        \\);
+    );
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_queue_jobs_ready\" ON \"_queue_jobs\" (\"status\",\"run_at\",\"priority\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_queue_jobs_created\" ON \"_queue_jobs\" (\"created\");");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -259,6 +290,7 @@ pub const all = [_]Migration{
     .{ .name = "0010_token_epoch", .up = init_0010_token_epoch },
     .{ .name = "0011_sessions", .up = init_0011_sessions },
     .{ .name = "0012_experiment_assignments", .up = init_0012_experiment_assignments },
+    .{ .name = "0013_queue_jobs", .up = init_0013_queue_jobs },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {
@@ -434,6 +466,28 @@ test "0011 creates the _sessions store with its indexes" {
     defer e.finalize();
     _ = try e.step();
     try std.testing.expect(e.isNull(0));
+}
+
+test "0013 creates the _queue_jobs table with its indexes" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try run(&d);
+    var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('_queue_jobs');");
+    defer t.finalize();
+    _ = try t.step();
+    try std.testing.expectEqual(@as(i64, 13), t.columnInt(0));
+    var idx = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_queue_jobs_ready','idx_queue_jobs_created');");
+    defer idx.finalize();
+    _ = try idx.step();
+    try std.testing.expectEqual(@as(i64, 2), idx.columnInt(0));
+    // claimed_at is nullable (NULL = unclaimed); a fresh row omits it.
+    try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"created\") VALUES ('j1','default','mail',5,datetime('now'));");
+    var e = try d.prepare("SELECT claimed_at, status, attempts FROM \"_queue_jobs\" WHERE id='j1';");
+    defer e.finalize();
+    _ = try e.step();
+    try std.testing.expect(e.isNull(0));
+    try std.testing.expectEqualStrings("pending", e.columnText(1));
+    try std.testing.expectEqual(@as(i64, 0), e.columnInt(2));
 }
 
 test "0003 creates _externalAuths with unique provider/providerId and per-record indexes" {

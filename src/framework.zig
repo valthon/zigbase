@@ -26,6 +26,9 @@ const field_policy = @import("field_policy.zig");
 const rewrap = @import("rewrap.zig");
 const features = @import("features.zig");
 const ctx_mod = @import("ctx.zig");
+const queue = @import("queue/queue.zig");
+const queue_config = @import("queue/config.zig");
+const queue_durable = @import("queue/durable.zig");
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -188,9 +191,14 @@ pub fn App(comptime cfg: anytype) type {
     return struct {
         /// Prebuilt at comptime; the runtime app holds a pointer to it (static lifetime).
         pub const dispatch: events.Dispatch = blk: {
+            // Headroom: this block validates every cfg key against `allowed` (a growing
+            // list) AND runs the hook-typo guard (`validateHooks`), all on one comptime
+            // budget — a large consumer config (many hooks + cfg keys) can otherwise trip
+            // the default 1000-branch limit inside `validateHooks`.
+            @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -269,12 +277,86 @@ pub fn App(comptime cfg: anytype) type {
         else
             &.{};
 
-        /// Framework-internal jobs: the TTL sweep, the session-GC sweep, and/or the sticky-
-        /// assignment GC sweep, each gated on its own condition. Appended after the consumer's
-        /// jobs so user `.cron` names win the lower indices, and an internal job runs even with
-        /// no user cron.
-        const internal_jobs: []const scheduler.RuntimeJob =
-            scheduler.concatJobs(scheduler.concatJobs(ttl_jobs, session_gc_jobs), experiment_gc_jobs);
+        // ── Background jobs & queues (#137 PR2) ────────────────────────────────
+        // The comptime `.queues`/`.workers`/`.jobs` config lowered into runtime slices,
+        // plus the generated `Queue`/`Job` enums (so `App.enqueue(ctx, .q, .kind, …)` is
+        // compile-checked). `.default` is always synthesized; absent `.workers` yields one
+        // implicit worker over all queues (strict priority). `app.queues` points at
+        // `queue_registry`. The durable poller + GC jobs are installed ONLY when a durable
+        // queue is declared (pure-memory and no-queue apps install nothing — zero overhead).
+
+        /// Declared queues (always includes a synthesized `.default`).
+        pub const queue_defs: []const queue.QueueDef =
+            queue_config.queueMeta(if (@hasField(@TypeOf(cfg), "queues")) cfg.queues else .{});
+
+        /// Declared workers (or the implicit single all-queues worker when `.workers` is absent).
+        pub const worker_defs: []const queue.WorkerDef =
+            queue_config.workerMeta(if (@hasField(@TypeOf(cfg), "workers")) cfg.workers else .{}, queue_defs);
+
+        /// Declared job-kind → handler registry (the reserved `.jobs.pool_size` key is skipped).
+        pub const job_regs: []const queue.JobReg =
+            queue_config.jobsMeta(if (@hasField(@TypeOf(cfg), "jobs")) cfg.jobs else .{});
+
+        /// Enum of declared queue names — the compile-checked key for `App.enqueue`.
+        pub const Queue = queue_config.QueueEnum(if (@hasField(@TypeOf(cfg), "queues")) cfg.queues else .{});
+
+        /// Enum of declared job kinds — the compile-checked kind for `App.enqueue`.
+        pub const Job = queue_config.JobEnum(if (@hasField(@TypeOf(cfg), "jobs")) cfg.jobs else .{});
+
+        /// Static lowered registry threaded (type-erased) into `app.queues` by serveImpl.
+        pub const queue_registry: queue.Registry = .{ .queues = queue_defs, .workers = worker_defs, .jobs = job_regs };
+
+        /// True when any declared queue is durable — gates the poller + GC jobs.
+        pub const has_durable_queue: bool = queue_registry.hasDurable();
+
+        /// Number of workers that drain at least one durable queue (each gets a poller).
+        const durable_worker_count: usize = blk: {
+            var c: usize = 0;
+            for (worker_defs) |w| if (queue_registry.workerHasDurable(w)) {
+                c += 1;
+            };
+            break :blk c;
+        };
+
+        /// One reactive poller job per durable worker (`_queue:<worker>`), claiming +
+        /// dispatching its durable queues' ready jobs each cycle. Empty when no durable queue.
+        const queue_worker_jobs: []const scheduler.RuntimeJob = blk: {
+            if (durable_worker_count == 0) break :blk &.{};
+            const Holder = struct {
+                const table: [durable_worker_count]scheduler.RuntimeJob = tbl: {
+                    var t: [durable_worker_count]scheduler.RuntimeJob = undefined;
+                    var i: usize = 0;
+                    for (worker_defs) |w| {
+                        if (!queue_registry.workerHasDurable(w)) continue;
+                        t[i] = .{ .name = "_queue:" ++ w.name, .schedule = schedule.Schedule.reactive, .run = queueWorkerRun };
+                        i += 1;
+                    }
+                    break :tbl t;
+                };
+            };
+            break :blk &Holder.table;
+        };
+
+        /// Hourly durable-queue GC + reclaim sweep (`_queue_gc`); empty when no durable queue.
+        const queue_gc_jobs: []const scheduler.RuntimeJob = if (has_durable_queue)
+            scheduler.buildJobs(.{
+                .{ .name = "_queue_gc", .schedule = schedule.Schedule{ .cron = "0 * * * *" }, .handler = queueGcJob },
+            })
+        else
+            &.{};
+
+        /// Framework-internal jobs: the TTL sweep, the session-GC sweep, the sticky-
+        /// assignment GC sweep, the durable-queue worker pollers, and the durable-queue GC
+        /// sweep — each gated on its own condition. Appended after the consumer's jobs so
+        /// user `.cron` names win the lower indices, and an internal job runs even with no
+        /// user cron.
+        const internal_jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(
+            scheduler.concatJobs(
+                scheduler.concatJobs(scheduler.concatJobs(ttl_jobs, session_gc_jobs), experiment_gc_jobs),
+                queue_worker_jobs,
+            ),
+            queue_gc_jobs,
+        );
 
         /// The full job table = consumer jobs ++ framework-internal jobs. The scheduler
         /// starts whenever this is non-empty, so a TTL collection alone starts it.
@@ -520,6 +602,15 @@ pub fn App(comptime cfg: anytype) type {
             return ctx.resolveDeclaredExperiment(def, subject);
         }
 
+        /// Enqueue a background job with COMPILE-CHECKED queue + kind names (mirrors
+        /// `App.flag`): a typo'd `.queue` or `.kind` is a compile error. `payload` is
+        /// JSON-serialized and routed to the queue's backend (memory|durable). The generic
+        /// runtime escape hatch is `ctx.enqueue(.queue, .kind, payload)`. Callable from
+        /// background jobs.
+        pub fn enqueue(ctx: *ctx_mod.Ctx, comptime q: Queue, comptime job: Job, payload: anytype) !void {
+            return ctx.enqueueByName(@tagName(q), @tagName(job), payload);
+        }
+
         /// Explicit migrations (the escape hatch for non-additive changes), run in
         /// order before provisioning and recorded once in `_migrations`. Empty by default.
         ///
@@ -554,6 +645,7 @@ pub fn App(comptime cfg: anytype) type {
             .features = &features_registry,
             .experiment_assignment_ttl = experiment_assignment_ttl,
             .features_public_route = features_public_route,
+            .queues = &queue_registry,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -600,6 +692,37 @@ fn experimentGcJob(ctx: *@import("ctx.zig").Ctx, ev: *events.JobEvent) anyerror!
     _ = try @import("features_resolver.zig").gcExpiredAssignments(w, ctx.app.experiment_assignment_ttl);
 }
 
+/// The per-durable-worker poller (`_queue:<worker>`, #137 PR2). Reactive: each cycle it
+/// reclaims stale claims, claims+dispatches a batch of its durable queues' ready jobs, then
+/// re-arms promptly (~one scheduler tick) so durable jobs drain with low latency. Registered
+/// only for workers that drain a durable queue (see `App.queue_worker_jobs`).
+fn queueWorkerRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!?schedule.Reactive {
+    const reg = queue.registryFromApp(ctx.app) orelse return schedule.Reactive{ .after = .{ .minutes = 1 } };
+    const prefix = "_queue:";
+    const wname = if (std.mem.startsWith(u8, ev.name, prefix)) ev.name[prefix.len..] else ev.name;
+    var worker: ?queue.WorkerDef = null;
+    for (reg.workers) |w| if (std.mem.eql(u8, w.name, wname)) {
+        worker = w;
+    };
+    const wk = worker orelse return schedule.Reactive{ .after = .{ .minutes = 1 } };
+    _ = queue_durable.pollOnce(ctx.app, reg, wk) catch |e|
+        std.log.warn("queue worker '{s}' poll failed: {s}", .{ wname, @errorName(e) });
+    // Re-arm at the minimum interval (0) so the next scheduler tick (~500ms) polls again.
+    return schedule.Reactive{ .after = .{ .minutes = 0 } };
+}
+
+/// The framework-internal `_queue_gc` job (#137 PR2): reclaims stale claims and reaps
+/// done/failed rows older than the registry TTL, in bounded batches. Registered only when a
+/// durable queue is declared (see `App.queue_gc_jobs`).
+fn queueGcJob(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
+    _ = ev;
+    const reg = queue.registryFromApp(ctx.app) orelse return;
+    const w = ctx.app.pool.acquireWriter();
+    defer ctx.app.pool.releaseWriter();
+    _ = queue_durable.reclaimStale(w, clock.nowUnix(ctx.app.io), reg.visibility_timeout_s) catch {};
+    _ = try queue_durable.gcDoneJobs(w, reg.done_ttl_s);
+}
+
 /// Comptime knobs threaded from `App(cfg)` into the serve path: which storage /
 /// mailer plugin TYPES to instantiate, the assembled auth method type list,
 /// and the warm-reader-pool cap.
@@ -633,6 +756,10 @@ pub const ServeOpts = struct {
     /// Public feature-state route (`api/state.zig`) mount path; null = disabled.
     /// Lowered from the `.features` knob; threaded into `app.features_public_route`.
     features_public_route: ?[]const u8 = "/api/state",
+    /// Lowered queue/worker/job registry (#137 PR2), pointed (type-erased) into
+    /// `app.queues` by serveImpl so `ctx.enqueue`/`App.enqueue` can route by backend.
+    /// Static lifetime (a comptime-lowered const). null = no registry wired.
+    queues: ?*const queue.Registry = null,
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -1231,6 +1358,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .features = opts.features,
         .experiment_assignment_ttl = opts.experiment_assignment_ttl,
         .features_public_route = opts.features_public_route,
+        .queues = if (opts.queues) |r| @as(?*const anyopaque, @ptrCast(r)) else null,
         // Always wire the shared limiter store: the default-scope limiter no-ops when
         // rate_limit_max==0 (RateLimiter.allow returns true for max==0), but a configured
         // per-method custom limit must still be honored against this store regardless of
@@ -1345,6 +1473,57 @@ test "App(cfg) builds a record dispatcher only when hooks are present" {
     };
     const WithHook = App(.{ .hooks = .{ .posts = .{ .afterCreate = H.f } } });
     try std.testing.expect(WithHook.dispatch.record != null);
+}
+
+fn qTestHandler(ctx: *ctx_mod.Ctx, payload: []const u8) anyerror!void {
+    _ = ctx;
+    _ = payload;
+}
+
+
+test "App(cfg) synthesizes a default queue + implicit worker; no durable jobs for memory-only" {
+    const Bare = App(.{});
+    try std.testing.expectEqual(@as(usize, 1), Bare.queue_defs.len);
+    try std.testing.expectEqualStrings("default", Bare.queue_defs[0].name);
+    try std.testing.expect(!Bare.has_durable_queue);
+    // The generated Queue enum carries `.default`; an empty Job enum has no members.
+    try std.testing.expectEqualStrings("default", @tagName(@as(Bare.Queue, .default)));
+    try std.testing.expectEqual(@as(usize, 0), std.meta.fields(Bare.Job).len);
+    // A memory-only app installs NO queue worker/GC jobs.
+    for (Bare.jobs) |j| {
+        try std.testing.expect(!std.mem.startsWith(u8, j.name, "_queue"));
+    }
+}
+
+test "App(cfg) lowers .queues/.workers/.jobs and installs durable poller + GC jobs" {
+    const A = App(.{
+        .queues = .{ .emails = .{ .backend = .durable, .priority = .high } },
+        .workers = .{ .mailer = .{ .queues = .{"emails"}, .concurrency = 2 } },
+        .jobs = .{ .send = qTestHandler },
+    });
+    try std.testing.expect(A.has_durable_queue);
+    try std.testing.expectEqual(@as(usize, 1), A.job_regs.len);
+    try std.testing.expectEqualStrings("send", A.job_regs[0].kind);
+    try std.testing.expectEqualStrings("send", @tagName(@as(A.Job, .send)));
+    try std.testing.expectEqualStrings("emails", @tagName(@as(A.Queue, .emails)));
+
+    var saw_poller = false;
+    var saw_gc = false;
+    for (A.jobs) |j| {
+        if (std.mem.eql(u8, j.name, "_queue:mailer")) saw_poller = true;
+        if (std.mem.eql(u8, j.name, "_queue_gc")) saw_gc = true;
+    }
+    try std.testing.expect(saw_poller);
+    try std.testing.expect(saw_gc);
+}
+
+test "App(cfg) keeps legacy .jobs.pool_size working alongside the job registry" {
+    // `.jobs.pool_size` is the legacy scheduler-pool lever; it must NOT become a job kind.
+    const A = App(.{ .jobs = .{ .pool_size = 3, .resize = qTestHandler } });
+    try std.testing.expectEqual(@as(usize, 3), A.job_pool_size);
+    try std.testing.expectEqual(@as(usize, 1), A.job_regs.len);
+    try std.testing.expectEqualStrings("resize", A.job_regs[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), std.meta.fields(A.Job).len);
 }
 
 test "App(cfg) installs the auth-lifecycle dispatcher only for a non-empty .auth group" {

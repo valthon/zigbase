@@ -69,6 +69,13 @@ pub const App = struct {
     /// In-memory rate limiter for sensitive auth endpoints; null = disabled
     /// (rate_limit_max == 0, or tests/CLI that don't wire it). Set in serveImpl.
     rate_limiter: ?*ratelimit.RateLimiter = null,
+    /// Type-erased pointer to the lowered queue/worker/job `Registry` (#137 PR2), set by
+    /// serveImpl from the comptime `.queues`/`.workers`/`.jobs` config. Drives
+    /// `ctx.enqueue`/`App.enqueue` (route by backend) and the durable poller/GC jobs.
+    /// Stored as opaque (cast to `*const @import("queue/queue.zig").Registry`) to avoid an
+    /// app.zig→queue→ctx→app import cycle, mirroring `auth_methods`. null = no registry
+    /// wired (tests/CLI constructing App directly).
+    queues: ?*const anyopaque = null,
     /// Type-erased pointer to the running auth-method Registry (set by serveImpl); null = not running.
     /// Cast to `*const @import("auth/registry.zig").Registry` to read slugs. Stored as opaque
     /// to avoid an import cycle: app.zig must NOT import registry.zig or auth/method.zig.

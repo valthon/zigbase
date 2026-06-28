@@ -64,6 +64,18 @@ pub const FlagDef = @import("features.zig").FlagDef;
 pub const ExperimentDef = @import("features.zig").ExperimentDef;
 pub const FeatureRegistry = @import("features.zig").Registry;
 
+// ---- Background jobs & queues (#137) ---------------------------------------
+// Types a consumer names when declaring `.queues`/`.workers`/`.jobs`. The typed,
+// compile-checked accessor (App.enqueue) and the generated Queue/Job enums live on
+// the App(cfg) type; the runtime escape hatch is ctx.enqueue / ctx.enqueueByName.
+pub const QueueDef = @import("queue/queue.zig").QueueDef;
+pub const WorkerDef = @import("queue/queue.zig").WorkerDef;
+pub const RetryPolicy = @import("queue/queue.zig").RetryPolicy;
+pub const Backend = @import("queue/queue.zig").Backend;
+pub const Priority = @import("queue/queue.zig").Priority;
+pub const Backoff = @import("queue/queue.zig").Backoff;
+pub const QueueRegistry = @import("queue/queue.zig").Registry;
+
 // ---- Ctx capability object -------------------------------------------------
 pub const Ctx = @import("ctx.zig").Ctx;
 /// The transaction scope passed to a `ctx.tx(T, fn(*Tx) ...)` callback — `t.records()`
@@ -236,6 +248,10 @@ test {
     _ = @import("ctx.zig");
     _ = @import("features.zig");
     _ = @import("features_resolver.zig");
+    _ = @import("queue/queue.zig");
+    _ = @import("queue/config.zig");
+    _ = @import("queue/durable.zig");
+    _ = @import("queue/memory.zig");
     _ = @import("session.zig");
     _ = @import("http_client.zig");
     _ = @import("testcapture.zig");

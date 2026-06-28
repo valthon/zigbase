@@ -90,7 +90,9 @@ error.**
 | `onBeforeServe` | Lifecycle: just before the server starts serving. |
 | `onBeforeTerminate` | Lifecycle: just before shutdown. |
 | `cron` | Scheduled job table. |
-| `jobs` | Scheduler settings (e.g. `.pool_size`). |
+| `jobs` | Scheduler `.pool_size` **and** the queue job-kind registry (kind → handler). See [Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs). |
+| `queues` | Named background-job queues (backend `memory`/`durable`, priority, retry). A `.default` queue is always synthesized. See [Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs). |
+| `workers` | Named queue workers (queue subset drained in strict priority + concurrency). Omit → one implicit worker over all queues. |
 | `collections` | Comptime schema: collections provisioned at startup (additive auto-migration). |
 | `migrations` | Explicit migrations (the escape hatch for non-additive schema changes). |
 | `static_files` | Comptime static-file mode: absent (default flag), `.disabled`, `.{ .dir = "..." }`, `.{ .embedded = ... }`. |
@@ -1516,6 +1518,10 @@ modes. See the
 },
 ```
 
+> `.jobs` does double duty: the reserved `.pool_size` key sets the scheduler worker-pool
+> size (above), and any OTHER key registers a queue **job-kind handler** — see
+> [§7b Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs).
+
 Each `cron` spec needs `.name`, `.schedule`, and `.handler` (missing/wrong-typed
 → compile error). The three schedule modes (`zigbase.schedule.Schedule`):
 
@@ -1592,6 +1598,92 @@ CLI/tests/no jobs configured).
 > scheduler's stop/deinit and must not assume `app` (or its pool/storage)
 > outlives it indefinitely. Cron/interval jobs, by contrast, use the bounded,
 > cleanly-joined worker pool.
+
+## 7b. Background jobs & queues (`.queues` / `.workers` / `.jobs`)
+
+`.cron`/`app.submit` (§7) are for *scheduled* and *fire-and-forget* work. For **enqueued
+background jobs** with retries, priorities, and optional durability, ZigBase ships a generic
+multi-queue / worker / job engine. The same engine backs the built-in `mail` and `webhook`
+job kinds.
+
+Three config keys lower at comptime:
+
+```zig
+App(.{
+    // Named queues. `.default` (memory/normal) is ALWAYS synthesized if you don't declare it.
+    .queues = .{
+        .emails = .{
+            .backend  = .durable,   // .memory (default) | .durable
+            .priority = .high,      // .high | .normal (default) | .low
+            .retry    = .{ .max_attempts = 5, .backoff = .exponential, .base_ms = 1000, .max_ms = 300_000, .jitter = true },
+        },
+        .reports = .{ .backend = .durable, .priority = .low },
+    },
+    // Named workers, each draining a subset of queues in STRICT priority order.
+    // OMIT `.workers` entirely → ONE implicit worker drains ALL queues, strict priority.
+    .workers = .{
+        .mailer  = .{ .queues = .{"emails"}, .concurrency = 4 },
+        .general = .{ .queues = .{ "reports", "default" } },
+    },
+    // Job-kind registry: kind name → handler `fn(*Ctx, payload: []const u8) anyerror!void`.
+    // (`.pool_size` is reserved here for the scheduler pool size — see §7.)
+    .jobs = .{
+        .resize_image = resizeImage,
+        .reindex      = reindex,
+    },
+})
+```
+
+A job handler receives the JSON payload as bytes and deserializes it:
+
+```zig
+fn resizeImage(ctx: *zigbase.Ctx, payload: []const u8) anyerror!void {
+    const parsed = try std.json.parseFromSlice(struct { id: []const u8 }, ctx.arena, payload, .{});
+    // …do the work; touch the DB via ctx.records() / ctx.app.pool.acquireWriter()…
+}
+```
+
+### Enqueueing
+
+From any route, hook, or job:
+
+```zig
+// Compile-checked (a typo'd queue or kind is a COMPILE ERROR), mirrors App.flag:
+try App.enqueue(ctx, .emails, .resize_image, .{ .id = "abc123" });
+
+// Runtime-validated escape hatch (errors UnknownQueue / UnknownJobKind):
+try ctx.enqueue(.emails, .resize_image, .{ .id = "abc123" });
+```
+
+`payload` is JSON-serialized (a `[]const u8` is treated as raw JSON and passed through
+unchanged), and the job is routed to the queue's backend.
+
+### Backends, priority, and reliability
+
+- **Backend `memory`** (default): the job runs in-process on a detached thread with backoff
+  retry. **At-most-once across restart** — an enqueued memory job lives only in RAM, so a
+  crash/shutdown before it completes drops it. Zero schema; great for best-effort work.
+- **Backend `durable`**: the job is persisted to the `_queue_jobs` table and drained by a
+  per-worker poller. **At-least-once** — a crash after a side effect but before the row is
+  marked done replays the job, so durable consumers must tolerate replays (idempotency keys
+  are the antidote). A **reclaim sweep** resets jobs stranded by a crashed worker (claimed
+  longer than the visibility timeout), and a GC sweep reaps old done/failed rows. The poller
+  and GC jobs are installed **only when a durable queue is declared** — pure-memory and
+  no-queue apps install nothing (zero overhead).
+- **Priority** (`high`/`normal`/`low`) is a per-queue property. A worker bound to several
+  queues drains them in strict priority order: all ready `high`-priority jobs first, then
+  `normal`, then `low`. There is no weighted-fair scheduler — priority plus the
+  worker/`concurrency` topology is the throughput and anti-starvation lever.
+- **Retry/backoff**: on a retryable failure the durable job's `attempts` is bumped and its
+  next run is pushed out by the queue's backoff (`fixed` or `exponential`, with optional
+  jitter, capped at `max_ms`); exhausting `max_attempts` marks it `failed` and fires your
+  `.onError` handler (phase `.job`). Memory jobs retry in-process the same way.
+
+### Caveats
+
+- Durable workers **poll** (roughly every scheduler tick, ~0.5s), so durable jobs drain with
+  low but non-zero latency. The scheduler is single-process (see §7 caveats).
+- Memory jobs run on detached threads not joined at shutdown (like `app.submit`).
 
 ## 8. Define your schema in code (`.collections` + `.migrations`)
 
@@ -2174,6 +2266,12 @@ The public surface (from `src/root.zig`):
   plugin vtable types; `zigbase.DefaultStoragePlugin` / `zigbase.DefaultMailerPlugin`
   — the built-in defaults; `zigbase.LocalStorage`, `zigbase.LogMailer`,
   `zigbase.SmtpMailer`, `zigbase.CommandMailer`, `zigbase.SmtpTls` — the concrete backends.
+- `zigbase.QueueDef` / `zigbase.WorkerDef` / `zigbase.RetryPolicy` / `zigbase.Backend` /
+  `zigbase.Priority` / `zigbase.Backoff` / `zigbase.QueueRegistry` — the background-jobs
+  config types named when declaring `.queues` / `.workers`. The compile-checked enqueue
+  accessor (`App.enqueue(ctx, .queue, .kind, payload)`) and the generated `Queue`/`Job`
+  enums live on the `App(cfg)` type; the runtime escape hatch is `ctx.enqueue` /
+  `ctx.enqueueByName`.
 - `zigbase.AuthMethod` — the auth plugin vtable type.
 - `zigbase.AuthCtx` — the per-request auth context passed to plugin phases.
 - `zigbase.auth.Resolution` / `zigbase.auth.InitiateResult` — the phase return types.
