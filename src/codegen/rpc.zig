@@ -84,7 +84,18 @@ fn urlTemplate(comptime path: []const u8) []const u8 {
     }
 }
 
+/// Render the RPC section with a fresh per-call seen-map (the standalone form used by
+/// tests). The generator proper uses `renderShared` so the seen-map is shared with the
+/// custom-auth surface for cross-surface collision detection.
 pub fn render(comptime routes: []const RouteMeta, alloc: std.mem.Allocator) !Section {
+    var seen = rpc_ts.SeenMap.init(alloc);
+    defer seen.deinit();
+    return renderShared(routes, alloc, &seen);
+}
+
+/// Like `render` but takes an externally-owned seen-map so named-decl deduplication and
+/// TS-name collision detection span this surface AND the typed custom-auth surface.
+pub fn renderShared(comptime routes: []const RouteMeta, alloc: std.mem.Allocator, seen: *rpc_ts.SeenMap) !Section {
     var decls: W = .empty;
     var iface: W = .empty;
     var factory: W = .empty;
@@ -93,10 +104,6 @@ pub fn render(comptime routes: []const RouteMeta, alloc: std.mem.Allocator) !Sec
         iface.deinit(alloc);
         factory.deinit(alloc);
     }
-
-    // One shared seen-map so a type used by multiple routes is declared only once.
-    var seen = rpc_ts.SeenMap.init(alloc);
-    defer seen.deinit();
 
     inline for (routes) |r| {
         // Untyped handlers own the raw response (cookies/redirect/non-JSON body) and have
@@ -108,8 +115,8 @@ pub fn render(comptime routes: []const RouteMeta, alloc: std.mem.Allocator) !Sec
         const out_ts = comptime rpc_ts.tsForType(r.Output);
 
         // 1) named decls for Input (if struct/enum) and Output (if struct/enum)
-        try rpc_ts.renderNamedDeclsShared(r.Input, &decls, alloc, &seen);
-        try rpc_ts.renderNamedDeclsShared(r.Output, &decls, alloc, &seen);
+        try rpc_ts.renderNamedDeclsShared(r.Input, &decls, alloc, seen);
+        try rpc_ts.renderNamedDeclsShared(r.Output, &decls, alloc, seen);
 
         // 2) interface member: name(<params,><input,> opts?): Promise<Out>;
         try iface.appendSlice(alloc, "    ");

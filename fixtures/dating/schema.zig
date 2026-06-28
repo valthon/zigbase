@@ -54,8 +54,48 @@ fn winksRaw(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     return .{ .bool = true };
 }
 
+// ---------------------------------------------------------------------------
+// Custom auth method with DECLARED comptime I/O types (issue #119).
+// `device_link` is a CLI/TV-style device-linking flow:
+//   initiate (void input)      -> a device code the user enters elsewhere
+//   complete ({ deviceCode })  -> a session token once the code is approved
+// The typed `.custom` declaration below feeds the TS client generator so the
+// generated client gets precise initiate/complete I/O — see App.custom_auth.
+// The runtime impl is a no-op stub (this fixture exists for codegen coverage).
+// ---------------------------------------------------------------------------
+const DeviceLinkInitiateResp = struct { deviceCode: []const u8, expiresIn: i64 };
+const DeviceLinkCompleteReq = struct { deviceCode: []const u8 };
+const DeviceLinkSession = struct { token: []const u8 };
+
+const DeviceLinkMethod = struct {
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !DeviceLinkMethod {
+        _ = gpa;
+        _ = io;
+        _ = cfg;
+        return .{};
+    }
+    pub fn method(self: *DeviceLinkMethod) zigbase.AuthMethod {
+        return .{ .slug = "device_link", .ctx = self, .vtable = &vtable };
+    }
+    pub fn deinit(self: *DeviceLinkMethod) void {
+        _ = self;
+    }
+    const vtable = zigbase.AuthMethod.VTable{ .initiate = initiate, .complete = complete };
+    fn initiate(ctx: *anyopaque, ac: *zigbase.AuthCtx) anyerror!zigbase.InitiateResult {
+        _ = ctx;
+        _ = ac;
+        return .{ .status = 200, .body = "{\"deviceCode\":\"demo\",\"expiresIn\":600}" };
+    }
+    fn complete(ctx: *anyopaque, ac: *zigbase.AuthCtx) anyerror!zigbase.Resolution {
+        _ = ctx;
+        _ = ac;
+        return .{ .fail = .{ .status = 501, .message = "device_link is a codegen demo; not implemented" } };
+    }
+};
+
 pub const App = zigbase.App(.{
     .enable_typegen = true,
+    .auth_methods = .{DeviceLinkMethod},
     .routes = .{
         .{ .method = .POST, .path = "/api/echo/:id/ping", .handler = echoPing, .auth = .public },
         .{ .method = .POST, .path = "/api/winks/send", .handler = winksSend, .auth = .public },
@@ -76,6 +116,16 @@ pub const App = zigbase.App(.{
             },
             // Public signup + public profile browsing; self-service edits.
             .rules = .{ .list = "@public", .view = "@public", .create = "@public", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
+            // Typed custom auth method (issue #119): the struct form carries comptime
+            // I/O types the generator reflects into precise TS interfaces (named by the
+            // Zig type). A void Initiate.Input omits the initiate `input` arg.
+            .auth = .{ .methods = .{ .custom = &.{
+                .{
+                    .slug = "device_link",
+                    .Initiate = .{ .Output = DeviceLinkInitiateResp },
+                    .Complete = .{ .Input = DeviceLinkCompleteReq, .Output = DeviceLinkSession },
+                },
+            } } },
         },
         .tags = .{
             .fields = .{

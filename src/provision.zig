@@ -329,7 +329,7 @@ fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
         if (@hasField(@TypeOf(wa), "rate_limit")) p.rate_limit = buildRateLimitOpt(wa.rate_limit);
         out.webauthn = p;
     }
-    if (@hasField(M, "custom")) out.custom = strTupleToSlice(m.custom);
+    if (@hasField(M, "custom")) out.custom = customSlugsToSlice(m.custom);
     return out;
 }
 
@@ -533,6 +533,39 @@ fn strTupleToSlice(comptime t: anytype) []const []const u8 {
         for (tf, 0..) |tff, i| {
             const v: []const u8 = @field(t, tff.name);
             out[i] = v;
+        }
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+/// Lower a comptime `.auth.methods.custom` tuple into the runtime slug list
+/// (`[]const []const u8`). Each element is EITHER a bare slug string (back-compat)
+/// OR a typed-method struct `.{ .slug = "...", .Initiate = ..., .Complete = ... }`;
+/// both forms contribute their slug. The comptime I/O types on a struct entry are
+/// reflected separately by `events.customAuthMeta` (the typed-codegen channel) and
+/// are intentionally discarded here — the runtime dispatch keys only on the slug, so
+/// this lowering is byte-for-byte compatible with the previous string-only behavior.
+fn customSlugsToSlice(comptime t: anytype) []const []const u8 {
+    comptime {
+        // Accept a bare tuple `.{ ... }` or a `&.{ ... }` pointer-to-tuple.
+        const tup = if (@typeInfo(@TypeOf(t)) == .pointer) t.* else t;
+        const info = @typeInfo(@TypeOf(tup));
+        if (info != .@"struct") @compileError(".auth.methods.custom must be a tuple of slug strings and/or typed-method structs");
+        const tf = info.@"struct".fields;
+        var out: [tf.len][]const u8 = undefined;
+        for (tf, 0..) |tff, i| {
+            const elem = @field(tup, tff.name);
+            switch (@typeInfo(@TypeOf(elem))) {
+                .pointer => out[i] = elem, // bare slug string
+                .@"struct" => {
+                    if (!@hasField(@TypeOf(elem), "slug"))
+                        @compileError(".auth.methods.custom struct entry must have a .slug field");
+                    const slug: []const u8 = elem.slug;
+                    out[i] = slug;
+                },
+                else => @compileError(".auth.methods.custom entry must be a slug string or a struct with a .slug field"),
+            }
         }
         const frozen = out;
         return &frozen;

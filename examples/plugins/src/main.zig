@@ -235,6 +235,15 @@ const AuditMailer = struct {
 //   .record = id_string              -- framework mints session + fires onAuth(.custom).
 //   .fail = { .status, .message }    -- framework returns the status code + body.
 // ---------------------------------------------------------------------------
+// Typed I/O for the custom method (issue #119). Declaring these comptime structs
+// in the `.auth.methods.custom` struct form (below) lets `zig build gen-client`
+// reflect them into precise TS interfaces named by the Zig type — instead of the
+// untyped `Record<string, unknown>` stub. Initiate takes no input (void); complete
+// exchanges an identity+token for a session.
+const ApiTokenInitiateOutput = struct { flow: []const u8 };
+const ApiTokenCompleteInput = struct { identity: []const u8, token: []const u8 };
+const ApiTokenCompleteOutput = struct { token: []const u8 };
+
 const ApiTokenMethod = struct {
     pub fn create(
         gpa: std.mem.Allocator,
@@ -289,7 +298,7 @@ const ApiTokenMethod = struct {
         if (body.len == 0) return .{ .fail = .{ .status = 400, .message = "missing body" } };
 
         const parsed = std.json.parseFromSlice(
-            struct { identity: []const u8, token: []const u8 },
+            ApiTokenCompleteInput,
             ac.ctx.allocator,
             body,
             .{},
@@ -536,7 +545,17 @@ pub fn main(init: std.process.Init) !void {
                             .rp_name = "ZigBase Plugins Example",
                             .origin = "http://localhost:8090",
                         },
-                        .custom = .{"api_token"},
+                        // Typed custom method (issue #119): the struct form declares
+                        // comptime I/O types so `zig build gen-client` emits precise TS
+                        // interfaces (ApiTokenInitiateOutput / ApiTokenCompleteInput /
+                        // ApiTokenCompleteOutput) instead of the untyped Record stub.
+                        .custom = &.{
+                            .{
+                                .slug = "api_token",
+                                .Initiate = .{ .Output = ApiTokenInitiateOutput },
+                                .Complete = .{ .Input = ApiTokenCompleteInput, .Output = ApiTokenCompleteOutput },
+                            },
+                        },
                     },
                 },
                 .rules = .{ .list = "@public", .view = "@public" },

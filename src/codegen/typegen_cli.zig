@@ -25,7 +25,7 @@ pub fn provisionAndGenerate(
     try migrations.run(&d);
     try provision.applySpecs(alloc, io, &d, cols);
     const rt = try acquire_datadir.acquireFromDb(alloc, &d);
-    return gen_client.generate(alloc, rt, &.{}, in_repo, authCollectionName(rt), client_name, api_prefix);
+    return gen_client.generate(alloc, rt, &.{}, &.{}, in_repo, authCollectionName(rt), client_name, api_prefix);
 }
 
 pub const Options = struct {
@@ -86,7 +86,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, opts: Options) !void {
     else
         try acquireHttp(alloc, io, opts); // implemented in Task 4
 
-    const text = gen_client.generate(alloc, cols, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix) catch |e| {
+    const text = gen_client.generate(alloc, cols, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix) catch |e| {
         std.log.err("typegen: code generation failed: {s}", .{@errorName(e)});
         return e;
     };
@@ -135,8 +135,8 @@ test "equivalence: data-dir runtime path reproduces the comptime collection surf
     const ct_cols = try a.dupe(schema.Collection, &specs);
     acquire.sortByName(ct_cols);
 
-    const rt = try gen_client.generate(a, rt_cols, &.{}, true, authCollectionName(rt_cols), "ZbClient", "/api");
-    const ct = try gen_client.generate(a, ct_cols, &.{}, true, authCollectionName(ct_cols), "ZbClient", "/api");
+    const rt = try gen_client.generate(a, rt_cols, &.{}, &.{}, true, authCollectionName(rt_cols), "ZbClient", "/api");
+    const ct = try gen_client.generate(a, ct_cols, &.{}, &.{}, true, authCollectionName(ct_cols), "ZbClient", "/api");
     try std.testing.expectEqualStrings(ct, rt);
 }
 
