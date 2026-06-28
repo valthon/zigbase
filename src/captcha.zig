@@ -213,9 +213,16 @@ pub fn verify(
     alloc: std.mem.Allocator,
     client: http_client.HttpClient,
 ) !Result {
+    // Free the temporaries here so `verify` doesn't leak when called with a
+    // general-purpose allocator (the Ctx call site passes an arena, but the
+    // function must not assume it). The parsed `Result` slices reference the
+    // response body, NOT these buffers, so freeing them before return is safe.
     const enc_secret = try formEncode(alloc, secret);
+    defer alloc.free(enc_secret);
     const enc_token = try formEncode(alloc, token);
+    defer alloc.free(enc_token);
     const body_form = try std.fmt.allocPrint(alloc, "secret={s}&response={s}", .{ enc_secret, enc_token });
+    defer alloc.free(body_form);
 
     const resp = try client.post(provider.verifyUrl(), .{
         .headers = &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }},

@@ -542,8 +542,11 @@ pub const app = zigbase.App(.{
 **Verify in a route handler:**
 
 ```zig
-fn submitHandler(ctx: *zigbase.Ctx, ev: *zigbase.events.RouteEvent) anyerror!http.Response {
-    const token = ev.request.body_param("g-recaptcha-response") orelse "";
+// Untyped route handler: a single `*zigbase.Ctx` argument returning an `http.Response`.
+fn submitHandler(ctx: *zigbase.Ctx) anyerror!http.Response {
+    // Read the token however your frontend submits it — here from the query string;
+    // for a JSON/form POST, read `ctx.request.?.body` / `ctx.request.?.form_fields`.
+    const token = (try ctx.query()).get("captcha") orelse "";
     const r = try ctx.verifyCaptcha(.recaptcha_v3, token);
     if (!r.ok) return ctx.jsonError(403, "captcha_required");
     // reCAPTCHA v3: score 0.0 (bot) → 1.0 (human); block suspicious traffic.

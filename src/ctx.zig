@@ -303,6 +303,11 @@ pub const Ctx = struct {
     /// **Network errors** (transport failures, non-2xx from the provider) propagate
     /// as a Zig error — the handler decides whether to fail-open or fail-closed.
     ///
+    /// **Provider mismatch:** the secret is configured for ONE provider (`app.captcha_provider`).
+    /// Calling with a different `provider` would send that secret to the wrong endpoint, so it
+    /// fails fast with `error.CaptchaProviderMismatch` rather than silently failing the check.
+    /// (The check is skipped when no provider is configured — e.g. tests that set only a secret.)
+    ///
     /// ```zig
     /// const r = try ctx.verifyCaptcha(.recaptcha_v3, token);
     /// if (!r.ok) return ctx.jsonError(403, "captcha_required");
@@ -310,6 +315,12 @@ pub const Ctx = struct {
     /// ```
     pub fn verifyCaptcha(self: *Ctx, provider: captcha_mod.Provider, token: []const u8) !captcha_mod.Result {
         if (self.app.captcha_secret.len == 0) return .{ .ok = true };
+        if (self.app.captcha_provider) |expected| {
+            if (provider != expected) {
+                std.log.warn("captcha: provider mismatch (configured {s}, called with {s})", .{ @tagName(expected), @tagName(provider) });
+                return error.CaptchaProviderMismatch;
+            }
+        }
         return captcha_mod.verify(provider, self.app.captcha_secret, token, self.arena, self.http());
     }
 
@@ -1972,4 +1983,21 @@ test "#140 ctx.verifyCaptcha network error propagates (fails-closed by default)"
 
     // Network failure propagates — handler can catch and decide fail-open vs fail-closed.
     try std.testing.expectError(error.TransportFailed, ctx.verifyCaptcha(.turnstile, "token"));
+}
+
+test "#140 ctx.verifyCaptcha errors on a provider that differs from the configured one" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    // Both a secret AND a provider are configured: a mismatched call must fail fast.
+    env.app.captcha_secret = "real-secret";
+    env.app.captcha_provider = .recaptcha_v3;
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    try std.testing.expectError(error.CaptchaProviderMismatch, ctx.verifyCaptcha(.hcaptcha, "token"));
+
+    // The dev-bypass wins even over a mismatch: an empty secret never verifies, so no error.
+    env.app.captcha_secret = "";
+    const r = try ctx.verifyCaptcha(.hcaptcha, "token");
+    try std.testing.expect(r.ok);
 }
