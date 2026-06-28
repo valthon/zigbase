@@ -910,13 +910,21 @@ the collection body (see [api.md → Collection options](api.md#collection-optio
 ## Recipe: built-in KV store and feature flags
 
 `ctx.kv()` is a schema-less key→value store (backed by an internal `_kv` table, invisible to
-the record API); `ctx.flag()` / `ctx.setFlag()` are a typed boolean view over the same store:
+the record API). Feature flags (0.8.0) are **declared** in the `App(cfg)` literal and accessed
+through a compile-checked accessor — a typo'd `.name` won't compile. See
+[framework.md → Feature flags + experiments](framework.md#feature-flags--experiments-declared)
+for the full surface (flags, experiments, `resolveAll`).
 
 ```zig
+pub const App = zigbase.App(.{
+    .flags = .{ .new_checkout = false }, // declared (default off)
+    // ... routes etc.
+});
+
 fn toggleBeta(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
-    try ctx.setFlag("new_checkout", true);          // stores "true"
+    try App.setFlag(ctx, .new_checkout, true);      // writes the override (typed, compile-checked)
     try ctx.kv().set("welcome_banner", "Hi there"); // arbitrary string value
-    const on = try ctx.flag("new_checkout");         // false if unset; "true"/"1" are truthy
+    const on = App.flag(ctx, .new_checkout);         // declared default until an override is set
     const banner = try ctx.kv().get("welcome_banner"); // ?[]const u8
     _ = on; _ = banner;
     return .{ .status = 204, .body = "" };
@@ -926,7 +934,8 @@ fn toggleBeta(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 KV/flags are **server-side and superuser-managed** by default. Superusers can manage them over
 HTTP (`GET/PUT/DELETE /api/settings[/:key]`) or in the admin UI's "Settings / Feature Flags"
 screen. To expose one value publicly, write a one-line custom route that reads it via
-`ctx.flag()` / `ctx.kv()` — exposing a flag is then an explicit choice, not the default.
+`ctx.flagByName(name)` (returns `?bool`, null when undeclared) or `ctx.kv()` — exposing a flag
+is then an explicit choice, not the default.
 
 ## Recipe: deterministic tests (frozen clock, seeded IDs, captured mail/HTTP)
 

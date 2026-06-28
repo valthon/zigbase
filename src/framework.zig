@@ -24,6 +24,8 @@ const pagination = @import("pagination.zig");
 const registry = @import("auth/registry.zig");
 const field_policy = @import("field_policy.zig");
 const rewrap = @import("rewrap.zig");
+const features = @import("features.zig");
+const ctx_mod = @import("ctx.zig");
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -188,7 +190,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const dispatch: events.Dispatch = blk: {
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -398,6 +400,58 @@ pub fn App(comptime cfg: anytype) type {
         else
             &.{};
 
+        // ── Feature flags + experiments (#128/#129/#130) ───────────────────────
+        // The declared registry, lowered at comptime from `.flags`/`.experiments`.
+        // `flags`/`experiments` are the metadata slices; `Flag`/`Experiment` are
+        // generated enums whose members are the declared names (Option B), so a
+        // typo'd `.name` at an `App.flag`/`App.experiment`/`App.setFlag` call site
+        // is a compile error. `features_registry` is the static lowered registry the
+        // runtime app points at (`app.features`).
+
+        /// Declared boolean flags (empty when no `.flags`).
+        pub const flags: []const features.FlagDef = if (@hasField(@TypeOf(cfg), "flags"))
+            features.flagMeta(cfg.flags)
+        else
+            &.{};
+
+        /// Declared experiments (empty when no `.experiments`).
+        pub const experiments: []const features.ExperimentDef = if (@hasField(@TypeOf(cfg), "experiments"))
+            features.experimentMeta(cfg.experiments)
+        else
+            &.{};
+
+        /// Enum of declared flag names — the typed key for `App.flag`/`App.setFlag`.
+        pub const Flag = features.EnumFromFields(if (@hasField(@TypeOf(cfg), "flags")) cfg.flags else .{});
+
+        /// Enum of declared experiment names — the typed key for `App.experiment`.
+        pub const Experiment = features.EnumFromFields(if (@hasField(@TypeOf(cfg), "experiments")) cfg.experiments else .{});
+
+        /// Static lowered registry threaded into `app.features` by serveImpl.
+        pub const features_registry: features.Registry = .{ .flags = flags, .experiments = experiments };
+
+        /// Resolve a DECLARED flag (the `flag:<name>` override from `_kv` if present,
+        /// else the declared default). Typo'd `.name` → compile error. Swallows read
+        /// errors back to the default, so a kill-switch check never fails the request.
+        pub fn flag(ctx: *ctx_mod.Ctx, comptime f: Flag) bool {
+            const def = comptime features_registry.flags[@intFromEnum(f)];
+            return ctx.resolveDeclaredFlag(def);
+        }
+
+        /// Set a DECLARED flag's override (`flag:<name>` = `"true"`/`"false"`) in `_kv`.
+        /// Typo'd `.name` → compile error.
+        pub fn setFlag(ctx: *ctx_mod.Ctx, comptime f: Flag, enabled: bool) !void {
+            const def = comptime features_registry.flags[@intFromEnum(f)];
+            return ctx.writeFlagOverride(def.name, enabled);
+        }
+
+        /// Resolve a DECLARED experiment to a variant for `subject` (weight override
+        /// from `_kv` if valid, else declared weights, then deterministic bucketing).
+        /// Typo'd `.name` → compile error.
+        pub fn experiment(ctx: *ctx_mod.Ctx, comptime e: Experiment, subject: []const u8) ![]const u8 {
+            const def = comptime features_registry.experiments[@intFromEnum(e)];
+            return ctx.resolveDeclaredExperiment(def, subject);
+        }
+
         /// Explicit migrations (the escape hatch for non-additive changes), run in
         /// order before provisioning and recorded once in `_migrations`. Empty by default.
         ///
@@ -429,6 +483,7 @@ pub fn App(comptime cfg: anytype) type {
             .session_store = session_store_config,
             .enable_typegen = enable_typegen,
             .has_ttl = has_ttl_collection,
+            .features = &features_registry,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -488,6 +543,9 @@ pub const ServeOpts = struct {
     /// startup one-shot TTL sweep in serveImpl (the periodic job is gated separately
     /// by `jobs`).
     has_ttl: bool = false,
+    /// Declared feature-flag + experiment registry (#128/#129/#130), pointed into
+    /// `app.features` by serveImpl. Static lifetime (a comptime-lowered const).
+    features: ?*const features.Registry = null,
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -1083,6 +1141,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .mailer = &mailer_iface,
         .auth_methods = @ptrCast(&am_registry),
         .dispatch = dispatch,
+        .features = opts.features,
         // Always wire the shared limiter store: the default-scope limiter no-ops when
         // rate_limit_max==0 (RateLimiter.allow returns true for max==0), but a configured
         // per-method custom limit must still be honored against this store regardless of
@@ -1399,6 +1458,37 @@ test "App(.{}) has no comptime collections and no provision migrations" {
     const A = App(.{});
     try std.testing.expectEqual(@as(usize, 0), A.collections.len);
     try std.testing.expectEqual(@as(usize, 0), A.provision_migrations.len);
+}
+
+test "App(cfg) lowers .flags/.experiments into the registry + generated enums (#128/#129/#130)" {
+    const A = App(.{
+        .flags = .{
+            .checkout_enabled = true,
+            .new_dashboard = .{ .default = false, .description = "dark" },
+        },
+        .experiments = .{
+            .checkout_layout = .{ .variants = .{ "control", "compact" }, .weights = .{ 90, 10 } },
+        },
+    });
+    // Metadata slices.
+    try std.testing.expectEqual(@as(usize, 2), A.flags.len);
+    try std.testing.expectEqualStrings("checkout_enabled", A.flags[0].name);
+    try std.testing.expect(A.flags[0].default);
+    try std.testing.expectEqual(@as(usize, 1), A.experiments.len);
+    try std.testing.expectEqualStrings("checkout_layout", A.experiments[0].name);
+    // Static registry mirrors the slices.
+    try std.testing.expectEqual(@as(usize, 2), A.features_registry.flags.len);
+    try std.testing.expectEqual(@as(usize, 1), A.features_registry.experiments.len);
+    // Generated enums: members are the declared names; @intFromEnum indexes the registry.
+    try std.testing.expectEqual(@as(usize, 2), std.meta.fields(A.Flag).len);
+    try std.testing.expectEqual(@as(usize, 1), std.meta.fields(A.Experiment).len);
+    try std.testing.expectEqualStrings("new_dashboard", A.features_registry.flags[@intFromEnum(@field(A.Flag, "new_dashboard"))].name);
+
+    // Empty default: no flags/experiments, empty enums.
+    const E = App(.{});
+    try std.testing.expectEqual(@as(usize, 0), E.flags.len);
+    try std.testing.expectEqual(@as(usize, 0), E.experiments.len);
+    try std.testing.expectEqual(@as(usize, 0), std.meta.fields(E.Flag).len);
 }
 
 test "App(cfg) resolves the comptime session_store config (#99; defaults to .epoch)" {

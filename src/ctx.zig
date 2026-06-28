@@ -15,6 +15,8 @@ const http_mod = @import("http.zig");
 const auth_helpers = @import("auth_helpers.zig");
 const api_auth = @import("api/auth.zig");
 const session = @import("session.zig");
+const features = @import("features.zig");
+const features_resolver = @import("features_resolver.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -121,16 +123,76 @@ pub const Ctx = struct {
         return .{ .ctx = self };
     }
 
-    /// Typed boolean view over the KV store (#88). Returns `false` for an unset
-    /// flag; `"true"` and `"1"` are truthy, anything else is `false`.
-    pub fn flag(self: *Ctx, name: []const u8) !bool {
-        const v = (try self.kv().get(name)) orelse return false;
-        return std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+    // -----------------------------------------------------------------------
+    // Feature flags + experiments (#128/#129/#130).
+    //
+    // Flags are DECLARED in the `App(.{ .flags = … })` literal. The typed,
+    // compile-checked accessors live on the App type (`App.flag(ctx, .name)`,
+    // `App.setFlag(ctx, .name, on)`, `App.experiment(ctx, .name, subject)`) — a
+    // typo'd `.name` is a compile error. The runtime escape hatches below resolve
+    // by string for dynamic names; both consult the registry threaded onto
+    // `app.features`. (The old v0.7 `ctx.flag("arbitrary")` KV-or-false API is
+    // removed — only declared flags resolve.)
+    // -----------------------------------------------------------------------
+
+    /// Resolve a DECLARED flag's effective value: the `flag:<name>` override from
+    /// `_kv` if present, else the declared default. Swallows read errors (falls back
+    /// to the default) so a kill-switch check never fails the request. Used by the
+    /// typed `App.flag` accessor and by `flagByName`.
+    pub fn resolveDeclaredFlag(self: *Ctx, def: features.FlagDef) bool {
+        const conn = self.connForRead() catch return def.default;
+        const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena };
+        const key = std.fmt.allocPrint(self.arena, "flag:{s}", .{def.name}) catch return def.default;
+        const ov = data.kvGet(key) catch return def.default;
+        return features_resolver.resolveFlag(ov, def);
     }
 
-    /// Set a feature flag (#88): stores `"true"`/`"false"` in the KV store.
+    /// Resolve a DECLARED experiment to a variant for `subject`: applies the
+    /// `exp:<name>:weights` JSON override from `_kv` when valid, else declared
+    /// weights, then deterministic bucketing. Used by the typed `App.experiment`
+    /// accessor.
+    pub fn resolveDeclaredExperiment(self: *Ctx, def: features.ExperimentDef, subject: []const u8) ![]const u8 {
+        const conn = try self.connForRead();
+        const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena };
+        const key = try std.fmt.allocPrint(self.arena, "exp:{s}:weights", .{def.name});
+        const ov = try data.kvGet(key);
+        return features_resolver.resolveExperiment(self.arena, ov, def, subject);
+    }
+
+    /// Write a `flag:<name>` override (`"true"`/`"false"`) into `_kv`. Used by the
+    /// typed `App.setFlag` accessor (the App-side enum guarantees `name` is declared).
+    pub fn writeFlagOverride(self: *Ctx, name: []const u8, enabled: bool) !void {
+        const key = try std.fmt.allocPrint(self.arena, "flag:{s}", .{name});
+        try self.kv().set(key, if (enabled) "true" else "false");
+    }
+
+    /// Runtime escape hatch: resolve a flag by string name. Returns `null` when the
+    /// name is not DECLARED (or no registry is wired), else its resolved value. Use
+    /// the typed `App.flag(ctx, .name)` whenever the name is known at compile time.
+    pub fn flagByName(self: *Ctx, name: []const u8) ?bool {
+        const reg = self.app.features orelse return null;
+        for (reg.flags) |def| {
+            if (std.mem.eql(u8, def.name, name)) return self.resolveDeclaredFlag(def);
+        }
+        return null;
+    }
+
+    /// Runtime escape hatch: set a flag override by string name. Errors with
+    /// `error.UndeclaredFlag` when the name is not declared (or no registry is
+    /// wired). The typed `App.setFlag(ctx, .name, on)` is the compile-checked path.
     pub fn setFlag(self: *Ctx, name: []const u8, enabled: bool) !void {
-        try self.kv().set(name, if (enabled) "true" else "false");
+        const reg = self.app.features orelse return error.UndeclaredFlag;
+        for (reg.flags) |def| {
+            if (std.mem.eql(u8, def.name, name)) return self.writeFlagOverride(name, enabled);
+        }
+        return error.UndeclaredFlag;
+    }
+
+    /// Returns the feature-resolution namespace (`ctx.flags()`): `resolveAll(subject)`
+    /// resolves every declared flag + experiment in one batched `_kv` scan (the shape
+    /// the public `/api/state` projection serves).
+    pub fn flags(self: *Ctx) FlagsApi {
+        return .{ .ctx = self };
     }
 
     /// Run `f` inside an IMMEDIATE transaction on the writer connection.
@@ -495,6 +557,25 @@ pub const KeyValue = struct {
     }
 };
 
+/// Feature-resolution namespace (`ctx.flags()`) bound to a Ctx (#128/#129/#130).
+pub const FlagsApi = struct {
+    ctx: *Ctx,
+
+    /// Resolve every DECLARED flag + experiment for `subject` in a SINGLE batched
+    /// `_kv` scan (`flag:*` / `exp:*`). Returns empty when no registry is wired.
+    /// Allocates on the ctx arena. This is the exact shape the public `/api/state`
+    /// projection (a later PR) serves.
+    pub fn resolveAll(self: FlagsApi, subject: []const u8) !features_resolver.Resolved {
+        const reg = self.ctx.app.features orelse return .{};
+        const conn = try self.ctx.connForRead();
+        const data = Data{ .app = self.ctx.app, .conn = conn, .io = self.ctx.app.io, .alloc = self.ctx.arena };
+        const entries = try data.kvScanPrefix(&.{ "flag:", "exp:" });
+        const pairs = try self.ctx.arena.alloc(features_resolver.KvPair, entries.len);
+        for (entries, 0..) |e, i| pairs[i] = .{ .key = e.key, .value = e.value };
+        return features_resolver.resolveAll(self.ctx.arena, reg.*, pairs, subject);
+    }
+};
+
 /// A transaction scope: wraps an inner Ctx whose bound_conn is set so that
 /// all Records writes inside the callback reuse the in-progress transaction.
 pub const Tx = struct {
@@ -799,42 +880,86 @@ test "ctx.kv set/get round-trips; delete removes" {
     try std.testing.expect((try ctx.kv().get("k")) == null);
 }
 
-test "ctx.flag is a typed bool view; setFlag toggles; unset is false" {
+// A small declared registry for the ctx feature-flag tests below: `beta` (default
+// off, the override case), `default_on` (the #128 kill-switch case), `intx` (the
+// in-transaction write case).
+const flag_test_registry = features.Registry{
+    .flags = &.{
+        .{ .name = "beta", .default = false },
+        .{ .name = "default_on", .default = true },
+        .{ .name = "intx", .default = false },
+    },
+    .experiments = &.{
+        .{ .name = "layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 } },
+    },
+};
+
+test "ctx flags: declared default returned when unset; override wins; flagByName null for undeclared" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
+    env.app.features = &flag_test_registry;
     var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
     defer ctx.deinit();
 
-    // Unset flag is false.
-    try std.testing.expect(!(try ctx.flag("beta")));
-    // setFlag(true) -> true.
+    // Unset declared flag → declared default.
+    try std.testing.expect(!(ctx.flagByName("beta").?));
+    // A default-ON flag stays on when unset (#128 kill-switch).
+    try std.testing.expect(ctx.flagByName("default_on").?);
+
+    // setFlag writes the flag:<name> override; override wins.
     try ctx.setFlag("beta", true);
-    try std.testing.expect(try ctx.flag("beta"));
-    // "1" is also truthy.
-    try ctx.kv().set("beta", "1");
-    try std.testing.expect(try ctx.flag("beta"));
-    // setFlag(false) -> false.
-    try ctx.setFlag("beta", false);
-    try std.testing.expect(!(try ctx.flag("beta")));
-    // an arbitrary string is not truthy.
-    try ctx.kv().set("beta", "yes");
-    try std.testing.expect(!(try ctx.flag("beta")));
+    try std.testing.expect(ctx.flagByName("beta").?);
+    try std.testing.expectEqualStrings("true", (try ctx.kv().get("flag:beta")).?);
+    // Flip the kill switch off.
+    try ctx.setFlag("default_on", false);
+    try std.testing.expect(!(ctx.flagByName("default_on").?));
+
+    // An undeclared name resolves to null (escape hatch), and setFlag errors.
+    try std.testing.expect(ctx.flagByName("never_declared") == null);
+    try std.testing.expectError(error.UndeclaredFlag, ctx.setFlag("never_declared", true));
+}
+
+test "ctx.flags().resolveAll returns all declared flags + experiments via the batched scan" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    env.app.features = &flag_test_registry;
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    // One flag override in _kv; everything else falls back to declared defaults.
+    try ctx.setFlag("beta", true);
+
+    const resolved = try ctx.flags().resolveAll("user-7");
+    try std.testing.expectEqual(@as(usize, 3), resolved.flags.len);
+    try std.testing.expectEqual(@as(usize, 1), resolved.experiments.len);
+    // beta overridden on, default_on default on, intx default off.
+    for (resolved.flags) |rf| {
+        if (std.mem.eql(u8, rf.name, "beta")) try std.testing.expect(rf.value);
+        if (std.mem.eql(u8, rf.name, "default_on")) try std.testing.expect(rf.value);
+        if (std.mem.eql(u8, rf.name, "intx")) try std.testing.expect(!rf.value);
+    }
+    // The experiment resolves to one of its declared variants, deterministically.
+    const v = resolved.experiments[0].variant;
+    try std.testing.expect(std.mem.eql(u8, v, "control") or std.mem.eql(u8, v, "compact"));
+    const again = try ctx.flags().resolveAll("user-7");
+    try std.testing.expectEqualStrings(v, again.experiments[0].variant);
 }
 
 fn txnSetFlag(t: *Tx) anyerror!void {
     try t.inner.setFlag("intx", true);
-    try std.testing.expectEqualStrings("true", (try t.inner.kv().get("intx")).?);
+    try std.testing.expectEqualStrings("true", (try t.inner.kv().get("flag:intx")).?);
 }
 
-test "ctx.kv/setFlag work inside ctx.tx (bound_conn path)" {
+test "ctx.setFlag works inside ctx.tx (bound_conn path)" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
+    env.app.features = &flag_test_registry;
     var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
     defer ctx.deinit();
 
     try ctx.tx(void, txnSetFlag);
     // committed and visible after the transaction.
-    try std.testing.expect(try ctx.flag("intx"));
+    try std.testing.expect(ctx.flagByName("intx").?);
 }
 
 test "ctx.http() returns a client bound to the ctx arena and io" {
