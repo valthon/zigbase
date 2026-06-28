@@ -62,6 +62,10 @@ pub const App = struct {
     /// (`.experiment_assignment_ttl`, default 90). Only consulted when a `.sticky`
     /// experiment is declared (otherwise the GC job is never installed).
     experiment_assignment_ttl: u32 = 90,
+    /// Mount path for the public feature-state projection (`GET <path>?subject=`,
+    /// served by `api/state.zig`); null = disabled. Lowered from the `.features`
+    /// config knob and set by serveImpl. Default "/api/state" (auto-mounted).
+    features_public_route: ?[]const u8 = "/api/state",
     /// In-memory rate limiter for sensitive auth endpoints; null = disabled
     /// (rate_limit_max == 0, or tests/CLI that don't wire it). Set in serveImpl.
     rate_limiter: ?*ratelimit.RateLimiter = null,
