@@ -227,7 +227,12 @@ fn retryAfterMs(headers: []const http_client.Header) ?u32 {
 }
 
 fn fireOnError(ctx: *Ctx, err: anyerror, message: []const u8) void {
-    var ev = events.ErrorEvent{ .app = ctx.app, .ctx = &ctx.rctx, .err = err, .phase = .webhook, .message = message };
+    // `.ctx = null`: a webhook delivery runs as a queued BACKGROUND JOB (the queue builds
+    // its Ctx with `.rctx = .{}, .request = null`), so there is no request/auth context to
+    // surface — matching the `.job`/`.cron` background-error dispatches (scheduler.zig,
+    // queue/durable.zig, queue/memory.zig), which all pass `null`. Passing `&ctx.rctx` here
+    // would falsely advertise an empty default RequestContext to `onError` consumers.
+    var ev = events.ErrorEvent{ .app = ctx.app, .ctx = null, .err = err, .phase = .webhook, .message = message };
     events.dispatchError(ctx.app, ctx.app.dispatch, &ev);
 }
 
