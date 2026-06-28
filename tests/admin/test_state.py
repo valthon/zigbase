@@ -60,20 +60,24 @@ def _http(method, url, token=None, body=None):
 
 
 # ---------------------------------------------------------------------------
-# Stock binary (no declared flags): empty projection, public, no leakage.
+# Stock binary: resolves its sample declared flags/experiments, public, no leakage.
+# (src/main.zig ships .flags = { dark_mode, maintenance }, .experiments = { onboarding_flow }.)
 # ---------------------------------------------------------------------------
 
-def test_state_public_no_auth_returns_exact_empty_shape(server):
+def test_state_public_no_auth_returns_resolved_shape(server):
     # No Authorization header at all — the endpoint is public.
     status, body = _http("GET", f"{server}/api/state?subject=anon")
     assert status == 200, body
     doc = json.loads(body)
-    # Exactly two keys, both objects; the stock app declares nothing → empty maps.
+    # Exactly two keys, both objects; values are RESOLVED (booleans / variant strings).
     assert set(doc.keys()) == {"flags", "experiments"}
-    assert doc["flags"] == {}
-    assert doc["experiments"] == {}
-    # Must NOT leak the _kv admin surface (raw keys / timestamps / key prefixes).
-    for forbidden in ('"key"', '"created"', '"updated"', "flag:", "exp:"):
+    # The stock binary's sample declarations resolve to their defaults.
+    assert doc["flags"] == {"dark_mode": False, "maintenance": False}
+    assert doc["experiments"]["onboarding_flow"] in ("control", "streamlined")
+    # Must NOT leak the _kv admin surface (raw keys / timestamps / key prefixes /
+    # declared defaults / weights).
+    for forbidden in ('"key"', '"created"', '"updated"', "flag:", "exp:",
+                      '"default"', '"weights"', '"variants"'):
         assert forbidden not in body, forbidden
 
 
@@ -161,3 +165,30 @@ def test_state_experiment_is_deterministic_per_subject(dating_server):
     a = json.loads(_http("GET", f"{base}/api/state?subject=stable")[1])["experiments"]["discovery_ranking"]
     b = json.loads(_http("GET", f"{base}/api/state?subject=stable")[1])["experiments"]["discovery_ranking"]
     assert a == b
+
+
+def test_state_sticky_experiment_survives_weight_override(dating_server):
+    # `discovery_ranking` is a .sticky experiment: the public, unauthenticated /api/state
+    # must return the PERSISTED variant for a seen subject even after a weight override
+    # that would otherwise re-bucket it — proving the public path honors sticky and agrees
+    # with App.experiment (and persists reader-first, without writer-storming on hits).
+    base = dating_server
+    subject = "sticky-seen-1"
+    # First call (no auth) persists the assignment under the declared weights.
+    seen = json.loads(_http("GET", f"{base}/api/state?subject={subject}")[1])["experiments"]["discovery_ranking"]
+    assert seen in ("recency", "affinity", "hybrid")
+
+    # Operator forces ALL future buckets to a different variant via a weight override.
+    token = _su_token(base)
+    forced = "recency" if seen != "recency" else "hybrid"
+    weights = {"recency": "[100,0,0]", "affinity": "[0,100,0]", "hybrid": "[0,0,100]"}[forced]
+    status, _ = _http("PUT", f"{base}/api/settings/exp:discovery_ranking:weights",
+                      token=token, body={"value": weights})
+    assert status == 200
+
+    # The already-seen subject KEEPS its persisted variant (sticky), still without auth.
+    after = json.loads(_http("GET", f"{base}/api/state?subject={subject}")[1])["experiments"]["discovery_ranking"]
+    assert after == seen
+    # A brand-new subject under the override DOES follow the new weights (override is live).
+    fresh = json.loads(_http("GET", f"{base}/api/state?subject=sticky-new-1")[1])["experiments"]["discovery_ranking"]
+    assert fresh == forced

@@ -106,6 +106,7 @@ pub const App = zigbase.App(.{
         .discovery_ranking = .{
             .variants = .{ "recency", "affinity", "hybrid" },
             .weights = .{ 34, 33, 33 },
+            .sticky = true, // persist assignments so they survive weight changes (#129)
             .description = "Profile discovery ordering",
         },
     },

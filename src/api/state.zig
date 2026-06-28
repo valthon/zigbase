@@ -48,7 +48,12 @@ pub fn handle(ctx: *http.RequestCtx) anyerror!http.Response {
         const entries = try data.kvScanPrefix(&.{ "flag:", "exp:" });
         const pairs = try ctx.allocator.alloc(features_resolver.KvPair, entries.len);
         for (entries, 0..) |e, i| pairs[i] = .{ .key = e.key, .value = e.value };
-        resolved = try features_resolver.resolveAll(ctx.allocator, reg.*, pairs, subject);
+        // Reader-first sticky resolution (#129): `/api/state` is UNAUTHENTICATED with a
+        // caller-supplied subject, so a sticky HIT must NOT take the global writer. Reads
+        // run on the pooled reader; only a first-time MISS briefly borrows the pool writer
+        // to persist the assignment, so the public projection agrees with `App.experiment`.
+        const sticky = features_resolver.StickyConns{ .read = &conn, .pool = app.pool };
+        resolved = try features_resolver.resolveAll(ctx.allocator, reg.*, pairs, subject, sticky);
     }
 
     return .{ .status = 200, .body = try renderJson(ctx.allocator, resolved) };

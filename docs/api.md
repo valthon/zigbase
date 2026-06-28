@@ -804,6 +804,12 @@ stable "anonymous" assignment. The response is exactly:
 default); `experiments` maps each declared experiment name to its resolved variant. Apps
 that declare no flags/experiments get `{ "flags": {}, "experiments": {} }`.
 
+A `.sticky` experiment returns its **persisted** assignment here (the same value
+`App.experiment` resolves), so the public projection survives later weight changes. The
+lookup is **reader-first** — a repeat call for a known `subject` is served from a pooled
+reader, and only a subject's *first-ever* resolve briefly takes the writer to persist it —
+so this unauthenticated, caller-supplied-`subject` endpoint never storms the writer lock.
+
 **Mount + disable.** The route auto-mounts at `/api/state`. Configure it with the
 `.features` knob: `.features = .{ .public_route = "/state" }` remaps it, and
 `.features = .{ .public_route = .disabled }` turns it off (then it `404`s). The typed

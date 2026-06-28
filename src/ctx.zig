@@ -151,28 +151,32 @@ pub const Ctx = struct {
         return value;
     }
 
+    /// Connections for **reader-first** sticky experiment resolution (#129). Inside a
+    /// `ctx.tx`/before-hook the bound writer is both reader and writer (no pool borrow);
+    /// otherwise reads go on a pooled reader and only a sticky MISS briefly borrows the
+    /// pool writer. Shared by `resolveDeclaredExperiment` and `ctx.flags().resolveAll`,
+    /// so a steady-state sticky HIT never takes the writer on either path.
+    pub fn stickyConns(self: *Ctx) !features_resolver.StickyConns {
+        if (self.bound_conn) |c| return .{ .read = c, .pool = null };
+        return .{ .read = try self.connForRead(), .pool = self.app.pool };
+    }
+
     /// Resolve a DECLARED experiment to a variant for `subject`: applies the
     /// `exp:<name>:weights` JSON override from `_kv` when valid, else declared
-    /// weights, then deterministic bucketing. Used by the typed `App.experiment`
-    /// accessor.
+    /// weights, then deterministic bucketing. A `.sticky` experiment returns its
+    /// PERSISTED assignment (reader-first — see `stickyConns`; only a first-time miss
+    /// touches the writer). Used by the typed `App.experiment` accessor.
     pub fn resolveDeclaredExperiment(self: *Ctx, def: features.ExperimentDef, subject: []const u8) ![]const u8 {
         const key = try std.fmt.allocPrint(self.arena, "exp:{s}:weights", .{def.name});
-        // A sticky experiment with a non-empty subject persists its first assignment, so
-        // the miss path INSERTs — it needs the writer. Non-sticky resolution (and an empty
-        // subject, which is never persisted) stays read-only. Reuse the bound writer inside
-        // a `ctx.tx`; otherwise acquire it just for this resolve.
         const sticky = def.sticky and subject.len > 0;
-        const need_writer = sticky and self.bound_conn == null;
-        const conn = if (sticky)
-            (self.bound_conn orelse self.app.pool.acquireWriter())
-        else
-            try self.connForRead();
-        defer if (need_writer) self.app.pool.releaseWriter();
-        const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena };
+        const sc: ?features_resolver.StickyConns = if (sticky) try self.stickyConns() else null;
+        // The weight-override read uses the sticky read conn when present (else a reader).
+        const read_conn = if (sc) |s| s.read else try self.connForRead();
+        const data = Data{ .app = self.app, .conn = read_conn, .io = self.app.io, .alloc = self.arena };
         const ov = try data.kvGet(key);
-        const variant = try features_resolver.resolveExperiment(self.arena, if (sticky) conn else null, ov, def, subject);
-        // Notify-only exposure seam, fired on the RESOLVED variant (after the sticky
-        // lookup). Zero-cost when no .onFeatureExposure handler is registered.
+        const variant = try features_resolver.resolveExperiment(self.arena, sc, ov, def, subject);
+        // Notify-only exposure seam, fired on the RESOLVED variant (after the reader-first
+        // sticky lookup). Zero-cost when no .onFeatureExposure handler is registered.
         events.dispatchExperimentExposure(self.app, self.app.dispatch, def.name, subject, variant);
         return variant;
     }
@@ -588,12 +592,15 @@ pub const FlagsApi = struct {
     /// projection (a later PR) serves.
     pub fn resolveAll(self: FlagsApi, subject: []const u8) !features_resolver.Resolved {
         const reg = self.ctx.app.features orelse return .{};
-        const conn = try self.ctx.connForRead();
-        const data = Data{ .app = self.ctx.app, .conn = conn, .io = self.ctx.app.io, .alloc = self.ctx.arena };
+        // Reader-first sticky conns (shared with `App.experiment`): the batched `_kv`
+        // scan reads on `sc.read`, and a `.sticky` experiment returns its PERSISTED
+        // variant (only a first-time miss briefly borrows the writer).
+        const sc = try self.ctx.stickyConns();
+        const data = Data{ .app = self.ctx.app, .conn = sc.read, .io = self.ctx.app.io, .alloc = self.ctx.arena };
         const entries = try data.kvScanPrefix(&.{ "flag:", "exp:" });
         const pairs = try self.ctx.arena.alloc(features_resolver.KvPair, entries.len);
         for (entries, 0..) |e, i| pairs[i] = .{ .key = e.key, .value = e.value };
-        return features_resolver.resolveAll(self.ctx.arena, reg.*, pairs, subject);
+        return features_resolver.resolveAll(self.ctx.arena, reg.*, pairs, subject, sc);
     }
 };
 

@@ -741,7 +741,10 @@ returns every declared flag + experiment resolved for a caller-supplied `subject
 ```
 
 It serves **resolved values only** (never the `_kv` keys, defaults, weights, or the
-superuser settings verbs). It auto-mounts at `/api/state`; the `.features` knob remaps or
+superuser settings verbs). A `.sticky` experiment returns its persisted assignment here
+too — resolved **reader-first**, so a repeat call for a known `subject` is read-only and
+only a subject's first resolve briefly takes the writer (an unauthenticated caller can't
+storm the writer lock). It auto-mounts at `/api/state`; the `.features` knob remaps or
 disables it:
 
 ```zig

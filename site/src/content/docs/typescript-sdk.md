@@ -576,6 +576,10 @@ flags: {
 - A flag with no `_kv` override resolves to its declared default; an `exp:<name>:weights`
   override (or the declared weights) drives the bucket. The endpoint returns **resolved
   values only** — never keys, defaults, or weights.
+- A `.sticky` experiment returns its **persisted** assignment (the same value the server's
+  `App.experiment` resolves), so it survives later weight changes. Resolution is
+  reader-first, so repeated `resolveAll` calls for a known `subject` don't contend the
+  writer.
 - A group with no declarations is typed `Record<string, never>` (the server returns `{}`).
 - **Comptime-only:** the typed surface is emitted by `zig build gen-client`, which reads
   your Zig `.flags`/`.experiments`. The runtime-introspection tier
