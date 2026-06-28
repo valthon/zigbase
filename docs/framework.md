@@ -284,6 +284,64 @@ via `ctx.request.?` (a `*http.RequestCtx`), the authenticated identity via
 framework **enforces `.auth` before** calling the handler. **Built-in routes always
 win** over custom routes that would match the same method + path.
 
+### Route guards: path-secret + per-route rate limit
+
+Routes run an ordered **guard chain** before the handler: (1) the `.auth` level above,
+(2) an optional **path-secret** guard, (3) an optional **per-route rate limit**. The first
+guard to deny short-circuits — the handler never runs.
+
+**Path-secret (`#139`).** Instead of an `AuthLevel`, `.auth` may be a guard struct that gates
+the route on a shared secret the caller presents (think unguessable webhook/deploy URLs):
+
+```zig
+.{ .method = .POST, .path = "/api/hooks/deploy/:token", .handler = onDeploy,
+   .auth = .{ .path_secret = .{
+       .param = "token",                    // path param / query key / header name (per .in)
+       .source = .{ .kv = "deploy_secret" },// .kv | .settings | .config = "..."
+       .in = .path,                         // .path (default) | .query | .header
+       .on_mismatch = .not_found,           // .not_found (default, bare 404) | .forbidden (403)
+   } } },
+```
+
+- **Source** — `.kv`/`.settings` resolve the secret from the named `_kv` entry at request time
+  (rotate it live with `ctx.kv().set(...)` or the settings API); `.config` is a static
+  compile-time string baked into the binary.
+- **Constant-time + no oracle (security).** The submitted value is compared to the stored secret
+  in **constant time** (no `==` timing leak), and a mismatch returns a **bare 404** by default —
+  indistinguishable from a route that doesn't exist, so an attacker can't probe for the
+  endpoint's existence. Set `.on_mismatch = .forbidden` for an explicit 403 when the path itself
+  is already public knowledge. An empty/absent stored secret fails closed (never matches).
+- **Rotation.** Write a new secret to the source and every link carrying the old one immediately
+  404s. There is no grace window — old URLs break the moment the secret changes.
+- A guard-gated route is `.public` at the AuthLevel layer (the secret *is* the gate). For ad-hoc
+  checks, `ctx.verifyPathSecret(param, stored)` does the same constant-time path-param comparison
+  inside a handler (return `ctx.notFound()` on `false` to mirror the bare-404 behavior).
+
+**Per-route rate limit (`#142`).** Add a `.rate_limit` (and optional `.rate_limit_key`):
+
+```zig
+.{ .method = .POST, .path = "/api/contact", .handler = contact, .auth = .public,
+   .rate_limit = .{ .custom = .{ .max = 5, .window_s = 60 } } }, // 5 / 60s per client
+```
+
+- `.rate_limit` is `.default`/`.off` (no per-route bucket — routes are unthrottled by default)
+  or `.{ .custom = .{ .max = N, .window_s = S } }`. A denied request returns **`429` with a
+  `Retry-After`** header.
+- **Bucket key (security).** By default the bucket keys on the client IP, which honors
+  `ZIGBASE_TRUST_PROXY`: when proxies are untrusted a spoofed `X-Forwarded-For` resolves to an
+  empty IP, so a forged header **cannot evade or poison** another client's bucket. Supply
+  `.rate_limit_key = fn(*Ctx) ?[]const u8` to key on something you resolve instead (API key,
+  tenant id, user id); returning `null` falls back to the IP key.
+- Both guards **compose** on one route — the path-secret check is ordered first, so a wrong
+  secret 404s without consuming the rate-limit budget.
+
+> **Ordering caveat.** Because `path_secret` runs *before* `rate_limit`, a `.rate_limit` on a
+> path-secret route throttles **authorized** traffic (requests that pass the secret check) — it
+> does **not** throttle secret-*guessing*, since a wrong secret 404s before reaching the limiter.
+> This ordering is intentional (a flood of bad guesses can't exhaust a legitimate caller's
+> budget). Rely on a **high-entropy secret** for brute-force resistance — the constant-time
+> compare already makes guessing infeasible — not on the per-route rate limit.
+
 ### Reading the request (`ctx.request.?`)
 
 In a route handler `ctx.request` is non-null (it is `null` only in job/hook

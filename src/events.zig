@@ -157,6 +157,51 @@ pub const ExposureHandler = *const fn (ev: *ExposureEvent) void;
 
 pub const AuthLevel = enum { public, authed, superuser };
 
+// ---------------------------------------------------------------------------
+// Declarative route-guard pipeline (#139 path-secret + #142 per-route rate limit).
+//
+// SELF-CONTAINED SECTION — types + lowering + the `RuntimeRoute` fields live together so
+// sibling Wave-2 PRs that also append to events.zig rebase cleanly. The guards are ENFORCED
+// in `server.zig dispatchCustom` as an ordered chain BEFORE the handler runs.
+// ---------------------------------------------------------------------------
+
+/// A `path_secret` guard (#139): the route is gated on a shared secret presented by the
+/// caller (in the path/query/header) matching a server-side stored value, compared in
+/// CONSTANT TIME. A mismatch returns a BARE 404 by default (no existence oracle — an
+/// attacker cannot distinguish "wrong secret" from "no such route"). Rotation story: write a
+/// new secret to the source and every link carrying the old one immediately 404s.
+pub const PathSecretGuard = struct {
+    /// Name of the path param / query key / header (per `in`) carrying the submitted secret.
+    param: []const u8,
+    /// Where the authoritative secret is stored.
+    source: SecretSource,
+    /// Where to read the submitted secret value from on the request.
+    in: enum { path, query, header } = .path,
+    /// Response on mismatch: a bare 404 (default, no oracle) or an explicit 403.
+    on_mismatch: enum { not_found, forbidden } = .not_found,
+
+    /// Where the stored secret is resolved from. `kv`/`settings` read the named key via
+    /// `ctx.kv().get` (the `_kv` store — settings are KV entries); `config` is a static
+    /// compile-time string baked into the route.
+    pub const SecretSource = union(enum) {
+        kv: []const u8,
+        settings: []const u8,
+        config: []const u8,
+    };
+};
+
+/// An extensible route auth guard. `.auth` accepts either an `AuthLevel` literal OR one of
+/// these guard structs; today the only guard is `path_secret`, but the union leaves room for
+/// future kinds (e.g. an HMAC-signature guard) without changing the route-spec surface.
+pub const RouteAuthGuard = union(enum) {
+    path_secret: PathSecretGuard,
+};
+
+/// App-supplied key function for a per-route rate-limit bucket (#142). Returns the string to
+/// key the bucket on (e.g. an API key or resolved user id); returning null falls back to the
+/// trust_proxy-honored client IP. Receives the request-bound `*Ctx`.
+pub const RateLimitKeyFn = *const fn (*Ctx) ?[]const u8;
+
 pub const RouteEvent = struct {
     app: *App,
     ctx: *http.RequestCtx,
@@ -201,8 +246,94 @@ pub const RuntimeRoute = struct {
     method: http.Method,
     pattern: []const u8,
     handler: RouteHandler,
+    /// The effective AuthLevel enforced first in the guard chain. When `.auth` is a guard
+    /// struct (e.g. `path_secret`), this is `.public` (the secret IS the gate) and the guard
+    /// is carried in `auth_guard`.
     auth: AuthLevel,
+    /// Optional declarative auth guard applied AFTER the AuthLevel check (#139). Null = none.
+    auth_guard: ?RouteAuthGuard = null,
+    /// Per-route rate limit (#142). `.default`/`.off` ⇒ no per-route bucket (routes are
+    /// unthrottled by default); `.custom` ⇒ a dedicated bucket of max/window_s.
+    rate_limit: schema.RateLimitOpt = .default,
+    /// Optional app-supplied bucket-key function (#142); null ⇒ key on the client IP.
+    rate_limit_key: ?RateLimitKeyFn = null,
 };
+
+/// Lower a `.path_secret.source` literal (`.{ .kv = "k" }` / `.{ .settings = "k" }` /
+/// `.{ .config = "secret" }`) into the `SecretSource` union. Loud-comptime on an unknown shape.
+fn lowerSecretSource(comptime src: anytype, comptime path: []const u8) PathSecretGuard.SecretSource {
+    const S = @TypeOf(src);
+    if (S == PathSecretGuard.SecretSource) return src;
+    if (@typeInfo(S) != .@"struct")
+        @compileError("route '" ++ path ++ "': .path_secret.source must be one of " ++
+            ".{ .kv = \"key\" } / .{ .settings = \"key\" } / .{ .config = \"secret\" }");
+    for (std.meta.fields(S)) |f| {
+        const ok = std.mem.eql(u8, f.name, "kv") or std.mem.eql(u8, f.name, "settings") or std.mem.eql(u8, f.name, "config");
+        if (!ok) @compileError("route '" ++ path ++ "': unknown .path_secret.source variant '." ++ f.name ++ "' (recognized: .kv, .settings, .config)");
+    }
+    // Exactly one source variant — `.{ .kv = "a", .settings = "b" }` would otherwise compile
+    // and silently use only `.kv`, dropping the rest (loud-comptime convention).
+    if (std.meta.fields(S).len != 1)
+        @compileError("route '" ++ path ++ "': .path_secret.source must have exactly one field (.kv, .settings, or .config)");
+    if (@hasField(S, "kv")) return .{ .kv = src.kv };
+    if (@hasField(S, "settings")) return .{ .settings = src.settings };
+    if (@hasField(S, "config")) return .{ .config = src.config };
+    @compileError("route '" ++ path ++ "': .path_secret.source is missing a variant; expected one of .kv/.settings/.config");
+}
+
+/// Lower a `.auth` guard struct (`.{ .path_secret = .{ … } }`) into a `RouteAuthGuard`.
+/// Loud `@compileError` on a malformed `.path_secret` (missing `.param`/`.source`, unknown keys).
+fn lowerRouteAuthGuard(comptime a: anytype, comptime path: []const u8) RouteAuthGuard {
+    const A = @TypeOf(a);
+    if (A == RouteAuthGuard) return a;
+    if (@typeInfo(A) != .@"struct")
+        @compileError("route '" ++ path ++ "': .auth must be an AuthLevel (.public/.authed/.superuser) " ++
+            "or a guard struct like .{ .path_secret = .{ .param = \"...\", .source = .{ .kv = \"...\" } } }");
+    for (std.meta.fields(A)) |f| {
+        if (!std.mem.eql(u8, f.name, "path_secret"))
+            @compileError("route '" ++ path ++ "': unknown .auth guard '." ++ f.name ++ "' (recognized guard: .path_secret)");
+    }
+    if (!@hasField(A, "path_secret"))
+        @compileError("route '" ++ path ++ "': .auth guard struct must have a .path_secret field");
+    const ps = a.path_secret;
+    const P = @TypeOf(ps);
+    if (@typeInfo(P) != .@"struct")
+        @compileError("route '" ++ path ++ "': .path_secret must be a struct .{ .param = \"...\", .source = .{ .kv|.settings|.config = \"...\" } }");
+    if (!@hasField(P, "param"))
+        @compileError("route '" ++ path ++ "': .path_secret is missing required '.param' (the path/query/header name carrying the secret)");
+    if (!@hasField(P, "source"))
+        @compileError("route '" ++ path ++ "': .path_secret is missing required '.source' (.{ .kv = \"key\" } / .{ .settings = \"key\" } / .{ .config = \"secret\" })");
+    for (std.meta.fields(P)) |f| {
+        const ok = std.mem.eql(u8, f.name, "param") or std.mem.eql(u8, f.name, "source") or
+            std.mem.eql(u8, f.name, "in") or std.mem.eql(u8, f.name, "on_mismatch");
+        if (!ok) @compileError("route '" ++ path ++ "': unknown .path_secret key '." ++ f.name ++ "' (recognized: .param, .source, .in, .on_mismatch)");
+    }
+    var guard = PathSecretGuard{ .param = ps.param, .source = lowerSecretSource(ps.source, path) };
+    if (@hasField(P, "in")) guard.in = ps.in;
+    if (@hasField(P, "on_mismatch")) guard.on_mismatch = ps.on_mismatch;
+    return .{ .path_secret = guard };
+}
+
+/// True iff `.auth` is an AuthLevel (the `AuthLevel` type itself OR a bare enum literal like
+/// `.public`), as opposed to a guard struct.
+fn authIsLevel(comptime A: type) bool {
+    return A == AuthLevel or A == @TypeOf(.enum_literal);
+}
+
+/// The effective AuthLevel for a route spec: the literal when `.auth` is an AuthLevel, else
+/// `.public` (a guard-gated route is public at the AuthLevel layer — the guard is the gate),
+/// defaulting to `.superuser` (safe default) when `.auth` is omitted.
+fn routeAuthLevel(comptime s: anytype) AuthLevel {
+    if (!@hasField(@TypeOf(s), "auth")) return .superuser;
+    return if (authIsLevel(@TypeOf(s.auth))) s.auth else .public;
+}
+
+/// The lowered `RouteAuthGuard` for a route spec, or null when `.auth` is an AuthLevel/omitted.
+fn routeAuthGuard(comptime s: anytype) ?RouteAuthGuard {
+    if (!@hasField(@TypeOf(s), "auth")) return null;
+    if (authIsLevel(@TypeOf(s.auth))) return null;
+    return lowerRouteAuthGuard(s.auth, s.path);
+}
 
 pub const AuthMethod = enum { password, oauth2, magic_link, otp, webauthn, custom };
 pub const AuthEvent = struct {
@@ -553,7 +684,9 @@ pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
                     .method = s.method,
                     .path = s.path,
                     .name = comptimeRouteName(s.path, override),
-                    .auth = if (@hasField(@TypeOf(s), "auth")) s.auth else .superuser,
+                    // `.auth` may be an AuthLevel literal OR a guard struct; the guard maps to
+                    // a `.public` AuthLevel here (the secret is the gate). See `routeAuthLevel`.
+                    .auth = routeAuthLevel(s),
                     // Untyped handlers own the raw response; they contribute no typed RPC
                     // surface, so Input/Output are void (representable + query-parseable)
                     // and `untyped` flags them out of TS RPC codegen.
@@ -609,12 +742,28 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
             var t: [fields.len]RuntimeRoute = undefined;
             for (fields, 0..) |f, i| {
                 const s = @field(specs, f.name);
-                const auth: AuthLevel = if (@hasField(@TypeOf(s), "auth")) s.auth else .superuser;
+                const auth: AuthLevel = routeAuthLevel(s);
                 // Untyped handlers already match RouteHandler — store directly so they keep
                 // full control of the response (cookies/redirect/content-type). Typed handlers
                 // are wrapped in a thunk that parses Input and serializes Output as JSON.
                 const handler = if (isUntypedHandler(@TypeOf(s.handler))) s.handler else route_types.makeThunk(s.handler);
-                t[i] = .{ .method = s.method, .pattern = s.path, .handler = handler, .auth = auth };
+                // Route-guard pipeline (#139/#142): lower the optional `.auth` guard and
+                // `.rate_limit` (via the shared `schema.buildRateLimitOpt`); both are enforced
+                // before the handler in `server.zig dispatchCustom`.
+                const rate_limit: schema.RateLimitOpt = if (@hasField(@TypeOf(s), "rate_limit"))
+                    schema.buildRateLimitOpt(s.rate_limit)
+                else
+                    .default;
+                const rate_limit_key: ?RateLimitKeyFn = if (@hasField(@TypeOf(s), "rate_limit_key")) s.rate_limit_key else null;
+                t[i] = .{
+                    .method = s.method,
+                    .pattern = s.path,
+                    .handler = handler,
+                    .auth = auth,
+                    .auth_guard = routeAuthGuard(s),
+                    .rate_limit = rate_limit,
+                    .rate_limit_key = rate_limit_key,
+                };
             }
             break :blk t;
         };
@@ -1089,6 +1238,102 @@ test "buildRoutes defaults auth to .superuser when omitted" {
     });
     try std.testing.expect(table[0].auth == .superuser);
 }
+
+test "buildRoutes lowers a path_secret guard: .auth=.public + carried guard (#139)" {
+    const H = struct {
+        fn h(ctx: *Ctx) anyerror!http.Response {
+            _ = ctx;
+            return .{ .status = 200, .body = "{}" };
+        }
+    };
+    const table = buildRoutes(.{
+        .{ .method = .POST, .path = "/api/hooks/deploy", .handler = H.h, .auth = .{ .path_secret = .{
+            .param = "secret",
+            .source = .{ .kv = "deploy_secret" },
+            .in = .query,
+            .on_mismatch = .forbidden,
+        } } },
+    });
+    try std.testing.expectEqual(@as(usize, 1), table.len);
+    // A guard-gated route is `.public` at the AuthLevel layer; the secret is the gate.
+    try std.testing.expect(table[0].auth == .public);
+    const g = table[0].auth_guard.?;
+    try std.testing.expect(g == .path_secret);
+    try std.testing.expectEqualStrings("secret", g.path_secret.param);
+    try std.testing.expect(g.path_secret.in == .query);
+    try std.testing.expect(g.path_secret.on_mismatch == .forbidden);
+    try std.testing.expect(g.path_secret.source == .kv);
+    try std.testing.expectEqualStrings("deploy_secret", g.path_secret.source.kv);
+    // Defaults: rate_limit .default, no key fn.
+    try std.testing.expect(table[0].rate_limit == .default);
+    try std.testing.expect(table[0].rate_limit_key == null);
+}
+
+test "buildRoutes path_secret defaults: in=.path, on_mismatch=.not_found, config source" {
+    const H = struct {
+        fn h(ctx: *Ctx) anyerror!http.Response {
+            _ = ctx;
+            return .{ .status = 200, .body = "{}" };
+        }
+    };
+    const table = buildRoutes(.{
+        .{ .method = .GET, .path = "/api/x/:token", .handler = H.h, .auth = .{ .path_secret = .{
+            .param = "token",
+            .source = .{ .config = "s3cr3t" },
+        } } },
+    });
+    const g = table[0].auth_guard.?;
+    try std.testing.expect(g.path_secret.in == .path); // default
+    try std.testing.expect(g.path_secret.on_mismatch == .not_found); // default (bare-404)
+    try std.testing.expect(g.path_secret.source == .config);
+    try std.testing.expectEqualStrings("s3cr3t", g.path_secret.source.config);
+}
+
+test "buildRoutes lowers a per-route rate_limit + rate_limit_key (#142)" {
+    const H = struct {
+        fn h(ctx: *Ctx) anyerror!http.Response {
+            _ = ctx;
+            return .{ .status = 200, .body = "{}" };
+        }
+        fn key(ctx: *Ctx) ?[]const u8 {
+            _ = ctx;
+            return "k";
+        }
+    };
+    const table = buildRoutes(.{
+        .{ .method = .POST, .path = "/api/limited", .handler = H.h, .auth = .public, .rate_limit = .{ .custom = .{ .max = 3, .window_s = 60 } }, .rate_limit_key = H.key },
+    });
+    try std.testing.expect(table[0].auth == .public);
+    try std.testing.expect(table[0].auth_guard == null);
+    try std.testing.expect(table[0].rate_limit == .custom);
+    try std.testing.expectEqual(@as(u32, 3), table[0].rate_limit.custom.max);
+    try std.testing.expectEqual(@as(i64, 60), table[0].rate_limit.custom.window_s);
+    try std.testing.expect(table[0].rate_limit_key != null);
+}
+
+test "buildRoutes accepts a pre-lowered RateLimitOpt for .rate_limit" {
+    const H = struct {
+        fn h(ctx: *Ctx) anyerror!http.Response {
+            _ = ctx;
+            return .{ .status = 200, .body = "{}" };
+        }
+    };
+    // A consumer may pass a const `RateLimitOpt` straight through (it must not re-enter the
+    // struct-lowering branch — see schema.buildRateLimitOpt's passthrough guard).
+    const limit: schema.RateLimitOpt = .{ .custom = .{ .max = 4, .window_s = 120 } };
+    const table = buildRoutes(.{
+        .{ .method = .POST, .path = "/api/pre", .handler = H.h, .auth = .public, .rate_limit = limit },
+    });
+    try std.testing.expect(table[0].rate_limit == .custom);
+    try std.testing.expectEqual(@as(u32, 4), table[0].rate_limit.custom.max);
+}
+
+// NOTE: a malformed `.path_secret` (missing `.param`/`.source`, an unknown key, an unknown
+// `.source` variant, or MORE THAN ONE `.source` variant) is rejected at COMPILE time by
+// `lowerRouteAuthGuard`/`lowerSecretSource` — e.g. `.auth = .{ .path_secret = .{ .source =
+// .{ .kv = "k" } } }` (no `.param`) and `.source = .{ .kv = "a", .config = "b" }` (two
+// variants) are both `@compileError`s. They cannot be asserted at runtime (they would fail
+// the build), matching the loud-comptime convention used for hooks and `.rate_limit`.
 
 test "AuthMethod enumerates all method tags" {
     try std.testing.expectEqualStrings("magic_link", @tagName(AuthMethod.magic_link));

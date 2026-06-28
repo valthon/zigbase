@@ -464,6 +464,20 @@ pub const Ctx = struct {
         return error_mod.ApiError.notFound().toResponse(self.arena);
     }
 
+    /// Constant-time check that the route path param `param` equals `stored` (#139 escape
+    /// hatch). Returns false when there is no request, the param is absent, or `stored` is
+    /// empty / differs. Uses `crypto.timingSafeEql`, so a wrong value leaks no byte-position
+    /// timing oracle — never compare a secret with `==`/`std.mem.eql`. The declarative
+    /// `.auth = .{ .path_secret = … }` route guard is the preferred path; reach for this only
+    /// for ad-hoc checks (e.g. against a secret you resolved yourself). It does NOT itself
+    /// 404/deny — the caller decides (return `ctx.notFound()` on false to mirror the guard's
+    /// bare-404, no-oracle behavior).
+    pub fn verifyPathSecret(self: *Ctx, param: []const u8, stored: []const u8) bool {
+        const req = self.request orelse return false;
+        const submitted = req.param(param) orelse return false;
+        return stored.len > 0 and crypto.timingSafeEql(submitted, stored);
+    }
+
     /// The request's URL query string, lazily parsed (and cached on the Ctx) into decoded
     /// key/value pairs: `+` → space, `%XX` percent-decoded (see `query/params.zig`). Returns
     /// an empty `Params` in a job/hook context (no request). `q.get("k")` is `?[]const u8`.
@@ -1694,6 +1708,28 @@ test "#137 ctx.subjectCookie mints once, is idempotent, and reads back an existi
         try std.testing.expectEqual(Ctx.subject_token_len, id.len);
         try std.testing.expectEqual(@as(usize, 1), ctx.pending_cookies.items.len);
     }
+}
+
+test "#139 ctx.verifyPathSecret constant-time path param check" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    const params = [_]http_mod.Param{.{ .key = "token", .value = "s3cr3t" }};
+    var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .params = &params };
+    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &req };
+    defer ctx.deinit();
+
+    // Correct secret matches; wrong secret and empty stored fail.
+    try std.testing.expect(ctx.verifyPathSecret("token", "s3cr3t"));
+    try std.testing.expect(!ctx.verifyPathSecret("token", "wrong"));
+    try std.testing.expect(!ctx.verifyPathSecret("token", "")); // empty stored never matches
+    try std.testing.expect(!ctx.verifyPathSecret("missing", "s3cr3t")); // absent param
+
+    // No request context -> false (no panic).
+    var jobctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    defer jobctx.deinit();
+    try std.testing.expect(!jobctx.verifyPathSecret("token", "s3cr3t"));
 }
 
 // ---------------------------------------------------------------------------

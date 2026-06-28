@@ -101,6 +101,66 @@ pub const RateLimitOpt = union(enum) {
     custom: struct { max: u32, window_s: i64 },
 };
 
+/// Comptime lowering of a `.rate_limit` config literal into a `RateLimitOpt`. Accepts the
+/// enum-literals `.default` / `.off` or the struct form `.{ .custom = .{ .max = N, .window_s
+/// = S } }`. A misshaped struct (e.g. the `.custom` wrapper forgotten) or an unknown literal
+/// is a `@compileError` (loud-comptime convention) rather than a silent fallback to
+/// `.default`. Shared by `provision.buildMethodsOptions` (per-auth-method limits) and
+/// `events.buildRoutes` (per-route limits) so both lower `.rate_limit` identically.
+pub fn buildRateLimitOpt(comptime rl: anytype) RateLimitOpt {
+    const T = @TypeOf(rl);
+    // Already a lowered `RateLimitOpt` (a `union(enum)`) — pass through. Without this, a
+    // pre-lowered `.default`/`.off` would fall into the struct branch below where
+    // `@hasField(RateLimitOpt, "custom")` is true, triggering an "access of inactive union
+    // field" comptime panic on `rl.custom`.
+    //
+    // NOTE: the enum-literal branch below compares with `==` rather than `@tagName`
+    // deliberately. Because this function also has `return rl` typed as `RateLimitOpt`
+    // (the passthrough), Zig coerces a bare `.default`/`.off` enum-literal argument toward
+    // the union at analysis time, after which `@tagName(rl)` no longer yields the literal's
+    // name — a direct enum-literal `==` comparison is unaffected. (`@tagName` IS still safe
+    // inside the unreached error `@compileError` below, which only the bad-literal path hits.)
+    if (T == RateLimitOpt) return rl;
+    // The struct form `.{ .custom = .{ .max = …, .window_s = … } }`: an anonymous struct
+    // (NOT an enum/union), so `@tagName` would fail — match on the `custom` field instead.
+    if (T != @TypeOf(.enum_literal)) {
+        if (@hasField(T, "custom")) {
+            const cv = rl.custom;
+            return .{ .custom = .{ .max = cv.max, .window_s = cv.window_s } };
+        }
+        // A struct without a `custom` field is a misshaped config (e.g. forgetting the
+        // `.custom` wrapper: `.{ .max = 5, .window_s = 60 }`). Fail at comptime rather than
+        // silently applying `.default`.
+        @compileError("rate_limit: unrecognized struct shape; expected " ++
+            ".rate_limit = .{ .custom = .{ .max = N, .window_s = S } } " ++
+            "(or the enum-literals .default / .off)");
+    }
+    // The enum-literal form `.default` / `.off`. An unknown literal (e.g. `.on`, a typo) is
+    // a comptime error, not a silent `.default`.
+    if (rl == .off) return .off;
+    if (rl == .default) return .default;
+    @compileError("rate_limit: unknown value '." ++ @tagName(rl) ++ "'; expected " ++
+        ".default, .off, or .{ .custom = .{ .max = N, .window_s = S } }");
+}
+
+test "buildRateLimitOpt passes a pre-lowered RateLimitOpt through unchanged" {
+    // A value that is ALREADY a `RateLimitOpt` (e.g. a const, or re-lowering) must pass
+    // through — without the passthrough guard, `.default`/`.off` would hit the struct branch
+    // and panic on `rl.custom` (access of inactive union field).
+    const def: RateLimitOpt = .default;
+    try std.testing.expect(buildRateLimitOpt(def) == .default);
+    const off: RateLimitOpt = .off;
+    try std.testing.expect(buildRateLimitOpt(off) == .off);
+    const cust: RateLimitOpt = .{ .custom = .{ .max = 7, .window_s = 30 } };
+    const out = buildRateLimitOpt(cust);
+    try std.testing.expect(out == .custom);
+    try std.testing.expectEqual(@as(u32, 7), out.custom.max);
+    try std.testing.expectEqual(@as(i64, 30), out.custom.window_s);
+    // The bare enum-literal and struct forms still lower as before.
+    try std.testing.expect(buildRateLimitOpt(.default) == .default);
+    try std.testing.expect(buildRateLimitOpt(.{ .custom = .{ .max = 1, .window_s = 1 } }) == .custom);
+}
+
 pub const PasswordMethodOpts = struct {
     rate_limit: RateLimitOpt = .default,
 };

@@ -32,6 +32,15 @@ pub const RequestCtx = struct {
     if_none_match: []const u8 = "",
     form_fields: ?std.json.Value = null,
     files: []const UploadedFile = &.{},
+    /// Generic request headers for the route-guard `.header` source (#139). Unit tests set
+    /// this list directly; in production `server.zig` wires `raw_header_fn`/`raw_header_ctx`
+    /// to the live request instead (the HTTP server exposes lookup-by-name, not iteration).
+    /// `header(name)` consults the live lookup first, then this list.
+    headers: []const Param = &.{},
+    /// Opaque pointer to the live request, passed to `raw_header_fn`. Set by `server.zig`.
+    raw_header_ctx: ?*anyopaque = null,
+    /// Live header lookup-by-name (lowercase), wired by `server.zig` from the HTTP request.
+    raw_header_fn: ?*const fn (*anyopaque, []const u8) ?[]const u8 = null,
 
     pub fn param(self: *const RequestCtx, name: []const u8) ?[]const u8 {
         for (self.params) |p| {
@@ -46,6 +55,19 @@ pub const RequestCtx = struct {
         if (!std.mem.startsWith(u8, self.authorization, prefix)) return null;
         const t = self.authorization[prefix.len..];
         return if (t.len == 0) null else t;
+    }
+
+    /// The value of an arbitrary request header `name` (case-insensitive), or null. Consults
+    /// the live server lookup (`raw_header_fn`) first, then the `headers` list (unit tests).
+    /// Used by the `path_secret` route guard's `.header` source.
+    pub fn header(self: *const RequestCtx, name: []const u8) ?[]const u8 {
+        if (self.raw_header_fn) |f| {
+            if (f(self.raw_header_ctx.?, name)) |v| return v;
+        }
+        for (self.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.key, name)) return h.value;
+        }
+        return null;
     }
 
     /// The value of cookie `name` from the Cookie header, or null. Trims surrounding spaces.
