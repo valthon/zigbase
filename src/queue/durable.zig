@@ -76,15 +76,17 @@ pub fn claimBatch(
         \\   SELECT "id" FROM "_queue_jobs"
         \\    WHERE "status"='pending' AND "run_at" <= ?3 AND "queue" IN (
     );
+    var numbuf: [20]u8 = undefined;
     var pidx: usize = 4;
     for (queue_names, 0..) |_, i| {
-        const frag = try std.fmt.allocPrint(arena, "{s}?{d}", .{ if (i == 0) "" else ",", pidx });
-        try sql.appendSlice(arena, frag);
+        if (i != 0) try sql.append(arena, ',');
+        try sql.append(arena, '?');
+        try sql.appendSlice(arena, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
         pidx += 1;
     }
-    const tail = try std.fmt.allocPrint(arena, ") ORDER BY \"priority\" ASC, \"run_at\" ASC LIMIT ?{d})", .{pidx});
-    try sql.appendSlice(arena, tail);
-    try sql.appendSlice(arena, " RETURNING \"id\",\"queue\",\"kind\",\"payload\",\"attempts\",\"max_attempts\";");
+    try sql.appendSlice(arena, ") ORDER BY \"priority\" ASC, \"run_at\" ASC LIMIT ?");
+    try sql.appendSlice(arena, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
+    try sql.appendSlice(arena, ") RETURNING \"id\",\"queue\",\"kind\",\"payload\",\"attempts\",\"max_attempts\";");
     const sql_z = try arena.dupeZ(u8, sql.items);
 
     var st = try w.prepare(sql_z);
@@ -170,13 +172,15 @@ pub fn gcDoneJobs(w: *db.Db, queue_name: []const u8, ttl_s: i64) !usize {
     const modifier = std.fmt.bufPrint(&buf, "-{d} seconds", .{ttl_s}) catch unreachable;
     var total: usize = 0;
     while (true) {
+        // `created` is always written canonical via datetime('now'), so compare it DIRECTLY
+        // against datetime('now', ?2) rather than wrapping both sides in strftime — keeping
+        // the predicate sargable so the `(created)` index serves the scan instead of a full table scan.
         var st = try w.prepare(comptime std.fmt.comptimePrint(
             \\DELETE FROM "_queue_jobs"
             \\ WHERE rowid IN (
             \\   SELECT rowid FROM "_queue_jobs"
             \\    WHERE "status" IN ('done','failed') AND "queue"=?1
-            \\      AND strftime('%Y-%m-%dT%H:%M:%SZ', "created") IS NOT NULL
-            \\      AND strftime('%Y-%m-%dT%H:%M:%SZ', "created") <= strftime('%Y-%m-%dT%H:%M:%SZ','now',?2)
+            \\      AND "created" <= datetime('now', ?2)
             \\    LIMIT {d}
             \\ )
             \\ RETURNING "id";
@@ -251,7 +255,9 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
             } else {
                 const policy = if (reg.queueByName(job.queue)) |q| q.retry else queue.RetryPolicy{};
                 const delay_ms = queue.backoffMs(policy, @intCast(new_attempts), randomU64(io));
-                const run_at = now + @as(i64, @intCast(delay_ms / 1000));
+                // Round ms→s UP so a sub-second backoff (e.g. base_ms=500) still waits >=1s
+                // rather than truncating to an immediate retry. (delay_ms==0 stays 0.)
+                const run_at = now + @as(i64, @intCast((delay_ms + 999) / 1000));
                 try markRetry(w, job.id, new_attempts, run_at, @errorName(e));
             }
         } else {
@@ -387,8 +393,9 @@ test "durable gcDoneJobs reaps old done/failed rows, keeps fresh + pending" {
     defer d.close();
     try migrations.run(&d);
     // Old done + old failed (created a year ago) -> reaped; fresh done + pending -> kept.
-    try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('a','q','k',5,'done',strftime('%Y-%m-%dT%H:%M:%SZ','now','-400 days'));");
-    try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('b','q','k',5,'failed',strftime('%Y-%m-%dT%H:%M:%SZ','now','-400 days'));");
+    // `created` is canonical datetime('now') format, as durable.enqueue writes it.
+    try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('a','q','k',5,'done',datetime('now','-400 days'));");
+    try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('b','q','k',5,'failed',datetime('now','-400 days'));");
     try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('c','q','k',5,'done',datetime('now'));");
     try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('d','q','k',5,'pending',datetime('now'));");
 

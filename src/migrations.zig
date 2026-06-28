@@ -254,7 +254,7 @@ fn init_0013_queue_jobs(w: *db.Db) db.DbError!void {
     // 'claimed' row is reclaimed to 'pending' once claimed_at is older than the visibility
     // timeout. On success → 'done'; a retryable failure bumps attempts and pushes run_at
     // out by the backoff; exhausting max_attempts → 'failed' (last_error + .onError). The
-    // (status,run_at,priority) index serves the claim query; (created) serves the GC sweep
+    // (status,priority,run_at) index serves the claim query; (created) serves the GC sweep
     // that reaps old done/failed rows in bounded batches (mirrors _experiment_assignments).
     try w.exec(
         \\CREATE TABLE IF NOT EXISTS "_queue_jobs" (
@@ -273,7 +273,10 @@ fn init_0013_queue_jobs(w: *db.Db) db.DbError!void {
         \\  "created" TEXT NOT NULL
         \\);
     );
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_queue_jobs_ready\" ON \"_queue_jobs\" (\"status\",\"run_at\",\"priority\");");
+    // Column order matches the claim query: status (equality) then the ORDER BY
+    // (priority, run_at), so SQLite can serve the sort straight from the index (no
+    // filesort) and stop at LIMIT instead of materializing every ready row.
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_queue_jobs_ready\" ON \"_queue_jobs\" (\"status\",\"priority\",\"run_at\");");
     try w.exec("CREATE INDEX IF NOT EXISTS \"idx_queue_jobs_created\" ON \"_queue_jobs\" (\"created\");");
 }
 

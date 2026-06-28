@@ -188,7 +188,12 @@ pub fn jobsMeta(comptime jobs_cfg: anytype) []const JobReg {
             if (std.mem.eql(u8, f.name, reserved_pool_size_key)) continue;
             const h = @field(jobs_cfg, f.name);
             const HT = @TypeOf(h);
-            if (@typeInfo(HT) != .@"fn" and !(@typeInfo(HT) == .pointer and @typeInfo(@typeInfo(HT).pointer.child) == .@"fn"))
+            const is_fn = switch (@typeInfo(HT)) {
+                .@"fn" => true,
+                .pointer => |ptr| ptr.size == .one and @typeInfo(ptr.child) == .@"fn",
+                else => false,
+            };
+            if (!is_fn)
                 @compileError("job '" ++ f.name ++ "' must be a handler fn 'fn(*Ctx, []const u8) anyerror!void'");
             const handler: queue.JobHandler = h; // coerces or fails loudly with the contract type
             list = list ++ &[_]JobReg{.{ .kind = f.name, .handler = handler }};
