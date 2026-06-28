@@ -70,6 +70,7 @@ pub fn genToken(io: std.Io, alloc: std.mem.Allocator, len: usize) ![]u8 {
 /// where a strictly `[0-9a-f]` alphabet is wanted (e.g. opaque ids in URLs/headers).
 pub fn genHex(io: std.Io, alloc: std.mem.Allocator, len: usize) ![]u8 {
     const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out); // only fires on an error path below; the success `return out` leaves it owned by the caller
     if (len == 0) return out;
     const nbytes = (len + 1) / 2;
     const raw = try alloc.alloc(u8, nbytes);
