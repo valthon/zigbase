@@ -263,19 +263,28 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
 }
 
 fn buildRateLimitOpt(comptime rl: anytype) schema.RateLimitOpt {
+    const T = @TypeOf(rl);
     // The struct form `.{ .custom = .{ .max = …, .window_s = … } }`: an anonymous struct
     // (NOT an enum/union), so `@tagName` would fail — match on the `custom` field instead.
-    if (@TypeOf(rl) != @TypeOf(.enum_literal)) {
-        if (@hasField(@TypeOf(rl), "custom")) {
+    if (T != @TypeOf(.enum_literal)) {
+        if (@hasField(T, "custom")) {
             const cv = rl.custom;
             return .{ .custom = .{ .max = cv.max, .window_s = cv.window_s } };
         }
-        return .default;
+        // A struct without a `custom` field is a misshaped config (e.g. forgetting the
+        // `.custom` wrapper: `.{ .max = 5, .window_s = 60 }`). Fail at comptime rather than
+        // silently applying `.default`.
+        @compileError("rate_limit: unrecognized struct shape; expected " ++
+            ".rate_limit = .{ .custom = .{ .max = N, .window_s = S } } " ++
+            "(or the enum-literals .default / .off)");
     }
-    // The enum-literal form `.default` / `.off`.
+    // The enum-literal form `.default` / `.off`. An unknown literal (e.g. `.on`, a typo) is
+    // a comptime error, not a silent `.default`.
     const tag = @tagName(rl);
     if (std.mem.eql(u8, tag, "off")) return .off;
-    return .default;
+    if (std.mem.eql(u8, tag, "default")) return .default;
+    @compileError("rate_limit: unknown value '." ++ tag ++ "'; expected " ++
+        ".default, .off, or .{ .custom = .{ .max = N, .window_s = S } }");
 }
 
 fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
@@ -1461,13 +1470,14 @@ test "buildCollection lowers .auth.methods into collection options" {
     try std.testing.expect(accounts.options.auth.methods.password == null);
 }
 
-test "buildCollection lowers a per-method comptime rate_limit (.default and .{ .custom })" {
+test "buildCollection lowers a per-method comptime rate_limit (.default / .off / .{ .custom })" {
     const specs = comptime buildCollections(.{
         .accounts = .{ .type = .auth, .fields = .{}, .auth = .{ .methods = .{
             // The struct form must lower without `@tagName`-on-a-struct failing.
             .magic_link = .{ .rate_limit = .{ .custom = .{ .max = 5, .window_s = 60 } } },
-            // The enum-literal form coexists.
+            // The enum-literal forms coexist.
             .otp = .{ .rate_limit = .off },
+            .password = .{ .rate_limit = .default },
         } } },
     });
     const ml = specs[0].options.auth.methods.magic_link.?;
@@ -1476,6 +1486,10 @@ test "buildCollection lowers a per-method comptime rate_limit (.default and .{ .
     try std.testing.expectEqual(@as(i64, 60), ml.rate_limit.custom.window_s);
     const otp = specs[0].options.auth.methods.otp.?;
     try std.testing.expect(otp.rate_limit == .off);
+    const pw = specs[0].options.auth.methods.password.?;
+    try std.testing.expect(pw.rate_limit == .default);
+    // NOTE: the negative cases (a misshaped struct without `.custom`, or an unknown enum
+    // literal) are `@compileError`s and so cannot be exercised by a unit test.
 }
 
 test "buildCollection plumbs magic_link redirect_default/redirect_allow" {
