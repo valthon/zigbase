@@ -250,10 +250,30 @@ pub fn App(comptime cfg: anytype) type {
         else
             &.{};
 
-        /// Framework-internal jobs: the TTL sweep and/or the session-GC sweep, each gated on
-        /// its own condition. Appended after the consumer's jobs so user `.cron` names win the
-        /// lower indices, and an internal job runs even with no user cron.
-        const internal_jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(ttl_jobs, session_gc_jobs);
+        /// True when ANY declared experiment opts into sticky persistence (`.sticky = true`).
+        /// Gates the framework-internal `_experiment_gc` job — pure-hash-only apps install no
+        /// job/timer/writer touch (the zero-overhead guarantee, mirroring session GC).
+        pub const has_sticky_experiment: bool = blk: {
+            for (experiments) |e| if (e.sticky) break :blk true;
+            break :blk false;
+        };
+
+        /// Sticky-assignment GC sweep (#129) — auto-installed ONLY when a `.sticky` experiment
+        /// is declared, so pure-hash apps install no job/timer/writer touch. Hourly cadence;
+        /// reaps `_experiment_assignments` rows older than `.experiment_assignment_ttl`.
+        const experiment_gc_jobs: []const scheduler.RuntimeJob = if (has_sticky_experiment)
+            scheduler.buildJobs(.{
+                .{ .name = "_experiment_gc", .schedule = schedule.Schedule{ .cron = "0 * * * *" }, .handler = experimentGcJob },
+            })
+        else
+            &.{};
+
+        /// Framework-internal jobs: the TTL sweep, the session-GC sweep, and/or the sticky-
+        /// assignment GC sweep, each gated on its own condition. Appended after the consumer's
+        /// jobs so user `.cron` names win the lower indices, and an internal job runs even with
+        /// no user cron.
+        const internal_jobs: []const scheduler.RuntimeJob =
+            scheduler.concatJobs(scheduler.concatJobs(ttl_jobs, session_gc_jobs), experiment_gc_jobs);
 
         /// The full job table = consumer jobs ++ framework-internal jobs. The scheduler
         /// starts whenever this is non-empty, so a TTL collection alone starts it.
@@ -429,6 +449,17 @@ pub fn App(comptime cfg: anytype) type {
         /// Static lowered registry threaded into `app.features` by serveImpl.
         pub const features_registry: features.Registry = .{ .flags = flags, .experiments = experiments };
 
+        /// TTL in DAYS for sticky `_experiment_assignments` rows (#129). The comptime-gated
+        /// `_experiment_gc` sweep deletes assignments older than this. Default 90 days. Only
+        /// consumed when at least one declared experiment is `.sticky` — setting it without
+        /// any sticky experiment is a `@compileError` (a silent no-op otherwise, mirroring
+        /// the `session_gc_cron` misuse guard).
+        pub const experiment_assignment_ttl: u32 = blk: {
+            if (@hasField(@TypeOf(cfg), "experiment_assignment_ttl") and !has_sticky_experiment)
+                @compileError("experiment_assignment_ttl has no effect without a .sticky experiment");
+            break :blk if (@hasField(@TypeOf(cfg), "experiment_assignment_ttl")) cfg.experiment_assignment_ttl else 90;
+        };
+
         /// Resolve a DECLARED flag (the `flag:<name>` override from `_kv` if present,
         /// else the declared default). Typo'd `.name` → compile error. Swallows read
         /// errors back to the default, so a kill-switch check never fails the request.
@@ -484,6 +515,7 @@ pub fn App(comptime cfg: anytype) type {
             .enable_typegen = enable_typegen,
             .has_ttl = has_ttl_collection,
             .features = &features_registry,
+            .experiment_assignment_ttl = experiment_assignment_ttl,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -519,6 +551,17 @@ fn sessionGcJob(ctx: *@import("ctx.zig").Ctx, ev: *events.JobEvent) anyerror!voi
     _ = try @import("api/auth.zig").gcExpiredSessions(w);
 }
 
+/// The framework-internal `_experiment_gc` job handler (#129): acquires the writer and
+/// reaps sticky `_experiment_assignments` rows older than `app.experiment_assignment_ttl`
+/// (days) in bounded batches. Registered only when a `.sticky` experiment is declared
+/// (see `App.experiment_gc_jobs`); never installed for pure-hash-only apps.
+fn experimentGcJob(ctx: *@import("ctx.zig").Ctx, ev: *events.JobEvent) anyerror!void {
+    _ = ev;
+    const w = ctx.app.pool.acquireWriter();
+    defer ctx.app.pool.releaseWriter();
+    _ = try @import("features_resolver.zig").gcExpiredAssignments(w, ctx.app.experiment_assignment_ttl);
+}
+
 /// Comptime knobs threaded from `App(cfg)` into the serve path: which storage /
 /// mailer plugin TYPES to instantiate, the assembled auth method type list,
 /// and the warm-reader-pool cap.
@@ -546,6 +589,9 @@ pub const ServeOpts = struct {
     /// Declared feature-flag + experiment registry (#128/#129/#130), pointed into
     /// `app.features` by serveImpl. Static lifetime (a comptime-lowered const).
     features: ?*const features.Registry = null,
+    /// TTL in DAYS for sticky `_experiment_assignments` rows (#129); threaded into
+    /// `app.experiment_assignment_ttl` for the comptime-gated `_experiment_gc` job.
+    experiment_assignment_ttl: u32 = 90,
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -1142,6 +1188,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .auth_methods = @ptrCast(&am_registry),
         .dispatch = dispatch,
         .features = opts.features,
+        .experiment_assignment_ttl = opts.experiment_assignment_ttl,
         // Always wire the shared limiter store: the default-scope limiter no-ops when
         // rate_limit_max==0 (RateLimiter.allow returns true for max==0), but a configured
         // per-method custom limit must still be honored against this store regardless of
@@ -1521,6 +1568,40 @@ test "#114 session-GC job installs in table mode only (absent in epoch); cadence
     // @compileError, which can't be unit-tested): default-unset epoch + table-with-override.
     try std.testing.expectEqualStrings("0 * * * *", App(.{}).session_gc_cron);
     try std.testing.expectEqualStrings("*/30 * * * *", App(.{ .session_store = .table, .session_gc_cron = "*/30 * * * *" }).session_gc_cron);
+}
+
+test "#129 experiment-GC job installs only when a .sticky experiment is declared" {
+    // No experiments / pure-hash experiments: no `_experiment_gc` job — zero-overhead.
+    for (App(.{}).jobs) |j| try std.testing.expect(!std.mem.eql(u8, j.name, "_experiment_gc"));
+    const PureHash = App(.{ .experiments = .{
+        .layout = .{ .variants = .{ "a", "b" }, .weights = .{ 50, 50 } },
+    } });
+    try std.testing.expect(!PureHash.has_sticky_experiment);
+    for (PureHash.jobs) |j| try std.testing.expect(!std.mem.eql(u8, j.name, "_experiment_gc"));
+
+    // A `.sticky` experiment installs exactly one `_experiment_gc` job at the hourly cron.
+    const Sticky = App(.{ .experiments = .{
+        .layout = .{ .variants = .{ "a", "b" }, .weights = .{ 50, 50 }, .sticky = true },
+    } });
+    try std.testing.expect(Sticky.has_sticky_experiment);
+    {
+        var found = false;
+        for (Sticky.jobs) |j| if (std.mem.eql(u8, j.name, "_experiment_gc")) {
+            found = true;
+            try std.testing.expect(j.schedule == .cron);
+            try std.testing.expectEqualStrings("0 * * * *", j.schedule.cron);
+        };
+        try std.testing.expect(found);
+    }
+
+    // TTL default is 90 days; the override is honored (the misuse case — TTL without a
+    // sticky experiment — is a @compileError, which can't be unit-tested).
+    try std.testing.expectEqual(@as(u32, 90), App(.{}).experiment_assignment_ttl);
+    try std.testing.expectEqual(@as(u32, 90), Sticky.experiment_assignment_ttl);
+    const Custom = App(.{ .experiments = .{
+        .layout = .{ .variants = .{ "a", "b" }, .weights = .{ 50, 50 }, .sticky = true },
+    }, .experiment_assignment_ttl = 30 });
+    try std.testing.expectEqual(@as(u32, 30), Custom.experiment_assignment_ttl);
 }
 
 test "App(cfg) resolves the comptime pagination config (defaults + overrides)" {

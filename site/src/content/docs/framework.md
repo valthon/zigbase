@@ -104,6 +104,9 @@ pub fn main(init: std.process.Init) !void {
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
 | `session_store` | Session-management model: `.epoch` (default, stateless token-epoch revocation, zero extra DB work) or `.table` (server-side `_sessions` store for per-device list/revoke, one extra read per request). See [Revoking sessions](#revoking-sessions-99). |
 | `session_gc_cron` | Cadence (UTC cron) for the table-mode expired-`_sessions` GC sweep. Default `"0 * * * *"` (hourly). Only valid with `.session_store = .table` — setting it otherwise is a `@compileError`. |
+| `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). |
+| `experiments` | Declared A/B/n experiments (variants + weights, optional `.sticky`). See [Feature flags + experiments](#feature-flags--experiments-declared). |
+| `experiment_assignment_ttl` | TTL in **days** for sticky `_experiment_assignments` rows (default `90`). Only valid when a `.sticky` experiment is declared — setting it otherwise is a `@compileError`. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
 
 ## 3b. The `typegen` gate (`.enable_typegen`) {#the-apptypegen-gate-enable_typegen}
@@ -656,6 +659,40 @@ buckets `subject` deterministically over the weights (`FNV1a-64(name ++ 0x00 ++ 
 same `(name, subject)` always lands on the same variant; an empty subject maps to the first
 variant. A weight override in `_kv` under `exp:<name>:weights` (JSON, e.g. `[90,10]`) changes
 the split without a redeploy.
+
+**Sticky assignments (`.sticky = true`).** By default an experiment is a *pure* function of
+`(name, subject, weights)` — change the weights and a subject can re-bucket to a different
+variant. Declare `.sticky = true` to **persist a subject's first assignment** so it survives
+later weight changes (#129):
+
+```zig
+.experiments = .{
+    .checkout_layout = .{ .variants = .{ "control", "compact" }, .weights = .{ 50, 50 }, .sticky = true },
+},
+```
+
+The first `App.experiment(ctx, .checkout_layout, subject)` for a non-empty `subject` buckets
+it and writes the result to the internal `_experiment_assignments` table (keyed by
+`(experiment, subject)`); every later resolve returns the stored variant, even after you
+edit `exp:<name>:weights`. New subjects still follow the current weights. An empty subject is
+never persisted (it always maps to the first variant). The sticky read/write needs the
+writer, so sticky resolution costs one extra write only on the **first** sighting of a
+subject; pure-hash experiments touch no table at all.
+
+Stale assignments are reaped by a framework-internal `_experiment_gc` job that is installed
+**only when at least one declared experiment is `.sticky`** (zero overhead otherwise) and runs
+hourly, deleting rows older than `.experiment_assignment_ttl` (in **days**, default `90`) in
+bounded batches on the writer:
+
+```zig
+zigbase.App(.{
+    .experiments = .{ .checkout_layout = .{ .variants = .{ "control", "compact" }, .weights = .{ 50, 50 }, .sticky = true } },
+    .experiment_assignment_ttl = 30, // reap sticky assignments older than 30 days
+});
+```
+
+Setting `.experiment_assignment_ttl` without any `.sticky` experiment is a `@compileError`
+(it would be a silent no-op).
 
 **Dynamic names + batch resolution** on `ctx` (the runtime escape hatches):
 
