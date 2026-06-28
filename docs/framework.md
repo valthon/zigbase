@@ -749,6 +749,46 @@ fn publicFlag(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 `try ctx.flag("x")` with `App.flag(ctx, .x)` (compile-checked) or `ctx.flagByName("x")`
 (dynamic), and `try ctx.setFlag("x", v)` with `try App.setFlag(ctx, .x, v)`.
 
+#### Exposure events (`.onFeatureExposure`)
+
+Register `.onFeatureExposure` to feed an analytics/exposure pipeline: it fires every time a
+declared flag or experiment is **resolved** (the `App.flag`/`ctx.flagByName` and
+`App.experiment` read paths).
+
+```zig
+fn onExposure(ev: *zigbase.ExposureEvent) void {
+    switch (ev.kind) {                       // .flag | .experiment
+        .flag => log.info("flag {s} = {}", .{ ev.name, ev.value }),
+        .experiment => log.info("exp {s} [{s}] -> {s}", .{ ev.name, ev.subject, ev.variant }),
+    }
+}
+// .onFeatureExposure = onExposure,
+```
+
+`ExposureEvent` is `{ app, kind: enum { flag, experiment }, name, subject, value (flag),
+variant (experiment) }`. For a `.flag` exposure `value` is the resolved boolean and `subject`
+is empty (flags are global); for an `.experiment` `variant` is the resolved variant and
+`subject` is the bucketing subject. The handler is **notify-only** — it cannot abort or write.
+It is **zero-cost when unregistered**: the resolver short-circuits before constructing the
+event, so an app without `.onFeatureExposure` pays nothing on the read path.
+
+#### Realtime signal (`__features`)
+
+Any override change — `ctx.setFlag`/`App.setFlag`, or an admin `PUT`/`DELETE` of a
+`flag:<name>` / `exp:<name>:weights` setting — broadcasts a single frame
+`{"type":"features.changed"}` on the fixed **public** realtime channel `__features` (over the
+existing WebSocket). It is **signal-only**: no per-subject state or experiment assignment is
+ever pushed. Clients subscribe anonymously to `__features` and re-`GET /api/state` (or call
+`ctx.flags().resolveAll`) on receipt to pull fresh resolved values:
+
+```js
+const ws = new WebSocket(`ws://${location.host}/api/realtime`);
+ws.onopen = () => ws.send(JSON.stringify({ action: "subscribe", topic: "__features" }));
+ws.onmessage = (e) => {
+  if (JSON.parse(e.data).type === "features.changed") refetchState();
+};
+```
+
 ### Superuser settings HTTP API
 
 For administrative management there is a built-in **superuser-only** HTTP surface over
@@ -780,6 +820,7 @@ One handler each, registered by the matching config key:
 | `onBootstrap` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | After bootstrap. |
 | `onBeforeServe` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | Just before serving starts. |
 | `onBeforeTerminate` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | Just before shutdown. |
+| `onFeatureExposure` | `fn (ev: *zigbase.ExposureEvent) void` | Notify-only, each time a declared flag/experiment is resolved. Zero-cost when unset. See [Exposure events](#exposure-events-onfeatureexposure). |
 
 `AuthEvent` carries `app`, `ctx`, `collection`, `record: ?std.json.Value`, and
 `method` (`.password` | `.oauth2` | `.magic_link` | `.otp` | `.webauthn` | `.custom`). `FileEvent` carries `app`, `ctx`,

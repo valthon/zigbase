@@ -17,6 +17,7 @@ const api_auth = @import("api/auth.zig");
 const session = @import("session.zig");
 const features = @import("features.zig");
 const features_resolver = @import("features_resolver.zig");
+const realtime_ws = @import("realtime/ws.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -144,7 +145,10 @@ pub const Ctx = struct {
         const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena };
         const key = std.fmt.allocPrint(self.arena, "flag:{s}", .{def.name}) catch return def.default;
         const ov = data.kvGet(key) catch return def.default;
-        return features_resolver.resolveFlag(ov, def);
+        const value = features_resolver.resolveFlag(ov, def);
+        // Notify-only exposure seam (zero-cost when no .onFeatureExposure handler).
+        events.dispatchFlagExposure(self.app, self.app.dispatch, def.name, value);
+        return value;
     }
 
     /// Resolve a DECLARED experiment to a variant for `subject`: applies the
@@ -166,7 +170,11 @@ pub const Ctx = struct {
         defer if (need_writer) self.app.pool.releaseWriter();
         const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena };
         const ov = try data.kvGet(key);
-        return features_resolver.resolveExperiment(self.arena, if (sticky) conn else null, ov, def, subject);
+        const variant = try features_resolver.resolveExperiment(self.arena, if (sticky) conn else null, ov, def, subject);
+        // Notify-only exposure seam, fired on the RESOLVED variant (after the sticky
+        // lookup). Zero-cost when no .onFeatureExposure handler is registered.
+        events.dispatchExperimentExposure(self.app, self.app.dispatch, def.name, subject, variant);
+        return variant;
     }
 
     /// Write a `flag:<name>` override (`"true"`/`"false"`) into `_kv`. Used by the
@@ -174,6 +182,9 @@ pub const Ctx = struct {
     pub fn writeFlagOverride(self: *Ctx, name: []const u8, enabled: bool) !void {
         const key = try std.fmt.allocPrint(self.arena, "flag:{s}", .{name});
         try self.kv().set(key, if (enabled) "true" else "false");
+        // Signal-only realtime push: tell subscribers to re-GET /api/state. No-op when
+        // the reactor isn't running (tests/CLI).
+        realtime_ws.broadcastFeaturesChanged();
     }
 
     /// Runtime escape hatch: resolve a flag by string name. Returns `null` when the
@@ -953,6 +964,85 @@ test "ctx.flags().resolveAll returns all declared flags + experiments via the ba
     try std.testing.expect(std.mem.eql(u8, v, "control") or std.mem.eql(u8, v, "compact"));
     const again = try ctx.flags().resolveAll("user-7");
     try std.testing.expectEqualStrings(v, again.experiments[0].variant);
+}
+
+test "feature exposure hook fires on flag read + experiment resolve; zero-cost when unset" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    env.app.features = &flag_test_registry;
+
+    const H = struct {
+        var flag_calls: usize = 0;
+        var exp_calls: usize = 0;
+        var last_flag_name: []const u8 = "";
+        var last_flag_value: bool = false;
+        var last_exp_name: []const u8 = "";
+        var last_exp_subject: []const u8 = "";
+        var last_exp_variant: []const u8 = "";
+        fn onExposure(ev: *events.ExposureEvent) void {
+            switch (ev.kind) {
+                .flag => {
+                    flag_calls += 1;
+                    last_flag_name = ev.name;
+                    last_flag_value = ev.value;
+                },
+                .experiment => {
+                    exp_calls += 1;
+                    last_exp_name = ev.name;
+                    last_exp_subject = ev.subject;
+                    last_exp_variant = ev.variant;
+                },
+            }
+        }
+    };
+    H.flag_calls = 0;
+    H.exp_calls = 0;
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    // Zero-cost path: no dispatch wired -> resolving must NOT invoke any handler.
+    try std.testing.expect(env.app.dispatch == null);
+    _ = ctx.flagByName("default_on").?;
+    _ = try ctx.resolveDeclaredExperiment(flag_test_registry.experiments[0], "user-7");
+    try std.testing.expectEqual(@as(usize, 0), H.flag_calls);
+    try std.testing.expectEqual(@as(usize, 0), H.exp_calls);
+
+    // Wire a handler -> resolving fires exposure with the right kind/name/subject/value|variant.
+    var dispatch = events.Dispatch{ .on_feature_exposure = H.onExposure };
+    env.app.dispatch = &dispatch;
+
+    const on = ctx.flagByName("default_on").?;
+    try std.testing.expectEqual(@as(usize, 1), H.flag_calls);
+    try std.testing.expectEqualStrings("default_on", H.last_flag_name);
+    try std.testing.expectEqual(on, H.last_flag_value);
+    try std.testing.expect(H.last_flag_value);
+
+    const variant = try ctx.resolveDeclaredExperiment(flag_test_registry.experiments[0], "user-7");
+    try std.testing.expectEqual(@as(usize, 1), H.exp_calls);
+    try std.testing.expectEqualStrings("layout", H.last_exp_name);
+    try std.testing.expectEqualStrings("user-7", H.last_exp_subject);
+    try std.testing.expectEqualStrings(variant, H.last_exp_variant);
+
+    // A STICKY experiment (persists its assignment) still fires exposure on the
+    // RESOLVED variant — including on the second resolve, which reads the stored
+    // assignment rather than re-bucketing.
+    const sticky_def = features.ExperimentDef{
+        .name = "sticky_layout",
+        .variants = &.{ "control", "compact" },
+        .weights = &.{ 50, 50 },
+        .sticky = true,
+    };
+    const sv1 = try ctx.resolveDeclaredExperiment(sticky_def, "user-9");
+    try std.testing.expectEqual(@as(usize, 2), H.exp_calls);
+    try std.testing.expectEqualStrings("sticky_layout", H.last_exp_name);
+    try std.testing.expectEqualStrings("user-9", H.last_exp_subject);
+    try std.testing.expectEqualStrings(sv1, H.last_exp_variant);
+    // Second resolve hits the stored assignment; exposure still fires with the same variant.
+    const sv2 = try ctx.resolveDeclaredExperiment(sticky_def, "user-9");
+    try std.testing.expectEqual(@as(usize, 3), H.exp_calls);
+    try std.testing.expectEqualStrings(sv1, sv2);
+    try std.testing.expectEqualStrings(sv1, H.last_exp_variant);
 }
 
 fn txnSetFlag(t: *Tx) anyerror!void {

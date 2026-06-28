@@ -130,6 +130,31 @@ pub const ErrorEvent = struct {
 pub const RecordHandler = *const fn (ctx: *Ctx, ev: *RecordEvent) anyerror!void;
 pub const ErrorHandler = *const fn (ev: *ErrorEvent) void;
 
+/// Which kind of feature was resolved for the `ExposureEvent`.
+pub const ExposureKind = enum { flag, experiment };
+
+/// Notify-only analytics seam (#128/#129/#130): fired each time a DECLARED flag or
+/// experiment is RESOLVED for a subject (the `App.flag`/`flagByName` and
+/// `App.experiment` read paths). It cannot abort or write — it exists to feed an
+/// analytics/exposure pipeline. For a `.flag`, `value` is the resolved boolean and
+/// `subject` is empty (flags are global). For an `.experiment`, `variant` is the
+/// resolved variant and `subject` is the bucketing subject.
+///
+/// It is ZERO-COST when no `.onFeatureExposure` handler is registered: the resolver
+/// gates on `dispatch.on_feature_exposure` and never even constructs the event
+/// (mirrors the `dispatchError` null-gating).
+pub const ExposureEvent = struct {
+    app: *App,
+    kind: ExposureKind,
+    name: []const u8,
+    subject: []const u8 = "",
+    /// Resolved value for a `.flag` exposure (unused for experiments).
+    value: bool = false,
+    /// Resolved variant for an `.experiment` exposure (unused for flags).
+    variant: []const u8 = "",
+};
+pub const ExposureHandler = *const fn (ev: *ExposureEvent) void;
+
 pub const AuthLevel = enum { public, authed, superuser };
 
 pub const RouteEvent = struct {
@@ -613,6 +638,8 @@ pub const Dispatch = struct {
     on_bootstrap: ?LifecycleHandler = null,
     on_before_serve: ?LifecycleHandler = null,
     on_before_terminate: ?LifecycleHandler = null,
+    /// Generated from `cfg.onFeatureExposure`; null = no subscribers (zero-cost).
+    on_feature_exposure: ?ExposureHandler = null,
 };
 
 /// Map a comptime RecordPhase to its hook-config field name.
@@ -890,6 +917,26 @@ pub fn dispatchError(app: *App, dispatch: ?*const Dispatch, ev: *ErrorEvent) voi
     sentry.backstop(app, ev.message);
 }
 
+/// Fire the feature-exposure hook for a resolved FLAG, but ONLY when a handler is
+/// registered — the `orelse return` short-circuits before the `ExposureEvent` is
+/// even constructed, so an app without `.onFeatureExposure` pays nothing on the read
+/// path (mirrors `dispatchError`'s null-gating).
+pub fn dispatchFlagExposure(app: *App, dispatch: ?*const Dispatch, name: []const u8, value: bool) void {
+    const d = dispatch orelse return;
+    const h = d.on_feature_exposure orelse return;
+    var ev = ExposureEvent{ .app = app, .kind = .flag, .name = name, .subject = "", .value = value };
+    h(&ev);
+}
+
+/// Fire the feature-exposure hook for a resolved EXPERIMENT, zero-cost when unset
+/// (see `dispatchFlagExposure`).
+pub fn dispatchExperimentExposure(app: *App, dispatch: ?*const Dispatch, name: []const u8, subject: []const u8, variant: []const u8) void {
+    const d = dispatch orelse return;
+    const h = d.on_feature_exposure orelse return;
+    var ev = ExposureEvent{ .app = app, .kind = .experiment, .name = name, .subject = subject, .variant = variant };
+    h(&ev);
+}
+
 test "dispatchError runs consumer handler before the backstop" {
     const H = struct {
         // Records the order in which the consumer handler and the backstop ran.
@@ -920,6 +967,42 @@ test "dispatchError runs consumer handler before the backstop" {
     try std.testing.expectEqual(@as(usize, 2), H.seq.items.len);
     try std.testing.expectEqualStrings("handler", H.seq.items[0]);
     try std.testing.expectEqualStrings("backstop", H.seq.items[1]);
+}
+
+test "dispatch*Exposure fires the handler with the right fields and is zero-cost when unset" {
+    const H = struct {
+        var calls: usize = 0;
+        var last: ExposureEvent = undefined;
+        fn onExposure(ev: *ExposureEvent) void {
+            calls += 1;
+            last = ev.*;
+        }
+    };
+    H.calls = 0;
+    var app: App = undefined;
+
+    // No handler registered (or no dispatch at all) -> never invoked (zero-cost path).
+    dispatchFlagExposure(&app, null, "beta", true);
+    var empty = Dispatch{};
+    dispatchFlagExposure(&app, &empty, "beta", true);
+    dispatchExperimentExposure(&app, &empty, "layout", "user-1", "compact");
+    try std.testing.expectEqual(@as(usize, 0), H.calls);
+
+    // Handler registered -> fired with the resolved kind/name/subject/value|variant.
+    var d = Dispatch{ .on_feature_exposure = H.onExposure };
+    dispatchFlagExposure(&app, &d, "beta", true);
+    try std.testing.expectEqual(@as(usize, 1), H.calls);
+    try std.testing.expectEqual(ExposureKind.flag, H.last.kind);
+    try std.testing.expectEqualStrings("beta", H.last.name);
+    try std.testing.expectEqualStrings("", H.last.subject);
+    try std.testing.expect(H.last.value);
+
+    dispatchExperimentExposure(&app, &d, "layout", "user-1", "compact");
+    try std.testing.expectEqual(@as(usize, 2), H.calls);
+    try std.testing.expectEqual(ExposureKind.experiment, H.last.kind);
+    try std.testing.expectEqualStrings("layout", H.last.name);
+    try std.testing.expectEqualStrings("user-1", H.last.subject);
+    try std.testing.expectEqualStrings("compact", H.last.variant);
 }
 
 test "only the matching phase's handler runs" {

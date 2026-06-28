@@ -8,6 +8,16 @@ const db = @import("../db.zig");
 const migrations = @import("../migrations.zig");
 const crypto = @import("../crypto.zig");
 const jwt = @import("../jwt.zig");
+const realtime_ws = @import("../realtime/ws.zig");
+
+/// True for the feature-management override keys (`flag:<name>` and `exp:<name>:weights`),
+/// the only `_kv` writes that must fan out the realtime `features.changed` signal. Distinct
+/// prefixes mean an arbitrary setting never triggers a broadcast.
+fn isFeatureOverrideKey(key: []const u8) bool {
+    if (std.mem.startsWith(u8, key, "flag:")) return true;
+    if (std.mem.startsWith(u8, key, "exp:") and std.mem.endsWith(u8, key, ":weights")) return true;
+    return false;
+}
 
 // Superuser-only HTTP surface over the built-in key→value/settings store (#87/#88).
 // KV/settings are server-managed and never public by default; every handler here
@@ -87,6 +97,8 @@ pub fn put(ctx: *http.RequestCtx) anyerror!http.Response {
     const d = dataOnWriter(ctx);
     defer app.pool.releaseWriter();
     try d.kvSet(key, parsed.value.value);
+    // Signal-only realtime push on a feature-override change (no-op if the key isn't one).
+    if (isFeatureOverrideKey(key)) realtime_ws.broadcastFeaturesChanged();
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, try entryJsonKeyValue(ctx.allocator, key, parsed.value.value), .{});
     return .{ .status = 200, .body = body };
 }
@@ -99,6 +111,8 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     const d = dataOnWriter(ctx);
     defer app.pool.releaseWriter();
     if (!(try d.kvDelete(key))) return ApiError.notFound().toResponse(ctx.allocator);
+    // Clearing a feature override reverts to the declared default; signal subscribers.
+    if (isFeatureOverrideKey(key)) realtime_ws.broadcastFeaturesChanged();
     return .{ .status = 204, .body = "" };
 }
 
@@ -143,6 +157,15 @@ const TestEnv = struct {
 
 fn ctxFor(env: *TestEnv, arena: std.mem.Allocator, method: http.Method, path: []const u8, body: []const u8, params: []const http.Param) http.RequestCtx {
     return .{ .method = method, .path = path, .body = body, .allocator = arena, .app = &env.app, .params = params };
+}
+
+test "isFeatureOverrideKey matches flag:/exp:*:weights only" {
+    try std.testing.expect(isFeatureOverrideKey("flag:checkout_enabled"));
+    try std.testing.expect(isFeatureOverrideKey("exp:layout:weights"));
+    // Not a feature key: arbitrary settings never trigger a broadcast.
+    try std.testing.expect(!isFeatureOverrideKey("beta"));
+    try std.testing.expect(!isFeatureOverrideKey("exp:layout")); // no :weights suffix
+    try std.testing.expect(!isFeatureOverrideKey("smtp_host"));
 }
 
 test "settings API requires a superuser" {
