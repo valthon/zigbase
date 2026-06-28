@@ -13,7 +13,7 @@ All notable changes to ZigBase are documented here. The format is based on
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-06-27
+## [0.8.0] - 2026-06-28
 
 ### Breaking
 
