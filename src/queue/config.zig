@@ -65,7 +65,13 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
                     @compileError("queue '" ++ f.name ++ "': .visibility_timeout_s must be >= 1 (set it above the queue's longest job runtime)");
                 def.visibility_timeout_s = spec.visibility_timeout_s;
             }
-            if (@hasField(ST, "done_ttl_s")) def.done_ttl_s = spec.done_ttl_s;
+            if (@hasField(ST, "done_ttl_s")) {
+                // A non-positive TTL makes gcDoneJobs's `datetime('now','-{d} seconds')`
+                // modifier malformed → SQLite yields NULL and GC silently reaps nothing.
+                if (spec.done_ttl_s <= 0)
+                    @compileError("queue '" ++ f.name ++ "': .done_ttl_s must be >= 1 (seconds to retain done/failed jobs; omit for the 7-day default)");
+                def.done_ttl_s = spec.done_ttl_s;
+            }
             list = list ++ &[_]QueueDef{def};
         }
         if (!has_default)

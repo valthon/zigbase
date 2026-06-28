@@ -723,8 +723,10 @@ fn queueGcJob(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
     defer ctx.app.pool.releaseWriter();
     for (reg.queues) |q| {
         if (q.backend != .durable) continue;
-        _ = queue_durable.reclaimStale(w, q.name, now, q.visibility_timeout_s) catch {};
-        _ = queue_durable.gcDoneJobs(w, q.name, q.done_ttl_s) catch {};
+        _ = queue_durable.reclaimStale(w, q.name, now, q.visibility_timeout_s) catch |e|
+            std.log.warn("_queue_gc: reclaim for '{s}' failed: {s}", .{ q.name, @errorName(e) });
+        _ = queue_durable.gcDoneJobs(w, q.name, q.done_ttl_s) catch |e|
+            std.log.warn("_queue_gc: GC for '{s}' failed: {s}", .{ q.name, @errorName(e) });
     }
 }
 
