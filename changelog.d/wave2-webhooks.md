@@ -1,6 +1,7 @@
 ### Features
 
 - `ctx.webhook(url, payload, .{…})` delivers outbound webhooks in the background on the built-in `"webhook"` job kind (riding the multi-queue engine). Transport errors, `5xx`, and `429` (honoring an integer `Retry-After`) are retried with backoff up to `retries` attempts; any other `4xx` is terminal. A terminal rejection or exhausted attempts fires `onError` with the new `.webhook` error phase. Options: `queue`, `retries`, `backoff`, `timeout_s`, `sign`, `idempotency`.
+- `ErrorPhase` gained a `.webhook` variant. This is additive, but consumers whose `onError` handler `switch`es exhaustively over `ErrorPhase` must add a `.webhook` arm to keep compiling.
 
 ### Security
 

@@ -619,6 +619,13 @@ body>"` and compares. Header names are overridable on the `Hmac` struct.
 **once** at enqueue time and frozen onto the (durable) job row, so every retry — and any
 at-least-once replay after a crash — reuses the same key, letting the receiver dedupe.
 
+> Worker-stall caveat: retries back off by **sleeping in the worker thread** for the full
+> retry duration. Under the default single-worker topology a slow or failing endpoint
+> therefore stalls draining of **every** queue (including `"mail"`). For production, give
+> webhooks a **dedicated queue + worker** so their backoff never blocks other jobs —
+> `.queues = .{ .webhooks = .{ .backend = .durable } }` plus a worker bound to it
+> (`.workers = .{ .hooks = .{ .queues = .{"webhooks"} } }`), then pass `.queue = "webhooks"`.
+
 > Security note: a **durable**, **signed** webhook persists the signing secret inside the
 > `_queue_jobs.payload` column (your own DB). Prefer a `memory` queue, a short
 > `done_ttl_s`, or DB-at-rest encryption if that is a concern. TLS verification is always
