@@ -139,12 +139,12 @@ fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     // Validate the id before it touches any query (defense-in-depth + consistency).
     if (!isSafeId(id)) return req.fail(400, "Invalid booking id.");
 
-    // Feature-flag kill switch (#88): an operator can freeze all confirmations
-    // instantly by setting the `bookings_frozen` flag (e.g.
-    // `PUT /api/settings/bookings_frozen {"value":"true"}` as a superuser) — no
-    // redeploy, no schema. `ctx.flag` is a typed bool view over the built-in KV
-    // store; an unset flag is false, so the default behavior is unchanged.
-    if (req.ctx.flag("bookings_frozen") catch false)
+    // Feature-flag kill switch (#88/#128): an operator can freeze all confirmations
+    // instantly by setting the DECLARED `bookings_frozen` flag (no redeploy, no schema).
+    // `App.flag(ctx, .name)` is the typed accessor — a typo'd flag name is a compile
+    // error — and falls back to the declared default (false) when unset, so the default
+    // behavior is unchanged.
+    if (App.flag(req.ctx, .bookings_frozen))
         return req.fail(503, "Bookings are temporarily frozen.");
 
     // The caller's auth id (empty string when unauthenticated — the .authed
@@ -520,15 +520,15 @@ fn calendarFeed(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 // ---------------------------------------------------------------------------
 // 6c. Public feature-flag read: GET /api/golfsim/flags/:name
 //
-//    KV/feature flags are superuser-managed and NOT public by default, so a
-//    consumer opts a specific flag into a public read with a one-line custom
-//    route. This returns `{"name":"…","enabled":true|false}` using the typed
-//    `ctx.flag` view over the built-in KV store (#87/#88). Manage the value with
-//    the superuser settings API, e.g. `PUT /api/settings/promo_banner`.
+//    Declared feature flags are superuser-managed and NOT public by default, so a
+//    consumer opts them into a public read with a one-line custom route. This returns
+//    `{"name":"…","enabled":true|false}` for a DECLARED flag via the runtime escape
+//    hatch `ctx.flagByName` (#88/#128), which returns null for an undeclared name (→
+//    404 here). Manage the value with the superuser settings API or `App.setFlag`.
 // ---------------------------------------------------------------------------
 fn flagStatus(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const name = ctx.request.?.param("name") orelse return ctx.errorResponse(ctx.fail(400, "Missing flag name."));
-    const enabled = try ctx.flag(name);
+    const enabled = ctx.flagByName(name) orelse return ctx.errorResponse(ctx.fail(404, "Unknown feature flag."));
     var o: std.json.ObjectMap = .empty;
     try o.put(ctx.arena, "name", .{ .string = name });
     try o.put(ctx.arena, "enabled", .{ .bool = enabled });
@@ -820,6 +820,14 @@ pub const App = zigbase.App(.{
         .session_store = .table,
         // Seed mutable config (the booking webhook URL) from the environment into KV at boot.
         .onBootstrap = seedConfig,
+        // Declared feature flags (#88/#128): only DECLARED flags resolve. `bookings_frozen`
+        // is the operator kill switch (default off) for booking confirmation; `promo_banner`
+        // is a public-facing toggle read via `GET /api/golfsim/flags/:name`. Flip either with
+        // the typed `App.setFlag` or the superuser settings API (`PUT /api/settings/flag:<name>`).
+        .flags = .{
+            .bookings_frozen = false,
+            .promo_banner = false,
+        },
         .routes = .{
             .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
             .{ .method = .POST, .path = "/api/bookings/:id/cancel", .handler = cancelBooking, .auth = .authed },

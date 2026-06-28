@@ -2,6 +2,7 @@ const std = @import("std");
 const db = @import("db.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
+const features = @import("features.zig");
 
 /// Session-management model (#99). `epoch` (default) is the stateless token-epoch
 /// revocation scheme: cheap, no per-request DB read beyond the existing auth fetch.
@@ -51,6 +52,11 @@ pub const App = struct {
     pagination: pagination.Runtime = .{},
     /// Type-erased event dispatch built by the comptime App(cfg) builder; null = no subscribers.
     dispatch: ?*const @import("events.zig").Dispatch = null,
+    /// Declared feature-flag + experiment registry (lowered at comptime from the
+    /// `App(.{ .flags, .experiments })` config and pointed here by serveImpl; #128/#129/#130).
+    /// Drives `ctx.flagByName` / `ctx.flags().resolveAll` and the typed `App.flag`/`App.experiment`
+    /// accessors. null = no registry wired (tests/CLI constructing App directly).
+    features: ?*const features.Registry = null,
     /// In-memory rate limiter for sensitive auth endpoints; null = disabled
     /// (rate_limit_max == 0, or tests/CLI that don't wire it). Set in serveImpl.
     rate_limiter: ?*ratelimit.RateLimiter = null,

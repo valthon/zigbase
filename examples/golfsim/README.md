@@ -87,7 +87,7 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
 | Method | Path | Auth | What it does |
 |--------|------|------|--------------|
-| `POST` | `/api/bookings/:id/confirm` | authed | Host confirms a booking. Multi-hop owner check: booking → listing → simulator → owner. 403 if caller doesn't own the simulator. Gated by the `bookings_frozen` feature flag (`ctx.flag`) — returns 503 when set. On success offloads a best-effort booking-confirmation webhook (`ctx.http()`) to the background worker pool via `ctx.app.submit` so the response isn't blocked. |
+| `POST` | `/api/bookings/:id/confirm` | authed | Host confirms a booking. Multi-hop owner check: booking → listing → simulator → owner. 403 if caller doesn't own the simulator. Gated by the declared `bookings_frozen` feature flag (`App.flag(ctx, .bookings_frozen)`) — returns 503 when set. On success offloads a best-effort booking-confirmation webhook (`ctx.http()`) to the background worker pool via `ctx.app.submit` so the response isn't blocked. |
 | `POST` | `/api/bookings/:id/cancel` | authed | Guest cancels their own booking. 403 if caller is not the booking's guest. Reads/writes via `req.ctx.records()`. |
 | `GET` | `/api/listings/:id/availability` | authed | Returns all non-cancelled bookings for a listing for availability calendar rendering. Reads via `req.ctx.records()`. |
 | `POST` | `/api/holds/:id/convert` | authed | Promotes the caller's `hold` into a pending `booking` for a chosen window. Runs the booking-create + hold-delete **atomically in one `ctx.tx()`**. 403 if caller is not the hold's guest. |
@@ -95,15 +95,17 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 | `GET` | `/api/golfsim/sessions` | authed | "Active devices": `ctx.auth().listActiveSessions()` → `{"items":[…]}`, each session flagged `is_current`. Requires `.session_store = .table`. |
 | `POST` | `/api/golfsim/sessions/:id/revoke` | authed | "Log out this device": `ctx.auth().revoke(id)`. Owner-authorized — a non-owner or absent id is `404`. |
 | `GET` | `/api/golfsim/health` | public | Smoke endpoint. |
-| `GET` | `/api/golfsim/flags/:name` | public | Public read of one feature flag via `ctx.flag` → `{"name","enabled"}`. Manage values with the superuser settings API (`PUT /api/settings/:key`). |
+| `GET` | `/api/golfsim/flags/:name` | public | Public read of one declared feature flag via `ctx.flagByName` → `{"name","enabled"}` (404 for an undeclared name). Manage values with the superuser settings API or `App.setFlag`. |
 | `POST` | `/api/golfsim/logout` | public | Clears the `zb_auth`/`zb_csrf` session cookies via `ctx.auth().clearSession()`. Works even with a stale or expired cookie. |
 | `GET` | `/api/golfsim/calendar.ics` | public | Returns a static iCal feed (`text/calendar`). Untyped handler (raw `http.Response`) — not in the generated `zb.rpc.*` client; subscribe to this URL directly from a calendar app. |
 
-Feature flags use the built-in KV/settings store (`ctx.kv`/`ctx.flag`, backed by the
-internal `_kv` table). Flags are superuser-managed and not public by default — the
-`flags/:name` route above opts a value into a public read. The kill switch
-`bookings_frozen` lets an operator freeze confirmations instantly with a single
-`PUT /api/settings/bookings_frozen {"value":"true"}` — no redeploy.
+Feature flags are **declared** in the `App(.{ .flags = … })` literal (0.8.0) and resolve
+through the typed `App.flag(ctx, .name)` accessor (a typo'd name is a compile error) over the
+built-in KV store (`flag:<name>` overrides, backed by the internal `_kv` table). Flags are
+superuser-managed and not public by default — the `flags/:name` route above opts declared
+flags into a public read via `ctx.flagByName`. The kill switch `bookings_frozen` lets an
+operator freeze confirmations instantly with a single
+`PUT /api/settings/flag:bookings_frozen {"value":"true"}` — no redeploy.
 
 The `confirmBooking` route shows the multi-hop imperative owner check (the access
 rule engine does this via traversal for CRUD endpoints; custom routes do it via

@@ -611,33 +611,76 @@ The same primitive is on the curated `Data` facade as `data.kvGet` / `data.kvSet
 > access-rule system. To expose a value publicly, write a custom route that returns exactly
 > what you intend (see feature flags below).
 
-### `ctx.flag()` / `ctx.setFlag()` — typed feature flags
+### Feature flags + experiments (declared)
 
-A binary on/off toggle is the most common shape of a setting, so it gets a typed view over
-the **same** KV store — no second table:
+> **Breaking in 0.8.0.** Flags are now **declared-only**: you list them in the `App(cfg)`
+> literal and access them through a typed accessor whose `.name` is checked at compile time.
+> The old runtime-string `ctx.flag("arbitrary")` (KV-or-false) API is **removed** — see the
+> migration note at the end of this section.
+
+Declare flags and experiments alongside the rest of your config:
 
 ```zig
-if (try ctx.flag("new_checkout")) {
-    // ... new path
-}
-try ctx.setFlag("new_checkout", true);  // stores "true"/"false"
+pub const App = zigbase.App(.{
+    .flags = .{
+        .checkout_enabled = true,                                       // bare bool = default
+        .new_dashboard    = .{ .default = false, .description = "Dark mode shell" },
+    },
+    .experiments = .{
+        .checkout_layout = .{ .variants = .{ "control", "compact" }, .weights = .{ 50, 50 } },
+    },
+});
 ```
 
-`flag(name)` returns `false` for an unset flag; `"true"` and `"1"` are truthy, anything
-else is `false`. `setFlag(name, enabled)` stores `"true"`/`"false"`.
+A flag is either a bare `bool` (its default) or `.{ .default = <bool>, .description = "…" }`.
+An experiment is `.{ .variants = .{…}, .weights = .{…} }` (parallel tuples; weights need not
+sum to 100) with optional `.sticky` and `.description`. Malformed declarations
+(unknown sub-key, length mismatch, empty/duplicate variants, all-zero weights) are
+**compile errors**.
+
+**Typed accessors** live on the `App` type — a typo'd `.name` is a compile error, not a
+silent miss:
+
+```zig
+if (App.flag(ctx, .checkout_enabled)) {        // bool; unset → declared default
+    // ... new path
+}
+try App.setFlag(ctx, .checkout_enabled, false); // operator kill switch: writes the override
+const variant = try App.experiment(ctx, .checkout_layout, user_id); // []const u8 ("control"/"compact")
+```
+
+`App.flag` returns the `flag:<name>` override from the KV store if one is set, otherwise the
+declared default (so a default-ON kill switch stays on until an override sets `"false"`); it
+swallows read errors back to the default so a check never fails the request. `App.experiment`
+buckets `subject` deterministically over the weights (`FNV1a-64(name ++ subject)`), so the
+same `(name, subject)` always lands on the same variant; an empty subject maps to the first
+variant. A weight override in `_kv` under `exp:<name>:weights` (JSON, e.g. `[90,10]`) changes
+the split without a redeploy.
+
+**Dynamic names + batch resolution** on `ctx` (the runtime escape hatches):
+
+```zig
+const on = ctx.flagByName("checkout_enabled"); // ?bool — null when the name is undeclared
+const all = try ctx.flags().resolveAll(user_id); // every declared flag + experiment, one _kv scan
+// all.flags: []{ name, value: bool }   all.experiments: []{ name, variant: []const u8 }
+```
 
 Because flags are server-side by default, exposing one publicly is an explicit choice — a
-one-line custom route:
+one-line custom route over `ctx.flagByName` (or `ctx.flags().resolveAll` for the whole set):
 
 ```zig
 fn publicFlag(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const name = ctx.request.?.param("name").?;
-    const on = try ctx.flag(name);
+    const on = ctx.flagByName(name) orelse return ctx.errorResponse(ctx.fail(404, "Unknown flag."));
     const body = try std.fmt.allocPrint(ctx.arena, "{{\"enabled\":{}}}", .{on});
     return .{ .status = 200, .body = body };
 }
 // .routes = .{ .{ .method = .GET, .path = "/api/public-flags/:name", .handler = publicFlag } }
 ```
+
+**Migrating from 0.7:** declare each flag you used in `.flags`, then replace
+`try ctx.flag("x")` with `App.flag(ctx, .x)` (compile-checked) or `ctx.flagByName("x")`
+(dynamic), and `try ctx.setFlag("x", v)` with `try App.setFlag(ctx, .x, v)`.
 
 ### Superuser settings HTTP API
 

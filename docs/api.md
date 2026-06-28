@@ -719,7 +719,8 @@ protection, it does not replace PKCE.
 
 ZigBase ships a built-in key→value store (backed by an internal `_kv` system table) and a
 **superuser-only** HTTP surface over it. It is the same store that the embeddable
-`ctx.kv()` / `ctx.flag()` API and the admin UI's "Settings / Feature Flags" screen use.
+`ctx.kv()` API and the admin UI's "Settings / Feature Flags" screen use, and where the
+declared feature-flag/experiment overrides live (`flag:<name>`, `exp:<name>:weights`).
 Every endpoint requires a valid **superuser** token (`401`/`403` otherwise); values are
 server-managed and never public by default.
 
@@ -735,11 +736,12 @@ server-managed and never public by default.
 { "value": "Closed for maintenance" }
 ```
 
-Values are stored as opaque strings. A boolean feature flag is just a value of `"true"` /
-`"false"` (the `ctx.flag()` helper reads `"true"`/`"1"` as truthy). To publish a specific
-value to non-superusers, write your own custom route that reads it via `ctx.kv()` /
-`ctx.flag()` — see
-[framework.md → KV / feature flags](framework.md#ctxkv--built-in-keyvalue-settings-store).
+Values are stored as opaque strings. Declared feature flags (0.8.0) store their override
+under the `flag:<name>` key as `"true"` / `"false"`; resolution uses the declared default
+when no override is set. To publish a value to non-superusers, write your own custom route
+that reads it via `ctx.kv()`, or `ctx.flagByName()` / `ctx.flags().resolveAll()` for declared
+flags — see
+[framework.md → Feature flags + experiments](framework.md#feature-flags--experiments-declared).
 
 ---
 

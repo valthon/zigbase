@@ -137,6 +137,42 @@ pub const Data = struct {
         }
         return out.toOwnedSlice(self.alloc);
     }
+
+    /// Scan `_kv` for every entry whose key GLOB-matches one of `prefixes` (each
+    /// matched as `<prefix>*`), in a single parameter-bound query. Used by the
+    /// feature-flag resolver to batch the `flag:*` / `exp:*` reads. Each field is
+    /// duped onto `self.alloc`; results are ordered by key.
+    pub fn kvScanPrefix(self: Data, prefixes: []const []const u8) ![]KvEntry {
+        if (prefixes.len == 0) return &.{};
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(self.alloc);
+        try sql.appendSlice(self.alloc, "SELECT key, value, created, updated FROM \"_kv\" WHERE ");
+        for (prefixes, 0..) |_, i| {
+            if (i > 0) try sql.appendSlice(self.alloc, " OR ");
+            const clause = try std.fmt.allocPrint(self.alloc, "key GLOB ?{d}", .{i + 1});
+            try sql.appendSlice(self.alloc, clause);
+        }
+        try sql.appendSlice(self.alloc, " ORDER BY key;");
+        const sql_z = try self.alloc.dupeZ(u8, sql.items);
+
+        var st = try self.conn.prepare(sql_z);
+        defer st.finalize();
+        for (prefixes, 0..) |p, i| {
+            const pat = try std.fmt.allocPrint(self.alloc, "{s}*", .{p});
+            try st.bindText(@intCast(i + 1), pat);
+        }
+
+        var out: std.ArrayList(KvEntry) = .empty;
+        while (try st.step()) {
+            try out.append(self.alloc, .{
+                .key = try self.alloc.dupe(u8, st.columnText(0)),
+                .value = try self.alloc.dupe(u8, st.columnText(1)),
+                .created = try self.alloc.dupe(u8, st.columnText(2)),
+                .updated = try self.alloc.dupe(u8, st.columnText(3)),
+            });
+        }
+        return out.toOwnedSlice(self.alloc);
+    }
 };
 
 test "Data kvSet/kvGet/kvDelete round-trip; upsert preserves created" {
@@ -195,6 +231,31 @@ test "Data.kvList returns all entries ordered by key" {
     try std.testing.expectEqualStrings("a", list[0].key);
     try std.testing.expectEqualStrings("1", list[0].value);
     try std.testing.expectEqualStrings("b", list[1].key);
+}
+
+test "Data.kvScanPrefix returns only prefix-matching entries across multiple prefixes" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = undefined };
+    const d = Data{ .app = &app, .conn = &conn, .io = std.testing.io, .alloc = a };
+
+    try d.kvSet("flag:beta", "true");
+    try d.kvSet("exp:layout:weights", "[90,10]");
+    try d.kvSet("welcome_banner", "hi"); // unrelated key — must NOT match
+
+    const hits = try d.kvScanPrefix(&.{ "flag:", "exp:" });
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    // Ordered by key: "exp:..." sorts before "flag:...".
+    try std.testing.expectEqualStrings("exp:layout:weights", hits[0].key);
+    try std.testing.expectEqualStrings("flag:beta", hits[1].key);
+    try std.testing.expectEqualStrings("true", hits[1].value);
+
+    // Empty prefix list → no rows.
+    try std.testing.expectEqual(@as(usize, 0), (try d.kvScanPrefix(&.{})).len);
 }
 
 test "Data.create then findById round-trips a record" {

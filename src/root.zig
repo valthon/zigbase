@@ -52,6 +52,15 @@ pub const Migration = @import("provision.zig").Migration;
 // build.zig embedStaticDir) and of `.static_files = .{ .embedded = ... }`.
 pub const StaticFile = @import("static_files.zig").StaticFile;
 
+// ---- Feature flags + experiments (#128/#129/#130) --------------------------
+// Types a consumer names when declaring `.flags`/`.experiments` or building a
+// registry. The typed accessors (App.flag/experiment/setFlag) and the generated
+// Flag/Experiment enums live on the App(cfg) type; the runtime read paths are
+// ctx.flagByName / ctx.flags().resolveAll.
+pub const FlagDef = @import("features.zig").FlagDef;
+pub const ExperimentDef = @import("features.zig").ExperimentDef;
+pub const FeatureRegistry = @import("features.zig").Registry;
+
 // ---- Ctx capability object -------------------------------------------------
 pub const Ctx = @import("ctx.zig").Ctx;
 /// The transaction scope passed to a `ctx.tx(T, fn(*Tx) ...)` callback — `t.records()`
@@ -216,6 +225,8 @@ test {
     _ = @import("clock_test.zig");
     _ = @import("entropy.zig");
     _ = @import("ctx.zig");
+    _ = @import("features.zig");
+    _ = @import("features_resolver.zig");
     _ = @import("session.zig");
     _ = @import("http_client.zig");
     _ = @import("testcapture.zig");
