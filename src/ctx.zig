@@ -24,6 +24,7 @@ const clock = @import("clock.zig");
 const queue_mod = @import("queue/queue.zig");
 const queue_memory = @import("queue/memory.zig");
 const queue_durable = @import("queue/durable.zig");
+const mail_send = @import("mail/send.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -262,6 +263,14 @@ pub const Ctx = struct {
     /// Returns an outbound HTTP client bound to this Ctx's arena and the app's io.
     pub fn http(self: *Ctx) http_client.HttpClient {
         return .{ .alloc = self.arena, .io = self.app.io };
+    }
+
+    /// Returns the outbound-mail namespace (`ctx.mail()`, #141): `send` (synchronous,
+    /// via the configured mailer + dev test-capture seam) and `enqueue` (durable/memory
+    /// background delivery via the built-in `"mail"` job kind). The framework owns CRLF
+    /// header-injection rejection + recipient address validation — see `MailApi`.
+    pub fn mail(self: *Ctx) MailApi {
+        return .{ .ctx = self };
     }
 
     // -----------------------------------------------------------------------
@@ -805,6 +814,49 @@ pub const FlagsApi = struct {
         const pairs = try self.ctx.arena.alloc(features_resolver.KvPair, entries.len);
         for (entries, 0..) |e, i| pairs[i] = .{ .key = e.key, .value = e.value };
         return features_resolver.resolveAll(self.ctx.arena, reg.*, pairs, subject, sc);
+    }
+};
+
+/// Outbound-mail namespace (`ctx.mail()`, #141). SELF-CONTAINED section (struct +
+/// re-exported message type) so sibling Wave-2 PRs that also append to ctx.zig rebase
+/// cleanly.
+///
+/// SECURITY: the framework owns CRLF/header-injection rejection AND recipient address
+/// validation here (in `mail/send.zig`) — a consumer never re-rolls them. Both `send`
+/// and `enqueue` validate before any byte reaches a backend or a durable row.
+///
+/// - `send`    — build + deliver synchronously via the configured mailer (the same
+///               `Mailer.send` vtable seam that feeds the dev-only `testcapture.mail`
+///               outbox, so consumer mail is assertable like the framework's auth mail).
+/// - `enqueue` — hand the message to the background queue (built-in `"mail"` job kind)
+///               for durable/memory delivery; pick the queue via `.{ .queue = "…" }`.
+pub const MailApi = struct {
+    ctx: *Ctx,
+
+    /// The consumer-facing message shape (`{ to, subject, text?, html?, reply_to? }`).
+    /// Re-exported from `mail/send.zig` so a caller names `ctx.mail().Message` / the
+    /// re-exported `zigbase.MailMessage`.
+    pub const Message = mail_send.MailMessage;
+
+    /// Options for `enqueue`. `queue` is the queue NAME to route the mail job onto
+    /// (defaults to the always-present `"default"` queue).
+    pub const EnqueueOpts = struct { queue: []const u8 = "default" };
+
+    /// Validate + deliver `msg` synchronously through the configured mailer (log
+    /// fallback when none is wired). Errors: `error.InvalidAddress` / `error.HeaderInjection`
+    /// / `error.EmptyBody` on a bad message, or a backend failure.
+    pub fn send(self: MailApi, msg: Message) !void {
+        return mail_send.send(self.ctx.app, self.ctx.arena, msg);
+    }
+
+    /// Validate `msg`, then enqueue it as a background `"mail"` job on `opts.queue`.
+    /// Routed to the queue's backend by `ctx.enqueue` (memory → in-process retry;
+    /// durable → persisted to `_queue_jobs`, drained by a worker). Validating BEFORE
+    /// enqueue means a malformed message fails fast at the call site, not later in a
+    /// worker. Requires a wired queue registry (`error.QueuesUnavailable` otherwise).
+    pub fn enqueue(self: MailApi, msg: Message, opts: EnqueueOpts) !void {
+        try mail_send.validate(msg);
+        return self.ctx.enqueueByName(opts.queue, "mail", msg);
     }
 };
 
@@ -1682,4 +1734,131 @@ test "ctx.enqueue errors on unknown queue / kind / no registry" {
     env.app.queues = @ptrCast(&reg);
     try std.testing.expectError(error.UnknownQueue, ctx.enqueueByName("nope", "echo", .{}));
     try std.testing.expectError(error.UnknownJobKind, ctx.enqueueByName("default", "nope", .{}));
+}
+
+// ---------------------------------------------------------------------------
+// ctx.mail() (#141) — send via the mailer/test-capture seam; enqueue via the
+// built-in "mail" job kind (memory + durable round-trips).
+// ---------------------------------------------------------------------------
+
+const mailer_mod = @import("mail/mailer.zig");
+const testcapture = @import("testcapture.zig");
+
+/// The framework-owned built-in "mail" job kind registry entry (mirrors what
+/// framework.zig prepends), so the queue can drain a "mail" job in these tests.
+const mail_job_reg = queue_mod.JobReg{ .kind = "mail", .handler = mail_send.jobHandler };
+
+test "#141 ctx.mail().send delivers via the mailer and is captured by testcapture.mail" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+
+    var lm = mailer_mod.LogMailer.init();
+    const m = lm.mailer();
+    env.app.mailer = &m;
+
+    testcapture.mail.reset();
+    defer testcapture.mail.reset();
+    testcapture.mail.enable(true); // capture + suppress real delivery
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    try ctx.mail().send(.{
+        .to = "user@example.com",
+        .subject = "Welcome",
+        .text = "hello there",
+        .html = "<b>hello there</b>",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), testcapture.mail.count());
+    const e = testcapture.mail.get(0).?;
+    try std.testing.expectEqualStrings("user@example.com", e.to);
+    try std.testing.expectEqualStrings("Welcome", e.subject);
+    try std.testing.expectEqualStrings("hello there", e.body); // text part captured
+}
+
+test "#141 ctx.mail().send rejects a malformed address / header injection up front" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    try std.testing.expectError(error.InvalidAddress, ctx.mail().send(.{ .to = "not-an-email", .subject = "s", .text = "b" }));
+    try std.testing.expectError(error.HeaderInjection, ctx.mail().send(.{ .to = "u@x.io\r\nBcc: e@evil.io", .subject = "s", .text = "b" }));
+    try std.testing.expectError(error.EmptyBody, ctx.mail().send(.{ .to = "u@x.io", .subject = "s" }));
+}
+
+test "#141 ctx.mail().enqueue durable round-trips into a _queue_jobs 'mail' row" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{mail_job_reg},
+    };
+    env.app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    try ctx.mail().enqueue(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{});
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var st = try w.prepare("SELECT kind, payload, status FROM \"_queue_jobs\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("mail", st.columnText(0));
+    // The payload is the serialized MailMessage (round-trippable by the job handler).
+    try std.testing.expect(std.mem.indexOf(u8, st.columnText(1), "\"to\":\"user@example.com\"") != null);
+    try std.testing.expectEqualStrings("pending", st.columnText(2));
+}
+
+test "#141 ctx.mail().enqueue validates before enqueueing (bad address never persists)" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{mail_job_reg},
+    };
+    env.app.queues = @ptrCast(&reg);
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    try std.testing.expectError(error.InvalidAddress, ctx.mail().enqueue(.{ .to = "bad", .subject = "s", .text = "b" }, .{}));
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var st = try w.prepare("SELECT COUNT(*) FROM \"_queue_jobs\";");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0)); // nothing persisted
+}
+
+test "#141 ctx.mail().enqueue memory round-trips: built-in handler delivers + is captured" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Mailer must outlive the detached memory-job thread; we spin-wait for completion.
+    var lm = mailer_mod.LogMailer.init();
+    const m = lm.mailer();
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined, .mailer = &m };
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .memory, .retry = .{ .base_ms = 0, .jitter = false } }},
+        .jobs = &.{mail_job_reg},
+    };
+    app.queues = @ptrCast(&reg);
+
+    testcapture.mail.reset();
+    defer testcapture.mail.reset();
+    testcapture.mail.enable(true);
+
+    var ctx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    try ctx.mail().enqueue(.{ .to = "queued@example.com", .subject = "Async", .text = "later" }, .{});
+
+    // The memory backend runs on a detached thread; spin-wait for the captured send.
+    var spins: usize = 0;
+    while (testcapture.mail.count() == 0 and spins < 500) : (spins += 1) {
+        app.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake) catch {};
+    }
+    app.io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 1), testcapture.mail.count());
+    try std.testing.expectEqualStrings("queued@example.com", testcapture.mail.get(0).?.to);
 }
