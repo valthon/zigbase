@@ -13,6 +13,7 @@ const webauthn_register_api = @import("api/webauthn_register.zig");
 const oauth_api = @import("api/oauth.zig");
 const files_api = @import("api/files.zig");
 const settings_api = @import("api/settings.zig");
+const features_api = @import("api/features.zig");
 const realtime_ws = @import("realtime/ws.zig");
 const files_multipart = @import("files/multipart.zig");
 const admin = @import("admin.zig");
@@ -59,6 +60,7 @@ const routes = [_]router.Route{
     .{ .method = .GET, .pattern = "/api/settings/:key", .handler = settings_api.get },
     .{ .method = .PUT, .pattern = "/api/settings/:key", .handler = settings_api.put },
     .{ .method = .DELETE, .pattern = "/api/settings/:key", .handler = settings_api.delete },
+    .{ .method = .GET, .pattern = "/api/features", .handler = features_api.get },
 };
 
 pub const Server = struct {

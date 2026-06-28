@@ -743,6 +743,38 @@ that reads it via `ctx.kv()`, or `ctx.flagByName()` / `ctx.flags().resolveAll()`
 flags — see
 [framework.md → Feature flags + experiments](framework.md#feature-flags--experiments-declared).
 
+## Features (declared registry)
+
+A separate **superuser-only** read endpoint exposes the comptime-declared flag + experiment
+registry together with each entry's active `_kv` override:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/api/features` | Return declared flags + experiments and their current overrides. |
+
+```json
+// GET /api/features   (Authorization: Bearer <superuser-jwt>)
+{
+  "flags": [
+    { "name": "dark_mode", "default": false, "description": "",
+      "override": "true" }
+  ],
+  "experiments": [
+    { "name": "onboarding_flow",
+      "variants": ["control", "streamlined"], "weights": [70, 30],
+      "sticky": false, "description": "Onboarding flow A/B test",
+      "weight_override": "[90,10]" }
+  ]
+}
+```
+
+`override` / `weight_override` are `null` when no `_kv` row is present (the declared
+default is used). To change an override, use the existing
+`PUT /api/settings/flag:<name>` / `PUT /api/settings/exp:<name>:weights` verbs.
+
+The embedded admin UI exposes this as the **Feature Flags & Experiments** screen
+(`/_/#/features`) — see [framework.md → Admin UI](framework.md#admin-ui).
+
 ---
 
 ## Files
