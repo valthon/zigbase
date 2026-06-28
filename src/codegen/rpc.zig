@@ -19,6 +19,11 @@ pub const Section = struct {
 /// Ordered ":segment" names (colon stripped) from a path.
 pub fn pathParams(comptime path: []const u8) []const []const u8 {
     comptime {
+        // A larger route table accumulates comptime branches across the shared evaluation;
+        // raise the per-evaluation quota well above the default 1000 so real-world apps with
+        // dozens/hundreds of custom routes don't hit it (provision.zig uses 1_000_000; this is
+        // safe headroom with zero runtime cost).
+        @setEvalBranchQuota(100_000);
         var out: []const []const u8 = &.{};
         var it = std.mem.tokenizeScalar(u8, path, '/');
         while (it.next()) |seg| {

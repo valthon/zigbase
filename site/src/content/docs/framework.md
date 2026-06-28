@@ -1878,6 +1878,8 @@ The public surface (from `src/root.zig`):
   for convenience (the same types as `zigbase.events.*`); they are the second parameter of
   hook / job handlers.
 - `zigbase.Req`, `zigbase.RouteError` — the typed-route handler input wrapper and error set.
+- `zigbase.Tx` — the transaction scope passed to a `ctx.tx(T, fn(*Tx) ...)` callback
+  (`t.records()`, `t.arena()`).
 - `zigbase.Migration` — the `.migrations` slice element type; `zigbase.Db` — the writer
   connection passed to a migration's `.up`.
 - `zigbase.StaticFile` — the embedded manifest entry type (path, bytes, etag); used by

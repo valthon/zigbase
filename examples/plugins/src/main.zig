@@ -559,7 +559,15 @@ pub fn main(init: std.process.Init) !void {
                 },
                 .auth = .{
                     .methods = .{
-                        .magic_link = .{ .ttl_s = 900, .auto_create = true },
+                        // Comptime per-method rate limit: cap magic-link requests at 5 per 60s
+                        // per client key (vs the runtime `ac.rateLimit(...)` the custom api_token
+                        // method calls imperatively). `.rate_limit = .default` uses the global
+                        // ZIGBASE_RATE_LIMIT_* config; `.custom` overrides it for this method only.
+                        .magic_link = .{
+                            .ttl_s = 900,
+                            .auto_create = true,
+                            .rate_limit = .{ .custom = .{ .max = 5, .window_s = 60 } },
+                        },
                     },
                 },
                 // Publicly listable (frontend can render display_name on comments);

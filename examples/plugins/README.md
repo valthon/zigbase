@@ -189,6 +189,27 @@ ZIGBASE_PUBLIC_URL=http://localhost:8090 ./zig-out/bin/plugins serve --insecure-
 # open http://127.0.0.1:8090/  (admin UI at /_/)
 ```
 
+### Rotating the field-encryption key (`zigbase rewrap`)
+
+`ZIGBASE_FIELD_KEY` is the primary key (generation 1 by default). To rotate it without
+losing access to data already written under the old key, keep the old key available as a
+read-only older generation and run `rewrap` to re-encrypt every cell under the new key:
+
+```sh
+# 1. Restart writing under the new key (generation 2); old v1: rows still decrypt via _V1.
+ZIGBASE_FIELD_KEY=new-strong-key ZIGBASE_FIELD_KEY_GENERATION=2 ZIGBASE_FIELD_KEY_V1=dev-only-field-key \
+  ./zig-out/bin/plugins serve --insecure-cookies
+
+# 2. Re-encrypt every v1: cell as v2: (idempotent, fail-closed; --dry-run reports counts only).
+ZIGBASE_FIELD_KEY=new-strong-key ZIGBASE_FIELD_KEY_GENERATION=2 ZIGBASE_FIELD_KEY_V1=dev-only-field-key \
+  ./zig-out/bin/plugins rewrap --data-dir ./zb_data
+```
+
+`ZIGBASE_FIELD_KEY_GENERATION` (1–64) is the generation stamped on new writes (the `v<N>:`
+prefix); `ZIGBASE_FIELD_KEY_V<M>` supplies a read-only key for an older generation `M`. See
+[docs/recipes.md](../../docs/recipes.md) ("encrypt a field at rest + key rotation") and
+[docs/framework.md](../../docs/framework.md) for the full rotation playbook.
+
 This demonstrates the **embedded** static-files mode: the Astro frontend is
 compiled into the binary by `embedStaticDir` in `build.zig`. Delete
 `frontend/dist` after building — the site still serves from the binary.

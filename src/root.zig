@@ -54,6 +54,10 @@ pub const StaticFile = @import("static_files.zig").StaticFile;
 
 // ---- Ctx capability object -------------------------------------------------
 pub const Ctx = @import("ctx.zig").Ctx;
+/// The transaction scope passed to a `ctx.tx(T, fn(*Tx) ...)` callback — `t.records()`
+/// runs writes on the in-transaction connection and `t.arena()` is the invocation arena.
+/// See the `ctx.tx()` section of docs/framework.md.
+pub const Tx = @import("ctx.zig").Tx;
 
 // ---- General outbound HTTP client -----------------------------------------
 // HttpMethod/HttpHeader use the Http-prefix to avoid collision with http.zig's
