@@ -477,10 +477,47 @@ the `complete` of every built-in resolves to a shared `AuthMethodResult`:
 `magic_link` and `otp` `initiate` return `Promise<void>` (the endpoint replies `204`, and is
 enumeration-safe); `webauthn.initiate` returns the typed `WebAuthnInitiateResult` challenge.
 
-**Custom methods stay untyped.** A custom slug (registered via `.auth_methods` and enabled in
-`.auth.methods.custom`) carries no comptime I/O type info, so the generator emits
-`initiate(input: Record<string, unknown>): Promise<unknown>` / `complete(...)` stubs — the
-shape is yours to define.
+**Custom methods can be typed too.** A custom slug enabled as a **bare string**
+(`.custom = .{ "api_token" }`) carries no comptime I/O type info, so the generator falls back to
+`initiate(input: Record<string, unknown>): Promise<unknown>` / `complete(...)` stubs — the shape
+is yours to define. To get precise types, enable the slug in the **struct form** and declare the
+`initiate`/`complete` Zig I/O types:
+
+```zig
+.auth = .{ .methods = .{ .custom = &.{
+    // bare string → stays untyped (back-compat)
+    "legacy_slug",
+    // struct form → typed: the generator reflects these Zig types into TS
+    .{
+        .slug = "device_link",
+        .Initiate = .{ .Output = DeviceLinkInitiateResp },           // void Input omitted
+        .Complete = .{ .Input = DeviceLinkCompleteReq, .Output = DeviceLinkSession },
+    },
+} } },
+```
+
+`zig build gen-client` then emits a precise surface:
+
+```ts
+auth: {
+  profiles: {
+    deviceLink: {
+      initiate(opts?: SendOptions): Promise<DeviceLinkInitiateResp>;        // void Input → no input arg
+      complete(input: DeviceLinkCompleteReq, opts?: SendOptions): Promise<DeviceLinkSession>;
+    };
+  };
+}
+```
+
+- **Interfaces are named by the Zig type's own (short) name** — `DeviceLinkInitiateResp`,
+  `DeviceLinkCompleteReq`, `DeviceLinkSession` — exactly like the typed `zb.rpc.*` route surface.
+  Two distinct Zig types that would collide on the same TS name are a build error.
+- A `void` `Input` **omits** the `input` argument; a `void` `Output` maps to `Promise<void>`.
+- The declared I/O types must be in the Zig→TS subset (scalars, `[]const u8`, enums, optionals,
+  slices, `std.json.Value`, and structs thereof) — same bound as typed routes.
+- **Comptime-only:** typed custom methods need the build-time generator (`zig build gen-client`),
+  which reads your Zig source. The **runtime-introspection** tier (`typegen --data-dir/--url`)
+  cannot see Zig types, so it keeps custom methods untyped — identical to how typed routes behave.
 
 ```ts
 // golfsim's users collection enables OTP; zig build gen-client emits:

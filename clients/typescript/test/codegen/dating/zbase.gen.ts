@@ -883,6 +883,19 @@ export interface SearchIn {
 export interface SearchOut {
   count: number;
 }
+
+// ---- Custom auth method I/O ----
+
+export interface DeviceLinkInitiateResp {
+  deviceCode: string;
+  expiresIn: number;
+}
+export interface DeviceLinkCompleteReq {
+  deviceCode: string;
+}
+export interface DeviceLinkSession {
+  token: string;
+}
 export interface ZbClient {
   db: {
     profiles: ProfilesService;
@@ -901,6 +914,14 @@ export interface ZbClient {
     messages: MessagesRealtime;
     winks: WinksRealtime;
     subscriptions: SubscriptionsRealtime;
+  };
+  auth: {
+    profiles: {
+      deviceLink: {
+        initiate(opts?: SendOptions): Promise<DeviceLinkInitiateResp>;
+        complete(input: DeviceLinkCompleteReq, opts?: SendOptions): Promise<DeviceLinkSession>;
+      };
+    };
   };
   files: FilesService;
   rpc: {
@@ -966,6 +987,16 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       messages: makeTypedRealtime<Message, MessageWhere>(base.realtime, messagesMeta, relationResolver),
       winks: makeTypedRealtime<Wink, WinkWhere>(base.realtime, winksMeta, relationResolver),
       subscriptions: makeTypedRealtime<Subscription, SubscriptionWhere>(base.realtime, subscriptionsMeta, relationResolver),
+    },
+    auth: {
+      profiles: {
+        deviceLink: {
+          initiate: (opts?: SendOptions): Promise<DeviceLinkInitiateResp> =>
+            base.send<DeviceLinkInitiateResp>("POST", `/api/collections/profiles/auth/device_link/initiate`, { ...opts }),
+          complete: (input: DeviceLinkCompleteReq, opts?: SendOptions): Promise<DeviceLinkSession> =>
+            base.send<DeviceLinkSession>("POST", `/api/collections/profiles/auth/device_link/complete`, { body: input, ...opts }),
+        },
+      },
     },
     files: base.files,
     rpc: {

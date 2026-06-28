@@ -4,7 +4,7 @@
 // In a consumer repo this file imports from "@zigbase/client" and
 // "@zigbase/client/typed". In this in-repo snapshot we import from the
 // package source so it typechecks against the working tree without a built dist.
-import { createClient as baseCreateClient, type Client } from "../../../src/index.js";
+import { createClient as baseCreateClient, type Client, type SendOptions } from "../../../src/index.js";
 import { withRealtime, type RealtimeEnabledClient } from "../../../src/realtime-entry.js";
 import type { ListResult } from "../../../src/records.js";
 import type { CursorPage } from "../../../src/cursor.js";
@@ -882,6 +882,18 @@ export interface ZbClient {
     tags: TagsRealtime;
     winks: WinksRealtime;
   };
+  auth: {
+    profiles: {
+      deviceLink: {
+        // TODO(typed): custom auth methods carry no type info (m.custom is bare
+        // slug strings). Typing these needs a comptime typed-I/O declaration API
+        // — m.custom entries carrying comptime Input/Output Zig types the generator
+        // can reflect. Until then these stay untyped.
+        initiate(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;
+        complete(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;
+      };
+    };
+  };
   files: FilesService;
   authStore: Client["authStore"];
   send: Client["send"];
@@ -939,6 +951,16 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       subscriptions: makeTypedRealtime<Subscription, SubscriptionWhere>(base.realtime, subscriptionsMeta, relationResolver),
       tags: makeTypedRealtime<Tag, TagWhere>(base.realtime, tagsMeta),
       winks: makeTypedRealtime<Wink, WinkWhere>(base.realtime, winksMeta, relationResolver),
+    },
+    auth: {
+      profiles: {
+        deviceLink: {
+          initiate: (input: Record<string, unknown>, opts?: SendOptions) =>
+            base.send("POST", `/api/collections/profiles/auth/device_link/initiate`, { body: input, ...opts }),
+          complete: (input: Record<string, unknown>, opts?: SendOptions) =>
+            base.send("POST", `/api/collections/profiles/auth/device_link/complete`, { body: input, ...opts }),
+        },
+      },
     },
     files: base.files,
     authStore: base.authStore,

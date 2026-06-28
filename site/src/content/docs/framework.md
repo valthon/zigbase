@@ -864,7 +864,7 @@ The dispatch enforces enablement: a disabled or unknown method slug returns `404
 | `otp` | `{ identity }` | `void` (204) | `{ identity, code }` | `{ token }` |
 | `webauthn` | `{ identity? }` | `{ challenge, rpId, ceremonyId, timeout }` | `{ ceremonyId, credentialId, authenticatorData, clientDataJSON, signature }` | `{ token }` |
 
-Every built-in `complete` resolves to `{ token }` (`AuthMethodResult`); the session cookies (`zb_auth`/`zb_csrf`) are also set on the response. **Custom methods** (`.custom` slugs) stay on untyped `Record<string, unknown>` / `unknown` stubs — they carry no comptime type info today (a typed-I/O declaration API for custom methods is a planned follow-up).
+Every built-in `complete` resolves to `{ token }` (`AuthMethodResult`); the session cookies (`zb_auth`/`zb_csrf`) are also set on the response. **Custom methods** can be typed too: a bare-string slug (`.custom = .{"corp-sso"}`) stays on the untyped `Record<string, unknown>` / `unknown` stubs, while the **struct form** declares comptime I/O types the generator reflects into precise TS interfaces (named by the Zig type) — `.{ .slug = "corp-sso", .Initiate = .{ .Input = …, .Output = … }, .Complete = .{ .Input = …, .Output = … } }`. A `void` Input omits the input arg; a `void` Output maps to `Promise<void>`. See [typescript-sdk.md → Typed auth methods](typescript-sdk.md#typed-auth-methods--zbauth).
 
 ### Custom `AuthMethod` plugin (`.auth_methods`)
 

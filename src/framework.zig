@@ -385,6 +385,19 @@ pub fn App(comptime cfg: anytype) type {
         else
             &.{};
 
+        /// Comptime-reflected typed I/O for CUSTOM auth methods declared in the
+        /// `.collections` literal (one entry per `.{ .slug, .Initiate, .Complete }`
+        /// struct under a collection's `.auth.methods.custom`). Parallels `App.routes`
+        /// — a comptime channel carrying Zig `type`s that the build-time TS client
+        /// generator reflects into precise interfaces. Bare-string custom entries
+        /// contribute nothing here and stay untyped. Empty when there are no
+        /// collections or no typed custom methods. ZERO runtime effect (the runtime
+        /// slug list lives on `schema.MethodsOptions.custom`).
+        pub const custom_auth: []const events.CustomAuthMeta = if (@hasField(@TypeOf(cfg), "collections"))
+            events.customAuthMeta(cfg.collections)
+        else
+            &.{};
+
         /// Explicit migrations (the escape hatch for non-additive changes), run in
         /// order before provisioning and recorded once in `_migrations`. Empty by default.
         ///

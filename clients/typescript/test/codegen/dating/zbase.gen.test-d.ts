@@ -3,6 +3,7 @@ import { createClient } from "./zbase.gen.js";
 import type {
   Profile, Tag, Photo, PrivatePhoto, Subscription,
   ProfileCreate, PhotoCreate, ProfileGender, SubscriptionPlan,
+  DeviceLinkInitiateResp, DeviceLinkCompleteReq, DeviceLinkSession,
 } from "./zbase.gen.js";
 
 const zb = createClient("http://api.test", { WebSocket: globalThis.WebSocket });
@@ -105,6 +106,20 @@ function serviceShapes() {
   expectTypeOf(zb.db.profiles.getFirstListItem).toBeFunction();
   // realtime alias exists per collection.
   expectTypeOf(zb.realtime.photos.subscribe).toBeFunction();
+}
+
+// --- typed CUSTOM auth method (issue #119) ----------------------------------
+async function typedCustomAuthMethod() {
+  // The `device_link` custom method declares comptime I/O types, so its generated
+  // surface is precise (named by the Zig type), not `Record<string, unknown>`.
+  // void Initiate.Input -> initiate takes no input arg, resolves the typed result.
+  const init = await zb.auth.profiles.deviceLink.initiate();
+  expectTypeOf(init).toEqualTypeOf<DeviceLinkInitiateResp>();
+  // complete takes the typed request and resolves the typed session.
+  const done = await zb.auth.profiles.deviceLink.complete({ deviceCode: "abc" } satisfies DeviceLinkCompleteReq);
+  expectTypeOf(done).toEqualTypeOf<DeviceLinkSession>();
+  // @ts-expect-error initiate takes no input argument (void Initiate.Input)
+  await zb.auth.profiles.deviceLink.initiate({ nope: 1 });
 }
 
 // --- relation-less collections expose the full read surface -----------------

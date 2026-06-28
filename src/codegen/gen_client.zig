@@ -9,6 +9,8 @@ const events = @import("../events.zig");
 const emit = @import("emit.zig");
 const guards = @import("guards.zig");
 const ident = @import("identifiers.zig");
+const rpc_ts = @import("rpc_ts.zig");
+const rpc = @import("rpc.zig");
 
 const W = std.ArrayList(u8);
 
@@ -52,6 +54,7 @@ pub fn generate(
     alloc: std.mem.Allocator,
     cols: []const schema.Collection,
     comptime routes: []const events.RouteMeta,
+    comptime custom_auth: []const events.CustomAuthMeta,
     in_repo: bool,
     auth_collection: []const u8,
     client_name: []const u8,
@@ -88,7 +91,9 @@ pub fn generate(
             \\
         );
     }
-    try emit.emitImports(alloc, &w, in_repo, routes.len > 0);
+    // SendOptions is referenced by typed RPC routes AND by auth-method stubs
+    // (built-in or custom), so import it whenever either is present.
+    try emit.emitImports(alloc, &w, in_repo, routes.len > 0 or anyNonPasswordAuthMethods(cols));
 
     try section(alloc, &w, "Records");
     for (cols) |c| try emit.emitSelectUnions(alloc, &w, c);
@@ -120,9 +125,15 @@ pub fn generate(
     try section(alloc, &w, "Typed realtime surface");
     for (cols) |c| try emit.emitRealtimeAlias(alloc, &w, c);
     try section(alloc, &w, "createClient");
-    const rpc_section = try @import("rpc.zig").render(routes, alloc);
+    // One SeenMap shared across the typed RPC route surface AND the typed custom-auth
+    // surface, so two DISTINCT Zig types that map to the same TS name across those
+    // surfaces are caught (error.RpcTypeNameCollision) instead of emitting an
+    // ambiguous client (Decision E).
+    var seen = rpc_ts.SeenMap.init(alloc);
+    defer seen.deinit();
+    const rpc_section = try rpc.renderShared(routes, alloc, &seen);
     // rpc_section slices are owned by the arena (alloc), freed on arena deinit.
-    try emitClientFactory(alloc, &w, cols, client_name, auth_collection, rpc_section, routes.len, api_prefix);
+    try emitClientFactory(alloc, &w, cols, client_name, auth_collection, rpc_section, routes.len, api_prefix, custom_auth, &seen);
 
     return w.toOwnedSlice(alloc);
 }
@@ -134,16 +145,22 @@ fn emitClientFactory(
     cols: []const schema.Collection,
     client_name: []const u8,
     auth_collection: []const u8,
-    rpc_section: @import("rpc.zig").Section,
+    rpc_section: rpc.Section,
     routes_len: usize,
     api_prefix: []const u8,
+    comptime custom_auth: []const events.CustomAuthMeta,
+    seen: *rpc_ts.SeenMap,
 ) !void {
     // Pre-build the auth iface + factory sections (empty if no non-password methods).
+    // `auth_decls` receives the named `export interface`/`export type` declarations for
+    // any TYPED custom auth methods (deduped through the shared `seen` map).
     var auth_iface: W = .empty;
     var auth_factory: W = .empty;
-    try emitAuthMethodEndpoints(alloc, &auth_iface, &auth_factory, cols, api_prefix);
+    var auth_decls: W = .empty;
+    try emitAuthMethodEndpoints(alloc, &auth_iface, &auth_factory, &auth_decls, cols, api_prefix, custom_auth, seen);
     const auth_iface_s = try auth_iface.toOwnedSlice(alloc);
     const auth_factory_s = try auth_factory.toOwnedSlice(alloc);
+    const auth_decls_s = try auth_decls.toOwnedSlice(alloc);
     const has_auth_methods = auth_iface_s.len > 0;
 
     // Emit named RPC Input/Output decls before the client interface (only when routes exist).
@@ -153,6 +170,12 @@ fn emitClientFactory(
     // Emit the shared built-in auth-method I/O interfaces before the client interface
     // (only for built-ins actually enabled across the collections).
     if (has_auth_methods) try emitAuthMethodIODecls(alloc, w, cols);
+    // Emit named decls for any TYPED custom auth methods (after built-ins, still before
+    // the client interface that references them).
+    if (auth_decls_s.len > 0) {
+        try section(alloc, w, "Custom auth method I/O");
+        try w.appendSlice(alloc, auth_decls_s);
+    }
     // BlogClient-style interface
     try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "export interface {s} {{\n  db: {{\n", .{client_name}));
     for (cols) |c| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: {s};\n", .{ c.name, try ident.serviceName(alloc, c.name) }));
@@ -478,8 +501,11 @@ fn emitAuthMethodEndpoints(
     alloc: std.mem.Allocator,
     w_iface: *W, // receives the auth: { ... } interface body
     w_factory: *W, // receives the auth: { ... } factory body
+    w_decls: *W, // receives named decls for TYPED custom methods
     cols: []const schema.Collection,
     api_prefix: []const u8,
+    comptime custom_auth: []const events.CustomAuthMeta,
+    seen: *rpc_ts.SeenMap,
 ) !void {
     // Build the list of (colName, []slug) pairs for non-password methods.
     // We need a helper to iterate slugs for a given MethodsOptions.
@@ -581,7 +607,18 @@ fn emitAuthMethodEndpoints(
         if (m.magic_link != null) try emit_builtin(alloc, w_iface, w_factory, c.name, "magic_link", api_prefix, builtinIO("magic_link").?);
         if (m.otp != null) try emit_builtin(alloc, w_iface, w_factory, c.name, "otp", api_prefix, builtinIO("otp").?);
         if (m.webauthn != null) try emit_builtin(alloc, w_iface, w_factory, c.name, "webauthn", api_prefix, builtinIO("webauthn").?);
-        for (m.custom) |slug| try emit_custom(alloc, w_iface, w_factory, c.name, slug, api_prefix);
+        for (m.custom) |slug| {
+            // A custom slug declared with comptime I/O types (a struct entry in the
+            // `.custom` tuple) gets a TYPED surface; a bare-string slug stays untyped.
+            var matched = false;
+            inline for (custom_auth) |cm| {
+                if (!matched and std.mem.eql(u8, cm.col_name, c.name) and std.mem.eql(u8, cm.slug, slug)) {
+                    try emitCustomTyped(alloc, w_iface, w_factory, w_decls, seen, c.name, slug, cm, api_prefix);
+                    matched = true;
+                }
+            }
+            if (!matched) try emit_custom(alloc, w_iface, w_factory, c.name, slug, api_prefix);
+        }
 
         // Interface: close colName
         try w_iface.appendSlice(alloc, "    };\n");
@@ -593,6 +630,88 @@ fn emitAuthMethodEndpoints(
     try w_iface.appendSlice(alloc, "  };\n");
     // Factory: close auth
     try w_factory.appendSlice(alloc, "    },\n");
+}
+
+/// Emit the TYPED interface + factory + named-decls for one custom auth method whose
+/// comptime I/O types were declared via the `.custom` struct form. Mirrors the
+/// built-in path (`emit_builtin` + `emitAuthMethodIODecls`) but reflects the declared
+/// Zig types through `rpc_ts` (interfaces named by the Zig type's own short name).
+/// A `void` Input omits the `input` argument; a `void` Output maps to `Promise<void>`
+/// (Decision C). Named decls are deduped through the shared `seen` map (Decision E).
+fn emitCustomTyped(
+    a: std.mem.Allocator,
+    wi: *W,
+    wf: *W,
+    wd: *W,
+    seen: *rpc_ts.SeenMap,
+    col_name: []const u8,
+    slug: []const u8,
+    comptime cm: events.CustomAuthMeta,
+    prefix: []const u8,
+) !void {
+    const camel = try camelFromSlug(a, slug);
+
+    // Named `export interface`/`export type` decls for each non-scalar I/O type,
+    // dependencies first, deduped (and collision-checked) via the shared seen map.
+    try rpc_ts.renderNamedDeclsShared(cm.InitiateInput, wd, a, seen);
+    try rpc_ts.renderNamedDeclsShared(cm.InitiateOutput, wd, a, seen);
+    try rpc_ts.renderNamedDeclsShared(cm.CompleteInput, wd, a, seen);
+    try rpc_ts.renderNamedDeclsShared(cm.CompleteOutput, wd, a, seen);
+
+    const init_in = comptime rpc_ts.tsForType(cm.InitiateInput);
+    const init_out = comptime rpc_ts.tsForType(cm.InitiateOutput);
+    const comp_in = comptime rpc_ts.tsForType(cm.CompleteInput);
+    const comp_out = comptime rpc_ts.tsForType(cm.CompleteOutput);
+    const init_has_input = cm.InitiateInput != void;
+    const comp_has_input = cm.CompleteInput != void;
+
+    // Interface member: <camel>: { initiate(...): Promise<...>; complete(...): Promise<...>; };
+    try wi.appendSlice(a, try std.fmt.allocPrint(a, "      {s}: {{\n", .{camel}));
+    if (init_has_input) {
+        try wi.appendSlice(a, try std.fmt.allocPrint(a,
+            "        initiate(input: {s}, opts?: SendOptions): Promise<{s}>;\n", .{ init_in, init_out }));
+    } else {
+        try wi.appendSlice(a, try std.fmt.allocPrint(a,
+            "        initiate(opts?: SendOptions): Promise<{s}>;\n", .{init_out}));
+    }
+    if (comp_has_input) {
+        try wi.appendSlice(a, try std.fmt.allocPrint(a,
+            "        complete(input: {s}, opts?: SendOptions): Promise<{s}>;\n", .{ comp_in, comp_out }));
+    } else {
+        try wi.appendSlice(a, try std.fmt.allocPrint(a,
+            "        complete(opts?: SendOptions): Promise<{s}>;\n", .{comp_out}));
+    }
+    try wi.appendSlice(a, "      };\n");
+
+    // Factory member — explicit send<T> type arg so the literal is assignable to the iface.
+    try wf.appendSlice(a, try std.fmt.allocPrint(a, "        {s}: {{\n", .{camel}));
+    if (init_has_input) {
+        try wf.appendSlice(a, try std.fmt.allocPrint(a,
+            \\          initiate: (input: {0s}, opts?: SendOptions): Promise<{1s}> =>
+            \\            base.send<{1s}>("POST", `{2s}/collections/{3s}/auth/{4s}/initiate`, {{ body: input, ...opts }}),
+            \\
+        , .{ init_in, init_out, prefix, col_name, slug }));
+    } else {
+        try wf.appendSlice(a, try std.fmt.allocPrint(a,
+            \\          initiate: (opts?: SendOptions): Promise<{0s}> =>
+            \\            base.send<{0s}>("POST", `{1s}/collections/{2s}/auth/{3s}/initiate`, {{ ...opts }}),
+            \\
+        , .{ init_out, prefix, col_name, slug }));
+    }
+    if (comp_has_input) {
+        try wf.appendSlice(a, try std.fmt.allocPrint(a,
+            \\          complete: (input: {0s}, opts?: SendOptions): Promise<{1s}> =>
+            \\            base.send<{1s}>("POST", `{2s}/collections/{3s}/auth/{4s}/complete`, {{ body: input, ...opts }}),
+            \\
+        , .{ comp_in, comp_out, prefix, col_name, slug }));
+    } else {
+        try wf.appendSlice(a, try std.fmt.allocPrint(a,
+            \\          complete: (opts?: SendOptions): Promise<{0s}> =>
+            \\            base.send<{0s}>("POST", `{1s}/collections/{2s}/auth/{3s}/complete`, {{ ...opts }}),
+            \\
+        , .{ comp_out, prefix, col_name, slug }));
+    }
+    try wf.appendSlice(a, "        },\n");
 }
 
 /// Mirror of emit.zig's hasSingleFileFields: the per-collection fileUrl graft is
@@ -655,7 +774,7 @@ fn authCollectionName(cols: []const schema.Collection) []const u8 {
 /// as named modules) and call mainWithCollections() here. This keeps gen_client.zig
 /// as a self-contained library file usable by the zigbase test suite WITHOUT being
 /// a module root.
-pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collection, comptime routes: []const events.RouteMeta) !void {
+pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collection, comptime routes: []const events.RouteMeta, comptime custom_auth: []const events.CustomAuthMeta) !void {
     const io = init.io;
     // Use an arena for all temporary allocations during the generator run.
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
@@ -675,7 +794,7 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
     const in_repo = init.environ_map.contains("ZBASE_INREPO");
     const client_name = "ZbClient";
 
-    const text = generate(a, cols, routes, in_repo, authCollectionName(cols), client_name, args.api_prefix) catch |e| {
+    const text = generate(a, cols, routes, custom_auth, in_repo, authCollectionName(cols), client_name, args.api_prefix) catch |e| {
         // guard messages are printed via the report; re-run path for the message:
         var report = guards.GuardReport{ .message = "" };
         guards.checkOperatorNames(a, cols, &report) catch {};
@@ -712,7 +831,7 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
 /// the Zig 0.16 "file exists in multiple modules" error (see note above).
 pub fn main(init: std.process.Init) !void {
     const app = @import("app");
-    return mainWithCollections(init, app.App.collections, app.App.routes);
+    return mainWithCollections(init, app.App.collections, app.App.routes, app.App.custom_auth);
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +860,7 @@ test "generate emits a parseable file with the expected top-level constructs" {
     defer arena.deinit();
     const a = arena.allocator();
     const cols = try miniBlog(a);
-    const out = try generate(a, cols, &.{}, true, "users", "BlogClient", "/api");
+    const out = try generate(a, cols, &.{}, &.{}, true, "users", "BlogClient", "/api");
     try std.testing.expect(std.mem.startsWith(u8, out, "// generated by zigbase — do not edit\n// schema-hash: "));
     inline for (.{
         "export interface Post {",        "export type PostStatus =",
@@ -774,7 +893,7 @@ test "--check diff: stale buffer differs from fresh output" {
     defer arena.deinit();
     const a = arena.allocator();
     const cols = try miniBlog(a);
-    const fresh = try generate(a, cols, &.{}, true, "users", "BlogClient", "/api");
+    const fresh = try generate(a, cols, &.{}, &.{}, true, "users", "BlogClient", "/api");
     const stale = try std.fmt.allocPrint(a, "{s}\n// drift\n", .{fresh});
     try std.testing.expect(!std.mem.eql(u8, fresh, stale)); // --check would exit non-zero
     try std.testing.expect(std.mem.eql(u8, fresh, fresh));   // --check would exit zero
@@ -790,7 +909,7 @@ test "guards run inside generate: operator-named relation target errors" {
         .{ .id = "", .name = "tags", .fields = tag_f },
         .{ .id = "", .name = "posts", .fields = post_f },
     });
-    try std.testing.expectError(guards.GuardError.OperatorNameClash, generate(a, cols, &.{}, true, "", "ZbClient", "/api"));
+    try std.testing.expectError(guards.GuardError.OperatorNameClash, generate(a, cols, &.{}, &.{}, true, "", "ZbClient", "/api"));
 }
 
 test "auth-method endpoints: magic_link emits TYPED initiate/complete; password emits nothing" {
@@ -809,7 +928,7 @@ test "auth-method endpoints: magic_link emits TYPED initiate/complete; password 
             .options = .{ .auth = .{ .methods = .{ .magic_link = .{} } } },
         },
     });
-    const out_ml = try generate(a, members_cols, &.{}, true, "members", "MembersClient", "/api");
+    const out_ml = try generate(a, members_cols, &.{}, &.{}, true, "members", "MembersClient", "/api");
     // Should contain magic_link initiate + complete paths
     try std.testing.expect(std.mem.indexOf(u8, out_ml, "/auth/magic_link/initiate") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_ml, "/auth/magic_link/complete") != null);
@@ -837,7 +956,7 @@ test "auth-method endpoints: magic_link emits TYPED initiate/complete; password 
             .options = .{ .auth = .{ .methods = .{ .password = .{} } } },
         },
     });
-    const out_pw = try generate(a, pw_cols, &.{}, true, "users", "UsersClient", "/api");
+    const out_pw = try generate(a, pw_cols, &.{}, &.{}, true, "users", "UsersClient", "/api");
     // Should NOT contain any /auth/password/ URL stubs
     try std.testing.expect(std.mem.indexOf(u8, out_pw, "/auth/password/") == null);
     // Should NOT contain an auth namespace on the client interface
@@ -863,7 +982,7 @@ test "auth-method endpoints: otp + webauthn emit precise typed I/O" {
             } } },
         },
     });
-    const out = try generate(a, cols, &.{}, true, "users", "UsersClient", "/api");
+    const out = try generate(a, cols, &.{}, &.{}, true, "users", "UsersClient", "/api");
     inline for (.{
         // OTP typed I/O
         "export interface OtpInitiateInput {",
@@ -902,7 +1021,9 @@ test "auth-method endpoints: custom slugs stay untyped with a follow-up TODO" {
             .options = .{ .auth = .{ .methods = .{ .custom = &.{"my_method"} } } },
         },
     });
-    const out = try generate(a, cols, &.{}, true, "users", "UsersClient", "/api");
+    // Back-compat: a bare-string slug stays UNTYPED even with the comptime custom-auth
+    // channel present (here empty) — exactly the pre-#119 behavior.
+    const out = try generate(a, cols, &.{}, &.{}, true, "users", "UsersClient", "/api");
     // Custom slug present + camelCased.
     try std.testing.expect(std.mem.indexOf(u8, out, "/auth/my_method/initiate") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "myMethod") != null);
@@ -911,4 +1032,108 @@ test "auth-method endpoints: custom slugs stay untyped with a follow-up TODO" {
     try std.testing.expect(std.mem.indexOf(u8, out, "comptime typed-I/O declaration API") != null);
     // No built-in I/O interfaces are emitted when only custom methods exist.
     try std.testing.expect(std.mem.indexOf(u8, out, "export interface AuthMethodResult") == null);
+}
+
+test "auth-method endpoints: custom methods with declared I/O emit typed interfaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two custom methods on `users`: one with full typed initiate+complete, and one
+    // bare-string slug that must STILL be untyped even alongside the typed channel.
+    const SsoInitiateReq = struct { redirect: []const u8 };
+    const SsoInitiateResp = struct { authorizeUrl: []const u8 };
+    const SsoCompleteReq = struct { code: []const u8, state: []const u8 };
+    const SsoCompleteResp = struct { token: []const u8 };
+
+    const cols = try a.dupe(schema.Collection, &.{
+        .{
+            .id = "",
+            .name = "users",
+            .type = .auth,
+            .fields = &.{},
+            // Runtime slug list carries BOTH slugs (lowering is slug-only).
+            .options = .{ .auth = .{ .methods = .{ .custom = &.{ "corp_sso", "legacy" } } } },
+        },
+    });
+    // Comptime channel: only `corp_sso` is typed; `legacy` is absent → stays untyped.
+    const custom_auth = [_]events.CustomAuthMeta{.{
+        .col_name = "users",
+        .slug = "corp_sso",
+        .InitiateInput = SsoInitiateReq,
+        .InitiateOutput = SsoInitiateResp,
+        .CompleteInput = SsoCompleteReq,
+        .CompleteOutput = SsoCompleteResp,
+    }};
+    const out = try generate(a, cols, &.{}, &custom_auth, true, "users", "UsersClient", "/api");
+
+    // Named interfaces emitted (by the Zig type's own short name).
+    inline for (.{
+        "export interface SsoInitiateReq {",
+        "export interface SsoInitiateResp {",
+        "export interface SsoCompleteReq {",
+        "export interface SsoCompleteResp {",
+    }) |needle| try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
+
+    // Typed initiate/complete signatures + URLs for the typed method.
+    try std.testing.expect(std.mem.indexOf(u8, out, "initiate(input: SsoInitiateReq, opts?: SendOptions): Promise<SsoInitiateResp>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "complete(input: SsoCompleteReq, opts?: SendOptions): Promise<SsoCompleteResp>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "base.send<SsoCompleteResp>(\"POST\", `/api/collections/users/auth/corp_sso/complete`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "corpSso") != null);
+
+    // The bare-string `legacy` slug remains untyped (the Record stub still appears).
+    try std.testing.expect(std.mem.indexOf(u8, out, "/auth/legacy/initiate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Record<string, unknown>") != null);
+}
+
+test "auth-method endpoints: custom method void I/O omits input arg and returns Promise<void>" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const TokenResp = struct { token: []const u8 };
+    const cols = try a.dupe(schema.Collection, &.{
+        .{
+            .id = "",
+            .name = "users",
+            .type = .auth,
+            .fields = &.{},
+            .options = .{ .auth = .{ .methods = .{ .custom = &.{"api_token"} } } },
+        },
+    });
+    // void initiate input + void initiate output; void complete input, typed output.
+    const custom_auth = [_]events.CustomAuthMeta{.{
+        .col_name = "users",
+        .slug = "api_token",
+        .CompleteOutput = TokenResp,
+    }};
+    const out = try generate(a, cols, &.{}, &custom_auth, true, "users", "UsersClient", "/api");
+
+    // void input → no `input` arg; void output → Promise<void>.
+    try std.testing.expect(std.mem.indexOf(u8, out, "initiate(opts?: SendOptions): Promise<void>;") != null);
+    // void complete input but typed output.
+    try std.testing.expect(std.mem.indexOf(u8, out, "complete(opts?: SendOptions): Promise<TokenResp>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export interface TokenResp {") != null);
+    // Typed method must NOT fall back to the untyped Record stub.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Record<string, unknown>") == null);
+}
+
+test "customAuthMeta reflects struct entries and skips bare strings" {
+    const Req = struct { x: i32 };
+    const meta = comptime events.customAuthMeta(.{
+        .users = .{
+            .type = .auth,
+            .auth = .{ .methods = .{ .custom = .{
+                "bare_slug",
+                .{ .slug = "typed", .Complete = .{ .Input = Req } },
+            } } },
+        },
+        .posts = .{ .fields = .{} }, // non-auth collection → ignored
+    });
+    try std.testing.expectEqual(@as(usize, 1), meta.len);
+    try std.testing.expectEqualStrings("users", meta[0].col_name);
+    try std.testing.expectEqualStrings("typed", meta[0].slug);
+    try std.testing.expectEqual(void, meta[0].InitiateInput); // default
+    try std.testing.expectEqual(Req, meta[0].CompleteInput);
+    try std.testing.expectEqual(void, meta[0].CompleteOutput); // default
 }

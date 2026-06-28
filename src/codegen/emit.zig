@@ -532,8 +532,11 @@ pub fn emitMeta(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
 // Imports
 // ---------------------------------------------------------------------------
 
-pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool, has_rpc: bool) !void {
-    const send_opts = if (has_rpc) ", type SendOptions" else "";
+/// `needs_send_opts` is true when the generated client references `SendOptions` —
+/// i.e. it has typed RPC routes OR any non-password auth method (built-in or custom),
+/// both of which emit `opts?: SendOptions` parameters.
+pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool, needs_send_opts: bool) !void {
+    const send_opts = if (needs_send_opts) ", type SendOptions" else "";
     if (in_repo) {
         const imports = try std.fmt.allocPrint(alloc,
             \\import {{ createClient as baseCreateClient, type Client{s} }} from "../../../src/index.js";

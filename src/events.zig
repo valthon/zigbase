@@ -11,6 +11,7 @@ const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
 const schema = @import("schema.zig");
 const route_types = @import("route_types.zig");
+const rpc_ts = @import("codegen/rpc_ts.zig");
 
 // ---------------------------------------------------------------------------
 // RAII DB-access handles for `RouteEvent` (the one app-only event that still
@@ -351,6 +352,121 @@ pub const RouteMeta = struct {
     /// doesn't emit a client method that would mis-handle their non-JSON responses.
     untyped: bool = false,
 };
+
+/// Comptime metadata for a TYPED custom auth method: the owning collection + slug
+/// plus the reflected Zig I/O types for its `initiate`/`complete` flows. Mirrors
+/// `RouteMeta` — it carries comptime-only `type` fields and is consumed by the TS
+/// client generator (`gen_client.generate`) to emit precise interfaces for custom
+/// auth methods, exactly as `RouteMeta` drives the typed `rpc.*` surface.
+///
+/// Bare-string custom entries (`.custom = .{"slug"}`) produce NO `CustomAuthMeta`;
+/// they remain untyped (the generator falls back to the `Record<string, unknown>`
+/// stub for any enabled slug it cannot find a meta for). Defaults are `void`, which
+/// the generator maps to "omit the input arg" / `Promise<void>`.
+pub const CustomAuthMeta = struct {
+    col_name: []const u8,
+    slug: []const u8,
+    InitiateInput: type = void,
+    InitiateOutput: type = void,
+    CompleteInput: type = void,
+    CompleteOutput: type = void,
+};
+
+/// Comptime guard for a custom-auth `.Initiate`/`.Complete` sub-struct: it must be a
+/// struct whose only keys are `.Input`/`.Output`. A typo'd key would otherwise be
+/// silently ignored and the type would default to `void` (loud-comptime convention).
+fn validateFlowKeys(comptime Flow: type, comptime col_name: []const u8, comptime which: []const u8) void {
+    comptime {
+        if (@typeInfo(Flow) != .@"struct")
+            @compileError("collection '" ++ col_name ++ "' custom auth entry ." ++ which ++ " must be a struct of the form .{ .Input = T, .Output = U }");
+        for (std.meta.fields(Flow)) |kf| {
+            if (!std.mem.eql(u8, kf.name, "Input") and !std.mem.eql(u8, kf.name, "Output"))
+                @compileError("collection '" ++ col_name ++ "' custom auth entry ." ++ which ++ ": unknown key '." ++ kf.name ++ "' (recognized keys: .Input, .Output)");
+        }
+    }
+}
+
+/// Reflect a raw `.collections` config literal into `[]const CustomAuthMeta`, one
+/// entry per STRUCT custom-auth method across all collections. Walks each
+/// collection's `.auth.methods.custom` tuple; bare-string elements are skipped
+/// (they stay untyped via the runtime slug list lowered in `provision.zig`), struct
+/// elements `.{ .slug, .Initiate = .{ .Input, .Output }, .Complete = .{ .Input,
+/// .Output } }` yield a meta entry. `@compileError`s (loud-comptime convention) on a
+/// struct missing `.slug`, an unknown key, or a non-representable I/O type.
+pub fn customAuthMeta(comptime cols_cfg: anytype) []const CustomAuthMeta {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        const Cfg = @TypeOf(cols_cfg);
+        const cinfo = @typeInfo(Cfg);
+        if (cinfo != .@"struct") return &.{};
+        var list: []const CustomAuthMeta = &.{};
+        for (cinfo.@"struct".fields) |cf| {
+            const col_name = cf.name;
+            const spec = @field(cols_cfg, col_name);
+            if (@typeInfo(@TypeOf(spec)) != .@"struct") continue;
+            if (!@hasField(@TypeOf(spec), "auth")) continue;
+            const auth = spec.auth;
+            if (@typeInfo(@TypeOf(auth)) != .@"struct") continue;
+            if (!@hasField(@TypeOf(auth), "methods")) continue;
+            const methods = auth.methods;
+            if (@typeInfo(@TypeOf(methods)) != .@"struct") continue;
+            if (!@hasField(@TypeOf(methods), "custom")) continue;
+            const custom = methods.custom;
+            // `.custom` may be a bare tuple `.{ ... }` or a `&.{ ... }` pointer-to-tuple.
+            const tup = if (@typeInfo(@TypeOf(custom)) == .pointer) custom.* else custom;
+            const TT = @TypeOf(tup);
+            if (@typeInfo(TT) != .@"struct")
+                @compileError("collection '" ++ col_name ++ "' .auth.methods.custom must be a tuple of slug strings and/or typed-method structs");
+            for (std.meta.fields(TT)) |ef| {
+                const elem = @field(tup, ef.name);
+                const E = @TypeOf(elem);
+                switch (@typeInfo(E)) {
+                    // Bare slug string (`*const [N:0]u8` or `[]const u8`) → untyped, no meta.
+                    .pointer => {},
+                    .@"struct" => {
+                        if (!@hasField(E, "slug"))
+                            @compileError("collection '" ++ col_name ++ "' custom auth entry must be a slug string or a struct with a .slug field");
+                        // Loud-comptime: reject typo'd keys on the typed entry.
+                        for (std.meta.fields(E)) |kf| {
+                            if (!std.mem.eql(u8, kf.name, "slug") and
+                                !std.mem.eql(u8, kf.name, "Initiate") and
+                                !std.mem.eql(u8, kf.name, "Complete"))
+                                @compileError("collection '" ++ col_name ++ "' custom auth entry: unknown key '." ++ kf.name ++ "' (recognized keys: .slug, .Initiate, .Complete)");
+                        }
+                        var meta = CustomAuthMeta{ .col_name = col_name, .slug = elem.slug };
+                        // Loud-comptime: an `.Initiate`/`.Complete` sub-struct must be a
+                        // struct whose only keys are `.Input`/`.Output` — otherwise a typo
+                        // like `.input`/`.ouput` would SILENTLY fall back to `void`.
+                        if (@hasField(E, "Initiate")) {
+                            const ini = elem.Initiate;
+                            validateFlowKeys(@TypeOf(ini), col_name, "Initiate");
+                            if (@hasField(@TypeOf(ini), "Input")) meta.InitiateInput = ini.Input;
+                            if (@hasField(@TypeOf(ini), "Output")) meta.InitiateOutput = ini.Output;
+                        }
+                        if (@hasField(E, "Complete")) {
+                            const cmp = elem.Complete;
+                            validateFlowKeys(@TypeOf(cmp), col_name, "Complete");
+                            if (@hasField(@TypeOf(cmp), "Input")) meta.CompleteInput = cmp.Input;
+                            if (@hasField(@TypeOf(cmp), "Output")) meta.CompleteOutput = cmp.Output;
+                        }
+                        for ([_]struct { t: type, w: []const u8 }{
+                            .{ .t = meta.InitiateInput, .w = "Initiate.Input" },
+                            .{ .t = meta.InitiateOutput, .w = "Initiate.Output" },
+                            .{ .t = meta.CompleteInput, .w = "Complete.Input" },
+                            .{ .t = meta.CompleteOutput, .w = "Complete.Output" },
+                        }) |chk| {
+                            if (!rpc_ts.isRepresentable(chk.t))
+                                @compileError("custom auth method '" ++ meta.slug ++ "' on collection '" ++ col_name ++ "': " ++ chk.w ++ " type '" ++ @typeName(chk.t) ++ "' is not representable in the TS subset (allowed: void, bool, int, float, []const u8, enum, std.json.Value, optional, slice, and structs thereof)");
+                        }
+                        list = list ++ &[_]CustomAuthMeta{meta};
+                    },
+                    else => @compileError("collection '" ++ col_name ++ "' custom auth entry must be a slug string or a struct with a .slug field"),
+                }
+            }
+        }
+        return list;
+    }
+}
 
 /// Comptime path→method-name (mirrors codegen `identifiers.routeMethodName`) with an
 /// optional `.name` override. Strips the "/api" prefix + ":param" segments, camel-joins

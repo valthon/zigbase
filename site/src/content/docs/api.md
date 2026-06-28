@@ -479,6 +479,8 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 
 `:method` is the method slug (`magic_link`, `otp`, `password`, `webauthn`, `oauth2`, or a custom plugin's slug). Returns 404 when the collection doesn't exist, isn't an auth collection, or the method isn't enabled.
 
+> The generated TypeScript client exposes these as `zb.auth.<col>.<method>.{initiate,complete}`. Built-ins are typed; custom methods can declare comptime I/O types to get precise interfaces too — see [typescript-sdk.md → Typed auth methods](typescript-sdk.md#typed-auth-methods--zbauth).
+
 > **`require_verified`:** if the auth collection is configured with `require_verified: true`, `complete` returns **403** when the matched record's `verified` field is `false`. This applies to all methods — including WebAuthn and OAuth2 accounts from providers that did not confirm the email address (created `verified=false`).
 
 **WebAuthn passkey registration** (authed — requires a valid session):
