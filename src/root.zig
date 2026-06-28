@@ -90,6 +90,10 @@ pub const Backend = @import("queue/queue.zig").Backend;
 pub const Priority = @import("queue/queue.zig").Priority;
 pub const Backoff = @import("queue/queue.zig").Backoff;
 pub const QueueRegistry = @import("queue/queue.zig").Registry;
+// Outbound webhooks (#144): `ctx.webhook(url, payload, .{…})` enqueues a managed,
+// retrying delivery via the built-in `"webhook"` job kind.
+pub const WebhookOpts = @import("webhook.zig").WebhookOpts;
+pub const WebhookHmac = @import("webhook.zig").Hmac;
 
 // ---- Ctx capability object -------------------------------------------------
 pub const Ctx = @import("ctx.zig").Ctx;
@@ -272,4 +276,5 @@ test {
     _ = @import("http_client.zig");
     _ = @import("testcapture.zig");
     _ = @import("captcha.zig");
+    _ = @import("webhook.zig");
 }

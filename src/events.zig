@@ -117,7 +117,7 @@ pub const RecordEvent = struct {
     // connection — so a before-hook's side-write commits/rolls back atomically with it.
 };
 
-pub const ErrorPhase = enum { request, before_hook, after_hook, cron, job, file_serve };
+pub const ErrorPhase = enum { request, before_hook, after_hook, cron, job, file_serve, webhook };
 
 pub const ErrorEvent = struct {
     app: *App,

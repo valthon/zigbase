@@ -611,6 +611,49 @@ const res2 = try client.post("https://webhook.example.com/notify", .{
 });
 ```
 
+### `ctx.webhook()` — managed outbound webhooks (#144)
+
+`ctx.http()` is a one-shot client — fire-and-handle-the-result yourself. `ctx.webhook()`
+is its **managed, retrying** counterpart: it serializes `payload` to JSON, enqueues a
+background `"webhook"` job (a built-in queue kind, like `"mail"`), and a worker POSTs it
+with automatic retries and back-off.
+
+```zig
+try ctx.webhook("https://hooks.example.com/booking", .{
+    .event = "booking_confirmed",
+    .id    = booking_id,
+}, .{
+    .queue   = "outbound",          // null → the always-present "default" queue
+    .retries = 5,                    // max delivery attempts (1 = no retry)
+    .backoff = .exponential,         // .fixed | .exponential (queue back-off math)
+    .timeout_s = 10,                 // per-attempt request timeout
+    .sign    = .{ .secret = "whsec_…" }, // optional HMAC-SHA256 body signature
+    // .idempotency = true,          // default: stable Idempotency-Key across retries
+});
+```
+
+**Response classification.** A `2xx` is delivered. A **network/transport error, any `5xx`,
+or a `429`** (honoring an integer `Retry-After` in preference to the configured back-off)
+is **retryable** up to `retries`. **Any other `4xx`** (and `1xx`/`3xx`) is **terminal** —
+the receiver rejected it, so retrying is pointless. When delivery is terminally rejected
+**or** attempts are exhausted, the framework fires your `.onError` hook with phase
+**`.webhook`**; the job itself then succeeds so the queue does not double-retry.
+
+**Signing (`opts.sign`).** When set, each attempt adds `X-Signature:
+hex(HMAC-SHA256(secret, "<timestamp>.<body>"))` and `X-Webhook-Timestamp: <unix>`. The
+timestamp is bound into the signed string (and is fresh per attempt) so a captured request
+cannot be replayed indefinitely; a receiver recomputes the digest over `"<timestamp>.<raw
+body>"` and compares. Header names are overridable on the `Hmac` struct.
+
+**Idempotency (`opts.idempotency`, default on).** A single `Idempotency-Key` is minted
+**once** at enqueue time and frozen onto the (durable) job row, so every retry — and any
+at-least-once replay after a crash — reuses the same key, letting the receiver dedupe.
+
+> Security note: a **durable**, **signed** webhook persists the signing secret inside the
+> `_queue_jobs.payload` column (your own DB). Prefer a `memory` queue, a short
+> `done_ttl_s`, or DB-at-rest encryption if that is a concern. TLS verification is always
+> on. Requires a wired queue (see [§7b Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs)).
+
 ### `ctx.verifyCaptcha()` — CAPTCHA verification (#140)
 
 Verify a browser-submitted CAPTCHA token against one of four supported providers:

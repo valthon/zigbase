@@ -26,6 +26,7 @@ const queue_mod = @import("queue/queue.zig");
 const queue_memory = @import("queue/memory.zig");
 const queue_durable = @import("queue/durable.zig");
 const mail_send = @import("mail/send.zig");
+const webhook_mod = @import("webhook.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -272,6 +273,37 @@ pub const Ctx = struct {
     /// header-injection rejection + recipient address validation — see `MailApi`.
     pub fn mail(self: *Ctx) MailApi {
         return .{ .ctx = self };
+    }
+
+    /// Caller-facing options for `ctx.webhook` (re-exported from `webhook.zig`).
+    pub const WebhookOpts = webhook_mod.WebhookOpts;
+
+    /// Enqueue a managed outbound webhook delivery (#144). The `payload` is
+    /// JSON-serialized into the request body and POSTed by the built-in `"webhook"`
+    /// job kind on the selected queue (`opts.queue` orelse the always-present
+    /// `"default"` queue). The handler classifies the response — network errors,
+    /// 5xx, and 429 (honoring an integer `Retry-After`) are RETRYABLE up to
+    /// `opts.retries`; any other 4xx is TERMINAL; a terminal/exhausted delivery
+    /// fires `.onError` with phase `.webhook`.
+    ///
+    /// `opts.sign` adds an `HMAC-SHA256` body signature (`X-Signature` +
+    /// `X-Webhook-Timestamp`); `opts.idempotency` (default on) attaches a stable
+    /// `Idempotency-Key` minted ONCE here and frozen onto the (durable) job row so
+    /// every retry/replay reuses it. Requires a wired queue registry
+    /// (`error.QueuesUnavailable` otherwise).
+    pub fn webhook(self: *Ctx, url: []const u8, payload: anytype, opts: WebhookOpts) !void {
+        const body = try self.serializePayload(payload);
+        const idem: ?[]const u8 = if (opts.idempotency) try self.randomHex(16) else null;
+        const job = webhook_mod.WebhookJob{
+            .url = url,
+            .body = body,
+            .idempotency_key = idem,
+            .sign = opts.sign,
+            .max_attempts = opts.retries,
+            .backoff = opts.backoff,
+            .timeout_ms = std.math.mul(u32, opts.timeout_s, 1000) catch std.math.maxInt(u32),
+        };
+        return self.enqueueByName(opts.queue orelse "default", webhook_mod.job_kind, job);
     }
 
     // -----------------------------------------------------------------------
