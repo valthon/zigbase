@@ -2,6 +2,13 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const clock_sql = @import("clock_sql.zig");
 const clock_vfs = @import("clock_vfs.zig");
+const build_options = @import("build_options");
+
+/// sqlite-vec's static entry point (#157). Declared unconditionally but only REFERENCED inside the
+/// `build_options.vector` comptime branch in `open`, so the default build neither links the symbol
+/// nor compiles the amalgamation. With `-DSQLITE_CORE` the init fn calls SQLite directly (no api
+/// routines pointer needed), so we pass null for pzErrMsg/pApi.
+extern fn sqlite3_vec_init(db: ?*c.sqlite3, pzErrMsg: ?*?[*:0]u8, pApi: ?*const anyopaque) callconv(.c) c_int;
 
 /// Returns the linked SQLite library version string, e.g. "3.53.2".
 pub fn libVersion() []const u8 {
@@ -42,6 +49,9 @@ pub const Db = struct {
         // honors the frozen test clock (#84). comptime no-op on a prod build, so the writer/
         // any Db.open caller (incl. openMemory) is unchanged in production.
         clock_sql.register(conn.handle);
+        // Opt-in vector search (#157): register sqlite-vec on every connection so vec_distance_*
+        // is available to the reader pool + writer. comptime-folded away in the default build.
+        if (build_options.vector) _ = sqlite3_vec_init(conn.handle, null, null);
         return conn;
     }
 

@@ -21,6 +21,7 @@ const rules = @import("rules.zig");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
 const secrets = @import("oauth/secrets.zig");
+const fts = @import("search/fts.zig");
 
 /// F3 startup lint: log a prominent warning for every `@public` (allow-all) rule on `col`, so a
 /// wide-open collection is never silent. Called once per collection during provisioning.
@@ -152,7 +153,7 @@ fn rejectUnknownKeys(comptime spec: anytype, comptime allowed: []const []const u
 }
 
 /// Field keys read by `buildOptions` for a given field type, on top of the common
-/// keys handled in `buildField` (name/type/required/unique/hidden/encrypted). Kept in
+/// keys handled in `buildField` (name/type/required/unique/hidden/encrypted/searchable). Kept in
 /// lock-step with the `switch (ftype)` in `buildOptions` — a key read there must appear
 /// here or a valid spec would falsely @compileError.
 fn fieldOptionKeys(comptime ftype: schema.FieldType) []const []const u8 {
@@ -179,7 +180,7 @@ fn rejectUnknownFieldKeys(comptime f: anytype, comptime ftype: schema.FieldType,
     comptime {
         const info = @typeInfo(@TypeOf(f));
         if (info != .@"struct") return;
-        const common = [_][]const u8{ "name", "type", "required", "unique", "hidden", "encrypted" };
+        const common = [_][]const u8{ "name", "type", "required", "unique", "hidden", "encrypted", "searchable" };
         const opt = fieldOptionKeys(ftype);
         for (info.@"struct".fields) |fld| {
             var ok = false;
@@ -440,6 +441,17 @@ fn buildField(comptime col_name: []const u8, comptime f: anytype) schema.Field {
         if (@hasField(F, "unique")) field.unique = f.unique;
         if (@hasField(F, "hidden")) field.hidden = f.hidden;
         if (@hasField(F, "encrypted")) field.encrypted = f.encrypted;
+        if (@hasField(F, "searchable")) field.searchable = f.searchable;
+
+        // Full-text search (#157): only free-text columns can be mirrored into an FTS5 index, and an
+        // encrypted column (per-row-nonce ciphertext) can never be searchable. Enforced loud at
+        // comptime here; the runtime collections API mirrors these in schema.validate.
+        if (field.searchable) {
+            if (!schema.isSearchableType(ftype))
+                @compileError("field '" ++ fname ++ "' in collection '" ++ col_name ++ "': .searchable is only supported on text/editor fields");
+            if (field.encrypted)
+                @compileError("field '" ++ fname ++ "' in collection '" ++ col_name ++ "': an encrypted field cannot be .searchable (ciphertext is not full-text searchable)");
+        }
 
         // At-rest encryption (Theme B1) is only meaningful for string-stored types
         // and is incompatible with uniqueness (a per-row nonce means identical
@@ -839,11 +851,16 @@ pub fn ensureCollection(
         _ = try collections.create(alloc, io, w, spec);
         std.log.info("provision: created collection '{s}'", .{spec.name});
         try ensureTenantIndex(alloc, w, spec);
+        try fts.ensureIndex(alloc, w, spec);
         return;
     }
     const live = existing.?;
     // The physical table exists now; ensure the tenant_field is indexed (idempotent).
     try ensureTenantIndex(alloc, w, spec);
+    // Provision/refresh the FTS5 full-text index (#157) — idempotent; rebuilds if the searchable
+    // column set drifted or an earlier additive rebuild dropped the sync triggers. Runs every
+    // startup so an upgrade that adds `.searchable` builds the index without a migration.
+    try fts.ensureIndex(alloc, w, spec);
 
     // Diff user fields. `live.fields` from get() includes injected auth system
     // fields for auth collections; compare only against non-system field names.
@@ -921,6 +938,9 @@ pub fn ensureCollection(
     newdef.options.ttl_field = spec.options.ttl_field;
     _ = try collections.update(alloc, io, w, live.id, newdef);
     std.log.info("provision: collection '{s}' added {d} field(s)", .{ spec.name, additions.items.len });
+    // The additive rebuild drops triggers tied to the old table; re-ensure the FTS index so its
+    // sync triggers (and any newly-searchable column) are restored.
+    try fts.ensureIndex(alloc, w, spec);
 }
 
 /// Return a copy of `col` where each single-relation field's targetCollectionId

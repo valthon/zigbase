@@ -20,6 +20,8 @@ const datetime = @import("datetime.zig");
 const field_policy = @import("field_policy.zig");
 const tenancy = @import("tenancy/tenancy.zig");
 const abilities = @import("authz/abilities.zig");
+const fts = @import("search/fts.zig");
+const vector = @import("search/vector.zig");
 
 /// A compiled rule constraint enforced atomically on create/update.
 pub const Guard = struct {
@@ -1113,6 +1115,15 @@ pub const ListQuery = struct {
     perPage: u32 = 30,
     rule: ?[]const u8 = null,
     rctx: ?*const request.RequestContext = null,
+    /// Full-text search terms (#157, the `?search=`/`?q=` param). When non-null/non-empty on a
+    /// SEARCHABLE collection, a bound FTS5 `MATCH` predicate is AND-ed into the same WHERE
+    /// composition as filter/rule/ability/tenant/ttl, and results are ranked by bm25 relevance
+    /// (offset mode). A search on a non-searchable collection returns `error.NotSearchable`.
+    search: ?[]const u8 = null,
+    /// Vector / nearest-neighbor search spec (#157, the `?vector=` param) — `<field>[:metric]:<json
+    /// embedding>`. Honored only in a `-Dvector` build (else `error.VectorDisabled`); composes a
+    /// KNN distance ordering into the SAME scoped query (offset mode).
+    vectorSpec: ?[]const u8 = null,
     /// Opaque cursor token. When non-null, `list` runs in CURSOR (keyset) mode. The `page`
     /// field is then ignored. Decode/validation failures surface as keyset.DecodeError.
     cursor: ?[]const u8 = null,
@@ -1715,12 +1726,73 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     var j = joiner.Joiner.init(alloc, conn, col);
     var where_sql: []const u8 = "";
     var params: []const compiler.Param = &.{};
+
+    // Full-text search (#157): compose a BOUND FTS5 `MATCH` predicate as the FIRST WHERE clause —
+    // so its `?` is params[0] — then let filter/rule/ability/tenant/ttl below narrow it further. The
+    // FTS shadow table is brought in via a join; relevance (bm25 `rank`) drives the OFFSET ordering.
+    // CRITICAL: search NEVER bypasses scoping — it AND-s INTO the same composition, so a search on a
+    // tenant-/ability-guarded collection still returns only rows the caller may view. A search on a
+    // collection with no searchable field is `error.NotSearchable` (handler -> 400).
+    var search_order: ?[]const u8 = null;
+    var search_term_hash: ?[]const u8 = null; // the SANITIZED term, folded into the cursor hash
+    if (q.search) |sterm| {
+        const trimmed = std.mem.trim(u8, sterm, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (!fts.isSearchable(col)) return error.NotSearchable;
+            if (try fts.build(alloc, col, sterm)) |s| {
+                try j.joins.append(alloc, s.join_sql);
+                where_sql = s.where_sql;
+                const p = try alloc.alloc(compiler.Param, 1);
+                p[0] = s.param;
+                params = p;
+                search_order = s.order_sql;
+                search_term_hash = s.param.text;
+            } else {
+                // A non-empty search that sanitizes to nothing (operator-/punctuation-only, e.g.
+                // `?search=AND`) carries no matchable token. Match NOTHING rather than silently
+                // degrade to a full (scoped) list — the constant-false `"0"` fragment short-circuits
+                // every page to empty through the normal machinery (and AND-s harmlessly with the
+                // scope predicates below). The query was a search; an empty search yields no rows.
+                where_sql = "0";
+                search_term_hash = trimmed; // bind the cursor to the (rejected) term anyway
+            }
+        }
+    }
+
+    // Vector / nearest-neighbor search (#157, gated by `-Dvector`). The WHERE fragment (no param)
+    // AND-s into the same scoped composition; the distance ordering + its bound query-embedding
+    // param are threaded into the OFFSET path below. A `?vector=` in a default build, or in cursor
+    // mode, is a clean error the handler maps to 400.
+    var vector_order: ?[]const u8 = null;
+    var vector_param: ?compiler.Param = null;
+    if (q.vectorSpec) |vspec| if (vspec.len > 0) {
+        // `vector.build` carries the explicit `error.VectorDisabled` in a default build, so the
+        // handler's error mapping stays well-typed regardless of the `-Dvector` flag.
+        const v = try vector.build(alloc, col, vspec);
+        if (q.cursor != null or q.cursorMode) return error.VectorCursorUnsupported;
+        where_sql = if (where_sql.len > 0)
+            try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, v.where_sql })
+        else
+            v.where_sql;
+        vector_order = v.order_sql;
+        vector_param = v.param;
+    };
+
     if (q.filter) |fstr| if (fstr.len > 0) {
         const toks = try lexer.lex(alloc, fstr);
         const ast = try parser.parse(alloc, toks);
         const compiled = try compiler.compile(alloc, &j, ast, null);
-        where_sql = compiled.where_sql;
-        params = compiled.params;
+        // AND-compose onto any prior clause (the FTS `MATCH` / vector predicate set above) and
+        // APPEND params — never assign, which would clobber the search predicate AND drop its bound
+        // term, so `?search=X&filter=Y` would silently ignore the search. Mirrors the rule block.
+        where_sql = if (where_sql.len > 0)
+            try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, compiled.where_sql })
+        else
+            compiled.where_sql;
+        var merged: std.ArrayList(compiler.Param) = .empty;
+        try merged.appendSlice(alloc, params);
+        try merged.appendSlice(alloc, compiled.params);
+        params = try merged.toOwnedSlice(alloc);
     };
     if (q.rule) |rstr| if (rstr.len > 0) {
         const rtoks = try lexer.lex(alloc, rstr);
@@ -1803,10 +1875,17 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // (client sort or the default `created DESC`) UNCHANGED so existing offset clients are byte-
     // identical.
     const base_terms = if (q.sort) |sstr| (if (sstr.len > 0) try sort.compileTerms(alloc, &j, sstr) else &.{}) else &.{};
-    const offset_order_sql: []const u8 = if (base_terms.len > 0)
+    var offset_order_sql: []const u8 = if (base_terms.len > 0)
         try sort.orderByFromTerms(alloc, base_terms)
     else
         try std.fmt.allocPrint(alloc, "\"{s}\".\"created\" DESC", .{col.name});
+    // Search/vector relevance leads the OFFSET ordering: bm25 `rank` (FTS) and/or nearest-neighbor
+    // distance (vector), with any client sort kept as the tiebreaker. Cursor mode keeps the keyset
+    // order (the MATCH/where predicate still scopes the page; vector cursors are rejected above).
+    if (search_order) |so|
+        offset_order_sql = if (base_terms.len > 0) try std.fmt.allocPrint(alloc, "{s}, {s}", .{ so, offset_order_sql }) else so;
+    if (vector_order) |vo|
+        offset_order_sql = if (base_terms.len > 0 or search_order != null) try std.fmt.allocPrint(alloc, "{s}, {s}", .{ vo, offset_order_sql }) else vo;
     const eff_terms = try effectiveSortTerms(alloc, col, base_terms);
     const order_sql = try sort.orderByFromTerms(alloc, eff_terms);
 
@@ -1829,7 +1908,11 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         // The token binds to the PUBLIC effective-sort spec (e.g. "-created,id"), not the column
         // SQL — so an SDK that synthesizes the same spec produces a matching cursor.
         const eff_sort_str = try effectiveSortString(alloc, eff_terms);
-        const fh = keyset.filterHash(q.filter, q.rule);
+        // Fold the SANITIZED search term into the cursor hash so a token minted under `?search=X` is
+        // rejected when replayed with a different search (else the boundary would straddle a
+        // different result set). Vector + cursor is rejected earlier, so the vector spec can't reach
+        // here. `q.filter`/`q.rule` already bind the rest of the result-set shape.
+        const fh = keyset.filterHash(q.filter, q.rule, search_term_hash);
 
         // Decode the boundary cursor (if any). first_page = no token supplied.
         const maybe_cur: ?keyset.Cursor = if (q.cursor) |token| try decodeCursor(alloc, q, conn, col, token, eff_sort_str, fh) else null;
@@ -1913,7 +1996,10 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, offset_order_sql }, 0);
     var pst = try conn.prepare(page_sql);
     defer pst.finalize();
-    const after = try bindParams(&pst, params, 1);
+    var after = try bindParams(&pst, params, 1);
+    // The vector ORDER BY carries one `?` (the query embedding), positioned after the WHERE params
+    // and before LIMIT/OFFSET in the SQL — bind it there so the placeholder indices line up.
+    if (vector_param) |vp| after = try bindParams(&pst, &.{vp}, after);
     try pst.bindInt(after, @intCast(per));
     try pst.bindInt(after + 1, offset);
 

@@ -221,13 +221,16 @@ const Wire = struct {
 /// fnv64 of the normalized (trimmed) filter and rule expressions, in a fixed order with a
 /// separator so distinct (filter, rule) pairs can't collide by concatenation. A null/empty
 /// filter or rule hashes as the empty string.
-pub fn filterHash(filter: ?[]const u8, rule: ?[]const u8) u64 {
+pub fn filterHash(filter: ?[]const u8, rule: ?[]const u8, search: ?[]const u8) u64 {
     var h = std.hash.Fnv1a_64.init();
     const f = std.mem.trim(u8, filter orelse "", " \t\r\n");
     const r = std.mem.trim(u8, rule orelse "", " \t\r\n");
+    const s = std.mem.trim(u8, search orelse "", " \t\r\n");
     h.update(f);
     h.update("\x00"); // unambiguous separator
     h.update(r);
+    h.update("\x00");
+    h.update(s); // the full-text search term (#157): a cursor is bound to its search too
     return h.final();
 }
 
@@ -566,8 +569,11 @@ test "stateful payload round-trips through the store blob form" {
 }
 
 test "filterHash: stable, whitespace-normalized, order-sensitive between filter and rule" {
-    try testing.expectEqual(filterHash("a = 1", "b = 2"), filterHash("  a = 1 ", "b = 2\n"));
-    try testing.expect(filterHash("a = 1", "b = 2") != filterHash("b = 2", "a = 1"));
-    try testing.expectEqual(filterHash(null, null), filterHash("", ""));
-    try testing.expect(filterHash("a", null) != filterHash(null, "a"));
+    try testing.expectEqual(filterHash("a = 1", "b = 2", null), filterHash("  a = 1 ", "b = 2\n", null));
+    try testing.expect(filterHash("a = 1", "b = 2", null) != filterHash("b = 2", "a = 1", null));
+    try testing.expectEqual(filterHash(null, null, null), filterHash("", "", ""));
+    try testing.expect(filterHash("a", null, null) != filterHash(null, "a", null));
+    // The search term participates: same filter+rule but a different search => a different hash.
+    try testing.expect(filterHash("a = 1", null, "zig") != filterHash("a = 1", null, "rust"));
+    try testing.expectEqual(filterHash("a = 1", null, null), filterHash("a = 1", null, ""));
 }
