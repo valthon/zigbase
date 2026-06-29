@@ -5,7 +5,7 @@ const App = @import("../app.zig").App;
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
-const rules = @import("../rules.zig");
+const policy = @import("../policy.zig");
 const auth = @import("../auth.zig");
 const id = @import("../id.zig");
 const protocol = @import("protocol.zig");
@@ -68,7 +68,7 @@ fn releaseConnectionSlot() void {
 /// still independently gated per record by `hub.shouldDeliver`; this just stops anonymous sockets
 /// from registering subscriptions on gated data.
 fn subscribeAuthorized(view_rule: ?[]const u8, authed: bool, is_superuser: bool) bool {
-    if (rules.isPublic(view_rule)) return true;
+    if (policy.isPublic(view_rule)) return true;
     return authed or is_superuser;
 }
 

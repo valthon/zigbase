@@ -10,7 +10,7 @@ const ApiError = @import("error.zig").ApiError;
 const FieldError = @import("error.zig").FieldError;
 const params_mod = @import("../query/params.zig");
 const expand_mod = @import("../query/expand.zig");
-const rules = @import("../rules.zig");
+const policy = @import("../policy.zig");
 const request = @import("../request.zig");
 const Ctx = @import("../ctx.zig").Ctx;
 const auth = @import("../auth.zig");
@@ -150,10 +150,10 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rctx = buildContext(ctx, &r, null);
-    switch (rules.decide(col.viewRule, &rctx)) {
+    switch (policy.decide(col, .view, &rctx)) {
         .deny_locked => return ApiError.notFound().toResponse(ctx.allocator),
         .allow => {},
-        .check => if (!try rules.matches(ctx.allocator, &r, col, rid, col.viewRule.?, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
+        .check => if (!try policy.authorizes(ctx.allocator, &r, col, .view, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
     }
     var rec = (try records.get(ctx.allocator, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const qp = try params_mod.parse(ctx.allocator, ctx.query);
@@ -210,7 +210,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const rctx = buildContext(ctx, w, data);
     // Gate FIRST: before-hooks must run only on already-authorized ops (matching delete).
     // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
-    const decision = rules.decide(col.createRule, &rctx);
+    const decision = policy.decide(col, .create, &rctx);
     if (decision == .deny_locked) return forbidden(ctx);
 
     // A2 KEYSTONE: the handler owns ONE write transaction spanning the before-hook,
@@ -255,7 +255,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // Access-rule guard evaluated INSIDE the transaction:
     // a denial rolls the INSERT back so a forbidden write never persists.
     if (decision == .check) {
-        const guard = try rules.compileGuard(ctx.allocator, w, col, col.createRule.?, &rctx);
+        const guard = (try policy.compilePredicate(ctx.allocator, w, col, .create, &rctx)).?;
         if (!try records.guardPasses(ctx.allocator, w, col, rec.object.get("id").?.string, guard)) {
             w.rollback() catch {};
             return forbidden(ctx);
@@ -303,7 +303,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const rctx = buildContext(ctx, w, data);
     // Gate FIRST: before-hooks must run only on already-authorized ops (matching delete).
     // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
-    const decision = rules.decide(col.updateRule, &rctx);
+    const decision = policy.decide(col, .update, &rctx);
     if (decision == .deny_locked) return forbidden(ctx);
 
     // A2 KEYSTONE: one transaction spanning the before-hook, the UPDATE, and the
@@ -355,7 +355,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     // Access-rule guard evaluated INSIDE the transaction on the UPDATED row:
     // a denial rolls the UPDATE back. A guard miss maps to 404.
     if (decision == .check) {
-        const guard = try rules.compileGuard(ctx.allocator, w, col, col.updateRule.?, &rctx);
+        const guard = (try policy.compilePredicate(ctx.allocator, w, col, .update, &rctx)).?;
         if (!try records.guardPasses(ctx.allocator, w, col, rid, guard)) {
             w.rollback() catch {};
             if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
@@ -385,10 +385,10 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     const rctx = buildContext(ctx, w, null);
     // Gate FIRST (pre-delete authorization): the deleteRule is checked against the live
     // row before the transaction opens — unchanged semantics.
-    switch (rules.decide(col.deleteRule, &rctx)) {
+    switch (policy.decide(col, .delete, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => {},
-        .check => if (!try rules.matches(ctx.allocator, w, col, rid, col.deleteRule.?, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
+        .check => if (!try policy.authorizes(ctx.allocator, w, col, .delete, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
     }
 
     // A2 KEYSTONE: one transaction spanning the before-hook, the DELETE, and the auth
@@ -432,7 +432,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rctx = buildContext(ctx, &r, null);
     var rule_expr: ?[]const u8 = null;
-    switch (rules.decide(col.listRule, &rctx)) {
+    switch (policy.decide(col, .list, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => {},
         .check => rule_expr = col.listRule,
