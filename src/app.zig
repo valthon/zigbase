@@ -56,6 +56,10 @@ pub const App = struct {
     /// config in serveImpl. Default `.enabled = false` is the byte-identical no-tenancy path: the
     /// per-request resolver is skipped and `tenancy.scopePredicate` is a no-op.
     tenancy: tenancy_mod.Runtime = .{},
+    /// Role total-order (#155/#156) used to compare a membership role against an ability's
+    /// `.min_role`. Threaded from the comptime `.tenancy.roles` config (default ladder otherwise)
+    /// and copied onto each request's `RequestContext.role_ranking` by `buildContext`.
+    role_ranking: @import("tenancy/roles.zig").Ranking = .{},
     /// Type-erased event dispatch built by the comptime App(cfg) builder; null = no subscribers.
     dispatch: ?*const @import("events.zig").Dispatch = null,
     /// Declared feature-flag + experiment registry (lowered at comptime from the

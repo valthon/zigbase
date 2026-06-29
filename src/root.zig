@@ -107,6 +107,13 @@ pub const RoleRanking = @import("tenancy/roles.zig").Ranking;
 pub const TenancyResolver = @import("tenancy/tenancy.zig").Resolver;
 /// Build a cross-tenant request context (superuser/admin tooling) that suppresses tenant scoping.
 pub const crossTenant = @import("tenancy/tenancy.zig").crossTenant;
+// Abilities (#155, PR3): relationship-based row authorization configured via
+// `App(.{ .abilities = .{ .<col> = .{ .view = .{ .relationship = .{ .via, .min_role } } } } })`.
+// `policy.zig` composes the lowered predicate into the same guard stack as the access rule and
+// tenant scope; `ctx.can(.action, "col", id)` authorizes a record through that same path.
+pub const Ability = @import("authz/abilities.zig").Ability;
+pub const Abilities = @import("authz/abilities.zig").Abilities;
+pub const PolicyAction = @import("policy.zig").Action;
 
 // ---- Ctx capability object -------------------------------------------------
 pub const Ctx = @import("ctx.zig").Ctx;
@@ -194,6 +201,7 @@ test {
     _ = @import("policy.zig");
     _ = @import("tenancy/roles.zig");
     _ = @import("tenancy/tenancy.zig");
+    _ = @import("authz/abilities.zig");
     _ = @import("api/accounts.zig");
     _ = @import("crypto.zig");
     _ = @import("aead.zig");
