@@ -98,6 +98,18 @@ fn andPredicate(alloc: std.mem.Allocator, guard: ?Guard, sql: []const u8, extra:
     return .{ .where_sql = sql, .params = try alloc.dupe(compiler.Param, extra) };
 }
 
+/// The list rule expression to compose as a FILTER in the list read-path, or null when none
+/// applies. The list handler can't reuse `compilePredicate` (the list/cursor engine rolls its own
+/// composition), so this mirrors `compilePredicate`'s rule arm for the list path: a rule is returned
+/// ONLY when it is ITSELF a `.check` expression. An allow/`@public`/locked rule — or a `.check`
+/// forced purely by an ability or the tenant scope — yields null, so the handler never feeds a
+/// non-filter sentinel like `@public` to the filter compiler (which would 400). The ability and
+/// tenant predicates are composed INSIDE `records.list` independently of this. (#155)
+pub fn listRuleFilter(col: schema.Collection, rctx: *const request.RequestContext) ?[]const u8 {
+    if (rules.decide(col.listRule, rctx) == .check) return col.listRule;
+    return null;
+}
+
 /// Compile the composed predicate for `action` into a `Guard`, or null when no predicate applies
 /// (the `allow` state — superuser/@public). A `deny_locked` state yields a constant-false guard so
 /// AND-ing it denies every row (fail-closed). PR1: the only contributing predicate is the access
@@ -442,4 +454,95 @@ test "ability with no qualifying membership compiles to constant-false (fail clo
     const ok = [_]request.Membership{.{ .account = "acc1", .role = "owner" }};
     const okctx = request.RequestContext{ .memberships = &ok };
     try std.testing.expect(try authorizes(a, &d, col, .view, "r1", &okctx));
+}
+
+// ---- Abilities LIST read-path regression tests (#155 CRITICAL-1) ------------
+// CRITICAL-1: the bulk LIST endpoint composes filter+rule+TTL+tenant in `records.zig:list` and
+// previously had ZERO ability composition, so an ability-guarded collection leaked ability-denied
+// rows on `GET …/records` and 400'd the documented `@public` + view-ability config. These exercise
+// the REAL `records.list` engine path (not just the policy layer the prior PIN tests covered) plus
+// `policy.listRuleFilter` (the handler's rule-selection), the seam where the bug lived.
+
+/// Owner ids present in a list result, for set assertions.
+fn listOwners(items: []std.json.Value) [][]const u8 {
+    var out = std.testing.allocator.alloc([]const u8, items.len) catch unreachable;
+    for (items, 0..) |it, i| out[i] = it.object.get("owner").?.string;
+    return out;
+}
+
+fn hasOwner(owners: [][]const u8, want: []const u8) bool {
+    for (owners) |o| if (std.mem.eql(u8, o, want)) return true;
+    return false;
+}
+
+test "records.list narrows to ability-viewable rows (viewer + non-member excluded)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = try pinBase(a, &d);
+    // Three rows owned by three different accounts.
+    try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
+        "('r1','t','t','x','acc1'),('r2','t','t','y','acc2'),('r3','t','t','z','acc3');");
+    // view ability: editor+ of the owning account. Caller: editor of acc1, viewer of acc2, no acc3.
+    const col = withRule(withAbility(base, "editor"), "@public");
+    const mem = [_]request.Membership{
+        .{ .account = "acc1", .role = "editor" },
+        .{ .account = "acc2", .role = "viewer" },
+    };
+    const rctx = request.RequestContext{ .memberships = &mem };
+    const res = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &rctx), .rctx = &rctx });
+    const owners = listOwners(res.items);
+    defer std.testing.allocator.free(owners);
+    // Only acc1's row (editor >= editor). acc2 (viewer) and acc3 (non-member) are filtered out.
+    try std.testing.expectEqual(@as(usize, 1), res.items.len);
+    try std.testing.expect(hasOwner(owners, "acc1"));
+    try std.testing.expect(!hasOwner(owners, "acc2"));
+    try std.testing.expect(!hasOwner(owners, "acc3"));
+}
+
+test "records.list ability empty-set returns zero rows (fail closed, not all rows)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = try pinBase(a, &d);
+    try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
+        "('r1','t','t','x','acc1'),('r2','t','t','y','acc2');");
+    const col = withRule(withAbility(base, "editor"), "@public");
+    // No qualifying membership (only a viewer of acc1, below the editor floor) -> constant-false.
+    const mem = [_]request.Membership{.{ .account = "acc1", .role = "viewer" }};
+    const rctx = request.RequestContext{ .memberships = &mem };
+    const res = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &rctx), .rctx = &rctx });
+    try std.testing.expectEqual(@as(usize, 0), res.items.len);
+    // And a principal with no memberships at all also gets zero rows (never the full table).
+    const anon = request.RequestContext{};
+    const res2 = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    try std.testing.expectEqual(@as(usize, 0), res2.items.len);
+}
+
+test "documented @public list rule + ability: listRuleFilter avoids the 400 and narrows" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = try pinBase(a, &d);
+    try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES ('r1','t','t','x','acc1');");
+    const col = withRule(withAbility(base, ""), "@public"); // .rules.list = "@public" + view ability
+    const mem = [_]request.Membership{.{ .account = "acc1", .role = "viewer" }};
+    const rctx = request.RequestContext{ .memberships = &mem };
+
+    // FAILS-BEFORE: the pre-fix handler passed the `@public` listRule straight to `records.list` as
+    // a filter; `@public` is an allow sentinel, not a boolean expression, so the compiler rejects it.
+    try std.testing.expectError(error.UnexpectedToken, records.list(a, &d, col, .{ .rule = "@public", .rctx = &rctx }));
+
+    // PASSES-AFTER: `listRuleFilter` returns null for an `@public` (allow) rule, so the handler now
+    // passes no rule clause; the view ability still narrows the result (200, ability-scoped rows).
+    try std.testing.expect(listRuleFilter(col, &rctx) == null);
+    const res = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &rctx), .rctx = &rctx });
+    try std.testing.expectEqual(@as(usize, 1), res.items.len); // acc1 member sees acc1's row
+    try std.testing.expectEqualStrings("acc1", res.items[0].object.get("owner").?.string);
 }

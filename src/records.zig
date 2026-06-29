@@ -19,6 +19,7 @@ const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
 const field_policy = @import("field_policy.zig");
 const tenancy = @import("tenancy/tenancy.zig");
+const abilities = @import("authz/abilities.zig");
 
 /// A compiled rule constraint enforced atomically on create/update.
 pub const Guard = struct {
@@ -1735,6 +1736,28 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         try merged.appendSlice(alloc, rc.params);
         params = try merged.toOwnedSlice(alloc);
     };
+
+    // Ability scoping (#155): AND the lowered `"<col>"."<via>" IN (?,…)` view-ability predicate so a
+    // LIST narrows to the rows the principal may VIEW by relationship — the read-path complement to
+    // `policy.compilePredicate` (which governs view/create/update/delete/expand/realtime). Without
+    // this, a list rule broader than the ability would leak ability-denied rows on the bulk endpoint.
+    // An empty qualifying set lowers to the constant-false `"0"` fragment (zero params) → 0 rows
+    // (fail closed); a superuser / no-ability collection yields null → byte-identical to the prior
+    // SQL. Identifiers are gated in `abilityPredicate`; account-ids are bound.
+    if (q.rctx) |rctx| {
+        const view_ability = if (col.options.abilities) |ab| ab.view else null;
+        if (try abilities.abilityPredicate(alloc, col, view_ability, rctx)) |ap| {
+            where_sql = if (where_sql.len > 0)
+                try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, ap.sql })
+            else
+                ap.sql;
+            var merged: std.ArrayList(compiler.Param) = .empty;
+            defer merged.deinit(alloc);
+            try merged.appendSlice(alloc, params);
+            try merged.appendSlice(alloc, ap.params);
+            params = try merged.toOwnedSlice(alloc);
+        }
+    }
 
     // TTL read-time exclusion: AND a predicate that hides expired rows. This is the
     // read-time complement to gcExpiredRecords (which only runs every ~5 min), giving

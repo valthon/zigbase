@@ -530,10 +530,18 @@ pub fn App(comptime cfg: anytype) type {
             // Lower the top-level `.abilities` config onto the matching collections' options (#155).
             // Validates (unknown collection / non-relation `.via` / `.min_role` not in
             // `.tenancy.roles`) with a loud `@compileError`. Absent → byte-identical to no abilities.
-            break :blk if (@hasField(@TypeOf(cfg), "abilities"))
-                abilities_mod.applyAbilities(base, cfg.abilities, role_ranking)
-            else
-                base;
+            if (@hasField(@TypeOf(cfg), "abilities")) {
+                // Abilities resolve `IN (@request.account.ids …)` from the request's memberships,
+                // which only exist when tenancy is enabled. Without it every ability would lower to
+                // the constant-false predicate and silently deny ALL non-superuser access — a
+                // confusing runtime lockout. Fail loudly at comptime instead.
+                if (!tenancy_config.enabled)
+                    @compileError(".abilities requires .tenancy.enabled = true: abilities authorize by " ++
+                        "account membership, which only resolves when tenancy is enabled (otherwise every " ++
+                        "ability denies all access). Set .tenancy = .{ .enabled = true, .auth_collection = \"...\" }.");
+                break :blk abilities_mod.applyAbilities(base, cfg.abilities, role_ranking);
+            }
+            break :blk base;
         };
 
         /// Comptime-reflected route metadata from `.routes` (empty when absent).

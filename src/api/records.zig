@@ -220,6 +220,8 @@ pub fn abilities(ctx: *http.RequestCtx) anyerror!http.Response {
     const can_update = try policy.authorizes(ctx.allocator, &r, col, .update, rid, &rctx);
     const can_delete = try policy.authorizes(ctx.allocator, &r, col, .delete, rid, &rctx);
     var obj: std.json.ObjectMap = .empty;
+    // `view` is always `true` on a 200: we already returned 404 above unless the caller can view the
+    // record, so the response's very existence IS the view grant. It is emitted for a uniform shape.
     try obj.put(ctx.allocator, "view", .{ .bool = can_view });
     try obj.put(ctx.allocator, "update", .{ .bool = can_update });
     try obj.put(ctx.allocator, "delete", .{ .bool = can_delete });
@@ -529,7 +531,13 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     switch (policy.decide(col, .list, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => {},
-        .check => rule_expr = col.listRule,
+        // Pass the list rule to `records.list` as a filter ONLY when the rule ITSELF is a
+        // check-state expression (`policy.listRuleFilter`). `decide` can force `.check` purely from
+        // an ability or the tenant scope (e.g. an `@public` list rule + a view ability); feeding
+        // "@public" — an allow sentinel, not a boolean filter — to the filter compiler would 400.
+        // The ability/tenant predicates are composed inside `records.list` regardless, so dropping
+        // the rule clause here keeps the row-narrowing while avoiding the bogus filter. (#155)
+        .check => rule_expr = policy.listRuleFilter(col, &rctx),
     }
     const qp = try params_mod.parse(ctx.allocator, ctx.query);
     const pg = app.pagination;
