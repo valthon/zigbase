@@ -4,14 +4,14 @@ const records = @import("../records.zig");
 const schema = @import("../schema.zig");
 const db = @import("../db.zig");
 const migrations = @import("../migrations.zig");
-const rules = @import("../rules.zig");
+const policy = @import("../policy.zig");
 const request = @import("../request.zig");
 
 const max_depth = 6;
 
 /// Explicit error set so the mutual recursion between `expand` and `expandField`
 /// does not produce an inferred-error-set dependency loop.
-pub const ExpandError = records.RecordError || collections.EngineError || rules.RuleError;
+pub const ExpandError = records.RecordError || collections.EngineError || policy.PolicyError;
 
 /// Expand the given comma-separated, dot-nested expand-spec ("author,tags.owner") into
 /// `rec.object`'s "expand" key. `rec` must be a `.object`. Single relations nest an object;
@@ -45,12 +45,9 @@ pub fn expand(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, re
 /// Mirrors the view handler in src/api/records.zig: superuser/empty-rule => allow,
 /// null rule => deny, otherwise the row must satisfy the rule. This is what closes the
 /// access-control bypass where a public collection's relation leaked a locked target.
+/// Routed through `policy.*` so PR2 tenant-scope + PR3 abilities cover `?expand=` too.
 fn canView(alloc: std.mem.Allocator, conn: *db.Db, target: schema.Collection, id: []const u8, rctx: *const request.RequestContext) ExpandError!bool {
-    return switch (rules.decide(target.viewRule, rctx)) {
-        .deny_locked => false,
-        .allow => true,
-        .check => try rules.matches(alloc, conn, target, id, target.viewRule.?, rctx),
-    };
+    return policy.authorizes(alloc, conn, target, .view, id, rctx);
 }
 
 fn expandField(alloc: std.mem.Allocator, conn: *db.Db, target: schema.Collection, id_val: std.json.Value, rest: []const u8, depth: usize, rctx: *const request.RequestContext) ExpandError!std.json.Value {
@@ -153,6 +150,52 @@ test "H1: expand enforces the target collection's viewRule" {
         try expand(a, &d, posts, &rec, "owner", 0, &su);
         const owner = rec.object.get("expand").?.object.get("owner").?;
         try std.testing.expectEqualStrings("111-22-3333", owner.object.get("ssn").?.string);
+    }
+}
+
+test "PIN: expand view-authz routes through policy byte-identically (check-state rule)" {
+    // Guards the M1 fix: `canView` now delegates to `policy.authorizes(.view)`. For an
+    // owner-scoped (check-state) target rule the per-record decision must equal the
+    // `rules.*` primitive it replaced — so PR2 tenant-scope / PR3 abilities compose into
+    // `?expand=` without silently changing today's behavior.
+    const rules = @import("../rules.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const notes = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &[_]schema.Field{
+        .{ .id = "n1", .name = "body", .options = .{ .text = .{} } },
+        .{ .id = "n2", .name = "owner", .options = .{ .text = .{} } },
+    }, .viewRule = "owner = @request.auth.id" });
+    const pf = [_]schema.Field{.{ .id = "f3", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes.id, .maxSelect = 1 } } }};
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf, .viewRule = "@public" });
+    try d.exec("INSERT INTO notes (id,created,updated,body,owner) VALUES ('n_1','t','t','secret','u1');");
+    try d.exec("INSERT INTO posts (id,created,updated,note) VALUES ('p_1','t','t','n_1');");
+
+    var owner_obj: std.json.ObjectMap = .empty;
+    try owner_obj.put(a, "id", .{ .string = "u1" });
+    const owner = request.RequestContext{ .auth = .{ .object = owner_obj } };
+    var other_obj: std.json.ObjectMap = .empty;
+    try other_obj.put(a, "id", .{ .string = "u2" });
+    const other = request.RequestContext{ .auth = .{ .object = other_obj } };
+
+    // canView (policy-routed) must agree with the rules primitive for both principals.
+    for ([_]request.RequestContext{ owner, other }) |rctx| {
+        const want = try rules.matches(a, &d, notes, "n_1", notes.viewRule.?, &rctx);
+        try std.testing.expectEqual(want, try canView(a, &d, notes, "n_1", &rctx));
+    }
+    // End-to-end through expand(): owner gets the note, stranger gets null.
+    {
+        var rec = (try records.get(a, &d, posts, "p_1")).?;
+        try expand(a, &d, posts, &rec, "note", 0, &owner);
+        try std.testing.expectEqualStrings("secret", rec.object.get("expand").?.object.get("note").?.object.get("body").?.string);
+    }
+    {
+        var rec = (try records.get(a, &d, posts, "p_1")).?;
+        try expand(a, &d, posts, &rec, "note", 0, &other);
+        try std.testing.expect(rec.object.get("expand").?.object.get("note").? == .null);
     }
 }
 
