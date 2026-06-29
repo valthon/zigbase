@@ -49,6 +49,7 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_HTTP_HOST` | `--http-host` | `127.0.0.1` | bind address (loopback by default; set `0.0.0.0` for all interfaces) |
 | `ZIGBASE_HTTP_PORT` | `--http-port` | `8090` | listen port |
 | `ZIGBASE_DATA_DIR` | `--data-dir` | `./zb_data` | data directory (holds `data.db` and `storage/`) |
+| `ZIGBASE_DB_URL` | — | `""` (SQLite) | **Experimental, opt-in.** A `postgres://…` URL selects the PostgreSQL backend instead of SQLite. Only honored in a binary built with `-Dpostgres=true` (see below); ignored otherwise |
 | — | `--serve-static` | `""` (off) | serve static files from DIR at the root path (default mode only) |
 | `ZIGBASE_JWT_SECRET` | — | _auto-generated_ | token signing secret (≥32 bytes). Unset → a random secret is generated + persisted at `<data-dir>/.jwt_secret` (0600); a shorter provided value is refused |
 | `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
@@ -72,6 +73,27 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_SENDMAIL_COMMAND` | — | `""` (off) | local-MTA command to pipe mail to (e.g. `sendmail -t -i` or `msmtp -t`); when set, **overrides** SMTP. App holds no SMTP creds |
 | `ZIGBASE_FAKE_NOW` | — | _unset_ | **DEV-ONLY test clock.** Freeze "now" to an ISO-8601 UTC instant (e.g. `2029-03-07T16:00:00Z`) for deterministic time-boundary e2e tests. Freezes both the framework's own timestamps and a consumer's raw SQL `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')` (and `date`/`time`/`julianday`), plus the `CURRENT_TIMESTAMP` / `CURRENT_TIME` / `CURRENT_DATE` keywords and column `DEFAULT CURRENT_TIMESTAMP` (via a wrapping VFS). **Ignored entirely on a production build** (compiled out unless built with `-Ddev-clock=true`; off in any release build). See [Known limitations → Testing](./known-limitations) for scope |
 | `ZIGBASE_FAKE_SEED` | — | _unset_ | **DEV-ONLY seeded entropy.** Set to a decimal `u64` (e.g. `12345`) to make record/field ID and token generation deterministic: two runs with the same seed produce identical IDs and tokens. Useful for snapshot tests. **Ignored entirely on a production build** (compiled out unless built with `-Ddev-clock=true`; off in any release build). See [Framework → Test/dev-mode seams](./framework#14-test--dev-mode-determinism-seams) |
+
+## Database backend (experimental)
+
+ZigBase defaults to its embedded SQLite database (`<data-dir>/data.db`) — the single-binary
+story, and the only backend in a stock build. A **pure-Zig PostgreSQL backend** (issue #159) is
+being built behind the opt-in `-Dpostgres` build flag; it is **off by default** and adds **no
+libpq, C, or OpenSSL** (TLS and SCRAM-SHA-256 use Zig `std` only), so the default binary stays
+fully static and OpenSSL-free, with its SQLite data path unchanged.
+
+When compiled in (`zig build -Dpostgres=true`), setting `ZIGBASE_DB_URL` to a
+`postgres://user:pass@host:port/dbname?sslmode=require` URL selects PostgreSQL at startup; any
+other value (or an unset var) keeps SQLite. The backend is chosen once, by connection string —
+"switch via configuration alone". A **stock (`-Dpostgres=false`) binary** handed a `postgres://`
+`ZIGBASE_DB_URL` does **not** silently write to local SQLite — it logs a prominent warning and
+falls back to SQLite, so a misconfigured deployment is visible rather than misdirecting data.
+
+This is **foundational scaffolding, not yet a supported deployment target**: full schema /
+query / migration / realtime parity lands in follow-up PRs. Transport is also **not yet
+authenticated** — `sslmode=require` encrypts but does not verify the server certificate/hostname
+(libpq `require` parity), and `verify-ca`/`verify-full` are rejected — so use it only on a
+trusted network path for now. Full documentation ships with the parity work.
 
 ## Email delivery
 

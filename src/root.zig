@@ -63,6 +63,10 @@ pub const DefaultMailerPlugin = @import("framework.zig").DefaultMailerPlugin;
 // Migration: the `up` fn for an explicit migration receives a `*Db` writer; the
 // `.migrations` config is a list of `Migration` entries.
 pub const Db = @import("db.zig").Db;
+/// The active database backend tag (sqlite | postgres) and the SQL `Dialect` selected for it.
+/// `-Dpostgres=false` builds are always `.sqlite`; Postgres is opt-in (#159).
+pub const DbBackend = @import("db.zig").Backend;
+pub const Dialect = @import("sql/dialect.zig").Dialect;
 pub const Migration = @import("provision.zig").Migration;
 
 // Static files: the entry type of a build-generated embedded manifest (see
@@ -325,7 +329,11 @@ test {
     _ = @import("captcha.zig");
     _ = @import("webhook.zig");
     // Opt-in pure-Zig PostgreSQL backend (#159). The `build_options.postgres` condition is
-    // comptime-known, so when it is false (the default) this `@import` is never analyzed —
+    // comptime-known, so when it is false (the default) these `@import`s are never analyzed —
     // the driver compiles to nothing and the default build stays byte-identical.
-    if (@import("build_options").postgres) _ = @import("backend/postgres/postgres.zig");
+    if (@import("build_options").postgres) {
+        _ = @import("backend/postgres/postgres.zig");
+        // PR-1b: the end-to-end seam smoke (db.Db union → real Postgres). Skips if no PG.
+        _ = @import("backend/seam_test.zig");
+    }
 }

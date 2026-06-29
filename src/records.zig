@@ -1657,7 +1657,7 @@ test "encrypted field: round-trip through records, ciphertext-at-rest, strict fa
 
     // Stamp a field cipher on the connection (as the pool does in serveImpl).
     var cipher = field_policy.Cipher.fromEnv(io, "operator-field-key");
-    d.field_cipher = @ptrCast(&cipher);
+    db.dbSetFieldCipher(&d, @ptrCast(&cipher));
 
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
@@ -1694,11 +1694,11 @@ test "encrypted field: round-trip through records, ciphertext-at-rest, strict fa
 
     // (c) Strict fail-closed: decrypting the real envelope with the WRONG key fails.
     var wrong = field_policy.Cipher.fromEnv(io, "a-totally-different-key");
-    d.field_cipher = @ptrCast(&wrong);
+    db.dbSetFieldCipher(&d, @ptrCast(&wrong));
     try std.testing.expectError(error.BadEnvelope, get(a, &d, col, id));
 
     // A legacy/plaintext stored value (no envelope) also fails closed — no passthrough.
-    d.field_cipher = @ptrCast(&cipher);
+    db.dbSetFieldCipher(&d, @ptrCast(&cipher));
     try d.exec("UPDATE vault SET secret='legacy-plaintext';");
     try std.testing.expectError(error.BadEnvelope, get(a, &d, col, id));
 }

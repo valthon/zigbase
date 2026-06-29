@@ -1326,9 +1326,44 @@ fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, option
     return db.Pool.initOpts(allocator, io, db_path, options);
 }
 
+/// Open the database pool, selecting the backend (#159). When `ZIGBASE_DB_URL` is a
+/// `postgres://…` URL AND the binary was built with `-Dpostgres=true`, the Postgres pool is
+/// opened; otherwise the SQLite `<data_dir>/data.db` pool as before.
+///
+/// I-1 (fail-loud): `ZIGBASE_DB_URL` is read UNCONDITIONALLY (outside the build gate). A stock
+/// `-Dpostgres=false` binary therefore no longer *silently* ignores a `postgres://` URL and
+/// writes to local SQLite — it emits a prominent startup warning so an operator who points a
+/// non-PG binary at production Postgres sees the misdirection instead of losing writes into a
+/// `data.db`. The actual PG *selection* stays gated behind `build_options.postgres`; the SQLite
+/// data path is unchanged (the warning only fires for a `postgres://` value in a non-PG build).
+/// This is why the default build is no longer byte-for-byte identical to pre-#159 — by design;
+/// behavioral equivalence of the SQLite path is asserted by `db.chooseBackend`'s tests instead.
+fn openPoolSelect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions, environ: *const std.process.Environ.Map) !db.Pool {
+    const getter = config.EnvGetter{ .environ = environ };
+    const db_url = getter.get("ZIGBASE_DB_URL");
+    switch (db.chooseBackend(db_url)) {
+        .postgres => {
+            // Reachable only in a `-Dpostgres` build (chooseBackend gates on build_options).
+            const url = try allocator.dupeZ(u8, db_url.?);
+            defer allocator.free(url);
+            std.log.info("database backend: PostgreSQL (experimental, #159)", .{});
+            return db.Pool.initOpts(allocator, io, url, options);
+        },
+        .postgres_url_without_build => {
+            std.log.warn(
+                "ZIGBASE_DB_URL is a postgres:// URL but this binary was built without -Dpostgres; " ++
+                    "falling back to SQLite at {s}/data.db (set -Dpostgres=true to use PostgreSQL)",
+                .{cfg.data_dir},
+            );
+            return openPool(allocator, io, cfg, options);
+        },
+        .sqlite => return openPool(allocator, io, cfg, options),
+    }
+}
+
 fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !void {
     const cfg = try loadCfg(environ, sa);
-    var pool = try openPool(allocator, io, cfg, .{});
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
@@ -1351,7 +1386,7 @@ fn rewrapImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.proc
         std.log.err("rewrap: invalid field-encryption key config ({s}); see ZIGBASE_FIELD_KEY_GENERATION / ZIGBASE_FIELD_KEY_V<n>", .{@errorName(e)});
         return e;
     };
-    var pool = try openPool(allocator, io, cfg, .{});
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
@@ -1441,7 +1476,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     if (cfg.realtime_allowed_origins.len == 0) {
         std.log.info("realtime: no allowed Origins configured; cross-origin browser WebSocket upgrades are DENIED (set ZIGBASE_REALTIME_ORIGINS)", .{});
     }
-    var pool = try openPool(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib });
+    var pool = try openPoolSelect(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib }, environ);
     defer pool.deinit();
     // Transparent at-rest field encryption (Theme B1). Resolve the cipher ONCE from
     // ZIGBASE_FIELD_KEY and stamp it onto the pool so every acquired connection carries
@@ -1454,7 +1489,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             std.log.err("refusing to start: invalid field-encryption key config ({s}); see ZIGBASE_FIELD_KEY_GENERATION / ZIGBASE_FIELD_KEY_V<n>", .{@errorName(e)});
             return e;
         };
-        pool.field_cipher = @ptrCast(&field_cipher);
+        db.poolSetFieldCipher(&pool, @ptrCast(&field_cipher));
         if (cfg.field_key_generation != 1)
             std.log.info("field encryption: primary generation v{d} (writes); older generations read from ZIGBASE_FIELD_KEY_V<n>. Run `zigbase rewrap` to migrate old data forward.", .{cfg.field_key_generation});
     } else if (anyEncryptedField(schema_collections)) {
@@ -1500,7 +1535,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         // schema whose ciphertext can never be read. (The value layer also fails closed on
         // read/write, so plaintext never leaks; this just turns a silent half-broken server
         // into a loud startup refusal.)
-        if (pool.field_cipher == null) {
+        if (db.poolFieldCipher(&pool) == null) {
             var scan_arena = std.heap.ArenaAllocator.init(allocator);
             defer scan_arena.deinit();
             if (try liveEncryptedCollection(scan_arena.allocator(), w)) |cname| {
@@ -1679,7 +1714,7 @@ fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const
         return;
     }
     const cfg = try loadCfg(environ, .{ .data_dir = sa.data_dir });
-    var pool = try openPool(allocator, io, cfg, .{});
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
