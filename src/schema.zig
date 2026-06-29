@@ -356,7 +356,16 @@ fn abilityFromJson(alloc: std.mem.Allocator, abilities: std.json.Value, key: []c
     if (rv != .object) return null;
     const via_v = rv.object.get("via") orelse return null;
     if (via_v != .string) return null;
-    const min_role = if (rv.object.get("min_role")) |mr| (if (mr == .string) mr.string else "") else "";
+    // `min_role` resolution, distinguishing three cases so malformed input fails CLOSED:
+    //   - ABSENT  → "" (any active member qualifies; the DSL allows omitting `.min_role`).
+    //   - STRING  → pass through (an unknown role already fails closed via ranking.gte → empty set).
+    //   - PRESENT but NOT a string → the deny sentinel, so the ability filters out every membership
+    //     (empty qualifying set → constant-false "0" → deny) instead of widening to "any member".
+    const abilities_mod = @import("authz/abilities.zig");
+    const min_role: []const u8 = if (rv.object.get("min_role")) |mr|
+        (if (mr == .string) mr.string else abilities_mod.invalid_min_role)
+    else
+        "";
     return .{ .relationship = .{
         .via = try alloc.dupe(u8, via_v.string),
         .min_role = try alloc.dupe(u8, min_role),
@@ -1326,6 +1335,31 @@ test "abilities round-trip through optionsToJson/optionsFromJson" {
     try std.testing.expectEqualStrings("", back.view.?.relationship.min_role);
     try std.testing.expectEqualStrings("editor", back.update.?.relationship.min_role);
     try std.testing.expect(back.delete == null and back.create == null);
+}
+
+test "abilities deserialization fails closed on a malformed (non-string) min_role" {
+    const abilities_mod = @import("authz/abilities.zig");
+    const request = @import("request.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = Collection{ .id = "c", .name = "posts", .fields = &.{} };
+    const mem = [_]request.Membership{.{ .account = "acc1", .role = "owner" }}; // a top-rank member
+    const rctx = request.RequestContext{ .memberships = &mem };
+
+    // `min_role` PRESENT but a number (malformed): must NOT widen to "any member" — it parses to the
+    // deny sentinel so even a top-rank member is filtered out → constant-false "0" → deny.
+    const bad = (try optionsFromJson(a, "{\"abilities\":{\"view\":{\"via\":\"account\",\"min_role\":3}}}")).abilities.?.view.?;
+    try std.testing.expectEqualStrings(abilities_mod.invalid_min_role, bad.relationship.min_role);
+    const pbad = (try abilities_mod.abilityPredicate(a, col, bad, &rctx)).?;
+    try std.testing.expectEqualStrings("0", pbad.sql);
+
+    // Control — `min_role` ABSENT still means "any active member qualifies" (a real IN predicate,
+    // not a deny). This is the legitimate omit-the-floor case and must stay green.
+    const ok = (try optionsFromJson(a, "{\"abilities\":{\"view\":{\"via\":\"account\"}}}")).abilities.?.view.?;
+    try std.testing.expectEqualStrings("", ok.relationship.min_role);
+    const pok = (try abilities_mod.abilityPredicate(a, col, ok, &rctx)).?;
+    try std.testing.expectEqualStrings("\"posts\".\"account\" IN (?)", pok.sql);
 }
 
 test "validate rejects an auth collection with a non-identifier identity field" {

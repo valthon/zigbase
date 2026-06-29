@@ -23,6 +23,13 @@ const request = @import("../request.zig");
 const compiler = @import("../query/compiler.zig");
 const roles = @import("../tenancy/roles.zig");
 
+/// A `min_role` sentinel that no configured role can ever equal (it embeds a NUL byte, which a
+/// role-name string literal cannot contain). Used by deserialization to FAIL CLOSED on a malformed
+/// (present-but-non-string) `min_role`: `ranking.gte(role, invalid_min_role)` is always false (the
+/// rank lookup misses), so every membership is filtered out → empty qualifying set → constant-false
+/// `"0"` → deny. This is distinct from an EMPTY `min_role` ("" = any active member qualifies).
+pub const invalid_min_role = "\x00__invalid__";
+
 /// A `.relationship` ability rule. `via` names a RELATION field on the collection whose column
 /// holds an account id; `min_role` (the lowest role that qualifies; "" = any active membership) is
 /// compared against the principal's membership role for that account via the configured ranking.
