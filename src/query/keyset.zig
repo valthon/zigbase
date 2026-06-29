@@ -16,6 +16,7 @@ const compiler = @import("compiler.zig");
 const sort = @import("sort.zig");
 const values = @import("../values.zig");
 const schema = @import("../schema.zig");
+const Dialect = @import("../sql/dialect.zig").Dialect;
 
 const b64 = std.base64.url_safe_no_pad;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -101,7 +102,7 @@ fn jsonToParam(field: ?schema.Field, v: std.json.Value) KeysetError!compiler.Par
 /// NULLs are made explicit and deterministic to match SQLite's ORDER BY NULL placement
 /// (NULLs FIRST in ASC, LAST in DESC). The whole fragment is wrapped in one set of parens,
 /// ready to AND onto the existing filter+rule clause.
-pub fn build(alloc: std.mem.Allocator, terms: []const sort.SortTerm, boundary: []const std.json.Value, forward: bool) KeysetError!Keyset {
+pub fn build(alloc: std.mem.Allocator, terms: []const sort.SortTerm, boundary: []const std.json.Value, forward: bool, dialect: Dialect) KeysetError!Keyset {
     if (terms.len == 0 or terms.len != boundary.len) return error.BadCursor;
 
     var sql: std.ArrayList(u8) = .empty;
@@ -122,7 +123,7 @@ pub fn build(alloc: std.mem.Allocator, terms: []const sort.SortTerm, boundary: [
             try sql.appendSlice(alloc, " AND ");
         }
         // Strict comparison on term i.
-        try emitCmpRung(alloc, &sql, &params, terms[i], boundary[i], forward);
+        try emitCmpRung(alloc, &sql, &params, terms[i], boundary[i], forward, dialect);
         try sql.append(alloc, ')');
     }
     try sql.append(alloc, ')');
@@ -162,7 +163,7 @@ fn nullable(term: sort.SortTerm) bool {
 ///   - vi IS NULL  -> `0`  (nothing comes after a trailing NULL — emit a never-true predicate)
 ///   - else        -> `ti < vi` (+ `OR ti IS NULL` only when the column is nullable — a trailing
 ///                    NULL comes after any non-NULL value)
-fn emitCmpRung(alloc: std.mem.Allocator, sql: *std.ArrayList(u8), params: *std.ArrayList(compiler.Param), term: sort.SortTerm, v: std.json.Value, forward: bool) KeysetError!void {
+fn emitCmpRung(alloc: std.mem.Allocator, sql: *std.ArrayList(u8), params: *std.ArrayList(compiler.Param), term: sort.SortTerm, v: std.json.Value, forward: bool, dialect: Dialect) KeysetError!void {
     const asc_effective = term.desc == !forward; // term.desc XOR (!forward) == false  -> ASC
     if (asc_effective) {
         if (v == .null) {
@@ -176,7 +177,8 @@ fn emitCmpRung(alloc: std.mem.Allocator, sql: *std.ArrayList(u8), params: *std.A
     } else {
         if (v == .null) {
             // Nothing sorts after a trailing NULL: a never-true rung keeps the ladder well-formed.
-            try sql.append(alloc, '0');
+            // SQLite accepts the bare `0`; Postgres needs `false` (a boolean context).
+            try sql.appendSlice(alloc, dialect.constFalse());
         } else if (nullable(term)) {
             try sql.append(alloc, '(');
             try sql.appendSlice(alloc, term.col_sql);
@@ -346,7 +348,7 @@ test "keyset: single ASC term + id tiebreaker, forward" {
     const a = arena.allocator();
     const terms = [_]sort.SortTerm{ sysTerm("c", false), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .{ .string = "2026-01-03T00:00:00Z" }, .{ .string = "r3" } };
-    const ks = try build(a, &terms, &boundary, true);
+    const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
     try testing.expectEqualStrings("((c > ?) OR (c = ? AND id > ?))", ks.where_sql);
     try testing.expectEqual(@as(usize, 3), ks.params.len);
     try testing.expectEqualStrings("2026-01-03T00:00:00Z", ks.params[0].text);
@@ -360,7 +362,7 @@ test "keyset: single DESC term flips the operator" {
     const a = arena.allocator();
     const terms = [_]sort.SortTerm{ sysTerm("c", true), sysTerm("id", true) };
     const boundary = [_]std.json.Value{ .{ .string = "2026-01-03T00:00:00Z" }, .{ .string = "r3" } };
-    const ks = try build(a, &terms, &boundary, true);
+    const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
     try testing.expectEqualStrings("((c < ?) OR (c = ? AND id < ?))", ks.where_sql);
 }
 
@@ -371,7 +373,7 @@ test "keyset: backward flips every comparison op" {
     // forward DESC -> '<'; backward DESC -> '>'
     const terms = [_]sort.SortTerm{ sysTerm("c", true), sysTerm("id", true) };
     const boundary = [_]std.json.Value{ .{ .string = "t" }, .{ .string = "r3" } };
-    const ks = try build(a, &terms, &boundary, false);
+    const ks = try build(a, &terms, &boundary, false, Dialect.sqlite);
     try testing.expectEqualStrings("((c > ?) OR (c = ? AND id > ?))", ks.where_sql);
 }
 
@@ -382,7 +384,7 @@ test "keyset: mixed DESC,ASC uses the per-term operator" {
     // effective: created DESC, price ASC, id ASC
     const terms = [_]sort.SortTerm{ sysTerm("created", true), sysTerm("price", false), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .{ .string = "t" }, .{ .string = "2.00" }, .{ .string = "r3" } };
-    const ks = try build(a, &terms, &boundary, true);
+    const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
     try testing.expectEqualStrings(
         "((created < ?) OR (created = ? AND price > ?) OR (created = ? AND price = ? AND id > ?))",
         ks.where_sql,
@@ -396,7 +398,7 @@ test "keyset: NULL boundary, ASC term (NULLs first)" {
     // score ASC nullable, id ASC; boundary score is NULL -> cmp rung 'IS NOT NULL', no param
     const terms = [_]sort.SortTerm{ sysTerm("score", false), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .null, .{ .string = "r3" } };
-    const ks = try build(a, &terms, &boundary, true);
+    const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
     try testing.expectEqualStrings("((score IS NOT NULL) OR (score IS NULL AND id > ?))", ks.where_sql);
     try testing.expectEqual(@as(usize, 1), ks.params.len);
     try testing.expectEqualStrings("r3", ks.params[0].text);
@@ -409,7 +411,7 @@ test "keyset: NULL boundary, DESC term (NULLs last) is never-true on the cmp run
     const score = schema.Field{ .id = "s", .name = "score", .options = .{ .number = .{ .mode = .float } } };
     const terms = [_]sort.SortTerm{ fieldTerm("score", score, true), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .null, .{ .string = "r3" } };
-    const ks = try build(a, &terms, &boundary, true);
+    const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
     try testing.expectEqualStrings("((0) OR (score IS NULL AND id > ?))", ks.where_sql);
 }
 
@@ -421,7 +423,7 @@ test "keyset: non-NULL boundary over a nullable DESC column uses (< OR IS NULL)"
     const score = schema.Field{ .id = "s", .name = "score", .options = .{ .number = .{ .mode = .float } } };
     const terms = [_]sort.SortTerm{ fieldTerm("score", score, true), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .{ .float = 1.5 }, .{ .string = "r3" } };
-    const ks = try build(a, &terms, &boundary, true);
+    const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
     // Boundary score is non-NULL (1.5), so the equality rung is `score = ?`, not `IS NULL`.
     // The cmp rung's own parens nest inside the OR-rung parens: ((...)).
     try testing.expectEqualStrings("(((score < ? OR score IS NULL)) OR (score = ? AND id > ?))", ks.where_sql);
@@ -434,7 +436,7 @@ test "keyset: a REQUIRED column skips the IS NULL branch on a DESC cmp rung" {
     const score = schema.Field{ .id = "s", .name = "score", .required = true, .options = .{ .number = .{ .mode = .float } } };
     const terms = [_]sort.SortTerm{ fieldTerm("score", score, true), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .{ .float = 1.5 }, .{ .string = "r3" } };
-    const ks = try build(a, &terms, &boundary, true);
+    const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
     try testing.expectEqualStrings("((score < ?) OR (score = ? AND id > ?))", ks.where_sql);
 }
 
@@ -446,7 +448,7 @@ test "keyset: type coercion into the right Param variant" {
     const ratio = schema.Field{ .id = "g", .name = "ratio", .options = .{ .number = .{ .mode = .float } } };
     const terms = [_]sort.SortTerm{ fieldTerm("price", price, false), fieldTerm("ratio", ratio, false), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .{ .string = "10.50" }, .{ .float = 1.5 }, .{ .string = "r3" } };
-    const ks = try build(a, &terms, &boundary, true);
+    const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
     // Param order follows the OR-of-AND ladder (eq prefixes repeat boundary values):
     //   [price>], [price=, ratio>], [price=, ratio=, id>]
     // => [int, int, double, int, double, text]. fixed "10.50" -> int 1050; float -> double; id -> text.
@@ -463,7 +465,7 @@ test "keyset: injection-safe — SQL metacharacters stay in params, never the SQ
     const terms = [_]sort.SortTerm{ sysTerm("c", false), sysTerm("id", false) };
     const evil = "x'); DROP TABLE posts;--";
     const boundary = [_]std.json.Value{ .{ .string = evil }, .{ .string = "r3" } };
-    const ks = try build(a, &terms, &boundary, true);
+    const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
     try testing.expect(std.mem.indexOf(u8, ks.where_sql, "DROP") == null);
     try testing.expectEqualStrings(evil, ks.params[0].text);
 }
@@ -474,10 +476,10 @@ test "keyset: arity mismatch and empty terms are rejected" {
     const a = arena.allocator();
     const terms = [_]sort.SortTerm{sysTerm("c", false)};
     const two = [_]std.json.Value{ .{ .string = "a" }, .{ .string = "b" } };
-    try testing.expectError(error.BadCursor, build(a, &terms, &two, true));
+    try testing.expectError(error.BadCursor, build(a, &terms, &two, true, Dialect.sqlite));
     const none = [_]sort.SortTerm{};
     const nonev = [_]std.json.Value{};
-    try testing.expectError(error.BadCursor, build(a, &none, &nonev, true));
+    try testing.expectError(error.BadCursor, build(a, &none, &nonev, true, Dialect.sqlite));
 }
 
 // ===========================================================================

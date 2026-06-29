@@ -200,6 +200,7 @@ test {
     _ = @import("cli.zig");
     _ = @import("datetime.zig");
     _ = @import("db.zig");
+    _ = @import("sql/param_sink.zig");
     _ = @import("http.zig");
     _ = @import("router.zig");
     _ = @import("request.zig");

@@ -128,7 +128,7 @@ pub fn compilePredicate(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Coll
     // Compose the ability predicate (#155), then the tenant-scope predicate (#156) — the order in
     // the brief: (rule) AND (ability) AND (tenant). Each is null when it does not apply, leaving the
     // composed SQL byte-identical to the pre-abilities/pre-tenancy guard (pinned below).
-    if (try abilities.abilityPredicate(alloc, col, abilityFor(col, action), rctx)) |ap|
+    if (try abilities.abilityPredicate(alloc, col, abilityFor(col, action), rctx, db.dbDialect(conn))) |ap|
         guard = try andPredicate(alloc, guard, ap.sql, ap.params);
     if (try tenancy.scopePredicate(alloc, col, rctx)) |sp| guard = try andPredicate(alloc, guard, sp.sql, &.{sp.param});
     return guard;
@@ -158,7 +158,7 @@ pub fn matchesRule(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collectio
     // Realtime delivery on an ability- or tenant-guarded collection is narrowed to what the
     // subscriber may VIEW too (the composition funnels through this one place). Each is null =
     // no-op (byte-identical to the prior `rules.matches` for a plain collection / no-tenancy app).
-    if (try abilities.abilityPredicate(alloc, col, abilityFor(col, .view), rctx)) |ap|
+    if (try abilities.abilityPredicate(alloc, col, abilityFor(col, .view), rctx, db.dbDialect(conn))) |ap|
         guard = try andPredicate(alloc, guard, ap.sql, ap.params);
     if (try tenancy.scopePredicate(alloc, col, rctx)) |sp| guard = try andPredicate(alloc, guard, sp.sql, &.{sp.param});
     // No rule clause AND no ability AND no tenant scope => unconstrained (deliver). Otherwise run

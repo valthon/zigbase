@@ -1453,14 +1453,14 @@ test "abilities deserialization fails closed on a malformed (non-string) min_rol
     // deny sentinel so even a top-rank member is filtered out → constant-false "0" → deny.
     const bad = (try optionsFromJson(a, "{\"abilities\":{\"view\":{\"via\":\"account\",\"min_role\":3}}}")).abilities.?.view.?;
     try std.testing.expectEqualStrings(abilities_mod.invalid_min_role, bad.relationship.min_role);
-    const pbad = (try abilities_mod.abilityPredicate(a, col, bad, &rctx)).?;
+    const pbad = (try abilities_mod.abilityPredicate(a, col, bad, &rctx, dialect.Dialect.sqlite)).?;
     try std.testing.expectEqualStrings("0", pbad.sql);
 
     // Control — `min_role` ABSENT still means "any active member qualifies" (a real IN predicate,
     // not a deny). This is the legitimate omit-the-floor case and must stay green.
     const ok = (try optionsFromJson(a, "{\"abilities\":{\"view\":{\"via\":\"account\"}}}")).abilities.?.view.?;
     try std.testing.expectEqualStrings("", ok.relationship.min_role);
-    const pok = (try abilities_mod.abilityPredicate(a, col, ok, &rctx)).?;
+    const pok = (try abilities_mod.abilityPredicate(a, col, ok, &rctx, dialect.Dialect.sqlite)).?;
     try std.testing.expectEqualStrings("\"posts\".\"account\" IN (?)", pok.sql);
 }
 

@@ -22,6 +22,15 @@ const tenancy = @import("tenancy/tenancy.zig");
 const abilities = @import("authz/abilities.zig");
 const fts = @import("search/fts.zig");
 const vector = @import("search/vector.zig");
+const param_sink = @import("sql/param_sink.zig");
+
+/// Renumber a statement's placeholders for `h`'s active backend before preparing it: SQLite gets
+/// the verbatim `?`/`?N` SQL (zero-cost — the same slice), Postgres gets `$n` matching the
+/// positional bind order (`sql/param_sink.zig`). Every CRUD/query `prepare` of a placeholder-
+/// bearing statement in this file routes through here so the `$n` rework has one chokepoint.
+fn prep(alloc: std.mem.Allocator, h: *db.Db, sql: [:0]const u8) !db.Stmt {
+    return h.prepare(try param_sink.renumberZ(alloc, db.dbDialect(h), sql));
+}
 
 /// A compiled rule constraint enforced atomically on create/update.
 pub const Guard = struct {
@@ -45,7 +54,7 @@ fn guardJoinsSql(alloc: std.mem.Allocator, joins: []const []const u8) ![]u8 {
 pub fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8, g: Guard) !bool {
     const js = try guardJoinsSql(alloc, g.joins);
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, js, col.name, g.where_sql }, 0);
-    var st = try w.prepare(sql);
+    var st = try prep(alloc, w, sql);
     defer st.finalize();
     try st.bindText(1, rid);
     _ = try bindParams(&st, g.params, 2);
@@ -96,17 +105,18 @@ pub fn get(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []co
     // GC's fail-safe: NULL ttl → no expiry (always shown); strftime(tf) IS NULL means an
     // unparseable value → fail-safe, keep visible (same as GC which won't delete garbage).
     // Security: identifiers gated through isValidIdentifier before interpolation.
+    const dialect = db.dbDialect(r);
     const sql = blk: {
         if (col.options.ttl_field) |tf| {
             if (schema.isValidIdentifier(col.name) and schema.isValidIdentifier(tf)) {
-                break :blk try std.fmt.allocPrintSentinel(alloc,
-                    "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1 AND (\"{s}\" IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\") IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\") > strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
-                    .{ cols, col.name, tf, tf, tf }, 0);
+                const qtf = try std.fmt.allocPrint(alloc, "\"{s}\"", .{tf});
+                const ttl_pred = try dialect.ttlVisiblePredicate(alloc, qtf);
+                break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1 AND ({s});", .{ cols, col.name, ttl_pred }, 0);
             }
         }
         break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1;", .{ cols, col.name }, 0);
     };
-    var st = try r.prepare(sql);
+    var st = try prep(alloc, r, sql);
     defer st.finalize();
     try st.bindText(1, id);
     if (!try st.step()) return null;
@@ -278,7 +288,7 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             };
             for (items) |it| if (it == .string) {
                 const q = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\" WHERE \"id\" = ?1;", .{tcol.name}, 0);
-                var st = try conn.prepare(q);
+                var st = try prep(alloc, conn, q);
                 defer st.finalize();
                 try st.bindText(1, it.string);
                 if (!try st.step())
@@ -536,10 +546,13 @@ pub fn createInTxn(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.
     if (data != .object) return error.NotObject;
     var errs: std.ArrayList(schema.ValidationError) = .empty;
 
+    const dialect = db.dbDialect(w);
+    const now_iso = dialect.nowIso8601Expr();
+
     var cols: std.ArrayList(u8) = .empty;
     var vals: std.ArrayList(u8) = .empty;
     try cols.appendSlice(alloc, "\"id\",\"created\",\"updated\"");
-    try vals.appendSlice(alloc, "?1,strftime('%Y-%m-%dT%H:%M:%SZ','now'),strftime('%Y-%m-%dT%H:%M:%SZ','now')");
+    try vals.appendSlice(alloc, try std.fmt.allocPrint(alloc, "?1,{s},{s}", .{ now_iso, now_iso }));
 
     var binds: std.ArrayList(BindItem) = .empty;
     var next: usize = 2;
@@ -551,7 +564,7 @@ pub fn createInTxn(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.
             try cols.append(alloc, ',');
             try cols.appendSlice(alloc, try ddl.quoteIdent(alloc, f.name));
             try vals.append(alloc, ',');
-            try vals.appendSlice(alloc, if (f.options.autodate.onCreate) "strftime('%Y-%m-%dT%H:%M:%SZ','now')" else "NULL");
+            try vals.appendSlice(alloc, if (f.options.autodate.onCreate) now_iso else "NULL");
             continue;
         }
         if (f.required and (provided == null or isEmpty(provided.?))) {
@@ -577,7 +590,7 @@ pub fn createInTxn(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.
     var gen_id = id_gen.collectionId(io);
 
     const sql = try std.fmt.allocPrintSentinel(alloc, "INSERT INTO \"{s}\" ({s}) VALUES ({s}) RETURNING {s};", .{ col.name, cols.items, vals.items, rcols }, 0);
-    var st = try w.prepare(sql);
+    var st = try prep(alloc, w, sql);
     defer st.finalize();
     try st.bindText(1, &gen_id);
     for (binds.items) |b| {
@@ -955,15 +968,18 @@ pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
     if (data != .object) return error.NotObject;
     var errs: std.ArrayList(schema.ValidationError) = .empty;
 
+    const dialect = db.dbDialect(w);
+    const now_iso = dialect.nowIso8601Expr();
+
     var sets: std.ArrayList(u8) = .empty;
-    try sets.appendSlice(alloc, "\"updated\"=strftime('%Y-%m-%dT%H:%M:%SZ','now')");
+    try sets.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"updated\"={s}", .{now_iso}));
     var binds: std.ArrayList(BindItem) = .empty;
     var next: usize = 2; // ?1 is the id in WHERE
 
     for (col.fields) |f| {
         if (f.fieldType() == .autodate) {
             if (f.options.autodate.onUpdate) {
-                try sets.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"{s}\"=strftime('%Y-%m-%dT%H:%M:%SZ','now')", .{f.name}));
+                try sets.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"{s}\"={s}", .{ f.name, now_iso }));
             }
             continue;
         }
@@ -978,7 +994,7 @@ pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
     const rcols = try columnList(alloc, col);
 
     const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ col.name, sets.items, rcols }, 0);
-    var st = try w.prepare(sql);
+    var st = try prep(alloc, w, sql);
     defer st.finalize();
     try st.bindText(1, id);
     for (binds.items) |b| {
@@ -1002,7 +1018,7 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
 /// be inside one (or accept autocommit). Returns true if a row was deleted.
 pub fn deleteInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
     const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"id\"=?1 RETURNING \"id\";", .{col.name}, 0);
-    var st = try w.prepare(sql);
+    var st = try prep(alloc, w, sql);
     defer st.finalize();
     try st.bindText(1, id);
     return try st.step();
@@ -1263,10 +1279,10 @@ fn storeStatefulCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col
     id_gen.generate(io, &id_buf);
     const id: []const u8 = try alloc.dupe(u8, &id_buf);
     const now = try nowUnixDb(conn);
-    var st = try w.prepare(
-        \\INSERT INTO "_cursorStates" ("id","collectionRef","payload","expires","created")
-        \\ VALUES (?1,?2,?3,?4,datetime('now'));
-    );
+    const insert_sql = try std.fmt.allocPrintSentinel(alloc,
+        "INSERT INTO \"_cursorStates\" (\"id\",\"collectionRef\",\"payload\",\"expires\",\"created\") VALUES (?1,?2,?3,?4,{s});",
+        .{db.dbDialect(w).nowExpr()}, 0);
+    var st = try prep(alloc, w, insert_sql);
     defer st.finalize();
     try st.bindText(1, id);
     try st.bindText(2, col.name);
@@ -1284,10 +1300,11 @@ fn loadStatefulCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col:
     const c = q.writer orelse conn;
     if (token.len == 0 or token.len > keyset.max_cursor_len) return error.BadCursor;
     const now = nowUnixDb(c) catch return error.BadCursor;
-    var st = c.prepare(
+    const select_sql = param_sink.renumberZ(alloc, db.dbDialect(c),
         \\SELECT "payload" FROM "_cursorStates"
         \\ WHERE "id"=?1 AND "collectionRef"=?2 AND "expires" > ?3;
     ) catch return error.BadCursor;
+    var st = c.prepare(select_sql) catch return error.BadCursor;
     defer st.finalize();
     st.bindText(1, token) catch return error.BadCursor;
     st.bindText(2, col.name) catch return error.BadCursor;
@@ -1320,7 +1337,12 @@ fn nowUnixDb(conn: *db.Db) db.DbError!i64 {
 /// GC: delete expired stateful cursor entries. Safe to call periodically (scheduler) or inline.
 pub fn gcCursorStates(w: *db.Db) db.DbError!void {
     const now = try nowUnixDb(w);
-    var st = try w.prepare("DELETE FROM \"_cursorStates\" WHERE \"expires\" <= ?1;");
+    // No request arena here; the placeholder renumber needs a tiny scratch allocator (the SQL is a
+    // fixed ~50 bytes, so a stack buffer is ample). SQLite renumber is a no-op (returns the slice).
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const sql = param_sink.renumberZ(fba.allocator(), db.dbDialect(w), "DELETE FROM \"_cursorStates\" WHERE \"expires\" <= ?1;") catch return error.PrepareFailed;
+    var st = try w.prepare(sql);
     defer st.finalize();
     try st.bindInt(1, now);
     _ = try st.step();
@@ -1620,7 +1642,9 @@ pub fn gcExpiredRecords(alloc: std.mem.Allocator, w: *db.Db) !usize {
         const tf = col.options.ttl_field orelse continue;
         if (!schema.isValidIdentifier(col.name)) continue;
         if (!schema.isValidIdentifier(tf)) continue;
-        const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\") <= strftime('%Y-%m-%dT%H:%M:%SZ','now');", .{ col.name, tf, tf }, 0);
+        const qtf = try std.fmt.allocPrint(alloc, "\"{s}\"", .{tf});
+        const expired = try db.dbDialect(w).ttlExpiredDeletePredicate(alloc, qtf);
+        const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE {s};", .{ col.name, expired }, 0);
         defer alloc.free(sql); // no-op for arena callers; protects any future GPA caller
         // Resilient per-collection: a single drifted collection (e.g. the table was
         // dropped but its `_collections` metadata remains) must not abort the whole
@@ -1723,6 +1747,7 @@ test "encrypted field with no cipher fails closed (never plaintext)" {
 pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: ListQuery) !ListResult {
     if (q.filter) |fstr| if (fstr.len > max_filter_len) return error.BadFilter;
     if (q.sort) |sstr| if (sstr.len > max_filter_len) return error.BadSort;
+    const dialect = db.dbDialect(conn);
     var j = joiner.Joiner.init(alloc, conn, col);
     var where_sql: []const u8 = "";
     var params: []const compiler.Param = &.{};
@@ -1753,7 +1778,8 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
                 // degrade to a full (scoped) list — the constant-false `"0"` fragment short-circuits
                 // every page to empty through the normal machinery (and AND-s harmlessly with the
                 // scope predicates below). The query was a search; an empty search yields no rows.
-                where_sql = "0";
+                // SQLite accepts the bare `0`; Postgres needs `false` (boolean context).
+                where_sql = dialect.constFalse();
                 search_term_hash = trimmed; // bind the cursor to the (rejected) term anyway
             }
         }
@@ -1781,7 +1807,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     if (q.filter) |fstr| if (fstr.len > 0) {
         const toks = try lexer.lex(alloc, fstr);
         const ast = try parser.parse(alloc, toks);
-        const compiled = try compiler.compile(alloc, &j, ast, null);
+        const compiled = try compiler.compile(alloc, &j, ast, null, dialect);
         // AND-compose onto any prior clause (the FTS `MATCH` / vector predicate set above) and
         // APPEND params — never assign, which would clobber the search predicate AND drop its bound
         // term, so `?search=X&filter=Y` would silently ignore the search. Mirrors the rule block.
@@ -1797,7 +1823,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     if (q.rule) |rstr| if (rstr.len > 0) {
         const rtoks = try lexer.lex(alloc, rstr);
         const rast = try parser.parse(alloc, rtoks);
-        const rc = try compiler.compile(alloc, &j, rast, q.rctx);
+        const rc = try compiler.compile(alloc, &j, rast, q.rctx, dialect);
         if (where_sql.len > 0) {
             where_sql = try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, rc.where_sql });
         } else {
@@ -1818,7 +1844,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // SQL. Identifiers are gated in `abilityPredicate`; account-ids are bound.
     if (q.rctx) |rctx| {
         const view_ability = if (col.options.abilities) |ab| ab.view else null;
-        if (try abilities.abilityPredicate(alloc, col, view_ability, rctx)) |ap| {
+        if (try abilities.abilityPredicate(alloc, col, view_ability, rctx, dialect)) |ap| {
             where_sql = if (where_sql.len > 0)
                 try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, ap.sql })
             else
@@ -1843,9 +1869,8 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // Security: both col.name and tf validated through isValidIdentifier (GC pattern).
     if (col.options.ttl_field) |tf| {
         if (schema.isValidIdentifier(col.name) and schema.isValidIdentifier(tf)) {
-            const ttl_pred = try std.fmt.allocPrint(alloc,
-                "\"{s}\".\"{s}\" IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\".\"{s}\") IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', \"{s}\".\"{s}\") > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
-                .{ col.name, tf, col.name, tf, col.name, tf });
+            const qtf = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\"", .{ col.name, tf });
+            const ttl_pred = try dialect.ttlVisiblePredicate(alloc, qtf);
             where_sql = if (where_sql.len > 0)
                 try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, ttl_pred })
             else
@@ -1876,9 +1901,9 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // identical.
     const base_terms = if (q.sort) |sstr| (if (sstr.len > 0) try sort.compileTerms(alloc, &j, sstr) else &.{}) else &.{};
     var offset_order_sql: []const u8 = if (base_terms.len > 0)
-        try sort.orderByFromTerms(alloc, base_terms)
+        try sort.orderByFromTerms(alloc, base_terms, dialect)
     else
-        try std.fmt.allocPrint(alloc, "\"{s}\".\"created\" DESC", .{col.name});
+        try std.fmt.allocPrint(alloc, "\"{s}\".\"created\" DESC{s}", .{ col.name, dialect.nullsOrder(.desc) });
     // Search/vector relevance leads the OFFSET ordering: bm25 `rank` (FTS) and/or nearest-neighbor
     // distance (vector), with any client sort kept as the tiebreaker. Cursor mode keeps the keyset
     // order (the MATCH/where predicate still scopes the page; vector cursors are rejected above).
@@ -1887,7 +1912,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     if (vector_order) |vo|
         offset_order_sql = if (base_terms.len > 0 or search_order != null) try std.fmt.allocPrint(alloc, "{s}, {s}", .{ vo, offset_order_sql }) else vo;
     const eff_terms = try effectiveSortTerms(alloc, col, base_terms);
-    const order_sql = try sort.orderByFromTerms(alloc, eff_terms);
+    const order_sql = try sort.orderByFromTerms(alloc, eff_terms, dialect);
 
     var joins_sql: std.ArrayList(u8) = .empty;
     for (j.joins.items) |jn| { try joins_sql.append(alloc, ' '); try joins_sql.appendSlice(alloc, jn); }
@@ -1923,7 +1948,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         var win_where: []const u8 = where_clause;
         var ks_params: []const compiler.Param = &.{};
         if (maybe_cur) |cur| {
-            const ks = try keyset.build(alloc, eff_terms, cur.keys, forward);
+            const ks = try keyset.build(alloc, eff_terms, cur.keys, forward, dialect);
             ks_params = ks.params;
             win_where = if (where_sql.len > 0)
                 try std.fmt.allocPrint(alloc, " WHERE ({s}) AND {s}", .{ where_sql, ks.where_sql })
@@ -1933,10 +1958,10 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
 
         // Backward travel: reverse the ORDER BY so the DB returns the rows CLOSEST to the boundary
         // going backward; we re-reverse the page into forward order after fetch.
-        const fetch_order = if (forward) order_sql else try reversedOrderBy(alloc, eff_terms);
+        const fetch_order = if (forward) order_sql else try reversedOrderBy(alloc, eff_terms, dialect);
 
         const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ?;", .{ bcols, col.name, joins_sql.items, win_where, fetch_order }, 0);
-        var pst = try conn.prepare(page_sql);
+        var pst = try prep(alloc, conn, page_sql);
         defer pst.finalize();
         var idx = try bindParams(&pst, params, 1);
         idx = try bindParams(&pst, ks_params, idx);
@@ -1994,7 +2019,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     const page: u32 = if (q.page == 0) 1 else q.page;
     const offset: i64 = @as(i64, (page - 1)) * @as(i64, per);
     const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, offset_order_sql }, 0);
-    var pst = try conn.prepare(page_sql);
+    var pst = try prep(alloc, conn, page_sql);
     defer pst.finalize();
     var after = try bindParams(&pst, params, 1);
     // The vector ORDER BY carries one `?` (the query embedding), positioned after the WHERE params
@@ -2021,14 +2046,14 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
 
 fn countTotal(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, joins: []const u8, where_clause: []const u8, params: []const compiler.Param) !i64 {
     const count_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COUNT(*) FROM \"{s}\"{s}{s};", .{ col.name, joins, where_clause }, 0);
-    var cst = try conn.prepare(count_sql);
+    var cst = try prep(alloc, conn, count_sql);
     defer cst.finalize();
     _ = try bindParams(&cst, params, 1);
     _ = try cst.step();
     return cst.columnInt(0);
 }
 
-fn reversedOrderBy(alloc: std.mem.Allocator, terms: []const sort.SortTerm) ![]u8 {
+fn reversedOrderBy(alloc: std.mem.Allocator, terms: []const sort.SortTerm, dialect: db.Dialect) ![]u8 {
     const rev = try alloc.alloc(sort.SortTerm, terms.len);
     // `rev` is a scratch copy (SortTerms only borrow their slices); free it after building the
     // string so only the returned ORDER BY fragment remains allocated.
@@ -2037,7 +2062,7 @@ fn reversedOrderBy(alloc: std.mem.Allocator, terms: []const sort.SortTerm) ![]u8
         rev[i] = t;
         rev[i].desc = !t.desc;
     }
-    return sort.orderByFromTerms(alloc, rev);
+    return sort.orderByFromTerms(alloc, rev, dialect);
 }
 
 pub fn bindParams(st: *db.Stmt, params: []const compiler.Param, start: c_int) !c_int {
@@ -2324,7 +2349,7 @@ test "reversedOrderBy frees its scratch slice (no leak on the testing allocator)
         .{ .col_sql = "\"posts\".\"created\"", .field = null, .desc = true, .path = "created" },
         .{ .col_sql = "\"posts\".\"id\"", .field = null, .desc = true, .path = "id" },
     };
-    const ob = try reversedOrderBy(a, &terms);
+    const ob = try reversedOrderBy(a, &terms, db.Dialect.sqlite);
     defer a.free(ob);
     // Reversed: DESC -> ASC for every term.
     try std.testing.expectEqualStrings("\"posts\".\"created\" ASC, \"posts\".\"id\" ASC", ob);
