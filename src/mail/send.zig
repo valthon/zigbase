@@ -13,6 +13,14 @@
 //! `jobHandler` is the built-in `"mail"` queue job kind: it deserializes the JSON
 //! payload `ctx.mail().enqueue` enqueued back into a `MailMessage` and calls the same
 //! `send`. It is registered onto the queue registry in `framework.zig`.
+//!
+//! ENFORCEMENT BOUNDARY (#154 review M4): verified-sender + suppression enforcement is a POLICY of
+//! this `ctx.mail()` / `mail.send` layer (`enforce` below), NOT a guarantee of the `Mailer.send`
+//! vtable seam. A framework-internal caller that reaches for `app.mailer.?.send(...)` directly (or
+//! a custom backend invoked out-of-band) BYPASSES verified-sender and suppression checks — only
+//! header/CRLF rejection (which lives in every backend) still applies. Application code should send
+//! through `ctx.mail()`; the direct seam is for the framework's own auth mail, which is a system
+//! send (no account) that bypasses verified-sender enforcement by design anyway.
 
 const std = @import("std");
 const mailer = @import("mailer.zig");
@@ -115,17 +123,17 @@ fn toEmail(msg: MailMessage) Email {
 ///     account's verified identity). A send with NO account is a system/superuser send and bypasses.
 ///   * suppression — a send to a hard-bounced/complained recipient (for the account, or globally)
 ///     is blocked.
-fn enforce(app: *App, conn: *db.Db, msg: MailMessage) !void {
+fn enforce(app: *App, alloc: std.mem.Allocator, conn: *db.Db, msg: MailMessage) !void {
     if (app.mail.require_verified_sender) {
         const acct = msg.account orelse "";
         if (acct.len > 0) {
             const from = msg.from orelse "";
             if (from.len == 0) return error.SenderNotVerified; // scoped send must declare a verified From
-            try senders.assertVerified(conn, acct, from);
+            try senders.assertVerified(alloc, conn, acct, from);
         }
     }
     if (app.mail.check_suppression) {
-        try suppression.assertNotSuppressed(conn, msg.account orelse "", msg.to);
+        try suppression.assertNotSuppressed(alloc, conn, msg.account orelse "", msg.to);
     }
 }
 
@@ -142,7 +150,7 @@ pub fn send(app: *App, alloc: std.mem.Allocator, msg: MailMessage) !void {
     if (app.mail.enforces()) {
         var r = try app.pool.acquireReader();
         defer app.pool.releaseReader(&r);
-        try enforce(app, &r, msg);
+        try enforce(app, alloc, &r, msg);
     }
     const email = toEmail(msg);
     if (app.mailer) |m| {
@@ -279,7 +287,8 @@ test "send rejects an unverified sender when require_verified_sender is on (fail
         const req = try senders.requestVerification(std.testing.io, std.testing.allocator, w, "acc1", "from@acct.com");
         defer std.testing.allocator.free(req.id);
         defer std.testing.allocator.free(req.token);
-        try testing.expect(try senders.confirm(w, "acc1", req.id, req.token));
+        defer std.testing.allocator.free(req.email);
+        try testing.expect(try senders.confirm(std.testing.allocator, w, "acc1", req.id, req.token));
     }
     try send(&env.app, std.testing.allocator, .{ .to = "user@example.com", .subject = "Hi", .text = "body", .from = "from@acct.com", .account = "acc1" });
 
@@ -293,11 +302,12 @@ test "send blocks a suppressed recipient when check_suppression is on (fail clos
     {
         const w = env.writer();
         defer env.pool.releaseWriter();
-        try suppression.upsert(std.testing.io, w, "acc1", "bounced@example.com", suppression.reason_hard_bounce, "ses");
+        try suppression.upsert(std.testing.io, std.testing.allocator, w, "acc1", "bounced@example.com", suppression.reason_hard_bounce, "ses");
     }
-    // A send to the suppressed recipient (for the account) is blocked.
+    // A send to the suppressed recipient (for the account) is blocked — even a differently-cased
+    // spelling (I1 normalization: the suppression check is case-insensitive).
     try testing.expectError(error.RecipientSuppressed, send(&env.app, std.testing.allocator, .{
-        .to = "bounced@example.com",
+        .to = "Bounced@Example.com",
         .subject = "Hi",
         .text = "body",
         .account = "acc1",

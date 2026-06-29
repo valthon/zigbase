@@ -771,10 +771,10 @@ senders (fail closed, `403`). Superusers may target any account.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| POST | `/api/senders` | Request verification of a From address. Body `{ "email": "from@acct.com" }`; emails a single-use token. Returns `{ id, email, status }` (`201` pending, `200` if already verified). |
+| POST | `/api/senders` | Request verification of a From address. Body `{ "email": "from@acct.com" }`; emails a single-use token. Returns `{ id, email, status }` (`201` pending, `200` if already verified). Re-sends are rate-limited per `(account,email)` — a repeat within ~60s is `429`. |
 | POST | `/api/senders/:id/verify` | Confirm a pending identity. Body `{ "token": "..." }`; `{ "verified": true }` on success, `404` on a wrong/absent token (no oracle). |
 | GET | `/api/senders` | List the active account's identities: `[{ id, email, status, verified_at }, …]`. |
-| POST | `/api/mail/webhooks/:provider` | Inbound bounce/complaint ingestion (`provider` = `ses` \| `postmark`). Verifies a shared-secret HMAC-SHA256 signature (`X-Signature` over `"<X-Webhook-Timestamp>.<body>"`, constant-time); `401` on a bad signature, `404` when no `webhook_secret` is configured. Upserts a suppression per hard bounce / complaint; returns `{ "suppressed": n }`. |
+| POST | `/api/mail/webhooks/:provider` | Inbound bounce/complaint ingestion (`provider` = `ses` \| `postmark`). Verifies a shared-secret HMAC-SHA256 signature over `"<X-Webhook-Timestamp>.<provider>.<X-Account-Id>.<body>"` (constant-time) and a ±5m timestamp-freshness window; `401` on a stale timestamp or bad signature, `404` when no `webhook_secret` is configured. Upserts a suppression per hard bounce / complaint; returns `{ "suppressed": n }`. A genuine provider webhook (no signature/`X-Account-Id`) is GLOBAL-only — per-account scoping requires a signing relay. |
 
 When `.mail.require_verified_sender = true`, an account-scoped send whose From is not a verified
 identity is rejected. When `.mail.check_suppression = true`, a send to a suppressed recipient is

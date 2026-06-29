@@ -122,19 +122,21 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
 
     const req = senders.requestVerification(app.io, ctx.allocator, w, scope.account, email) catch |e| switch (e) {
         error.InvalidSenderEmail => return ApiError.badRequest("Invalid sender email.").toResponse(ctx.allocator),
+        // Rate-limited (I3): a (re)send was requested again within the window — do not re-issue/email.
+        error.VerificationThrottled => return (ApiError{ .status = 429, .message = "Verification email already sent recently; try again later." }).toResponse(ctx.allocator),
         else => return e,
     };
 
-    // Deliver the token to the address being verified — a SYSTEM send (no account/from) so it
-    // bypasses verified-sender enforcement (chicken-and-egg). Best-effort: a mail failure must not
-    // lose the already-persisted pending identity, so we swallow it (the operator can re-request).
+    // Deliver the token to the (normalized) address being verified — a SYSTEM send (no account/from)
+    // so it bypasses verified-sender enforcement (chicken-and-egg). Best-effort: a mail failure must
+    // not lose the already-persisted pending identity, so we swallow it (the operator can re-request).
     if (!req.already_verified and req.token.len > 0) {
-        const text = std.fmt.allocPrint(ctx.allocator, "Confirm you can send from {s} by submitting this token to /api/senders/{s}/verify:\n\n{s}\n", .{ email, req.id, req.token }) catch "";
+        const text = std.fmt.allocPrint(ctx.allocator, "Confirm you can send from {s} by submitting this token to /api/senders/{s}/verify:\n\n{s}\n", .{ req.email, req.id, req.token }) catch "";
         mail_send.send(app, ctx.allocator, .{
-            .to = email,
+            .to = req.email,
             .subject = "Verify your sender address",
             .text = text,
-        }) catch |e| std.log.warn("sender verification email to {s} failed: {s}", .{ email, @errorName(e) });
+        }) catch |e| std.log.warn("sender verification email to {s} failed: {s}", .{ req.email, @errorName(e) });
     }
 
     var o: std.json.ObjectMap = .empty;
@@ -168,7 +170,7 @@ pub fn verify(ctx: *http.RequestCtx) anyerror!http.Response {
     var early: ?http.Response = null;
     const scope = (try resolveScope(ctx, app, w, &early)) orelse return early.?;
 
-    const ok = try senders.confirm(w, scope.account, identity_id, token);
+    const ok = try senders.confirm(ctx.allocator, w, scope.account, identity_id, token);
     if (!ok) {
         // Indistinguishable: wrong token, wrong account, or absent id all collapse to 404 (no oracle).
         return ApiError.notFound().toResponse(ctx.allocator);

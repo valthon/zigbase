@@ -69,17 +69,26 @@ pub const CaptureMailer = struct {
         try self.record(self.from, email);
     }
 
-    /// Record a message under the mutex (the owned copies live on `self.alloc`).
+    /// Record a message under the mutex (the owned copies live on `self.alloc`). Each dupe has its own
+    /// `errdefer` so a later allocation failing frees the earlier copies (no partial-alloc leak).
     pub fn record(self: *CaptureMailer, from: []const u8, email: Email) !void {
         lockMutex(&self.mutex);
         defer self.mutex.unlock();
+        const from_copy = try self.alloc.dupe(u8, from);
+        errdefer self.alloc.free(from_copy);
+        const to_copy = try self.alloc.dupe(u8, email.to);
+        errdefer self.alloc.free(to_copy);
+        const subject_copy = try self.alloc.dupe(u8, email.subject);
+        errdefer self.alloc.free(subject_copy);
+        const text_copy = try self.alloc.dupe(u8, email.text_body);
+        errdefer self.alloc.free(text_copy);
         const html_copy: ?[]u8 = if (email.html_body) |h| try self.alloc.dupe(u8, h) else null;
         errdefer if (html_copy) |h| self.alloc.free(h);
         try self.messages.append(self.alloc, .{
-            .from = try self.alloc.dupe(u8, from),
-            .to = try self.alloc.dupe(u8, email.to),
-            .subject = try self.alloc.dupe(u8, email.subject),
-            .text = try self.alloc.dupe(u8, email.text_body),
+            .from = from_copy,
+            .to = to_copy,
+            .subject = subject_copy,
+            .text = text_copy,
             .html = html_copy,
         });
     }

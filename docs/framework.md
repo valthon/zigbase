@@ -634,14 +634,31 @@ Routes (tenant-scoped, fail closed):
 - `GET /api/senders` — list the active account's identities.
 
 A send whose From is not a verified identity for the account is **rejected** (`error.SenderNotVerified`).
+Addresses are compared **case-insensitively** (normalized/lowercased on store and lookup), so
+`From@Acct.com` and `from@acct.com` are one identity. Verification-email **(re)sends are rate-limited**
+per `(account, email)` (a repeat within ~60s returns `429`) so an authenticated member cannot amplify
+mail at an arbitrary recipient. The verification token is matched in **constant time**.
 
 **Bounce/complaint suppression.** `POST /api/mail/webhooks/:provider` (`ses` | `postmark`) ingests
-delivery events. It verifies a shared-secret **HMAC-SHA256 signature with a constant-time compare**
-(`X-Signature` over `"<X-Webhook-Timestamp>.<body>"`, mirroring the outbound webhook signer); a
-wrong/missing signature is rejected (401), and with no `.mail.webhook_secret` set the route is
-disabled (404) — ingestion is opt-in. A hard bounce or complaint upserts a `_suppressions` row
-(account-scoped, or global). When `.mail.check_suppression = true`, a send to a suppressed recipient
-is **blocked** (`error.RecipientSuppressed`).
+delivery events. It verifies a shared-secret **HMAC-SHA256 signature with a constant-time compare** —
+the signed string is `"<X-Webhook-Timestamp>.<provider>.<X-Account-Id>.<body>"`, so the body AND the
+target account are authenticated (a replayer can't redirect a captured event to another tenant). A
+stale `X-Webhook-Timestamp` (outside ±5m) and a wrong/missing signature are rejected (401), and with
+no `.mail.webhook_secret` set the route is disabled (404) — ingestion is opt-in. A hard bounce or
+complaint upserts a `_suppressions` row. When `.mail.check_suppression = true`, a send to a suppressed
+recipient (case-insensitive) is **blocked** (`error.RecipientSuppressed`).
+
+> **Attribution honesty (per-tenant vs global).** A *genuine* provider webhook (SES SNS / Postmark)
+> cannot compute our HMAC and cannot add `X-Account-Id`, so it can only reach this endpoint via an
+> **operator-run relay** that decides the owning account, injects `X-Account-Id`, and signs the
+> string above. A suppression with an empty account is **GLOBAL** (blocks the address for *every*
+> tenant). Do not assume per-tenant isolation from a raw provider webhook — only the signed relay
+> provides it.
+
+> **Enforcement boundary.** Verified-sender + suppression checks are a **policy of the `ctx.mail()`
+> layer**, not of the `Mailer.send` vtable seam. Code that bypasses `ctx.mail()` and calls a backend
+> directly skips them (header/CRLF rejection still applies). Always send application mail through
+> `ctx.mail()`.
 
 ```zig
 const App = zigbase.App(.{
@@ -649,7 +666,7 @@ const App = zigbase.App(.{
     .mail = .{
         .require_verified_sender = true, // tenant sends must use a verified From
         .check_suppression = true,       // block hard-bounced / complained recipients
-        .webhook_secret = "…",           // enable the bounce/complaint webhook
+        .webhook_secret = "…",           // enable the bounce/complaint webhook (signed relay)
     },
 });
 ```

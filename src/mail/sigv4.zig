@@ -31,7 +31,12 @@ fn hmac(key: []const u8, data: []const u8) [HmacSha256.mac_length]u8 {
 /// Derive the SigV4 signing key: HMAC chain over date → region → service → "aws4_request",
 /// seeded with `"AWS4" ++ secret`. Returns the 32-byte key.
 pub fn signingKey(secret: []const u8, date: []const u8, region: []const u8, service: []const u8) [HmacSha256.mac_length]u8 {
-    var seed_buf: [256]u8 = undefined;
+    // "AWS4" + secret. 1024 bytes comfortably covers any realistic AWS secret (long-term keys are 40
+    // chars; even an SSO/STS-derived secret is far below this), so `bufPrint` cannot overflow — the
+    // `unreachable` would only fire on a >1019-char secret, which is not a valid AWS credential. We do
+    // NOT fall back to a truncated/raw seed: a wrong seed silently computes the WRONG signing key (a
+    // confusing auth failure at AWS), which is worse than a clear crash on impossible input.
+    var seed_buf: [1024]u8 = undefined;
     const seed = std.fmt.bufPrint(&seed_buf, "AWS4{s}", .{secret}) catch unreachable;
     const k_date = hmac(seed, date);
     const k_region = hmac(&k_date, region);

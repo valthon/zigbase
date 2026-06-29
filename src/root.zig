@@ -260,6 +260,7 @@ test {
     _ = @import("mail/mailer.zig");
     _ = @import("mail/send.zig");
     _ = @import("mail/template.zig");
+    _ = @import("mail/addr.zig");
     _ = @import("mail/sigv4.zig");
     _ = @import("mail/ses.zig");
     _ = @import("mail/postmark.zig");

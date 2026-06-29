@@ -40,10 +40,21 @@
   account) bypasses. Suppression blocking engages only with `.mail.check_suppression = true` — a send
   to a hard-bounced/complained recipient is BLOCKED.
 - The inbound bounce/complaint webhook verifies a shared-secret HMAC-SHA256 signature with a
-  CONSTANT-TIME compare (mirroring the outbound webhook signing); a wrong/missing signature is
-  rejected (401). With no `webhook_secret` configured the route is disabled (404) — ingestion is
-  strictly opt-in.
+  CONSTANT-TIME compare; the signed string binds the timestamp, provider, AND the target account
+  (`X-Account-Id`) plus the body, so a captured event cannot be redirected to another tenant. A
+  ±5-minute timestamp-freshness window rejects replays, and a wrong/missing/stale request is rejected
+  (401). With no `webhook_secret` configured the route is disabled (404) — ingestion is strictly
+  opt-in. NOTE: a genuine provider webhook cannot sign/scope itself, so it is GLOBAL-only;
+  per-account scoping requires an operator-run signing relay (documented).
+- Email addresses are normalized (lowercased) for suppression and verified-sender identity, so a
+  suppression on `bad@x.io` also blocks `Bad@X.IO` (no case-based fail-open) and a verified
+  `From@Acct.com` matches a send from `from@acct.com`.
+- Sender-verification emails are rate-limited per `(account, email)` (a re-request within ~60s
+  returns 429), preventing an authenticated member from amplifying mail at an arbitrary recipient.
+  The verification token is matched in constant time, and the multipart MIME boundary is now random
+  (not timestamp-derived) so it cannot be guessed to forge a MIME part.
 - The HTTP providers CRLF/ASCII-control-char-reject every header-bound value (from/to/subject/
   reply_to) before it enters the provider JSON body, and SES requests are SigV4-signed over the exact
   payload bytes. Sender-identity verification and suppression are tenant-scoped and parameter-bound
-  (no cross-account verification; no SQL interpolation of recipient addresses).
+  (no cross-account verification; no SQL interpolation of recipient addresses). Verified-sender +
+  suppression enforcement is a `ctx.mail()`-layer policy (not a `Mailer.send` vtable guarantee).
