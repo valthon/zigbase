@@ -413,8 +413,11 @@ GET /api/collections/posts/records?q=alpha%20OR%20beta&filter=published=true
 Results are ranked by relevance (`bm25`) in offset mode. The terms support the basic FTS5
 operators (`AND`, `OR`, `NOT`, and a trailing `*` for prefix search); the whole term is passed
 as a **bound parameter** (never interpolated) and lowered to a guaranteed-valid query, so a
-malformed input is harmless — it can never become a SQL error or injection. A `search` on a
-collection with no `searchable` field returns **400**.
+malformed input is harmless — it can never become a SQL error or injection. `search` AND-s with
+your `filter` (the result is the intersection — a row must match both). A `search` whose terms
+reduce to nothing (e.g. operator-only, `?search=AND`) matches **no rows** rather than returning the
+whole collection. A `search` on a collection with no `searchable` field returns **400**. The
+`_fts` collection-name suffix is reserved (it backs the per-collection shadow tables).
 
 **Vector / nearest-neighbor (sqlite-vec) — opt-in `-Dvector` build.** Vector search is **not**
 compiled into the default binary. Build with `-Dvector=true` to vendor and link
@@ -427,9 +430,11 @@ GET /api/collections/docs/records?vector=embedding:l2:[0.12,0.04,...]&filter=lan
 ```
 
 The form is `<field>[:cosine|:l2]:<json-embedding>` (cosine is the default metric); rows are
-ordered nearest-first. The embedding is a bound parameter. In the **default build** a `vector`
-query returns **400** (`"Vector search is not enabled in this build."`), and the binary is
-byte-for-byte unaffected. Vector search runs in offset mode (cursor paging is rejected with 400).
+ordered nearest-first. The embedding is validated (a non-empty JSON array of finite numbers) and
+bound; a malformed or dimension-mismatched embedding returns a clean **400**. In the **default
+build** a `vector` query returns **400** (`"Vector search is not enabled in this build."`), and the
+binary is byte-for-byte unaffected. Vector search runs in offset mode (cursor paging is rejected
+with 400).
 
 ---
 

@@ -660,3 +660,52 @@ test "records.list full-text search ranks by bm25 and binds a basic-operator que
     } };
     try std.testing.expectError(error.NotSearchable, records.list(a, &d, withRule(plain, "@public"), .{ .search = "alpha", .rctx = &anon }));
 }
+
+test "records.list full-text search intersects with the filter (search still constrains)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = withRule(try searchableBase(a, &d), "@public");
+    // r1: matches "budget" AND owner acc1; r2: matches "budget" but owner acc2; r3: owner acc1 but
+    // does NOT match "budget".
+    try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
+        "('r1','t','t','budget plan','acc1')," ++
+        "('r2','t','t','budget review','acc2')," ++
+        "('r3','t','t','random note','acc1');");
+    const anon = request.RequestContext{};
+
+    // The result must be the INTERSECTION of search AND filter: only r1.
+    // FAILS-BEFORE: the filter block ASSIGNED where_sql, clobbering the FTS MATCH (and dropping its
+    // bound param), so `search=budget&filter=owner='acc1'` returned every owner=acc1 row — r1 AND r3
+    // (r3 lacks "budget"). PASSES-AFTER: the filter AND-composes onto the MATCH, so r3 is excluded.
+    const res = try records.list(a, &d, col, .{
+        .search = "budget",
+        .filter = "owner = \"acc1\"",
+        .rule = listRuleFilter(col, &anon),
+        .rctx = &anon,
+    });
+    try std.testing.expectEqual(@as(usize, 1), res.items.len);
+    try std.testing.expectEqualStrings("r1", res.items[0].object.get("id").?.string);
+}
+
+test "records.list search that sanitizes to empty returns no rows (not the full scoped list)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = withRule(try searchableBase(a, &d), "@public");
+    try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
+        "('r1','t','t','hello world','acc1'),('r2','t','t','goodbye world','acc1');");
+    const anon = request.RequestContext{};
+
+    // A non-empty search that sanitizes to nothing (operator-only) matches NOTHING — it must NOT
+    // degrade to a full (scoped) list just because the user "searched".
+    const empty = try records.list(a, &d, col, .{ .search = "AND", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    try std.testing.expectEqual(@as(usize, 0), empty.items.len);
+    // Sanity: a real term still returns its match (the short-circuit is specific to empty queries).
+    const real = try records.list(a, &d, col, .{ .search = "hello", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    try std.testing.expectEqual(@as(usize, 1), real.items.len);
+}

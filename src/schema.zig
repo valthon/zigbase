@@ -4,6 +4,11 @@ const datetime = @import("datetime.zig");
 
 pub const NumberMode = enum { float, int, fixed };
 
+/// Reserved suffix for full-text search (#157) shadow tables: a searchable collection `<x>`
+/// provisions an FTS5 table named `<x>_fts`. Canonical here so `schema.validate` (which reserves
+/// the suffix on collection names) and `search/fts.zig` (which builds the table name) agree.
+pub const fts_suffix = "_fts";
+
 pub const FieldType = enum {
     text, email, url, editor, date, autodate, @"bool", number, json, select, relation, file,
 };
@@ -678,6 +683,11 @@ pub fn hasSearchableField(c: Collection) bool {
 pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(ValidationError)) std.mem.Allocator.Error!void {
     if (!isValidIdentifier(c.name))
         try errors.append(alloc, .{ .field = "name", .code = "validation_invalid_name", .message = "Name must start with a letter and contain only letters, digits, and underscores." });
+    // `_fts` is reserved: a searchable collection `posts` provisions an FTS5 shadow table named
+    // `posts_fts`, so a user collection literally named `<x>_fts` could collide with `<x>`'s index
+    // (CREATE VIRTUAL TABLE over an existing base table errors). Reserve the suffix outright (#157).
+    if (std.mem.endsWith(u8, c.name, fts_suffix))
+        try errors.append(alloc, .{ .field = "name", .code = "validation_reserved_suffix", .message = "Collection name may not end with '_fts' (reserved for full-text search index tables)." });
 
     for (c.fields, 0..) |f, i| {
         if (!isValidIdentifier(f.name)) {
@@ -1213,6 +1223,21 @@ test "invalid name, reserved field, duplicate, bad scale, empty select are caugh
     var errs = try collectErrors(.{ .id = "c1", .name = "1bad", .fields = &fields });
     defer errs.deinit(std.testing.allocator);
     try std.testing.expect(errs.items.len >= 5);
+}
+
+test "validate reserves the _fts collection-name suffix (#157 shadow-table collision)" {
+    const fields = [_]Field{.{ .id = "a", .name = "title", .options = .{ .text = .{} } }};
+    var errs = try collectErrors(.{ .id = "c1", .name = "posts_fts", .fields = &fields });
+    defer errs.deinit(std.testing.allocator);
+    var saw = false;
+    for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_reserved_suffix")) {
+        saw = true;
+    };
+    try std.testing.expect(saw);
+    // A normal name is unaffected.
+    var ok = try collectErrors(.{ .id = "c2", .name = "posts", .fields = &fields });
+    defer ok.deinit(std.testing.allocator);
+    for (ok.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_reserved_suffix"));
 }
 
 test "sqlType mapping" {

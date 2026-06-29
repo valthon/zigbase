@@ -1734,6 +1734,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // tenant-/ability-guarded collection still returns only rows the caller may view. A search on a
     // collection with no searchable field is `error.NotSearchable` (handler -> 400).
     var search_order: ?[]const u8 = null;
+    var search_term_hash: ?[]const u8 = null; // the SANITIZED term, folded into the cursor hash
     if (q.search) |sterm| {
         const trimmed = std.mem.trim(u8, sterm, " \t\r\n");
         if (trimmed.len > 0) {
@@ -1745,6 +1746,15 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
                 p[0] = s.param;
                 params = p;
                 search_order = s.order_sql;
+                search_term_hash = s.param.text;
+            } else {
+                // A non-empty search that sanitizes to nothing (operator-/punctuation-only, e.g.
+                // `?search=AND`) carries no matchable token. Match NOTHING rather than silently
+                // degrade to a full (scoped) list — the constant-false `"0"` fragment short-circuits
+                // every page to empty through the normal machinery (and AND-s harmlessly with the
+                // scope predicates below). The query was a search; an empty search yields no rows.
+                where_sql = "0";
+                search_term_hash = trimmed; // bind the cursor to the (rejected) term anyway
             }
         }
     }
@@ -1772,8 +1782,17 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         const toks = try lexer.lex(alloc, fstr);
         const ast = try parser.parse(alloc, toks);
         const compiled = try compiler.compile(alloc, &j, ast, null);
-        where_sql = compiled.where_sql;
-        params = compiled.params;
+        // AND-compose onto any prior clause (the FTS `MATCH` / vector predicate set above) and
+        // APPEND params — never assign, which would clobber the search predicate AND drop its bound
+        // term, so `?search=X&filter=Y` would silently ignore the search. Mirrors the rule block.
+        where_sql = if (where_sql.len > 0)
+            try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, compiled.where_sql })
+        else
+            compiled.where_sql;
+        var merged: std.ArrayList(compiler.Param) = .empty;
+        try merged.appendSlice(alloc, params);
+        try merged.appendSlice(alloc, compiled.params);
+        params = try merged.toOwnedSlice(alloc);
     };
     if (q.rule) |rstr| if (rstr.len > 0) {
         const rtoks = try lexer.lex(alloc, rstr);
@@ -1889,7 +1908,11 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         // The token binds to the PUBLIC effective-sort spec (e.g. "-created,id"), not the column
         // SQL — so an SDK that synthesizes the same spec produces a matching cursor.
         const eff_sort_str = try effectiveSortString(alloc, eff_terms);
-        const fh = keyset.filterHash(q.filter, q.rule);
+        // Fold the SANITIZED search term into the cursor hash so a token minted under `?search=X` is
+        // rejected when replayed with a different search (else the boundary would straddle a
+        // different result set). Vector + cursor is rejected earlier, so the vector spec can't reach
+        // here. `q.filter`/`q.rule` already bind the rest of the result-set shape.
+        const fh = keyset.filterHash(q.filter, q.rule, search_term_hash);
 
         // Decode the boundary cursor (if any). first_page = no token supplied.
         const maybe_cur: ?keyset.Cursor = if (q.cursor) |token| try decodeCursor(alloc, q, conn, col, token, eff_sort_str, fh) else null;

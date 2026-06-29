@@ -615,6 +615,15 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
             return ApiError.badRequest("Vector search does not support cursor pagination; use offset paging.").toResponse(ctx.allocator),
         error.BadVector =>
             return ApiError.badRequest("Invalid vector search query.").toResponse(ctx.allocator),
+        // A vector query whose embedding dimension does not match the stored vectors surfaces as a
+        // sqlite-vec runtime error (StepFailed) — only knowable at query time (dims aren't in the
+        // field schema). Map it to a clean 400 ONLY when a vector query was requested, so non-vector
+        // DB failures keep their 500. (`vec_distance_*` validates dims; the embedding JSON itself is
+        // already validated up front in `vector.build`.)
+        error.StepFailed => if (qp.get("vector") != null)
+            return ApiError.badRequest("Invalid vector search query (embedding dimension mismatch).").toResponse(ctx.allocator)
+        else
+            return e,
         error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep =>
             return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
         else => return e,

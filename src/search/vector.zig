@@ -70,11 +70,38 @@ pub fn build(alloc: std.mem.Allocator, col: schema.Collection, raw: []const u8) 
         else => return error.BadVector,
     }
 
+    // Validate the query embedding is a non-empty JSON array of finite numbers BEFORE it reaches
+    // sqlite-vec — a malformed or non-numeric body would otherwise surface as a SQLite runtime error
+    // (500). (A dimension MISMATCH can only be caught at query time, since dims aren't part of the
+    // field schema; the list handler maps that runtime error to a clean 400.)
+    if (!try validEmbedding(alloc, rest)) return error.BadVector;
+
     return .{
         .where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" IS NOT NULL", .{ col.name, field }),
         .order_sql = try std.fmt.allocPrint(alloc, "{s}(\"{s}\".\"{s}\", ?)", .{ dist_fn, col.name, field }),
         .param = .{ .text = rest },
     };
+}
+
+/// True iff `s` is a JSON array of one-or-more finite numbers (the only well-formed query embedding).
+/// Rejects malformed JSON, a non-array, an empty array, or any non-numeric / non-finite element.
+fn validEmbedding(alloc: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error!bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false, // any parse/syntax error => not a valid embedding
+    };
+    defer parsed.deinit();
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return false,
+    };
+    if (arr.items.len == 0) return false;
+    for (arr.items) |it| switch (it) {
+        .integer => {},
+        .float => |fv| if (!std.math.isFinite(fv)) return false,
+        else => return false,
+    };
+    return true;
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -108,6 +135,24 @@ test "vector build parses field/metric/embedding and binds the query vector" {
     // Unknown / non-storable target field is rejected.
     try std.testing.expectError(error.BadVector, build(a, col, "missing:[1,2]"));
     try std.testing.expectError(error.BadVector, build(a, col, "n:[1,2]"));
+    // A malformed / non-numeric embedding is rejected at build time (-> 400, never a SQLite 500).
+    try std.testing.expectError(error.BadVector, build(a, col, "embedding:not-json"));
+    try std.testing.expectError(error.BadVector, build(a, col, "embedding:[1,\"x\"]"));
+    try std.testing.expectError(error.BadVector, build(a, col, "embedding:{\"a\":1}"));
+    try std.testing.expectError(error.BadVector, build(a, col, "embedding:[]"));
+}
+
+test "validEmbedding accepts numeric arrays and rejects malformed input (build-independent)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(try validEmbedding(a, "[1,2,3]"));
+    try std.testing.expect(try validEmbedding(a, "[0.1, -2.5, 3e2]"));
+    try std.testing.expect(!try validEmbedding(a, "[]"));
+    try std.testing.expect(!try validEmbedding(a, "not json"));
+    try std.testing.expect(!try validEmbedding(a, "[1, \"two\"]"));
+    try std.testing.expect(!try validEmbedding(a, "{\"v\":[1,2]}"));
+    try std.testing.expect(!try validEmbedding(a, "42"));
 }
 
 test "sqlite-vec extension is registered and vec_distance functions evaluate (KNN end-to-end)" {

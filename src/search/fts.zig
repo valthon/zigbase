@@ -22,8 +22,9 @@ const schema = @import("../schema.zig");
 const db = @import("../db.zig");
 const compiler = @import("../query/compiler.zig");
 
-/// Suffix appended to a collection name to form its FTS5 shadow table.
-pub const suffix = "_fts";
+/// Suffix appended to a collection name to form its FTS5 shadow table. Canonical in `schema.zig`
+/// (where `schema.validate` reserves it on collection names) — aliased here for the table builder.
+pub const suffix = schema.fts_suffix;
 
 /// Defensive cap on a user search term we process (bounds work; longer input is truncated).
 pub const max_term_len = 256;
