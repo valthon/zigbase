@@ -73,18 +73,22 @@ fn dropTempSchema(a: std.mem.Allocator, d: *dbm.Db, name: []const u8) void {
 /// Provision `col`'s table on Postgres using the Postgres column types for each field's storage
 /// class (BIGINT / DOUBLE PRECISION / TEXT). System columns mirror what `records` reads/writes.
 ///
-/// FINDING (collation, for PR-2's real DDL): every TEXT column is declared `COLLATE "C"` so its
-/// ordering is BYTE order — matching SQLite's default BINARY collation. Without this, Postgres
-/// sorts text by the database's locale (e.g. `en_US.UTF-8`, case/punctuation-insensitive), so the
-/// `id` keyset TIEBREAKER among equal sort-key rows diverges from SQLite and keyset pages drift.
-/// The plan flagged this as the "Collation" divergence; PR-2's column DDL must apply `COLLATE "C"`
-/// (or an explicit shared collation) to text columns used as sort/keyset keys.
+/// Every TEXT column gets the dialect's byte-order collation (`Dialect.textCollate()` → `COLLATE
+/// "C"` on Postgres) so its ordering matches SQLite's default BINARY collation — the same clause
+/// PR-2's REAL provisioning (`ddl.zig`/`provision.zig`, #169) now emits, and that
+/// `schema_pg_test.zig` proves end-to-end. Sourcing it from the dialect helper (not a magic
+/// string) keeps this hand-rolled CRUD-test DDL in lock-step with production. Without it Postgres
+/// sorts text by the database locale (e.g. `en_US.UTF-8`), so an `id` keyset TIEBREAKER among
+/// equal sort-key rows would diverge from SQLite. (These CRUD tests assert keyset pagination via
+/// collation-independent SCORE sequences, so they don't depend on this; it's correctness hygiene
+/// that mirrors the provisioned schema.)
 fn provisionPg(a: std.mem.Allocator, d: *dbm.Db, col: schema.Collection) !void {
+    const tc = Dialect.postgres.textCollate(); // " COLLATE \"C\"" on Postgres
     var sql: std.ArrayList(u8) = .empty;
-    try sql.appendSlice(a, try std.fmt.allocPrint(a, "CREATE TABLE \"{s}\" (\"id\" TEXT COLLATE \"C\" PRIMARY KEY, \"created\" TEXT COLLATE \"C\", \"updated\" TEXT COLLATE \"C\"", .{col.name}));
+    try sql.appendSlice(a, try std.fmt.allocPrint(a, "CREATE TABLE \"{s}\" (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ col.name, tc, tc, tc }));
     for (col.fields) |f| {
         const ty = Dialect.postgres.sqlType(f.storageClass());
-        const collate = if (std.mem.eql(u8, ty, "TEXT")) " COLLATE \"C\"" else "";
+        const collate = if (std.mem.eql(u8, ty, "TEXT")) tc else "";
         try sql.appendSlice(a, try std.fmt.allocPrint(a, ", \"{s}\" {s}{s}", .{ f.name, ty, collate }));
     }
     try sql.appendSlice(a, ");");

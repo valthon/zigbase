@@ -52,6 +52,18 @@ pub const ParamSink = struct {
     /// through untouched so a literal that happens to contain `?` is never mistaken for a
     /// placeholder. Identifiers (`"..."`) cannot contain `?` (gated by `schema.isValidIdentifier`),
     /// so they need no special handling.
+    ///
+    /// SECURITY-RELEVANT SCANNER ASSUMPTIONS — keep these invariants true when adding SQL producers:
+    ///   1. The scanner only understands SINGLE-quoted string literals (`'...'` with `''` escapes).
+    ///      It does NOT understand: PostgreSQL JSON/hstore operators that spell `?` (`?`, `?|`,
+    ///      `?&`), a `??` literal-question-mark escape, `E'...'` backslash escapes, or `$tag$…$tag$`
+    ///      dollar-quoted bodies. ZigBase's generated SQL uses NONE of these today, so every `?`
+    ///      outside a `'...'` literal IS a bind placeholder. If a future producer emits any of them,
+    ///      this scanner MUST be extended first — an unhandled `?` inside e.g. a JSON operator or a
+    ///      dollar-quoted body would be miscounted as a placeholder and shift every later `$n`.
+    ///   2. Safety ALSO rests on the broader invariant that all user-supplied values are BOUND, never
+    ///      interpolated — so no attacker-controlled `?` (or `'`) ever reaches this generated SQL.
+    ///      The scanner is a syntactic renumber, not a sanitizer; it relies on that binding discipline.
     pub fn rewrite(self: *ParamSink, alloc: std.mem.Allocator, sql: []const u8) std.mem.Allocator.Error![]u8 {
         if (self.dialect.kind == .sqlite) return alloc.dupe(u8, sql);
 

@@ -44,8 +44,10 @@ fn opSql(op: lexer.TokKind, dialect: Dialect) []const u8 {
         .ge => ">=",
         .lt => "<",
         .le => "<=",
-        // `~`/`!~` are case-insensitive contains — SQLite `LIKE` is already case-insensitive,
-        // Postgres needs `ILIKE`/`NOT ILIKE` to match that behavior.
+        // `~`/`!~` are case-insensitive "contains" matches (the value is wrapped in `%…%` by the
+        // caller). To realize case-insensitivity on each backend: SQLite's `LIKE` is already
+        // ASCII-case-insensitive, while Postgres's `LIKE` is case-sensitive, so Postgres emits
+        // `ILIKE`/`NOT ILIKE` (SQLite keeps `LIKE`/`NOT LIKE`).
         .like => dialect.likeOp(true),
         .nlike => if (dialect.kind == .postgres) "NOT ILIKE" else "NOT LIKE",
         else => unreachable, // parser only produces comparison ops in a cmp node
