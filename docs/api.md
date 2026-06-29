@@ -307,6 +307,14 @@ share one grammar.
 | `<=` | less than or equal |
 | `~` | LIKE (contains / pattern match) |
 | `!~` | NOT LIKE |
+| `in` | set membership — `field in (a, b, c)` or `field in <list-macro>` |
+
+The `in` operator tests a field against a **list**: either a parenthesized,
+comma-separated literal list (`status in ("draft", "published")`) or a list-valued
+macro (see below). It compiles to a parameter-bound `IN (?, ?, …)`. An **empty** list
+(`field in ()`, or an empty membership set) matches nothing (fail-closed). `in` is a
+reserved word — a field literally named `in` cannot appear bare on the left of a
+comparison.
 
 **Boolean combination:** `&&` (and), `||` (or), with parentheses `( )` for grouping.
 
@@ -327,6 +335,15 @@ other character is rejected. The bound parameter receives the unescaped value.
 | `@request.auth.<field>` | a field of the authenticated record (e.g. `@request.auth.id`) |
 | `@request.data.<field>` | a field of the incoming request body |
 | `@request.method` | the HTTP method (e.g. `"GET"`) |
+| `@request.account.id` | the active account scope's id (`""` when none); multi-tenancy foundation |
+| `@request.account.role` | the principal's role in the active account (`""` when none) |
+| `@request.account.ids` | **list macro** — every account the principal belongs to; use with `in` |
+
+> The `@request.account.*` macros are the **foundation** for multi-tenancy and
+> row-level/relationship authorization. Until the tenancy resolver ships they resolve
+> to `""` / the empty list, so a rule using them is fail-closed and existing rules are
+> unaffected. A typical use is scoping a collection to the caller's accounts:
+> `account in @request.account.ids`.
 
 Examples:
 
@@ -335,6 +352,8 @@ status = "published"
 title ~ "zig" && views >= 100
 @request.auth.id = owner
 author.role = "admin" || @request.method = "GET"
+status in ("draft", "published")
+account in @request.account.ids
 ```
 
 > **Encrypted fields are not filterable or sortable.** A field marked `encrypted` (see

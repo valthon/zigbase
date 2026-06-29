@@ -2022,7 +2022,9 @@ Each value is a struct with:
   each is a filter-expression string). **Safe-by-default:** an omitted rule, `null`, or
   `""` is **Locked** (superuser only). Use the explicit sentinel `"@public"` to open an
   operation to everyone (ZigBase logs a startup warning for every `@public` rule). Any other
-  string is a filter expression checked per record.
+  string is a filter expression checked per record (full grammar in
+  [api.md → Filter grammar](api.md#filter-grammar) — comparisons, relation traversal, the
+  `in` set-membership operator, and the `@request.auth.*` / `@request.account.*` macros).
 
 Each field literal needs `.name` and `.type`, plus optional `.required`,
 `.unique`, `.hidden`, and type-specific options:

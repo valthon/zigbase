@@ -95,6 +95,12 @@ pub const QueueRegistry = @import("queue/queue.zig").Registry;
 pub const WebhookOpts = @import("webhook.zig").WebhookOpts;
 pub const WebhookHmac = @import("webhook.zig").Hmac;
 
+// ---- Multi-tenancy / authorization foundation (#156/#155) ------------------
+// `Membership` is the account+role pair a consumer names when populating a request's account
+// scope (PR1 foundation; the resolver + tenant scoping land in later PRs). The `@request.account.*`
+// rule macros and the additive `in` operator read it.
+pub const Membership = @import("request.zig").Membership;
+
 // ---- Ctx capability object -------------------------------------------------
 pub const Ctx = @import("ctx.zig").Ctx;
 /// The transaction scope passed to a `ctx.tx(T, fn(*Tx) ...)` callback — `t.records()`
@@ -178,6 +184,7 @@ test {
     _ = @import("ddl.zig");
     _ = @import("migrations.zig");
     _ = @import("rules.zig");
+    _ = @import("policy.zig");
     _ = @import("crypto.zig");
     _ = @import("aead.zig");
     _ = @import("field_policy.zig");

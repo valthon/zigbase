@@ -4,7 +4,7 @@ const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
 const records = @import("../records.zig");
-const rules = @import("../rules.zig");
+const policy = @import("../policy.zig");
 const request = @import("../request.zig");
 const auth = @import("../auth.zig");
 const jwt = @import("../jwt.zig");
@@ -73,10 +73,10 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         .collection = if (ident) |i| i.collection else "",
         .method = "GET",
     };
-    switch (rules.decide(col.viewRule, &rctx)) {
+    switch (policy.decide(col, .view, &rctx)) {
         .deny_locked => return ApiError.notFound().toResponse(ctx.allocator),
         .allow => {},
-        .check => if (!try rules.matches(ctx.allocator, &r, col, rid, col.viewRule.?, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
+        .check => if (!try policy.authorizes(ctx.allocator, &r, col, .view, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
     }
 
     // file.beforeServe runs only on files the requester may already access; a handler
@@ -101,7 +101,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     const disp_kind: []const u8 = if (force_download or !inline_safe) "attachment" else "inline";
     const disposition = try std.fmt.allocPrint(ctx.allocator, "{s}; filename=\"{s}\"", .{ disp_kind, name });
 
-    const cache: []const u8 = if (rules.isPublic(col.viewRule)) "public, max-age=3600" else "private";
+    const cache: []const u8 = if (policy.isPublic(col.viewRule)) "public, max-age=3600" else "private";
     const headers = try ctx.allocator.dupe(http.Header, &.{
         .{ .name = "Referrer-Policy", .value = "no-referrer" },
         .{ .name = "X-Content-Type-Options", .value = "nosniff" },
@@ -110,6 +110,41 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         .{ .name = "Content-Disposition", .value = disposition },
     });
     return .{ .status = 200, .body = "", .file_path = path, .extra_headers = headers };
+}
+
+test "PIN: file-download view-authz + cache route through policy byte-identically" {
+    // Guards the M1 fix: `serve` gates downloads via `policy.decide(.view)` /
+    // `policy.authorizes(.view)` and sets Cache-Control via `policy.isPublic`. These must
+    // equal the `rules.*` primitive they replaced, so PR2 tenant-scope / PR3 abilities
+    // automatically cover file downloads instead of leaking cross-tenant.
+    const rules = @import("../rules.zig");
+    const collections_mod = @import("../collections.zig");
+    const migrations = @import("../migrations.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const base = try collections_mod.create(a, std.testing.io, &d, .{ .id = "", .name = "docs", .fields = &[_]schema.Field{
+        .{ .id = "d1", .name = "owner", .options = .{ .text = .{} } },
+        .{ .id = "d2", .name = "file", .options = .{ .file = .{ .maxSelect = 1 } } },
+    } });
+    try d.exec("INSERT INTO docs (id,created,updated,owner,file) VALUES ('r1','t','t','u1','a.png');");
+    var owner_obj: std.json.ObjectMap = .empty;
+    try owner_obj.put(a, "id", .{ .string = "u1" });
+    const owner = request.RequestContext{ .auth = .{ .object = owner_obj } };
+
+    inline for (.{ "@public", "owner = @request.auth.id", "" }) |rule| {
+        var col = base;
+        col.viewRule = if (rule.len == 0) null else rule;
+        // The authz decision the handler branches on is identical to the rules primitive.
+        try std.testing.expectEqual(rules.decide(col.viewRule, &owner), policy.decide(col, .view, &owner));
+        if (policy.decide(col, .view, &owner) == .check)
+            try std.testing.expectEqual(try rules.matches(a, &d, col, "r1", col.viewRule.?, &owner), try policy.authorizes(a, &d, col, .view, "r1", &owner));
+        // The Cache-Control public/private decision is identical too.
+        try std.testing.expectEqual(rules.isPublic(col.viewRule), policy.isPublic(col.viewRule));
+    }
 }
 
 test "isInlineSafeExt allows only known-safe types" {

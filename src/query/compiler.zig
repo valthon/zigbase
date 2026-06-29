@@ -86,6 +86,8 @@ fn operandToParam(field: ?schema.Field, op: parser.Operand, rctx: ?*const reques
 }
 
 fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext) CompileError![]u8 {
+    if (c.op == .in) return emitIn(alloc, j, c, params, rctx);
+
     const l_col = isColPath(c.lhs);
     const r_col = isColPath(c.rhs);
 
@@ -122,13 +124,51 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
     return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op)});
 }
 
+/// Emit a set-membership predicate `<col> IN (?,?,…)`, binding each element as a parameter.
+/// The left side MUST be a column path. The right side is either an explicit literal list
+/// (`("a","b")`) or a list-valued macro (`@request.account.ids`), whose elements are read from the
+/// request context. An EMPTY list (`()` or an empty membership set) compiles to the constant-false
+/// predicate `0` — fail-closed, and avoids SQLite's `IN ()` syntax error.
+fn emitIn(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext) CompileError![]u8 {
+    if (!isColPath(c.lhs)) return error.BadFilter; // `<literal> in (...)` is meaningless
+    const col = try j.resolve(c.lhs.path);
+    var n: usize = 0;
+    switch (c.rhs) {
+        .list => |items| for (items) |it| {
+            try params.append(alloc, try operandToParam(col.field, it, rctx));
+            n += 1;
+        },
+        .list_macro => |m| {
+            const rc = rctx orelse return error.BadFilter;
+            // `try` so OutOfMemory propagates (a real 500) instead of being masked as a
+            // BadFilter 400; an unknown list macro is the only BadFilter case here.
+            const ids = (try rc.resolveMacroList(alloc, m)) orelse return error.BadFilter;
+            for (ids) |idv| {
+                try params.append(alloc, .{ .text = idv });
+                n += 1;
+            }
+        },
+        else => return error.BadFilter, // parser only yields list/list_macro on the RHS of `in`
+    }
+    if (n == 0) return alloc.dupe(u8, "0"); // empty set -> constant-false, fail-closed
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(alloc, col.sql);
+    try buf.appendSlice(alloc, " IN (");
+    for (0..n) |i| {
+        if (i > 0) try buf.append(alloc, ',');
+        try buf.append(alloc, '?');
+    }
+    try buf.append(alloc, ')');
+    return buf.toOwnedSlice(alloc);
+}
+
 fn literalToText(op: parser.Operand) CompileError![]const u8 {
     return switch (op) {
         .str => op.str,
         .num => op.num,
         .boolean => |b| if (b) "true" else "false",
         .nul => "",
-        .path => error.BadFilter,
+        .path, .list, .list_macro => error.BadFilter,
     };
 }
 
@@ -147,7 +187,7 @@ fn literalToParam(field: ?schema.Field, op: parser.Operand) CompileError!Param {
         .num => .{ .text = op.num },
         .boolean => |b| .{ .text = if (b) "true" else "false" },
         .nul => .{ .text = "" },
-        .path => error.BadFilter,
+        .path, .list, .list_macro => error.BadFilter,
     };
 }
 
@@ -333,6 +373,94 @@ test "compile @ path without a context errors" {
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
     try std.testing.expectError(error.BadFilter, compile(a, &j, ast, null));
+}
+
+test "compile `in` with a literal list emits placeholders and binds each element" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compileFilter(a, &d, posts, "title in (\"a\", \"b\", \"c\")", &j);
+    try std.testing.expectEqualStrings("\"posts\".\"title\" IN (?,?,?)", c.where_sql);
+    try std.testing.expectEqual(@as(usize, 3), c.params.len);
+    try std.testing.expectEqualStrings("a", c.params[0].text);
+    try std.testing.expectEqualStrings("c", c.params[2].text);
+}
+
+test "compile `in` coerces list elements to the column type" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compileFilter(a, &d, posts, "price in (1.00, 2.50)", &j);
+    try std.testing.expectEqualStrings("\"posts\".\"price\" IN (?,?)", c.where_sql);
+    try std.testing.expectEqual(@as(i64, 100), c.params[0].int);
+    try std.testing.expectEqual(@as(i64, 250), c.params[1].int);
+}
+
+test "compile `in @request.account.ids` binds each membership id" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    const mem = [_]request.Membership{ .{ .account = "acc1" }, .{ .account = "acc2" } };
+    const rctx = request.RequestContext{ .memberships = &mem };
+    const toks = try lexer.lex(a, "author in @request.account.ids");
+    const ast = try parser.parse(a, toks);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compile(a, &j, ast, &rctx);
+    try std.testing.expectEqualStrings("\"posts\".\"author\" IN (?,?)", c.where_sql);
+    try std.testing.expectEqualStrings("acc1", c.params[0].text);
+    try std.testing.expectEqualStrings("acc2", c.params[1].text);
+}
+
+test "compile `in` with an empty set is a constant-false predicate (fail-closed)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    // Empty literal list.
+    var j1 = joiner.Joiner.init(a, &d, posts);
+    const c1 = try compileFilter(a, &d, posts, "title in ()", &j1);
+    try std.testing.expectEqualStrings("0", c1.where_sql);
+    try std.testing.expectEqual(@as(usize, 0), c1.params.len);
+    // Empty membership set via the macro.
+    const rctx = request.RequestContext{}; // no memberships
+    const toks = try lexer.lex(a, "author in @request.account.ids");
+    const ast = try parser.parse(a, toks);
+    var j2 = joiner.Joiner.init(a, &d, posts);
+    const c2 = try compile(a, &j2, ast, &rctx);
+    try std.testing.expectEqualStrings("0", c2.where_sql);
+}
+
+test "compile a relation-path macro rule (account.owner_user = @request.auth.id) still compiles" {
+    // PR1 confirms relationship traversal + macros compose (the foundation for ability rules).
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a); // posts.author -> users
+    var auth: std.json.ObjectMap = .empty;
+    try auth.put(a, "id", .{ .string = "u1" });
+    const rctx = request.RequestContext{ .auth = .{ .object = auth } };
+    const toks = try lexer.lex(a, "author.name = @request.auth.id");
+    const ast = try parser.parse(a, toks);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compile(a, &j, ast, &rctx);
+    try std.testing.expectEqual(@as(usize, 1), j.joins.items.len);
+    try std.testing.expectEqualStrings("j1.\"name\" = ?", c.where_sql);
+    try std.testing.expectEqualStrings("u1", c.params[0].text);
 }
 
 test "compile a method-vs-literal rule binds both as text" {

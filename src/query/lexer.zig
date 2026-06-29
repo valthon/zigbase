@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const TokKind = enum { ident, string, number, eq, ne, gt, ge, lt, le, like, nlike, l_and, l_or, lparen, rparen, eof };
+pub const TokKind = enum { ident, string, number, eq, ne, gt, ge, lt, le, like, nlike, in, l_and, l_or, lparen, rparen, comma, eof };
 pub const Token = struct { kind: TokKind, text: []const u8 };
 pub const LexError = error{ UnexpectedChar, UnterminatedString, InvalidEscape } || std.mem.Allocator.Error;
 
@@ -31,6 +31,7 @@ pub fn lex(alloc: std.mem.Allocator, input: []const u8) LexError![]Token {
         switch (c) {
             '(' => { try toks.append(alloc, .{ .kind = .lparen, .text = "(" }); i += 1; },
             ')' => { try toks.append(alloc, .{ .kind = .rparen, .text = ")" }); i += 1; },
+            ',' => { try toks.append(alloc, .{ .kind = .comma, .text = "," }); i += 1; },
             '=' => { try toks.append(alloc, .{ .kind = .eq, .text = "=" }); i += 1; },
             '~' => { try toks.append(alloc, .{ .kind = .like, .text = "~" }); i += 1; },
             '>' => { if (i + 1 < input.len and input[i + 1] == '=') { try toks.append(alloc, .{ .kind = .ge, .text = ">=" }); i += 2; } else { try toks.append(alloc, .{ .kind = .gt, .text = ">" }); i += 1; } },
@@ -73,7 +74,12 @@ pub fn lex(alloc: std.mem.Allocator, input: []const u8) LexError![]Token {
                 } else if (isIdentStart(c)) {
                     const start = i;
                     while (i < input.len and isIdentChar(input[i])) : (i += 1) {}
-                    try toks.append(alloc, .{ .kind = .ident, .text = input[start..i] });
+                    const text = input[start..i];
+                    // `in` is the only word-operator (additive set-membership). The exact bareword
+                    // "in" lexes as the `.in` operator; identifiers that merely START with it
+                    // (e.g. "index", "internal") stay `.ident`.
+                    const kind: TokKind = if (std.mem.eql(u8, text, "in")) .in else .ident;
+                    try toks.append(alloc, .{ .kind = kind, .text = text });
                 } else return error.UnexpectedChar;
             },
         }
@@ -228,6 +234,22 @@ test "lex frees owned escaped-string buffers on success (no leak)" {
     }
     try std.testing.expectEqualStrings("a\tb", toks[0].text);
     try std.testing.expectEqualStrings("c\nd", toks[2].text);
+}
+
+test "lex the `in` operator, a list, and a list macro" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const toks = try lex(a, "status in (\"a\", \"b\") || account in @request.account.ids");
+    const kinds = [_]TokKind{ .ident, .in, .lparen, .string, .comma, .string, .rparen, .l_or, .ident, .in, .ident, .eof };
+    try std.testing.expectEqual(kinds.len, toks.len);
+    for (kinds, 0..) |k, i| try std.testing.expectEqual(k, toks[i].kind);
+    // The exact bareword "in" is the operator; words merely starting with it stay identifiers.
+    const toks2 = try lex(a, "internal = 1 && index = 2");
+    try std.testing.expectEqual(TokKind.ident, toks2[0].kind);
+    try std.testing.expectEqualStrings("internal", toks2[0].text);
+    try std.testing.expectEqual(TokKind.ident, toks2[4].kind);
+    try std.testing.expectEqualStrings("index", toks2[4].text);
 }
 
 test "lex an @request macro path" {

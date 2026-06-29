@@ -2,6 +2,7 @@ const std = @import("std");
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const rules = @import("../rules.zig");
+const policy = @import("../policy.zig");
 const request = @import("../request.zig");
 const collections = @import("../collections.zig");
 const records = @import("../records.zig");
@@ -10,7 +11,7 @@ const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 const Conn = connection.Conn;
 
-pub const DeliverError = rules.RuleError;
+pub const DeliverError = policy.PolicyError;
 
 /// Combine clauses with `&&`, each parenthesized: `(c1) && (c2)`.
 fn combineClauses(alloc: std.mem.Allocator, clauses: []const []const u8) ![]u8 {
@@ -47,7 +48,7 @@ pub fn shouldDeliver(
     const rctx = conn.requestContext(now);
 
     if (action == .delete) {
-        switch (rules.decide(col.viewRule, &rctx)) {
+        switch (policy.decide(col, .view, &rctx)) {
             .deny_locked => return false, // locked: superuser already short-circuited to .allow
             .allow => {}, // @public or superuser: anyone may learn of the delete
             .check => {
@@ -63,7 +64,7 @@ pub fn shouldDeliver(
 
     var clauses: std.ArrayList([]const u8) = .empty;
     defer clauses.deinit(alloc);
-    switch (rules.decide(col.viewRule, &rctx)) {
+    switch (policy.decide(col, .view, &rctx)) {
         .deny_locked => return false,
         .allow => {},
         .check => try clauses.append(alloc, col.viewRule.?),
@@ -72,7 +73,7 @@ pub fn shouldDeliver(
     if (clauses.items.len == 0) return true;
 
     const combined = try combineClauses(alloc, clauses.items);
-    return rules.matches(alloc, reader, col, record_id, combined, &rctx);
+    return policy.matchesRule(alloc, reader, col, record_id, combined, &rctx);
 }
 
 /// Evaluate `rule` against a single deleted-record `snapshot` (F4). Builds a throwaway in-memory
@@ -146,7 +147,7 @@ fn matchesSnapshot(
         bi += 1;
     }
     _ = try st.step();
-    return rules.matches(alloc, &tmp, live_col, record_id, rule, rctx) catch false;
+    return policy.matchesRule(alloc, &tmp, live_col, record_id, rule, rctx) catch false;
 }
 
 pub const EventFrames = struct {
