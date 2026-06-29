@@ -912,6 +912,61 @@ TypeScript SDK exposes this as `zb.flags.resolveAll(subject)` — see
 
 ---
 
+## Analytics
+
+Read the built-in product-analytics data: the raw event feed and the declarative rollups
+(see [framework → Product analytics](framework.md#product-analytics-analytics--ctxtrack)).
+Events are emitted server-side with `ctx.track(name, payload)`; the rollups aggregate them on
+a schedule into per-rollup summary tables.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/api/analytics/events?name=&actor=&since=&limit=` | The raw activity feed (newest first). |
+| GET | `/api/analytics/rollups/:name?from=&to=` | A rollup's summary rows. |
+
+Both endpoints are **authenticated and fail closed**. A **superuser** sees all data; a **member**
+sees only their **active account's** data (resolved from a verified `_memberships` row — send
+`X-Account-Id` or activate the `zb_account` cookie). With tenancy **disabled**, the feed is scoped
+to the caller's **own** events and a (global) rollup is **superuser-only** (`403`). A member can
+never read another account's events or rollups; an anonymous request gets `401` (the rollups handler
+authenticates **before** the rollup-name lookup, so 401-vs-404 never leaks which rollup names exist).
+
+Visibility within an account is **account-level, not role-level**: any active member of an account —
+whatever their role — reads the whole account's event feed (including other members' events and
+payloads) and all of its rollup buckets. The trust boundary is the tenant, not the role.
+
+**Events.** Filters: `name` (exact event name), `actor` (exact principal id), `since` (an ISO-8601
+lower bound on `occurred_at`), `limit` (default 50, max 200). The `actor` / `account` / `occurred_at`
+fields are stamped server-side at capture time and cannot be forged by a client.
+
+```json
+// GET /api/analytics/events?name=user.signup&limit=2   (Authorization + X-Account-Id)
+{
+  "items": [
+    { "id": "…", "created": "2026-06-29T12:00:05Z", "name": "user.signup",
+      "payload": { "plan": "pro" }, "actor_collection": "users", "actor": "u_123",
+      "account": "acc_abc", "occurred_at": "2026-06-29T12:00:05Z" }
+  ]
+}
+```
+
+**Rollups.** `:name` must be a **declared** rollup (else `404`, no table-name oracle). Filters:
+`from` / `to` bound the `bucket` value. Each row is `{ bucket, account, actor, value, computed_at }`;
+columns absent from the rollup's `group_by` are the empty string. The summary table is created on the
+first scheduled run — until then the endpoint returns `{ "items": [] }`.
+
+```json
+// GET /api/analytics/rollups/signups_daily   (Authorization + X-Account-Id)
+{
+  "items": [
+    { "bucket": "2026-06-29", "account": "acc_abc", "actor": "", "value": 5,
+      "computed_at": "2026-06-29T13:00:00Z" }
+  ]
+}
+```
+
+---
+
 ## Files
 
 File-type fields hold uploaded files.

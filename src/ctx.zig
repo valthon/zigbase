@@ -28,6 +28,7 @@ const queue_memory = @import("queue/memory.zig");
 const queue_durable = @import("queue/durable.zig");
 const mail_send = @import("mail/send.zig");
 const webhook_mod = @import("webhook.zig");
+const analytics = @import("analytics/analytics.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -424,6 +425,38 @@ pub const Ctx = struct {
     /// `broadcast(topic, payload)`.
     pub fn realtime(self: *Ctx) RealtimeApi {
         return .{ .ctx = self };
+    }
+
+    // -----------------------------------------------------------------------
+    // Product analytics (#158). SELF-CONTAINED section so sibling PRs that also
+    // append to ctx.zig rebase cleanly.
+    //
+    // `track(name, payload)` appends ONE immutable `_events` row. The actor /
+    // actor_collection (from the authenticated principal) and the account (the
+    // request's resolved tenant scope) are stamped SERVER-SIDE here; `occurred_at`
+    // is stamped by SQLite. A client cannot forge any of them — `track` ignores its
+    // own request body for context and only takes the event `name` + opaque `payload`.
+    // -----------------------------------------------------------------------
+
+    /// Emit one analytics event: persist `name` + the JSON-serialized `payload` to `_events`,
+    /// with `actor`/`actor_collection` resolved from the authenticated principal and `account`
+    /// from the request's active tenant scope (`""` when tenancy is disabled or unscoped). Cheap:
+    /// a single INSERT. Uses the bound (in-transaction) connection inside a hook/`ctx.tx`, else
+    /// acquires the pool writer. A `[]const u8`/`[]u8` payload is taken as raw JSON unchanged.
+    pub fn track(self: *Ctx, name: []const u8, payload: anytype) !void {
+        const payload_json = try self.serializePayload(payload);
+        const u = self.user();
+        const ev = analytics.EventContext{
+            .name = name,
+            .payload_json = payload_json,
+            .actor = if (u) |uu| uu.id else "",
+            .actor_collection = if (u) |uu| uu.collection else "",
+            .account = self.rctx.account_id,
+        };
+        if (self.bound_conn) |c| return analytics.insertEvent(c, self.app.io, ev);
+        const w = self.app.pool.acquireWriter();
+        defer self.app.pool.releaseWriter();
+        return analytics.insertEvent(w, self.app.io, ev);
     }
 
     fn serializePayload(self: *Ctx, payload: anytype) ![]const u8 {

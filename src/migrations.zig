@@ -411,6 +411,50 @@ fn init_0016_email(w: *db.Db) db.DbError!void {
     );
 }
 
+fn init_0015_events(w: *db.Db) db.DbError!void {
+    // Product analytics event log (#158). A single append-only `_events` table backs
+    // `ctx.track` (event capture) and the declarative rollups (scheduled aggregation into
+    // `_rollup_<name>` summary tables). It is seeded into `_collections` with system=1 and
+    // HARDCODED stable field ids (8-char, matching `provision`'s FNV id width) so a raw-SQL
+    // migration can index the human-named physical columns directly and the records engine
+    // can address it as a system collection (Locked rules — superuser-only via the records
+    // API; tenant reads go through the dedicated `/api/analytics/*` endpoints).
+    //
+    // `actor`/`actor_collection` identify the principal that emitted the event (resolved
+    // SERVER-SIDE by `ctx.track`); `account` is the tenant scope (rctx.account_id, "" when
+    // tenancy is disabled or unscoped); `payload` is opaque JSON text (bound param);
+    // `occurred_at` is the server-stamped ISO-8601 UTC time the event fired. `updated`
+    // mirrors `created` and exists only so the records engine's base-column SELECT
+    // (id/created/updated) does not break for a superuser browsing the collection.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_events" (
+        \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL,
+        \\  "name" TEXT NOT NULL DEFAULT '',
+        \\  "payload" TEXT NOT NULL DEFAULT '',
+        \\  "actor_collection" TEXT NOT NULL DEFAULT '',
+        \\  "actor" TEXT NOT NULL DEFAULT '',
+        \\  "account" TEXT NOT NULL DEFAULT '',
+        \\  "occurred_at" TEXT NOT NULL DEFAULT ''
+        \\);
+    );
+    // (account,name,occurred_at) serves the per-event-name rollup scan + a name-filtered feed;
+    // (account,occurred_at) serves the account-scoped activity feed (newest-first by occurred_at).
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_events_account_name_occurred\" ON \"_events\" (\"account\",\"name\",\"occurred_at\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_events_account_occurred\" ON \"_events\" (\"account\",\"occurred_at\");");
+
+    // Seed the `_collections` row (system=1) so the engine can address `_events` as a
+    // collection. Rules are NULL = Locked (superusers only) — members never read raw events
+    // through the records API; they use the tenant-scoped `/api/analytics/events` endpoint.
+    try w.exec(
+        \\INSERT OR IGNORE INTO "_collections"
+        \\  ("id","name","type","system","schema","indexes","options","listRule","viewRule","createRule","updateRule","deleteRule","created","updated")
+        \\ VALUES
+        \\  ('_events________','_events','base',1,
+        \\    '[{"id":"evtsname","name":"name","type":"text","options":{}},{"id":"evtspayl","name":"payload","type":"json","options":{}},{"id":"evtsacol","name":"actor_collection","type":"text","options":{}},{"id":"evtsactr","name":"actor","type":"text","options":{}},{"id":"evtsacct","name":"account","type":"text","options":{}},{"id":"evtsocat","name":"occurred_at","type":"text","options":{}}]',
+        \\    '[]','{}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now'));
+    );
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -426,6 +470,7 @@ pub const all = [_]Migration{
     .{ .name = "0012_experiment_assignments", .up = init_0012_experiment_assignments },
     .{ .name = "0013_queue_jobs", .up = init_0013_queue_jobs },
     .{ .name = "0014_tenancy", .up = init_0014_tenancy },
+    .{ .name = "0015_events", .up = init_0015_events },
     .{ .name = "0016_email", .up = init_0016_email },
 };
 
@@ -732,6 +777,41 @@ test "0016 creates email tables, uniqueness, and seeds _collections" {
     // Re-running migrations does not duplicate the seeded collection rows.
     try run(&d);
     var dup = try d.prepare("SELECT COUNT(*) FROM \"_collections\" WHERE name='_sender_identities';");
+    defer dup.finalize();
+    _ = try dup.step();
+    try std.testing.expectEqual(@as(i64, 1), dup.columnInt(0));
+}
+
+test "0015 creates the _events table, indexes, and seeds the _events collection" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try run(&d);
+
+    // Table exists with id/created/updated + the 6 analytics columns (9 total).
+    var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('_events');");
+    defer t.finalize();
+    _ = try t.step();
+    try std.testing.expectEqual(@as(i64, 9), t.columnInt(0));
+
+    // Both scan indexes present.
+    var idx = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_events_account_name_occurred','idx_events_account_occurred');");
+    defer idx.finalize();
+    _ = try idx.step();
+    try std.testing.expectEqual(@as(i64, 2), idx.columnInt(0));
+
+    // Seeded into _collections as a system collection with Locked (NULL) rules.
+    var c = try d.prepare("SELECT system, listRule FROM \"_collections\" WHERE name='_events';");
+    defer c.finalize();
+    try std.testing.expect((try c.step()));
+    try std.testing.expectEqual(@as(i64, 1), c.columnInt(0));
+    try std.testing.expect(c.isNull(1)); // listRule NULL = Locked (superusers only)
+
+    // A row can be inserted (append-only event capture).
+    try d.exec("INSERT INTO \"_events\" (\"id\",\"created\",\"updated\",\"name\",\"payload\",\"account\",\"occurred_at\") VALUES ('e1','t','t','user.signup','{}','acc1','2026-01-01T00:00:00Z');");
+
+    // Re-running migrations does not duplicate the seeded collection row.
+    try run(&d);
+    var dup = try d.prepare("SELECT COUNT(*) FROM \"_collections\" WHERE name='_events';");
     defer dup.finalize();
     _ = try dup.step();
     try std.testing.expectEqual(@as(i64, 1), dup.columnInt(0));

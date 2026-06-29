@@ -211,6 +211,9 @@ test {
     _ = @import("search/fts.zig");
     _ = @import("search/vector.zig");
     _ = @import("api/accounts.zig");
+    _ = @import("analytics/analytics.zig");
+    _ = @import("analytics/config.zig");
+    _ = @import("analytics/api.zig");
     _ = @import("crypto.zig");
     _ = @import("aead.zig");
     _ = @import("field_policy.zig");
