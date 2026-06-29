@@ -60,14 +60,17 @@ pub const mail_template = @import("mail/template.zig");
 pub const DefaultStoragePlugin = @import("framework.zig").DefaultStoragePlugin;
 pub const DefaultMailerPlugin = @import("framework.zig").DefaultMailerPlugin;
 
-// Migration: the `up` fn for an explicit migration receives a `*Db` writer; the
-// `.migrations` config is a list of `Migration` entries.
+// Migration: the `up` fn for an explicit migration receives a `*Migrator` carrying the active
+// SQL dialect (so raw SQL can branch per backend); the `.migrations` config is a list of
+// `Migration` entries. See `src/migrator.zig` for the cross-backend migration contract (#159).
 pub const Db = @import("db.zig").Db;
 /// The active database backend tag (sqlite | postgres) and the SQL `Dialect` selected for it.
 /// `-Dpostgres=false` builds are always `.sqlite`; Postgres is opt-in (#159).
 pub const DbBackend = @import("db.zig").Backend;
 pub const Dialect = @import("sql/dialect.zig").Dialect;
 pub const Migration = @import("provision.zig").Migration;
+/// The dialect-aware handle a migration's `up` fn receives (#159, PR-2).
+pub const Migrator = @import("migrator.zig").Migrator;
 
 // Static files: the entry type of a build-generated embedded manifest (see
 // build.zig embedStaticDir) and of `.static_files = .{ .embedded = ... }`.
@@ -207,6 +210,7 @@ test {
     _ = @import("values.zig");
     _ = @import("ddl.zig");
     _ = @import("migrations.zig");
+    _ = @import("migrator.zig");
     _ = @import("rules.zig");
     _ = @import("policy.zig");
     _ = @import("tenancy/roles.zig");
@@ -335,5 +339,8 @@ test {
         _ = @import("backend/postgres/postgres.zig");
         // PR-1b: the end-to-end seam smoke (db.Db union → real Postgres). Skips if no PG.
         _ = @import("backend/seam_test.zig");
+        // PR-2: live-PG schema/DDL + migration parity (all 16 migrations, full provision,
+        // additive-rebuild ALTER). Skips if no PG.
+        _ = @import("backend/postgres/schema_pg_test.zig");
     }
 }

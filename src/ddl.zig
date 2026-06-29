@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const schema = @import("schema.zig");
+const dialect = @import("sql/dialect.zig");
 
 pub fn quoteIdent(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -24,21 +25,45 @@ pub fn quoteIdent(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-pub fn columnDef(alloc: std.mem.Allocator, f: schema.Field) ![]u8 {
-    if (f.unique) return std.fmt.allocPrint(alloc, "\"{s}\" {s} UNIQUE", .{ f.name, f.sqlType() });
-    return std.fmt.allocPrint(alloc, "\"{s}\" {s}", .{ f.name, f.sqlType() });
+/// True when `name` is a column covered by a `.nocase` index on `c`. Such a column intentionally
+/// needs case-insensitive collation (the proper `lower()`/citext route is a tracked follow-up), so
+/// the byte-order `COLLATE "C"` parity pin is NOT applied to it.
+pub fn isNocaseField(c: schema.Collection, name: []const u8) bool {
+    for (c.indexes) |ix| {
+        if (ix.collation != .nocase) continue;
+        for (ix.fields) |fname| if (std.mem.eql(u8, fname, name)) return true;
+    }
+    return false;
 }
 
-pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel_target: ?[]const u8) ![]u8 {
+pub fn columnDef(alloc: std.mem.Allocator, f: schema.Field, d: dialect.Dialect, collate: []const u8) ![]u8 {
+    const ty = d.sqlType(f.storageClass());
+    if (f.unique) return std.fmt.allocPrint(alloc, "\"{s}\" {s}{s} UNIQUE", .{ f.name, ty, collate });
+    return std.fmt.allocPrint(alloc, "\"{s}\" {s}{s}", .{ f.name, ty, collate });
+}
+
+/// The byte-order collation suffix to attach to field `f`'s column DDL: `d.textCollate()` for a
+/// plain TEXT column (so PG matches SQLite's BINARY ordering), or "" for non-text storage or a
+/// `.nocase`-indexed column (see `isNocaseField`).
+fn fieldCollate(c: schema.Collection, f: schema.Field, d: dialect.Dialect) []const u8 {
+    if (f.storageClass() != .text) return "";
+    if (isNocaseField(c, f.name)) return "";
+    return d.textCollate();
+}
+
+pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel_target: ?[]const u8, d: dialect.Dialect) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, "CREATE TABLE ");
     const tbl = try quoteIdent(alloc, c.name);
     try out.appendSlice(alloc, tbl);
-    try out.appendSlice(alloc, " (\"id\" TEXT PRIMARY KEY, \"created\" TEXT, \"updated\" TEXT");
+    // The base text columns (incl. the `id` keyset tiebreaker) get the byte-order collation pin so
+    // text ORDER BY / keyset pagination produces the SAME order on Postgres as on SQLite (BINARY).
+    const tc = d.textCollate();
+    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ tc, tc, tc }));
     for (c.fields) |f| {
         try out.appendSlice(alloc, ", ");
-        try out.appendSlice(alloc, try columnDef(alloc, f));
+        try out.appendSlice(alloc, try columnDef(alloc, f, d, fieldCollate(c, f, d)));
     }
     for (c.fields) |f| {
         switch (f.options) {
@@ -54,9 +79,16 @@ pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel
     return out.toOwnedSlice(alloc);
 }
 
-pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.Index) ![]u8 {
+pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.Index, d: dialect.Dialect) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
+    // Case-insensitive collation routes through the dialect: SQLite ` COLLATE NOCASE`; Postgres
+    // has no built-in NOCASE collation, so the suffix is "" there (a `citext`/`lower()` expression
+    // index is the portable route — a documented PR-10/follow-up; PR-2 keeps the index valid).
+    const collate = switch (idx.collation) {
+        .binary => "",
+        .nocase => d.collateNocase(),
+    };
     try out.appendSlice(alloc, if (idx.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
     try out.appendSlice(alloc, try quoteIdent(alloc, idx.name));
     try out.appendSlice(alloc, " ON ");
@@ -66,7 +98,7 @@ pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.I
     for (idx.fields, 0..) |fname, i| {
         if (i > 0) try out.append(alloc, ',');
         try out.appendSlice(alloc, try quoteIdent(alloc, fname));
-        try out.appendSlice(alloc, idx.collation.sqlSuffix());
+        try out.appendSlice(alloc, collate);
     }
     try out.append(alloc, ')');
     if (idx.where) |w| {
@@ -91,14 +123,22 @@ pub fn authIdentityIndexSql(alloc: std.mem.Allocator, table: []const u8, field: 
     );
 }
 
-pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema.Collection) ![]const []u8 {
+/// Produce the ordered DDL statements that migrate a collection's physical table from `old` to
+/// `new`, matching retained columns by **stable field id** (`of.id == nf.id`) so data survives a
+/// rename/retype. SQLite (which cannot drop/retype a column in place pre-3.35) does this via a
+/// table rebuild — create `<name>__new`, copy, drop, rename, reindex. Postgres does it with
+/// targeted `ALTER TABLE ADD/RENAME/ALTER TYPE/DROP COLUMN` against the live table (no rebuild),
+/// keyed off the same id matching — see `rebuildPlanPg`.
+pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema.Collection, d: dialect.Dialect) ![]const []u8 {
+    if (d.kind == .postgres) return rebuildPlanPg(alloc, old, new, d);
+
     var stmts: std.ArrayList([]u8) = .empty;
     errdefer stmts.deinit(alloc);
 
     const tmp = try std.fmt.allocPrint(alloc, "{s}__new", .{new.name});
     var tmp_col = new;
     tmp_col.name = tmp;
-    try stmts.append(alloc, try createTableSql(alloc, tmp_col, null));
+    try stmts.append(alloc, try createTableSql(alloc, tmp_col, null, d));
 
     var new_cols: std.ArrayList(u8) = .empty;
     var src_cols: std.ArrayList(u8) = .empty;
@@ -115,10 +155,10 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
             break :blk null;
         };
         if (old_match) |of| {
-            if (std.mem.eql(u8, of.sqlType(), nf.sqlType())) {
+            if (of.storageClass() == nf.storageClass()) {
                 try src_cols.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\"", .{of.name}));
             } else {
-                try src_cols.appendSlice(alloc, try std.fmt.allocPrint(alloc, "CAST(\"{s}\" AS {s})", .{ of.name, nf.sqlType() }));
+                try src_cols.appendSlice(alloc, try std.fmt.allocPrint(alloc, "CAST(\"{s}\" AS {s})", .{ of.name, d.sqlType(nf.storageClass()) }));
             }
         } else {
             try src_cols.appendSlice(alloc, "NULL");
@@ -127,7 +167,87 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
     try stmts.append(alloc, try std.fmt.allocPrint(alloc, "INSERT INTO \"{s}\" ({s}) SELECT {s} FROM \"{s}\";", .{ tmp, new_cols.items, src_cols.items, old.name }));
     try stmts.append(alloc, try std.fmt.allocPrint(alloc, "DROP TABLE \"{s}\";", .{old.name}));
     try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE \"{s}\" RENAME TO \"{s}\";", .{ tmp, new.name }));
-    for (new.indexes) |idx| try stmts.append(alloc, try createIndexSql(alloc, new.name, idx));
+    for (new.indexes) |idx| try stmts.append(alloc, try createIndexSql(alloc, new.name, idx, d));
+    return stmts.toOwnedSlice(alloc);
+}
+
+/// Postgres rebuild via in-place `ALTER TABLE`. Statement order is significant:
+///   1. DROP the FK constraint of every OLD single relation field (so a renamed/retyped/dropped
+///      relation, an option change, or a relation↔non-relation flip never leaves a stale FK); then
+///      DROP every column whose old field id is absent from `new` (data loss matches the SQLite
+///      rebuild, which simply does not copy it).
+///   2. For each new field, keyed by id: RENAME a retained-but-renamed column, then ALTER its TYPE
+///      (`USING` cast) if the storage class changed; ADD a brand-new column (default NULL, with the
+///      byte-order text collation).
+///   3. RECREATE the FK constraint for every NEW single relation field (by its current name) — so
+///      adds/renames/retypes/option-updates all converge to the correct FK.
+///   4. DROP every index present in `old` but absent from `new` (the SQLite rebuild destroys them;
+///      PG's in-place ALTER would leave them stale), then DROP-and-recreate every declared `new`
+///      index (covers renamed columns + new declarations; idempotent via DROP IF EXISTS).
+/// Retained columns keep their data; the table is never dropped.
+fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.Collection, d: dialect.Dialect) ![]const []u8 {
+    var stmts: std.ArrayList([]u8) = .empty;
+    errdefer stmts.deinit(alloc);
+    const tbl = new.name;
+
+    // 1a. Drop the FK of every old single relation field (converges all relation changes; gemini #2).
+    for (old.fields) |of| switch (of.options) {
+        .relation => |r| if (r.maxSelect == 1) {
+            try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE \"{s}\" DROP CONSTRAINT IF EXISTS \"fk_{s}_{s}\";", .{ tbl, tbl, of.name }));
+        },
+        else => {},
+    };
+
+    // 1b. Drop columns: an old field whose id is not present in `new`.
+    for (old.fields) |of| {
+        const kept = blk: {
+            for (new.fields) |nf| if (std.mem.eql(u8, of.id, nf.id)) break :blk true;
+            break :blk false;
+        };
+        if (!kept) try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE \"{s}\" DROP COLUMN IF EXISTS \"{s}\";", .{ tbl, of.name }));
+    }
+
+    // 2. Adds / renames / type changes, keyed by stable field id.
+    for (new.fields) |nf| {
+        const ty = d.sqlType(nf.storageClass());
+        const old_match = blk: {
+            for (old.fields) |of| if (std.mem.eql(u8, of.id, nf.id)) break :blk of;
+            break :blk null;
+        };
+        if (old_match) |of| {
+            if (!std.mem.eql(u8, of.name, nf.name))
+                try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE \"{s}\" RENAME COLUMN \"{s}\" TO \"{s}\";", .{ tbl, of.name, nf.name }));
+            if (of.storageClass() != nf.storageClass())
+                try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" TYPE {s} USING (\"{s}\"::{s});", .{ tbl, nf.name, ty, nf.name, ty }));
+        } else {
+            const uniq = if (nf.unique) " UNIQUE" else "";
+            try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE \"{s}\" ADD COLUMN IF NOT EXISTS \"{s}\" {s}{s}{s};", .{ tbl, nf.name, ty, fieldCollate(new, nf, d), uniq }));
+        }
+    }
+
+    // 3. Recreate the FK for every new single relation field (by its current name).
+    for (new.fields) |nf| switch (nf.options) {
+        .relation => |r| if (r.maxSelect == 1) {
+            const on_delete = if (r.cascadeDelete) "CASCADE" else "SET NULL";
+            // `new` is relation-resolved by the caller: targetCollectionId is the table name.
+            try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE \"{s}\" ADD CONSTRAINT \"fk_{s}_{s}\" FOREIGN KEY (\"{s}\") REFERENCES \"{s}\" (\"id\") ON DELETE {s};", .{ tbl, tbl, nf.name, nf.name, r.targetCollectionId, on_delete }));
+        },
+        else => {},
+    };
+
+    // 4a. Drop indexes present in `old` but absent from `new` (PG leaves them stale otherwise).
+    for (old.indexes) |oix| {
+        const kept = blk: {
+            for (new.indexes) |nix| if (std.mem.eql(u8, oix.name, nix.name)) break :blk true;
+            break :blk false;
+        };
+        if (!kept) try stmts.append(alloc, try std.fmt.allocPrint(alloc, "DROP INDEX IF EXISTS \"{s}\";", .{oix.name}));
+    }
+    // 4b. Drop-if-exists + recreate every declared index.
+    for (new.indexes) |idx| {
+        try stmts.append(alloc, try std.fmt.allocPrint(alloc, "DROP INDEX IF EXISTS \"{s}\";", .{idx.name}));
+        try stmts.append(alloc, try createIndexSql(alloc, tbl, idx, d));
+    }
     return stmts.toOwnedSlice(alloc);
 }
 
@@ -145,21 +265,46 @@ test "createTableSql includes system columns, field columns, and FK for single r
         .{ .id = "c", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users", .cascadeDelete = true, .maxSelect = 1 } } },
     };
     const col = schema.Collection{ .id = "c1", .name = "posts", .fields = &fields };
-    const sql = try createTableSql(a, col, "users");
+    const sql = try createTableSql(a, col, "users", .sqlite);
+    // SQLite is byte-identical: textCollate() is "" so no COLLATE clauses appear.
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"id\" TEXT PRIMARY KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"created\" TEXT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"title\" TEXT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"price\" REAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "COLLATE") == null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "FOREIGN KEY (\"author\") REFERENCES \"users\" (\"id\") ON DELETE CASCADE") != null);
+}
+
+test "createTableSql (Postgres) pins TEXT columns to COLLATE \"C\" except .nocase-indexed ones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]schema.Field{
+        .{ .id = "a", .name = "title", .options = .{ .text = .{} } }, // plain text -> COLLATE "C"
+        .{ .id = "b", .name = "email", .options = .{ .text = .{} } }, // covered by a .nocase index -> no COLLATE
+        .{ .id = "c", .name = "price", .options = .{ .number = .{ .mode = .float } } }, // non-text -> no COLLATE
+    };
+    const idx = [_]schema.Index{.{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase }};
+    const col = schema.Collection{ .id = "c1", .name = "posts", .fields = &fields, .indexes = &idx };
+    const sql = try createTableSql(a, col, null, .postgres);
+    // System tiebreaker columns + plain text field get the byte-order collation.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"id\" TEXT COLLATE \"C\" PRIMARY KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"created\" TEXT COLLATE \"C\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"title\" TEXT COLLATE \"C\"") != null);
+    // The .nocase-indexed column is left WITHOUT COLLATE "C" (the case-insensitive follow-up owns it).
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"email\" TEXT COLLATE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"email\" TEXT,") != null or std.mem.indexOf(u8, sql, "\"email\" TEXT UNIQUE") != null or std.mem.indexOf(u8, sql, "\"email\" TEXT)") != null);
+    // Non-text column never gets a collation.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"price\" DOUBLE PRECISION") != null);
 }
 
 test "createIndexSql builds unique and non-unique" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const u = try createIndexSql(a, "posts", .{ .name = "idx_title", .fields = &.{"title"}, .unique = true });
+    const u = try createIndexSql(a, "posts", .{ .name = "idx_title", .fields = &.{"title"}, .unique = true }, .sqlite);
     try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_title\" ON \"posts\" (\"title\");", u);
-    const n = try createIndexSql(a, "posts", .{ .name = "idx_ab", .fields = &.{ "a", "b" }, .unique = false });
+    const n = try createIndexSql(a, "posts", .{ .name = "idx_ab", .fields = &.{ "a", "b" }, .unique = false }, .sqlite);
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_ab\" ON \"posts\" (\"a\",\"b\");", n);
 }
 
@@ -167,18 +312,21 @@ test "createIndexSql emits COLLATE NOCASE and a partial WHERE predicate" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const ci = try createIndexSql(a, "customers", .{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase });
+    const ci = try createIndexSql(a, "customers", .{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase }, .sqlite);
     try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_email\" ON \"customers\" (\"email\" COLLATE NOCASE);", ci);
-    const partial = try createIndexSql(a, "posts", .{ .name = "idx_active", .fields = &.{"slug"}, .unique = true, .where = "deleted_at IS NULL" });
+    const partial = try createIndexSql(a, "posts", .{ .name = "idx_active", .fields = &.{"slug"}, .unique = true, .where = "deleted_at IS NULL" }, .sqlite);
     try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_active\" ON \"posts\" (\"slug\") WHERE deleted_at IS NULL;", partial);
     // collation applies per-column, predicate follows the column list
-    const both = try createIndexSql(a, "t", .{ .name = "idx_both", .fields = &.{ "a", "b" }, .collation = .nocase, .where = "a IS NOT NULL" });
+    const both = try createIndexSql(a, "t", .{ .name = "idx_both", .fields = &.{ "a", "b" }, .collation = .nocase, .where = "a IS NOT NULL" }, .sqlite);
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_both\" ON \"t\" (\"a\" COLLATE NOCASE,\"b\" COLLATE NOCASE) WHERE a IS NOT NULL;", both);
     // an empty or whitespace-only predicate emits no WHERE clause (not "WHERE ;")
-    const empty = try createIndexSql(a, "t", .{ .name = "idx_e", .fields = &.{"a"}, .where = "" });
+    const empty = try createIndexSql(a, "t", .{ .name = "idx_e", .fields = &.{"a"}, .where = "" }, .sqlite);
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_e\" ON \"t\" (\"a\");", empty);
-    const ws = try createIndexSql(a, "t", .{ .name = "idx_w", .fields = &.{"a"}, .where = "  \t\n" });
+    const ws = try createIndexSql(a, "t", .{ .name = "idx_w", .fields = &.{"a"}, .where = "  \t\n" }, .sqlite);
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_w\" ON \"t\" (\"a\");", ws);
+    // Postgres: no built-in NOCASE collation, so the suffix is dropped (index stays valid).
+    const pg_ci = try createIndexSql(a, "customers", .{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase }, .postgres);
+    try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_email\" ON \"customers\" (\"email\");", pg_ci);
 }
 
 test "rebuildPlan copies retained columns by field id, adds new, drops removed" {
@@ -195,7 +343,7 @@ test "rebuildPlan copies retained columns by field id, adds new, drops removed" 
     };
     const old = schema.Collection{ .id = "c1", .name = "posts", .fields = &old_fields };
     const new = schema.Collection{ .id = "c1", .name = "posts", .fields = &new_fields };
-    const plan = try rebuildPlan(a, old, new);
+    const plan = try rebuildPlan(a, old, new, .sqlite);
     // No indexes in the fixture, so the plan is exactly: create, insert, drop, rename.
     try std.testing.expectEqual(@as(usize, 4), plan.len);
     try std.testing.expect(std.mem.indexOf(u8, plan[0], "\"posts__new\"") != null);
@@ -205,6 +353,36 @@ test "rebuildPlan copies retained columns by field id, adds new, drops removed" 
     try std.testing.expect(std.mem.indexOf(u8, insert, "\"title\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan[2], "DROP TABLE \"posts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan[3], "RENAME TO \"posts\"") != null);
+}
+
+test "rebuildPlan (Postgres) emits in-place ALTERs keyed by field id (rename, add, drop)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const old_fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "old_price", .options = .{ .number = .{ .mode = .float } } },
+    };
+    const new_fields = [_]schema.Field{
+        .{ .id = "f1", .name = "headline", .options = .{ .text = .{} } }, // retained, renamed
+        .{ .id = "f3", .name = "views", .options = .{ .number = .{ .mode = .int } } }, // added
+    };
+    const old = schema.Collection{ .id = "c1", .name = "posts", .fields = &old_fields };
+    const new = schema.Collection{ .id = "c1", .name = "posts", .fields = &new_fields };
+    const plan = try rebuildPlan(a, old, new, .postgres);
+    // No table rebuild: targeted ALTERs only — drop old_price, rename title->headline, add views.
+    var saw_drop = false;
+    var saw_rename = false;
+    var saw_add = false;
+    for (plan) |s| {
+        if (std.mem.indexOf(u8, s, "DROP COLUMN IF EXISTS \"old_price\"") != null) saw_drop = true;
+        if (std.mem.indexOf(u8, s, "RENAME COLUMN \"title\" TO \"headline\"") != null) saw_rename = true;
+        if (std.mem.indexOf(u8, s, "ADD COLUMN IF NOT EXISTS \"views\" BIGINT") != null) saw_add = true;
+        // never a destructive table rebuild on Postgres
+        try std.testing.expect(std.mem.indexOf(u8, s, "DROP TABLE") == null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "__new") == null);
+    }
+    try std.testing.expect(saw_drop and saw_rename and saw_add);
 }
 
 test "authIdentityIndexSql builds a partial unique index over non-empty values" {

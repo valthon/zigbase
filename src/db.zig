@@ -364,6 +364,22 @@ pub inline fn poolDialect(pool: *const Pool) Dialect {
     });
 }
 
+/// The active backend of a live `Db` handle. Mirrors `poolBackend` for the per-connection
+/// handle the DDL / migration / collection layers hold. In the default build (`Db == sqlite.Db`)
+/// this is always `.sqlite`; the union switch is only compiled when Postgres is built in.
+pub inline fn dbBackend(d: *const Db) Backend {
+    if (build_options.postgres) return std.meta.activeTag(d.*) else return .sqlite;
+}
+
+/// The SQL `Dialect` for a live `Db` handle's backend. The schema/DDL/migration/provision layers
+/// reach the active dialect through this so the SAME code emits backend-correct SQL on both.
+pub inline fn dbDialect(d: *const Db) Dialect {
+    return Dialect.forKind(switch (dbBackend(d)) {
+        .sqlite => .sqlite,
+        .postgres => .postgres,
+    });
+}
+
 // ---- Test discovery --------------------------------------------------------
 // Pull in the relocated SQLite backend's tests + the dialect tests. The Postgres
 // seam-smoke lives in backend/seam_test.zig, referenced from root.zig only under

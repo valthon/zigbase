@@ -49,10 +49,11 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     // build a DDL view where each single-relation's target collection id is resolved to its table name
     const ddl_col = try resolveRelations(alloc, w, full);
 
+    const d = db.dbDialect(w);
     try w.begin();
     errdefer w.rollback() catch {};
-    try w.exec(try alloc.dupeZ(u8, try ddl.createTableSql(alloc, ddl_col, null)));
-    for (col.indexes) |idx| try w.exec(try alloc.dupeZ(u8, try ddl.createIndexSql(alloc, col.name, idx)));
+    try w.exec(try alloc.dupeZ(u8, try ddl.createTableSql(alloc, ddl_col, null, d)));
+    for (col.indexes) |idx| try w.exec(try alloc.dupeZ(u8, try ddl.createIndexSql(alloc, col.name, idx, d)));
     if (col.type == .auth) {
         for (col.options.auth.identityFields) |idf| {
             try w.exec(try alloc.dupeZ(u8, try ddl.authIdentityIndexSql(alloc, col.name, idf)));
@@ -93,11 +94,17 @@ fn insertRow(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) Engine
     const schema_json = try schema.fieldsToJson(alloc, col.fields);
     const indexes_json = try schema.indexesToJson(alloc, col.indexes);
     const options_json = try schema.optionsToJson(alloc, col, false);
-    var st = try w.prepare(
+    const d = db.dbDialect(w);
+    const now = d.nowTextExpr();
+    // Identifiers are double-quoted: the mixed-case columns (listRule/viewRule/…) were created
+    // quoted by migration 0001, so Postgres (which folds UNQUOTED identifiers to lowercase) needs
+    // them quoted to match; SQLite is unaffected.
+    const raw = try std.fmt.allocPrint(alloc,
         \\INSERT INTO "_collections"
-        \\ (id,name,type,system,schema,indexes,listRule,viewRule,createRule,updateRule,deleteRule,options,created,updated)
-        \\ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12, datetime('now'), datetime('now'));
-    );
+        \\ ("id","name","type","system","schema","indexes","listRule","viewRule","createRule","updateRule","deleteRule","options","created","updated")
+        \\ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12, {s}, {s});
+    , .{ now, now });
+    var st = try w.prepare(try d.renumberPlaceholders(alloc, raw));
     defer st.finalize();
     try st.bindText(1, col.id);
     try st.bindText(2, col.name);
@@ -115,7 +122,7 @@ fn insertRow(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) Engine
 }
 
 const select_cols =
-    \\SELECT id,name,type,system,schema,indexes,listRule,viewRule,createRule,updateRule,deleteRule,created,updated,options FROM "_collections"
+    \\SELECT "id","name","type","system","schema","indexes","listRule","viewRule","createRule","updateRule","deleteRule","created","updated","options" FROM "_collections"
 ;
 
 fn dupOptText(alloc: std.mem.Allocator, st: *db.Stmt, idx: c_int) !?[]const u8 {
@@ -151,7 +158,8 @@ fn rowToCollection(alloc: std.mem.Allocator, st: *db.Stmt) EngineError!schema.Co
 }
 
 pub fn get(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineError!?schema.Collection {
-    var st = try w.prepare(select_cols ++ " WHERE id = ?1 OR name = ?1 LIMIT 1;");
+    const sql = try db.dbDialect(w).renumberPlaceholders(alloc, select_cols ++ " WHERE id = ?1 OR name = ?1 LIMIT 1;");
+    var st = try w.prepare(sql);
     defer st.finalize();
     try st.bindText(1, id_or_name);
     if (!try st.step()) return null;
@@ -203,11 +211,19 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     // relation-resolved view for the rebuild's FK generation
     const ddl_new = try resolveRelations(alloc, w, newc_full);
 
-    try w.exec("PRAGMA foreign_keys=OFF;");
-    errdefer w.exec("PRAGMA foreign_keys=ON;") catch {};
+    const d = db.dbDialect(w);
+    // SQLite rebuilds via __new+copy+drop+rename, so FK enforcement must be paused around it;
+    // Postgres uses in-place ALTERs (rebuildPlanPg) and has no such PRAGMA (it would error).
+    const sqlite_rebuild = d.kind == .sqlite;
+    if (sqlite_rebuild) {
+        try w.exec("PRAGMA foreign_keys=OFF;");
+    }
+    errdefer if (sqlite_rebuild) {
+        w.exec("PRAGMA foreign_keys=ON;") catch {};
+    };
     try w.begin();
     errdefer w.rollback() catch {};
-    const plan = try ddl.rebuildPlan(alloc, old, ddl_new);
+    const plan = try ddl.rebuildPlan(alloc, old, ddl_new, d);
     for (plan) |stmt| try w.exec(try alloc.dupeZ(u8, stmt));
     if (newc.type == .auth) {
         for (newc.options.auth.identityFields) |idf| {
@@ -216,7 +232,9 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     }
     try updateRow(alloc, w, old.id, newc); // persist user fields only
     try w.commit();
-    try w.exec("PRAGMA foreign_keys=ON;");
+    if (sqlite_rebuild) {
+        try w.exec("PRAGMA foreign_keys=ON;");
+    }
 
     return newc_full;
 }
@@ -225,10 +243,12 @@ fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schem
     const schema_json = try schema.fieldsToJson(alloc, col.fields);
     const indexes_json = try schema.indexesToJson(alloc, col.indexes);
     const options_json = try schema.optionsToJson(alloc, col, false);
-    var st = try w.prepare(
-        \\UPDATE "_collections" SET schema=?2, indexes=?3, listRule=?4, viewRule=?5,
-        \\ createRule=?6, updateRule=?7, deleteRule=?8, options=?9, updated=datetime('now') WHERE id=?1;
-    );
+    const d = db.dbDialect(w);
+    const raw = try std.fmt.allocPrint(alloc,
+        \\UPDATE "_collections" SET "schema"=?2, "indexes"=?3, "listRule"=?4, "viewRule"=?5,
+        \\ "createRule"=?6, "updateRule"=?7, "deleteRule"=?8, "options"=?9, "updated"={s} WHERE "id"=?1;
+    , .{d.nowTextExpr()});
+    var st = try w.prepare(try d.renumberPlaceholders(alloc, raw));
     defer st.finalize();
     try st.bindText(1, col_id);
     try st.bindText(2, schema_json);
@@ -256,7 +276,7 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) Engin
     try w.begin();
     errdefer w.rollback() catch {};
     try w.exec(try std.fmt.allocPrintSentinel(alloc, "DROP TABLE \"{s}\";", .{target.name}, 0));
-    var st = try w.prepare("DELETE FROM \"_collections\" WHERE \"id\" = ?1;");
+    var st = try w.prepare(try db.dbDialect(w).renumberPlaceholders(alloc, "DELETE FROM \"_collections\" WHERE \"id\" = ?1;"));
     defer st.finalize();
     try st.bindText(1, target.id);
     _ = try st.step();
