@@ -19,6 +19,12 @@ pub const Email = struct {
     /// Optional `Reply-To` address. CRLF/control chars are rejected like the
     /// other header fields (header-injection backstop).
     reply_to: ?[]const u8 = null,
+    /// Optional per-message `From` override (#154). `null` (the default) keeps the
+    /// backend's configured sender, so existing callers are byte-for-byte unchanged.
+    /// When set, the backend uses THIS address as the envelope/header From — the seam
+    /// verified per-account sender identities ride on (a tenant sends as its own verified
+    /// address rather than the app's global From). CRLF-checked like the other fields.
+    from: ?[]const u8 = null,
 };
 
 /// Pluggable, backend-agnostic mailer. Mirrors the `Storage` vtable pattern in
@@ -198,13 +204,15 @@ pub const SmtpMailer = struct {
     /// wait for the 220 banner and EHLO; for STARTTLS the banner was already
     /// consumed on the plaintext leg and we only re-EHLO over TLS.
     fn runExchange(self: *SmtpMailer, io: std.Io, alloc: std.mem.Allocator, email: Email, conn: *Conn, comptime starttls_resumed: bool) anyerror!void {
-        // Reject control chars in the envelope BEFORE writing any command: `self.from`
+        // Per-message From override (#154) when present, else the backend's configured sender.
+        const env_from = email.from orelse self.from;
+        // Reject control chars in the envelope BEFORE writing any command: `env_from`
         // and `email.to` are interpolated into the `MAIL FROM`/`RCPT TO` command lines,
         // so a newline would let an attacker inject arbitrary SMTP commands (extra
         // RCPT TO, DATA, etc.). `email.subject` is NOT part of the envelope — it is
         // validated in buildMessage where it goes into the headers — so it is not
         // checked here.
-        try checkHeaderField(self.from);
+        try checkHeaderField(env_from);
         try checkHeaderField(email.to);
         if (!starttls_resumed) {
             // Greeting (implicit TLS and plaintext both see the banner here).
@@ -225,7 +233,7 @@ pub const SmtpMailer = struct {
         }
 
         // MAIL FROM.
-        const mail_from = try std.fmt.allocPrint(alloc, "MAIL FROM:<{s}>\r\n", .{self.from});
+        const mail_from = try std.fmt.allocPrint(alloc, "MAIL FROM:<{s}>\r\n", .{env_from});
         defer alloc.free(mail_from);
         try writeLine(conn, mail_from);
         try expectCode(conn.r, 250);
@@ -241,7 +249,7 @@ pub const SmtpMailer = struct {
         try expectCode(conn.r, 354);
 
         const now_s = std.Io.Clock.real.now(io).toSeconds();
-        const msg = try buildMessage(alloc, self.from, email, now_s);
+        const msg = try buildMessage(alloc, io, env_from, email, now_s);
         defer alloc.free(msg);
         try writeLine(conn, msg);
         try writeLine(conn, "\r\n.\r\n");
@@ -340,7 +348,7 @@ pub const CommandMailer = struct {
         // buildMessage validates from/to/subject against header injection, so the
         // bytes handed to the child are always a well-formed RFC822 message.
         const now_s = std.Io.Clock.real.now(io).toSeconds();
-        const msg = try buildMessage(alloc, self.from, email, now_s);
+        const msg = try buildMessage(alloc, io, email.from orelse self.from, email, now_s);
         defer alloc.free(msg);
 
         // Spawn → write stdin → wait, all inside a block so the `errdefer kill`
@@ -485,9 +493,17 @@ fn checkHeaderField(s: []const u8) HeaderError!void {
     if (hasControlChar(s)) return error.HeaderInjection;
 }
 
-/// Build the RFC5322 message bytes (headers + blank line + body). Pure: no I/O,
-/// so it can be unit-tested by asserting the produced bytes. The dot-stuffing
-/// terminator (\r\n.\r\n) is appended by the DATA send path, not here.
+/// Public CRLF/control-char backstop for header-bound values, reused by the HTTP providers
+/// (SES/Postmark) which build their own JSON bodies instead of going through `buildMessage`.
+/// Rejects every ASCII control char (CR/LF/NUL/TAB/…) so a `from`/`to`/`subject`/`reply_to`
+/// cannot inject an extra header into a provider payload. Same rule as `buildMessage` applies.
+pub fn rejectControlChars(s: []const u8) HeaderError!void {
+    return checkHeaderField(s);
+}
+
+/// Build the RFC5322 message bytes (headers + blank line + body). `io` is used ONLY to draw a random
+/// MIME boundary for the multipart case (see below); the header/body bytes are otherwise determined
+/// by the inputs. The dot-stuffing terminator (\r\n.\r\n) is appended by the DATA send path, not here.
 /// Returns error.HeaderInjection if `from`/`to`/`subject`/`reply_to` contain a
 /// CR, LF, NUL, or any other ASCII control char.
 ///
@@ -496,7 +512,7 @@ fn checkHeaderField(s: []const u8) HeaderError!void {
 ///   - `html_body` set, text empty   → `text/html` single part.
 ///   - `html_body` set, text present → `multipart/alternative` (text part, then HTML),
 ///                                     so clients pick the richest part they can render.
-pub fn buildMessage(alloc: std.mem.Allocator, from: []const u8, email: Email, now_unix: i64) ![]u8 {
+pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, email: Email, now_unix: i64) ![]u8 {
     try checkHeaderField(from);
     try checkHeaderField(email.to);
     try checkHeaderField(email.subject);
@@ -534,11 +550,15 @@ pub fn buildMessage(alloc: std.mem.Allocator, from: []const u8, email: Email, no
         );
     }
     // Both parts: multipart/alternative, text first (least-rich), HTML last (most-rich),
-    // per RFC 2046 §5.1.4 (clients render the LAST part they understand). The boundary
-    // is derived from `now_unix`; control chars can't reach the body, so it can't be
-    // forged to break the structure.
-    var bbuf: [40]u8 = undefined;
-    const boundary = std.fmt.bufPrint(&bbuf, "=_zigbase_{x}_part", .{@as(u64, @bitCast(now_unix))}) catch unreachable;
+    // per RFC 2046 §5.1.4 (clients render the LAST part they understand). The boundary is RANDOM
+    // (96 bits via `io.random`), NOT derived from the timestamp (M2): the body legitimately allows
+    // CRLF, so a guessable boundary would let a sender who knows it emit `--<boundary>` lines and
+    // forge/cut MIME parts. A random boundary the sender cannot predict closes that.
+    var rnd: [12]u8 = undefined;
+    io.random(&rnd);
+    const rhex = std.fmt.bytesToHex(rnd, .lower);
+    var bbuf: [48]u8 = undefined;
+    const boundary = std.fmt.bufPrint(&bbuf, "=_zigbase_{s}_part", .{rhex}) catch unreachable;
     return std.fmt.allocPrint(
         alloc,
         "{s}Content-Type: multipart/alternative; boundary=\"{s}\"\r\n\r\n" ++
@@ -590,7 +610,7 @@ test "LogMailer satisfies the Mailer interface and send succeeds" {
 
 test "buildMessage produces RFC5322 headers and body" {
     const a = std.testing.allocator;
-    const msg = try buildMessage(a, "noreply@zigbase.dev", .{
+    const msg = try buildMessage(a, std.testing.io, "noreply@zigbase.dev", .{
         .to = "user@example.com",
         .subject = "Verify your email",
         .text_body = "Your token: abc123",
@@ -609,36 +629,36 @@ test "buildMessage produces RFC5322 headers and body" {
 test "buildMessage rejects CRLF header injection in to/subject/from" {
     const a = std.testing.allocator;
     // CRLF in `to` would inject a Bcc header (and a RCPT TO on the wire).
-    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, std.testing.io, "noreply@zigbase.dev", .{
         .to = "victim@x.io\r\nBcc: spam@evil.com",
         .subject = "Hi",
         .text_body = "body",
     }, 0));
     // CRLF in the subject would inject an arbitrary header.
-    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, std.testing.io, "noreply@zigbase.dev", .{
         .to = "victim@x.io",
         .subject = "Hi\r\nX-Injected: yes",
         .text_body = "body",
     }, 0));
     // A bare LF and a NUL are equally rejected (in `from`).
-    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev\nEvil: 1", .{
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, std.testing.io, "noreply@zigbase.dev\nEvil: 1", .{
         .to = "victim@x.io",
         .subject = "Hi",
         .text_body = "body",
     }, 0));
-    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, std.testing.io, "noreply@zigbase.dev", .{
         .to = "victim@x.io\x00",
         .subject = "Hi",
         .text_body = "body",
     }, 0));
     // Other ASCII control chars (TAB here) are rejected too — some mail infra folds on them.
-    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, std.testing.io, "noreply@zigbase.dev", .{
         .to = "victim@x.io",
         .subject = "Hi\tthere",
         .text_body = "body",
     }, 0));
     // A newline in the BODY is fine (data, not a header).
-    const ok = try buildMessage(a, "noreply@zigbase.dev", .{
+    const ok = try buildMessage(a, std.testing.io, "noreply@zigbase.dev", .{
         .to = "victim@x.io",
         .subject = "Hi",
         .text_body = "line1\r\nline2",
@@ -649,7 +669,7 @@ test "buildMessage rejects CRLF header injection in to/subject/from" {
 
 test "buildMessage emits multipart/alternative with text + html parts and Reply-To" {
     const a = std.testing.allocator;
-    const msg = try buildMessage(a, "noreply@zigbase.dev", .{
+    const msg = try buildMessage(a, std.testing.io, "noreply@zigbase.dev", .{
         .to = "user@example.com",
         .subject = "Hi",
         .text_body = "plain version",
@@ -670,7 +690,7 @@ test "buildMessage emits multipart/alternative with text + html parts and Reply-
 
 test "buildMessage with html only emits a single text/html part" {
     const a = std.testing.allocator;
-    const msg = try buildMessage(a, "noreply@zigbase.dev", .{
+    const msg = try buildMessage(a, std.testing.io, "noreply@zigbase.dev", .{
         .to = "user@example.com",
         .subject = "Hi",
         .text_body = "",
@@ -683,7 +703,7 @@ test "buildMessage with html only emits a single text/html part" {
 
 test "buildMessage rejects CRLF in reply_to" {
     const a = std.testing.allocator;
-    try std.testing.expectError(error.HeaderInjection, buildMessage(a, "noreply@zigbase.dev", .{
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, std.testing.io, "noreply@zigbase.dev", .{
         .to = "user@example.com",
         .subject = "Hi",
         .text_body = "body",

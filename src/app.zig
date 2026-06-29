@@ -48,6 +48,12 @@ pub const App = struct {
     /// Default = LogMailer (logs); set SMTP config to upgrade to SmtpMailer. null in
     /// tests/CLI where no mailer was wired (callers must fall back to logging).
     mailer: ?*const @import("mail/mailer.zig").Mailer = null,
+    /// Email-subsystem runtime knobs (#154), threaded from the comptime `App(.{ .mail = ... })`
+    /// config in serveImpl. Default `.{}` is the fully-off, byte-identical-to-pre-#154 path:
+    /// verified-sender + suppression enforcement are disabled and the bounce/complaint webhook
+    /// route is 404 until a `webhook_secret` is configured. So an app that only calls the existing
+    /// mailer is completely unaffected by this subsystem.
+    mail: @import("mail/config.zig").Runtime = .{},
     /// Resolved pagination knobs (offset/cursor enablement + cursor token format), threaded from
     /// the comptime `App(.{ .pagination = ... })` config in framework.serveImpl. Defaults match
     /// the stock binary: both modes enabled, stateless tokens.

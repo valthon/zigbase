@@ -356,6 +356,61 @@ fn init_0014_tenancy(w: *db.Db) db.DbError!void {
     );
 }
 
+fn init_0016_email(w: *db.Db) db.DbError!void {
+    // Email subsystem (#154): verified per-account sender identities + bounce/complaint
+    // suppression. Two built-in system collections, seeded into `_collections` with system=1 and
+    // HARDCODED 8-char stable field ids (matching `provision`'s FNV id width) so additive rebuilds
+    // match columns by id. Rules are NULL = Locked (superusers only): tenant CRUD goes through the
+    // dedicated, account-scoped sender-management + webhook routes (api/senders.zig, mail/inbound.zig),
+    // NOT the generic record API. (NOTE: 0015 is reserved for the parallel analytics workstream.)
+    //
+    // _sender_identities: one row per (account, from-email). A send whose From is not a `verified`
+    // identity for the sending account is REJECTED when verified-sender enforcement is on. `status`
+    // is 'pending' until the verification token is confirmed, then 'verified' + `verified_at` set.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_sender_identities" (
+        \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL,
+        \\  "account" TEXT NOT NULL DEFAULT '',
+        \\  "email" TEXT NOT NULL,
+        \\  "verified_at" TEXT NOT NULL DEFAULT '',
+        \\  "verification_token" TEXT NOT NULL DEFAULT '',
+        \\  "status" TEXT NOT NULL DEFAULT 'pending'
+        \\);
+    );
+    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_sender_identities_unique\" ON \"_sender_identities\" (\"account\",\"email\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_sender_identities_token\" ON \"_sender_identities\" (\"verification_token\");");
+
+    // _suppressions: a (account, email) the app must NOT send to, populated by the bounce/complaint
+    // webhook on a hard bounce or complaint. `reason` is 'hard_bounce'|'complaint'; `source` records
+    // the provider ('ses'|'postmark'|…). A send to a suppressed address is BLOCKED when suppression
+    // checking is on. An empty `account` is a GLOBAL suppression (applies to every account's sends).
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_suppressions" (
+        \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL,
+        \\  "account" TEXT NOT NULL DEFAULT '',
+        \\  "email" TEXT NOT NULL,
+        \\  "reason" TEXT NOT NULL DEFAULT '',
+        \\  "source" TEXT NOT NULL DEFAULT ''
+        \\);
+    );
+    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_suppressions_unique\" ON \"_suppressions\" (\"account\",\"email\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_suppressions_email\" ON \"_suppressions\" (\"email\");");
+
+    // Seed the two `_collections` rows (system=1). id/created/updated are implicit base columns and
+    // are NOT listed in the schema blob. Rules NULL = Locked (superusers only).
+    try w.exec(
+        \\INSERT OR IGNORE INTO "_collections"
+        \\  ("id","name","type","system","schema","indexes","options","listRule","viewRule","createRule","updateRule","deleteRule","created","updated")
+        \\ VALUES
+        \\  ('_senderidents_','_sender_identities','base',1,
+        \\    '[{"id":"sidaccnt","name":"account","type":"text","options":{}},{"id":"sidemail","name":"email","type":"email","options":{}},{"id":"sidvrfat","name":"verified_at","type":"text","options":{}},{"id":"sidvtokn","name":"verification_token","type":"text","options":{}},{"id":"sidstatu","name":"status","type":"text","options":{}}]',
+        \\    '[]','{}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now')),
+        \\  ('_suppression__','_suppressions','base',1,
+        \\    '[{"id":"supaccnt","name":"account","type":"text","options":{}},{"id":"supemail","name":"email","type":"email","options":{}},{"id":"supreasn","name":"reason","type":"text","options":{}},{"id":"supsourc","name":"source","type":"text","options":{}}]',
+        \\    '[]','{}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now'));
+    );
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -371,6 +426,7 @@ pub const all = [_]Migration{
     .{ .name = "0012_experiment_assignments", .up = init_0012_experiment_assignments },
     .{ .name = "0013_queue_jobs", .up = init_0013_queue_jobs },
     .{ .name = "0014_tenancy", .up = init_0014_tenancy },
+    .{ .name = "0016_email", .up = init_0016_email },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {
@@ -629,6 +685,53 @@ test "0014 creates the tenancy tables, indexes, uniqueness, and seeds _collectio
     // Re-running migrations does not duplicate the seeded collection rows.
     try run(&d);
     var dup = try d.prepare("SELECT COUNT(*) FROM \"_collections\" WHERE name='_accounts';");
+    defer dup.finalize();
+    _ = try dup.step();
+    try std.testing.expectEqual(@as(i64, 1), dup.columnInt(0));
+}
+
+test "0016 creates email tables, uniqueness, and seeds _collections" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try run(&d);
+
+    // Tables exist with the expected column counts.
+    inline for (.{
+        .{ "_sender_identities", @as(i64, 8) }, // id,created,updated,account,email,verified_at,verification_token,status
+        .{ "_suppressions", @as(i64, 6) }, // id,created,account,email,reason,source
+    }) |spec| {
+        var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('" ++ spec[0] ++ "');");
+        defer t.finalize();
+        _ = try t.step();
+        try std.testing.expectEqual(spec[1], t.columnInt(0));
+    }
+
+    // Indexes present.
+    var idx = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN " ++
+        "('idx_sender_identities_unique','idx_sender_identities_token','idx_suppressions_unique','idx_suppressions_email');");
+    defer idx.finalize();
+    _ = try idx.step();
+    try std.testing.expectEqual(@as(i64, 4), idx.columnInt(0));
+
+    // Seeded into _collections as system collections.
+    var c = try d.prepare("SELECT COUNT(*) FROM \"_collections\" WHERE name IN ('_sender_identities','_suppressions') AND system=1;");
+    defer c.finalize();
+    _ = try c.step();
+    try std.testing.expectEqual(@as(i64, 2), c.columnInt(0));
+
+    // UNIQUE(account,email) on _sender_identities.
+    try d.exec("INSERT INTO \"_sender_identities\" (\"id\",\"created\",\"updated\",\"account\",\"email\") VALUES ('s1','','','a1','from@x.io');");
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"_sender_identities\" (\"id\",\"created\",\"updated\",\"account\",\"email\") VALUES ('s2','','','a1','from@x.io');"));
+    // Same email, different account is fine.
+    try d.exec("INSERT INTO \"_sender_identities\" (\"id\",\"created\",\"updated\",\"account\",\"email\") VALUES ('s3','','','a2','from@x.io');");
+
+    // UNIQUE(account,email) on _suppressions.
+    try d.exec("INSERT INTO \"_suppressions\" (\"id\",\"created\",\"account\",\"email\",\"reason\") VALUES ('p1','','a1','bad@x.io','hard_bounce');");
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"_suppressions\" (\"id\",\"created\",\"account\",\"email\",\"reason\") VALUES ('p2','','a1','bad@x.io','complaint');"));
+
+    // Re-running migrations does not duplicate the seeded collection rows.
+    try run(&d);
+    var dup = try d.prepare("SELECT COUNT(*) FROM \"_collections\" WHERE name='_sender_identities';");
     defer dup.finalize();
     _ = try dup.step();
     try std.testing.expectEqual(@as(i64, 1), dup.columnInt(0));

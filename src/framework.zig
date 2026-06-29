@@ -30,6 +30,7 @@ const queue = @import("queue/queue.zig");
 const queue_config = @import("queue/config.zig");
 const queue_durable = @import("queue/durable.zig");
 const mail_send = @import("mail/send.zig");
+const mail_cfg = @import("mail/config.zig");
 const webhook = @import("webhook.zig");
 const captcha = @import("captcha.zig");
 const tenancy = @import("tenancy/tenancy.zig");
@@ -204,7 +205,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -765,6 +766,26 @@ pub fn App(comptime cfg: anytype) type {
             break :blk rt;
         };
 
+        /// The comptime-lowered email-subsystem knobs (#154), threaded into `app.mail`. Validates
+        /// `.mail` keys with a loud `@compileError`; absent → `.{}` (fully off, back-compat).
+        pub const mail_config: mail_cfg.Runtime = blk: {
+            if (!@hasField(@TypeOf(cfg), "mail")) break :blk .{};
+            const mc = cfg.mail;
+            const MC = @TypeOf(mc);
+            if (@typeInfo(MC) != .@"struct")
+                @compileError(".mail must be a struct, e.g. '.{ .require_verified_sender = true, .webhook_secret = \"…\" }'");
+            for (std.meta.fields(MC)) |f| {
+                const ok = std.mem.eql(u8, f.name, "require_verified_sender") or
+                    std.mem.eql(u8, f.name, "check_suppression") or std.mem.eql(u8, f.name, "webhook_secret");
+                if (!ok) @compileError(".mail: unknown key '." ++ f.name ++ "' (recognized: .require_verified_sender, .check_suppression, .webhook_secret)");
+            }
+            var rt = mail_cfg.Runtime{};
+            if (@hasField(MC, "require_verified_sender")) rt.require_verified_sender = mc.require_verified_sender;
+            if (@hasField(MC, "check_suppression")) rt.check_suppression = mc.check_suppression;
+            if (@hasField(MC, "webhook_secret")) rt.webhook_secret = mc.webhook_secret;
+            break :blk rt;
+        };
+
         /// Bundle of comptime-resolved knobs threaded into the serve path: the
         /// selected storage/mailer plugin TYPES, the auth method type list,
         /// and the reader-pool cap.
@@ -788,6 +809,7 @@ pub fn App(comptime cfg: anytype) type {
             .captcha_secret = captcha_secret,
             .tenancy = tenancy_config,
             .role_ranking = role_ranking,
+            .mail = mail_config,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -921,6 +943,9 @@ pub const ServeOpts = struct {
     /// Role total-order (#155/#156), threaded into `app.role_ranking` for ability `.min_role`
     /// comparisons. Default = the standard ladder (`viewer<editor<admin<owner`).
     role_ranking: roles.Ranking = .{},
+    /// Email-subsystem knobs (#154), threaded into `app.mail`. Default `.{}` is fully off
+    /// (no verified-sender/suppression enforcement, webhook route disabled).
+    mail: mail_cfg.Runtime = .{},
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -1401,7 +1426,9 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             var prov_arena = std.heap.ArenaAllocator.init(allocator);
             defer prov_arena.deinit();
             const resolved = try provision.injectOAuthSecrets(
-                prov_arena.allocator(), io, jwt_secret,
+                prov_arena.allocator(),
+                io,
+                jwt_secret,
                 config.EnvGetter{ .environ = environ },
                 schema_collections,
             );
@@ -1514,6 +1541,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         },
         .tenancy = opts.tenancy,
         .role_ranking = opts.role_ranking,
+        .mail = opts.mail,
         .storage = &storage_iface,
         .mailer = &mailer_iface,
         .auth_methods = @ptrCast(&am_registry),
@@ -1651,7 +1679,6 @@ fn qTestHandler(ctx: *ctx_mod.Ctx, payload: []const u8) anyerror!void {
     _ = payload;
 }
 
-
 test "App(cfg) synthesizes a default queue + implicit worker; no durable jobs for memory-only" {
     const Bare = App(.{});
     try std.testing.expectEqual(@as(usize, 1), Bare.queue_defs.len);
@@ -1743,7 +1770,7 @@ test "App(cfg) assembles custom routes onto dispatch" {
             _ = req;
         }
     };
-    const A = App(.{ .routes = .{ .{ .method = .GET, .path = "/api/x", .handler = H.h, .auth = .public } } });
+    const A = App(.{ .routes = .{.{ .method = .GET, .path = "/api/x", .handler = H.h, .auth = .public }} });
     try std.testing.expectEqual(@as(usize, 1), A.dispatch.routes.len);
     try std.testing.expectEqualStrings("/api/x", A.dispatch.routes[0].pattern);
 }
@@ -2109,10 +2136,13 @@ test "App exposes route metadata for codegen" {
     const TestApp = App(.{
         .routes = .{
             .{
-                .method = .POST, .path = "/api/widgets/:id/poke",
+                .method = .POST,
+                .path = "/api/widgets/:id/poke",
                 .auth = .authed,
                 .handler = struct {
-                    fn h(req: *route_types.Req(In)) route_types.RouteError!void { _ = req; }
+                    fn h(req: *route_types.Req(In)) route_types.RouteError!void {
+                        _ = req;
+                    }
                 }.h,
             },
         },

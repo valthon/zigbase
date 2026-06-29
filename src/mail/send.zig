@@ -13,11 +13,22 @@
 //! `jobHandler` is the built-in `"mail"` queue job kind: it deserializes the JSON
 //! payload `ctx.mail().enqueue` enqueued back into a `MailMessage` and calls the same
 //! `send`. It is registered onto the queue registry in `framework.zig`.
+//!
+//! ENFORCEMENT BOUNDARY (#154 review M4): verified-sender + suppression enforcement is a POLICY of
+//! this `ctx.mail()` / `mail.send` layer (`enforce` below), NOT a guarantee of the `Mailer.send`
+//! vtable seam. A framework-internal caller that reaches for `app.mailer.?.send(...)` directly (or
+//! a custom backend invoked out-of-band) BYPASSES verified-sender and suppression checks — only
+//! header/CRLF rejection (which lives in every backend) still applies. Application code should send
+//! through `ctx.mail()`; the direct seam is for the framework's own auth mail, which is a system
+//! send (no account) that bypasses verified-sender enforcement by design anyway.
 
 const std = @import("std");
 const mailer = @import("mailer.zig");
 const App = @import("../app.zig").App;
 const Ctx = @import("../ctx.zig").Ctx;
+const db = @import("../db.zig");
+const senders = @import("senders.zig");
+const suppression = @import("suppression.zig");
 
 const Email = mailer.Email;
 
@@ -31,13 +42,21 @@ pub const MailMessage = struct {
     text: ?[]const u8 = null,
     html: ?[]const u8 = null,
     reply_to: ?[]const u8 = null,
+    /// Optional per-message From override (#154). `null` keeps the backend's configured sender, so
+    /// existing callers are unchanged. When verified-sender enforcement is on AND `account` is set,
+    /// this From must be a VERIFIED `_sender_identities` row for `account`.
+    from: ?[]const u8 = null,
+    /// Optional sending account (#154). `null`/empty = a system/superuser send (bypasses verified-
+    /// sender enforcement). When set, it scopes the verified-sender + suppression checks to that
+    /// account. `ctx.mail()` defaults this from the request's active account scope.
+    account: ?[]const u8 = null,
 };
 
 pub const MailError = error{
-    /// `to`/`subject`/`reply_to` carried a CR, LF, NUL, or other ASCII control char
+    /// `to`/`subject`/`reply_to`/`from` carried a CR, LF, NUL, or other ASCII control char
     /// (a header/command-injection vector). Same class as `mailer.HeaderError`.
     HeaderInjection,
-    /// `to` (or `reply_to`) is not a syntactically valid email address.
+    /// `to` (or `reply_to`/`from`) is not a syntactically valid email address.
     InvalidAddress,
     /// Neither `text` nor `html` was provided (an empty message has nothing to send).
     EmptyBody,
@@ -79,6 +98,8 @@ pub fn validate(msg: MailMessage) MailError!void {
     try validateAddress(msg.to);
     try checkHeader(msg.subject);
     if (msg.reply_to) |rt| try validateAddress(rt);
+    if (msg.from) |fr| try validateAddress(fr);
+    if (msg.account) |acct| try checkHeader(acct);
 }
 
 /// Lower a validated `MailMessage` to a `mail.Email` (the backend wire type).
@@ -89,7 +110,31 @@ fn toEmail(msg: MailMessage) Email {
         .text_body = msg.text orelse "",
         .html_body = msg.html,
         .reply_to = msg.reply_to,
+        .from = msg.from,
     };
+}
+
+/// Fail-closed send-time enforcement (#154), run against a reader `conn` ONLY when the app has
+/// opted into verified-sender and/or suppression enforcement (`app.mail.enforces()`). Both checks
+/// are account-scoped:
+///   * verified sender — when `require_verified_sender` is on and the send is account-scoped
+///     (`account` non-empty), the From must be a verified identity for that account. A scoped send
+///     with no explicit From is rejected (it would fall back to the global From, which is not the
+///     account's verified identity). A send with NO account is a system/superuser send and bypasses.
+///   * suppression — a send to a hard-bounced/complained recipient (for the account, or globally)
+///     is blocked.
+fn enforce(app: *App, alloc: std.mem.Allocator, conn: *db.Db, msg: MailMessage) !void {
+    if (app.mail.require_verified_sender) {
+        const acct = msg.account orelse "";
+        if (acct.len > 0) {
+            const from = msg.from orelse "";
+            if (from.len == 0) return error.SenderNotVerified; // scoped send must declare a verified From
+            try senders.assertVerified(alloc, conn, acct, from);
+        }
+    }
+    if (app.mail.check_suppression) {
+        try suppression.assertNotSuppressed(alloc, conn, msg.account orelse "", msg.to);
+    }
 }
 
 /// Build + deliver `msg` synchronously via the configured `app.mailer`. Validates
@@ -100,6 +145,13 @@ fn toEmail(msg: MailMessage) Email {
 /// A real backend failure propagates so it is never silently dropped.
 pub fn send(app: *App, alloc: std.mem.Allocator, msg: MailMessage) !void {
     try validate(msg);
+    // Fail-closed enforcement (verified sender + suppression), only when the app opted in. The
+    // default path (`enforces()==false`) acquires no reader and is byte-identical to pre-#154.
+    if (app.mail.enforces()) {
+        var r = try app.pool.acquireReader();
+        defer app.pool.releaseReader(&r);
+        try enforce(app, alloc, &r, msg);
+    }
     const email = toEmail(msg);
     if (app.mailer) |m| {
         try m.send(app.io, alloc, email);
@@ -160,4 +212,106 @@ test "toEmail maps text/html/reply_to onto the backend Email" {
     const e2 = toEmail(.{ .to = "u@x.io", .subject = "s", .html = "<b>h</b>" });
     try testing.expect(e2.html_body != null);
     try testing.expectEqualStrings("", e2.text_body);
+}
+
+test "toEmail carries the per-message From override" {
+    const e = toEmail(.{ .to = "u@x.io", .subject = "s", .text = "t", .from = "tenant@acct.com" });
+    try testing.expectEqualStrings("tenant@acct.com", e.from.?);
+}
+
+// --- Send-time enforcement (fail-closed) ------------------------------------
+
+const migrations = @import("../migrations.zig");
+
+const EnforceEnv = struct {
+    tmp: std.testing.TmpDir,
+    db_path: [:0]u8,
+    pool: db.Pool,
+    app: App,
+
+    fn init(mail_cfg: @import("config.zig").Runtime) !*EnforceEnv {
+        const ga = std.testing.allocator;
+        const env = try ga.create(EnforceEnv);
+        errdefer ga.destroy(env);
+        env.tmp = std.testing.tmpDir(.{});
+        errdefer env.tmp.cleanup();
+        const dir_path = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+        defer ga.free(dir_path);
+        env.db_path = try std.fmt.allocPrintSentinel(ga, "{s}/mail.db", .{dir_path}, 0);
+        errdefer ga.free(env.db_path);
+        env.pool = try db.Pool.init(ga, std.testing.io, env.db_path);
+        errdefer env.pool.deinit();
+        {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            try migrations.run(w);
+        }
+        env.app = App{ .allocator = ga, .io = std.testing.io, .pool = &env.pool, .mail = mail_cfg };
+        return env;
+    }
+    fn writer(env: *EnforceEnv) *db.Db {
+        return env.pool.acquireWriter();
+    }
+    fn deinit(env: *EnforceEnv) void {
+        const ga = std.testing.allocator;
+        env.pool.deinit();
+        ga.free(env.db_path);
+        env.tmp.cleanup();
+        ga.destroy(env);
+    }
+};
+
+test "send rejects an unverified sender when require_verified_sender is on (fail closed)" {
+    var env = try EnforceEnv.init(.{ .require_verified_sender = true });
+    defer env.deinit();
+    // A tenant send (account + from) whose From is NOT a verified identity → rejected.
+    try testing.expectError(error.SenderNotVerified, send(&env.app, std.testing.allocator, .{
+        .to = "user@example.com",
+        .subject = "Hi",
+        .text = "body",
+        .from = "from@acct.com",
+        .account = "acc1",
+    }));
+    // A scoped send with no explicit From is also rejected (would fall back to the global From).
+    try testing.expectError(error.SenderNotVerified, send(&env.app, std.testing.allocator, .{
+        .to = "user@example.com",
+        .subject = "Hi",
+        .text = "body",
+        .account = "acc1",
+    }));
+
+    // Verify the identity, then the same tenant send passes enforcement (no mailer wired → logs).
+    {
+        const w = env.writer();
+        defer env.pool.releaseWriter();
+        const req = try senders.requestVerification(std.testing.io, std.testing.allocator, w, "acc1", "from@acct.com");
+        defer std.testing.allocator.free(req.id);
+        defer std.testing.allocator.free(req.token);
+        defer std.testing.allocator.free(req.email);
+        try testing.expect(try senders.confirm(std.testing.allocator, w, "acc1", req.id, req.token));
+    }
+    try send(&env.app, std.testing.allocator, .{ .to = "user@example.com", .subject = "Hi", .text = "body", .from = "from@acct.com", .account = "acc1" });
+
+    // A system send (no account) bypasses verified-sender enforcement entirely.
+    try send(&env.app, std.testing.allocator, .{ .to = "user@example.com", .subject = "Hi", .text = "body" });
+}
+
+test "send blocks a suppressed recipient when check_suppression is on (fail closed)" {
+    var env = try EnforceEnv.init(.{ .check_suppression = true });
+    defer env.deinit();
+    {
+        const w = env.writer();
+        defer env.pool.releaseWriter();
+        try suppression.upsert(std.testing.io, std.testing.allocator, w, "acc1", "bounced@example.com", suppression.reason_hard_bounce, "ses");
+    }
+    // A send to the suppressed recipient (for the account) is blocked — even a differently-cased
+    // spelling (I1 normalization: the suppression check is case-insensitive).
+    try testing.expectError(error.RecipientSuppressed, send(&env.app, std.testing.allocator, .{
+        .to = "Bounced@Example.com",
+        .subject = "Hi",
+        .text = "body",
+        .account = "acc1",
+    }));
+    // A different recipient is fine (no mailer wired → log fallback, no error).
+    try send(&env.app, std.testing.allocator, .{ .to = "ok@example.com", .subject = "Hi", .text = "body", .account = "acc1" });
 }

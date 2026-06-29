@@ -7,6 +7,8 @@ const health = @import("api/health.zig");
 const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
 const accounts_api = @import("api/accounts.zig");
+const senders_api = @import("api/senders.zig");
+const mail_inbound = @import("mail/inbound.zig");
 const auth_api = @import("api/auth.zig");
 const auth_methods_api = @import("api/auth_methods.zig");
 const magic_link_consume_api = @import("api/magic_link_consume.zig");
@@ -64,6 +66,14 @@ const routes = [_]router.Route{
     // Multi-tenancy (#156): activate an account scope for browser apps (sets the signed
     // `zb_account` cookie). 404s when tenancy is disabled; 403 without an active membership.
     .{ .method = .POST, .pattern = "/api/accounts/:id/activate", .handler = accounts_api.activate },
+    // Email (#154): verified per-account sender identities. Tenant-scoped + fail closed (handlers
+    // authenticate + resolve the active account internally, like accounts.activate).
+    .{ .method = .GET, .pattern = "/api/senders", .handler = senders_api.list },
+    .{ .method = .POST, .pattern = "/api/senders", .handler = senders_api.create },
+    .{ .method = .POST, .pattern = "/api/senders/:id/verify", .handler = senders_api.verify },
+    // Email (#154): inbound bounce/complaint webhook (SES/Postmark). 404 unless a webhook_secret is
+    // configured; 401 on a bad signature (constant-time compare); upserts suppressions on success.
+    .{ .method = .POST, .pattern = "/api/mail/webhooks/:provider", .handler = mail_inbound.webhook_handler },
     // Public, UNAUTHENTICATED feature-state projection (#130). Mounted at the default
     // "/api/state"; the handler 404s when disabled or remapped (a custom path is
     // dispatched dynamically in onRequest). NEVER exposes the superuser settings verbs.
