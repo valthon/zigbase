@@ -343,6 +343,7 @@ fn handleError(ev: *zigbase.ErrorEvent) void {
         .cron => "cron",
         .job => "job",
         .file_serve => "file_serve",
+        .webhook => "webhook",
     };
     std.log.err("[onError] phase={s} err={s} msg={s}", .{
         phase_name, @errorName(ev.err), ev.message,
