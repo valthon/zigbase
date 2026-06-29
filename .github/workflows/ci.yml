@@ -109,6 +109,56 @@ jobs:
       - name: "Unit tests (prod gate: -Ddev-clock=false)"
         run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-clock=false
 
+  # Opt-in PostgreSQL backend (#159). Runs the full suite WITH -Dpostgres=true against a
+  # real postgres service container, exercising the pure-Zig wire driver's SCRAM-SHA-256
+  # auth + extended-protocol query/transaction/pool tests. The container forces SCRAM
+  # (POSTGRES_HOST_AUTH_METHOD=scram-sha-256); ZIGBASE_PG_TEST_URL points the live tests at
+  # it. The default SQLite jobs above are untouched, so the default story can't regress.
+  postgres:
+    runs-on: ubuntu-latest
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
+      # sslmode=prefer: the stock postgres image has no server TLS, so the driver negotiates
+      # SSLRequest and transparently falls back to plaintext. SCRAM is still exercised here;
+      # TLS-handshake coverage runs against a TLS-enabled local PostgreSQL during development.
+      ZIGBASE_PG_TEST_URL: postgres://zbpg:zbpg_secret_pw@127.0.0.1:5432/zbpgtest?sslmode=prefer
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zbpg
+          POSTGRES_PASSWORD: zbpg_secret_pw
+          POSTGRES_DB: zbpgtest
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zbpg -d zbpgtest"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: Cache zig global cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+      - name: Cache zig local cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-local
+          key: zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          restore-keys: |
+            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
+            zig-local-postgres-${{ runner.os }}-zig0.16.0-
+      - name: Unit + PostgreSQL driver tests (-Dpostgres=true)
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true
+
   browser:
     runs-on: ubuntu-latest
     needs: build

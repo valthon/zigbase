@@ -38,6 +38,13 @@ pub fn build(b: *std.Build) void {
     // into the SQLite build (below) and db.zig registers the extension on each connection.
     const vector = b.option(bool, "vector", "Compile in opt-in sqlite-vec vector search (default: off)") orelse false;
     build_options.addOption(bool, "vector", vector);
+    // Opt-in pure-Zig PostgreSQL backend (#159). OFF by default: when false, the entire
+    // src/backend/postgres/ subtree is comptime-unreachable (gated in src/root.zig and, in
+    // PR-1b, db.zig), so the default build links zero new symbols and is byte-identical.
+    // The driver is pure Zig std (TLS via std.crypto.tls.Client, SCRAM via std.crypto) — no
+    // C/libpq/OpenSSL to compile, so unlike -Dvector there is no extra C source to add here.
+    const postgres = b.option(bool, "postgres", "Compile in the opt-in pure-Zig PostgreSQL wire-protocol backend (default: off)") orelse false;
+    build_options.addOption(bool, "postgres", postgres);
     zigbase_mod.addOptions("build_options", build_options);
 
     zigbase_mod.addIncludePath(b.path("vendor/sqlite"));
