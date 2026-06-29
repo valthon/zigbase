@@ -18,6 +18,7 @@ const files_api = @import("api/files.zig");
 const settings_api = @import("api/settings.zig");
 const features_api = @import("api/features.zig");
 const state_api = @import("api/state.zig");
+const analytics_api = @import("analytics/api.zig");
 const realtime_ws = @import("realtime/ws.zig");
 const files_multipart = @import("files/multipart.zig");
 const admin = @import("admin.zig");
@@ -83,6 +84,10 @@ const routes = [_]router.Route{
     .{ .method = .PUT, .pattern = "/api/settings/:key", .handler = settings_api.put },
     .{ .method = .DELETE, .pattern = "/api/settings/:key", .handler = settings_api.delete },
     .{ .method = .GET, .pattern = "/api/features", .handler = features_api.get },
+    // Product analytics (#158): tenant-scoped read API. The raw activity feed and a rollup's
+    // summary rows. Both authenticate + fail closed — a member never sees another account's data.
+    .{ .method = .GET, .pattern = "/api/analytics/events", .handler = analytics_api.events },
+    .{ .method = .GET, .pattern = "/api/analytics/rollups/:name", .handler = analytics_api.rollups },
 };
 
 pub const Server = struct {

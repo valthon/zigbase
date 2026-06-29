@@ -92,6 +92,12 @@ pub const App = struct {
     /// app.zig→queue→ctx→app import cycle, mirroring `auth_methods`. null = no registry
     /// wired (tests/CLI constructing App directly).
     queues: ?*const anyopaque = null,
+    /// Type-erased pointer to the lowered analytics rollup `Registry` (#158), set by serveImpl from
+    /// the comptime `.analytics` config. Drives the per-rollup scheduled aggregation job and the
+    /// `/api/analytics/rollups/:name` read endpoint. Stored opaque (cast to
+    /// `*const @import("analytics/analytics.zig").Registry`) to avoid an app→analytics import cycle,
+    /// mirroring `queues`. null = no `.analytics` config (events still capture; no rollups scheduled).
+    analytics: ?*const anyopaque = null,
     /// Type-erased pointer to the running auth-method Registry (set by serveImpl); null = not running.
     /// Cast to `*const @import("auth/registry.zig").Registry` to read slugs. Stored as opaque
     /// to avoid an import cycle: app.zig must NOT import registry.zig or auth/method.zig.

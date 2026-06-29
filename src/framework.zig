@@ -36,6 +36,8 @@ const captcha = @import("captcha.zig");
 const tenancy = @import("tenancy/tenancy.zig");
 const roles = @import("tenancy/roles.zig");
 const abilities_mod = @import("authz/abilities.zig");
+const analytics = @import("analytics/analytics.zig");
+const analytics_config = @import("analytics/config.zig");
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -205,7 +207,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail", "analytics" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -395,17 +397,53 @@ pub fn App(comptime cfg: anytype) type {
         else
             &.{};
 
+        // ── Product analytics (#158) ───────────────────────────────────────────
+        // The comptime `.analytics = .{ .rollups = .{ … } }` config lowered into runtime rollup
+        // specs (validated by analytics_config), plus one scheduled aggregation job per rollup
+        // (`_rollup:<name>`, cadence = the rollup's `.every`). `app.analytics` points at
+        // `analytics_registry`. Absent `.analytics` → no specs, no jobs: `_events` still captures
+        // via `ctx.track`, but nothing is scheduled (zero overhead).
+
+        /// Declared rollup specs (empty when no `.analytics`).
+        pub const analytics_rollups: []const analytics.RollupSpec =
+            if (@hasField(@TypeOf(cfg), "analytics")) analytics_config.rollupSpecs(cfg.analytics) else &.{};
+
+        /// Static lowered registry threaded (type-erased) into `app.analytics` by serveImpl.
+        pub const analytics_registry: analytics.Registry = .{ .rollups = analytics_rollups };
+
+        /// One non-reactive aggregation job per rollup (`_rollup:<name>`), scheduled on the
+        /// rollup's `.every` cadence. Empty when no rollup is declared. The handler resolves the
+        /// spec by `ev.name` from `app.analytics` (mirrors the durable-queue worker poller).
+        const analytics_jobs: []const scheduler.RuntimeJob = blk: {
+            if (analytics_rollups.len == 0) break :blk &.{};
+            const Holder = struct {
+                const table: [analytics_rollups.len]scheduler.RuntimeJob = tbl: {
+                    var t: [analytics_rollups.len]scheduler.RuntimeJob = undefined;
+                    for (analytics_rollups, 0..) |r, i| t[i] = .{
+                        .name = "_rollup:" ++ r.name,
+                        .schedule = r.every,
+                        .run = analyticsRollupRun,
+                    };
+                    break :tbl t;
+                };
+            };
+            break :blk &Holder.table;
+        };
+
         /// Framework-internal jobs: the TTL sweep, the session-GC sweep, the sticky-
-        /// assignment GC sweep, the durable-queue worker pollers, and the durable-queue GC
-        /// sweep — each gated on its own condition. Appended after the consumer's jobs so
-        /// user `.cron` names win the lower indices, and an internal job runs even with no
-        /// user cron.
+        /// assignment GC sweep, the durable-queue worker pollers, the durable-queue GC
+        /// sweep, and the analytics rollup aggregation jobs — each gated on its own
+        /// condition. Appended after the consumer's jobs so user `.cron` names win the
+        /// lower indices, and an internal job runs even with no user cron.
         const internal_jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(
             scheduler.concatJobs(
-                scheduler.concatJobs(scheduler.concatJobs(ttl_jobs, session_gc_jobs), experiment_gc_jobs),
-                queue_worker_jobs,
+                scheduler.concatJobs(
+                    scheduler.concatJobs(scheduler.concatJobs(ttl_jobs, session_gc_jobs), experiment_gc_jobs),
+                    queue_worker_jobs,
+                ),
+                queue_gc_jobs,
             ),
-            queue_gc_jobs,
+            analytics_jobs,
         );
 
         /// The full job table = consumer jobs ++ framework-internal jobs. The scheduler
@@ -805,6 +843,7 @@ pub fn App(comptime cfg: anytype) type {
             .experiment_assignment_ttl = experiment_assignment_ttl,
             .features_public_route = features_public_route,
             .queues = &queue_registry,
+            .analytics = &analytics_registry,
             .captcha_provider = captcha_provider,
             .captcha_secret = captcha_secret,
             .tenancy = tenancy_config,
@@ -894,6 +933,20 @@ fn queueGcJob(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
     }
 }
 
+/// The per-rollup analytics aggregation job (`_rollup:<name>`, #158). Resolves the spec by
+/// `ev.name` from `app.analytics`, then runs ONE incremental aggregation pass on the writer
+/// (provision summary table → aggregate new events past the watermark → advance the watermark).
+/// A missing registry/spec is a no-op (defensive — the job is only installed when declared).
+fn analyticsRollupRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
+    const reg = analytics.registryFromApp(ctx.app) orelse return;
+    const prefix = "_rollup:";
+    const name = if (std.mem.startsWith(u8, ev.name, prefix)) ev.name[prefix.len..] else ev.name;
+    const spec = reg.byName(name) orelse return;
+    const w = ctx.app.pool.acquireWriter();
+    defer ctx.app.pool.releaseWriter();
+    try analytics.runRollup(w, ctx.arena, spec);
+}
+
 /// Comptime knobs threaded from `App(cfg)` into the serve path: which storage /
 /// mailer plugin TYPES to instantiate, the assembled auth method type list,
 /// and the warm-reader-pool cap.
@@ -937,6 +990,10 @@ pub const ServeOpts = struct {
     /// Captcha site-verify secret (#140 PR6), threaded into `app.captcha_secret`.
     /// `""` = dev-bypass (ctx.verifyCaptcha returns .{.ok=true} without a network call).
     captcha_secret: []const u8 = "",
+    /// Lowered analytics rollup registry (#158), pointed (type-erased) into `app.analytics` by
+    /// serveImpl so the `_rollup:<name>` jobs + the rollups read endpoint resolve specs by name.
+    /// Static lifetime (a comptime-lowered const). null = no `.analytics` config.
+    analytics: ?*const analytics.Registry = null,
     /// Multi-tenancy knobs (#156), threaded into `app.tenancy`. Default `.enabled = false` is the
     /// byte-identical no-tenancy path.
     tenancy: tenancy.Runtime = .{},
@@ -1550,6 +1607,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .experiment_assignment_ttl = opts.experiment_assignment_ttl,
         .features_public_route = opts.features_public_route,
         .queues = if (opts.queues) |r| @as(?*const anyopaque, @ptrCast(r)) else null,
+        .analytics = if (opts.analytics) |r| @as(?*const anyopaque, @ptrCast(r)) else null,
         .captcha_provider = opts.captcha_provider,
         .captcha_secret = opts.captcha_secret,
         // Always wire the shared limiter store: the default-scope limiter no-ops when
