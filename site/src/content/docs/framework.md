@@ -2073,6 +2073,80 @@ Semantics:
   intended expiry (autodate defaults to write-on-create "now", which would expire
   the row immediately).
 
+### Multi-tenancy — account-scoped collections (`.tenancy` + `.tenant_field`)
+
+ZigBase has built-in **account-scoped multi-tenancy** (#156): a collection can be *tenant-owned*,
+and every read/write of it is automatically narrowed to the request's **active account** — you do
+not write `account = @request.account.id` on every rule, and a client can never read or write across
+tenants.
+
+Turn it on in `App(.{ ... })` and mark each owned collection's owning-account column with
+`.tenant_field`:
+
+```zig
+zigbase.App(.{
+    .tenancy = .{
+        .enabled = true,
+        .resolver = .header,          // read the active account from X-Account-Id / the zb_account cookie
+        .auth_collection = "users",   // the auth collection whose records are members
+        .roles = .{ "viewer", "editor", "admin", "owner" }, // optional; this is the default ladder
+    },
+    .collections = .{
+        .projects = .{
+            .fields = .{
+                .{ .name = "title",   .type = .text },
+                .{ .name = "account", .type = .text },   // holds the owning account id
+            },
+            .tenant_field = "account",                   // <- makes `projects` tenant-owned
+            .rules = .{ .list = "@public", .view = "@public" },
+        },
+    },
+});
+```
+
+**Data model.** Migration `0014_tenancy` creates three system collections (visible in
+`_collections`, `system = 1`):
+
+- `_accounts(id, created, updated, name, slug UNIQUE, owner_user, status)` — one row per tenant.
+- `_memberships(id, …, account, user_collection, user, role, status)` — the principal↔account edge.
+  `(account, user_collection, user)` is unique; `user_collection` is part of the key because several
+  auth collections may exist. Indexed on `(user_collection, user, status)` ("my accounts") and
+  `(account, status)`.
+- `_invitations(id, …, account, email, role, token UNIQUE, invited_by, expires, accepted_at)` —
+  pending invites. (Invite/accept/remove **lifecycle** is a later PR; PR2 ships the tables only.)
+
+**Resolution (fail closed).** On each request the active account is resolved from `X-Account-Id`
+(or the signed `zb_account` cookie) and verified against an **active** `_memberships` row for the
+authenticated principal — one indexed `SELECT`, cached on the request. No/invalid/inactive
+membership ⇒ **no account context**, and tenant-owned data is invisible. The resolution also fills
+the rule macros `@request.account.id`, `@request.account.role`, and the list-valued
+`@request.account.ids` (the `in` operator's membership-bounded source).
+
+**Activation for browsers.** `POST /api/accounts/:id/activate` verifies membership and sets a
+signed, HttpOnly `zb_account` cookie, so a browser SPA selects an account once instead of sending
+`X-Account-Id` on every call. API clients can skip this and just send the header. 403 without an
+active membership; 404 when tenancy is disabled.
+
+**Scoping & the write path.** A tenant-owned collection is auto-scoped at all CRUD chokepoints and
+realtime delivery via a bound `"<col>"."<tenant_field>" = ?` predicate composed into the guard
+stack — `WHERE (filter) AND (rule) AND (tenant_field = ?) AND (ttl)`. A **locked** rule (`null`/`""`)
+still denies first (the fail-closed floor is unchanged). On **create** the owning account is
+*stamped* onto the row (clients can't spoof it); on **update** a cross-tenant move is rejected by the
+in-transaction guard. Creating in a tenant-owned collection with no active account is denied.
+
+**Roles** form a total order (`tenancy/roles.zig`), default `viewer < editor < admin < owner`,
+configurable via `.tenancy.roles`. (PR3 consumes the ranking for ability checks.)
+
+**Superuser & cross-tenant tooling.** Superusers bypass tenancy entirely (consistent with the
+access-rule engine). For admin tooling that must legitimately span accounts (an ops dashboard,
+a maintenance job), `zigbase.crossTenant(rctx)` returns a context with the override enabled — the
+*explicit, never-silent* way to widen scope.
+
+**Back-compat is byte-identical.** With `.tenancy` absent/`enabled = false`, or for any collection
+without a `.tenant_field`, the composed SQL and authorization decisions are **identical** to the
+pre-tenancy engine (pinned by tests in `policy.zig`). Enabling tenancy never changes a non-tenant
+collection.
+
 ### Field encryption at rest (`.encrypted`)
 
 Mark a `text`, `editor`, or `json` field `.encrypted = true` to store it
