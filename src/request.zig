@@ -1,4 +1,5 @@
 const std = @import("std");
+const roles = @import("tenancy/roles.zig");
 
 /// One account membership for the authenticated principal (multi-tenancy foundation, #156).
 /// `account` is the account id; `role` is the principal's role within that account. The PR1
@@ -32,6 +33,21 @@ pub const RequestContext = struct {
     /// macro (membership-bounded `IN (?,?,…)`). Empty in PR1; PR2 populates it from one indexed
     /// membership SELECT cached on the context.
     memberships: []const Membership = &.{},
+    /// True when the app has tenancy enabled (`App(.{ .tenancy = .{ .enabled = true } })`). Gates
+    /// the tenant-scope predicate (`tenancy.scopePredicate`): when false, scoping is a no-op and
+    /// the composed SQL/decisions are byte-identical to the pre-tenancy engine. Default false so a
+    /// directly-constructed context (tests, non-tenant apps) takes the no-tenancy path.
+    tenancy_enabled: bool = false,
+    /// Explicit "operate across tenants" override for superuser / admin tooling (e.g. moving a
+    /// record between accounts). When true the tenant-scope predicate is suppressed (like the
+    /// superuser bypass) and the write-path cross-tenant guard is skipped. Default false — never
+    /// silently widens scope.
+    cross_tenant: bool = false,
+    /// The role total-order used to compare a membership role against an ability's `.min_role`
+    /// (#155). Threaded from the app's comptime `.tenancy.roles` config via `buildContext`; defaults
+    /// to the standard ladder (`viewer<editor<admin<owner`) so a directly-constructed context
+    /// (tests, non-tenant apps) ranks the default roles. Read by `authz/abilities.zig`.
+    role_ranking: roles.Ranking = .{},
 
     /// Resolve a `@request.*` macro path to a text value. Returns null for an unknown macro.
     /// `@request.auth.<field>` and `@request.data.<field>` yield "" when absent/unauthenticated.

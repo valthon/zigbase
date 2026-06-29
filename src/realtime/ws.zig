@@ -12,6 +12,7 @@ const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 const hub = @import("hub.zig");
 const request = @import("../request.zig");
+const tenancy = @import("../tenancy/tenancy.zig");
 const Ctx = @import("../ctx.zig").Ctx;
 
 /// Set true by the server just before `zap.start`; gates `broadcast` so it is a no-op when the
@@ -119,6 +120,11 @@ pub const LiveConn = struct {
     client_id: [15]u8 = undefined,
     sub_args: std.ArrayList(*WS.SubscribeArgs) = .empty,
     sub_ids: std.StringHashMapUnmanaged(usize) = .empty, // topic -> facil.io subscription id
+    /// The account the subscriber asked to act within, captured from the HTTP handshake
+    /// (`X-Account-Id` header or the signed `zb_account` cookie) and duped onto `durable`. It is
+    /// VERIFIED against `_memberships` at `auth`-frame time; an unverified value never grants scope.
+    /// "" when tenancy is off or no account was requested. (#156)
+    requested_account: []const u8 = "",
 };
 
 pub const WS = zap.WebSockets.Handler(LiveConn);
@@ -148,6 +154,37 @@ pub fn originAllowed(allowlist: []const u8, origin: ?[]const u8, host: ?[]const 
         if (std.mem.eql(u8, std.mem.trim(u8, allowed, " "), o)) return true;
     }
     return false;
+}
+
+/// The account the subscriber requested at the HTTP handshake: the `X-Account-Id` header (unsigned —
+/// the membership check at resolve time is the real gate) or the signed `zb_account` cookie. The
+/// returned slice is duped onto `da` (the connection-durable arena) because zap.Request buffers are
+/// freed after the upgrade callback returns. null when neither is present/valid. (#156)
+fn requestedAccountFromUpgrade(app: *App, r: zap.Request, da: std.mem.Allocator) ?[]const u8 {
+    if (r.getHeader("x-account-id")) |h| if (h.len > 0) return da.dupe(u8, h) catch null;
+    const ch = r.getHeader("cookie") orelse return null;
+    const raw = cookieValue(ch, tenancy.account_cookie) orelse return null;
+    const verified = tenancy.verifyAccount(app.jwt_secret, raw) orelse return null;
+    return da.dupe(u8, verified) catch null;
+}
+
+/// Extract the value of cookie `name` from a raw `Cookie` header (mirrors `http.RequestCtx.cookie`).
+fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, header, ';');
+    while (it.next()) |pair| {
+        const trimmed = std.mem.trim(u8, pair, " ");
+        if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq| {
+            if (std.mem.eql(u8, trimmed[0..eq], name)) return trimmed[eq + 1 ..];
+        }
+    }
+    return null;
+}
+
+/// The string `id` of a record JSON object, or "" when absent/non-object.
+fn recordIdOf(rec: std.json.Value) []const u8 {
+    if (rec != .object) return "";
+    const v = rec.object.get("id") orelse return "";
+    return if (v == .string) v.string else "";
 }
 
 /// Listener on_upgrade hook: validate Origin, allocate a LiveConn, upgrade. Path-gated to /api/realtime.
@@ -181,6 +218,14 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
     };
     const cid = id.collectionId(app.io);
     @memcpy(&lc.client_id, &cid);
+    // #156: carry tenancy through the realtime path. `tenancy_enabled` is set unconditionally from
+    // the app config so the realtime RequestContext ALWAYS fails closed (an unresolved account
+    // denies tenant-owned delivery, never leaks). Capture the requested account from the handshake
+    // now (zap.Request buffers are freed after this returns) — it is VERIFIED at auth time.
+    if (app.tenancy.enabled) {
+        lc.conn.tenancy_enabled = true;
+        if (requestedAccountFromUpgrade(app, r, lc.durable.allocator())) |acc| lc.requested_account = acc;
+    }
     lc.settings = .{
         .on_open = onOpen,
         .on_message = onMessage,
@@ -224,6 +269,16 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
             // auth record must persist across frames -> durable allocator
             if (auth.verifyToken(da, lc.app, &r, m.token)) |v| {
                 lc.conn.setAuth(.{ .record = v.record, .is_superuser = v.is_superuser, .exp = v.exp });
+                // #156: resolve + cache the active account scope against _memberships (durable
+                // allocator → persists across frames). Superusers bypass tenancy. A failed/absent
+                // resolution leaves account_id="" → tenant-owned delivery fails closed (deny).
+                if (lc.conn.tenancy_enabled and !v.is_superuser) {
+                    const uid = recordIdOf(v.record);
+                    if (uid.len > 0) {
+                        const res = tenancy.resolve(da, &r, v.collection, uid, lc.requested_account) catch tenancy.Resolution{};
+                        lc.conn.setTenancyScope(res.account_id, res.memberships);
+                    }
+                }
                 WS.write(handle, try protocol.authFrame(fa, true), true) catch {};
             } else {
                 lc.conn.clearAuth();

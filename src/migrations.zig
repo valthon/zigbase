@@ -280,6 +280,82 @@ fn init_0013_queue_jobs(w: *db.Db) db.DbError!void {
     try w.exec("CREATE INDEX IF NOT EXISTS \"idx_queue_jobs_created\" ON \"_queue_jobs\" (\"created\");");
 }
 
+fn init_0014_tenancy(w: *db.Db) db.DbError!void {
+    // Multi-tenancy data model (#156, PR2). Three built-in system collections back account-scoped
+    // tenancy. They are seeded into `_collections` with system=1 and HARDCODED stable field ids
+    // (8-char, matching `provision`'s FNV id width) so additive rebuilds match columns by id and a
+    // raw-SQL migration can index the human-named physical columns directly. Membership
+    // lifecycle (invite / accept / remove) is PR4 — this migration creates TABLES ONLY.
+    //
+    // _accounts: one row per tenant. `slug` is the human handle (UNIQUE); `owner_user` is the
+    // creating principal's record id; `status` gates soft-disable.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_accounts" (
+        \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL,
+        \\  "name" TEXT NOT NULL DEFAULT '',
+        \\  "slug" TEXT NOT NULL,
+        \\  "owner_user" TEXT NOT NULL DEFAULT '',
+        \\  "status" TEXT NOT NULL DEFAULT 'active'
+        \\);
+    );
+    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_accounts_slug\" ON \"_accounts\" (\"slug\");");
+
+    // _memberships: the principal<->account edge. `(user_collection,user)` is a COMPOSITE owner
+    // (mirrors _sessions/_externalAuths) because multiple auth collections may exist. `role` is a
+    // tenancy role (see tenancy/roles.zig); `status` is 'active' once accepted. The
+    // (user_collection,user,status) index serves the per-request "my active accounts" resolution
+    // SELECT; (account,status) serves account member listings.
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_memberships" (
+        \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL,
+        \\  "account" TEXT NOT NULL,
+        \\  "user_collection" TEXT NOT NULL,
+        \\  "user" TEXT NOT NULL,
+        \\  "role" TEXT NOT NULL DEFAULT 'viewer',
+        \\  "status" TEXT NOT NULL DEFAULT 'active'
+        \\);
+    );
+    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_memberships_unique\" ON \"_memberships\" (\"account\",\"user_collection\",\"user\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_memberships_user\" ON \"_memberships\" (\"user_collection\",\"user\",\"status\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_memberships_account\" ON \"_memberships\" (\"account\",\"status\");");
+
+    // _invitations: a pending invite to join an account. `token` is the single-use claim handle
+    // (UNIQUE); `expires`/`accepted_at` drive the accept flow (wired in PR4).
+    try w.exec(
+        \\CREATE TABLE IF NOT EXISTS "_invitations" (
+        \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL,
+        \\  "account" TEXT NOT NULL,
+        \\  "email" TEXT NOT NULL DEFAULT '',
+        \\  "role" TEXT NOT NULL DEFAULT 'viewer',
+        \\  "token" TEXT NOT NULL,
+        \\  "invited_by" TEXT NOT NULL DEFAULT '',
+        \\  "expires" TEXT NOT NULL DEFAULT '',
+        \\  "accepted_at" TEXT NOT NULL DEFAULT ''
+        \\);
+    );
+    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_invitations_token\" ON \"_invitations\" (\"token\");");
+    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_invitations_account\" ON \"_invitations\" (\"account\");");
+
+    // Seed the three `_collections` rows (system=1) so the engine can address them as collections.
+    // The `schema` blob carries each row's user fields with HARDCODED stable field ids (id/created/
+    // updated are implicit base columns and are NOT listed). Rules are NULL = Locked (superusers
+    // only) — tenant CRUD lands in PR4; until then only superuser tooling touches these tables.
+    try w.exec(
+        \\INSERT OR IGNORE INTO "_collections"
+        \\  ("id","name","type","system","schema","indexes","options","listRule","viewRule","createRule","updateRule","deleteRule","created","updated")
+        \\ VALUES
+        \\  ('_accounts______','_accounts','base',1,
+        \\    '[{"id":"acctname","name":"name","type":"text","options":{}},{"id":"acctslug","name":"slug","type":"text","unique":true,"options":{}},{"id":"acctownr","name":"owner_user","type":"text","options":{}},{"id":"acctstat","name":"status","type":"text","options":{}}]',
+        \\    '[]','{}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now')),
+        \\  ('_memberships___','_memberships','base',1,
+        \\    '[{"id":"membacct","name":"account","type":"text","options":{}},{"id":"membucol","name":"user_collection","type":"text","options":{}},{"id":"membuser","name":"user","type":"text","options":{}},{"id":"membrole","name":"role","type":"text","options":{}},{"id":"membstat","name":"status","type":"text","options":{}}]',
+        \\    '[]','{}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now')),
+        \\  ('_invitations___','_invitations','base',1,
+        \\    '[{"id":"invtacct","name":"account","type":"text","options":{}},{"id":"invtmail","name":"email","type":"email","options":{}},{"id":"invtrole","name":"role","type":"text","options":{}},{"id":"invttokn","name":"token","type":"text","unique":true,"options":{}},{"id":"invtinvb","name":"invited_by","type":"text","options":{}},{"id":"invtexpr","name":"expires","type":"text","options":{}},{"id":"invtacpt","name":"accepted_at","type":"text","options":{}}]',
+        \\    '[]','{}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now'));
+    );
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -294,6 +370,7 @@ pub const all = [_]Migration{
     .{ .name = "0011_sessions", .up = init_0011_sessions },
     .{ .name = "0012_experiment_assignments", .up = init_0012_experiment_assignments },
     .{ .name = "0013_queue_jobs", .up = init_0013_queue_jobs },
+    .{ .name = "0014_tenancy", .up = init_0014_tenancy },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {
@@ -405,7 +482,14 @@ test "0010 backfills token_epoch onto a pre-existing user auth table" {
     inline for (.{ "0001_init", "0002_auth", "0003_external_auths", "0004_consumed_tokens", "0005_oauth_states", "0006_cursor_states", "0007_auth_challenges", "0008_webauthn_credentials", "0009_kv" }) |name| {
         try d.exec("INSERT INTO \"_migrations\" (\"name\",\"applied_at\") VALUES ('" ++ name ++ "', datetime('now'));");
     }
-    try d.exec("CREATE TABLE \"_collections\" (\"id\" TEXT PRIMARY KEY, \"name\" TEXT UNIQUE NOT NULL, \"type\" TEXT NOT NULL DEFAULT 'base');");
+    // A realistic (full) _collections, as a real DB at 0009 would have from 0001/0002 — so the
+    // later 0014 tenancy seed (which INSERTs schema/options/rule columns) applies cleanly.
+    try d.exec(
+        \\CREATE TABLE "_collections" ("id" TEXT PRIMARY KEY, "name" TEXT UNIQUE NOT NULL, "type" TEXT NOT NULL DEFAULT 'base',
+        \\  "system" INTEGER NOT NULL DEFAULT 0, "schema" TEXT NOT NULL DEFAULT '[]', "indexes" TEXT NOT NULL DEFAULT '[]',
+        \\  "listRule" TEXT, "viewRule" TEXT, "createRule" TEXT, "updateRule" TEXT, "deleteRule" TEXT,
+        \\  "created" TEXT NOT NULL DEFAULT '', "updated" TEXT NOT NULL DEFAULT '', "options" TEXT NOT NULL DEFAULT '{}');
+    );
     try d.exec("CREATE TABLE \"_superusers\" (\"id\" TEXT PRIMARY KEY, \"email\" TEXT);");
     try d.exec("INSERT INTO \"_collections\" (\"id\",\"name\",\"type\") VALUES ('c1','members','auth');");
     try d.exec("CREATE TABLE \"members\" (\"id\" TEXT PRIMARY KEY, \"email\" TEXT, \"tokenKey\" TEXT);");
@@ -434,7 +518,12 @@ test "0010 backfills a long-named (251+ char) auth table — no fixed-buffer len
     inline for (.{ "0001_init", "0002_auth", "0003_external_auths", "0004_consumed_tokens", "0005_oauth_states", "0006_cursor_states", "0007_auth_challenges", "0008_webauthn_credentials", "0009_kv" }) |name| {
         try d.exec("INSERT INTO \"_migrations\" (\"name\",\"applied_at\") VALUES ('" ++ name ++ "', datetime('now'));");
     }
-    try d.exec("CREATE TABLE \"_collections\" (\"id\" TEXT PRIMARY KEY, \"name\" TEXT UNIQUE NOT NULL, \"type\" TEXT NOT NULL DEFAULT 'base');");
+    try d.exec(
+        \\CREATE TABLE "_collections" ("id" TEXT PRIMARY KEY, "name" TEXT UNIQUE NOT NULL, "type" TEXT NOT NULL DEFAULT 'base',
+        \\  "system" INTEGER NOT NULL DEFAULT 0, "schema" TEXT NOT NULL DEFAULT '[]', "indexes" TEXT NOT NULL DEFAULT '[]',
+        \\  "listRule" TEXT, "viewRule" TEXT, "createRule" TEXT, "updateRule" TEXT, "deleteRule" TEXT,
+        \\  "created" TEXT NOT NULL DEFAULT '', "updated" TEXT NOT NULL DEFAULT '', "options" TEXT NOT NULL DEFAULT '{}');
+    );
     try d.exec("CREATE TABLE \"_superusers\" (\"id\" TEXT PRIMARY KEY, \"email\" TEXT);");
     // A valid identifier of 260 chars (alpha-first, alnum) — passes schema.isValidIdentifier
     // (no length cap), so it must also be migrated. The old [320]u8/len<=250 guard skipped it.
@@ -491,6 +580,58 @@ test "0013 creates the _queue_jobs table with its indexes" {
     try std.testing.expect(e.isNull(0));
     try std.testing.expectEqualStrings("pending", e.columnText(1));
     try std.testing.expectEqual(@as(i64, 0), e.columnInt(2));
+}
+
+test "0014 creates the tenancy tables, indexes, uniqueness, and seeds _collections" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try run(&d);
+
+    // Tables exist with the expected column counts (id/created/updated + the named fields).
+    inline for (.{
+        .{ "_accounts", @as(i64, 7) }, // id,created,updated,name,slug,owner_user,status
+        .{ "_memberships", @as(i64, 8) }, // id,created,updated,account,user_collection,user,role,status
+        .{ "_invitations", @as(i64, 10) }, // id,created,updated,account,email,role,token,invited_by,expires,accepted_at
+    }) |spec| {
+        var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('" ++ spec[0] ++ "');");
+        defer t.finalize();
+        _ = try t.step();
+        try std.testing.expectEqual(spec[1], t.columnInt(0));
+    }
+
+    // Indexes present.
+    var idx = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN " ++
+        "('idx_accounts_slug','idx_memberships_unique','idx_memberships_user','idx_memberships_account','idx_invitations_token','idx_invitations_account');");
+    defer idx.finalize();
+    _ = try idx.step();
+    try std.testing.expectEqual(@as(i64, 6), idx.columnInt(0));
+
+    // Seeded into _collections as system collections.
+    var c = try d.prepare("SELECT COUNT(*) FROM \"_collections\" WHERE name IN ('_accounts','_memberships','_invitations') AND system=1;");
+    defer c.finalize();
+    _ = try c.step();
+    try std.testing.expectEqual(@as(i64, 3), c.columnInt(0));
+
+    // slug uniqueness on _accounts.
+    try d.exec("INSERT INTO \"_accounts\" (\"id\",\"created\",\"updated\",\"slug\") VALUES ('a1','','','acme');");
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"_accounts\" (\"id\",\"created\",\"updated\",\"slug\") VALUES ('a2','','','acme');"));
+
+    // composite (account,user_collection,user) uniqueness on _memberships.
+    try d.exec("INSERT INTO \"_memberships\" (\"id\",\"created\",\"updated\",\"account\",\"user_collection\",\"user\",\"role\",\"status\") VALUES ('m1','','','a1','users','u1','owner','active');");
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"_memberships\" (\"id\",\"created\",\"updated\",\"account\",\"user_collection\",\"user\",\"role\",\"status\") VALUES ('m2','','','a1','users','u1','viewer','active');"));
+    // same user, different account is fine.
+    try d.exec("INSERT INTO \"_memberships\" (\"id\",\"created\",\"updated\",\"account\",\"user_collection\",\"user\",\"role\",\"status\") VALUES ('m3','','','a-other','users','u1','viewer','active');");
+
+    // token uniqueness on _invitations.
+    try d.exec("INSERT INTO \"_invitations\" (\"id\",\"created\",\"updated\",\"account\",\"token\") VALUES ('i1','','','a1','tok-1');");
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"_invitations\" (\"id\",\"created\",\"updated\",\"account\",\"token\") VALUES ('i2','','','a1','tok-1');"));
+
+    // Re-running migrations does not duplicate the seeded collection rows.
+    try run(&d);
+    var dup = try d.prepare("SELECT COUNT(*) FROM \"_collections\" WHERE name='_accounts';");
+    defer dup.finalize();
+    _ = try dup.step();
+    try std.testing.expectEqual(@as(i64, 1), dup.columnInt(0));
 }
 
 test "0003 creates _externalAuths with unique provider/providerId and per-record indexes" {

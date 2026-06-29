@@ -18,6 +18,8 @@ const pagination = @import("pagination.zig");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
 const field_policy = @import("field_policy.zig");
+const tenancy = @import("tenancy/tenancy.zig");
+const abilities = @import("authz/abilities.zig");
 
 /// A compiled rule constraint enforced atomically on create/update.
 pub const Guard = struct {
@@ -596,6 +598,51 @@ fn seedPosts(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
         .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
     };
     return collections.create(a, std.testing.io, d, .{ .id = "", .name = "posts", .fields = &fields });
+}
+
+test "list tenant scoping: only the active account's rows; superuser sees all; off = unchanged" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "account", .options = .{ .text = .{} } },
+    };
+    var col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
+    col.options.tenant_field = "account"; // make it tenant-owned
+    try d.exec("INSERT INTO posts (id,created,updated,title,account) VALUES " ++
+        "('r1','2026-01-01T00:00:00Z','t','a','acc1')," ++
+        "('r2','2026-01-02T00:00:00Z','t','b','acc1')," ++
+        "('r3','2026-01-03T00:00:00Z','t','c','acc2');");
+
+    // Active account acc1 -> only its 2 rows.
+    const member = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
+    const r1 = try list(a, &d, col, .{ .rctx = &member });
+    try std.testing.expectEqual(@as(?i64, 2), r1.totalItems);
+    for (r1.items) |it| try std.testing.expectEqualStrings("acc1", it.object.get("account").?.string);
+
+    // No account context (empty) -> no rows (fail closed).
+    const noacct = request.RequestContext{ .tenancy_enabled = true, .account_id = "" };
+    const r2 = try list(a, &d, col, .{ .rctx = &noacct });
+    try std.testing.expectEqual(@as(?i64, 0), r2.totalItems);
+
+    // Superuser bypasses scoping -> all 3 rows.
+    const su = request.RequestContext{ .tenancy_enabled = true, .is_superuser = true, .account_id = "acc1" };
+    const r3 = try list(a, &d, col, .{ .rctx = &su });
+    try std.testing.expectEqual(@as(?i64, 3), r3.totalItems);
+
+    // Tenancy OFF -> all 3 rows (byte-identical to pre-tenancy, even though tenant_field is set).
+    const off = request.RequestContext{ .tenancy_enabled = false, .account_id = "acc1" };
+    const r4 = try list(a, &d, col, .{ .rctx = &off });
+    try std.testing.expectEqual(@as(?i64, 3), r4.totalItems);
+
+    // The tenant predicate composes with a user filter (still scoped to acc1).
+    const r5 = try list(a, &d, col, .{ .rctx = &member, .filter = "title = \"a\"" });
+    try std.testing.expectEqual(@as(?i64, 1), r5.totalItems);
+    try std.testing.expectEqualStrings("r1", r5.items[0].object.get("id").?.string);
 }
 
 test "get returns a record as a JSON object with typed values" {
@@ -1690,6 +1737,28 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         params = try merged.toOwnedSlice(alloc);
     };
 
+    // Ability scoping (#155): AND the lowered `"<col>"."<via>" IN (?,…)` view-ability predicate so a
+    // LIST narrows to the rows the principal may VIEW by relationship — the read-path complement to
+    // `policy.compilePredicate` (which governs view/create/update/delete/expand/realtime). Without
+    // this, a list rule broader than the ability would leak ability-denied rows on the bulk endpoint.
+    // An empty qualifying set lowers to the constant-false `"0"` fragment (zero params) → 0 rows
+    // (fail closed); a superuser / no-ability collection yields null → byte-identical to the prior
+    // SQL. Identifiers are gated in `abilityPredicate`; account-ids are bound.
+    if (q.rctx) |rctx| {
+        const view_ability = if (col.options.abilities) |ab| ab.view else null;
+        if (try abilities.abilityPredicate(alloc, col, view_ability, rctx)) |ap| {
+            where_sql = if (where_sql.len > 0)
+                try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, ap.sql })
+            else
+                ap.sql;
+            var merged: std.ArrayList(compiler.Param) = .empty;
+            defer merged.deinit(alloc);
+            try merged.appendSlice(alloc, params);
+            try merged.appendSlice(alloc, ap.params);
+            params = try merged.toOwnedSlice(alloc);
+        }
+    }
+
     // TTL read-time exclusion: AND a predicate that hides expired rows. This is the
     // read-time complement to gcExpiredRecords (which only runs every ~5 min), giving
     // immediate consistency. Three-clause OR mirrors the GC's fail-safe semantics:
@@ -1711,6 +1780,23 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
                 ttl_pred;
         }
     }
+
+    // Tenant scoping (#156): AND the bound `"<col>"."<tenant_field>" = ?` predicate so a list of a
+    // tenant-owned collection only returns the request's active account's rows. The single param
+    // is appended LAST (after filter+rule params); the TTL block above binds no params, so the
+    // trailing `?` here is the last placeholder in `where_sql` and therefore the last param. Null
+    // (no tenancy / not tenant-owned / superuser) is a no-op → byte-identical to the prior SQL.
+    if (q.rctx) |rctx| if (try tenancy.scopePredicate(alloc, col, rctx)) |sp| {
+        where_sql = if (where_sql.len > 0)
+            try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, sp.sql })
+        else
+            sp.sql;
+        var merged: std.ArrayList(compiler.Param) = .empty;
+        defer merged.deinit(alloc); // no-op after toOwnedSlice (success); frees on an OOM error path
+        try merged.appendSlice(alloc, params);
+        try merged.append(alloc, sp.param);
+        params = try merged.toOwnedSlice(alloc);
+    };
 
     // Resolve the client sort into structured terms. Cursor mode appends an `id` tiebreaker so the
     // order is strictly total (keyset requires it); OFFSET mode keeps its historical ORDER BY

@@ -100,6 +100,20 @@ pub const WebhookHmac = @import("webhook.zig").Hmac;
 // scope (PR1 foundation; the resolver + tenant scoping land in later PRs). The `@request.account.*`
 // rule macros and the additive `in` operator read it.
 pub const Membership = @import("request.zig").Membership;
+// Tenancy (#156, PR2): the role total-order a consumer names when configuring `.tenancy.roles`,
+// and the runtime tenancy knobs / resolver enum. The tenant-scope predicate is composed
+// internally by `policy.zig`; consumers configure tenancy via `App(.{ .tenancy = .{ … } })`.
+pub const RoleRanking = @import("tenancy/roles.zig").Ranking;
+pub const TenancyResolver = @import("tenancy/tenancy.zig").Resolver;
+/// Build a cross-tenant request context (superuser/admin tooling) that suppresses tenant scoping.
+pub const crossTenant = @import("tenancy/tenancy.zig").crossTenant;
+// Abilities (#155, PR3): relationship-based row authorization configured via
+// `App(.{ .abilities = .{ .<col> = .{ .view = .{ .relationship = .{ .via, .min_role } } } } })`.
+// `policy.zig` composes the lowered predicate into the same guard stack as the access rule and
+// tenant scope; `ctx.can(.action, "col", id)` authorizes a record through that same path.
+pub const Ability = @import("authz/abilities.zig").Ability;
+pub const Abilities = @import("authz/abilities.zig").Abilities;
+pub const PolicyAction = @import("policy.zig").Action;
 
 // ---- Ctx capability object -------------------------------------------------
 pub const Ctx = @import("ctx.zig").Ctx;
@@ -185,6 +199,10 @@ test {
     _ = @import("migrations.zig");
     _ = @import("rules.zig");
     _ = @import("policy.zig");
+    _ = @import("tenancy/roles.zig");
+    _ = @import("tenancy/tenancy.zig");
+    _ = @import("authz/abilities.zig");
+    _ = @import("api/accounts.zig");
     _ = @import("crypto.zig");
     _ = @import("aead.zig");
     _ = @import("field_policy.zig");

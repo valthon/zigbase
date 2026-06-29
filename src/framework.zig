@@ -32,6 +32,9 @@ const queue_durable = @import("queue/durable.zig");
 const mail_send = @import("mail/send.zig");
 const webhook = @import("webhook.zig");
 const captcha = @import("captcha.zig");
+const tenancy = @import("tenancy/tenancy.zig");
+const roles = @import("tenancy/roles.zig");
+const abilities_mod = @import("authz/abilities.zig");
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -201,7 +204,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -522,10 +525,24 @@ pub fn App(comptime cfg: anytype) type {
         /// Relation fields carry their target collection BY NAME in `targetCollectionId`;
         /// `provision.applySpecs` resolves names -> ids at startup. When empty, no
         /// provisioning runs and the binary behaves byte-for-byte as before.
-        pub const collections: []const schema.Collection = if (@hasField(@TypeOf(cfg), "collections"))
-            provision.buildCollections(cfg.collections)
-        else
-            &.{};
+        pub const collections: []const schema.Collection = blk: {
+            const base = if (@hasField(@TypeOf(cfg), "collections")) provision.buildCollections(cfg.collections) else &[_]schema.Collection{};
+            // Lower the top-level `.abilities` config onto the matching collections' options (#155).
+            // Validates (unknown collection / non-relation `.via` / `.min_role` not in
+            // `.tenancy.roles`) with a loud `@compileError`. Absent → byte-identical to no abilities.
+            if (@hasField(@TypeOf(cfg), "abilities")) {
+                // Abilities resolve `IN (@request.account.ids …)` from the request's memberships,
+                // which only exist when tenancy is enabled. Without it every ability would lower to
+                // the constant-false predicate and silently deny ALL non-superuser access — a
+                // confusing runtime lockout. Fail loudly at comptime instead.
+                if (!tenancy_config.enabled)
+                    @compileError(".abilities requires .tenancy.enabled = true: abilities authorize by " ++
+                        "account membership, which only resolves when tenancy is enabled (otherwise every " ++
+                        "ability denies all access). Set .tenancy = .{ .enabled = true, .auth_collection = \"...\" }.");
+                break :blk abilities_mod.applyAbilities(base, cfg.abilities, role_ranking);
+            }
+            break :blk base;
+        };
 
         /// Comptime-reflected route metadata from `.routes` (empty when absent).
         /// Mirrors `App.collections`; consumed by the SP2.2b TS client generator to
@@ -710,6 +727,44 @@ pub fn App(comptime cfg: anytype) type {
             break :blk if (@hasField(CT, "secret")) cc.secret else "";
         };
 
+        /// The comptime-lowered tenancy role total-order (#156). Validates `.tenancy.roles`
+        /// (rejects empty / non-string / duplicate); defaults to `viewer<editor<admin<owner`.
+        /// PR3 (abilities) threads this into the runtime; PR2 builds it to validate at comptime.
+        pub const role_ranking: roles.Ranking = blk: {
+            if (!@hasField(@TypeOf(cfg), "tenancy")) break :blk .{};
+            const tc = cfg.tenancy;
+            if (@typeInfo(@TypeOf(tc)) != .@"struct") break :blk .{};
+            if (!@hasField(@TypeOf(tc), "roles")) break :blk .{};
+            break :blk roles.buildRanking(tc.roles);
+        };
+
+        /// The comptime-lowered runtime tenancy knobs (#156), threaded into `app.tenancy`.
+        /// Loud `@compileError` for an unknown `.tenancy` key or an unknown `.resolver`.
+        pub const tenancy_config: tenancy.Runtime = blk: {
+            if (!@hasField(@TypeOf(cfg), "tenancy")) break :blk .{};
+            const tc = cfg.tenancy;
+            const TC = @TypeOf(tc);
+            if (@typeInfo(TC) != .@"struct")
+                @compileError(".tenancy must be a struct, e.g. '.{ .enabled = true, .auth_collection = \"users\" }'");
+            for (std.meta.fields(TC)) |f| {
+                const ok = std.mem.eql(u8, f.name, "enabled") or std.mem.eql(u8, f.name, "resolver") or
+                    std.mem.eql(u8, f.name, "auth_collection") or std.mem.eql(u8, f.name, "roles");
+                if (!ok) @compileError(".tenancy: unknown key '." ++ f.name ++ "' (recognized: .enabled, .resolver, .auth_collection, .roles)");
+            }
+            var rt = tenancy.Runtime{};
+            if (@hasField(TC, "enabled")) rt.enabled = tc.enabled;
+            if (@hasField(TC, "resolver")) {
+                // Coerce loudly: an unknown literal (e.g. `.subdomain`, not yet implemented) fails
+                // here rather than silently falling back to `.header`.
+                const _coerce: tenancy.Resolver = tc.resolver;
+                rt.resolver = _coerce;
+            }
+            if (@hasField(TC, "auth_collection")) rt.auth_collection = tc.auth_collection;
+            // Force role-ranking validation (rejects an empty/duplicate/non-string `.roles`).
+            _ = role_ranking;
+            break :blk rt;
+        };
+
         /// Bundle of comptime-resolved knobs threaded into the serve path: the
         /// selected storage/mailer plugin TYPES, the auth method type list,
         /// and the reader-pool cap.
@@ -731,6 +786,8 @@ pub fn App(comptime cfg: anytype) type {
             .queues = &queue_registry,
             .captcha_provider = captcha_provider,
             .captcha_secret = captcha_secret,
+            .tenancy = tenancy_config,
+            .role_ranking = role_ranking,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -858,6 +915,12 @@ pub const ServeOpts = struct {
     /// Captcha site-verify secret (#140 PR6), threaded into `app.captcha_secret`.
     /// `""` = dev-bypass (ctx.verifyCaptcha returns .{.ok=true} without a network call).
     captcha_secret: []const u8 = "",
+    /// Multi-tenancy knobs (#156), threaded into `app.tenancy`. Default `.enabled = false` is the
+    /// byte-identical no-tenancy path.
+    tenancy: tenancy.Runtime = .{},
+    /// Role total-order (#155/#156), threaded into `app.role_ranking` for ability `.min_role`
+    /// comparisons. Default = the standard ladder (`viewer<editor<admin<owner`).
+    role_ranking: roles.Ranking = .{},
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -1449,6 +1512,8 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             .cursor_enabled = opts.pagination.cursor,
             .cursor_token = opts.pagination.cursor_token,
         },
+        .tenancy = opts.tenancy,
+        .role_ranking = opts.role_ranking,
         .storage = &storage_iface,
         .mailer = &mailer_iface,
         .auth_methods = @ptrCast(&am_registry),
@@ -1886,6 +1951,54 @@ test "App(cfg) lowers .flags/.experiments into the registry + generated enums (#
     try std.testing.expectEqual(@as(usize, 0), E.flags.len);
     try std.testing.expectEqual(@as(usize, 0), E.experiments.len);
     try std.testing.expectEqual(@as(usize, 0), std.meta.fields(E.Flag).len);
+}
+
+test "App(cfg) lowers the comptime .tenancy config (#156; defaults to disabled)" {
+    // Default: tenancy off, default header resolver, default role ladder.
+    const D = App(.{});
+    try std.testing.expect(!D.tenancy_config.enabled);
+    try std.testing.expectEqual(tenancy.Resolver.header, D.tenancy_config.resolver);
+    try std.testing.expectEqual(@as(usize, 4), D.role_ranking.roles.len);
+
+    // Explicit: enabled + auth_collection + a custom role ladder.
+    const T = App(.{ .tenancy = .{ .enabled = true, .resolver = .header, .auth_collection = "users", .roles = .{ "member", "admin" } } });
+    try std.testing.expect(T.tenancy_config.enabled);
+    try std.testing.expectEqualStrings("users", T.tenancy_config.auth_collection);
+    try std.testing.expectEqual(@as(usize, 2), T.role_ranking.roles.len);
+    try std.testing.expect(T.role_ranking.gte("admin", "member"));
+    try std.testing.expect(!T.role_ranking.gte("member", "admin"));
+}
+
+test "App(cfg) lowers the comptime .abilities config onto the matching collection (#155)" {
+    const A = App(.{
+        .tenancy = .{ .enabled = true, .auth_collection = "users", .roles = .{ "viewer", "editor", "admin", "owner" } },
+        .collections = .{
+            .accounts = .{ .fields = .{.{ .name = "name", .type = .text }} },
+            .projects = .{ .fields = .{
+                .{ .name = "title", .type = .text },
+                .{ .name = "account", .type = .relation, .target = "accounts" },
+            } },
+        },
+        .abilities = .{
+            .projects = .{
+                .view = .{ .relationship = .{ .via = "account" } },
+                .update = .{ .relationship = .{ .via = "account", .min_role = .editor } },
+            },
+        },
+    });
+    // `accounts` is untouched; `projects` carries the lowered per-action abilities.
+    for (A.collections) |c| {
+        if (std.mem.eql(u8, c.name, "accounts")) try std.testing.expect(c.options.abilities == null);
+        if (std.mem.eql(u8, c.name, "projects")) {
+            const ab = c.options.abilities.?;
+            try std.testing.expectEqualStrings("account", ab.view.?.relationship.via);
+            try std.testing.expectEqualStrings("editor", ab.update.?.relationship.min_role);
+            try std.testing.expect(ab.delete == null and ab.create == null);
+        }
+    }
+    // No `.abilities` -> no collection carries any (byte-identical to pre-abilities).
+    for (App(.{ .collections = .{ .projects = .{ .fields = .{.{ .name = "title", .type = .text }} } } }).collections) |c|
+        try std.testing.expect(c.options.abilities == null);
 }
 
 test "App(cfg) resolves the comptime session_store config (#99; defaults to .epoch)" {
