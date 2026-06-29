@@ -2348,11 +2348,15 @@ const App = zigbase.App(.{
 ```
 
 `.group_by` keys: `.account` / `.actor` (bools) and `.time_bucket` (`.none` / `.day` / `.hour`).
-`.metric` is `.count` (default). Aggregation is **incremental and idempotent**: a persisted
-watermark (in `_kv`) means each run only counts events newer than the last pass, so re-running never
-double-counts. Summary-table / column identifiers are gated through `schema.isValidIdentifier`.
-Misconfiguration fails **loudly at compile time** — an unknown `.group_by`/`.metric`, a missing or
-empty `.event`, or a rollup name that is not a valid identifier is a `@compileError`.
+`.metric` is `.count` (default). Aggregation is **incremental and idempotent**: a persisted watermark
+(in `_kv`) tracks the monotonic `_events.rowid` already aggregated, and each run aggregates the
+disjoint window `watermark < rowid <= max_rowid`. Because the watermark is the rowid (not the
+timestamp) and the job holds the exclusive writer for the pass, a run **neither double-counts nor
+drops** — even an event inserted in the same wall-clock second as a prior run still has a
+strictly-greater rowid and is counted next pass. Summary-table / column identifiers are gated through
+`schema.isValidIdentifier`. Misconfiguration fails **loudly at compile time** — an unknown
+`.group_by`/`.metric`, a missing or empty `.event`, or a rollup name that is not a valid identifier is
+a `@compileError`.
 
 **Read API (tenant-scoped, fail-closed).** Both endpoints are authenticated and never leak across
 accounts:
@@ -2364,6 +2368,11 @@ A **superuser** sees everything; a **member** sees only their active account's d
 verified `_memberships` row, the same path the records chokepoints use); with tenancy **disabled** the
 feed is scoped to the caller's own events and a (global) rollup is superuser-only. A member can never
 read another account's events or rollups.
+
+> **Visibility is account-level, not role-level.** Any *active member* of an account — whatever their
+> role — can read the **entire** account's event feed (including other members' events and payloads)
+> and all of its rollup buckets. The trust boundary is the tenant, not the role; there is deliberately
+> no intra-account role gating. Treat event payloads as readable by every member of the account.
 
 **Back-compat.** With no `.analytics` config the `_events` table is still seeded (harmless) but no
 rollup job is scheduled, and `ctx.track` works standalone.

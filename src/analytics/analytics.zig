@@ -147,29 +147,41 @@ pub fn provisionSummary(conn: *db.Db, alloc: std.mem.Allocator, name: []const u8
 }
 
 /// Run one incremental aggregation pass for `spec` on the writer `conn`. Provisions the summary
-/// table, reads the persisted watermark, aggregates `_events` rows with
-/// `watermark < occurred_at <= now` into the summary (UPSERT, `count` metric), then advances the
-/// watermark to `now`. Idempotent: a re-run with no new events is a no-op. `now` is captured from
-/// SQLite (honoring `ZIGBASE_FAKE_NOW`) so a frozen-clock e2e test is deterministic.
+/// table, then aggregates the disjoint window `watermark < rowid <= max_rowid` of this rollup's
+/// events into the summary (UPSERT, `count` metric) and advances the watermark to `max_rowid`.
+///
+/// The watermark is the monotonically-increasing `_events.rowid` — NOT the timestamp — so the
+/// boundary is exact regardless of `occurred_at` granularity: an event inserted in the same
+/// wall-clock second as a prior run still gets a strictly-greater rowid and is counted next pass
+/// (the timestamp scheme could silently DROP it). The job holds the EXCLUSIVE pool writer for the
+/// whole pass, so no row is inserted between snapshotting `max_rowid` and aggregating — the window
+/// neither double-counts nor drops. Idempotent: a re-run with no new events (max_rowid unchanged)
+/// is an exact no-op. `computed_at` is SQLite's now (honoring `ZIGBASE_FAKE_NOW`).
 pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void {
     try provisionSummary(conn, alloc, spec.name);
     const table = try summaryTable(alloc, spec.name);
 
-    // Snapshot "now" once (ISO-8601 UTC). Everything with occurred_at <= now is aggregated this
-    // pass; the watermark advances to exactly this boundary so the next pass starts strictly after.
-    const now_iso = try scalarNow(conn, alloc);
-
     const wkey = try watermarkKey(alloc, spec.name);
-    const watermark = (try kvGet(conn, alloc, wkey)) orelse "";
+    const watermark: i64 = blk: {
+        const s = (try kvGet(conn, alloc, wkey)) orelse break :blk 0;
+        break :blk std.fmt.parseInt(i64, s, 10) catch 0;
+    };
+
+    // Snapshot the current max rowid for this event name on the exclusive writer. Everything with
+    // rowid <= max_rowid is fully present; rows beyond it (none for this name) are a later pass.
+    const max_rowid = try scalarMaxRowid(conn, spec.event);
+    if (max_rowid <= watermark) return; // no new events — exact no-op (preserves idempotency)
+
+    const computed_at = try scalarNow(conn, alloc);
 
     const account_expr: []const u8 = if (spec.group_account) "\"account\"" else "''";
     const actor_expr: []const u8 = if (spec.group_actor) "\"actor\"" else "''";
 
     const sql = try std.fmt.allocPrintSentinel(alloc,
         \\INSERT INTO "{s}" ("bucket","account","actor","value","computed_at")
-        \\ SELECT {s} AS b, {s} AS a, {s} AS ac, COUNT(*) AS v, ?3
+        \\ SELECT {s} AS b, {s} AS a, {s} AS ac, COUNT(*) AS v, ?2
         \\ FROM "_events"
-        \\ WHERE "name" = ?1 AND "occurred_at" > ?2 AND "occurred_at" <= ?3
+        \\ WHERE "name" = ?1 AND "rowid" > ?3 AND "rowid" <= ?4
         \\ GROUP BY b, a, ac
         \\ ON CONFLICT("bucket","account","actor")
         \\   DO UPDATE SET "value" = "value" + excluded."value", "computed_at" = excluded."computed_at";
@@ -178,11 +190,23 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
     var st = try conn.prepare(sql);
     defer st.finalize();
     try st.bindText(1, spec.event);
-    try st.bindText(2, watermark);
-    try st.bindText(3, now_iso);
+    try st.bindText(2, computed_at);
+    try st.bindInt(3, watermark);
+    try st.bindInt(4, max_rowid);
     _ = try st.step();
 
-    try kvSet(conn, alloc, wkey, now_iso);
+    const new_mark = try std.fmt.allocPrint(alloc, "{d}", .{max_rowid});
+    try kvSet(conn, alloc, wkey, new_mark);
+}
+
+/// The current max `rowid` among `_events` rows of `event` name (0 when none), snapshotted on the
+/// writer. The monotonic high-water mark the incremental aggregation advances to.
+fn scalarMaxRowid(conn: *db.Db, event: []const u8) !i64 {
+    var st = try conn.prepare("SELECT COALESCE(MAX(\"rowid\"),0) FROM \"_events\" WHERE \"name\" = ?1;");
+    defer st.finalize();
+    try st.bindText(1, event);
+    _ = try st.step();
+    return st.columnInt(0);
 }
 
 /// Capture SQLite's current ISO-8601 UTC second (honors the dev-only frozen clock VFS).
@@ -304,6 +328,41 @@ test "runRollup aggregates incrementally and is idempotent" {
     defer v.finalize();
     _ = try v.step();
     try std.testing.expectEqual(@as(i64, 2), v.columnInt(0));
+}
+
+test "runRollup does not drop an event sharing the prior pass's wall-clock second (rowid watermark)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+
+    const spec = RollupSpec{
+        .name = "signups_daily",
+        .event = "user.signup",
+        .every = .{ .interval = .hourly },
+        .group_account = true,
+        .group_actor = false,
+        .time_bucket = .day,
+        .metric = .count,
+    };
+
+    // First event, then a pass. A SECOND event with the SAME occurred_at second is inserted AFTER
+    // the pass — under a timestamp watermark (advanced to that second, then `occurred_at > mark`)
+    // it would be silently dropped. The rowid watermark gives it a strictly-greater rowid, so the
+    // next pass counts it: total must be 2.
+    try d.exec("INSERT INTO \"_events\" (\"id\",\"created\",\"updated\",\"name\",\"payload\",\"account\",\"occurred_at\") VALUES " ++
+        "('e1','t','t','user.signup','{}','acc1','2026-01-01T08:00:00Z');");
+    try runRollup(&d, a, spec);
+    try d.exec("INSERT INTO \"_events\" (\"id\",\"created\",\"updated\",\"name\",\"payload\",\"account\",\"occurred_at\") VALUES " ++
+        "('e2','t','t','user.signup','{}','acc1','2026-01-01T08:00:00Z');");
+    try runRollup(&d, a, spec);
+
+    var v = try d.prepare("SELECT value FROM \"_rollup_signups_daily\" WHERE account='acc1';");
+    defer v.finalize();
+    _ = try v.step();
+    try std.testing.expectEqual(@as(i64, 2), v.columnInt(0)); // both events counted, none dropped
 }
 
 test "registryFromApp round-trips the type-erased pointer; byName resolves" {

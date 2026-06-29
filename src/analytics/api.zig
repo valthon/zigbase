@@ -104,6 +104,11 @@ fn emptyItems(ctx: *http.RequestCtx) !http.Response {
 }
 
 /// GET /api/analytics/events — the tenant-scoped raw activity feed.
+///
+/// VISIBILITY IS ACCOUNT-LEVEL, NOT ROLE-LEVEL: any ACTIVE member of the account (whatever their
+/// role) reads the WHOLE account's event feed — including events emitted by other actors and their
+/// payloads. This is the intended threat model (the boundary is the tenant, not the role); there is
+/// deliberately no intra-account role gating here.
 pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app orelse return ApiError.internal().toResponse(ctx.allocator);
     var reader = try app.pool.acquireReader();
@@ -158,19 +163,25 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 /// GET /api/analytics/rollups/:name — a rollup's tenant-scoped summary rows.
+///
+/// VISIBILITY IS ACCOUNT-LEVEL, NOT ROLE-LEVEL: any ACTIVE member of the account (whatever their
+/// role) reads ALL of the account's summary buckets for the rollup. Intended threat model — the
+/// boundary is the tenant, not the role; there is deliberately no intra-account role gating.
 pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app orelse return ApiError.internal().toResponse(ctx.allocator);
     const name = ctx.param("name") orelse return ApiError.notFound().toResponse(ctx.allocator);
 
-    // The rollup must be DECLARED (and `name` a safe identifier) — else 404 (no table-name oracle).
-    const reg = analytics.registryFromApp(app) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const spec = reg.byName(name) orelse return ApiError.notFound().toResponse(ctx.allocator);
-
     var reader = try app.pool.acquireReader();
     defer app.pool.releaseReader(&reader);
 
+    // AUTHENTICATE FIRST: an anonymous caller always gets 401, BEFORE the registry lookup — otherwise
+    // 404 (undeclared) vs 401 (declared) would be a name-enumeration oracle for unauthenticated users.
     const scope = (try resolveScope(ctx, app, &reader)) orelse
         return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator);
+
+    // The rollup must be DECLARED (and `name` a safe identifier) — else 404 (no table-name oracle).
+    const reg = analytics.registryFromApp(app) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const spec = reg.byName(name) orelse return ApiError.notFound().toResponse(ctx.allocator);
 
     var b = Bound{ .alloc = ctx.allocator };
     if (scope.is_superuser) {
@@ -220,10 +231,17 @@ fn wrapItems(ctx: *http.RequestCtx, items: std.json.Array) !http.Response {
 
 /// Parse the stored payload text back into a JSON value for the response; a non-JSON payload (or an
 /// empty cell) renders as JSON null rather than failing the whole feed.
+///
+/// `text` is borrowed from `sqlite3_column_text` (invalidated by the next `step()`/`finalize()`), and
+/// the events loop serializes the accumulated rows AFTER the loop — so the parsed value must own all
+/// its bytes and reference nothing in `text`. Dynamic `std.json.Value` parsing already copies every
+/// string (it uses `.alloc_always` internally), so there is no dangling reference either way; we use
+/// `parseFromSliceLeaky` straight into `alloc` (the request arena) because that is the idiomatic
+/// arena path — it allocates directly into the request arena (freed at request end) instead of
+/// spinning up a child `Parsed` arena that the old `parseFromSlice` call then leaked undeinit'd.
 fn parsePayload(alloc: std.mem.Allocator, text: []const u8) std.json.Value {
     if (text.len == 0) return .null;
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return .null;
-    return parsed.value;
+    return std.json.parseFromSliceLeaky(std.json.Value, alloc, text, .{ .allocate = .alloc_always }) catch return .null;
 }
 
 fn parseLimit(raw: ?[]const u8) usize {
@@ -254,6 +272,21 @@ test "parsePayload: valid JSON round-trips; empty/garbage -> null" {
     const v = parsePayload(a, "{\"plan\":\"pro\"}");
     try std.testing.expect(v == .object);
     try std.testing.expectEqualStrings("pro", v.object.get("plan").?.string);
+}
+
+test "parsePayload's result is independent of the source buffer (owns its bytes)" {
+    // Regression guard for the column-buffer concern (PR #164 review): `parsePayload`'s `text` is
+    // borrowed from `sqlite3_column_text` and the events loop serializes rows AFTER later step()s
+    // invalidate that buffer, so the parsed value must reference none of `text`. Mutating the source
+    // buffer right after parsing must not affect the value. (This holds because dynamic `Value` parse
+    // copies every string via `.alloc_always`; the test pins that invariant against any std change.)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const buf = try a.dupe(u8, "{\"k\":\"alpha\"}");
+    const v = parsePayload(a, buf);
+    @memset(buf, 'X'); // invalidate the source bytes, as a later step() would
+    try std.testing.expectEqualStrings("alpha", v.object.get("k").?.string);
 }
 
 test "Bound builds a parameterized WHERE and binds in order" {
@@ -366,6 +399,41 @@ test "events read is tenant-scoped: a member sees only their account's events" {
     try std.testing.expect(std.mem.indexOf(u8, res.body, "accB") == null);
 }
 
+test "events read returns distinct string payloads intact across rows (no column-buffer UAF)" {
+    var env = try TenantTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        // Two rows with DISTINCT non-empty STRING JSON payloads. The events loop accumulates `items`
+        // across step() and serializes AFTER the loop; if a payload string were parsed as a slice
+        // INTO the SQLite column buffer (std.json's default .alloc_if_needed), the first row's value
+        // would be corrupted by the second step() → UAF. `alloc_always` copies into the arena, so
+        // BOTH distinct values survive. Fails-before / passes-after the parsePayload fix.
+        try w.exec("INSERT INTO \"_events\" (id,created,updated,name,payload,actor_collection,actor,account,occurred_at) VALUES " ++
+            "('e1','t','t','user.signup','{\"k\":\"alpha\"}','users','u1','accA','2026-01-01T00:00:01Z')," ++
+            "('e2','t','t','user.signup','{\"k\":\"bravo\"}','users','u1','accA','2026-01-01T00:00:02Z');");
+    }
+    const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs };
+    const res = try events(&ctx);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+
+    // Parse the response and collect each item's payload.k — BOTH distinct values must be intact.
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, res.body, .{});
+    const items = parsed.value.object.get("items").?.array;
+    try std.testing.expectEqual(@as(usize, 2), items.items.len);
+    var saw_alpha = false;
+    var saw_bravo = false;
+    for (items.items) |it| {
+        const k = it.object.get("payload").?.object.get("k").?.string;
+        if (std.mem.eql(u8, k, "alpha")) saw_alpha = true;
+        if (std.mem.eql(u8, k, "bravo")) saw_bravo = true;
+    }
+    try std.testing.expect(saw_alpha and saw_bravo);
+}
+
 test "events read fails closed: a member who did not activate an account sees nothing" {
     var env = try TenantTestEnv.init();
     defer env.deinit();
@@ -435,4 +503,30 @@ test "rollups read 404s for an undeclared rollup name" {
     var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/ghost", .allocator = a, .app = &env.app, .authorization = env.bearer, .params = &params };
     const res = try rollups(&ctx);
     try std.testing.expectEqual(@as(u16, 404), res.status);
+}
+
+test "rollups read authenticates BEFORE the registry lookup (no name-enumeration oracle)" {
+    var env = try TenantTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+    // Two rollups: one DECLARED, one not. An ANONYMOUS caller must get 401 for BOTH — otherwise the
+    // 404 (undeclared) vs 401 (declared) split would leak which rollup names exist to the public.
+    const reg = analytics.Registry{ .rollups = &.{.{
+        .name = "signups_daily",
+        .event = "user.signup",
+        .every = .{ .interval = .hourly },
+        .group_account = true,
+        .group_actor = false,
+        .time_bucket = .day,
+        .metric = .count,
+    }} };
+    env.app.analytics = @ptrCast(&reg);
+
+    const declared = [_]http.Param{.{ .key = "name", .value = "signups_daily" }};
+    var c1 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/signups_daily", .allocator = a, .app = &env.app, .params = &declared }; // NO Authorization
+    try std.testing.expectEqual(@as(u16, 401), (try rollups(&c1)).status);
+
+    const undeclared = [_]http.Param{.{ .key = "name", .value = "ghost" }};
+    var c2 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/ghost", .allocator = a, .app = &env.app, .params = &undeclared }; // NO Authorization
+    try std.testing.expectEqual(@as(u16, 401), (try rollups(&c2)).status); // same 401 — no oracle
 }

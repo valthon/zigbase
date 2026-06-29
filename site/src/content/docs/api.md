@@ -922,7 +922,12 @@ Both endpoints are **authenticated and fail closed**. A **superuser** sees all d
 sees only their **active account's** data (resolved from a verified `_memberships` row — send
 `X-Account-Id` or activate the `zb_account` cookie). With tenancy **disabled**, the feed is scoped
 to the caller's **own** events and a (global) rollup is **superuser-only** (`403`). A member can
-never read another account's events or rollups; an anonymous request gets `401`.
+never read another account's events or rollups; an anonymous request gets `401` (the rollups handler
+authenticates **before** the rollup-name lookup, so 401-vs-404 never leaks which rollup names exist).
+
+Visibility within an account is **account-level, not role-level**: any active member of an account —
+whatever their role — reads the whole account's event feed (including other members' events and
+payloads) and all of its rollup buckets. The trust boundary is the tenant, not the role.
 
 **Events.** Filters: `name` (exact event name), `actor` (exact principal id), `since` (an ISO-8601
 lower bound on `occurred_at`), `limit` (default 50, max 200). The `actor` / `account` / `occurred_at`
