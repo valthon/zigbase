@@ -1326,26 +1326,39 @@ fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, option
     return db.Pool.initOpts(allocator, io, db_path, options);
 }
 
-/// Open the database pool, selecting the backend (#159). When `-Dpostgres=true` and
-/// `ZIGBASE_DB_URL` is a `postgres://…` URL, the Postgres pool is opened; otherwise (and ALWAYS
-/// in the default build) the SQLite `<data_dir>/data.db` pool as before. `inline` + a
-/// comptime-`if` on the Postgres gate: in the default build this folds to exactly
-/// `openPool(allocator, io, cfg, options)` (the env-read + `environ` arg drop out), so the
-/// shipped binary is byte-identical. The connection string is read from the environment at
-/// open time (NOT carried on `config.Config`, whose layout must stay byte-stable).
-inline fn openPoolSelect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions, environ: *const std.process.Environ.Map) !db.Pool {
-    if (@import("build_options").postgres) {
-        const getter = config.EnvGetter{ .environ = environ };
-        if (getter.get("ZIGBASE_DB_URL")) |u| {
-            if (db.connstrLooksLikePostgres(u)) {
-                const url = try allocator.dupeZ(u8, u);
-                defer allocator.free(url);
-                std.log.info("database backend: PostgreSQL (experimental, #159)", .{});
-                return db.Pool.initOpts(allocator, io, url, options);
-            }
-        }
+/// Open the database pool, selecting the backend (#159). When `ZIGBASE_DB_URL` is a
+/// `postgres://…` URL AND the binary was built with `-Dpostgres=true`, the Postgres pool is
+/// opened; otherwise the SQLite `<data_dir>/data.db` pool as before.
+///
+/// I-1 (fail-loud): `ZIGBASE_DB_URL` is read UNCONDITIONALLY (outside the build gate). A stock
+/// `-Dpostgres=false` binary therefore no longer *silently* ignores a `postgres://` URL and
+/// writes to local SQLite — it emits a prominent startup warning so an operator who points a
+/// non-PG binary at production Postgres sees the misdirection instead of losing writes into a
+/// `data.db`. The actual PG *selection* stays gated behind `build_options.postgres`; the SQLite
+/// data path is unchanged (the warning only fires for a `postgres://` value in a non-PG build).
+/// This is why the default build is no longer byte-for-byte identical to pre-#159 — by design;
+/// behavioral equivalence of the SQLite path is asserted by `db.chooseBackend`'s tests instead.
+fn openPoolSelect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions, environ: *const std.process.Environ.Map) !db.Pool {
+    const getter = config.EnvGetter{ .environ = environ };
+    const db_url = getter.get("ZIGBASE_DB_URL");
+    switch (db.chooseBackend(db_url)) {
+        .postgres => {
+            // Reachable only in a `-Dpostgres` build (chooseBackend gates on build_options).
+            const url = try allocator.dupeZ(u8, db_url.?);
+            defer allocator.free(url);
+            std.log.info("database backend: PostgreSQL (experimental, #159)", .{});
+            return db.Pool.initOpts(allocator, io, url, options);
+        },
+        .postgres_url_without_build => {
+            std.log.warn(
+                "ZIGBASE_DB_URL is a postgres:// URL but this binary was built without -Dpostgres; " ++
+                    "falling back to SQLite at {s}/data.db (set -Dpostgres=true to use PostgreSQL)",
+                .{cfg.data_dir},
+            );
+            return openPool(allocator, io, cfg, options);
+        },
+        .sqlite => return openPool(allocator, io, cfg, options),
     }
-    return openPool(allocator, io, cfg, options);
 }
 
 fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !void {

@@ -160,14 +160,25 @@ pub const Dialect = struct {
     }
 
     /// A boolean predicate that is TRUE when the ISO-8601 TEXT timestamp in `col` is in the past
-    /// (i.e. a TTL row has expired), comparing against the backend's current time. SQLite's
-    /// `strftime` returns NULL on a malformed value (fail-safe: the row is treated as not
-    /// expired); on Postgres a plain text comparison against `nowIso8601Expr` is used (ISO-8601
-    /// `Z` strings sort chronologically as text). `col` is a trusted, already-quoted identifier.
+    /// (i.e. a TTL row has expired), comparing against the backend's current time. `col` is a
+    /// trusted, already-quoted identifier.
+    ///
+    /// **Fail-safe (M-3):** this feeds record DELETION (TTL GC), so a MALFORMED `col` value must
+    /// be treated as NOT expired (never silently deleted). SQLite's `strftime` returns NULL on a
+    /// malformed value, so its `>` comparison is NULL → the row doesn't match → not deleted. The
+    /// Postgres arm reproduces that: a plain text `>` never yields NULL (a garbage string could
+    /// compare as "expired"), so it is GUARDED by a regex validity check on `col` — only a
+    /// well-formed `YYYY-MM-DDTHH:MM:SSZ` value is eligible; a malformed one fails the AND and is
+    /// treated as not expired. (ISO-8601 `Z` strings sort chronologically as text, so the `>` is
+    /// correct once the shape is validated.)
     pub fn ttlExpiredPredicate(self: Dialect, alloc: std.mem.Allocator, col: []const u8) ![]u8 {
         return switch (self.kind) {
             .sqlite => std.fmt.allocPrint(alloc, "strftime('%Y-%m-%dT%H:%M:%SZ','now') > {s}", .{col}),
-            .postgres => std.fmt.allocPrint(alloc, "{s} > {s}", .{ self.nowIso8601Expr(), col }),
+            .postgres => std.fmt.allocPrint(
+                alloc,
+                "({s} ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}Z$' AND {s} > {s})",
+                .{ col, self.nowIso8601Expr(), col },
+            ),
         };
     }
 };
@@ -237,4 +248,8 @@ test "dialect: cast + ttl predicate" {
     const t2 = try Dialect.postgres.ttlExpiredPredicate(a, "\"expires\"");
     defer a.free(t2);
     try std.testing.expect(std.mem.indexOf(u8, t2, "> \"expires\"") != null);
+    // M-3 fail-safe: the PG arm guards the compare with a regex validity check on col, so a
+    // malformed timestamp is treated as NOT expired (never deleted) — matching SQLite's NULL.
+    try std.testing.expect(std.mem.indexOf(u8, t2, "\"expires\" ~ '^") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t2, " AND ") != null);
 }

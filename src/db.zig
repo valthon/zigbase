@@ -261,7 +261,14 @@ pub const Pool = if (build_options.postgres) struct {
     }
     pub fn releaseReader(self: *Pool, reader: *Db) void {
         switch (self.impl) {
-            inline else => |*p, tag| p.releaseReader(&@field(reader.*, @tagName(tag))),
+            inline else => |*p, tag| {
+                // M-4: the returned reader's active union arm MUST match the pool's backend —
+                // `@field(reader.*, tag)` reads the inactive variant (UB) otherwise. A caller
+                // can only obtain a `*Db` for THIS pool from `acquireReader`/`openReader`, so a
+                // mismatch is a logic bug; assert it in safe builds.
+                std.debug.assert(std.meta.activeTag(reader.*) == tag);
+                p.releaseReader(&@field(reader.*, @tagName(tag)));
+            },
         }
     }
     pub fn openReader(self: *Pool) DbError!Db {
@@ -387,11 +394,55 @@ test "seam: connstr routing selects the backend (no live PG needed)" {
     try std.testing.expect(!connstrLooksLikePostgres(":memory:"));
     try std.testing.expect(connstrLooksLikePostgres("postgres://localhost/db"));
     try std.testing.expect(connstrLooksLikePostgres("postgresql://h:5432/db"));
+    // M-2: the scheme is matched case-insensitively, so a mixed-case PG URL is recognized
+    // (and thus routed/warned correctly) instead of falling through to a confusing SQLite open.
+    try std.testing.expect(connstrLooksLikePostgres("POSTGRES://h/db"));
+    try std.testing.expect(connstrLooksLikePostgres("PostgreSQL://h/db"));
+    // A scheme that merely starts with "postgres" but isn't exactly the PG scheme is NOT PG.
+    try std.testing.expect(!connstrLooksLikePostgres("postgresx://h/db"));
 }
 
 /// Backend-neutral connection-string classifier (mirrors the predicate `Pool.initOpts` keys on).
 /// Lives here so the routing test runs in the default build too (the real `connstr` module is
-/// Postgres-gated).
+/// Postgres-gated). The scheme is compared case-insensitively (M-2): `POSTGRES://…` is as valid
+/// a PG URL as `postgres://…`, so a mixed-case URL is recognized (and routed/warned) rather than
+/// falling through to a confusing SQLite `OpenFailed`.
 pub fn connstrLooksLikePostgres(s: []const u8) bool {
-    return std.mem.startsWith(u8, s, "postgres://") or std.mem.startsWith(u8, s, "postgresql://");
+    const sep = std.mem.indexOf(u8, s, "://") orelse return false;
+    const scheme = s[0..sep];
+    return std.ascii.eqlIgnoreCase(scheme, "postgres") or std.ascii.eqlIgnoreCase(scheme, "postgresql");
+}
+
+/// The backend a connection-string config resolves to. `postgres_url_without_build` is the
+/// fail-loud case (I-1): a `postgres://` URL in a binary built WITHOUT `-Dpostgres` — the
+/// selector logs a warning and falls back to SQLite rather than silently misdirecting writes.
+pub const BackendChoice = enum { sqlite, postgres, postgres_url_without_build };
+
+/// Classify a `ZIGBASE_DB_URL` value into the backend to use. A `postgres://` URL maps to
+/// `.postgres` only when Postgres is compiled in; otherwise to `.postgres_url_without_build`
+/// (warn + SQLite fallback). Anything else (a file path, `:memory:`, or no URL) is `.sqlite` —
+/// the default SQLite data path, unchanged.
+pub fn chooseBackend(db_url: ?[]const u8) BackendChoice {
+    if (db_url) |u| {
+        if (connstrLooksLikePostgres(u)) {
+            return if (build_options.postgres) .postgres else .postgres_url_without_build;
+        }
+    }
+    return .sqlite;
+}
+
+test "I-1: chooseBackend never silently misdirects a postgres:// URL to SQLite" {
+    // SQLite data path is unchanged: a file path / :memory: / no URL always selects SQLite.
+    try std.testing.expectEqual(BackendChoice.sqlite, chooseBackend(null));
+    try std.testing.expectEqual(BackendChoice.sqlite, chooseBackend("/var/data/data.db"));
+    try std.testing.expectEqual(BackendChoice.sqlite, chooseBackend(":memory:"));
+    // A postgres:// URL is NEVER classified as plain .sqlite — it either opens PG (pg build) or
+    // trips the loud warn-and-fallback path (non-pg build). Either way, no silent misdirection.
+    const pg_choice = chooseBackend("postgres://h:5432/db");
+    try std.testing.expect(pg_choice != .sqlite);
+    if (build_options.postgres) {
+        try std.testing.expectEqual(BackendChoice.postgres, pg_choice);
+    } else {
+        try std.testing.expectEqual(BackendChoice.postgres_url_without_build, pg_choice);
+    }
 }

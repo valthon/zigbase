@@ -11,28 +11,19 @@
 const std = @import("std");
 const db = @import("../db.zig");
 
-/// Read an environment variable via libc's `environ`.
-fn getEnv(key: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (std.c.environ[i]) |entry| : (i += 1) {
-        const e = std.mem.span(entry);
-        if (e.len > key.len and std.mem.startsWith(u8, e, key) and e[key.len] == '=')
-            return e[key.len + 1 ..];
-    }
-    return null;
-}
-
-/// The PG test URL, or null to skip (no configured/reachable server).
-fn testUrlZ(a: std.mem.Allocator) !?[:0]const u8 {
-    const url = getEnv("ZIGBASE_PG_TEST_URL") orelse return null;
-    return try a.dupeZ(u8, url);
+/// The PG test URL from `ZIGBASE_PG_TEST_URL`, or null to skip (no configured server). Read via
+/// the Zig 0.16 test runner's process environment (`std.testing.environ`, populated by the
+/// runner) using the std `Environ.getPosix` helper — no libc `std.c.environ`, no hand-rolled
+/// `key=value` parsing. The returned slice borrows the environment block (valid for the test)
+/// and is already NUL-terminated, so it feeds `Pool.init`/`openPostgres` directly.
+fn testUrlZ() ?[:0]const u8 {
+    return std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL");
 }
 
 test "seam: db.Pool routes a postgres:// target to the PG backend and round-trips through db.Db" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const url = (try testUrlZ(a)) orelse return error.SkipZigTest;
-    defer a.free(url);
+    const url = testUrlZ() orelse return error.SkipZigTest;
 
     var pool = db.Pool.init(a, io, url) catch return error.SkipZigTest;
     defer pool.deinit();
@@ -69,8 +60,7 @@ test "seam: db.Pool routes a postgres:// target to the PG backend and round-trip
 
 test "seam: transaction commit/rollback through db.Db (PG arm)" {
     const a = std.testing.allocator;
-    const url = (try testUrlZ(a)) orelse return error.SkipZigTest;
-    defer a.free(url);
+    const url = testUrlZ() orelse return error.SkipZigTest;
 
     var conn = db.Db.openPostgres(a, std.testing.io, url) catch return error.SkipZigTest;
     defer conn.close();
@@ -94,8 +84,7 @@ test "seam: transaction commit/rollback through db.Db (PG arm)" {
 test "seam: pool reader round-trips through db.Db (PG arm)" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const url = (try testUrlZ(a)) orelse return error.SkipZigTest;
-    defer a.free(url);
+    const url = testUrlZ() orelse return error.SkipZigTest;
 
     var pool = db.Pool.init(a, io, url) catch return error.SkipZigTest;
     defer pool.deinit();

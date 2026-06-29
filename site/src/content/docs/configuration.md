@@ -78,13 +78,16 @@ Running `zigbase` with no recognised command prints usage.
 
 ZigBase defaults to its embedded SQLite database (`<data-dir>/data.db`) — the single-binary
 story, and the only backend in a stock build. A **pure-Zig PostgreSQL backend** (issue #159) is
-being built behind the opt-in `-Dpostgres` build flag; it is **off by default and the default
-binary is byte-identical** (no libpq, C, or OpenSSL — TLS and SCRAM-SHA-256 use Zig `std` only).
+being built behind the opt-in `-Dpostgres` build flag; it is **off by default** and adds **no
+libpq, C, or OpenSSL** (TLS and SCRAM-SHA-256 use Zig `std` only), so the default binary stays
+fully static and OpenSSL-free, with its SQLite data path unchanged.
 
 When compiled in (`zig build -Dpostgres=true`), setting `ZIGBASE_DB_URL` to a
 `postgres://user:pass@host:port/dbname?sslmode=require` URL selects PostgreSQL at startup; any
 other value (or an unset var) keeps SQLite. The backend is chosen once, by connection string —
-"switch via configuration alone".
+"switch via configuration alone". A **stock (`-Dpostgres=false`) binary** handed a `postgres://`
+`ZIGBASE_DB_URL` does **not** silently write to local SQLite — it logs a prominent warning and
+falls back to SQLite, so a misconfigured deployment is visible rather than misdirecting data.
 
 This is **foundational scaffolding, not yet a supported deployment target**: full schema /
 query / migration / realtime parity lands in follow-up PRs. Transport is also **not yet
