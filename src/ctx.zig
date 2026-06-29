@@ -967,11 +967,25 @@ pub const MailApi = struct {
     /// (defaults to the always-present `"default"` queue).
     pub const EnqueueOpts = struct { queue: []const u8 = "default" };
 
+    /// Default `msg.account` from the request's active account scope (#154) when the caller did not
+    /// set it explicitly. This is the EXPLICIT engagement point for verified-sender + suppression
+    /// enforcement: a request operating inside an account scope automatically attributes its mail to
+    /// that account; a job/anon context (empty scope) sends as a system send. An explicit
+    /// `msg.account` always wins.
+    fn withScope(self: MailApi, msg: Message) Message {
+        if (msg.account != null) return msg;
+        if (self.ctx.rctx.account_id.len == 0) return msg;
+        var m = msg;
+        m.account = self.ctx.rctx.account_id;
+        return m;
+    }
+
     /// Validate + deliver `msg` synchronously through the configured mailer (log
     /// fallback when none is wired). Errors: `error.InvalidAddress` / `error.HeaderInjection`
-    /// / `error.EmptyBody` on a bad message, or a backend failure.
+    /// / `error.EmptyBody` on a bad message, `error.SenderNotVerified` / `error.RecipientSuppressed`
+    /// when send-time enforcement is on (#154), or a backend failure.
     pub fn send(self: MailApi, msg: Message) !void {
-        return mail_send.send(self.ctx.app, self.ctx.arena, msg);
+        return mail_send.send(self.ctx.app, self.ctx.arena, self.withScope(msg));
     }
 
     /// Validate `msg`, then enqueue it as a background `"mail"` job on `opts.queue`.
@@ -980,8 +994,15 @@ pub const MailApi = struct {
     /// enqueue means a malformed message fails fast at the call site, not later in a
     /// worker. Requires a wired queue registry (`error.QueuesUnavailable` otherwise).
     pub fn enqueue(self: MailApi, msg: Message, opts: EnqueueOpts) !void {
-        try mail_send.validate(msg);
-        return self.ctx.enqueueByName(opts.queue, "mail", msg);
+        const scoped = self.withScope(msg);
+        try mail_send.validate(scoped);
+        return self.ctx.enqueueByName(opts.queue, "mail", scoped);
+    }
+
+    /// Alias for `enqueue` reading as the intent ("deliver this later, off the request path"). The
+    /// async transactional-mail entry point (#154).
+    pub fn deliverLater(self: MailApi, msg: Message, opts: EnqueueOpts) !void {
+        return self.enqueue(msg, opts);
     }
 };
 

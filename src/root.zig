@@ -49,6 +49,12 @@ pub const CommandMailer = @import("mail/mailer.zig").CommandMailer;
 pub const SmtpTls = @import("config.zig").SmtpTls;
 // Outbound application mail (#141): `ctx.mail().send`/`.enqueue` take a `MailMessage`.
 pub const MailMessage = @import("mail/send.zig").MailMessage;
+// Email subsystem (#154): HTTP-API providers, in-memory capture (tests), template engine, config.
+pub const SesMailer = @import("mail/ses.zig").SesMailer;
+pub const PostmarkMailer = @import("mail/postmark.zig").PostmarkMailer;
+pub const CaptureMailer = @import("mail/capture.zig").CaptureMailer;
+pub const MailConfig = @import("mail/config.zig").Runtime;
+pub const mail_template = @import("mail/template.zig");
 
 // Built-in plugins (for composition / overriding only one side of the pair).
 pub const DefaultStoragePlugin = @import("framework.zig").DefaultStoragePlugin;
@@ -253,6 +259,16 @@ test {
     _ = @import("scheduler.zig");
     _ = @import("mail/mailer.zig");
     _ = @import("mail/send.zig");
+    _ = @import("mail/template.zig");
+    _ = @import("mail/sigv4.zig");
+    _ = @import("mail/ses.zig");
+    _ = @import("mail/postmark.zig");
+    _ = @import("mail/capture.zig");
+    _ = @import("mail/config.zig");
+    _ = @import("mail/senders.zig");
+    _ = @import("mail/suppression.zig");
+    _ = @import("mail/inbound.zig");
+    _ = @import("api/senders.zig");
     _ = @import("codegen/ts_type.zig");
     _ = @import("codegen/identifiers.zig");
     _ = @import("codegen/guards.zig");

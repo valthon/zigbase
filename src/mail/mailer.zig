@@ -19,6 +19,12 @@ pub const Email = struct {
     /// Optional `Reply-To` address. CRLF/control chars are rejected like the
     /// other header fields (header-injection backstop).
     reply_to: ?[]const u8 = null,
+    /// Optional per-message `From` override (#154). `null` (the default) keeps the
+    /// backend's configured sender, so existing callers are byte-for-byte unchanged.
+    /// When set, the backend uses THIS address as the envelope/header From — the seam
+    /// verified per-account sender identities ride on (a tenant sends as its own verified
+    /// address rather than the app's global From). CRLF-checked like the other fields.
+    from: ?[]const u8 = null,
 };
 
 /// Pluggable, backend-agnostic mailer. Mirrors the `Storage` vtable pattern in
@@ -198,13 +204,15 @@ pub const SmtpMailer = struct {
     /// wait for the 220 banner and EHLO; for STARTTLS the banner was already
     /// consumed on the plaintext leg and we only re-EHLO over TLS.
     fn runExchange(self: *SmtpMailer, io: std.Io, alloc: std.mem.Allocator, email: Email, conn: *Conn, comptime starttls_resumed: bool) anyerror!void {
-        // Reject control chars in the envelope BEFORE writing any command: `self.from`
+        // Per-message From override (#154) when present, else the backend's configured sender.
+        const env_from = email.from orelse self.from;
+        // Reject control chars in the envelope BEFORE writing any command: `env_from`
         // and `email.to` are interpolated into the `MAIL FROM`/`RCPT TO` command lines,
         // so a newline would let an attacker inject arbitrary SMTP commands (extra
         // RCPT TO, DATA, etc.). `email.subject` is NOT part of the envelope — it is
         // validated in buildMessage where it goes into the headers — so it is not
         // checked here.
-        try checkHeaderField(self.from);
+        try checkHeaderField(env_from);
         try checkHeaderField(email.to);
         if (!starttls_resumed) {
             // Greeting (implicit TLS and plaintext both see the banner here).
@@ -225,7 +233,7 @@ pub const SmtpMailer = struct {
         }
 
         // MAIL FROM.
-        const mail_from = try std.fmt.allocPrint(alloc, "MAIL FROM:<{s}>\r\n", .{self.from});
+        const mail_from = try std.fmt.allocPrint(alloc, "MAIL FROM:<{s}>\r\n", .{env_from});
         defer alloc.free(mail_from);
         try writeLine(conn, mail_from);
         try expectCode(conn.r, 250);
@@ -241,7 +249,7 @@ pub const SmtpMailer = struct {
         try expectCode(conn.r, 354);
 
         const now_s = std.Io.Clock.real.now(io).toSeconds();
-        const msg = try buildMessage(alloc, self.from, email, now_s);
+        const msg = try buildMessage(alloc, env_from, email, now_s);
         defer alloc.free(msg);
         try writeLine(conn, msg);
         try writeLine(conn, "\r\n.\r\n");
@@ -340,7 +348,7 @@ pub const CommandMailer = struct {
         // buildMessage validates from/to/subject against header injection, so the
         // bytes handed to the child are always a well-formed RFC822 message.
         const now_s = std.Io.Clock.real.now(io).toSeconds();
-        const msg = try buildMessage(alloc, self.from, email, now_s);
+        const msg = try buildMessage(alloc, email.from orelse self.from, email, now_s);
         defer alloc.free(msg);
 
         // Spawn → write stdin → wait, all inside a block so the `errdefer kill`
@@ -483,6 +491,14 @@ fn hasControlChar(s: []const u8) bool {
 
 fn checkHeaderField(s: []const u8) HeaderError!void {
     if (hasControlChar(s)) return error.HeaderInjection;
+}
+
+/// Public CRLF/control-char backstop for header-bound values, reused by the HTTP providers
+/// (SES/Postmark) which build their own JSON bodies instead of going through `buildMessage`.
+/// Rejects every ASCII control char (CR/LF/NUL/TAB/…) so a `from`/`to`/`subject`/`reply_to`
+/// cannot inject an extra header into a provider payload. Same rule as `buildMessage` applies.
+pub fn rejectControlChars(s: []const u8) HeaderError!void {
+    return checkHeaderField(s);
 }
 
 /// Build the RFC5322 message bytes (headers + blank line + body). Pure: no I/O,

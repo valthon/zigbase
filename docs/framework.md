@@ -595,6 +595,73 @@ rather than later inside a worker; it requires a wired queue (see
 [§7b Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs)).
 Errors: `error.InvalidAddress`, `error.HeaderInjection`, `error.EmptyBody`.
 
+#### Email subsystem (#154): templates, providers, verified senders, suppression
+
+The transactional-mail core layers on top of `ctx.mail()`. Everything below is **additive and off
+by default** — an app that only calls the existing mailer is unaffected.
+
+**Templates (`zigbase.mail_template`).** A small, safe renderer for transactional mail — no
+arbitrary code, no loops/conditionals, just variable interpolation, named partials, and a shared
+layout. Interpolation is **HTML-escaped by default** (`{{ name }}`); raw output is an explicit
+opt-in (`{{{ name }}}`). `{{> partial }}` includes a named partial; `renderInLayout` wraps a body in
+a layout (which references the child via `{{{ body }}}`). `renderHtml` escapes; `renderText` does
+not (text/plain has no markup). Render both parts and pass them as `.html` / `.text`.
+
+```zig
+const tpl = zigbase.mail_template;
+const html = try tpl.renderHtml(ctx.arena, "<p>Hi {{ name }}</p>", &.{ .{ .key = "name", .value = user_name } }, &.{});
+```
+
+**HTTP-API providers.** Two first-class backends implement the same `Mailer` vtable as SMTP, so
+call sites are provider-agnostic — select one via `App(.{ .mailer = MyMailerPlugin })`:
+
+- `zigbase.SesMailer.init(region, access_key, secret_key, from)` — Amazon SES v2 `SendEmail`,
+  AWS SigV4-signed.
+- `zigbase.PostmarkMailer.init(server_token, from)` — Postmark `/email` API.
+
+A message may set a per-message `from` (additive, `null` default) to override the backend's global
+sender — the seam verified per-account senders ride on. For tests, `zigbase.CaptureMailer` records
+messages in memory so you can assert subject/recipient/both body parts with no network.
+
+**Verified per-account sender identities.** Prove an account controls a From address before it may
+send as it. Enforcement engages **only** when you set `.mail.require_verified_sender = true` AND the
+send is account-scoped (`ctx.mail()` attributes mail to the request's active account automatically);
+a system/superuser send (no account) bypasses, so existing simple-SMTP apps never start rejecting.
+Routes (tenant-scoped, fail closed):
+
+- `POST /api/senders` `{ "email": "from@acct.com" }` — request verification (emails a single-use token).
+- `POST /api/senders/:id/verify` `{ "token": "…" }` — confirm.
+- `GET /api/senders` — list the active account's identities.
+
+A send whose From is not a verified identity for the account is **rejected** (`error.SenderNotVerified`).
+
+**Bounce/complaint suppression.** `POST /api/mail/webhooks/:provider` (`ses` | `postmark`) ingests
+delivery events. It verifies a shared-secret **HMAC-SHA256 signature with a constant-time compare**
+(`X-Signature` over `"<X-Webhook-Timestamp>.<body>"`, mirroring the outbound webhook signer); a
+wrong/missing signature is rejected (401), and with no `.mail.webhook_secret` set the route is
+disabled (404) — ingestion is opt-in. A hard bounce or complaint upserts a `_suppressions` row
+(account-scoped, or global). When `.mail.check_suppression = true`, a send to a suppressed recipient
+is **blocked** (`error.RecipientSuppressed`).
+
+```zig
+const App = zigbase.App(.{
+    .mailer = MyProviderPlugin, // SES / Postmark / SMTP
+    .mail = .{
+        .require_verified_sender = true, // tenant sends must use a verified From
+        .check_suppression = true,       // block hard-bounced / complained recipients
+        .webhook_secret = "…",           // enable the bounce/complaint webhook
+    },
+});
+```
+
+The data model: migration `0016_email` seeds two system collections — `_sender_identities(account,
+email, verified_at, verification_token, status)` (UNIQUE `(account,email)`) and
+`_suppressions(account, email, reason, source)` (UNIQUE `(account,email)`).
+
+**Deferred (planned 0.9.x fast-follows, NOT in this release):** bulk/throttled personalized list
+sends; scheduled/sequenced (drip) sends; CSS-inlining + inline-image hosting; one-click unsubscribe /
+list management. The send job + suppression + verified-sender checks are the seams those build on.
+
 ### `ctx.http()` — outbound HTTP client
 
 Returns an `HttpClient` bound to the Ctx's arena and the app's `io`:
