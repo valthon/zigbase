@@ -277,20 +277,23 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
         }
 
         // Tenancy: `.tenant_field` names the field whose column holds the owning account id for
-        // account-scoped multi-tenancy (#156). Validate at comptime that the field exists (any
-        // text-storage type is fine — it holds an account id). The runtime auto-scopes every
-        // read/write of this collection to the request's active account.
+        // account-scoped multi-tenancy (#156). Validate at comptime that the field EXISTS and is
+        // TEXT-storage — an account id is always text, bound as a text param and compared as text,
+        // so a `number`/`bool` tenant_field would fail closed silently at runtime. The runtime
+        // auto-scopes every read/write of this collection to the request's active account.
         if (@hasField(S, "tenant_field")) {
             const tf: []const u8 = spec.tenant_field;
-            var exists = false;
+            var matched: ?schema.Field = null;
             for (frozen_fields) |f| {
                 if (std.mem.eql(u8, f.name, tf)) {
-                    exists = true;
+                    matched = f;
                     break;
                 }
             }
-            if (!exists)
+            if (matched == null)
                 @compileError("collection '" ++ name ++ "': .tenant_field '" ++ tf ++ "' must name an existing field, but no such field exists");
+            if (!std.mem.eql(u8, matched.?.sqlType(), "TEXT"))
+                @compileError("collection '" ++ name ++ "': .tenant_field '" ++ tf ++ "' must name a TEXT-storage field (it holds an account id), but '" ++ tf ++ "' is ." ++ @tagName(matched.?.fieldType()));
             col.options.tenant_field = tf;
         }
 

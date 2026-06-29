@@ -56,6 +56,10 @@ pub fn buildRanking(comptime roles: anytype) Ranking {
             @compileError(".tenancy.roles must be a tuple of role-name string literals, e.g. .{ \"viewer\", \"editor\", \"admin\", \"owner\" }");
         const fields = info.@"struct".fields;
         if (fields.len == 0) @compileError(".tenancy.roles must declare at least one role");
+        // Ranks are 0-based `u8` (see `rank`/`Ranking.roles`), so the ladder may hold at most 256
+        // roles (indices 0..255). A larger ladder would make `@intCast(i)` in `rank()` trap at
+        // runtime — reject it loudly at comptime instead.
+        if (fields.len > 256) @compileError(".tenancy.roles declares too many roles (max 256)");
         var out: [fields.len][]const u8 = undefined;
         for (fields, 0..) |_, i| {
             const r: []const u8 = @field(roles, fields[i].name);
