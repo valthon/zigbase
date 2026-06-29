@@ -1983,7 +1983,9 @@ is a struct with:
 - `.type` — `.base` (default) / `.auth` / `.view` (a `schema.CollectionType`).
 - `.fields` — a **tuple** of field literals (see below).
 - `.rules` — optional `.{ .list, .view, .create, .update, .delete }` (any subset; each is a
-  filter-expression string).
+  filter-expression string; full grammar in [API → Filter grammar](./api#filter-grammar) —
+  comparisons, relation traversal, the `in` set-membership operator, and the
+  `@request.auth.*` / `@request.account.*` macros).
 
 Each field literal needs `.name` and `.type`, plus optional `.required`, `.unique`,
 `.hidden`, and type-specific options:

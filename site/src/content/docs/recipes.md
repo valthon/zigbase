@@ -282,6 +282,13 @@ A rule is one of: **Locked** (`null` or `""` — superuser only; the safe defaul
   and reads its `owner`. You can chain: `listing.simulator.owner`. (Traversal works
   through **single-value** relations; traversing a multi-value relation — `maxSelect > 1`
   — is not supported and the query is rejected.)
+- **Set membership with `in`:** `status in ("draft", "published")` matches any value in
+  a literal list, and `account in @request.account.ids` matches the caller's accounts.
+- **Account-scope macros** (multi-tenancy foundation): `@request.account.id` /
+  `@request.account.role` (single values) and `@request.account.ids` (the list macro for
+  `in`). They resolve to `""`/empty until the tenancy resolver ships, so they are
+  fail-closed and don't change existing rules. See
+  [API → Filter grammar](./api#filter-grammar).
 
 ### Edit only your own records
 
