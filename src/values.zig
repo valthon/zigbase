@@ -14,7 +14,7 @@ pub const EncryptError = error{FieldKeyMissing};
 /// (db.Db.field_cipher), or null. Returns a pointer so the whole ring is not
 /// copied per value.
 fn cipherOf(stmt: *db.Stmt) ?*const field_policy.Cipher {
-    const p = stmt.field_cipher orelse return null;
+    const p = db.stmtFieldCipher(stmt) orelse return null;
     return @ptrCast(@alignCast(p));
 }
 

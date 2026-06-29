@@ -1506,7 +1506,7 @@ test "job Ctx writes then reads a committed record and releases the conn on dein
     const id = created.object.get("id").?.string;
 
     // No reader is checked out until the first read.
-    try std.testing.expectEqual(@as(usize, 0), env.pool.reader_count);
+    try std.testing.expectEqual(@as(usize, 0), db.poolReaderCount(&env.pool));
     const found = (try cx.records().get("posts", id, .{})).?;
     try std.testing.expectEqualStrings("world", found.object.get("title").?.string);
 
@@ -1514,10 +1514,10 @@ test "job Ctx writes then reads a committed record and releases the conn on dein
     // it by deiniting explicitly here and checking the warm count, then null it so
     // the deferred deinit is a no-op.
     cx.deinit();
-    try std.testing.expectEqual(@as(usize, 1), env.pool.reader_count);
+    try std.testing.expectEqual(@as(usize, 1), db.poolReaderCount(&env.pool));
 
     // Re-acquiring reuses that exact warm connection.
     var r2 = try env.pool.acquireReader();
     defer env.pool.releaseReader(&r2);
-    try std.testing.expectEqual(@as(usize, 0), env.pool.reader_count);
+    try std.testing.expectEqual(@as(usize, 0), db.poolReaderCount(&env.pool));
 }

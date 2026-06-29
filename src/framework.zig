@@ -1326,9 +1326,31 @@ fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, option
     return db.Pool.initOpts(allocator, io, db_path, options);
 }
 
+/// Open the database pool, selecting the backend (#159). When `-Dpostgres=true` and
+/// `ZIGBASE_DB_URL` is a `postgres://…` URL, the Postgres pool is opened; otherwise (and ALWAYS
+/// in the default build) the SQLite `<data_dir>/data.db` pool as before. `inline` + a
+/// comptime-`if` on the Postgres gate: in the default build this folds to exactly
+/// `openPool(allocator, io, cfg, options)` (the env-read + `environ` arg drop out), so the
+/// shipped binary is byte-identical. The connection string is read from the environment at
+/// open time (NOT carried on `config.Config`, whose layout must stay byte-stable).
+inline fn openPoolSelect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions, environ: *const std.process.Environ.Map) !db.Pool {
+    if (@import("build_options").postgres) {
+        const getter = config.EnvGetter{ .environ = environ };
+        if (getter.get("ZIGBASE_DB_URL")) |u| {
+            if (db.connstrLooksLikePostgres(u)) {
+                const url = try allocator.dupeZ(u8, u);
+                defer allocator.free(url);
+                std.log.info("database backend: PostgreSQL (experimental, #159)", .{});
+                return db.Pool.initOpts(allocator, io, url, options);
+            }
+        }
+    }
+    return openPool(allocator, io, cfg, options);
+}
+
 fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !void {
     const cfg = try loadCfg(environ, sa);
-    var pool = try openPool(allocator, io, cfg, .{});
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
@@ -1351,7 +1373,7 @@ fn rewrapImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.proc
         std.log.err("rewrap: invalid field-encryption key config ({s}); see ZIGBASE_FIELD_KEY_GENERATION / ZIGBASE_FIELD_KEY_V<n>", .{@errorName(e)});
         return e;
     };
-    var pool = try openPool(allocator, io, cfg, .{});
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
@@ -1441,7 +1463,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     if (cfg.realtime_allowed_origins.len == 0) {
         std.log.info("realtime: no allowed Origins configured; cross-origin browser WebSocket upgrades are DENIED (set ZIGBASE_REALTIME_ORIGINS)", .{});
     }
-    var pool = try openPool(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib });
+    var pool = try openPoolSelect(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib }, environ);
     defer pool.deinit();
     // Transparent at-rest field encryption (Theme B1). Resolve the cipher ONCE from
     // ZIGBASE_FIELD_KEY and stamp it onto the pool so every acquired connection carries
@@ -1454,7 +1476,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             std.log.err("refusing to start: invalid field-encryption key config ({s}); see ZIGBASE_FIELD_KEY_GENERATION / ZIGBASE_FIELD_KEY_V<n>", .{@errorName(e)});
             return e;
         };
-        pool.field_cipher = @ptrCast(&field_cipher);
+        db.poolSetFieldCipher(&pool, @ptrCast(&field_cipher));
         if (cfg.field_key_generation != 1)
             std.log.info("field encryption: primary generation v{d} (writes); older generations read from ZIGBASE_FIELD_KEY_V<n>. Run `zigbase rewrap` to migrate old data forward.", .{cfg.field_key_generation});
     } else if (anyEncryptedField(schema_collections)) {
@@ -1500,7 +1522,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         // schema whose ciphertext can never be read. (The value layer also fails closed on
         // read/write, so plaintext never leaks; this just turns a silent half-broken server
         // into a loud startup refusal.)
-        if (pool.field_cipher == null) {
+        if (db.poolFieldCipher(&pool) == null) {
             var scan_arena = std.heap.ArenaAllocator.init(allocator);
             defer scan_arena.deinit();
             if (try liveEncryptedCollection(scan_arena.allocator(), w)) |cname| {
@@ -1679,7 +1701,7 @@ fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const
         return;
     }
     const cfg = try loadCfg(environ, .{ .data_dir = sa.data_dir });
-    var pool = try openPool(allocator, io, cfg, .{});
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();

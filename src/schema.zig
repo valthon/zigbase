@@ -1,6 +1,7 @@
 const std = @import("std");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
+const dialect = @import("sql/dialect.zig");
 
 pub const NumberMode = enum { float, int, fixed };
 
@@ -50,12 +51,26 @@ pub const Field = struct {
         return std.meta.activeTag(self.options);
     }
 
-    pub fn sqlType(self: Field) []const u8 {
+    /// The backend-independent physical storage class of this field. The single source of
+    /// truth for "is this column integer / real / text storage", consumed by the dialect's
+    /// `sqlType` (for DDL) and by the provisioner's backend-neutral type comparisons. Bool is
+    /// stored as an integer 0/1 (kept consistent across backends so access rules compare
+    /// uniformly); a float number is real; everything else (incl. int/fixed numbers, which are
+    /// bound as i64) is integer or text per below.
+    pub fn storageClass(self: Field) dialect.StorageClass {
         return switch (self.options) {
-            .@"bool" => "INTEGER",
-            .number => |n| if (n.mode == .float) "REAL" else "INTEGER",
-            else => "TEXT",
+            .@"bool" => .integer,
+            .number => |n| if (n.mode == .float) .real else .integer,
+            else => .text,
         };
+    }
+
+    /// The concrete SQLite column TYPE keyword for this field ("INTEGER"/"REAL"/"TEXT"). The
+    /// type *mapping* now lives in the dialect (`Dialect.sqlType`, keyed on `storageClass`);
+    /// this is the SQLite-pinned accessor the existing DDL/provision call sites use unchanged,
+    /// which PR-2 replaces with `dialect.sqlType(field.storageClass())` to emit Postgres types.
+    pub fn sqlType(self: Field) []const u8 {
+        return dialect.Dialect.sqlite.sqlType(self.storageClass());
     }
 
     pub fn isMultiValue(self: Field) bool {

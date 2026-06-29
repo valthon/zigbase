@@ -231,7 +231,7 @@ test "no freeze: overridden builtins pass through to real SQLite" {
     defer clock.resetForTest();
     var d = try db.Db.openMemory();
     defer d.close();
-    register(d.handle);
+    register(db.sqliteHandle(&d));
 
     // unixepoch('now') is a plausible recent wall-clock value (not frozen/zero).
     try std.testing.expect((try scalarInt(&d, "SELECT unixepoch('now')")) > 1577836800);
@@ -249,7 +249,7 @@ test "frozen: consumer SQL 'now' resolves to the frozen instant (dev build only)
     defer clock.resetForTest();
     var d = try db.Db.openMemory();
     defer d.close();
-    register(d.handle);
+    register(db.sqliteHandle(&d));
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -276,6 +276,6 @@ test "PROD GATE: a non-dev build leaves consumer SQL on the wall clock" {
     defer clock.resetForTest();
     var d = try db.Db.openMemory();
     defer d.close();
-    register(d.handle); // comptime no-op
+    register(db.sqliteHandle(&d)); // comptime no-op
     try std.testing.expect((try scalarInt(&d, "SELECT unixepoch('now')")) > 1577836800);
 }

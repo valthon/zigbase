@@ -88,7 +88,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // Fail-closed: can't create an encrypted field with no field key configured
     // (the startup guard only inspects comptime collections). Without this, an
     // encrypted field created at runtime would be unwritable / leak intent.
-    if (schema.hasEncryptedField(def) and app.pool.field_cipher == null)
+    if (schema.hasEncryptedField(def) and db.poolFieldCipher(app.pool) == null)
         return ApiError.badRequest("Encrypted fields require ZIGBASE_FIELD_KEY to be configured.").toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
@@ -119,7 +119,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
         return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
-    if (schema.hasEncryptedField(def) and app.pool.field_cipher == null)
+    if (schema.hasEncryptedField(def) and db.poolFieldCipher(app.pool) == null)
         return ApiError.badRequest("Encrypted fields require ZIGBASE_FIELD_KEY to be configured.").toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
@@ -244,7 +244,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
 
     // Configure a field key so the remaining cases reach schema validation.
     var cipher = field_policy.Cipher.fromEnv(std.testing.io, "runtime-test-field-key");
-    env.pool.field_cipher = @ptrCast(&cipher);
+    db.poolSetFieldCipher(&env.pool, @ptrCast(&cipher));
 
     // (1) .encrypted on a NON-STRING type (number) is rejected — without this fix it
     // would be SILENTLY STORED AS PLAINTEXT. Verify 400 AND that nothing was created.
