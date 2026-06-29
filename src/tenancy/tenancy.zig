@@ -124,6 +124,7 @@ pub fn resolve(
     if (user_collection.len == 0 or user_id.len == 0) return .{};
 
     var list: std.ArrayList(request.Membership) = .empty;
+    defer list.deinit(alloc); // no-op after toOwnedSlice (success); frees on an OOM error path
     var st = try conn.prepare(
         "SELECT \"account\",\"role\" FROM \"_memberships\" WHERE \"user_collection\"=?1 AND \"user\"=?2 AND \"status\"=?3;",
     );
@@ -132,7 +133,12 @@ pub fn resolve(
     try st.bindText(2, user_id);
     try st.bindText(3, active_status);
     while (try st.step()) {
-        if (list.items.len >= max_memberships) break;
+        if (list.items.len >= max_memberships) {
+            // Pathological (a principal in >max_memberships active accounts). Already fail-closed
+            // (an omitted account just under-matches `@request.account.ids`); log for diagnosis.
+            std.log.warn("tenancy: membership list truncated at {d} for user '{s}' in '{s}' — @request.account.ids may under-match", .{ max_memberships, user_id, user_collection });
+            break;
+        }
         const account = try alloc.dupe(u8, st.columnText(0));
         const role = try alloc.dupe(u8, st.columnText(1));
         try list.append(alloc, .{ .account = account, .role = role });

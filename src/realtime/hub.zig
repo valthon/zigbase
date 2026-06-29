@@ -3,6 +3,7 @@ const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const rules = @import("../rules.zig");
 const policy = @import("../policy.zig");
+const tenancy = @import("../tenancy/tenancy.zig");
 const request = @import("../request.zig");
 const collections = @import("../collections.zig");
 const records = @import("../records.zig");
@@ -46,33 +47,50 @@ pub fn shouldDeliver(
     delete_snapshot: ?std.json.Value,
 ) DeliverError!bool {
     const rctx = conn.requestContext(now);
+    // Whether the tenant scope applies to THIS subscriber on THIS collection (tenancy enabled +
+    // tenant-owned + non-superuser). When it does, delivery must be scoped to the subscriber's
+    // active account even if the viewRule alone would `allow` (e.g. `@public`) — otherwise a
+    // tenant-owned collection leaks across accounts over WebSocket. The rule-clause decision below
+    // uses the RAW rule (`rules.decide`), not the tenancy-forced `policy.decide`, so an `@public`
+    // rule never gets compiled as a guard expression — the tenant predicate is composed inside
+    // `policy.matchesRule`.
+    const scope_applies = tenancy.scopeApplies(col, &rctx);
 
     if (action == .delete) {
-        switch (policy.decide(col, .view, &rctx)) {
+        switch (rules.decide(col.viewRule, &rctx)) {
             .deny_locked => return false, // locked: superuser already short-circuited to .allow
-            .allow => {}, // @public or superuser: anyone may learn of the delete
+            .allow => {
+                // @public or superuser: anyone may learn of the delete — UNLESS the collection is
+                // tenant-scoped for this subscriber, in which case authorize the deleted row's
+                // snapshot against the tenant predicate (no rule clause). No snapshot -> deny.
+                if (!scope_applies) return true;
+                const snap = delete_snapshot orelse return false;
+                return matchesSnapshot(alloc, io, col, record_id, "", snap, &rctx) catch false;
+            },
             .check => {
                 // Owner/expression-scoped viewRule: authorize the deleted row against its
-                // snapshot. The live row is gone, so evaluate the guard in a throwaway
-                // in-memory DB holding only the snapshot. No snapshot -> conservative deny.
+                // snapshot (the live row is gone). The tenant predicate, when applicable, is
+                // composed in by `matchesSnapshot`->`policy.matchesRule`. No snapshot -> deny.
                 const snap = delete_snapshot orelse return false;
                 return matchesSnapshot(alloc, io, col, record_id, col.viewRule.?, snap, &rctx) catch false;
             },
         }
-        return true;
     }
 
     var clauses: std.ArrayList([]const u8) = .empty;
     defer clauses.deinit(alloc);
-    switch (policy.decide(col, .view, &rctx)) {
+    switch (rules.decide(col.viewRule, &rctx)) {
         .deny_locked => return false,
         .allow => {},
         .check => try clauses.append(alloc, col.viewRule.?),
     }
     if (sub_filter) |f| if (f.len > 0) try clauses.append(alloc, f);
-    if (clauses.items.len == 0) return true;
+    // Unconstrained ONLY when there is no rule/filter clause AND no tenant scope. Otherwise run a
+    // guarded query: `matchesRule` ANDs the tenant predicate in (and tolerates an empty rule, so a
+    // tenant-only constraint is evaluated even with no viewRule/filter clause).
+    if (clauses.items.len == 0 and !scope_applies) return true;
 
-    const combined = try combineClauses(alloc, clauses.items);
+    const combined = if (clauses.items.len > 0) try combineClauses(alloc, clauses.items) else "";
     return policy.matchesRule(alloc, reader, col, record_id, combined, &rctx);
 }
 
@@ -335,6 +353,68 @@ test "F4: owner-scoped delete only notifies the owner (snapshot authz)" {
     try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .delete, "GONE", null, snapshot));
     // No snapshot at all -> conservative deny, even for the would-be owner.
     try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner, 0, .delete, "GONE", null, null));
+}
+
+test "tenant scoping: a subscriber receives ONLY its account's frames; unresolved account gets nothing" {
+    // CRITICAL regression guard (#156): the realtime delivery path must apply the tenant predicate.
+    // Before the fix `Conn.requestContext` never set tenancy_enabled/account_id, so a tenant-owned
+    // `@public` collection broadcast to every subscriber — a cross-tenant leak. This test FAILS
+    // under that code and passes after the fix.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A tenant-owned collection with a NATURAL @public viewRule (the whole point of auto-scoping).
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "account", .options = .{ .text = .{} } },
+    };
+    var col = try collections.create(a, std.testing.io, &tdb.d, .{
+        .id = "", .name = "projects", .fields = &fields, .viewRule = rules.public_sentinel,
+    });
+    col.options.tenant_field = "account";
+    try tdb.d.exec("INSERT INTO projects (id,created,updated,title,account) VALUES " ++
+        "('rA','t','t','a','accA'),('rB','t','t','b','accB');");
+
+    // A subscriber whose connection is scoped to accA (tenancy_enabled + resolved account).
+    var rec: std.json.ObjectMap = .empty;
+    try rec.put(a, "id", .{ .string = "uA" });
+    var connA = Conn{ .tenancy_enabled = true, .account_id = "accA" };
+    connA.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
+
+    // create/update of accA's row -> delivered; accB's row -> NOT delivered (cross-tenant denied).
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .create, "rA", null, null));
+    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .create, "rB", null, null));
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .update, "rA", null, null));
+    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .update, "rB", null, null));
+
+    // delete uses the pre-delete snapshot: accA's snapshot delivered, accB's not.
+    var snapA: std.json.ObjectMap = .empty;
+    try snapA.put(a, "id", .{ .string = "rA" });
+    try snapA.put(a, "account", .{ .string = "accA" });
+    var snapB: std.json.ObjectMap = .empty;
+    try snapB.put(a, "id", .{ .string = "rB" });
+    try snapB.put(a, "account", .{ .string = "accB" });
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .delete, "rA", null, .{ .object = snapA }));
+    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .delete, "rB", null, .{ .object = snapB }));
+
+    // A subscriber with tenancy enabled but NO resolved account receives NOTHING on a tenant-owned
+    // collection (fail closed) — even though the viewRule is @public.
+    var connNone = Conn{ .tenancy_enabled = true, .account_id = "" };
+    connNone.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
+    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &connNone, 0, .create, "rA", null, null));
+    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &connNone, 0, .create, "rB", null, null));
+
+    // A superuser bypasses tenancy (receives both); tenancy OFF on the conn = byte-identical legacy
+    // (@public delivers all), proving the gate is the per-connection tenancy flag.
+    var su = try authedConn(a, "admin", true);
+    su.tenancy_enabled = true;
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, "rB", null, null));
+    var legacy = Conn{ .tenancy_enabled = false };
+    legacy.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &legacy, 0, .create, "rB", null, null));
 }
 
 test "expired identity is treated as anonymous" {

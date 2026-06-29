@@ -1769,6 +1769,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         else
             sp.sql;
         var merged: std.ArrayList(compiler.Param) = .empty;
+        defer merged.deinit(alloc); // no-op after toOwnedSlice (success); frees on an OOM error path
         try merged.appendSlice(alloc, params);
         try merged.append(alloc, sp.param);
         params = try merged.toOwnedSlice(alloc);

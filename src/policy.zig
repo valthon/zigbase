@@ -118,12 +118,17 @@ pub fn authorizes(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection
 /// one expression that is not a single action rule. A thin pass-through to the rules primitive so
 /// realtime authz also funnels through the policy layer (the seam PR5 composes into).
 pub fn matchesRule(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, record_id: []const u8, rule: []const u8, rctx: *const request.RequestContext) PolicyError!bool {
-    var guard = try rules.compileGuard(alloc, conn, col, rule, rctx);
+    // An EMPTY `rule` contributes no rule-clause — the realtime hub passes "" when a tenant-owned
+    // collection's viewRule is `@public`/`allow` (no expression to compile) but the tenant scope
+    // must still constrain delivery. A non-empty rule compiles to a guard as before.
+    var guard: ?Guard = if (rule.len > 0) try rules.compileGuard(alloc, conn, col, rule, rctx) else null;
     // Realtime delivery on a tenant-owned collection is scoped to the subscriber's active account
     // too (the composition funnels through this one place). Null = no-op (byte-identical to the
     // prior `rules.matches` for a non-tenant collection / no-tenancy app).
     if (try tenancy.scopePredicate(alloc, col, rctx)) |sp| guard = try andTenant(alloc, guard, sp);
-    return records.guardPasses(alloc, conn, col, record_id, guard);
+    // No rule clause AND no tenant scope => unconstrained (deliver). Otherwise run the guarded SELECT 1.
+    const g = guard orelse return true;
+    return records.guardPasses(alloc, conn, col, record_id, g);
 }
 
 // ---- Back-compat PIN tests --------------------------------------------------

@@ -67,6 +67,7 @@ fn ensureTenantIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection
         .{ col.name, tf, col.name, tf },
         0,
     );
+    defer alloc.free(sql);
     try w.exec(sql);
     std.log.info("provision: ensured tenant index on '{s}'.'{s}'", .{ col.name, tf });
 }

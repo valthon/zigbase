@@ -103,7 +103,11 @@ fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) requ
     rctx.is_superuser = a.is_superuser;
     rctx.collection = a.collection;
     // Superusers bypass tenancy (consistent with rules.decide); skip the resolution query for them.
-    if (app.tenancy.enabled and !a.is_superuser) resolveTenant(ctx, conn, app, &rctx, a) catch {};
+    // A resolution error keeps the fail-closed empty scope (request scoped to no account → tenant-
+    // owned data denies), but is logged for observability rather than silently swallowed.
+    if (app.tenancy.enabled and !a.is_superuser)
+        resolveTenant(ctx, conn, app, &rctx, a) catch |e|
+            std.log.warn("tenant resolution failed (request scoped to no account): {}", .{e});
     return rctx;
 }
 
@@ -354,6 +358,21 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
     const decision = policy.decide(col, .update, &rctx);
     if (decision == .deny_locked) return forbidden(ctx);
+
+    // Tenant pre-authorization (defense-in-depth, symmetric with delete's pre-hook authz): for a
+    // tenant-owned collection, confirm the TARGET row belongs to the active account BEFORE opening
+    // the txn / running the before_update hook, so a cross-tenant PUT never triggers hook side
+    // effects against another account's record. The in-txn `.check` guard still independently
+    // rejects a cross-tenant MOVE (changing tenant_field on a row you DO own).
+    if (app.tenancy.enabled and !rctx.is_superuser and !rctx.cross_tenant) {
+        if (col.options.tenant_field) |tf| {
+            if (rctx.account_id.len == 0) return forbidden(ctx); // no active account (mirror create)
+            const owner = if (existing == .object) existing.object.get(tf) else null;
+            const owner_id = if (owner) |o| (if (o == .string) o.string else "") else "";
+            if (!std.mem.eql(u8, owner_id, rctx.account_id))
+                return ApiError.notFound().toResponse(ctx.allocator);
+        }
+    }
 
     // A2 KEYSTONE: one transaction spanning the before-hook, the UPDATE, and the
     // access-rule guard (see create() for the errdefer/explicit-rollback rationale).
@@ -1319,4 +1338,109 @@ test "before-hook side-write rolls back with the triggering write on hook error"
     try std.testing.expectEqual(@as(u16, 400), res.status);
     try std.testing.expectEqual(@as(i64, 0), try countRows(env, "posts"));
     try std.testing.expectEqual(@as(i64, 0), try countRows(env, "audit"));
+}
+
+// ---- Tenancy: update pre-authorization (reviewer MINOR 1, #156) -------------
+
+const TenantHooks = struct {
+    var before_update_calls: usize = 0;
+    fn countBeforeUpdate(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+        _ = ctx;
+        if (ev.phase == .before_update) before_update_calls += 1;
+    }
+};
+
+test "update pre-authorizes tenant ownership BEFORE the before_update hook fires (#156)" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(dir);
+    const path = try std.fmt.allocPrintSentinel(gpa, "{s}/t.db", .{dir}, 0);
+    defer gpa.free(path);
+    var pool = try db.Pool.init(gpa, std.testing.io, path);
+    defer pool.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Schema + seed data.
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try migrations.run(w);
+        _ = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+        const users_col = (try collections.get(a, w, "users")).?;
+        var ud: std.json.ObjectMap = .empty;
+        try ud.put(a, "email", .{ .string = "u1@x.io" });
+        try ud.put(a, "password", .{ .string = "longenough" });
+        const prepared = try auth.applyCreate(std.testing.io, a, .{ .object = ud }, users_col.options.auth.minPasswordLength);
+        _ = try records.create(a, std.testing.io, w, users_col, prepared);
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "projects",
+            .fields = &[_]schema.Field{
+                .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+                .{ .id = "f2", .name = "account", .options = .{ .text = .{} } },
+            },
+            .createRule = "@public", .updateRule = "@public", .viewRule = "@public",
+            .options = .{ .tenant_field = "account" },
+        });
+        try w.exec("INSERT INTO projects (id,created,updated,title,account) VALUES ('rA','t','t','a','accA'),('rB','t','t','b','accB');");
+    }
+
+    // The user's id + tokenKey, then an active membership of u1 in accA.
+    var u_id: []const u8 = "";
+    var u_tk: []const u8 = "";
+    {
+        var r = try pool.acquireReader();
+        defer pool.releaseReader(&r);
+        var st = try r.prepare("SELECT id, tokenKey FROM users WHERE email='u1@x.io';");
+        defer st.finalize();
+        _ = try st.step();
+        u_id = try a.dupe(u8, st.columnText(0));
+        u_tk = try a.dupe(u8, st.columnText(1));
+    }
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        var ins = try w.prepare("INSERT INTO _memberships (id,created,updated,account,user_collection,user,role,status) VALUES ('m1','','','accA','users',?1,'owner','active');");
+        defer ins.finalize();
+        try ins.bindText(1, u_id);
+        _ = try ins.step();
+    }
+
+    TenantHooks.before_update_calls = 0;
+    const dispatch = events.Dispatch{ .record = events.buildRecordDispatcher(.{ .projects = .{ .beforeUpdate = TenantHooks.countBeforeUpdate } }) };
+    var app = app_mod.App{
+        .allocator = gpa, .io = std.testing.io, .pool = &pool, .dispatch = &dispatch,
+        .tenancy = .{ .enabled = true, .resolver = .header, .auth_collection = "users" },
+    };
+
+    // Mint a session token for u1.
+    var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &app };
+    const tok = blk: {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        break :blk try api_auth.mintToken(&mintctx, w, "users", u_id, u_tk, .auth, 100000, "");
+    };
+    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
+
+    // Cross-tenant PATCH (accB's row) -> 404, and the before_update hook MUST NOT have fired.
+    {
+        const params = [_]http.Param{ .{ .key = "col", .value = "projects" }, .{ .key = "id", .value = "rB" } };
+        var uctx = http.RequestCtx{ .method = .PATCH, .path = "/", .body = "{\"title\":\"hax\"}", .allocator = a, .app = &app, .params = &params, .authorization = bearer, .headers = &hdrs };
+        const res = try update(&uctx);
+        try std.testing.expectEqual(@as(u16, 404), res.status);
+        try std.testing.expectEqual(@as(usize, 0), TenantHooks.before_update_calls);
+    }
+    // In-tenant PATCH (accA's row) -> 200, and the hook DID fire (proves the probe permits legit updates).
+    {
+        const params = [_]http.Param{ .{ .key = "col", .value = "projects" }, .{ .key = "id", .value = "rA" } };
+        var uctx = http.RequestCtx{ .method = .PATCH, .path = "/", .body = "{\"title\":\"ok\"}", .allocator = a, .app = &app, .params = &params, .authorization = bearer, .headers = &hdrs };
+        const res = try update(&uctx);
+        try std.testing.expectEqual(@as(u16, 200), res.status);
+        try std.testing.expectEqual(@as(usize, 1), TenantHooks.before_update_calls);
+    }
 }

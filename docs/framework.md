@@ -2172,7 +2172,16 @@ realtime delivery via a bound `"<col>"."<tenant_field>" = ?` predicate composed 
 stack — `WHERE (filter) AND (rule) AND (tenant_field = ?) AND (ttl)`. A **locked** rule (`null`/`""`)
 still denies first (the fail-closed floor is unchanged). On **create** the owning account is
 *stamped* onto the row (clients can't spoof it); on **update** a cross-tenant move is rejected by the
-in-transaction guard. Creating in a tenant-owned collection with no active account is denied.
+in-transaction guard, and a cross-tenant *target* is rejected **before** the `before_update` hook
+runs (so hooks never fire against another account's row). Creating in a tenant-owned collection with
+no active account is denied.
+
+**Realtime is scoped too.** A WebSocket connection resolves its active account at the handshake
+(the signed `zb_account` cookie or `X-Account-Id` header) and verifies a membership at `auth`-frame
+time; delivery of a tenant-owned collection's create/update/delete frames (including the delete
+snapshot) is then filtered to the subscriber's account. With tenancy enabled, a connection with no
+resolved account receives **nothing** from a tenant-owned collection — even one with a `@public`
+viewRule — so realtime never leaks across accounts (fail closed).
 
 **Roles** form a total order (`tenancy/roles.zig`), default `viewer < editor < admin < owner`,
 configurable via `.tenancy.roles`. (PR3 consumes the ranking for ability checks.)

@@ -14,12 +14,30 @@ pub const AuthIdentity = struct {
 pub const Conn = struct {
     auth: ?AuthIdentity = null,
     subs: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// Multi-tenancy scope for this connection (#156). `tenancy_enabled` mirrors `app.tenancy.enabled`
+    /// and is set at upgrade so the realtime `RequestContext` ALWAYS carries it (fail-closed: with no
+    /// resolved account the tenant predicate binds `tenant_field = ''` → zero rows, never a leak).
+    /// `account_id`/`memberships` are the resolved active scope, filled at `auth`-frame time from a
+    /// verified `_memberships` row; both live on the connection-durable arena (persist across frames).
+    tenancy_enabled: bool = false,
+    account_id: []const u8 = "",
+    memberships: []const request.Membership = &.{},
 
     pub fn setAuth(self: *Conn, ident: AuthIdentity) void {
         self.auth = ident;
     }
     pub fn clearAuth(self: *Conn) void {
         self.auth = null;
+        // Drop the resolved account scope with the identity it belonged to (the durable-arena
+        // slices are reclaimed when the connection closes; clearing the refs is enough).
+        self.account_id = "";
+        self.memberships = &.{};
+    }
+
+    /// Store the resolved active-account scope (durable-arena slices) for this connection.
+    pub fn setTenancyScope(self: *Conn, account_id: []const u8, memberships: []const request.Membership) void {
+        self.account_id = account_id;
+        self.memberships = memberships;
     }
 
     pub fn addSub(self: *Conn, alloc: std.mem.Allocator, topic: []const u8, filter: ?[]const u8) !void {
@@ -39,13 +57,22 @@ pub const Conn = struct {
     }
 
     /// Build the access-rules context for an event at unix time `now`. An absent or expired
-    /// identity yields an anonymous context.
+    /// identity yields an anonymous context. `tenancy_enabled` is ALWAYS propagated (fail-closed),
+    /// but the resolved `account_id`/`memberships` are carried ONLY while the identity is live — an
+    /// expired token becomes anonymous with no account, so tenant-owned data fails closed (deny)
+    /// rather than leaking under a stale scope.
     pub fn requestContext(self: *const Conn, now: i64) request.RequestContext {
-        if (self.auth) |ident| {
-            if (ident.exp > now)
-                return .{ .auth = ident.record, .is_superuser = ident.is_superuser, .method = "" };
+        const live = if (self.auth) |ident| ident.exp > now else false;
+        var ctx: request.RequestContext = if (live)
+            .{ .auth = self.auth.?.record, .is_superuser = self.auth.?.is_superuser, .method = "" }
+        else
+            .{ .auth = null, .is_superuser = false, .method = "" };
+        ctx.tenancy_enabled = self.tenancy_enabled;
+        if (live) {
+            ctx.account_id = self.account_id;
+            ctx.memberships = self.memberships;
         }
-        return .{ .auth = null, .is_superuser = false, .method = "" };
+        return ctx;
     }
 };
 
