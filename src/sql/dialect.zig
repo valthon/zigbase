@@ -117,6 +117,26 @@ pub const Dialect = struct {
         };
     }
 
+    /// A constant-FALSE boolean predicate, used as the fail-closed short-circuit for an empty
+    /// `IN ()` set, an empty ability/membership set, an empty FTS search, and the keyset
+    /// never-true rung. SQLite accepts the bare integer `0` in a boolean context; **Postgres does
+    /// NOT** (`WHERE 0` → "argument of WHERE must be type boolean"), so it must spell `false`.
+    /// (The plan/corrections mis-noted `0` as portable — it is not.)
+    pub fn constFalse(self: Dialect) []const u8 {
+        return switch (self.kind) {
+            .sqlite => "0",
+            .postgres => "false",
+        };
+    }
+
+    /// A constant-TRUE boolean predicate (the dual of `constFalse`). SQLite `1`; Postgres `true`.
+    pub fn constTrue(self: Dialect) []const u8 {
+        return switch (self.kind) {
+            .sqlite => "1",
+            .postgres => "true",
+        };
+    }
+
     /// The explicit NULL-ordering suffix for an ORDER BY term. SQLite sorts NULLs FIRST for
     /// ascending and LAST for descending (and has no `NULLS` syntax, so this is ""); Postgres
     /// defaults to the OPPOSITE (NULLs LAST for ascending), so it must spell out the SQLite
@@ -281,6 +301,55 @@ pub const Dialect = struct {
                 alloc,
                 "({s} ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}Z$' AND {s} > {s})",
                 .{ col, self.nowIso8601Expr(), col },
+            ),
+        };
+    }
+
+    /// The ISO-8601 `Z` shape a TTL TEXT column must match for its `>`/`<=` text compare to be a
+    /// valid instant comparison. Used by the Postgres TTL predicates to gate the compare (a value
+    /// that doesn't match is treated fail-safe — see below). SQLite uses `strftime` normalization
+    /// instead, so this constant is Postgres-only. The braces are DOUBLED because this is spliced
+    /// into `std.fmt` format strings (where `{{`/`}}` are the literal-brace escapes).
+    const iso_z_regex = "'^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}Z$'";
+
+    /// A boolean predicate that is TRUE when a row's TTL column `col` means the row is still
+    /// VISIBLE (read-time TTL exclusion in `records.get`/`records.list`). Three fail-safe clauses,
+    /// matching the GC's semantics: a NULL TTL (no expiry) → visible; an UNPARSEABLE value → visible
+    /// (never silently hidden); a well-formed FUTURE instant → visible. `col` is a trusted,
+    /// already-quoted column expression (possibly table-qualified). SQLite normalizes both sides via
+    /// `strftime` (so offsets/space/date-only forms compare as instants); Postgres gates the text
+    /// `>` compare on the ISO-`Z` regex and treats a non-matching value as visible (`!~`).
+    pub fn ttlVisiblePredicate(self: Dialect, alloc: std.mem.Allocator, col: []const u8) ![]u8 {
+        return switch (self.kind) {
+            .sqlite => std.fmt.allocPrint(
+                alloc,
+                "{s} IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', {s}) IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', {s}) > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+                .{ col, col, col },
+            ),
+            .postgres => std.fmt.allocPrint(
+                alloc,
+                "{s} IS NULL OR {s} !~ " ++ iso_z_regex ++ " OR {s} > {s}",
+                .{ col, col, col, self.nowIso8601Expr() },
+            ),
+        };
+    }
+
+    /// A boolean predicate selecting rows whose TTL column `col` has EXPIRED, for the GC DELETE
+    /// (`records.gcExpiredRecords`). Inverse-and-fail-safe of `ttlVisiblePredicate`: a NULL TTL is
+    /// never deleted, an unparseable value is never deleted (kept), only a well-formed PAST instant
+    /// is. `col` is a trusted, already-quoted column expression. SQLite normalizes via `strftime`;
+    /// Postgres gates the `<=` compare on the ISO-`Z` regex (an unmatched value can't be expired).
+    pub fn ttlExpiredDeletePredicate(self: Dialect, alloc: std.mem.Allocator, col: []const u8) ![]u8 {
+        return switch (self.kind) {
+            .sqlite => std.fmt.allocPrint(
+                alloc,
+                "{s} IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%SZ', {s}) <= strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+                .{ col, col },
+            ),
+            .postgres => std.fmt.allocPrint(
+                alloc,
+                "{s} IS NOT NULL AND {s} ~ " ++ iso_z_regex ++ " AND {s} <= {s}",
+                .{ col, col, col, self.nowIso8601Expr() },
             ),
         };
     }

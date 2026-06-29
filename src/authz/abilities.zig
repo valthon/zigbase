@@ -22,6 +22,7 @@ const schema = @import("../schema.zig");
 const request = @import("../request.zig");
 const compiler = @import("../query/compiler.zig");
 const roles = @import("../tenancy/roles.zig");
+const Dialect = @import("../sql/dialect.zig").Dialect;
 
 /// A `min_role` sentinel that no configured role can ever equal (it embeds a NUL byte, which a
 /// role-name string literal cannot contain). Used by deserialization to FAIL CLOSED on a malformed
@@ -81,11 +82,12 @@ pub fn abilityPredicate(
     col: schema.Collection,
     ability: ?Ability,
     rctx: *const request.RequestContext,
+    dialect: Dialect,
 ) std.mem.Allocator.Error!?Predicate {
     if (!abilityApplies(ability, rctx)) return null;
     const rel = ability.?.relationship;
     if (!schema.isValidIdentifier(col.name) or !schema.isValidIdentifier(rel.via))
-        return Predicate{ .sql = "0" }; // fail closed
+        return Predicate{ .sql = dialect.constFalse() }; // fail closed
 
     const ranking = rctx.role_ranking;
     var params: std.ArrayList(compiler.Param) = .empty;
@@ -95,7 +97,7 @@ pub fn abilityPredicate(
         try params.append(alloc, .{ .text = m.account });
     }
     const n = params.items.len;
-    if (n == 0) return Predicate{ .sql = "0" }; // empty set -> constant-false, fail closed
+    if (n == 0) return Predicate{ .sql = dialect.constFalse() }; // empty set -> constant-false, fail closed
 
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" IN (", .{ col.name, rel.via }));
@@ -240,7 +242,7 @@ test "abilityPredicate: binds qualifying account ids; emits an IN predicate" {
     };
     const rctx = request.RequestContext{ .memberships = &mem };
     const ab = Ability{ .relationship = .{ .via = "account", .min_role = "editor" } };
-    const p = (try abilityPredicate(a, posts, ab, &rctx)).?;
+    const p = (try abilityPredicate(a, posts, ab, &rctx, Dialect.sqlite)).?;
     // Only acc1 (owner >= editor) qualifies; acc2 (viewer) is filtered out.
     try std.testing.expectEqualStrings("\"posts\".\"account\" IN (?)", p.sql);
     try std.testing.expectEqual(@as(usize, 1), p.params.len);
@@ -257,7 +259,7 @@ test "abilityPredicate: no min_role -> every membership qualifies" {
     const mem = [_]request.Membership{ .{ .account = "a1", .role = "viewer" }, .{ .account = "a2", .role = "viewer" } };
     const rctx = request.RequestContext{ .memberships = &mem };
     const ab = Ability{ .relationship = .{ .via = "account" } };
-    const p = (try abilityPredicate(a, posts, ab, &rctx)).?;
+    const p = (try abilityPredicate(a, posts, ab, &rctx, Dialect.sqlite)).?;
     try std.testing.expectEqualStrings("\"posts\".\"account\" IN (?,?)", p.sql);
     try std.testing.expectEqual(@as(usize, 2), p.params.len);
 }
@@ -272,7 +274,7 @@ test "abilityPredicate: empty qualifying set is constant-false (fail closed)" {
     // No memberships at all.
     {
         const rctx = request.RequestContext{};
-        const p = (try abilityPredicate(a, posts, .{ .relationship = .{ .via = "account" } }, &rctx)).?;
+        const p = (try abilityPredicate(a, posts, .{ .relationship = .{ .via = "account" } }, &rctx, Dialect.sqlite)).?;
         try std.testing.expectEqualStrings("0", p.sql);
         try std.testing.expectEqual(@as(usize, 0), p.params.len);
     }
@@ -280,7 +282,7 @@ test "abilityPredicate: empty qualifying set is constant-false (fail closed)" {
     {
         const mem = [_]request.Membership{.{ .account = "a1", .role = "viewer" }};
         const rctx = request.RequestContext{ .memberships = &mem };
-        const p = (try abilityPredicate(a, posts, .{ .relationship = .{ .via = "account", .min_role = "owner" } }, &rctx)).?;
+        const p = (try abilityPredicate(a, posts, .{ .relationship = .{ .via = "account", .min_role = "owner" } }, &rctx, Dialect.sqlite)).?;
         try std.testing.expectEqualStrings("0", p.sql);
     }
 }
@@ -293,10 +295,10 @@ test "abilityPredicate: superuser bypass -> null (no predicate)" {
     const a = arena.allocator();
     const posts = try setupPosts(a, &d);
     const rctx = request.RequestContext{ .is_superuser = true };
-    try std.testing.expect((try abilityPredicate(a, posts, .{ .relationship = .{ .via = "account" } }, &rctx)) == null);
+    try std.testing.expect((try abilityPredicate(a, posts, .{ .relationship = .{ .via = "account" } }, &rctx, Dialect.sqlite)) == null);
     // No ability rule -> null too.
     const member = request.RequestContext{};
-    try std.testing.expect((try abilityPredicate(a, posts, null, &member)) == null);
+    try std.testing.expect((try abilityPredicate(a, posts, null, &member, Dialect.sqlite)) == null);
 }
 
 test "applyAbilities: lowers config onto the matching collection's options" {

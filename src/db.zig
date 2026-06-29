@@ -372,7 +372,9 @@ pub inline fn dbBackend(d: *const Db) Backend {
 }
 
 /// The SQL `Dialect` for a live `Db` handle's backend. The schema/DDL/migration/provision layers
-/// reach the active dialect through this so the SAME code emits backend-correct SQL on both.
+/// (#169) AND the record CRUD/query `$n`/`now()`/`ILIKE`/`NULLS …` producers (#170, PR-3) reach the
+/// active dialect through this so the SAME code emits backend-correct SQL on both. Always `.sqlite`
+/// in the default build (folds to a constant; the Postgres branches are dead code).
 pub inline fn dbDialect(d: *const Db) Dialect {
     return Dialect.forKind(switch (dbBackend(d)) {
         .sqlite => .sqlite,

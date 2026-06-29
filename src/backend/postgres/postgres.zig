@@ -65,4 +65,5 @@ test {
     _ = @import("db.zig");
     _ = @import("pool.zig");
     _ = @import("tests.zig");
+    _ = @import("crud_tests.zig");
 }

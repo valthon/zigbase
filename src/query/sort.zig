@@ -1,6 +1,8 @@
 const std = @import("std");
 const joiner = @import("joiner.zig");
 const schema = @import("../schema.zig");
+const dialect_mod = @import("../sql/dialect.zig");
+const Dialect = dialect_mod.Dialect;
 
 pub const SortError = error{ BadSort } || joiner.JoinError;
 
@@ -36,24 +38,29 @@ pub fn compileTerms(alloc: std.mem.Allocator, j: *joiner.Joiner, spec: []const u
 }
 
 /// Compile a comma-separated sort spec ("-created,author.name") into an ORDER BY fragment
-/// (without the "ORDER BY" keywords), resolving relation paths via `j`. Empty -> "".
-pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, spec: []const u8) SortError![]u8 {
+/// (without the "ORDER BY" keywords), resolving relation paths via `j`. Empty -> "". `dialect`
+/// adds the explicit `NULLS FIRST/LAST` Postgres needs to match SQLite's implicit NULL placement.
+pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, spec: []const u8, dialect: Dialect) SortError![]u8 {
     const terms = try compileTerms(alloc, j, spec);
     // The SortTerm structs only borrow `col_sql`/`path` (owned by the joiner / input spec), so the
     // slice itself is the only thing compile() owns here — free it after building the string.
     defer alloc.free(terms);
-    return orderByFromTerms(alloc, terms);
+    return orderByFromTerms(alloc, terms, dialect);
 }
 
 /// Build an ORDER BY fragment string (no "ORDER BY" keywords) from resolved terms.
 /// Shared by `compile` and the keyset path, which appends an `id` tiebreaker term first.
-pub fn orderByFromTerms(alloc: std.mem.Allocator, terms: []const SortTerm) SortError![]u8 {
+/// On Postgres each term gets an explicit `NULLS FIRST/LAST` so its NULL placement matches
+/// SQLite's implicit ordering (NULLs first ascending, last descending) — critical for keyset
+/// pagination boundaries to line up across the two backends. SQLite emits no `NULLS` clause.
+pub fn orderByFromTerms(alloc: std.mem.Allocator, terms: []const SortTerm, dialect: Dialect) SortError![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     for (terms, 0..) |t, i| {
         if (i != 0) try out.appendSlice(alloc, ", ");
         try out.appendSlice(alloc, t.col_sql);
         try out.appendSlice(alloc, if (t.desc) " DESC" else " ASC");
+        try out.appendSlice(alloc, dialect.nullsOrder(if (t.desc) .desc else .asc));
     }
     return out.toOwnedSlice(alloc);
 }
@@ -72,7 +79,7 @@ test "sort compiles direction and relation paths" {
     const pf = [_]schema.Field{.{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
     const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
     var j = joiner.Joiner.init(a, &d, posts);
-    const ob = try compile(a, &j, "-created,author.name");
+    const ob = try compile(a, &j, "-created,author.name", Dialect.sqlite);
     try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, j1.\"name\" ASC", ob);
 }
 
@@ -96,7 +103,7 @@ test "compile() frees its intermediate terms slice (no leak on the testing alloc
 
     const a = std.testing.allocator;
     var j = joiner.Joiner.init(sa, &d, posts); // joiner allocations live in the arena
-    const ob = try compile(a, &j, "-created,price"); // returned string owned by `a`
+    const ob = try compile(a, &j, "-created,price", Dialect.sqlite); // returned string owned by `a`
     defer a.free(ob);
     try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, \"posts\".\"price\" ASC", ob);
     // Test teardown: std.testing.allocator panics if compile() leaked the `terms` slice.
@@ -131,7 +138,7 @@ test "compileTerms surfaces resolved col_sql, direction, and field per term" {
     try std.testing.expect(terms[1].field != null);
     try std.testing.expectEqual(schema.FieldType.number, terms[1].field.?.fieldType());
     // and the string compiler still produces the same ORDER BY it always did.
-    try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, \"posts\".\"price\" ASC", try compile(a, &j, "-created,price"));
+    try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, \"posts\".\"price\" ASC", try compile(a, &j, "-created,price", Dialect.sqlite));
 }
 
 test "sort error paths: bare sign, unknown column, empty" {
@@ -148,10 +155,10 @@ test "sort error paths: bare sign, unknown column, empty" {
 
     var j = joiner.Joiner.init(a, &d, posts);
     // A bare sign with no column is a bad sort spec.
-    try std.testing.expectError(error.BadSort, compile(a, &j, "-"));
+    try std.testing.expectError(error.BadSort, compile(a, &j, "-", Dialect.sqlite));
     // Sorting on a nonexistent column propagates from the joiner.
-    try std.testing.expectError(error.UnknownField, compile(a, &j, "nope"));
+    try std.testing.expectError(error.UnknownField, compile(a, &j, "nope", Dialect.sqlite));
     // Empty / whitespace-only spec yields an empty ORDER BY fragment.
-    try std.testing.expectEqualStrings("", try compile(a, &j, ""));
-    try std.testing.expectEqualStrings("", try compile(a, &j, "   "));
+    try std.testing.expectEqualStrings("", try compile(a, &j, "", Dialect.sqlite));
+    try std.testing.expectEqualStrings("", try compile(a, &j, "   ", Dialect.sqlite));
 }

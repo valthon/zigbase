@@ -6,31 +6,37 @@ const lexer = @import("lexer.zig");
 const joiner = @import("joiner.zig");
 const values = @import("../values.zig");
 const request = @import("../request.zig");
+const dialect_mod = @import("../sql/dialect.zig");
+const Dialect = dialect_mod.Dialect;
 
 pub const Param = union(enum) { text: []const u8, int: i64, double: f64 };
 pub const CompileError = error{ BadFilter, BadValue } || joiner.JoinError || values.ValueError;
 
 pub const Compiled = struct { where_sql: []const u8, params: []const Param };
 
-pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, rctx: ?*const request.RequestContext) CompileError!Compiled {
+/// Compile a filter/rule AST into a parameter-bound WHERE fragment. `dialect` selects the
+/// case-insensitive `LIKE` spelling (SQLite `LIKE` is ASCII-case-insensitive; Postgres needs
+/// `ILIKE` to match) — every other operator is portable. Placeholders are still emitted as the
+/// anonymous `?`; the `$n` renumber happens once at the prepare boundary (`sql/param_sink.zig`).
+pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, rctx: ?*const request.RequestContext, dialect: Dialect) CompileError!Compiled {
     var params: std.ArrayList(Param) = .empty;
-    const sql = try emit(alloc, j, node, &params, rctx);
+    const sql = try emit(alloc, j, node, &params, rctx, dialect);
     return .{ .where_sql = sql, .params = try params.toOwnedSlice(alloc) };
 }
 
-fn emit(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext) CompileError![]u8 {
+fn emit(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect) CompileError![]u8 {
     switch (node.*) {
         .logic => |lg| {
-            const l = try emit(alloc, j, lg.l, params, rctx);
-            const r = try emit(alloc, j, lg.r, params, rctx);
+            const l = try emit(alloc, j, lg.l, params, rctx, dialect);
+            const r = try emit(alloc, j, lg.r, params, rctx, dialect);
             const conj = if (lg.op == .l_and) "AND" else "OR";
             return std.fmt.allocPrint(alloc, "({s} {s} {s})", .{ l, conj, r });
         },
-        .cmp => |c| return emitCmp(alloc, j, c, params, rctx),
+        .cmp => |c| return emitCmp(alloc, j, c, params, rctx, dialect),
     }
 }
 
-fn opSql(op: lexer.TokKind) []const u8 {
+fn opSql(op: lexer.TokKind, dialect: Dialect) []const u8 {
     return switch (op) {
         .eq => "=",
         .ne => "!=",
@@ -38,8 +44,12 @@ fn opSql(op: lexer.TokKind) []const u8 {
         .ge => ">=",
         .lt => "<",
         .le => "<=",
-        .like => "LIKE",
-        .nlike => "NOT LIKE",
+        // `~`/`!~` are case-insensitive "contains" matches (the value is wrapped in `%…%` by the
+        // caller). To realize case-insensitivity on each backend: SQLite's `LIKE` is already
+        // ASCII-case-insensitive, while Postgres's `LIKE` is case-sensitive, so Postgres emits
+        // `ILIKE`/`NOT ILIKE` (SQLite keeps `LIKE`/`NOT LIKE`).
+        .like => dialect.likeOp(true),
+        .nlike => if (dialect.kind == .postgres) "NOT ILIKE" else "NOT LIKE",
         else => unreachable, // parser only produces comparison ops in a cmp node
     };
 }
@@ -85,8 +95,8 @@ fn operandToParam(field: ?schema.Field, op: parser.Operand, rctx: ?*const reques
     }
 }
 
-fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext) CompileError![]u8 {
-    if (c.op == .in) return emitIn(alloc, j, c, params, rctx);
+fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect) CompileError![]u8 {
+    if (c.op == .in) return emitIn(alloc, j, c, params, rctx, dialect);
 
     const l_col = isColPath(c.lhs);
     const r_col = isColPath(c.rhs);
@@ -94,7 +104,7 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
     if (l_col and r_col) {
         const lc = try j.resolve(c.lhs.path);
         const rc = try j.resolve(c.rhs.path);
-        return std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ lc.sql, opSql(c.op), rc.sql });
+        return std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ lc.sql, opSql(c.op, dialect), rc.sql });
     }
 
     if (l_col or r_col) {
@@ -104,11 +114,11 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
             if (!likeAllowed(col.field)) return error.BadValue;
             const term = try operandToText(val_op, rctx);
             try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{term}) });
-            return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op) });
+            return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op, dialect) });
         }
         try params.append(alloc, try operandToParam(col.field, val_op, rctx));
-        if (l_col) return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op) });
-        return std.fmt.allocPrint(alloc, "? {s} {s}", .{ opSql(c.op), col.sql });
+        if (l_col) return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op, dialect) });
+        return std.fmt.allocPrint(alloc, "? {s} {s}", .{ opSql(c.op, dialect), col.sql });
     }
 
     // neither side is a column: both are macros/literals -> bind both as text
@@ -117,11 +127,11 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
         const rt = try operandToText(c.rhs, rctx);
         try params.append(alloc, .{ .text = lt });
         try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{rt}) });
-        return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op)});
+        return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op, dialect)});
     }
     try params.append(alloc, .{ .text = try operandToText(c.lhs, rctx) });
     try params.append(alloc, .{ .text = try operandToText(c.rhs, rctx) });
-    return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op)});
+    return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op, dialect)});
 }
 
 /// Emit a set-membership predicate `<col> IN (?,?,…)`, binding each element as a parameter.
@@ -129,7 +139,7 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
 /// (`("a","b")`) or a list-valued macro (`@request.account.ids`), whose elements are read from the
 /// request context. An EMPTY list (`()` or an empty membership set) compiles to the constant-false
 /// predicate `0` — fail-closed, and avoids SQLite's `IN ()` syntax error.
-fn emitIn(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext) CompileError![]u8 {
+fn emitIn(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect) CompileError![]u8 {
     if (!isColPath(c.lhs)) return error.BadFilter; // `<literal> in (...)` is meaningless
     const col = try j.resolve(c.lhs.path);
     var n: usize = 0;
@@ -150,7 +160,7 @@ fn emitIn(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arra
         },
         else => return error.BadFilter, // parser only yields list/list_macro on the RHS of `in`
     }
-    if (n == 0) return alloc.dupe(u8, "0"); // empty set -> constant-false, fail-closed
+    if (n == 0) return alloc.dupe(u8, dialect.constFalse()); // empty set -> constant-false, fail-closed
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(alloc, col.sql);
     try buf.appendSlice(alloc, " IN (");
@@ -209,7 +219,7 @@ fn compileFilter(a: std.mem.Allocator, d: *db.Db, posts: schema.Collection, filt
     _ = posts;
     const toks = try lexer.lex(a, filter);
     const ast = try parser.parse(a, toks);
-    return compile(a, j, ast, null);
+    return compile(a, j, ast, null, Dialect.sqlite);
 }
 
 test "compile text equality binds the literal" {
@@ -357,7 +367,7 @@ test "compile a macro rule binds the auth id as a param" {
     const toks = try lexer.lex(a, "title = @request.auth.id");
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
-    const c = try compile(a, &j, ast, &rctx);
+    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite);
     try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
     try std.testing.expectEqualStrings("u1", c.params[0].text);
 }
@@ -372,7 +382,7 @@ test "compile @ path without a context errors" {
     const toks = try lexer.lex(a, "title = @request.auth.id");
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
-    try std.testing.expectError(error.BadFilter, compile(a, &j, ast, null));
+    try std.testing.expectError(error.BadFilter, compile(a, &j, ast, null, Dialect.sqlite));
 }
 
 test "compile `in` with a literal list emits placeholders and binds each element" {
@@ -416,7 +426,7 @@ test "compile `in @request.account.ids` binds each membership id" {
     const toks = try lexer.lex(a, "author in @request.account.ids");
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
-    const c = try compile(a, &j, ast, &rctx);
+    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite);
     try std.testing.expectEqualStrings("\"posts\".\"author\" IN (?,?)", c.where_sql);
     try std.testing.expectEqualStrings("acc1", c.params[0].text);
     try std.testing.expectEqualStrings("acc2", c.params[1].text);
@@ -439,7 +449,7 @@ test "compile `in` with an empty set is a constant-false predicate (fail-closed)
     const toks = try lexer.lex(a, "author in @request.account.ids");
     const ast = try parser.parse(a, toks);
     var j2 = joiner.Joiner.init(a, &d, posts);
-    const c2 = try compile(a, &j2, ast, &rctx);
+    const c2 = try compile(a, &j2, ast, &rctx, Dialect.sqlite);
     try std.testing.expectEqualStrings("0", c2.where_sql);
 }
 
@@ -457,7 +467,7 @@ test "compile a relation-path macro rule (account.owner_user = @request.auth.id)
     const toks = try lexer.lex(a, "author.name = @request.auth.id");
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
-    const c = try compile(a, &j, ast, &rctx);
+    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite);
     try std.testing.expectEqual(@as(usize, 1), j.joins.items.len);
     try std.testing.expectEqualStrings("j1.\"name\" = ?", c.where_sql);
     try std.testing.expectEqualStrings("u1", c.params[0].text);
@@ -474,7 +484,7 @@ test "compile a method-vs-literal rule binds both as text" {
     const toks = try lexer.lex(a, "@request.method = \"GET\"");
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
-    const c = try compile(a, &j, ast, &rctx);
+    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite);
     try std.testing.expectEqualStrings("? = ?", c.where_sql);
     try std.testing.expectEqualStrings("GET", c.params[0].text);
     try std.testing.expectEqualStrings("GET", c.params[1].text);

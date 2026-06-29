@@ -42,7 +42,7 @@ pub fn compileGuard(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collecti
     const toks = try lexer.lex(alloc, rule);
     const ast = try parser.parse(alloc, toks);
     var j = joiner.Joiner.init(alloc, conn, col);
-    const c = try compiler.compile(alloc, &j, ast, rctx);
+    const c = try compiler.compile(alloc, &j, ast, rctx, db.dbDialect(conn));
     return .{ .where_sql = c.where_sql, .joins = j.joins.items, .params = c.params };
 }
 
@@ -52,7 +52,8 @@ pub fn matches(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, i
     var joins: std.ArrayList(u8) = .empty;
     for (g.joins) |jn| { try joins.append(alloc, ' '); try joins.appendSlice(alloc, jn); }
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, joins.items, col.name, g.where_sql }, 0);
-    var st = try conn.prepare(sql);
+    const param_sink = @import("sql/param_sink.zig");
+    var st = try conn.prepare(try param_sink.renumberZ(alloc, db.dbDialect(conn), sql));
     defer st.finalize();
     try st.bindText(1, id);
     _ = try records.bindParams(&st, g.params, 2);
