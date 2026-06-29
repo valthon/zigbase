@@ -151,6 +151,87 @@ pub const Dialect = struct {
         };
     }
 
+    /// A SQL expression evaluating to "now" as a TEXT value suitable for INSERT/UPDATE into a
+    /// TEXT timestamp column. SQLite's `datetime('now')` is already text; Postgres's `now()` is a
+    /// `timestamptz` that has no implicit assignment cast to `text`, so it is cast explicitly. The
+    /// SQLite arm is byte-identical to the historical `datetime('now')` so existing seed rows keep
+    /// their exact format. (Used by the system + consumer migrations, which store created/updated
+    /// as TEXT for cross-backend rule consistency.)
+    pub fn nowTextExpr(self: Dialect) []const u8 {
+        return switch (self.kind) {
+            .sqlite => "datetime('now')",
+            .postgres => "now()::text",
+        };
+    }
+
+    /// The column definition for an auto-incrementing integer PRIMARY KEY (used by the
+    /// `_migrations` ledger). SQLite spells it `INTEGER PRIMARY KEY AUTOINCREMENT`; Postgres uses
+    /// an identity column. The app never supplies this id (it is auto-filled), so both forms are
+    /// write-compatible with the existing `INSERT (name, applied_at)` statements.
+    pub fn autoIncPk(self: Dialect) []const u8 {
+        return switch (self.kind) {
+            .sqlite => "INTEGER PRIMARY KEY AUTOINCREMENT",
+            .postgres => "BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY",
+        };
+    }
+
+    /// Rewrite a curated SQL statement that uses SQLite's numbered placeholders (`?1..?N`) into
+    /// the active backend's positional form. SQLite keeps `?N` (byte-identical dupe); Postgres
+    /// rewrites each `?<digits>` run to `$<digits>` (the driver binds `$n` positionally and a
+    /// repeated `?1`/`$1` reuses the same param). The result is NUL-terminated for `Db.prepare`.
+    ///
+    /// This is the focused PR-2 lowering for the schema/migration prepared statements
+    /// (`_collections` CRUD, `_migrations` ledger); the comprehensive `$n` ParamSink rework over
+    /// the whole read/query stack is PR-3. Only `?` immediately followed by a digit is rewritten,
+    /// so a bare `?` (none appear in the curated statements) is left untouched.
+    pub fn renumberPlaceholders(self: Dialect, alloc: std.mem.Allocator, sql: []const u8) ![:0]u8 {
+        if (self.kind == .sqlite) return alloc.dupeZ(u8, sql);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        var i: usize = 0;
+        while (i < sql.len) {
+            if (sql[i] == '?' and i + 1 < sql.len and std.ascii.isDigit(sql[i + 1])) {
+                try out.append(alloc, '$');
+                i += 1;
+                while (i < sql.len and std.ascii.isDigit(sql[i])) : (i += 1) try out.append(alloc, sql[i]);
+            } else {
+                try out.append(alloc, sql[i]);
+                i += 1;
+            }
+        }
+        return out.toOwnedSliceSentinel(alloc, 0);
+    }
+
+    /// Lower a curated *migration* statement written in the SQLite flavor to the active backend.
+    /// On SQLite it returns a byte-identical NUL-terminated dupe (so SQLite DDL/seeds are
+    /// unchanged); on Postgres it applies the three migration-level SQLite-isms via the dialect:
+    ///   * the `INTEGER` column-type keyword → `sqlType(.integer)` (`BIGINT`),
+    ///   * `datetime('now')` → `nowTextExpr()` (`now()::text`),
+    ///   * `INSERT OR IGNORE … ;` → `INSERT …  ON CONFLICT DO NOTHING ;`.
+    /// It deliberately does NOT touch placeholders (migrations seed with literal/bound values, not
+    /// `?N`) and is brace-safe (no `std.fmt`), so seed JSON blobs pass through verbatim. The
+    /// `INTEGER` substitution is safe for these statements because `INTEGER` never appears inside a
+    /// string literal or identifier in the system migrations (only as a column type).
+    pub fn lowerMigrationSql(self: Dialect, alloc: std.mem.Allocator, sql: []const u8) ![:0]u8 {
+        if (self.kind == .sqlite) return alloc.dupeZ(u8, sql);
+        // Intermediates are freed explicitly so the function is leak-correct for any allocator
+        // (production callers pass an arena, but the unit tests use the checked testing allocator).
+        const s1 = try std.mem.replaceOwned(u8, alloc, sql, "INTEGER", self.sqlType(.integer));
+        defer alloc.free(s1);
+        const s2 = try std.mem.replaceOwned(u8, alloc, s1, "datetime('now')", self.nowTextExpr());
+        defer alloc.free(s2);
+        if (std.mem.indexOf(u8, s2, "INSERT OR IGNORE") == null) return alloc.dupeZ(u8, s2);
+        const s3 = try std.mem.replaceOwned(u8, alloc, s2, "INSERT OR IGNORE", "INSERT");
+        defer alloc.free(s3);
+        const semi = std.mem.lastIndexOfScalar(u8, s3, ';') orelse s3.len;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, s3[0..semi]);
+        try out.appendSlice(alloc, " ON CONFLICT DO NOTHING");
+        try out.appendSlice(alloc, s3[semi..]);
+        return out.toOwnedSliceSentinel(alloc, 0);
+    }
+
     /// A `CAST(expr AS <type>)` expression. Portable across both backends; centralized here so
     /// the `<type>` keyword can diverge later (e.g. a future `jsonb` cast) without touching call
     /// sites. `type_sql` is a trusted, dialect-correct type keyword (often `sqlType(...)`).
@@ -234,6 +315,45 @@ test "dialect: collate + insert-ignore + on-conflict differ" {
     try std.testing.expectEqualStrings("INSERT", Dialect.postgres.insertVerb(true));
     try std.testing.expectEqualStrings("", Dialect.sqlite.onConflictDoNothing());
     try std.testing.expectEqualStrings(" ON CONFLICT DO NOTHING", Dialect.postgres.onConflictDoNothing());
+}
+
+test "dialect: nowTextExpr + autoIncPk keep SQLite byte-identical, diverge on PG" {
+    try std.testing.expectEqualStrings("datetime('now')", Dialect.sqlite.nowTextExpr());
+    try std.testing.expectEqualStrings("now()::text", Dialect.postgres.nowTextExpr());
+    try std.testing.expectEqualStrings("INTEGER PRIMARY KEY AUTOINCREMENT", Dialect.sqlite.autoIncPk());
+    try std.testing.expect(std.mem.indexOf(u8, Dialect.postgres.autoIncPk(), "IDENTITY") != null);
+}
+
+test "dialect: renumberPlaceholders ?N -> $N only on Postgres" {
+    const a = std.testing.allocator;
+    const tmpl = "SELECT 1 FROM t WHERE id = ?1 OR name = ?1 AND x = ?10;";
+    const s = try Dialect.sqlite.renumberPlaceholders(a, tmpl);
+    defer a.free(s);
+    try std.testing.expectEqualStrings(tmpl, s); // SQLite: byte-identical
+    const p = try Dialect.postgres.renumberPlaceholders(a, tmpl);
+    defer a.free(p);
+    try std.testing.expectEqualStrings("SELECT 1 FROM t WHERE id = $1 OR name = $1 AND x = $10;", p);
+}
+
+test "dialect: lowerMigrationSql is identity on SQLite, lowers the three isms on PG" {
+    const a = std.testing.allocator;
+    // SQLite: byte-identical (DDL + seed unchanged).
+    const ddl = "CREATE TABLE \"t\" (\"x\" INTEGER NOT NULL DEFAULT 0, \"c\" TEXT);";
+    const s = try Dialect.sqlite.lowerMigrationSql(a, ddl);
+    defer a.free(s);
+    try std.testing.expectEqualStrings(ddl, s);
+    // Postgres: INTEGER -> BIGINT.
+    const p = try Dialect.postgres.lowerMigrationSql(a, ddl);
+    defer a.free(p);
+    try std.testing.expectEqualStrings("CREATE TABLE \"t\" (\"x\" BIGINT NOT NULL DEFAULT 0, \"c\" TEXT);", p);
+    // Postgres seed: INSERT OR IGNORE + datetime('now') + brace-laden JSON pass through.
+    const seed = "INSERT OR IGNORE INTO \"c\" (\"id\",\"opt\",\"created\") VALUES ('a','{\"k\":{}}',datetime('now'));";
+    const ps = try Dialect.postgres.lowerMigrationSql(a, seed);
+    defer a.free(ps);
+    try std.testing.expectEqualStrings(
+        "INSERT INTO \"c\" (\"id\",\"opt\",\"created\") VALUES ('a','{\"k\":{}}',now()::text) ON CONFLICT DO NOTHING;",
+        ps,
+    );
 }
 
 test "dialect: cast + ttl predicate" {

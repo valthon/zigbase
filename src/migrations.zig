@@ -1,10 +1,16 @@
 const std = @import("std");
 const db = @import("db.zig");
+const Migrator = @import("migrator.zig").Migrator;
 
-pub const Migration = struct { name: []const u8, up: *const fn (w: *db.Db) db.DbError!void };
+/// A system migration. `up` receives a `*Migrator` carrying the active SQL `Dialect`, so the SAME
+/// migration code emits backend-correct SQL on SQLite and Postgres (#159, PR-2). Bodies use
+/// `m.execLowered(sql)` — curated SQLite-flavor SQL the dialect lowers (INTEGER→BIGINT,
+/// datetime('now')→a text now, INSERT OR IGNORE→ON CONFLICT DO NOTHING) on Postgres while leaving
+/// SQLite byte-identical.
+pub const Migration = struct { name: []const u8, up: *const fn (m: *Migrator) db.DbError!void };
 
-fn init_0001(w: *db.Db) db.DbError!void {
-    try w.exec(
+fn init_0001(m: *Migrator) db.DbError!void {
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_collections" (
         \\  "id" TEXT PRIMARY KEY, "name" TEXT UNIQUE NOT NULL, "type" TEXT NOT NULL DEFAULT 'base',
         \\  "system" INTEGER NOT NULL DEFAULT 0, "schema" TEXT NOT NULL DEFAULT '[]',
@@ -15,17 +21,17 @@ fn init_0001(w: *db.Db) db.DbError!void {
     );
 }
 
-fn init_0002(w: *db.Db) db.DbError!void {
+fn init_0002(m: *Migrator) db.DbError!void {
     // add the options column (ignore the duplicate-column error if somehow re-run)
-    w.exec("ALTER TABLE \"_collections\" ADD COLUMN \"options\" TEXT NOT NULL DEFAULT '{}';") catch {};
+    m.execLowered("ALTER TABLE \"_collections\" ADD COLUMN \"options\" TEXT NOT NULL DEFAULT '{}';") catch {};
     // _superusers system auth collection: its physical table + its _collections row
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_superusers" (
         \\  "id" TEXT PRIMARY KEY, "created" TEXT, "updated" TEXT,
         \\  "email" TEXT UNIQUE, "username" TEXT, "passwordHash" TEXT, "tokenKey" TEXT, "verified" INTEGER
         \\);
     );
-    try w.exec(
+    try m.execLowered(
         \\INSERT OR IGNORE INTO "_collections"
         \\  ("id","name","type","system","schema","indexes","options","listRule","viewRule","createRule","updateRule","deleteRule","created","updated")
         \\ VALUES ('_superusers_____','_superusers','auth',1,'[]','[]',
@@ -34,80 +40,80 @@ fn init_0002(w: *db.Db) db.DbError!void {
     );
 }
 
-fn init_0003(w: *db.Db) db.DbError!void {
-    try w.exec(
+fn init_0003(m: *Migrator) db.DbError!void {
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_externalAuths" (
         \\  "id" TEXT PRIMARY KEY, "collectionRef" TEXT NOT NULL, "recordRef" TEXT NOT NULL,
         \\  "provider" TEXT NOT NULL, "providerId" TEXT NOT NULL,
         \\  "created" TEXT NOT NULL, "updated" TEXT NOT NULL
         \\);
     );
-    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_extauth_provider_pid\" ON \"_externalAuths\" (\"provider\",\"providerId\");");
-    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_extauth_rec_provider\" ON \"_externalAuths\" (\"collectionRef\",\"recordRef\",\"provider\");");
+    try m.execLowered("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_extauth_provider_pid\" ON \"_externalAuths\" (\"provider\",\"providerId\");");
+    try m.execLowered("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_extauth_rec_provider\" ON \"_externalAuths\" (\"collectionRef\",\"recordRef\",\"provider\");");
 }
 
-fn init_0004(w: *db.Db) db.DbError!void {
+fn init_0004(m: *Migrator) db.DbError!void {
     // Single-use ledger for verification / password-reset tokens (F7). A token's
     // random "jti" claim is recorded here on first redemption; a UNIQUE primary key
     // makes a second redemption fail atomically under the writer lock, independent of
     // any tokenKey-rotation side effect. "expires" is the token's own exp (unix secs)
     // so a sweeper can prune entries once the token could no longer verify anyway.
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_consumedTokens" (
         \\  "jti" TEXT PRIMARY KEY, "expires" INTEGER NOT NULL, "consumed" TEXT NOT NULL
         \\);
     );
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_consumed_expires\" ON \"_consumedTokens\" (\"expires\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_consumed_expires\" ON \"_consumedTokens\" (\"expires\");");
 }
 
-fn init_0005(w: *db.Db) db.DbError!void {
+fn init_0005(m: *Migrator) db.DbError!void {
     // Optional server-side OAuth `state` store (F11). When server-side CSRF protection
     // is enabled, auth-init mints a random state here; the callback verifies and deletes
     // it (single-use). "expires" is a unix-seconds TTL; a missing/mismatched/expired/reused
     // state is rejected. Unused when server-side state is disabled (client-driven flow).
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_oauthStates" (
         \\  "state" TEXT PRIMARY KEY, "collectionRef" TEXT NOT NULL, "provider" TEXT NOT NULL,
         \\  "expires" INTEGER NOT NULL, "created" TEXT NOT NULL
         \\);
     );
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_oauthstate_expires\" ON \"_oauthStates\" (\"expires\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_oauthstate_expires\" ON \"_oauthStates\" (\"expires\");");
 }
 
-fn init_0006(w: *db.Db) db.DbError!void {
+fn init_0006(m: *Migrator) db.DbError!void {
     // Server-side keyset-cursor state store for the STATEFUL token format
     // (App(.{ .pagination = .{ .cursor_token = .stateful } })). A minted cursor stores its
     // opaque keyset payload here keyed by a random "id"; the client receives only the id.
     // On use the payload is looked up (if unexpired) and decoded. "expires" is a unix-seconds
     // TTL; a periodic GC (records.gcCursorStates) prunes expired rows, and an index on
     // "expires" keeps that sweep cheap. Unused entirely in the stateless/signed modes.
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_cursorStates" (
         \\  "id" TEXT PRIMARY KEY, "collectionRef" TEXT NOT NULL, "payload" TEXT NOT NULL,
         \\  "expires" INTEGER NOT NULL, "created" TEXT NOT NULL
         \\);
     );
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_cursorstate_expires\" ON \"_cursorStates\" (\"expires\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_cursorstate_expires\" ON \"_cursorStates\" (\"expires\");");
 }
 
-fn init_0007(w: *db.Db) db.DbError!void {
+fn init_0007(m: *Migrator) db.DbError!void {
     // Server-side challenge store for pluggable auth methods (OTP, magic-link, FIDO2, etc.).
     // A challenge is minted by `put`, returned to the client as an opaque id (or embedded in
     // a URL), and redeemed exactly once by `take`/`takeByIdentity`. "consumed" tracks
     // single-use semantics atomically under the writer lock; "expires" is a unix-seconds TTL.
     // A periodic GC (auth/challenge_store.gcAuthChallenges) prunes consumed/expired rows.
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_authChallenges" (
         \\  "id" TEXT PRIMARY KEY, "collectionRef" TEXT NOT NULL, "method" TEXT NOT NULL,
         \\  "identity" TEXT NOT NULL, "payload" TEXT NOT NULL, "expires" INTEGER NOT NULL,
         \\  "consumed" INTEGER NOT NULL DEFAULT 0, "created" TEXT NOT NULL
         \\);
     );
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_authchallenge_expires\" ON \"_authChallenges\" (\"expires\");");
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_authchallenge_lookup\" ON \"_authChallenges\" (\"collectionRef\",\"method\",\"identity\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_authchallenge_expires\" ON \"_authChallenges\" (\"expires\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_authchallenge_lookup\" ON \"_authChallenges\" (\"collectionRef\",\"method\",\"identity\");");
 }
 
-fn init_0008(w: *db.Db) db.DbError!void {
+fn init_0008(m: *Migrator) db.DbError!void {
     // Per-credential WebAuthn store. One row per registered authenticator credential.
     // "credentialId" is the base64url of the raw credential id bytes returned by the
     // authenticator; it is the lookup key on every assertion and must be globally unique.
@@ -115,7 +121,7 @@ fn init_0008(w: *db.Db) db.DbError!void {
     // signatures. "signCount" is updated after every successful assertion (clone detection).
     // "alg" is the COSE algorithm id (e.g. -7 for ES256). "aaguid" / "transports" are
     // RECOMMENDED for passkey UX but optional; they default to empty string.
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_webauthnCredentials" (
         \\  "id" TEXT PRIMARY KEY,
         \\  "collectionRef" TEXT NOT NULL,
@@ -130,10 +136,10 @@ fn init_0008(w: *db.Db) db.DbError!void {
         \\  "updated" TEXT NOT NULL
         \\);
     );
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_webauthncred_record\" ON \"_webauthnCredentials\" (\"collectionRef\",\"recordRef\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_webauthncred_record\" ON \"_webauthnCredentials\" (\"collectionRef\",\"recordRef\");");
 }
 
-fn init_0009_kv(w: *db.Db) db.DbError!void {
+fn init_0009_kv(m: *Migrator) db.DbError!void {
     // Built-in key→value/settings store (#87). A single internal table holding small,
     // mutable, superuser-managed values keyed by an arbitrary string: feature flags
     // (#88, a typed bool view over this same store), maintenance toggles, cached
@@ -141,7 +147,7 @@ fn init_0009_kv(w: *db.Db) db.DbError!void {
     // `_collections` row, so it is invisible to the record API, query engine, and
     // access-rule system — settings stay superuser-only by default. "created"/"updated"
     // are ISO-8601 datetimes; an upsert preserves "created" and bumps "updated".
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_kv" (
         \\  "key" TEXT PRIMARY KEY,
         \\  "value" TEXT NOT NULL,
@@ -151,26 +157,29 @@ fn init_0009_kv(w: *db.Db) db.DbError!void {
     );
 }
 
-fn init_0010_token_epoch(w: *db.Db) db.DbError!void {
+fn init_0010_token_epoch(m: *Migrator) db.DbError!void {
     // Session epoch column for Variant A revocation (#99). A per-auth-record integer,
     // default 0, embedded in issued `.auth` tokens; "revoke all sessions" bumps it so
     // every outstanding token for the principal stops verifying. Added here for tables
     // that predate the `token_epoch` auth system field (fresh auth collections get the
     // column from `schema.authSystemFields()` at create time). `NOT NULL DEFAULT 0` so
     // existing rows + omitted inserts read as epoch 0, matching the default JWT claim.
-    w.exec("ALTER TABLE \"_superusers\" ADD COLUMN \"token_epoch\" INTEGER NOT NULL DEFAULT 0;") catch {};
+    // `execLowered` maps the INTEGER type keyword to the backend (BIGINT on Postgres).
+    m.execLowered("ALTER TABLE \"_superusers\" ADD COLUMN \"token_epoch\" INTEGER NOT NULL DEFAULT 0;") catch {};
 
     // Collect user auth-collection names FIRST: an ALTER TABLE bumps SQLite's schema
     // version and invalidates any open statement, so we cannot ALTER while iterating the
     // _collections cursor. page_allocator (one-shot, startup) keeps this dependency-free.
     const a = std.heap.page_allocator;
+    const int_ty = m.dialect.sqlType(.integer);
     var names: std.ArrayList([]u8) = .empty;
     defer {
         for (names.items) |n| a.free(n);
         names.deinit(a);
     }
     {
-        var st = try w.prepare("SELECT \"name\" FROM \"_collections\" WHERE \"type\"='auth' AND \"name\" != '_superusers';");
+        // No placeholders → portable across backends; prepare directly.
+        var st = try m.db.prepare("SELECT \"name\" FROM \"_collections\" WHERE \"type\"='auth' AND \"name\" != '_superusers';");
         defer st.finalize();
         while (try st.step()) {
             const nm = a.dupe(u8, st.columnText(0)) catch return error.ExecFailed;
@@ -184,10 +193,11 @@ fn init_0010_token_epoch(w: *db.Db) db.DbError!void {
         if (!isSafeIdent(nm)) continue; // defensive: never interpolate an unvalidated name
         // Allocate the ALTER (no fixed buffer) so a long-but-valid collection name is never
         // stranded without the column — `schema.isValidIdentifier` has no length cap, so a
-        // 251+ char name passes creation and MUST also be migrated here.
-        const sql = std.fmt.allocPrintSentinel(a, "ALTER TABLE \"{s}\" ADD COLUMN \"token_epoch\" INTEGER NOT NULL DEFAULT 0;", .{nm}, 0) catch return error.ExecFailed;
+        // 251+ char name passes creation and MUST also be migrated here. The column type comes
+        // from the dialect (BIGINT on Postgres, INTEGER on SQLite).
+        const sql = std.fmt.allocPrintSentinel(a, "ALTER TABLE \"{s}\" ADD COLUMN \"token_epoch\" {s} NOT NULL DEFAULT 0;", .{ nm, int_ty }, 0) catch return error.ExecFailed;
         defer a.free(sql);
-        w.exec(sql) catch {}; // ignore "duplicate column" when the column already exists
+        m.db.exec(sql) catch {}; // ignore "duplicate column" when the column already exists
     }
 }
 
@@ -202,7 +212,7 @@ fn isSafeIdent(s: []const u8) bool {
     return true;
 }
 
-fn init_0011_sessions(w: *db.Db) db.DbError!void {
+fn init_0011_sessions(m: *Migrator) db.DbError!void {
     // Variant B session store (#99), populated only when App(.{ .session_store = .table }).
     // One row per issued session enables per-device listActiveSessions()/revoke(sessionId)
     // on top of revoke-all. In the default `.epoch` mode this table is created but stays empty
@@ -210,7 +220,7 @@ fn init_0011_sessions(w: *db.Db) db.DbError!void {
     // recordRef) — the auth collection NAME + record id, matching `_externalAuths`. `expires`
     // is nullable (NULL = no expiry); verify accepts `expires IS NULL OR expires > now`.
     // Revocation DELETEs the row. `lastSeen`/`userAgent`/`ip` feed the per-device UI.
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_sessions" (
         \\  "id" TEXT PRIMARY KEY,
         \\  "collectionRef" TEXT NOT NULL,
@@ -222,11 +232,11 @@ fn init_0011_sessions(w: *db.Db) db.DbError!void {
         \\  "ip" TEXT NOT NULL DEFAULT ''
         \\);
     );
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_sessions_owner\" ON \"_sessions\" (\"collectionRef\",\"recordRef\");");
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_sessions_expires\" ON \"_sessions\" (\"expires\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_sessions_owner\" ON \"_sessions\" (\"collectionRef\",\"recordRef\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_sessions_expires\" ON \"_sessions\" (\"expires\");");
 }
 
-fn init_0012_experiment_assignments(w: *db.Db) db.DbError!void {
+fn init_0012_experiment_assignments(m: *Migrator) db.DbError!void {
     // Sticky experiment assignments (#129): one row per (experiment, subject) persists
     // the FIRST variant the subject was bucketed into, so a later weight change never
     // re-buckets an already-assigned subject (the survive-weight-change guarantee).
@@ -234,7 +244,7 @@ fn init_0012_experiment_assignments(w: *db.Db) db.DbError!void {
     // never touch this table. `created` is an ISO-8601 UTC string (matches the records
     // autodate format); the index on it lets the comptime-gated `_experiment_gc` job
     // reap rows older than `.experiment_assignment_ttl` in bounded batches.
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_experiment_assignments" (
         \\  "experiment" TEXT NOT NULL,
         \\  "subject" TEXT NOT NULL,
@@ -243,10 +253,10 @@ fn init_0012_experiment_assignments(w: *db.Db) db.DbError!void {
         \\  PRIMARY KEY ("experiment","subject")
         \\);
     );
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_experiment_assignments_created\" ON \"_experiment_assignments\" (\"created\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_experiment_assignments_created\" ON \"_experiment_assignments\" (\"created\");");
 }
 
-fn init_0013_queue_jobs(w: *db.Db) db.DbError!void {
+fn init_0013_queue_jobs(m: *Migrator) db.DbError!void {
     // Durable background-job queue (#137 PR2). One row per enqueued durable job; the
     // memory backend never touches this table. A per-worker poller claims ready rows
     // (status='pending' AND run_at<=now) for its queues, ORDER BY priority,run_at,
@@ -256,7 +266,7 @@ fn init_0013_queue_jobs(w: *db.Db) db.DbError!void {
     // out by the backoff; exhausting max_attempts → 'failed' (last_error + .onError). The
     // (status,priority,run_at) index serves the claim query; (created) serves the GC sweep
     // that reaps old done/failed rows in bounded batches (mirrors _experiment_assignments).
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_queue_jobs" (
         \\  "id" TEXT PRIMARY KEY,
         \\  "queue" TEXT NOT NULL,
@@ -276,11 +286,11 @@ fn init_0013_queue_jobs(w: *db.Db) db.DbError!void {
     // Column order matches the claim query: status (equality) then the ORDER BY
     // (priority, run_at), so SQLite can serve the sort straight from the index (no
     // filesort) and stop at LIMIT instead of materializing every ready row.
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_queue_jobs_ready\" ON \"_queue_jobs\" (\"status\",\"priority\",\"run_at\");");
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_queue_jobs_created\" ON \"_queue_jobs\" (\"created\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_queue_jobs_ready\" ON \"_queue_jobs\" (\"status\",\"priority\",\"run_at\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_queue_jobs_created\" ON \"_queue_jobs\" (\"created\");");
 }
 
-fn init_0014_tenancy(w: *db.Db) db.DbError!void {
+fn init_0014_tenancy(m: *Migrator) db.DbError!void {
     // Multi-tenancy data model (#156, PR2). Three built-in system collections back account-scoped
     // tenancy. They are seeded into `_collections` with system=1 and HARDCODED stable field ids
     // (8-char, matching `provision`'s FNV id width) so additive rebuilds match columns by id and a
@@ -289,7 +299,7 @@ fn init_0014_tenancy(w: *db.Db) db.DbError!void {
     //
     // _accounts: one row per tenant. `slug` is the human handle (UNIQUE); `owner_user` is the
     // creating principal's record id; `status` gates soft-disable.
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_accounts" (
         \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL,
         \\  "name" TEXT NOT NULL DEFAULT '',
@@ -298,14 +308,14 @@ fn init_0014_tenancy(w: *db.Db) db.DbError!void {
         \\  "status" TEXT NOT NULL DEFAULT 'active'
         \\);
     );
-    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_accounts_slug\" ON \"_accounts\" (\"slug\");");
+    try m.execLowered("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_accounts_slug\" ON \"_accounts\" (\"slug\");");
 
     // _memberships: the principal<->account edge. `(user_collection,user)` is a COMPOSITE owner
     // (mirrors _sessions/_externalAuths) because multiple auth collections may exist. `role` is a
     // tenancy role (see tenancy/roles.zig); `status` is 'active' once accepted. The
     // (user_collection,user,status) index serves the per-request "my active accounts" resolution
     // SELECT; (account,status) serves account member listings.
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_memberships" (
         \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL,
         \\  "account" TEXT NOT NULL,
@@ -315,13 +325,13 @@ fn init_0014_tenancy(w: *db.Db) db.DbError!void {
         \\  "status" TEXT NOT NULL DEFAULT 'active'
         \\);
     );
-    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_memberships_unique\" ON \"_memberships\" (\"account\",\"user_collection\",\"user\");");
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_memberships_user\" ON \"_memberships\" (\"user_collection\",\"user\",\"status\");");
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_memberships_account\" ON \"_memberships\" (\"account\",\"status\");");
+    try m.execLowered("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_memberships_unique\" ON \"_memberships\" (\"account\",\"user_collection\",\"user\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_memberships_user\" ON \"_memberships\" (\"user_collection\",\"user\",\"status\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_memberships_account\" ON \"_memberships\" (\"account\",\"status\");");
 
     // _invitations: a pending invite to join an account. `token` is the single-use claim handle
     // (UNIQUE); `expires`/`accepted_at` drive the accept flow (wired in PR4).
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_invitations" (
         \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL,
         \\  "account" TEXT NOT NULL,
@@ -333,14 +343,14 @@ fn init_0014_tenancy(w: *db.Db) db.DbError!void {
         \\  "accepted_at" TEXT NOT NULL DEFAULT ''
         \\);
     );
-    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_invitations_token\" ON \"_invitations\" (\"token\");");
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_invitations_account\" ON \"_invitations\" (\"account\");");
+    try m.execLowered("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_invitations_token\" ON \"_invitations\" (\"token\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_invitations_account\" ON \"_invitations\" (\"account\");");
 
     // Seed the three `_collections` rows (system=1) so the engine can address them as collections.
     // The `schema` blob carries each row's user fields with HARDCODED stable field ids (id/created/
     // updated are implicit base columns and are NOT listed). Rules are NULL = Locked (superusers
     // only) — tenant CRUD lands in PR4; until then only superuser tooling touches these tables.
-    try w.exec(
+    try m.execLowered(
         \\INSERT OR IGNORE INTO "_collections"
         \\  ("id","name","type","system","schema","indexes","options","listRule","viewRule","createRule","updateRule","deleteRule","created","updated")
         \\ VALUES
@@ -356,7 +366,7 @@ fn init_0014_tenancy(w: *db.Db) db.DbError!void {
     );
 }
 
-fn init_0016_email(w: *db.Db) db.DbError!void {
+fn init_0016_email(m: *Migrator) db.DbError!void {
     // Email subsystem (#154): verified per-account sender identities + bounce/complaint
     // suppression. Two built-in system collections, seeded into `_collections` with system=1 and
     // HARDCODED 8-char stable field ids (matching `provision`'s FNV id width) so additive rebuilds
@@ -367,7 +377,7 @@ fn init_0016_email(w: *db.Db) db.DbError!void {
     // _sender_identities: one row per (account, from-email). A send whose From is not a `verified`
     // identity for the sending account is REJECTED when verified-sender enforcement is on. `status`
     // is 'pending' until the verification token is confirmed, then 'verified' + `verified_at` set.
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_sender_identities" (
         \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL,
         \\  "account" TEXT NOT NULL DEFAULT '',
@@ -377,14 +387,14 @@ fn init_0016_email(w: *db.Db) db.DbError!void {
         \\  "status" TEXT NOT NULL DEFAULT 'pending'
         \\);
     );
-    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_sender_identities_unique\" ON \"_sender_identities\" (\"account\",\"email\");");
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_sender_identities_token\" ON \"_sender_identities\" (\"verification_token\");");
+    try m.execLowered("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_sender_identities_unique\" ON \"_sender_identities\" (\"account\",\"email\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_sender_identities_token\" ON \"_sender_identities\" (\"verification_token\");");
 
     // _suppressions: a (account, email) the app must NOT send to, populated by the bounce/complaint
     // webhook on a hard bounce or complaint. `reason` is 'hard_bounce'|'complaint'; `source` records
     // the provider ('ses'|'postmark'|…). A send to a suppressed address is BLOCKED when suppression
     // checking is on. An empty `account` is a GLOBAL suppression (applies to every account's sends).
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_suppressions" (
         \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL,
         \\  "account" TEXT NOT NULL DEFAULT '',
@@ -393,12 +403,12 @@ fn init_0016_email(w: *db.Db) db.DbError!void {
         \\  "source" TEXT NOT NULL DEFAULT ''
         \\);
     );
-    try w.exec("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_suppressions_unique\" ON \"_suppressions\" (\"account\",\"email\");");
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_suppressions_email\" ON \"_suppressions\" (\"email\");");
+    try m.execLowered("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_suppressions_unique\" ON \"_suppressions\" (\"account\",\"email\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_suppressions_email\" ON \"_suppressions\" (\"email\");");
 
     // Seed the two `_collections` rows (system=1). id/created/updated are implicit base columns and
     // are NOT listed in the schema blob. Rules NULL = Locked (superusers only).
-    try w.exec(
+    try m.execLowered(
         \\INSERT OR IGNORE INTO "_collections"
         \\  ("id","name","type","system","schema","indexes","options","listRule","viewRule","createRule","updateRule","deleteRule","created","updated")
         \\ VALUES
@@ -411,7 +421,7 @@ fn init_0016_email(w: *db.Db) db.DbError!void {
     );
 }
 
-fn init_0015_events(w: *db.Db) db.DbError!void {
+fn init_0015_events(m: *Migrator) db.DbError!void {
     // Product analytics event log (#158). A single append-only `_events` table backs
     // `ctx.track` (event capture) and the declarative rollups (scheduled aggregation into
     // `_rollup_<name>` summary tables). It is seeded into `_collections` with system=1 and
@@ -426,7 +436,7 @@ fn init_0015_events(w: *db.Db) db.DbError!void {
     // `occurred_at` is the server-stamped ISO-8601 UTC time the event fired. `updated`
     // mirrors `created` and exists only so the records engine's base-column SELECT
     // (id/created/updated) does not break for a superuser browsing the collection.
-    try w.exec(
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_events" (
         \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL,
         \\  "name" TEXT NOT NULL DEFAULT '',
@@ -439,13 +449,13 @@ fn init_0015_events(w: *db.Db) db.DbError!void {
     );
     // (account,name,occurred_at) serves the per-event-name rollup scan + a name-filtered feed;
     // (account,occurred_at) serves the account-scoped activity feed (newest-first by occurred_at).
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_events_account_name_occurred\" ON \"_events\" (\"account\",\"name\",\"occurred_at\");");
-    try w.exec("CREATE INDEX IF NOT EXISTS \"idx_events_account_occurred\" ON \"_events\" (\"account\",\"occurred_at\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_events_account_name_occurred\" ON \"_events\" (\"account\",\"name\",\"occurred_at\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_events_account_occurred\" ON \"_events\" (\"account\",\"occurred_at\");");
 
     // Seed the `_collections` row (system=1) so the engine can address `_events` as a
     // collection. Rules are NULL = Locked (superusers only) — members never read raw events
     // through the records API; they use the tenant-scoped `/api/analytics/events` endpoint.
-    try w.exec(
+    try m.execLowered(
         \\INSERT OR IGNORE INTO "_collections"
         \\  ("id","name","type","system","schema","indexes","options","listRule","viewRule","createRule","updateRule","deleteRule","created","updated")
         \\ VALUES
@@ -475,30 +485,40 @@ pub const all = [_]Migration{
 };
 
 pub fn run(w: *db.Db) db.DbError!void {
-    try w.exec(
+    // One-shot startup arena backing the Migrator's SQL lowering; freed when `run` returns.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    // The system migrations never read `io`; it is provided only on the consumer-migration path.
+    var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = arena.allocator(), .io = undefined };
+
+    // The `_migrations` ledger: the auto-increment PK keyword diverges per backend (AUTOINCREMENT
+    // vs IDENTITY), so it is composed via the dialect rather than lowered textually.
+    try m.execf(
         \\CREATE TABLE IF NOT EXISTS "_migrations" (
-        \\  "id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT UNIQUE NOT NULL, "applied_at" TEXT NOT NULL
+        \\  "id" {[pk]s}, "name" TEXT UNIQUE NOT NULL, "applied_at" TEXT NOT NULL
         \\);
-    );
-    for (all) |m| {
-        if (try isApplied(w, m.name)) continue;
+    , .{ .pk = m.dialect.autoIncPk() });
+
+    for (all) |mig| {
+        if (try isApplied(&m, mig.name)) continue;
         try w.begin();
         errdefer w.rollback() catch {};
-        try m.up(w);
-        try recordApplied(w, m.name);
+        try mig.up(&m);
+        try recordApplied(&m, mig.name);
         try w.commit();
     }
 }
 
-fn isApplied(w: *db.Db, name: []const u8) db.DbError!bool {
-    var st = try w.prepare("SELECT 1 FROM \"_migrations\" WHERE \"name\" = ?1;");
+fn isApplied(m: *Migrator, name: []const u8) db.DbError!bool {
+    var st = try m.prepare("SELECT 1 FROM \"_migrations\" WHERE \"name\" = ?1;");
     defer st.finalize();
     try st.bindText(1, name);
     return try st.step();
 }
 
-fn recordApplied(w: *db.Db, name: []const u8) db.DbError!void {
-    var st = try w.prepare("INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, datetime('now'));");
+fn recordApplied(m: *Migrator, name: []const u8) db.DbError!void {
+    const sql = std.fmt.allocPrint(m.arena, "INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, {s});", .{m.dialect.nowTextExpr()}) catch return error.PrepareFailed;
+    var st = try m.prepare(sql);
     defer st.finalize();
     try st.bindText(1, name);
     _ = try st.step();

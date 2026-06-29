@@ -450,10 +450,12 @@ fn auditSweepJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void 
 // ---------------------------------------------------------------------------
 // 4a. Migration 0001 -- create the plugin audit-log side table.
 // ---------------------------------------------------------------------------
-fn createAuditLog(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void {
-    _ = alloc;
-    _ = io;
-    try w.exec(
+fn createAuditLog(m: *zigbase.Migrator) anyerror!void {
+    // A consumer migration's `up` receives a `*zigbase.Migrator` carrying the active SQL dialect
+    // (#159). `m.execLowered` runs SQLite-flavor SQL, lowering the portable SQLite-isms (here the
+    // `INTEGER` type keyword) to the active backend; raw `m.exec` would be backend-specific. Branch
+    // on `m.dialect.kind` (or `m.rawFor(.postgres, …)`) when a statement truly differs per backend.
+    try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS plugin_audit_log (
         \\  id INTEGER PRIMARY KEY,
         \\  note TEXT NOT NULL DEFAULT ''
@@ -480,18 +482,15 @@ fn createAuditLog(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror
 //     Both statements run inside the single transaction that ZigBase opens
 //     around every migration's `up` call -- either both succeed or neither does.
 // ---------------------------------------------------------------------------
-fn addAuditNoteIndex(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void {
-    _ = alloc;
-    _ = io;
-
+fn addAuditNoteIndex(m: *zigbase.Migrator) anyerror!void {
     // (a) Index on plugin_audit_log.note -- a migration-owned table.
-    try w.exec(
+    try m.execLowered(
         \\CREATE INDEX IF NOT EXISTS idx_audit_note
         \\  ON plugin_audit_log (note);
     );
 
     // (b) Seed a bootstrapping audit row for operator visibility.
-    try w.exec(
+    try m.execLowered(
         \\INSERT INTO plugin_audit_log(note)
         \\  VALUES ('schema v2: idx_audit_note created');
     );

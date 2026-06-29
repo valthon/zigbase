@@ -140,6 +140,11 @@ pub fn sanitize(alloc: std.mem.Allocator, raw: []const u8) !?[]const u8 {
 /// missing (e.g. after an additive table rebuild dropped them). Called from `provision.ensureCollection`
 /// at startup — NOT a numbered migration. Identifiers are gated through `schema.isValidIdentifier`.
 pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !void {
+    // FTS5 (the external-content vtable + sync triggers + sqlite_master probes below) is
+    // SQLite-only. The Postgres port (tsvector/GIN/ts_rank behind the same `search=` surface) is
+    // PR-10 (#159); until then, provisioning skips FTS entirely on Postgres so a `.searchable`
+    // collection still provisions cleanly (its rows are just not full-text indexed there yet).
+    if (db.dbDialect(w).kind == .postgres) return;
     if (!schema.isValidIdentifier(col.name)) return;
     const ft = try tableName(alloc, col.name);
     const cols = try searchableColumns(alloc, col);

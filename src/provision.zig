@@ -22,6 +22,7 @@ const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
 const secrets = @import("oauth/secrets.zig");
 const fts = @import("search/fts.zig");
+const Migrator = @import("migrator.zig").Migrator;
 
 /// F3 startup lint: log a prominent warning for every `@public` (allow-all) rule on `col`, so a
 /// wide-open collection is never silent. Called once per collection during provisioning.
@@ -293,7 +294,7 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
             }
             if (matched == null)
                 @compileError("collection '" ++ name ++ "': .tenant_field '" ++ tf ++ "' must name an existing field, but no such field exists");
-            if (!std.mem.eql(u8, matched.?.sqlType(), "TEXT"))
+            if (matched.?.storageClass() != .text)
                 @compileError("collection '" ++ name ++ "': .tenant_field '" ++ tf ++ "' must name a TEXT-storage field (it holds an account id), but '" ++ tf ++ "' is ." ++ @tagName(matched.?.fieldType()));
             col.options.tenant_field = tf;
         }
@@ -679,14 +680,19 @@ fn stableFieldId(comptime col: []const u8, comptime name: []const u8) []const u8
 /// (renames, retypes, data backfills). Recorded in `_migrations` under
 /// `id` (prefixed), so it runs exactly once and is idempotent across restarts.
 ///
-/// Note: the `alloc` passed to `up` is a short-lived arena scoped to the
-/// `runMigrations` call — anything allocated from it is freed before
-/// `runMigrations` returns. Do not store pointers derived from `alloc` in
-/// state that outlives the call; use a separate long-lived allocator for
-/// persistent data.
+/// `up` receives a `*Migrator` carrying the active SQL `Dialect` (#159, PR-2): the SAME migration
+/// can therefore run on SQLite or Postgres. Use `m.execLowered(sql)` for portable additive
+/// DDL/seeds (the dialect lowers the SQLite-isms), `m.exec(sql)` for raw backend-specific SQL
+/// (the consumer owns dialect correctness — SQLite-only SQL run on Postgres fails loud at
+/// startup), or branch on `m.dialect.kind` / `m.rawFor(.postgres, …)`. `m.db`/`m.io` expose the
+/// writer + `std.Io`. See `src/migrator.zig` for the full contract.
+///
+/// Note: `m.arena` is a short-lived arena scoped to the `runMigrations` call — anything
+/// allocated from it is freed before `runMigrations` returns. Do not store pointers derived from
+/// it in state that outlives the call; use a separate long-lived allocator for persistent data.
 pub const Migration = struct {
     id: []const u8,
-    up: *const fn (alloc: std.mem.Allocator, io: std.Io, w: *db.Db) anyerror!void,
+    up: *const fn (m: *Migrator) anyerror!void,
 };
 
 // ---------------------------------------------------------------------------
@@ -875,8 +881,10 @@ pub fn ensureCollection(
             changed = true;
             continue;
         }
-        // present in both: detect a non-additive change (type or sql storage class)
-        if (lf.?.fieldType() != sf.fieldType() or !std.mem.eql(u8, lf.?.sqlType(), sf.sqlType())) {
+        // present in both: detect a non-additive change (field type or backend-neutral storage
+        // class — the dialect maps storageClass to the concrete column type, so comparing the
+        // class is correct on either backend).
+        if (lf.?.fieldType() != sf.fieldType() or lf.?.storageClass() != sf.storageClass()) {
             std.log.warn(
                 "provision: collection '{s}' field '{s}' type changed ({s} -> {s}); SKIPPED — write an explicit migration (auto-migration is additive-only)",
                 .{ spec.name, sf.name, @tagName(lf.?.fieldType()), @tagName(sf.fieldType()) },
@@ -990,28 +998,31 @@ pub fn runMigrations(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    // The dialect-aware handle threaded into each consumer migration's `up`.
+    var mig = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = a, .io = io };
 
     for (migs) |m| {
         const name = try std.fmt.allocPrint(a, "prov:{s}", .{m.id});
-        if (try migrationApplied(w, name)) continue;
+        if (try migrationApplied(&mig, name)) continue;
         try w.begin();
         errdefer w.rollback() catch {};
-        try m.up(a, io, w);
-        try recordMigration(w, name);
+        try m.up(&mig);
+        try recordMigration(&mig, name);
         try w.commit();
         std.log.info("provision: applied migration '{s}'", .{m.id});
     }
 }
 
-fn migrationApplied(w: *db.Db, name: []const u8) db.DbError!bool {
-    var st = try w.prepare("SELECT 1 FROM \"_migrations\" WHERE \"name\" = ?1;");
+fn migrationApplied(m: *Migrator, name: []const u8) db.DbError!bool {
+    var st = try m.prepare("SELECT 1 FROM \"_migrations\" WHERE \"name\" = ?1;");
     defer st.finalize();
     try st.bindText(1, name);
     return try st.step();
 }
 
-fn recordMigration(w: *db.Db, name: []const u8) db.DbError!void {
-    var st = try w.prepare("INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, datetime('now'));");
+fn recordMigration(m: *Migrator, name: []const u8) db.DbError!void {
+    const sql = std.fmt.allocPrint(m.arena, "INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, {s});", .{m.dialect.nowTextExpr()}) catch return error.PrepareFailed;
+    var st = try m.prepare(sql);
     defer st.finalize();
     try st.bindText(1, name);
     _ = try st.step();
@@ -1535,9 +1546,9 @@ test "runMigrations runs each explicit migration once (idempotent)" {
 
     const M = struct {
         var calls: usize = 0;
-        fn up(_: std.mem.Allocator, _: std.Io, w: *db.Db) anyerror!void {
+        fn up(m: *Migrator) anyerror!void {
             calls += 1;
-            try w.exec("CREATE TABLE IF NOT EXISTS \"prov_demo\" (\"x\" TEXT);");
+            try m.execLowered("CREATE TABLE IF NOT EXISTS \"prov_demo\" (\"x\" TEXT);");
         }
     };
     M.calls = 0;

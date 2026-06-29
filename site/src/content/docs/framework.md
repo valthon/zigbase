@@ -2503,18 +2503,41 @@ a bare anonymous tuple does **not** coerce:
 .migrations = &[_]zigbase.Migration{
     .{ .id = "0001_rename_title", .up = renameTitle },
 },
-// .up signature: fn (alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void
-//   (zigbase.Db is the writer connection; it exposes exec/prepare/begin/commit/rollback.)
-fn renameTitle(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void {
-    _ = alloc; _ = io;
-    try w.exec("ALTER TABLE \"posts\" RENAME COLUMN \"headline\" TO \"title\";");
+// .up signature: fn (m: *zigbase.Migrator) anyerror!void
+//   `m` carries the active SQL dialect, the writer connection (`m.db`), a scratch
+//   arena (`m.arena`), and `m.io`. It exposes exec/execLowered/prepare/rawFor.
+fn renameTitle(m: *zigbase.Migrator) anyerror!void {
+    // RENAME COLUMN is identical on SQLite and Postgres, so plain raw SQL is fine here.
+    try m.exec("ALTER TABLE \"posts\" RENAME COLUMN \"headline\" TO \"title\";");
 }
 ```
 
 Each migration has an `.id` (used for the once-only record) and an `.up` function `fn
-(alloc: std.mem.Allocator, io: std.Io, w: *zigbase.Db) anyerror!void` run inside a
-transaction (rolled back on error). Use migrations for renames, drops, type changes, and
-data backfills.
+(m: *zigbase.Migrator) anyerror!void` run inside a transaction (rolled back on error).
+Use migrations for renames, drops, type changes, and data backfills.
+
+#### Cross-backend migrations (SQLite **and** Postgres)
+
+The same migration runs on whichever backend the server was started with (SQLite by
+default, or PostgreSQL when built with `-Dpostgres` and pointed at a `postgres://` URL).
+`*zigbase.Migrator` makes that explicit — it is **pass-the-dialect**, not an SQL
+transpiler:
+
+- **`m.execLowered(sql)`** — run a curated statement written in the SQLite flavor; the
+  dialect lowers the portable migration-level SQLite-isms (`INTEGER`→`BIGINT`,
+  `datetime('now')`→a text now, `INSERT OR IGNORE`→`ON CONFLICT DO NOTHING`) on Postgres
+  while leaving SQLite **byte-identical**. Covers most additive DDL + seeds.
+- **`m.exec(sql)`** — run **raw, backend-specific** SQL verbatim. *You* own dialect
+  correctness: SQLite-only SQL run on Postgres **fails loud** at startup (the database
+  rejects it and the migration aborts — migrations are fail-fast).
+- **`m.dialect.kind`** (`.sqlite` / `.postgres`), **`m.rawFor(.postgres, sql)`** /
+  **`m.rawFor(.sqlite, sql)`** (run only on the matching backend), and
+  **`m.requireBackend(.sqlite)`** (assert + fail loudly on the wrong backend) let a
+  migration branch when a statement genuinely differs per backend.
+
+ZigBase deliberately does **not** transpile SQL between dialects. A SQLite-only consumer
+that never builds with `-Dpostgres` keeps working unchanged. The framework's own
+comptime-schema provisioning is fully cross-backend, so most apps need no raw migrations.
 
 ## 9. Pluggable storage & mailer backends (`.storage` / `.mailer`)
 
