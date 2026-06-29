@@ -324,4 +324,8 @@ test {
     _ = @import("testcapture.zig");
     _ = @import("captcha.zig");
     _ = @import("webhook.zig");
+    // Opt-in pure-Zig PostgreSQL backend (#159). The `build_options.postgres` condition is
+    // comptime-known, so when it is false (the default) this `@import` is never analyzed —
+    // the driver compiles to nothing and the default build stays byte-identical.
+    if (@import("build_options").postgres) _ = @import("backend/postgres/postgres.zig");
 }
