@@ -140,7 +140,9 @@ fn emitIn(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arra
         },
         .list_macro => |m| {
             const rc = rctx orelse return error.BadFilter;
-            const ids = (rc.resolveMacroList(alloc, m) catch return error.BadFilter) orelse return error.BadFilter;
+            // `try` so OutOfMemory propagates (a real 500) instead of being masked as a
+            // BadFilter 400; an unknown list macro is the only BadFilter case here.
+            const ids = (try rc.resolveMacroList(alloc, m)) orelse return error.BadFilter;
             for (ids) |idv| {
                 try params.append(alloc, .{ .text = idv });
                 n += 1;
