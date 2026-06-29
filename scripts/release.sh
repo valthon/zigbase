@@ -50,10 +50,12 @@ echo
 if [[ "${1:-}" == "--publish" ]]; then
   command -v gh >/dev/null 2>&1 || { echo "gh not found; cannot publish." >&2; exit 1; }
   scripts/assert-version.sh "$VERSION"
+  echo "Extracting release notes for ${VERSION}..."
+  scripts/extract-release-notes.sh "$VERSION" > "$OUT/RELEASE_NOTES.md"
   echo "Publishing GitHub release ${TAG}..."
   gh release create "$TAG" "$OUT"/*.tar.gz "$OUT/SHA256SUMS" \
     --title "ZigBase ${VERSION}" \
-    --notes-file CHANGELOG.md
+    --notes-file "$OUT/RELEASE_NOTES.md"
   echo "GitHub release done. To publish the npm packages, run:"
   echo "  node clients/typescript/npm/publish.mjs --provenance"
 else
