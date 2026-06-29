@@ -52,6 +52,12 @@ pub const Db = struct {
         return self.conn.errMsg();
     }
 
+    /// True if the underlying connection is safe to reuse (not desynced/dead and not stuck in
+    /// a failed transaction). The pool consults this to avoid recycling poisoned connections.
+    pub fn isHealthy(self: *const Db) bool {
+        return self.conn.isHealthy();
+    }
+
     /// Execute one or more statements with no bound parameters (simple protocol).
     pub fn exec(self: *Db, sql: [:0]const u8) DbError!void {
         self.conn.simpleExec(sql) catch return DbError.ExecFailed;

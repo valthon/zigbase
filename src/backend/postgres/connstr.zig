@@ -14,13 +14,18 @@ pub const SslMode = enum {
     pub fn parse(s: []const u8) ?SslMode {
         if (std.mem.eql(u8, s, "disable")) return .disable;
         if (std.mem.eql(u8, s, "prefer")) return .prefer;
-        if (std.mem.eql(u8, s, "require")) return .require;
-        // verify-ca / verify-full imply require here (the driver does not yet verify the
-        // server certificate chain — see conn.zig); treat them as `require`.
         if (std.mem.eql(u8, s, "allow")) return .prefer;
-        if (std.mem.eql(u8, s, "verify-ca")) return .require;
-        if (std.mem.eql(u8, s, "verify-full")) return .require;
+        if (std.mem.eql(u8, s, "require")) return .require;
+        // verify-ca / verify-full are NOT accepted: the driver does not yet verify the server
+        // certificate chain or hostname, so silently treating them as `require` would hand a
+        // user who explicitly asked for verification an UN-authenticated TLS session. They are
+        // rejected with ParseError.UnsupportedSslMode by `parse` instead. (I-3 / gemini#1.)
         return null;
+    }
+
+    /// True for sslmodes that demand certificate verification the driver cannot yet provide.
+    pub fn requiresVerification(s: []const u8) bool {
+        return std.mem.eql(u8, s, "verify-ca") or std.mem.eql(u8, s, "verify-full");
     }
 };
 
@@ -29,6 +34,10 @@ pub const ParseError = error{
     MissingHost,
     InvalidPort,
     InvalidSslMode,
+    /// `sslmode=verify-ca`/`verify-full` requested, but server-certificate verification is not
+    /// yet implemented. Use `sslmode=require` for encryption-only (a tracked follow-up adds
+    /// real verify-full cert+host verification).
+    UnsupportedSslMode,
     OutOfMemory,
 };
 
@@ -113,6 +122,7 @@ pub fn parse(allocator: std.mem.Allocator, uri: []const u8) ParseError!Config {
         const key = kv[0..eq];
         const val = kv[eq + 1 ..];
         if (std.mem.eql(u8, key, "sslmode")) {
+            if (SslMode.requiresVerification(val)) return ParseError.UnsupportedSslMode;
             sslmode = SslMode.parse(val) orelse return ParseError.InvalidSslMode;
         } else if (std.mem.eql(u8, key, "dbname") and database.len == 0) {
             database = val;
@@ -212,4 +222,12 @@ test "connstr: rejects non-postgres scheme" {
     try std.testing.expectError(ParseError.UnsupportedScheme, parse(std.testing.allocator, "mysql://x/y"));
     try std.testing.expect(!looksLikePostgres("/var/data/data.db"));
     try std.testing.expect(looksLikePostgres("postgres://localhost/db"));
+}
+
+test "connstr: verify-ca/verify-full are rejected (not silently downgraded)" {
+    const a = std.testing.allocator;
+    // Cert verification isn't implemented, so asking for it must fail LOUD, not become require.
+    try std.testing.expectError(ParseError.UnsupportedSslMode, parse(a, "postgres://h/db?sslmode=verify-ca"));
+    try std.testing.expectError(ParseError.UnsupportedSslMode, parse(a, "postgres://h/db?sslmode=verify-full"));
+    try std.testing.expectError(ParseError.InvalidSslMode, parse(a, "postgres://h/db?sslmode=bogus"));
 }

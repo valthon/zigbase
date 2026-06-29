@@ -12,6 +12,22 @@
 //!
 //! Everything in this subtree is reachable only when `build_options.postgres` is true; the
 //! default build never references it, so the shipped binary is byte-identical.
+//!
+//! ============================ SECURITY: TLS IS UN-AUTHENTICATED ============================
+//! The driver encrypts transport but does NOT yet authenticate the server, in ANY sslmode:
+//!   * `sslmode=disable` — plaintext.
+//!   * `sslmode=prefer` (default) — opportunistic TLS, but an active MITM can strip it to
+//!     plaintext (the server's "no SSL" reply is trusted).
+//!   * `sslmode=require` — TLS is mandatory, but the server certificate chain and hostname are
+//!     NOT verified (`host=.no_verification, ca=.no_verification`), so a MITM presenting any
+//!     certificate is accepted. This matches libpq `sslmode=require` semantics.
+//!   * `sslmode=verify-ca` / `verify-full` — REJECTED at parse time (the driver cannot honor
+//!     them yet), rather than silently downgraded to encryption-only.
+//! So the driver provides NO protection against an active man-in-the-middle today. Use it only
+//! on a trusted network path (loopback, private VPC, mTLS sidecar) until verify-full lands.
+//! Real certificate + hostname verification (a true `verify-full`) is the immediate tracked
+//! follow-up. The user-facing security note ships with the PR-1b wiring docs.
+//! ==========================================================================================
 
 const std = @import("std");
 

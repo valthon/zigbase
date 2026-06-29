@@ -87,23 +87,37 @@ pub const Pool = struct {
     }
 
     /// Checks out a connection, reusing a warm one when available. Returns a `Db` by value;
-    /// caller MUST hand it back via `releaseReader`.
+    /// caller MUST hand it back via `releaseReader`. Parked connections that have gone
+    /// unhealthy (e.g. the DB was restarted while they sat in the free-list) are closed and
+    /// skipped, so a poisoned free-list can never be handed back to a caller. (I-2.)
     pub fn acquireReader(self: *Pool) DbError!Db {
-        while (!self.reader_mutex.tryLock()) std.atomic.spinLoopHint();
-        if (self.reader_count > 0) {
-            self.reader_count -= 1;
-            var db = self.readers[self.reader_count];
+        while (true) {
+            while (!self.reader_mutex.tryLock()) std.atomic.spinLoopHint();
+            if (self.reader_count > 0) {
+                self.reader_count -= 1;
+                var db = self.readers[self.reader_count];
+                self.reader_mutex.unlock();
+                if (!db.isHealthy()) {
+                    db.close(); // dead parked conn → drop it and try the next / open fresh
+                    continue;
+                }
+                db.field_cipher = self.field_cipher;
+                return db;
+            }
             self.reader_mutex.unlock();
-            db.field_cipher = self.field_cipher;
-            return db;
+            return self.openReader();
         }
-        self.reader_mutex.unlock();
-        return self.openReader();
     }
 
     /// Returns a connection from `acquireReader` to the warm pool (up to `reader_cap`),
-    /// otherwise closes it. Pass the same `*Db` you received from `acquireReader`.
+    /// otherwise closes it. A BROKEN connection (mid-query close / desync / failed-transaction
+    /// state) is always closed rather than parked, so it can never poison the free-list. (I-2.)
+    /// Pass the same `*Db` you received from `acquireReader`.
     pub fn releaseReader(self: *Pool, reader: *Db) void {
+        if (!reader.isHealthy()) {
+            reader.close();
+            return;
+        }
         while (!self.reader_mutex.tryLock()) std.atomic.spinLoopHint();
         if (self.reader_count < self.reader_cap) {
             self.readers[self.reader_count] = reader.*;

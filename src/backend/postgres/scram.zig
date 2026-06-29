@@ -27,7 +27,14 @@ pub const ScramError = error{
     OutOfMemory,
     /// Server returned a SCRAM error in the server-final message (`e=<reason>`).
     AuthenticationRejected,
+    /// Server requested an unreasonable PBKDF2 iteration count (auth-time CPU DoS guard).
+    IterationCountTooHigh,
 };
+
+/// Upper bound on the server-supplied PBKDF2 iteration count. PostgreSQL defaults to 4096;
+/// a hostile/MITM server could otherwise pin a CPU core with an enormous `i=`. 1,000,000 is
+/// far above any legitimate setting yet cheap enough to refuse rather than execute. (M-2.)
+pub const max_iterations: u32 = 1_000_000;
 
 /// Client-side SCRAM-SHA-256 state machine. Owns small heap buffers (client nonce,
 /// client-first-bare, auth-message) allocated from the supplied allocator; call
@@ -78,6 +85,7 @@ pub const Client = struct {
             return ScramError.NonceMismatch;
 
         const iterations = std.fmt.parseInt(u32, iter_str, 10) catch return ScramError.MalformedServerFirst;
+        if (iterations > max_iterations) return ScramError.IterationCountTooHigh;
 
         var salt_buf: [256]u8 = undefined;
         const salt_len = b64.Decoder.calcSizeForSlice(salt_b64) catch return ScramError.InvalidBase64;
@@ -218,4 +226,16 @@ test "scram rejects a tampered server signature" {
     defer a.free(cfinal);
     try std.testing.expectError(ScramError.ServerSignatureMismatch, client.verifyServerFinal("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
     try std.testing.expectError(ScramError.AuthenticationRejected, client.verifyServerFinal("e=invalid-proof"));
+}
+
+test "scram rejects an absurd iteration count before running pbkdf2" {
+    const a = std.testing.allocator;
+    var seed: [24]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast(i +% 3);
+    var client = try Client.init(a, seed);
+    defer client.deinit();
+    // i= just above the ceiling must be refused (no multi-second pbkdf2 grind).
+    const server_first = try std.fmt.allocPrint(a, "r={s}zz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i={d}", .{ client.client_nonce, max_iterations + 1 });
+    defer a.free(server_first);
+    try std.testing.expectError(ScramError.IterationCountTooHigh, client.clientFinal("pencil", server_first));
 }

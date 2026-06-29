@@ -24,7 +24,19 @@ pub const ConnError = error{
     QueryFailed,
     EndOfStream,
     OutOfMemory,
+    /// An identifier that must be interpolated (e.g. a LISTEN channel — not parameterizable)
+    /// contained a quote or NUL and was rejected before interpolation.
+    InvalidIdentifier,
 };
+
+/// Reject an identifier that cannot be safely interpolated into a double-quoted SQL
+/// identifier. A `"` would break out of the quoting and a NUL terminates the C string the
+/// wire protocol sends, so both are refused. (gemini#3 — LISTEN channel injection.)
+fn validateIdentifier(ident: []const u8) ConnError!void {
+    for (ident) |ch| {
+        if (ch == '"' or ch == 0) return ConnError.InvalidIdentifier;
+    }
+}
 
 /// A bound parameter in TEXT format. `null` value means SQL NULL.
 pub const Param = struct { value: ?[]const u8 };
@@ -68,6 +80,11 @@ pub const Conn = struct {
     backend_secret: i32 = 0,
     tx_status: u8 = 'I',
     using_tls: bool = false,
+    /// Set when the connection is desynced/dead: a read failed (EndOfStream/Protocol), a
+    /// write/flush failed, or the wire framing was violated. A broken connection must never
+    /// be reused — the pool closes it instead of parking it. A *normal* SQL error (constraint
+    /// violation) drains cleanly to ReadyForQuery and does NOT set this. (I-2.)
+    broken: bool = false,
     /// Rows affected by the most recent DML (simple or extended). Mirrors SQLite's
     /// `changesCount`; surfaced through `db.Db.changesCount`.
     last_changes: i64 = 0,
@@ -96,7 +113,17 @@ pub const Conn = struct {
         self.stream_writer = stream.writer(io, &self.sock_write_buf);
         self.in = &self.stream_reader.interface;
         self.out = &self.stream_writer.interface;
-        errdefer self.closeSocket();
+        // A handshake failure (wrong password / unreachable DB) must free everything the
+        // partially-live connection owns, not just the socket — these buffers can grow during
+        // startup/auth (error text, notifications, message bodies). This is the pooled-open
+        // hot path, so a leak here compounds. (I-4 / gemini#2.)
+        errdefer {
+            self.closeSocket();
+            self.freeNotifications();
+            self.read_buf.deinit(self.gpa);
+            self.scratch.deinit(self.gpa);
+            self.last_error.deinit(self.gpa);
+        }
 
         try self.maybeStartTls(cfg.sslmode);
         try self.startup(cfg);
@@ -246,26 +273,8 @@ pub const Conn = struct {
     }
 
     fn sendMd5Password(self: *Conn, cfg: connstr.Config, salt: []const u8) ConnError!void {
-        // PostgreSQL md5: "md5" + hex(md5( hex(md5(password+user)) + salt )).
-        const Md5 = std.crypto.hash.Md5;
-        var inner: [16]u8 = undefined;
-        {
-            var h = Md5.init(.{});
-            h.update(cfg.password);
-            h.update(cfg.user);
-            h.final(&inner);
-        }
-        var inner_hex: [32]u8 = undefined;
-        _ = std.fmt.bufPrint(&inner_hex, "{x}", .{&inner}) catch return ConnError.Protocol;
-        var outer: [16]u8 = undefined;
-        {
-            var h = Md5.init(.{});
-            h.update(&inner_hex);
-            h.update(salt);
-            h.final(&outer);
-        }
-        var final_buf: [35]u8 = undefined; // "md5" + 32 hex
-        const token = std.fmt.bufPrint(&final_buf, "md5{x}", .{&outer}) catch return ConnError.Protocol;
+        var out: [35]u8 = undefined; // "md5" + 32 hex
+        const token = md5Token(cfg.user, cfg.password, salt, &out);
         try self.sendPassword(token);
     }
 
@@ -337,15 +346,24 @@ pub const Conn = struct {
 
     /// Read one backend message. The returned `body` aliases an internal buffer and is only
     /// valid until the next `readMessage` call — copy anything you need to retain.
+    /// Largest backend message body we will allocate for. PostgreSQL's protocol allows up to
+    /// ~2 GiB, but nothing this driver issues yields a message remotely near 16 MiB; bounding
+    /// it before `ensureTotalCapacity` stops a malicious or desynced server from forcing a
+    /// huge allocation / OOM from a bogus length prefix. (I-1 / gemini#4.)
+    const max_message_len: i32 = 16 * 1024 * 1024;
+
     fn readMessage(self: *Conn) ConnError!Message {
-        const t = self.in.takeByte() catch |e| return mapRead(e);
-        const len = self.in.takeInt(i32, .big) catch |e| return mapRead(e);
-        if (len < 4) return ConnError.Protocol;
+        const t = self.in.takeByte() catch |e| return self.markBroken(mapRead(e));
+        const len = self.in.takeInt(i32, .big) catch |e| return self.markBroken(mapRead(e));
+        if (len < 4 or len > max_message_len) {
+            self.broken = true; // framing violation → the stream position is now untrustworthy
+            return ConnError.Protocol;
+        }
         const body_len: usize = @intCast(len - 4);
         self.read_buf.clearRetainingCapacity();
         self.read_buf.ensureTotalCapacity(self.gpa, body_len) catch return ConnError.OutOfMemory;
         self.read_buf.items.len = body_len;
-        self.in.readSliceAll(self.read_buf.items) catch |e| return mapRead(e);
+        self.in.readSliceAll(self.read_buf.items) catch |e| return self.markBroken(mapRead(e));
         return .{ .type = t, .body = self.read_buf.items };
     }
 
@@ -354,6 +372,18 @@ pub const Conn = struct {
             error.EndOfStream => ConnError.EndOfStream,
             else => ConnError.Protocol,
         };
+    }
+
+    /// Mark the connection unusable and pass the error through (so it can never be re-parked).
+    fn markBroken(self: *Conn, e: ConnError) ConnError {
+        self.broken = true;
+        return e;
+    }
+
+    /// True if the connection is safe to reuse: not broken and not stuck in a failed
+    /// transaction (`tx_status == 'E'`). The pool checks this on release and acquire.
+    pub fn isHealthy(self: *const Conn) bool {
+        return !self.broken and self.tx_status != 'E';
     }
 
     /// Consume ParameterStatus / BackendKeyData / NoticeResponse until ReadyForQuery.
@@ -403,7 +433,7 @@ pub const Conn = struct {
         mb.start(proto.Frontend.query) catch return ConnError.OutOfMemory;
         mb.cstr(sql) catch return ConnError.OutOfMemory;
         mb.finish(self.out) catch return ConnError.QueryFailed;
-        self.flushOut() catch return ConnError.QueryFailed;
+        self.flushOut() catch { self.broken = true; return ConnError.QueryFailed; };
 
         var failed = false;
         while (true) {
@@ -473,7 +503,7 @@ pub const Conn = struct {
         // Sync.
         mb.start(proto.Frontend.sync) catch return ConnError.OutOfMemory;
         mb.finish(self.out) catch return ConnError.QueryFailed;
-        self.flushOut() catch return ConnError.QueryFailed;
+        self.flushOut() catch { self.broken = true; return ConnError.QueryFailed; };
 
         var result = QueryResult{};
         var rows: std.ArrayList([]?[]const u8) = .empty;
@@ -516,9 +546,11 @@ pub const Conn = struct {
 
     pub const Notification = struct { pid: i32, channel: []const u8, payload: []const u8 };
 
-    /// Subscribe to async notifications on `channel` (issues `LISTEN`). `channel` must be a
-    /// trusted identifier — it is not parameterizable in `LISTEN`.
+    /// Subscribe to async notifications on `channel` (issues `LISTEN`). `channel` is a SQL
+    /// identifier — it cannot be a bound parameter, so it is interpolated into a double-quoted
+    /// identifier and first validated (rejecting `"`/NUL) to foreclose injection.
     pub fn listen(self: *Conn, channel: []const u8) ConnError!void {
+        try validateIdentifier(channel);
         const sql = std.fmt.allocPrint(self.gpa, "LISTEN \"{s}\";", .{channel}) catch return ConnError.OutOfMemory;
         defer self.gpa.free(sql);
         try self.simpleExec(sql);
@@ -639,6 +671,62 @@ pub const Conn = struct {
         return vals;
     }
 };
+
+/// Compute the PostgreSQL md5 password token: `"md5" ++ hex(md5( hex(md5(password ++ user))
+/// ++ salt ))`. Writes into `out` (must be 35 bytes: "md5" + 32 hex) and returns the slice.
+/// Pure + testable; `sendMd5Password` is the only caller.
+fn md5Token(user: []const u8, password: []const u8, salt: []const u8, out: *[35]u8) []const u8 {
+    const Md5 = std.crypto.hash.Md5;
+    var inner: [16]u8 = undefined;
+    {
+        var h = Md5.init(.{});
+        h.update(password);
+        h.update(user);
+        h.final(&inner);
+    }
+    var inner_hex: [32]u8 = undefined;
+    _ = std.fmt.bufPrint(&inner_hex, "{x}", .{&inner}) catch unreachable;
+    var outer: [16]u8 = undefined;
+    {
+        var h = Md5.init(.{});
+        h.update(&inner_hex);
+        h.update(salt);
+        h.final(&outer);
+    }
+    return std.fmt.bufPrint(out, "md5{x}", .{&outer}) catch unreachable;
+}
+
+test "md5Token derives the PostgreSQL md5 auth token" {
+    // Cross-check against the documented construction with an independent computation.
+    const Md5 = std.crypto.hash.Md5;
+    const user = "alice";
+    const pass = "s3cret";
+    const salt = [4]u8{ 0x01, 0x02, 0x03, 0x04 };
+
+    var inner: [16]u8 = undefined;
+    Md5.hash("s3cretalice", &inner, .{});
+    var inner_hex: [32]u8 = undefined;
+    _ = try std.fmt.bufPrint(&inner_hex, "{x}", .{&inner});
+    var buf: [32 + 4]u8 = undefined;
+    @memcpy(buf[0..32], &inner_hex);
+    @memcpy(buf[32..36], &salt);
+    var outer: [16]u8 = undefined;
+    Md5.hash(&buf, &outer, .{});
+    var expected: [35]u8 = undefined;
+    _ = try std.fmt.bufPrint(&expected, "md5{x}", .{&outer});
+
+    var out: [35]u8 = undefined;
+    const tok = md5Token(user, pass, &salt, &out);
+    try std.testing.expectEqualStrings(&expected, tok);
+    try std.testing.expect(std.mem.startsWith(u8, tok, "md5"));
+}
+
+test "validateIdentifier rejects quote and NUL, accepts normal channels" {
+    try validateIdentifier("events");
+    try validateIdentifier("tenant_42_changes");
+    try std.testing.expectError(ConnError.InvalidIdentifier, validateIdentifier("a\"; DROP"));
+    try std.testing.expectError(ConnError.InvalidIdentifier, validateIdentifier("a\x00b"));
+}
 
 /// Parse the trailing affected-row count from a CommandComplete tag, e.g. "INSERT 0 5",
 /// "UPDATE 3", "DELETE 2", "SELECT 7". Returns 0 when there is no count.

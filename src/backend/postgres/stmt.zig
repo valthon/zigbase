@@ -41,8 +41,13 @@ pub const Stmt = struct {
         };
     }
 
+    /// PostgreSQL's Bind message encodes the parameter count as an i16, so `$1..$32767` is the
+    /// hard protocol ceiling. Bounding the 1-based index here also prevents a huge index from
+    /// growing the params list into an OOM / `@intCast` panic. (gemini#5.)
+    const max_bind_index: c_int = 32767;
+
     fn ensureParam(self: *Stmt, idx: c_int) StmtError!usize {
-        if (idx < 1) return StmtError.BindFailed;
+        if (idx < 1 or idx > max_bind_index) return StmtError.BindFailed;
         const i: usize = @intCast(idx - 1);
         while (self.params.items.len <= i) {
             self.params.append(self.gpa, null) catch return StmtError.OutOfMemory;
@@ -104,8 +109,23 @@ pub const Stmt = struct {
         return self.colBytes(idx) orelse "";
     }
 
+    /// The PG type OID of column `idx`, or null if out of range / no row description.
+    fn oidOf(self: *Stmt, idx: c_int) ?u32 {
+        const res = self.result orelse return null;
+        if (idx < 0) return null;
+        const i: usize = @intCast(idx);
+        if (i >= res.columns.len) return null;
+        return res.columns[i].oid;
+    }
+
     pub fn columnInt(self: *Stmt, idx: c_int) i64 {
         const v = self.colBytes(idx) orelse return 0;
+        // PostgreSQL returns booleans in TEXT format as 't'/'f', which `parseInt` cannot read
+        // (→ 0, i.e. every bool reads false). `columnType` reports bool as `.Integer` to match
+        // SQLite's 0/1 bool storage, so `columnInt` must decode it to 1/0. (I-5.)
+        if (self.oidOf(idx) == proto.Oid.bool_) {
+            return if (v.len > 0 and (v[0] == 't' or v[0] == 'T')) 1 else 0;
+        }
         return std.fmt.parseInt(i64, v, 10) catch 0;
     }
 

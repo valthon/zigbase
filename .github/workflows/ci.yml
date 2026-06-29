@@ -159,6 +159,66 @@ jobs:
       - name: Unit + PostgreSQL driver tests (-Dpostgres=true)
         run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true
 
+  # PostgreSQL with server TLS, so the suite runs over a REAL sslmode=require connection —
+  # exercising the TLS handshake, the dual-layer flushOut, and TLS partial-read framing (the
+  # exact area a flush hang already bit). The stock service-container image has no TLS, so we
+  # run our own PG via `docker run` with a generated self-signed cert + scram-sha-256.
+  postgres-tls:
+    runs-on: ubuntu-latest
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
+      ZIGBASE_PG_TEST_URL: postgres://zbpg:zbpg_secret_pw@127.0.0.1:5432/zbpgtest?sslmode=require
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: Cache zig global cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+      - name: Cache zig local cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-local
+          key: zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          restore-keys: |
+            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
+            zig-local-postgres-${{ runner.os }}-zig0.16.0-
+      - name: Start PostgreSQL with server TLS + SCRAM
+        run: |
+          mkdir -p "$PWD/pgtls"
+          openssl req -new -x509 -days 2 -nodes -text \
+            -subj "/CN=localhost" \
+            -out "$PWD/pgtls/server.crt" -keyout "$PWD/pgtls/server.key"
+          chmod 600 "$PWD/pgtls/server.key"
+          # The postgres image runs as uid 999; it must own the key to load it.
+          sudo chown 999:999 "$PWD/pgtls/server.crt" "$PWD/pgtls/server.key"
+          docker run -d --name pgtls \
+            -e POSTGRES_USER=zbpg -e POSTGRES_PASSWORD=zbpg_secret_pw -e POSTGRES_DB=zbpgtest \
+            -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
+            -e POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 \
+            -p 5432:5432 \
+            -v "$PWD/pgtls/server.crt":/etc/pgtls/server.crt:ro \
+            -v "$PWD/pgtls/server.key":/etc/pgtls/server.key:ro \
+            postgres:16 \
+            -c ssl=on -c ssl_cert_file=/etc/pgtls/server.crt -c ssl_key_file=/etc/pgtls/server.key
+          # Wait until the server accepts connections.
+          for i in $(seq 1 30); do
+            if docker exec pgtls pg_isready -U zbpg -d zbpgtest >/dev/null 2>&1; then
+              echo "postgres ready"; break
+            fi
+            sleep 2
+          done
+          # Sanity: confirm SSL is actually on.
+          docker exec pgtls psql -U zbpg -d zbpgtest -tAc "SHOW ssl;"
+      - name: Unit + PostgreSQL driver tests over TLS (sslmode=require)
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker rm -f pgtls || true
+
   browser:
     runs-on: ubuntu-latest
     needs: build

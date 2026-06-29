@@ -209,4 +209,50 @@ test "pg: LISTEN/NOTIFY basic round-trip" {
     const note = (try db.conn.takePending(arena.allocator())) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("zb_test_chan", note.channel);
     try std.testing.expectEqualStrings("hello", note.payload);
+
+    // A channel that would break out of the double-quoted identifier is refused. (gemini#3.)
+    try std.testing.expectError(error.InvalidIdentifier, db.conn.listen("evil\"; DROP TABLE x; --"));
+}
+
+test "pg: booleans read back through columnInt as 1/0 (I-5)" {
+    const a = std.testing.allocator;
+    var db = (try connectOrSkip(a, std.testing.io)) orelse return error.SkipZigTest;
+    defer db.close();
+
+    var sel = try db.prepare("SELECT true, false;");
+    defer sel.finalize();
+    try std.testing.expect(try sel.step());
+    // columnType advertises bool as .Integer, so columnInt MUST decode the 't'/'f' TEXT form.
+    try std.testing.expectEqual(pg.ColumnType.Integer, sel.columnType(0));
+    try std.testing.expectEqual(@as(i64, 1), sel.columnInt(0)); // true  -> 1
+    try std.testing.expectEqual(@as(i64, 0), sel.columnInt(1)); // false -> 0
+    try std.testing.expectEqualStrings("t", sel.columnText(0));
+    try std.testing.expectEqualStrings("f", sel.columnText(1));
+}
+
+test "pg: pool does not recycle a broken connection (I-2)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    var pool = pg.Pool.init(a, io, testUrl()) catch return error.SkipZigTest;
+    defer pool.deinit();
+
+    // Acquire a reader, then simulate a mid-query failure (server closed / desync) that left
+    // the connection dead — exactly what `readMessage`/flush set via `Conn.broken`.
+    var r = try pool.acquireReader();
+    try std.testing.expect(r.conn.isHealthy());
+    r.conn.broken = true;
+    pool.releaseReader(&r); // a broken conn must be CLOSED, not parked
+
+    try std.testing.expectEqual(@as(usize, 0), pool.reader_count);
+
+    // The next acquire must hand back a fresh, healthy connection (not the poisoned one), and
+    // it must actually work.
+    var r2 = try pool.acquireReader();
+    defer pool.releaseReader(&r2);
+    try std.testing.expect(r2.conn.isHealthy());
+    var st = try r2.prepare("SELECT 1;");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
 }
