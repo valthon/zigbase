@@ -226,6 +226,13 @@ pub const CollectionOptions = struct {
     /// deletes rows whose ttl_field is in the past. Null = no expiry. Validated at
     /// comptime in `provision.buildCollection` (field must exist and be date/autodate).
     ttl_field: ?[]const u8 = null,
+    /// When set, names an existing field whose column holds the OWNING ACCOUNT id for
+    /// account-scoped multi-tenancy (#156). The engine auto-scopes every read/write of this
+    /// collection to the request's active account (`tenancy.scopePredicate`, composed by
+    /// `policy.zig`), stamps it on create, and rejects a cross-tenant move on update. Null = the
+    /// collection is not tenant-owned (no scoping; byte-identical to the pre-tenancy engine).
+    /// Validated at comptime in `provision.buildCollection` (the field must exist).
+    tenant_field: ?[]const u8 = null,
 };
 
 pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u8 {
@@ -312,6 +319,11 @@ pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u
         try ttl.put(alloc, "field", .{ .string = tf });
         try root.put(alloc, "ttl", .{ .object = ttl });
     }
+    if (c.options.tenant_field) |tf| {
+        var tenant: ObjectMap = .empty;
+        try tenant.put(alloc, "field", .{ .string = tf });
+        try root.put(alloc, "tenant", .{ .object = tenant });
+    }
     return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
 }
 
@@ -339,6 +351,11 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
     // whether the `auth` block is present.
     if (root.object.get("ttl")) |tv| if (tv == .object) if (tv.object.get("field")) |fv| if (fv == .string) {
         opts.ttl_field = try alloc.dupe(u8, fv.string);
+    };
+    // `tenant` lives at the options root (sibling of `auth`/`ttl`); parse it regardless of
+    // whether the `auth` block is present.
+    if (root.object.get("tenant")) |tv| if (tv == .object) if (tv.object.get("field")) |fv| if (fv == .string) {
+        opts.tenant_field = try alloc.dupe(u8, fv.string);
     };
     const av = root.object.get("auth") orelse return opts;
     if (av != .object) return opts;
@@ -1222,6 +1239,24 @@ test "ttl_field round-trips through optionsToJson/optionsFromJson" {
     try std.testing.expect(std.mem.indexOf(u8, s, "\"ttl\"") != null);
     const back = try optionsFromJson(a, s);
     try std.testing.expect(back.ttl_field != null);
+    try std.testing.expectEqualStrings("expires_at", back.ttl_field.?);
+}
+
+test "tenant_field round-trips through optionsToJson/optionsFromJson" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // default: no tenant_field => omitted from JSON, parses back as null
+    const d = Collection{ .id = "c", .name = "posts", .fields = &.{} };
+    const back_d = try optionsFromJson(a, try optionsToJson(a, d, false));
+    try std.testing.expect(back_d.tenant_field == null);
+    // explicit tenant_field is emitted and parsed back, alongside an unrelated ttl_field
+    const c = Collection{ .id = "c", .name = "posts", .fields = &.{}, .options = .{ .tenant_field = "account", .ttl_field = "expires_at" } };
+    const s = try optionsToJson(a, c, false);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"tenant\"") != null);
+    const back = try optionsFromJson(a, s);
+    try std.testing.expect(back.tenant_field != null);
+    try std.testing.expectEqualStrings("account", back.tenant_field.?);
     try std.testing.expectEqualStrings("expires_at", back.ttl_field.?);
 }
 
