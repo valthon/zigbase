@@ -152,15 +152,30 @@ pub const Dialect = struct {
     }
 
     /// A SQL expression evaluating to "now" as a TEXT value suitable for INSERT/UPDATE into a
-    /// TEXT timestamp column. SQLite's `datetime('now')` is already text; Postgres's `now()` is a
-    /// `timestamptz` that has no implicit assignment cast to `text`, so it is cast explicitly. The
-    /// SQLite arm is byte-identical to the historical `datetime('now')` so existing seed rows keep
-    /// their exact format. (Used by the system + consumer migrations, which store created/updated
-    /// as TEXT for cross-backend rule consistency.)
+    /// TEXT timestamp column (the `_collections`/`_migrations` metadata timestamps). The SQLite arm
+    /// is byte-identical to the historical `datetime('now')` so existing seed rows keep their exact
+    /// format. The Postgres arm uses the ISO-8601 `Z` shape (NOT `now()::text`, which would carry
+    /// microseconds + a `+00` tz offset) so the stored metadata timestamp has a clean, predictable
+    /// shape across backends. (`now()` is a `timestamptz` with no implicit assignment cast to
+    /// `text`, so an explicit text-producing expression is required on Postgres regardless.)
     pub fn nowTextExpr(self: Dialect) []const u8 {
         return switch (self.kind) {
             .sqlite => "datetime('now')",
-            .postgres => "now()::text",
+            .postgres => self.nowIso8601Expr(),
+        };
+    }
+
+    /// A trailing `COLLATE` clause that pins a TEXT column to byte (binary) ordering, or "" when
+    /// the backend already orders text that way. SQLite's default text collation is BINARY (raw
+    /// byte order); Postgres orders by the database LOCALE, so the same TEXT `ORDER BY` / keyset
+    /// comparison (notably the `id` tiebreaker) yields a DIFFERENT order — breaking cross-backend
+    /// pagination determinism. Postgres pins it back with `COLLATE "C"` (the byte-order collation,
+    /// always present). NOT applied to case-insensitive (`.nocase`) columns, which intentionally
+    /// need a different collation (handled separately).
+    pub fn textCollate(self: Dialect) []const u8 {
+        return switch (self.kind) {
+            .sqlite => "",
+            .postgres => " COLLATE \"C\"",
         };
     }
 
@@ -223,12 +238,19 @@ pub const Dialect = struct {
         if (std.mem.indexOf(u8, s2, "INSERT OR IGNORE") == null) return alloc.dupeZ(u8, s2);
         const s3 = try std.mem.replaceOwned(u8, alloc, s2, "INSERT OR IGNORE", "INSERT");
         defer alloc.free(s3);
-        const semi = std.mem.lastIndexOfScalar(u8, s3, ';') orelse s3.len;
+        // The `ON CONFLICT DO NOTHING` suffix must land before the statement TERMINATOR — but a
+        // `lastIndexOfScalar(';')` would mis-split a statement whose JSON/string literal contains a
+        // `;`. So trim trailing whitespace + a single trailing `;` (the real terminator), append the
+        // clause, then re-add the `;` if one was present. (gemini #1.)
+        var end = s3.len;
+        while (end > 0 and std.ascii.isWhitespace(s3[end - 1])) end -= 1;
+        const had_semi = end > 0 and s3[end - 1] == ';';
+        if (had_semi) end -= 1;
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
-        try out.appendSlice(alloc, s3[0..semi]);
+        try out.appendSlice(alloc, s3[0..end]);
         try out.appendSlice(alloc, " ON CONFLICT DO NOTHING");
-        try out.appendSlice(alloc, s3[semi..]);
+        if (had_semi) try out.append(alloc, ';');
         return out.toOwnedSliceSentinel(alloc, 0);
     }
 
@@ -319,9 +341,16 @@ test "dialect: collate + insert-ignore + on-conflict differ" {
 
 test "dialect: nowTextExpr + autoIncPk keep SQLite byte-identical, diverge on PG" {
     try std.testing.expectEqualStrings("datetime('now')", Dialect.sqlite.nowTextExpr());
-    try std.testing.expectEqualStrings("now()::text", Dialect.postgres.nowTextExpr());
+    // PG uses the ISO-8601 Z shape (not now()::text with microseconds/tz), matching nowIso8601Expr.
+    try std.testing.expectEqualStrings(Dialect.postgres.nowIso8601Expr(), Dialect.postgres.nowTextExpr());
+    try std.testing.expect(std.mem.indexOf(u8, Dialect.postgres.nowTextExpr(), "to_char(now()") != null);
     try std.testing.expectEqualStrings("INTEGER PRIMARY KEY AUTOINCREMENT", Dialect.sqlite.autoIncPk());
     try std.testing.expect(std.mem.indexOf(u8, Dialect.postgres.autoIncPk(), "IDENTITY") != null);
+}
+
+test "dialect: textCollate pins PG text to byte order, no-op on SQLite" {
+    try std.testing.expectEqualStrings("", Dialect.sqlite.textCollate());
+    try std.testing.expectEqualStrings(" COLLATE \"C\"", Dialect.postgres.textCollate());
 }
 
 test "dialect: renumberPlaceholders ?N -> $N only on Postgres" {
@@ -346,13 +375,24 @@ test "dialect: lowerMigrationSql is identity on SQLite, lowers the three isms on
     const p = try Dialect.postgres.lowerMigrationSql(a, ddl);
     defer a.free(p);
     try std.testing.expectEqualStrings("CREATE TABLE \"t\" (\"x\" BIGINT NOT NULL DEFAULT 0, \"c\" TEXT);", p);
-    // Postgres seed: INSERT OR IGNORE + datetime('now') + brace-laden JSON pass through.
-    const seed = "INSERT OR IGNORE INTO \"c\" (\"id\",\"opt\",\"created\") VALUES ('a','{\"k\":{}}',datetime('now'));";
+    // Postgres seed: INSERT OR IGNORE + datetime('now') + brace-laden JSON pass through (the now
+    // expr lowers to the ISO to_char form).
+    const seed = "INSERT OR IGNORE INTO \"c\" (\"id\",\"opt\") VALUES ('a','{\"k\":{}}');";
     const ps = try Dialect.postgres.lowerMigrationSql(a, seed);
     defer a.free(ps);
     try std.testing.expectEqualStrings(
-        "INSERT INTO \"c\" (\"id\",\"opt\",\"created\") VALUES ('a','{\"k\":{}}',now()::text) ON CONFLICT DO NOTHING;",
+        "INSERT INTO \"c\" (\"id\",\"opt\") VALUES ('a','{\"k\":{}}') ON CONFLICT DO NOTHING;",
         ps,
+    );
+
+    // gemini #1: a `;` INSIDE a string literal must NOT be treated as the terminator — the
+    // ON CONFLICT clause still lands before the single real trailing `;`.
+    const tricky = "INSERT OR IGNORE INTO \"c\" (\"id\",\"note\") VALUES ('a','hello; world');";
+    const pt = try Dialect.postgres.lowerMigrationSql(a, tricky);
+    defer a.free(pt);
+    try std.testing.expectEqualStrings(
+        "INSERT INTO \"c\" (\"id\",\"note\") VALUES ('a','hello; world') ON CONFLICT DO NOTHING;",
+        pt,
     );
 }
 

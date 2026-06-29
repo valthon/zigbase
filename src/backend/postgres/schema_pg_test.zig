@@ -180,3 +180,80 @@ test "pg: additive field-add rebuild (ALTER) preserves existing data" {
     try std.testing.expectEqualStrings("hello", st.columnText(0)); // preserved
     try std.testing.expect(st.isNull(1)); // new column defaults NULL
 }
+
+test "pg: provisioned TEXT columns order by byte value (COLLATE \"C\"), matching SQLite BINARY" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "collate")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+
+    try migrations.run(w);
+    const specs = comptime provision.buildCollections(.{
+        .notes = .{ .fields = .{.{ .name = "label", .type = .text }} },
+    });
+    try provision.applySpecs(a, std.testing.io, w, specs);
+
+    // The provisioned text columns carry an explicit "C" collation (locale-independent proof of the
+    // DDL pin — this DB may itself be C.UTF-8, which would order by bytes anyway).
+    {
+        var cq = try w.prepare("SELECT collation_name FROM information_schema.columns " ++
+            "WHERE table_schema=current_schema() AND table_name='notes' AND column_name IN ('id','label') AND collation_name='C';");
+        defer cq.finalize();
+        var pinned: usize = 0;
+        while (try cq.step()) pinned += 1;
+        try std.testing.expectEqual(@as(usize, 2), pinned); // both id + label pinned to COLLATE "C"
+    }
+
+    // 'B' (0x42) sorts BEFORE 'a' (0x61) in byte order, but AFTER it under a typical case-folding
+    // locale collation. SQLite's default is BINARY (byte order), so cross-backend keyset/ORDER BY
+    // determinism requires PG to agree — which COLLATE "C" on the provisioned column delivers.
+    try w.exec("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"label\") VALUES ('n1','','','B');");
+    try w.exec("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"label\") VALUES ('n2','','','a');");
+
+    var st = try w.prepare("SELECT label FROM \"notes\" ORDER BY label ASC;");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("B", st.columnText(0)); // byte order: 'B' < 'a'
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("a", st.columnText(0));
+
+    // The `id` keyset tiebreaker column is likewise byte-ordered: 'Z' (0x5A) < 'a' (0x61).
+    try w.exec("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"label\") VALUES ('Zzz','','','x');");
+    try w.exec("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"label\") VALUES ('aaa','','','x');");
+    var idq = try w.prepare("SELECT id FROM \"notes\" WHERE label='x' ORDER BY id ASC;");
+    defer idq.finalize();
+    try std.testing.expect(try idq.step());
+    try std.testing.expectEqualStrings("Zzz", idq.columnText(0)); // 'Z' < 'a' in byte order
+}
+
+test "pg: a consumer .nocase UNIQUE index provisions case-SENSITIVELY (warned weakening)" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "nocase")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+
+    try migrations.run(w);
+    // Provisioning logs a prominent std.log.warn for this .nocase index under PG (see
+    // provision.warnNocaseIndexesUnderPg) — visible in the test output.
+    const specs = comptime provision.buildCollections(.{
+        .contacts = .{ .fields = .{.{ .name = "addr", .type = .text }}, .indexes = .{
+            .{ .name = "idx_contacts_addr", .fields = .{"addr"}, .unique = true, .collation = .nocase },
+        } },
+    });
+    try provision.applySpecs(a, std.testing.io, w, specs);
+
+    // The .nocase-indexed column is left at the DB default collation (NOT pinned to "C"), so the
+    // case-insensitive follow-up can take it over.
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(w,
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() " ++
+        "AND table_name='contacts' AND column_name='addr' AND collation_name='C';"));
+
+    // The known (warned, pre-GA follow-up) weakening: case-variant values are NOT deduped on PG,
+    // because PG has no NOCASE collation yet — so both rows insert.
+    try w.exec("INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c1','','','Bob@x.com');");
+    try w.exec("INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c2','','','bob@x.com');");
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w, "SELECT count(*) FROM \"contacts\";"));
+    // The exact-duplicate IS still rejected (the index is unique, just case-sensitive).
+    try std.testing.expectError(error.ExecFailed, w.exec(
+        "INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c3','','','bob@x.com');"));
+}

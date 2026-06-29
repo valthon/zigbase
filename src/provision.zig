@@ -45,6 +45,20 @@ fn warnPublicRules(col: schema.Collection) void {
     }
 }
 
+/// Collation startup lint (#159): warn for every `.nocase` index when provisioning under the
+/// Postgres dialect, where it currently provisions case-SENSITIVELY (no built-in NOCASE collation
+/// yet; the `lower()`/citext fix is a tracked pre-GA follow-up). No-op on SQLite.
+fn warnNocaseIndexesUnderPg(col: schema.Collection, d: db.Dialect) void {
+    if (d.kind != .postgres) return;
+    for (col.indexes) |ix| {
+        if (ix.collation != .nocase) continue;
+        std.log.warn(
+            "collection '{s}' index '{s}' is .nocase (case-insensitive) but Postgres has no NOCASE collation yet — it provisions CASE-SENSITIVELY there{s} (lower()/citext fix tracked pre-GA)",
+            .{ col.name, ix.name, if (ix.unique) ", so a UNIQUE index will NOT reject case-variant duplicates" else "" },
+        );
+    }
+}
+
 /// Tenancy startup lint (#156): log that a collection is account-scoped (tenant-owned), mirroring
 /// the `@public` warning so a collection whose visibility is silently narrowed to the active
 /// account is never a surprise. Called once per collection during provisioning.
@@ -851,6 +865,13 @@ pub fn ensureCollection(
     warnPublicRules(spec);
     // Tenancy lint: surface every tenant-owned collection so the operator can confirm scoping.
     warnTenantOwned(spec);
+    // Collation lint (#159): a `.nocase` index is case-INSENSITIVE on SQLite but, since Postgres
+    // has no built-in NOCASE collation yet (the `lower()`/citext route is a tracked pre-GA
+    // follow-up), it provisions as a case-SENSITIVE index there — so a `.nocase` UNIQUE index
+    // would NOT reject `Bob@x.com` vs `bob@x.com`. Warn prominently so the weakening is never
+    // silent. (The built-in auth identity index is a plain partial-unique, NOT `.nocase`, so it is
+    // unaffected and identical on both backends.)
+    warnNocaseIndexesUnderPg(spec, db.dbDialect(w));
 
     const existing = try collections.get(alloc, w, spec.name);
     if (existing == null) {

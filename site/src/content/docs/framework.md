@@ -2539,6 +2539,15 @@ ZigBase deliberately does **not** transpile SQL between dialects. A SQLite-only 
 that never builds with `-Dpostgres` keeps working unchanged. The framework's own
 comptime-schema provisioning is fully cross-backend, so most apps need no raw migrations.
 
+**Postgres collation caveats (pre-GA).** Provisioned TEXT columns are pinned to `COLLATE
+"C"` so text ordering / keyset pagination matches SQLite's BINARY byte order across
+backends. A comptime index marked `.collation = .nocase` is case-INSENSITIVE on SQLite but
+currently provisions **case-SENSITIVELY** on Postgres (no built-in NOCASE collation yet;
+the `lower()`/citext fix is tracked for pre-GA) — so a `.nocase` UNIQUE index does **not**
+reject case-variant duplicates there. Provisioning logs a prominent startup warning for
+every `.nocase` index under Postgres. The built-in auth identity uniqueness is a plain
+partial-unique index (not `.nocase`) and behaves identically on both backends.
+
 ## 9. Pluggable storage & mailer backends (`.storage` / `.mailer`)
 
 `.storage` and `.mailer` each select a comptime **plugin type**. The defaults reproduce the

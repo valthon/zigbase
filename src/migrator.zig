@@ -60,6 +60,13 @@ pub const Migrator = struct {
     /// Run a curated statement written in the SQLite flavor, lowered to the active backend by the
     /// dialect (`INTEGER`→backend int type, `datetime('now')`→text now, `INSERT OR IGNORE`→
     /// `ON CONFLICT DO NOTHING`). SQLite is byte-identical to the original statement.
+    ///
+    /// **Contract:** ONE statement per call, intended for the narrow set of portable
+    /// migration-level SQLite-isms above — type-keyword DDL (`CREATE TABLE` / `ALTER … ADD COLUMN`)
+    /// and `INSERT OR IGNORE` seeds. It is a small, brace-safe string lowering, NOT a general SQL
+    /// transpiler: it textually rewrites the `INTEGER` keyword and the `datetime('now')` token, so
+    /// SQL whose string literals contain those substrings, or anything needing other dialect
+    /// divergence, must use `exec`/`rawFor` and own its dialect correctness.
     pub fn execLowered(self: *Migrator, sql: [:0]const u8) db.DbError!void {
         const lowered = self.dialect.lowerMigrationSql(self.arena, sql) catch return error.ExecFailed;
         return self.db.exec(lowered);
