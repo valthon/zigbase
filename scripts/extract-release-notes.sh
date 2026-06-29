@@ -28,7 +28,7 @@ fi
 awk -v ver="$VERSION" '
   /^## \[/ {
     if (found) exit          # next version header: we are done
-    if ($0 ~ ("^## \\[" ver "\\]")) { found=1 }
+    if (index($0, "## [" ver "]") == 1) { found=1 }
   }
   found { print }
   END { if (!found) { print "error: version " ver " not found in CHANGELOG.md" > "/dev/stderr"; exit 1 } }
