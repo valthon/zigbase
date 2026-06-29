@@ -37,9 +37,14 @@ fn usingDefaultUrl() bool {
     return getEnv("ZIGBASE_PG_TEST_URL") == null;
 }
 
-/// Connect, or return null to signal the caller should skip (no reachable PG).
+/// Connect, or return null to signal the caller should skip. Only a connectivity/auth failure
+/// (`OpenFailed`) is treated as "no reachable PG → skip"; any other error (OutOfMemory, a real
+/// driver regression) PROPAGATES so CI fails on it instead of silently skipping.
 fn connectOrSkip(a: std.mem.Allocator, io: std.Io) !?pg.Db {
-    return pg.Db.open(a, io, testUrl()) catch null;
+    return pg.Db.open(a, io, testUrl()) catch |e| switch (e) {
+        error.OpenFailed => null,
+        else => e,
+    };
 }
 
 test "pg: connect over TLS + SCRAM and run a trivial SELECT" {
@@ -156,7 +161,10 @@ test "pg: pool acquire/release across threads" {
     const a = std.testing.allocator;
     const io = std.testing.io;
 
-    var pool = pg.Pool.init(a, io, testUrl()) catch return error.SkipZigTest;
+    var pool = pg.Pool.init(a, io, testUrl()) catch |e| switch (e) {
+        error.OpenFailed => return error.SkipZigTest, // no reachable PG
+        else => return e, // OOM / real regression must fail, not skip
+    };
     defer pool.deinit();
 
     // Seed a shared table via the writer.
@@ -234,7 +242,10 @@ test "pg: pool does not recycle a broken connection (I-2)" {
     const a = std.testing.allocator;
     const io = std.testing.io;
 
-    var pool = pg.Pool.init(a, io, testUrl()) catch return error.SkipZigTest;
+    var pool = pg.Pool.init(a, io, testUrl()) catch |e| switch (e) {
+        error.OpenFailed => return error.SkipZigTest, // no reachable PG
+        else => return e, // OOM / real regression must fail, not skip
+    };
     defer pool.deinit();
 
     // Acquire a reader, then simulate a mid-query failure (server closed / desync) that left

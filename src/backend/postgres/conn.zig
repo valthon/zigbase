@@ -203,8 +203,9 @@ pub const Conn = struct {
         client.* = tls.Client.init(self.in, self.out, .{
             // The driver does not (yet) verify the server certificate chain or hostname —
             // it uses TLS purely for transport encryption (parity with libpq sslmode=require,
-            // which also does not authenticate the server). verify-ca/verify-full are mapped
-            // to require by connstr.zig; chain verification is a documented follow-up.
+            // which also does not authenticate the server). connstr.parse REJECTS
+            // verify-ca/verify-full (ParseError.UnsupportedSslMode) rather than silently
+            // accepting them here; real cert+host verification is a documented follow-up.
             .host = .no_verification,
             .ca = .no_verification,
             .write_buffer = self.tls_write_buf,
@@ -570,10 +571,16 @@ pub const Conn = struct {
         const pid = cur.int32() orelse return ConnError.Protocol;
         const channel = cur.cstr() orelse return ConnError.Protocol;
         const payload = cur.cstr() orelse return ConnError.Protocol;
+        // Dup both, then append. Each later failure must free what was already duped, otherwise
+        // a notification storm / hostile server can accumulate leaks one allocation at a time.
+        const channel_owned = self.gpa.dupe(u8, channel) catch return ConnError.OutOfMemory;
+        errdefer self.gpa.free(channel_owned);
+        const payload_owned = self.gpa.dupe(u8, payload) catch return ConnError.OutOfMemory;
+        errdefer self.gpa.free(payload_owned);
         self.notifications.append(self.gpa, .{
             .pid = pid,
-            .channel = self.gpa.dupe(u8, channel) catch return ConnError.OutOfMemory,
-            .payload = self.gpa.dupe(u8, payload) catch return ConnError.OutOfMemory,
+            .channel = channel_owned,
+            .payload = payload_owned,
         }) catch return ConnError.OutOfMemory;
     }
 
@@ -641,13 +648,15 @@ pub const Conn = struct {
         const cols = arena.alloc(Column, @intCast(n)) catch return ConnError.OutOfMemory;
         var i: usize = 0;
         while (i < cols.len) : (i += 1) {
+            // Every field is required: a truncated RowDescription must fail loudly, not let the
+            // cursor stall on garbage and desync subsequent reads.
             const name = cur.cstr() orelse return ConnError.Protocol;
-            _ = cur.int32(); // table OID
-            _ = cur.int16(); // column attr number
-            const oid = cur.int32() orelse return ConnError.Protocol;
-            _ = cur.int16(); // type size
-            _ = cur.int32(); // type modifier
-            _ = cur.int16(); // format code
+            _ = cur.int32() orelse return ConnError.Protocol; // table OID
+            _ = cur.int16() orelse return ConnError.Protocol; // column attr number
+            const oid = cur.int32() orelse return ConnError.Protocol; // type OID
+            _ = cur.int16() orelse return ConnError.Protocol; // type size
+            _ = cur.int32() orelse return ConnError.Protocol; // type modifier
+            _ = cur.int16() orelse return ConnError.Protocol; // format code
             cols[i] = .{ .name = arena.dupe(u8, name) catch return ConnError.OutOfMemory, .oid = @bitCast(oid) };
         }
         return cols;
@@ -661,8 +670,10 @@ pub const Conn = struct {
         var i: usize = 0;
         while (i < vals.len) : (i += 1) {
             const vlen = cur.int32() orelse return ConnError.Protocol;
-            if (vlen < 0) {
-                vals[i] = null;
+            if (vlen == -1) {
+                vals[i] = null; // -1 is the ONLY NULL sentinel
+            } else if (vlen < 0) {
+                return ConnError.Protocol; // any other negative length is malformed framing
             } else {
                 const bytes = cur.take(@intCast(vlen)) orelse return ConnError.Protocol;
                 vals[i] = arena.dupe(u8, bytes) catch return ConnError.OutOfMemory;
@@ -792,4 +803,20 @@ test "cursor reads ints, strings, and rest with underflow guards" {
     try std.testing.expectEqualStrings("hi", cur.cstr().?);
     try std.testing.expectEqual(@as(i32, 0x01020304), cur.int32().?);
     try std.testing.expect(cur.int16() == null); // underflow
+}
+
+test "parseDataRow: -1 is NULL, other negative lengths are rejected as malformed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // One column, length -1 (0xFFFFFFFF) → NULL.
+    const null_row = [_]u8{ 0, 1, 0xFF, 0xFF, 0xFF, 0xFF };
+    const vals = try Conn.parseDataRow(a, &null_row);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == null);
+
+    // One column, length -2 (0xFFFFFFFE) → not a valid sentinel → Protocol error.
+    const bad_row = [_]u8{ 0, 1, 0xFF, 0xFF, 0xFF, 0xFE };
+    try std.testing.expectError(ConnError.Protocol, Conn.parseDataRow(a, &bad_row));
 }
