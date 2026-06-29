@@ -4,6 +4,8 @@ const schema = @import("schema.zig");
 const request = @import("request.zig");
 const records = @import("records.zig");
 const rules = @import("rules.zig");
+const tenancy = @import("tenancy/tenancy.zig");
+const compiler = @import("query/compiler.zig");
 
 // Authorization COMPOSITION layer (foundation for #156 multi-tenancy + #155 row-level authz).
 //
@@ -48,10 +50,35 @@ pub fn ruleFor(col: schema.Collection, action: Action) ?[]const u8 {
     };
 }
 
-/// The pure, per-collection authorization decision for `action`. PR1: delegates to
-/// `rules.decide` on the action's rule. (PR2/PR3 keep `deny_locked` as the fail-closed floor.)
+/// The pure, per-collection authorization decision for `action`. Delegates to `rules.decide` on
+/// the action's rule, then composes tenancy:
+///   - `deny_locked` SHORT-CIRCUITS FIRST (the fail-closed floor — locked beats everything).
+///   - otherwise, if tenant scoping APPLIES to `col` for `rctx` (enabled + tenant-owned +
+///     non-superuser), the decision is forced to `.check` so the chokepoint compiles+evaluates a
+///     per-row guard (the bound `tenant_field = account_id` predicate) even when the access rule
+///     alone would `allow`. A tenant-owned collection is thus NEVER served un-scoped.
+///   - else the bare rule decision (byte-identical to pre-tenancy for a non-tenant collection).
 pub fn decide(col: schema.Collection, action: Action, rctx: *const request.RequestContext) Decision {
-    return rules.decide(ruleFor(col, action), rctx);
+    const base = rules.decide(ruleFor(col, action), rctx);
+    if (base == .deny_locked) return .deny_locked;
+    if (tenancy.scopeApplies(col, rctx)) return .check;
+    return base;
+}
+
+/// AND the bound tenant-scope predicate `sp` into `guard` (null = no rule predicate yet). Combines
+/// the WHERE fragments with `AND`, appends the single tenant param AFTER the guard's params (so the
+/// trailing `?` binds last), and preserves the guard's joins. Allocations are on `alloc`.
+fn andTenant(alloc: std.mem.Allocator, guard: ?Guard, sp: tenancy.Scoped) std.mem.Allocator.Error!Guard {
+    if (guard) |g| {
+        const where = try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ g.where_sql, sp.sql });
+        const params = try alloc.alloc(compiler.Param, g.params.len + 1);
+        @memcpy(params[0..g.params.len], g.params);
+        params[g.params.len] = sp.param;
+        return .{ .where_sql = where, .joins = g.joins, .params = params };
+    }
+    const params = try alloc.alloc(compiler.Param, 1);
+    params[0] = sp.param;
+    return .{ .where_sql = sp.sql, .params = params };
 }
 
 /// Compile the composed predicate for `action` into a `Guard`, or null when no predicate applies
@@ -64,23 +91,26 @@ pub fn decide(col: schema.Collection, action: Action, rctx: *const request.Reque
 /// for future composition where the decision and predicate are computed together.
 pub fn compilePredicate(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, action: Action, rctx: *const request.RequestContext) PolicyError!?Guard {
     const rule = ruleFor(col, action);
-    return switch (rules.decide(rule, rctx)) {
-        .allow => null,
-        .deny_locked => Guard{ .where_sql = "0" }, // constant-false: AND-ing denies all rows
-        .check => try rules.compileGuard(alloc, conn, col, rule.?, rctx),
-    };
+    const base = rules.decide(rule, rctx);
+    if (base == .deny_locked) return Guard{ .where_sql = "0" }; // fail-closed: AND-ing denies all rows
+    // The access-rule predicate (null for `allow`; the compiled guard for `check`).
+    var guard: ?Guard = if (base == .check) try rules.compileGuard(alloc, conn, col, rule.?, rctx) else null;
+    // Compose the tenant-scope predicate when it applies (null is a no-op → byte-identical to the
+    // pre-tenancy guard for a non-tenant collection / no-tenancy app).
+    if (try tenancy.scopePredicate(alloc, col, rctx)) |sp| guard = try andTenant(alloc, guard, sp);
+    return guard;
 }
 
 /// Whether `record_id` is authorized for `action` under the composed policy. PR1: `allow` → true,
 /// `deny_locked` → false, `check` → `rules.matches` (a guarded `SELECT 1`). Byte-identical to the
 /// inline `decide` + `rules.matches` the chokepoints used before.
 pub fn authorizes(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, action: Action, record_id: []const u8, rctx: *const request.RequestContext) PolicyError!bool {
-    const rule = ruleFor(col, action);
-    return switch (rules.decide(rule, rctx)) {
-        .allow => true,
-        .deny_locked => false,
-        .check => try rules.matches(alloc, conn, col, record_id, rule.?, rctx),
-    };
+    // Route through compilePredicate so the SAME composition (rule AND tenant-scope) governs the
+    // single-record check that governs list. A null predicate is the `allow` state (true); the
+    // constant-false `"0"` guard is `deny_locked` (false); anything else is a guarded SELECT 1.
+    const guard = (try compilePredicate(alloc, conn, col, action, rctx)) orelse return true;
+    if (std.mem.eql(u8, guard.where_sql, "0")) return false;
+    return records.guardPasses(alloc, conn, col, record_id, guard);
 }
 
 /// Evaluate an ARBITRARY combined rule expression against `record_id` (a guarded `SELECT 1`).
@@ -88,7 +118,12 @@ pub fn authorizes(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection
 /// one expression that is not a single action rule. A thin pass-through to the rules primitive so
 /// realtime authz also funnels through the policy layer (the seam PR5 composes into).
 pub fn matchesRule(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, record_id: []const u8, rule: []const u8, rctx: *const request.RequestContext) PolicyError!bool {
-    return rules.matches(alloc, conn, col, record_id, rule, rctx);
+    var guard = try rules.compileGuard(alloc, conn, col, rule, rctx);
+    // Realtime delivery on a tenant-owned collection is scoped to the subscriber's active account
+    // too (the composition funnels through this one place). Null = no-op (byte-identical to the
+    // prior `rules.matches` for a non-tenant collection / no-tenancy app).
+    if (try tenancy.scopePredicate(alloc, col, rctx)) |sp| guard = try andTenant(alloc, guard, sp);
+    return records.guardPasses(alloc, conn, col, record_id, guard);
 }
 
 // ---- Back-compat PIN tests --------------------------------------------------
@@ -189,4 +224,87 @@ test "PIN: policy.authorizes matches rules decide+matches for allow/deny/check" 
     // allow (superuser) -> true without a query; locked (anon) -> false.
     try std.testing.expect(try authorizes(a, &d, col, .delete, "r1", &su));
     try std.testing.expect(!try authorizes(a, &d, withRule(base, null), .delete, "r1", &anon));
+}
+
+// ---- Tenancy composition tests (#156) --------------------------------------
+
+// THE CRITICAL BACK-COMPAT GUARANTEE: turning tenancy ON app-wide must NOT change the decision or
+// the compiled SQL for a collection that is NOT tenant-owned (no `tenant_field`). The pin compares
+// a `tenancy_enabled = true` context against the `false` baseline for every action/rule state on a
+// plain collection and asserts byte-identical results.
+test "PIN: tenancy enabled but no tenant_field is byte-identical to no-tenancy" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = try pinBase(a, &d); // posts: NO tenant_field
+    try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES ('r1','t','t','x','u1');");
+    var auth: std.json.ObjectMap = .empty;
+    try auth.put(a, "id", .{ .string = "u1" });
+    const states = [_]?[]const u8{ null, "", "@public", "owner = @request.auth.id" };
+    for (states) |rule| {
+        const col = withRule(base, rule);
+        // Same principal, one with tenancy off, one with tenancy on + an active account scope.
+        const off = request.RequestContext{ .auth = .{ .object = auth }, .tenancy_enabled = false, .account_id = "acc1" };
+        const on = request.RequestContext{ .auth = .{ .object = auth }, .tenancy_enabled = true, .account_id = "acc1" };
+        inline for (.{ .list, .view, .create, .update, .delete }) |action| {
+            // Decision identical.
+            try std.testing.expectEqual(decide(col, action, &off), decide(col, action, &on));
+            // Compiled predicate identical (where_sql + params).
+            const g_off = try compilePredicate(a, &d, col, action, &off);
+            const g_on = try compilePredicate(a, &d, col, action, &on);
+            try std.testing.expectEqual(g_off == null, g_on == null);
+            if (g_off) |go| {
+                try std.testing.expectEqualStrings(go.where_sql, g_on.?.where_sql);
+                try std.testing.expectEqual(go.params.len, g_on.?.params.len);
+            }
+            // authorizes identical.
+            try std.testing.expectEqual(
+                try authorizes(a, &d, col, action, "r1", &off),
+                try authorizes(a, &d, col, action, "r1", &on),
+            );
+        }
+    }
+}
+
+// A TENANT-OWNED collection: tenancy forces a per-row `.check` (even for an `@public` rule) and
+// composes the bound `tenant_field = account_id` predicate; a superuser bypasses scoping.
+test "tenant-owned collection: decide forces check + compilePredicate binds the account scope" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var base = try pinBase(a, &d); // posts(title, owner)
+    base.options.tenant_field = "owner"; // owning-account column
+
+    const member = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
+    const su = request.RequestContext{ .tenancy_enabled = true, .is_superuser = true, .account_id = "acc1" };
+    const xt = request.RequestContext{ .tenancy_enabled = true, .cross_tenant = true, .account_id = "acc1" };
+
+    // @public would normally `allow`; tenancy forces `.check` so the row is scoped.
+    const pub_col = withRule(base, "@public");
+    try std.testing.expectEqual(Decision.check, decide(pub_col, .list, &member));
+    const g = (try compilePredicate(a, &d, pub_col, .list, &member)).?;
+    try std.testing.expectEqualStrings("\"posts\".\"owner\" = ?", g.where_sql);
+    try std.testing.expectEqual(@as(usize, 1), g.params.len);
+    try std.testing.expectEqualStrings("acc1", g.params[0].text);
+
+    // Superuser + crossTenant bypass scoping entirely (decision falls back to the rule => allow).
+    try std.testing.expectEqual(Decision.allow, decide(pub_col, .list, &su));
+    try std.testing.expect((try compilePredicate(a, &d, pub_col, .list, &su)) == null);
+    try std.testing.expectEqual(Decision.allow, decide(pub_col, .list, &xt));
+    try std.testing.expect((try compilePredicate(a, &d, pub_col, .list, &xt)) == null);
+
+    // A locked rule STILL short-circuits to deny before tenancy (fail-closed floor preserved).
+    const locked = withRule(base, null);
+    try std.testing.expectEqual(Decision.deny_locked, decide(locked, .list, &member));
+    try std.testing.expectEqualStrings("0", (try compilePredicate(a, &d, locked, .list, &member)).?.where_sql);
+
+    // A `check` rule ANDs with the tenant predicate (both fragments present).
+    const owned = withRule(base, "title = \"x\"");
+    const g2 = (try compilePredicate(a, &d, owned, .update, &member)).?;
+    try std.testing.expect(std.mem.indexOf(u8, g2.where_sql, "\"posts\".\"owner\" = ?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g2.where_sql, ") AND (") != null);
 }

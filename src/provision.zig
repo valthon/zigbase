@@ -43,6 +43,34 @@ fn warnPublicRules(col: schema.Collection) void {
     }
 }
 
+/// Tenancy startup lint (#156): log that a collection is account-scoped (tenant-owned), mirroring
+/// the `@public` warning so a collection whose visibility is silently narrowed to the active
+/// account is never a surprise. Called once per collection during provisioning.
+fn warnTenantOwned(col: schema.Collection) void {
+    if (col.options.tenant_field) |tf| {
+        std.log.warn(
+            "collection '{s}' is TENANT-OWNED (auto-scoped to the active account via field '{s}') — #156 tenancy",
+            .{ col.name, tf },
+        );
+    }
+}
+
+/// Auto-create the index backing the `tenant_field` column so the per-request tenant scope
+/// predicate (`"<col>"."<tenant_field>" = ?`) is served from an index, not a scan. Idempotent
+/// (`IF NOT EXISTS`); identifiers are gated through `schema.isValidIdentifier` before interpolation.
+fn ensureTenantIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) ProvisionError!void {
+    const tf = col.options.tenant_field orelse return;
+    if (!schema.isValidIdentifier(col.name) or !schema.isValidIdentifier(tf)) return;
+    const sql = try std.fmt.allocPrintSentinel(
+        alloc,
+        "CREATE INDEX IF NOT EXISTS \"idx_{s}_{s}_tenant\" ON \"{s}\" (\"{s}\");",
+        .{ col.name, tf, col.name, tf },
+        0,
+    );
+    try w.exec(sql);
+    std.log.info("provision: ensured tenant index on '{s}'.'{s}'", .{ col.name, tf });
+}
+
 // ---------------------------------------------------------------------------
 // Comptime builder: a `.collections` literal -> []const schema.Collection
 // ---------------------------------------------------------------------------
@@ -177,7 +205,7 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
         if (sinfo != .@"struct") @compileError("collection '" ++ name ++ "' must be a struct literal");
         // Fail loud on an unknown collection-level key (a typo would otherwise be a silent
         // no-op). These are exactly the keys read below in this function.
-        rejectUnknownKeys(spec, &.{ "type", "fields", "rules", "auth", "indexes", "ttl_field" }, "collection '" ++ name ++ "'");
+        rejectUnknownKeys(spec, &.{ "type", "fields", "rules", "auth", "indexes", "ttl_field", "tenant_field" }, "collection '" ++ name ++ "'");
 
         // collection type (default .base)
         const ctype: schema.CollectionType = if (@hasField(S, "type")) spec.type else .base;
@@ -245,6 +273,24 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
             if (matched.? != .date and matched.? != .autodate)
                 @compileError("collection '" ++ name ++ "': .ttl_field '" ++ tf ++ "' must name a date/autodate field (got ." ++ @tagName(matched.?) ++ ")");
             col.options.ttl_field = tf;
+        }
+
+        // Tenancy: `.tenant_field` names the field whose column holds the owning account id for
+        // account-scoped multi-tenancy (#156). Validate at comptime that the field exists (any
+        // text-storage type is fine — it holds an account id). The runtime auto-scopes every
+        // read/write of this collection to the request's active account.
+        if (@hasField(S, "tenant_field")) {
+            const tf: []const u8 = spec.tenant_field;
+            var exists = false;
+            for (frozen_fields) |f| {
+                if (std.mem.eql(u8, f.name, tf)) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists)
+                @compileError("collection '" ++ name ++ "': .tenant_field '" ++ tf ++ "' must name an existing field, but no such field exists");
+            col.options.tenant_field = tf;
         }
 
         // An encrypted field cannot be indexed (the index would be built over
@@ -781,14 +827,19 @@ pub fn ensureCollection(
 
     // F3 lint: surface any allow-all (@public) rule prominently at startup.
     warnPublicRules(spec);
+    // Tenancy lint: surface every tenant-owned collection so the operator can confirm scoping.
+    warnTenantOwned(spec);
 
     const existing = try collections.get(alloc, w, spec.name);
     if (existing == null) {
         _ = try collections.create(alloc, io, w, spec);
         std.log.info("provision: created collection '{s}'", .{spec.name});
+        try ensureTenantIndex(alloc, w, spec);
         return;
     }
     const live = existing.?;
+    // The physical table exists now; ensure the tenant_field is indexed (idempotent).
+    try ensureTenantIndex(alloc, w, spec);
 
     // Diff user fields. `live.fields` from get() includes injected auth system
     // fields for auth collections; compare only against non-system field names.

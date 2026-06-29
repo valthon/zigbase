@@ -11,6 +11,7 @@ const FieldError = @import("error.zig").FieldError;
 const params_mod = @import("../query/params.zig");
 const expand_mod = @import("../query/expand.zig");
 const policy = @import("../policy.zig");
+const tenancy = @import("../tenancy/tenancy.zig");
 const request = @import("../request.zig");
 const Ctx = @import("../ctx.zig").Ctx;
 const auth = @import("../auth.zig");
@@ -89,14 +90,48 @@ fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value) !http.Res
     return .{ .status = status, .body = try std.json.Stringify.valueAlloc(ctx.allocator, v, .{}) };
 }
 
-/// Fills auth/superuser from the verified bearer/cookie token (anonymous if absent/invalid).
+/// Fills auth/superuser from the verified bearer/cookie token (anonymous if absent/invalid), then
+/// — when tenancy is enabled — resolves the active account scope (`account_id`/`account_role`/
+/// `memberships`) from a verified `_memberships` row. Resolution is cached on the returned context
+/// (one indexed SELECT per request) and fails closed: any error leaves the scope empty.
 fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) request.RequestContext {
-    if (ctx.app) |app| {
-        if (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null) |a| {
-            return .{ .auth = a.record, .is_superuser = a.is_superuser, .collection = a.collection, .data = data, .method = @tagName(ctx.method) };
-        }
+    var rctx = request.RequestContext{ .auth = null, .is_superuser = false, .collection = "", .data = data, .method = @tagName(ctx.method) };
+    const app = ctx.app orelse return rctx;
+    rctx.tenancy_enabled = app.tenancy.enabled;
+    const a = (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null) orelse return rctx;
+    rctx.auth = a.record;
+    rctx.is_superuser = a.is_superuser;
+    rctx.collection = a.collection;
+    // Superusers bypass tenancy (consistent with rules.decide); skip the resolution query for them.
+    if (app.tenancy.enabled and !a.is_superuser) resolveTenant(ctx, conn, app, &rctx, a) catch {};
+    return rctx;
+}
+
+/// The account id the request is asking to act within: the `X-Account-Id` header, else the signed
+/// `zb_account` cookie (browser apps that called `activate`). The header is unsigned but safe — a
+/// forged value only grants scope if `resolveTenant` finds an ACTIVE membership for it. Resolver
+/// is an enum so `.subdomain`/`.path` can be added here later without touching callers.
+fn requestedAccount(ctx: *http.RequestCtx, app: *app_mod.App) ?[]const u8 {
+    switch (app.tenancy.resolver) {
+        .header => {
+            if (ctx.header(tenancy.account_header)) |h| if (h.len > 0) return h;
+            if (ctx.cookie(tenancy.account_cookie)) |c| if (c.len > 0) return tenancy.verifyAccount(app.jwt_secret, c);
+            return null;
+        },
     }
-    return .{ .auth = null, .is_superuser = false, .collection = "", .data = data, .method = @tagName(ctx.method) };
+}
+
+/// Resolve + cache the active account scope onto `rctx` (verified membership, fail closed).
+fn resolveTenant(ctx: *http.RequestCtx, conn: *db.Db, app: *app_mod.App, rctx: *request.RequestContext, a: auth.Authed) !void {
+    const rec = a.record;
+    if (rec != .object) return;
+    const id_v = rec.object.get("id") orelse return;
+    if (id_v != .string) return;
+    const requested = requestedAccount(ctx, app) orelse "";
+    const res = try tenancy.resolve(ctx.allocator, conn, a.collection, id_v.string, requested);
+    rctx.account_id = res.account_id;
+    rctx.account_role = res.account_role;
+    rctx.memberships = res.memberships;
 }
 
 fn forbidden(ctx: *http.RequestCtx) !http.Response {
@@ -213,6 +248,12 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const decision = policy.decide(col, .create, &rctx);
     if (decision == .deny_locked) return forbidden(ctx);
 
+    // Tenant write guard (#156): creating a row in a tenant-owned collection requires an ACTIVE
+    // account context. A non-superuser with no resolved account is denied (fail closed) rather
+    // than writing an un-owned row. Superuser / crossTenant tooling is exempt.
+    if (app.tenancy.enabled and !rctx.is_superuser and !rctx.cross_tenant)
+        if (col.options.tenant_field != null and rctx.account_id.len == 0) return forbidden(ctx);
+
     // A2 KEYSTONE: the handler owns ONE write transaction spanning the before-hook,
     // the row INSERT, and the access-rule guard. A hook side-write + the primary
     // write commit atomically; a before-hook error (or a denied guard, or a storage
@@ -239,6 +280,14 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
             return resp;
         }
     }
+    // Stamp the owning account onto the new row so a client can never set/spoof `tenant_field`
+    // (superuser / crossTenant tooling keeps the client-provided value). The in-txn create guard
+    // below (decide() forces `.check` for tenant-owned collections) re-verifies tenant_field ==
+    // account_id, so even a before-hook that mutated it cannot persist a cross-tenant row.
+    if (app.tenancy.enabled and !rctx.is_superuser and !rctx.cross_tenant)
+        if (col.options.tenant_field) |tf| if (data_mut == .object)
+            try data_mut.object.put(ctx.allocator, tf, .{ .string = rctx.account_id });
+
     // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
     // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
     const rec = records.createInTxn(ctx.allocator, app.io, w, col, data_mut) catch |e| switch (e) {

@@ -4,6 +4,7 @@ const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
 const features = @import("features.zig");
 const captcha = @import("captcha.zig");
+const tenancy_mod = @import("tenancy/tenancy.zig");
 
 /// Session-management model (#99). `epoch` (default) is the stateless token-epoch
 /// revocation scheme: cheap, no per-request DB read beyond the existing auth fetch.
@@ -51,6 +52,10 @@ pub const App = struct {
     /// the comptime `App(.{ .pagination = ... })` config in framework.serveImpl. Defaults match
     /// the stock binary: both modes enabled, stateless tokens.
     pagination: pagination.Runtime = .{},
+    /// Resolved multi-tenancy knobs (#156), threaded from the comptime `App(.{ .tenancy = ... })`
+    /// config in serveImpl. Default `.enabled = false` is the byte-identical no-tenancy path: the
+    /// per-request resolver is skipped and `tenancy.scopePredicate` is a no-op.
+    tenancy: tenancy_mod.Runtime = .{},
     /// Type-erased event dispatch built by the comptime App(cfg) builder; null = no subscribers.
     dispatch: ?*const @import("events.zig").Dispatch = null,
     /// Declared feature-flag + experiment registry (lowered at comptime from the

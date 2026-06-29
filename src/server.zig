@@ -6,6 +6,7 @@ const router = @import("router.zig");
 const health = @import("api/health.zig");
 const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
+const accounts_api = @import("api/accounts.zig");
 const auth_api = @import("api/auth.zig");
 const auth_methods_api = @import("api/auth_methods.zig");
 const magic_link_consume_api = @import("api/magic_link_consume.zig");
@@ -59,6 +60,9 @@ const routes = [_]router.Route{
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
     .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
     .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
+    // Multi-tenancy (#156): activate an account scope for browser apps (sets the signed
+    // `zb_account` cookie). 404s when tenancy is disabled; 403 without an active membership.
+    .{ .method = .POST, .pattern = "/api/accounts/:id/activate", .handler = accounts_api.activate },
     // Public, UNAUTHENTICATED feature-state projection (#130). Mounted at the default
     // "/api/state"; the handler 404s when disabled or remapped (a custom path is
     // dispatched dynamically in onRequest). NEVER exposes the superuser settings verbs.
