@@ -7,6 +7,7 @@ const rules = @import("rules.zig");
 const tenancy = @import("tenancy/tenancy.zig");
 const abilities = @import("authz/abilities.zig");
 const compiler = @import("query/compiler.zig");
+const fts = @import("search/fts.zig");
 
 // Authorization COMPOSITION layer (foundation for #156 multi-tenancy + #155 row-level authz).
 //
@@ -545,4 +546,117 @@ test "documented @public list rule + ability: listRuleFilter avoids the 400 and 
     const res = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &rctx), .rctx = &rctx });
     try std.testing.expectEqual(@as(usize, 1), res.items.len); // acc1 member sees acc1's row
     try std.testing.expectEqualStrings("acc1", res.items[0].object.get("owner").?.string);
+}
+
+// ---- Full-text search × access-control chokepoint tests (#157 CRITICAL) -----
+// THE #1 RISK for search: a MATCH that runs as a separate, UNSCOPED query would leak rows the
+// caller may not view. These exercise the REAL `records.list` engine with `?search=` set and
+// assert the FTS predicate is AND-ed into the SAME composition as tenant-scope and the view
+// ability — so search NEVER widens visibility. The base `posts(title, owner)` table is reused with
+// `title` marked searchable; the FTS5 index + sync triggers are provisioned via `fts.ensureIndex`,
+// then rows are inserted with raw SQL (the AFTER INSERT trigger populates the index).
+
+/// `pinBase`'s posts table, re-typed with `title` searchable (the physical column is identical),
+/// and its FTS5 index provisioned. Returns the collection to drive `records.list(.{ .search })`.
+fn searchableBase(a: std.mem.Allocator, d: *db.Db) !schema.Collection {
+    const base = try pinBase(a, d);
+    const fields = try a.dupe(schema.Field, &[_]schema.Field{
+        .{ .id = "f1", .name = "title", .searchable = true, .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "owner", .options = .{ .text = .{} } },
+    });
+    var col = base;
+    col.fields = fields;
+    try fts.ensureIndex(a, d, col);
+    return col;
+}
+
+test "records.list full-text search on a tenant-owned collection returns only the caller's account rows" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var col = try searchableBase(a, &d);
+    col.options.tenant_field = "owner"; // owning-account column
+    // Two accounts each own a row whose title MATCHES the search term "budget".
+    try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
+        "('r1','t','t','quarterly budget report','acc1')," ++
+        "('r2','t','t','quarterly budget summary','acc2');");
+
+    const pub_col = withRule(col, "@public");
+    // A member of acc1 searching "budget" gets ONLY acc1's matching row — acc2's match is scoped out.
+    const m1 = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
+    const r1 = try records.list(a, &d, pub_col, .{ .search = "budget", .rule = listRuleFilter(pub_col, &m1), .rctx = &m1 });
+    try std.testing.expectEqual(@as(usize, 1), r1.items.len);
+    try std.testing.expectEqualStrings("acc1", r1.items[0].object.get("owner").?.string);
+
+    // A member of acc2 sees only acc2's row; a principal with no active account sees none.
+    const m2 = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc2" };
+    const r2 = try records.list(a, &d, pub_col, .{ .search = "budget", .rule = listRuleFilter(pub_col, &m2), .rctx = &m2 });
+    try std.testing.expectEqual(@as(usize, 1), r2.items.len);
+    try std.testing.expectEqualStrings("acc2", r2.items[0].object.get("owner").?.string);
+    const none = request.RequestContext{ .tenancy_enabled = true, .account_id = "" };
+    const r0 = try records.list(a, &d, pub_col, .{ .search = "budget", .rule = listRuleFilter(pub_col, &none), .rctx = &none });
+    try std.testing.expectEqual(@as(usize, 0), r0.items.len);
+}
+
+test "records.list full-text search respects the view ability (denied rows absent from results)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try searchableBase(a, &d);
+    // Three rows owned by three accounts; ALL match the search term "report".
+    try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
+        "('r1','t','t','annual report','acc1')," ++
+        "('r2','t','t','annual report','acc2')," ++
+        "('r3','t','t','annual report','acc3');");
+    // view ability: editor+ of the owning account. Caller: editor of acc1, viewer of acc2, no acc3.
+    const guarded = withRule(withAbility(col, "editor"), "@public");
+    const mem = [_]request.Membership{
+        .{ .account = "acc1", .role = "editor" },
+        .{ .account = "acc2", .role = "viewer" },
+    };
+    const rctx = request.RequestContext{ .memberships = &mem };
+    const res = try records.list(a, &d, guarded, .{ .search = "report", .rule = listRuleFilter(guarded, &rctx), .rctx = &rctx });
+    const owners = listOwners(res.items);
+    defer std.testing.allocator.free(owners);
+    // Only acc1's row survives BOTH the MATCH and the ability — acc2 (viewer) and acc3 (non-member)
+    // match the search but are denied by the ability, so they are absent (search never widens view).
+    try std.testing.expectEqual(@as(usize, 1), res.items.len);
+    try std.testing.expect(hasOwner(owners, "acc1"));
+    try std.testing.expect(!hasOwner(owners, "acc2"));
+    try std.testing.expect(!hasOwner(owners, "acc3"));
+}
+
+test "records.list full-text search ranks by bm25 and binds a basic-operator query safely" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = withRule(try searchableBase(a, &d), "@public");
+    try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
+        "('r1','t','t','alpha alpha alpha','acc1')," ++ // most relevant for "alpha"
+        "('r2','t','t','alpha beta','acc1')," ++
+        "('r3','t','t','gamma delta','acc1');");
+    const anon = request.RequestContext{};
+
+    // Ranked ordering: the row with the densest "alpha" match comes first (bm25 via FTS `rank`).
+    const ranked = try records.list(a, &d, col, .{ .search = "alpha", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    try std.testing.expectEqual(@as(usize, 2), ranked.items.len);
+    try std.testing.expectEqualStrings("r1", ranked.items[0].object.get("id").?.string);
+
+    // A basic-operator (OR) query parses + binds safely and returns the union of matches — no error,
+    // no injection: the operator is preserved while each term is a bound, quoted token.
+    const ored = try records.list(a, &d, col, .{ .search = "alpha OR gamma", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    try std.testing.expectEqual(@as(usize, 3), ored.items.len); // r1,r2 (alpha) + r3 (gamma)
+
+    // A search on a collection with NO searchable field is a clean error (handler -> 400), never a
+    // silent full-table return. (Rejected before any query, so no backing table is needed.)
+    const plain = schema.Collection{ .id = "p", .name = "plainposts", .fields = &[_]schema.Field{
+        .{ .id = "g1", .name = "title", .options = .{ .text = .{} } },
+    } };
+    try std.testing.expectError(error.NotSearchable, records.list(a, &d, withRule(plain, "@public"), .{ .search = "alpha", .rctx = &anon }));
 }

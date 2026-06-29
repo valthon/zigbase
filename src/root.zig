@@ -202,6 +202,8 @@ test {
     _ = @import("tenancy/roles.zig");
     _ = @import("tenancy/tenancy.zig");
     _ = @import("authz/abilities.zig");
+    _ = @import("search/fts.zig");
+    _ = @import("search/vector.zig");
     _ = @import("api/accounts.zig");
     _ = @import("crypto.zig");
     _ = @import("aead.zig");

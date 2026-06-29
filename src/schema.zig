@@ -34,6 +34,11 @@ pub const Field = struct {
     /// read. Only text/editor/json fields may set this (enforced at comptime in
     /// provision.zig). Encrypted fields are non-indexable/-unique/-filterable.
     encrypted: bool = false,
+    /// Full-text search (Theme A / #157). When true the field's text is mirrored into the
+    /// collection's FTS5 external-content index (provisioned at startup) and becomes matchable
+    /// via the `?search=` list param. Only text/editor fields may set this (enforced at comptime
+    /// in provision.zig); an encrypted field can never be searchable (ciphertext is opaque).
+    searchable: bool = false,
     options: FieldOptions,
 
     pub fn fieldType(self: Field) FieldType {
@@ -655,6 +660,20 @@ pub fn hasEncryptedField(c: Collection) bool {
     return false;
 }
 
+/// The field types whose plaintext can be mirrored into an FTS5 full-text index (#157):
+/// the free-text types text and editor. SINGLE SOURCE OF TRUTH for the searchable set —
+/// the comptime guard (provision.zig), the runtime validator (`validate`), and the search
+/// provisioner (search/fts.zig) all defer to it.
+pub fn isSearchableType(t: FieldType) bool {
+    return t == .text or t == .editor;
+}
+
+/// True if any field in `c` is `.searchable` (drives FTS5 index provisioning at startup).
+pub fn hasSearchableField(c: Collection) bool {
+    for (c.fields) |f| if (f.searchable) return true;
+    return false;
+}
+
 /// Appends any validation problems to `errors`. Self-sizing; messages/codes are static or borrowed from `c`.
 pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(ValidationError)) std.mem.Allocator.Error!void {
     if (!isValidIdentifier(c.name))
@@ -682,6 +701,15 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
                 try errors.append(alloc, .{ .field = f.name, .code = "validation_encrypted_type", .message = "Only text, editor, and json fields can be encrypted." });
             if (f.unique)
                 try errors.append(alloc, .{ .field = f.name, .code = "validation_encrypted_unique", .message = "An encrypted field cannot be unique." });
+        }
+        // Full-text search constraints (#157): only free-text types can be searchable, and an
+        // encrypted field can never be (its stored bytes are per-row-nonce ciphertext). The
+        // comptime `.collections` path enforces these with @compileError; the runtime API mirrors.
+        if (f.searchable) {
+            if (!isSearchableType(f.fieldType()))
+                try errors.append(alloc, .{ .field = f.name, .code = "validation_searchable_type", .message = "Only text and editor fields can be searchable." });
+            if (f.encrypted)
+                try errors.append(alloc, .{ .field = f.name, .code = "validation_searchable_encrypted", .message = "An encrypted field cannot be searchable." });
         }
         switch (f.options) {
             .text => |o| if (o.pattern) |pat| {
@@ -778,6 +806,7 @@ fn fieldToValue(alloc: std.mem.Allocator, f: Field) !Value {
     try obj.put(alloc, "required", jBool(f.required));
     try obj.put(alloc, "unique", jBool(f.unique));
     try obj.put(alloc, "encrypted", jBool(f.encrypted));
+    try obj.put(alloc, "searchable", jBool(f.searchable));
     try obj.put(alloc, "type", jStr(@tagName(std.meta.activeTag(f.options))));
 
     var opts: ObjectMap = .empty;
@@ -997,6 +1026,7 @@ fn fieldFromValue(alloc: std.mem.Allocator, v: Value) !Field {
         .required = getBool(v, "required", false),
         .unique = getBool(v, "unique", false),
         .encrypted = getBool(v, "encrypted", false),
+        .searchable = getBool(v, "searchable", false),
         .options = try optionsFromValue(alloc, t, opts),
     };
 }
@@ -1219,6 +1249,38 @@ test "round-trip fields through json" {
     try std.testing.expectEqualStrings("b", back[2].options.select.values[1]);
     try std.testing.expectEqualStrings("users", back[3].options.relation.targetCollectionId);
     try std.testing.expect(back[3].options.relation.cascadeDelete);
+}
+
+test "searchable field flag round-trips through fieldsToJson/fieldsFromJson" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]Field{
+        .{ .id = "aaaaaaaa", .name = "title", .searchable = true, .options = .{ .text = .{} } },
+        .{ .id = "bbbbbbbb", .name = "slug", .options = .{ .text = .{} } }, // default: not searchable
+        .{ .id = "cccccccc", .name = "body", .searchable = true, .options = .{ .editor = .{} } },
+    };
+    const back = try fieldsFromJson(a, try fieldsToJson(a, &fields));
+    try std.testing.expect(back[0].searchable);
+    try std.testing.expect(!back[1].searchable);
+    try std.testing.expect(back[2].searchable);
+    try std.testing.expect(hasSearchableField(.{ .id = "c", .name = "posts", .fields = &fields }));
+
+    // A searchable flag on a non-text type, or on an encrypted field, is a validation error.
+    var errs: std.ArrayList(ValidationError) = .empty;
+    const bad = Collection{ .id = "c", .name = "posts", .fields = &[_]Field{
+        .{ .id = "n1234567", .name = "count", .searchable = true, .options = .{ .number = .{} } },
+        .{ .id = "e1234567", .name = "secret", .searchable = true, .encrypted = true, .options = .{ .text = .{} } },
+    } };
+    try validate(a, bad, &errs);
+    var saw_type = false;
+    var saw_enc = false;
+    for (errs.items) |e| {
+        if (std.mem.eql(u8, e.code, "validation_searchable_type")) saw_type = true;
+        if (std.mem.eql(u8, e.code, "validation_searchable_encrypted")) saw_enc = true;
+    }
+    try std.testing.expect(saw_type);
+    try std.testing.expect(saw_enc);
 }
 
 test "indexes round-trip" {

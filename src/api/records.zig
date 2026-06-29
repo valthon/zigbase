@@ -577,6 +577,10 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const result = records.list(ctx.allocator, conn, col, .{
         .filter = qp.get("filter"),
         .sort = qp.get("sort"),
+        // Full-text search (#157): `?search=` (alias `?q=`) composes a bound FTS5 MATCH into the
+        // SAME scoped query. `?vector=` is the opt-in (-Dvector) KNN spec.
+        .search = qp.get("search") orelse qp.get("q"),
+        .vectorSpec = qp.get("vector"),
         .page = page,
         .perPage = perPage,
         .rule = rule_expr,
@@ -603,6 +607,14 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         error.BadCursor => return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator),
         error.EncryptedField =>
             return ApiError.badRequest("Cannot filter or sort by an encrypted field.").toResponse(ctx.allocator),
+        error.NotSearchable =>
+            return ApiError.badRequest("This collection has no searchable fields; `search` is not supported here.").toResponse(ctx.allocator),
+        error.VectorDisabled =>
+            return ApiError.badRequest("Vector search is not enabled in this build.").toResponse(ctx.allocator),
+        error.VectorCursorUnsupported =>
+            return ApiError.badRequest("Vector search does not support cursor pagination; use offset paging.").toResponse(ctx.allocator),
+        error.BadVector =>
+            return ApiError.badRequest("Invalid vector search query.").toResponse(ctx.allocator),
         error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep =>
             return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
         else => return e,

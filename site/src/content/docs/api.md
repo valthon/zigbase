@@ -192,6 +192,8 @@ The list endpoint supports two pagination styles: **offset** (`page`/`perPage`) 
 | `skipTotal` | `true` in cursor mode | Skip the `COUNT(*)` total. Set `skipTotal=false` to include `totalItems`/`totalPages`. |
 | `filter` | — | Filter expression (see [Filter grammar](#filter-grammar)). |
 | `sort` | — | Sort spec (see [sort](#sort)). In cursor mode this defines the keyset order; `id` is auto-appended as a tiebreaker. |
+| `search` | — | Full-text search terms (alias `q`). Matches `searchable` fields; results are ranked by relevance (see [Search](#search)). |
+| `vector` | — | Nearest-neighbor search (opt-in `-Dvector` build only); `<field>[:cosine|:l2]:<json-embedding>` (see [Search](#search)). |
 | `expand` | — | Relation expansion (see [expand](#expand)). Works in both modes. |
 
 The **offset** list response envelope:
@@ -377,6 +379,54 @@ expand=author,comments.user
 ```
 
 Expansion runs on both the list endpoint and the single-record `view` endpoint.
+
+### Search
+
+ZigBase has first-class search on the list endpoint. It is **not** a separate, unscoped query:
+the search predicate is AND-ed into the *same* composed `WHERE` as your `filter`, the list rule,
+abilities and tenant scope — so **search can never widen visibility**. A search of a
+tenant-owned or ability-guarded collection returns only the rows the caller may already view.
+
+**Full-text (FTS5) — default build.** Mark one or more `text`/`editor` fields `.searchable` in
+the schema:
+
+```zig
+.posts = .{ .fields = .{
+    .title = .{ .type = .text, .searchable = true },
+    .body  = .{ .type = .editor, .searchable = true },
+} },
+```
+
+At startup ZigBase provisions an [FTS5](https://www.sqlite.org/fts5.html) **external-content**
+index per searchable collection (`"<col>_fts"`, `content='<col>'`) plus `INSERT`/`UPDATE`/`DELETE`
+triggers that keep it in lock-step with the base table — no doubled storage, no migration. Query
+it with `search` (or its alias `q`):
+
+```text
+GET /api/collections/posts/records?search=zig%20database
+GET /api/collections/posts/records?q=alpha%20OR%20beta&filter=published=true
+```
+
+Results are ranked by relevance (`bm25`) in offset mode. The terms support the basic FTS5
+operators (`AND`, `OR`, `NOT`, and a trailing `*` for prefix search); the whole term is passed
+as a **bound parameter** (never interpolated) and lowered to a guaranteed-valid query, so a
+malformed input is harmless — it can never become a SQL error or injection. A `search` on a
+collection with no `searchable` field returns **400**.
+
+**Vector / nearest-neighbor (sqlite-vec) — opt-in `-Dvector` build.** Vector search is **not**
+compiled into the default binary. Build with `-Dvector=true` to vendor and link
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec); ZigBase then registers it on every
+connection and enables KNN ordering over a field that stores a JSON embedding array:
+
+```text
+GET /api/collections/docs/records?vector=embedding:cosine:[0.12,0.04,...]
+GET /api/collections/docs/records?vector=embedding:l2:[0.12,0.04,...]&filter=lang="en"
+```
+
+The form is `<field>[:cosine|:l2]:<json-embedding>` (cosine is the default metric); rows are
+ordered nearest-first. The embedding is a bound parameter. In the **default build** a `vector`
+query returns **400** (`"Vector search is not enabled in this build."`), and the binary is
+byte-for-byte unaffected. Vector search runs in offset mode (cursor paging is rejected with 400).
 
 ## Access rules
 

@@ -32,6 +32,12 @@ pub fn build(b: *std.Build) void {
     // with -Ddev-clock=true to build a debuggable binary that still honors the env (e2e dev).
     const dev_clock = b.option(bool, "dev-clock", "Compile in the dev-only ZIGBASE_FAKE_NOW test clock (default: on in Debug, off in release)") orelse (optimize == .Debug);
     build_options.addOption(bool, "dev_clock", dev_clock);
+    // Opt-in vector search (#157). OFF by default: the default build does NOT compile or link the
+    // sqlite-vec amalgamation, and every vector code path folds to comptime-dead — the shipped
+    // binary is byte-for-byte unaffected. `-Dvector=true` compiles vendor/sqlite-vec/sqlite-vec.c
+    // into the SQLite build (below) and db.zig registers the extension on each connection.
+    const vector = b.option(bool, "vector", "Compile in opt-in sqlite-vec vector search (default: off)") orelse false;
+    build_options.addOption(bool, "vector", vector);
     zigbase_mod.addOptions("build_options", build_options);
 
     zigbase_mod.addIncludePath(b.path("vendor/sqlite"));
@@ -57,6 +63,17 @@ pub fn build(b: *std.Build) void {
             "-DSQLITE_DEFAULT_MEMSTATUS=0", // we never query sqlite3_memory_used/high_water
         },
     });
+    // Opt-in vector search: compile the sqlite-vec amalgamation STATICALLY into the same module
+    // (SQLITE_CORE => it includes our vendored sqlite3.h and links against the in-tree SQLite;
+    // SQLITE_VEC_STATIC => no dllexport shims). Only when -Dvector=true, so the default build is
+    // untouched. db.zig calls sqlite3_vec_init on each connection (gated on build_options.vector).
+    if (vector) {
+        zigbase_mod.addIncludePath(b.path("vendor/sqlite-vec"));
+        zigbase_mod.addCSourceFile(.{
+            .file = b.path("vendor/sqlite-vec/sqlite-vec.c"),
+            .flags = &.{ "-DSQLITE_CORE", "-DSQLITE_VEC_STATIC" },
+        });
+    }
     zigbase_mod.addImport("zap", zap.module("zap"));
 
     // The shipped binary: a thin consumer of the library module.
