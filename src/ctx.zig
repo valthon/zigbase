@@ -8,6 +8,7 @@ const records_engine = @import("records.zig");
 const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
 const schema = @import("schema.zig");
+const policy = @import("policy.zig");
 const expand_mod = @import("query/expand.zig");
 const http_client = @import("http_client.zig");
 const captcha_mod = @import("captcha.zig");
@@ -126,6 +127,17 @@ pub const Ctx = struct {
     /// Returns a Records namespace bound to this Ctx for read operations.
     pub fn records(self: *Ctx) Records {
         return .{ .ctx = self };
+    }
+
+    /// Authorize `action` on a specific record (#155) through the SAME composed policy the REST
+    /// chokepoints use — the access rule AND any relationship ability AND the tenant scope. Lets a
+    /// custom route gate a record the way the engine would, instead of re-implementing the check.
+    /// Fails closed: an unknown collection, a locked rule, or no qualifying membership → false.
+    /// Uses the bound (in-transaction) connection when present, else a pooled reader.
+    pub fn can(self: *Ctx, action: policy.Action, collection: []const u8, id: []const u8) !bool {
+        const conn = try self.connForRead();
+        const col = (try collections.get(self.arena, conn, collection)) orelse return false;
+        return policy.authorizes(self.arena, conn, col, action, id, &self.rctx);
     }
 
     /// Returns the session-management namespace (`ctx.auth()`): `clearSession` (#86),

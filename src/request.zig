@@ -1,4 +1,5 @@
 const std = @import("std");
+const roles = @import("tenancy/roles.zig");
 
 /// One account membership for the authenticated principal (multi-tenancy foundation, #156).
 /// `account` is the account id; `role` is the principal's role within that account. The PR1
@@ -42,6 +43,11 @@ pub const RequestContext = struct {
     /// superuser bypass) and the write-path cross-tenant guard is skipped. Default false — never
     /// silently widens scope.
     cross_tenant: bool = false,
+    /// The role total-order used to compare a membership role against an ability's `.min_role`
+    /// (#155). Threaded from the app's comptime `.tenancy.roles` config via `buildContext`; defaults
+    /// to the standard ladder (`viewer<editor<admin<owner`) so a directly-constructed context
+    /// (tests, non-tenant apps) ranks the default roles. Read by `authz/abilities.zig`.
+    role_ranking: roles.Ranking = .{},
 
     /// Resolve a `@request.*` macro path to a text value. Returns null for an unknown macro.
     /// `@request.auth.<field>` and `@request.data.<field>` yield "" when absent/unauthenticated.

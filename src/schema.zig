@@ -233,6 +233,11 @@ pub const CollectionOptions = struct {
     /// collection is not tenant-owned (no scoping; byte-identical to the pre-tenancy engine).
     /// Validated at comptime in `provision.buildCollection` (the field must exist).
     tenant_field: ?[]const u8 = null,
+    /// Relationship-based row abilities (#155): per-action declarative rules lowered from the
+    /// top-level `App(.{ .abilities = ... })` config and composed into the guard stack by
+    /// `policy.zig`. Null = no abilities (byte-identical to the pre-abilities engine). Persists
+    /// alongside `tenant_field` so the chokepoints' DB-loaded collection carries it.
+    abilities: ?@import("authz/abilities.zig").Abilities = null,
 };
 
 pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u8 {
@@ -324,7 +329,38 @@ pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u
         try tenant.put(alloc, "field", .{ .string = tf });
         try root.put(alloc, "tenant", .{ .object = tenant });
     }
+    if (c.options.abilities) |ab| {
+        var abilities: ObjectMap = .empty;
+        try abilityToJson(alloc, &abilities, "view", ab.view);
+        try abilityToJson(alloc, &abilities, "update", ab.update);
+        try abilityToJson(alloc, &abilities, "delete", ab.delete);
+        try abilityToJson(alloc, &abilities, "create", ab.create);
+        try root.put(alloc, "abilities", .{ .object = abilities });
+    }
     return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
+}
+
+/// Serialize one ability rule under `key` into `obj` (omitted when null). Shape:
+/// `"<key>": { "via": "<relation>", "min_role": "<role>" }`.
+fn abilityToJson(alloc: std.mem.Allocator, obj: *ObjectMap, key: []const u8, ability: ?@import("authz/abilities.zig").Ability) !void {
+    const ab = ability orelse return;
+    var rule: ObjectMap = .empty;
+    try rule.put(alloc, "via", .{ .string = ab.relationship.via });
+    try rule.put(alloc, "min_role", .{ .string = ab.relationship.min_role });
+    try obj.put(alloc, key, .{ .object = rule });
+}
+
+/// Parse one ability rule out of the `abilities` object (null when absent/malformed).
+fn abilityFromJson(alloc: std.mem.Allocator, abilities: std.json.Value, key: []const u8) !?@import("authz/abilities.zig").Ability {
+    const rv = abilities.object.get(key) orelse return null;
+    if (rv != .object) return null;
+    const via_v = rv.object.get("via") orelse return null;
+    if (via_v != .string) return null;
+    const min_role = if (rv.object.get("min_role")) |mr| (if (mr == .string) mr.string else "") else "";
+    return .{ .relationship = .{
+        .via = try alloc.dupe(u8, via_v.string),
+        .min_role = try alloc.dupe(u8, min_role),
+    } };
 }
 
 fn rateLimitToJsonAlloc(alloc: std.mem.Allocator, rl: RateLimitOpt) !std.json.Value {
@@ -356,6 +392,15 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
     // whether the `auth` block is present.
     if (root.object.get("tenant")) |tv| if (tv == .object) if (tv.object.get("field")) |fv| if (fv == .string) {
         opts.tenant_field = try alloc.dupe(u8, fv.string);
+    };
+    // `abilities` lives at the options root (sibling of `auth`/`ttl`/`tenant`); #155.
+    if (root.object.get("abilities")) |abv| if (abv == .object) {
+        opts.abilities = .{
+            .view = try abilityFromJson(alloc, abv, "view"),
+            .update = try abilityFromJson(alloc, abv, "update"),
+            .delete = try abilityFromJson(alloc, abv, "delete"),
+            .create = try abilityFromJson(alloc, abv, "create"),
+        };
     };
     const av = root.object.get("auth") orelse return opts;
     if (av != .object) return opts;
@@ -1258,6 +1303,29 @@ test "tenant_field round-trips through optionsToJson/optionsFromJson" {
     try std.testing.expect(back.tenant_field != null);
     try std.testing.expectEqualStrings("account", back.tenant_field.?);
     try std.testing.expectEqualStrings("expires_at", back.ttl_field.?);
+}
+
+test "abilities round-trip through optionsToJson/optionsFromJson" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // default: no abilities => omitted from JSON, parses back as null
+    const d = Collection{ .id = "c", .name = "posts", .fields = &.{} };
+    const back_d = try optionsFromJson(a, try optionsToJson(a, d, false));
+    try std.testing.expect(back_d.abilities == null);
+    // explicit per-action abilities are emitted and parsed back
+    const ab = @import("authz/abilities.zig").Abilities{
+        .view = .{ .relationship = .{ .via = "account" } },
+        .update = .{ .relationship = .{ .via = "account", .min_role = "editor" } },
+    };
+    const c = Collection{ .id = "c", .name = "posts", .fields = &.{}, .options = .{ .abilities = ab } };
+    const s = try optionsToJson(a, c, false);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"abilities\"") != null);
+    const back = (try optionsFromJson(a, s)).abilities.?;
+    try std.testing.expectEqualStrings("account", back.view.?.relationship.via);
+    try std.testing.expectEqualStrings("", back.view.?.relationship.min_role);
+    try std.testing.expectEqualStrings("editor", back.update.?.relationship.min_role);
+    try std.testing.expect(back.delete == null and back.create == null);
 }
 
 test "validate rejects an auth collection with a non-identifier identity field" {

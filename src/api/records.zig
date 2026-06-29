@@ -98,6 +98,7 @@ fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) requ
     var rctx = request.RequestContext{ .auth = null, .is_superuser = false, .collection = "", .data = data, .method = @tagName(ctx.method) };
     const app = ctx.app orelse return rctx;
     rctx.tenancy_enabled = app.tenancy.enabled;
+    rctx.role_ranking = app.role_ranking; // ability `.min_role` comparisons (#155)
     const a = (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null) orelse return rctx;
     rctx.auth = a.record;
     rctx.is_superuser = a.is_superuser;
@@ -198,6 +199,31 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     const qp = try params_mod.parse(ctx.allocator, ctx.query);
     if (qp.get("expand")) |exp| if (exp.len > 0) try expand_mod.expand(ctx.allocator, &r, col, &rec, exp, 0, &rctx);
     return jsonResponse(ctx, 200, rec);
+}
+
+/// `GET /api/collections/:col/records/:id/abilities` (#155): the set of actions the current
+/// principal may perform on THIS record, computed through the same `policy` decision the REST
+/// chokepoints use. The endpoint itself is authorized — a principal who cannot VIEW the record
+/// gets 404 (it must not reveal a record's existence or its ability set). Returns
+/// `{ "view": bool, "update": bool, "delete": bool }`.
+pub fn abilities(ctx: *http.RequestCtx) anyerror!http.Response {
+    const app = ctx.app.?;
+    var r = try app.pool.acquireReader();
+    defer app.pool.releaseReader(&r);
+    const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const rctx = buildContext(ctx, &r, null);
+    // The record must exist AND be viewable; otherwise 404 (never leak existence).
+    if ((try records.get(ctx.allocator, &r, col, rid)) == null) return ApiError.notFound().toResponse(ctx.allocator);
+    const can_view = try policy.authorizes(ctx.allocator, &r, col, .view, rid, &rctx);
+    if (!can_view) return ApiError.notFound().toResponse(ctx.allocator);
+    const can_update = try policy.authorizes(ctx.allocator, &r, col, .update, rid, &rctx);
+    const can_delete = try policy.authorizes(ctx.allocator, &r, col, .delete, rid, &rctx);
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(ctx.allocator, "view", .{ .bool = can_view });
+    try obj.put(ctx.allocator, "update", .{ .bool = can_update });
+    try obj.put(ctx.allocator, "delete", .{ .bool = can_delete });
+    return jsonResponse(ctx, 200, .{ .object = obj });
 }
 
 /// The one body-ingestion path for record create/update: parse the body

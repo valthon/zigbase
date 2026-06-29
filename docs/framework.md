@@ -2196,6 +2196,71 @@ without a `.tenant_field`, the composed SQL and authorization decisions are **id
 pre-tenancy engine (pinned by tests in `policy.zig`). Enabling tenancy never changes a non-tenant
 collection.
 
+### Relationship-based row abilities (`.abilities`)
+
+Tenancy scopes a collection to **one** active account. **Abilities** (#155) authorize a CRUD
+action by the principal's **relationship** to the row — "you may edit a project if you are an
+`editor` (or higher) of the account it belongs to" — without writing that membership join by hand in
+every rule. Abilities are declared at the top level of `App(.{ … })`, keyed by collection name, with
+a per-action **relationship** rule:
+
+```zig
+const App = zigbase.App(.{
+    .tenancy = .{ .enabled = true, .auth_collection = "users",
+                  .roles = .{ "viewer", "editor", "admin", "owner" } },
+    .collections = .{
+        .projects = .{
+            .fields = .{
+                .{ .name = "title",   .type = .text },
+                .{ .name = "account", .type = .relation, .target = "accounts" }, // owning account
+            },
+            .rules = .{ .list = "@public", .view = "@public" },
+        },
+    },
+    // A row of `projects` is authorized when the principal holds a membership (role ≥ floor) of the
+    // account named by the `account` relation field.
+    .abilities = .{
+        .projects = .{
+            .view   = .{ .relationship = .{ .via = "account" } },               // any active member
+            .update = .{ .relationship = .{ .via = "account", .min_role = .editor } },
+            .delete = .{ .relationship = .{ .via = "account", .min_role = .admin } },
+            .create = .{ .relationship = .{ .via = "account", .min_role = .editor } },
+        },
+    },
+});
+```
+
+**Lowering.** Each rule compiles to a bound `IN` predicate over the principal's **qualifying**
+membership account-ids — `"projects"."account" IN (?,?,…)` — exactly the shape the `in` operator and
+`@request.account.ids` macro already emit. `min_role` filters the membership set through the
+configured role ladder (`.tenancy.roles`); `.via` **must name a relation field** (the field whose
+column holds the owning account id). `list` reuses the `view` ability.
+
+**Composition.** The ability predicate is AND-ed into the same guard stack as the access rule and the
+tenant scope: `WHERE (filter) AND (rule) AND (ability) AND (tenant_field = ?) AND (ttl)`. An ability
+forces a per-row check even when the access rule alone would `allow` (so `@public` + an ability still
+authorizes each row).
+
+**Fail closed.** No qualifying membership ⇒ the constant-false predicate `0` (the row is denied;
+never SQLite's invalid `IN ()`). A **locked** rule (`null`/`""`) still denies first. Account-ids are
+always **bound** parameters, never interpolated; superusers bypass abilities entirely.
+
+**Comptime validation.** An ability naming an unknown collection, a `.via` that is not a relation
+field, or a `.min_role` not in `.tenancy.roles` is a loud `@compileError`.
+
+**Custom routes.** `try ctx.can(.update, "projects", id)` authorizes a specific record through the
+**same** policy (rule + ability + tenant scope) the REST chokepoints use — use it instead of
+re-implementing the check in a handler.
+
+**Introspection.** `GET /api/collections/:col/records/:id/abilities` returns
+`{ "view": bool, "update": bool, "delete": bool }` — the actions the current principal may perform on
+that record. The endpoint itself requires view access (404 otherwise), so it never leaks a record's
+existence.
+
+**Back-compat is byte-identical.** A collection with no `.abilities` entry composes a null predicate,
+so its decisions and compiled SQL are **identical** to the pre-abilities engine (pinned in
+`policy.zig`).
+
 ### Field encryption at rest (`.encrypted`)
 
 Mark a `text`, `editor`, or `json` field `.encrypted = true` to store it
