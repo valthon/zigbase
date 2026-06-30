@@ -25,28 +25,16 @@ const dialect_mod = @import("../../sql/dialect.zig");
 
 const Dialect = dialect_mod.Dialect;
 
-// ---- connection plumbing (mirrors tests.zig) --------------------------------
+// ---- connection plumbing (shared with tests.zig / clock.zig) ----------------
 
-const default_url = "postgres://zbpg:zbpg_secret_pw@[::1]:5432/zbpgtest?sslmode=require";
-
-fn getEnv(key: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (std.c.environ[i]) |entry| : (i += 1) {
-        const e = std.mem.span(entry);
-        if (e.len > key.len and std.mem.startsWith(u8, e, key) and e[key.len] == '=')
-            return e[key.len + 1 ..];
-    }
-    return null;
-}
-
-fn testUrl() []const u8 {
-    return getEnv("ZIGBASE_PG_TEST_URL") orelse default_url;
-}
+/// `getEnv`/`testUrl`/`default_url` live in `tests.zig` as the single shared definition for
+/// the Postgres live-test files (was duplicated per-file).
+const pgtests = @import("tests.zig");
 
 /// Open a `db.Db` Postgres handle, or null to signal "no reachable PG → skip". Only a
 /// connectivity/auth failure (`OpenFailed`) skips; any other error propagates.
 fn openOrSkip(a: std.mem.Allocator, io: std.Io) !?dbm.Db {
-    return dbm.Db.openPostgres(a, io, testUrl()) catch |e| switch (e) {
+    return dbm.Db.openPostgres(a, io, pgtests.testUrl()) catch |e| switch (e) {
         error.OpenFailed => null,
         else => e,
     };

@@ -11,11 +11,15 @@
 const std = @import("std");
 const pg = @import("postgres.zig");
 
-const default_url = "postgres://zbpg:zbpg_secret_pw@[::1]:5432/zbpgtest?sslmode=require";
+/// The local default PG URL — shared by every live-PG test file in this subtree
+/// (`tests.zig`, `crud_tests.zig`, `clock.zig`). Targets `[::1]` so the stock
+/// `pg_hba.conf` forces `scram-sha-256`, and `sslmode=require` to force TLS.
+pub const default_url = "postgres://zbpg:zbpg_secret_pw@[::1]:5432/zbpgtest?sslmode=require";
 
 /// Read an environment variable via libc's `environ` (linked into the module). Returns a
-/// borrowed slice into the process environment, valid for the test's lifetime.
-fn getEnv(key: []const u8) ?[]const u8 {
+/// borrowed slice into the process environment, valid for the test's lifetime. The single
+/// shared definition for the Postgres live-test files (was duplicated per-file).
+pub fn getEnv(key: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (std.c.environ[i]) |entry| : (i += 1) {
         const e = std.mem.span(entry);
@@ -27,7 +31,7 @@ fn getEnv(key: []const u8) ?[]const u8 {
 
 /// The connection URL: `ZIGBASE_PG_TEST_URL` if set, else the local default (which forces
 /// SCRAM via [::1] and TLS via sslmode=require).
-fn testUrl() []const u8 {
+pub fn testUrl() []const u8 {
     return getEnv("ZIGBASE_PG_TEST_URL") orelse default_url;
 }
 

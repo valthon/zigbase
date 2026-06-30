@@ -2768,6 +2768,15 @@ timestamp routes through the seam:
   overridden to the frozen instant; all file I/O still delegates to the genuine OS VFS
   unchanged (`src/clock_vfs.zig`). There are no remaining unfrozen `'now'` paths.
 
+On the **Postgres backend** (`-Dpostgres`, opt-in), the same freeze is achieved with one
+portable mechanism instead of the two SQLite shims (there is no in-process function
+registration or VFS on a remote server): when a freeze is active, every connection installs a
+session-level `now()` override — a `zigbase_frozen.now()` wrapper returning the frozen instant,
+placed on the connection's `search_path` ahead of `pg_catalog` (`src/backend/postgres/clock.zig`).
+Because the framework and any consumer raw SQL both call `now()`, this freezes record autodate
+stamps, KV/metadata timestamps, and a consumer's own `now()` alike. Same comptime `dev_clock`
+gate, so a production Postgres binary is unaffected.
+
 ```sh
 ZIGBASE_FAKE_NOW="2029-03-07T16:00:00Z" ./zigbase serve ...
 ```

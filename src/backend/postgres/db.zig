@@ -8,6 +8,7 @@ const std = @import("std");
 const conn_mod = @import("conn.zig");
 const connstr = @import("connstr.zig");
 const stmt_mod = @import("stmt.zig");
+const frozen_clock = @import("clock.zig");
 
 pub const Conn = conn_mod.Conn;
 pub const Stmt = stmt_mod.Stmt;
@@ -36,6 +37,11 @@ pub const Db = struct {
         var cfg = connstr.parse(gpa, uri) catch return DbError.OpenFailed;
         defer cfg.deinit();
         const conn = conn_mod.Conn.connect(gpa, io, cfg) catch return DbError.OpenFailed;
+        // Dev-only: install the frozen test clock (`ZIGBASE_FAKE_NOW`) on every connection — the
+        // Postgres analog of the SQLite `clock_sql`/`clock_vfs` shims. comptime no-op + does
+        // nothing unless a freeze is active (see backend/postgres/clock.zig). The pool opens
+        // BOTH the writer and every reader through `open`, so this covers all connections.
+        frozen_clock.install(conn);
         return .{ .conn = conn, .gpa = gpa };
     }
 
