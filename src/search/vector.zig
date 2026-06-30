@@ -1,28 +1,45 @@
-//! Vector / nearest-neighbor search (Theme A / #157) — OPT-IN, gated behind the non-default
-//! `-Dvector` build flag (`build_options.vector`).
+//! Vector / nearest-neighbor search (Theme A / #157; Postgres port #159 PR-11) — OPT-IN, gated
+//! behind the non-default `-Dvector` build flag (`build_options.vector`). The SAME flag enables
+//! vector search on BOTH backends: on SQLite it compiles the sqlite-vec amalgamation; on Postgres
+//! it emits the pgvector lowering (no extra C — pgvector is a server EXTENSION). One flag, symmetric
+//! semantics ("vector search is opt-in"), and a default build that is byte-for-byte unaffected.
 //!
 //! When the flag is OFF (the default build) this module is INERT: `enabled` is comptime-false,
 //! `build` returns `error.VectorDisabled` (the list handler maps it to a clean 400 "vector search
 //! not enabled in this build"), and the sqlite-vec C amalgamation is NOT compiled or linked, so the
-//! shipped binary is byte-for-byte unaffected. When the flag is ON, `build.zig` compiles
-//! `vendor/sqlite-vec/sqlite-vec.c` into the SQLite build and `db.zig` registers the extension on
-//! every connection, exposing the `vec_distance_cosine` / `vec_distance_L2` scalar functions used
-//! here to ORDER a list by nearest-neighbor distance to a query embedding (KNN).
+//! shipped binary is byte-for-byte unaffected. When the flag is ON, `build` lowers the `?vector=`
+//! KNN per the active dialect:
+//!
+//!   * **SQLite (sqlite-vec):** `build.zig` compiles `vendor/sqlite-vec/sqlite-vec.c` and `db.zig`
+//!     registers the extension on every connection, exposing the `vec_distance_cosine` /
+//!     `vec_distance_L2` scalar functions used to ORDER a list by distance to the query embedding.
+//!   * **Postgres (pgvector):** the embedding column + the bound query embedding are cast to the
+//!     `vector` type at query time (PostgreSQL's text→type I/O cast), ordered by the native pgvector
+//!     KNN operators `<=>` (cosine distance) / `<->` (L2 distance). The `vector` type + operators
+//!     come from the pgvector server extension, which `ensureExtension` provisions
+//!     (`CREATE EXTENSION IF NOT EXISTS vector`) at startup. This is a brute-force scan — exactly
+//!     symmetric with sqlite-vec's scalar `vec_distance_*` (no ANN index either side); a `vector(N)`
+//!     column + ivfflat/hnsw ANN index is a documented future enhancement that would need a `dims`
+//!     field option.
 //!
 //! Like full-text search, vector search is a READ path: `build` returns a WHERE fragment + an
 //! ORDER-BY distance expression that `records.list` AND-s / appends into the SAME predicate
 //! composition as filter + listRule + ability + tenant-scope + ttl — never a separate, unscoped
-//! query. The query embedding is a BOUND parameter (`?`), never interpolated; the target column and
-//! collection identifiers are gated through `schema.isValidIdentifier`.
+//! query. So a vector search on a tenant-/ability-guarded collection still returns ONLY rows the
+//! caller may view, identically on both backends. The query embedding is ALWAYS a BOUND parameter
+//! (`?` → `$n` on Postgres via the records.list ParamSink renumber), never interpolated; the target
+//! column and collection identifiers are gated through `schema.isValidIdentifier`.
 //!
 //! Embeddings are stored in an ordinary `json`/`text` field as a JSON array (e.g. `[0.1,0.2,…]`);
-//! sqlite-vec parses that JSON directly. The query param form is
-//! `vector=<field>[:cosine|:l2]:<json-embedding>` (cosine is the default metric).
+//! sqlite-vec parses that JSON directly, and pgvector's `vector` text input format is byte-identical
+//! to a JSON array (`[0.1,0.2,…]`), so the same stored value casts cleanly on Postgres. The query
+//! param form is `vector=<field>[:cosine|:l2]:<json-embedding>` (cosine is the default metric).
 
 const std = @import("std");
 const build_options = @import("build_options");
 const schema = @import("../schema.zig");
 const compiler = @import("../query/compiler.zig");
+const db = @import("../db.zig");
 
 /// Comptime gate: true only in a `-Dvector=true` build. All vector functionality folds to
 /// comptime-dead code (and the sqlite-vec C side is absent) when false.
@@ -39,11 +56,14 @@ pub const Vector = struct {
     param: compiler.Param,
 };
 
-/// Build the KNN clause for a `vector=<field>[:metric]:<embedding>` param on `col`, or an error.
-/// `error.VectorDisabled` in a default (non-`-Dvector`) build → the handler returns a clean 400.
-/// `error.BadVector` for a malformed spec / unknown or non-storable target field. The embedding is
-/// bound, never interpolated.
-pub fn build(alloc: std.mem.Allocator, col: schema.Collection, raw: []const u8) VectorError!Vector {
+/// The nearest-neighbor distance metric a `?vector=` query selects (default cosine).
+const Metric = enum { cosine, l2 };
+
+/// Build the KNN clause for a `vector=<field>[:metric]:<embedding>` param on `col` under `dialect`,
+/// or an error. `error.VectorDisabled` in a default (non-`-Dvector`) build → the handler returns a
+/// clean 400. `error.BadVector` for a malformed spec / unknown or non-storable target field. The
+/// embedding is bound, never interpolated.
+pub fn build(alloc: std.mem.Allocator, dialect: db.Dialect, col: schema.Collection, raw: []const u8) VectorError!Vector {
     if (comptime !enabled) return error.VectorDisabled;
     if (!schema.isValidIdentifier(col.name)) return error.BadVector;
 
@@ -52,12 +72,12 @@ pub fn build(alloc: std.mem.Allocator, col: schema.Collection, raw: []const u8) 
     var rest = raw[colon + 1 ..];
     if (!schema.isValidIdentifier(field)) return error.BadVector;
 
-    // Optional metric prefix (default cosine). sqlite-vec exposes vec_distance_cosine / _L2.
-    var dist_fn: []const u8 = "vec_distance_cosine";
+    // Optional metric prefix (default cosine).
+    var metric: Metric = .cosine;
     if (std.mem.startsWith(u8, rest, "cosine:")) {
         rest = rest["cosine:".len..];
     } else if (std.mem.startsWith(u8, rest, "l2:")) {
-        dist_fn = "vec_distance_L2";
+        metric = .l2;
         rest = rest["l2:".len..];
     }
     if (rest.len == 0) return error.BadVector;
@@ -70,16 +90,62 @@ pub fn build(alloc: std.mem.Allocator, col: schema.Collection, raw: []const u8) 
         else => return error.BadVector,
     }
 
-    // Validate the query embedding is a non-empty JSON array of finite numbers BEFORE it reaches
-    // sqlite-vec — a malformed or non-numeric body would otherwise surface as a SQLite runtime error
-    // (500). (A dimension MISMATCH can only be caught at query time, since dims aren't part of the
-    // field schema; the list handler maps that runtime error to a clean 400.)
+    // Validate the query embedding is a non-empty JSON array of finite numbers BEFORE it reaches the
+    // backend — a malformed or non-numeric body would otherwise surface as a runtime error (500).
+    // (A dimension MISMATCH can only be caught at query time, since dims aren't part of the field
+    // schema; the list handler maps that runtime error to a clean 400.)
     if (!try validEmbedding(alloc, rest)) return error.BadVector;
 
+    // The WHERE fragment ("has an embedding") is identical on both backends; only the distance
+    // ORDER-BY expression differs. The single bound `?` (the query embedding) is renumbered to `$n`
+    // on Postgres by the records.list ParamSink pass.
+    const where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" IS NOT NULL", .{ col.name, field });
+    const order_sql = switch (dialect.kind) {
+        // sqlite-vec scalar distance functions over the JSON-array column.
+        .sqlite => try std.fmt.allocPrint(alloc, "{s}(\"{s}\".\"{s}\", ?)", .{
+            switch (metric) {
+                .cosine => "vec_distance_cosine",
+                .l2 => "vec_distance_L2",
+            },
+            col.name,
+            field,
+        }),
+        // pgvector: cast the stored column + the bound embedding to `vector` (text→type I/O cast)
+        // and order by the native KNN operator (`<=>` cosine distance, `<->` L2). Smaller = nearer,
+        // so ASC ordering yields nearest-first. `?::vector` renumbers to `$n::vector` (the `:` after
+        // `?` is not a digit, so the ParamSink treats it as the anonymous placeholder).
+        .postgres => try std.fmt.allocPrint(alloc, "(\"{s}\".\"{s}\")::vector {s} ?::vector", .{
+            col.name,
+            field,
+            switch (metric) {
+                .cosine => "<=>",
+                .l2 => "<->",
+            },
+        }),
+    };
+
     return .{
-        .where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" IS NOT NULL", .{ col.name, field }),
-        .order_sql = try std.fmt.allocPrint(alloc, "{s}(\"{s}\".\"{s}\", ?)", .{ dist_fn, col.name, field }),
+        .where_sql = where_sql,
+        .order_sql = order_sql,
         .param = .{ .text = rest },
+    };
+}
+
+/// Provision the pgvector server extension so the Postgres KNN lowering's `vector` type + `<=>`/
+/// `<->` operators exist. A no-op unless `-Dvector` is compiled in AND the active backend is
+/// Postgres. BEST-EFFORT: a role lacking `CREATE EXTENSION` privilege (or a managed Postgres where
+/// the extension must be pre-installed by an admin) logs a warning rather than aborting startup — a
+/// `?vector=` query then surfaces a clean runtime error at request time instead of taking the whole
+/// server down. Called once from `provision.applySpecs` at startup. The target Postgres must have
+/// the pgvector extension AVAILABLE (e.g. the `pgvector/pgvector:pgNN` image); see docs/api.md.
+pub fn ensureExtension(w: *db.Db) void {
+    if (comptime !enabled) return;
+    if (db.dbDialect(w).kind != .postgres) return;
+    w.exec("CREATE EXTENSION IF NOT EXISTS vector;") catch |e| {
+        std.log.warn(
+            "provision: could not ensure pgvector extension ({s}) — vector search (?vector=) will be unavailable until a privileged role runs 'CREATE EXTENSION vector'",
+            .{@errorName(e)},
+        );
     };
 }
 
@@ -113,10 +179,11 @@ test "vector build is disabled (clean error) in a default build" {
     const col = schema.Collection{ .id = "c", .name = "docs", .fields = &[_]schema.Field{
         .{ .id = "f1", .name = "embedding", .options = .{ .json = .{} } },
     } };
-    try std.testing.expectError(error.VectorDisabled, build(arena.allocator(), col, "embedding:[0.1,0.2]"));
+    try std.testing.expectError(error.VectorDisabled, build(arena.allocator(), db.Dialect.sqlite, col, "embedding:[0.1,0.2]"));
+    try std.testing.expectError(error.VectorDisabled, build(arena.allocator(), db.Dialect.postgres, col, "embedding:[0.1,0.2]"));
 }
 
-test "vector build parses field/metric/embedding and binds the query vector" {
+test "vector build parses field/metric/embedding and binds the query vector (SQLite)" {
     if (comptime !enabled) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -125,21 +192,46 @@ test "vector build parses field/metric/embedding and binds the query vector" {
         .{ .id = "f1", .name = "embedding", .options = .{ .json = .{} } },
         .{ .id = "f2", .name = "n", .options = .{ .number = .{} } },
     } };
-    const v = try build(a, col, "embedding:[0.1,0.2,0.3]");
+    const v = try build(a, db.Dialect.sqlite, col, "embedding:[0.1,0.2,0.3]");
     try std.testing.expectEqualStrings("\"docs\".\"embedding\" IS NOT NULL", v.where_sql);
     try std.testing.expectEqualStrings("vec_distance_cosine(\"docs\".\"embedding\", ?)", v.order_sql);
     try std.testing.expectEqualStrings("[0.1,0.2,0.3]", v.param.text);
     // l2 metric prefix selects the L2 distance function.
-    const v2 = try build(a, col, "embedding:l2:[1,2,3]");
+    const v2 = try build(a, db.Dialect.sqlite, col, "embedding:l2:[1,2,3]");
     try std.testing.expectEqualStrings("vec_distance_L2(\"docs\".\"embedding\", ?)", v2.order_sql);
     // Unknown / non-storable target field is rejected.
-    try std.testing.expectError(error.BadVector, build(a, col, "missing:[1,2]"));
-    try std.testing.expectError(error.BadVector, build(a, col, "n:[1,2]"));
+    try std.testing.expectError(error.BadVector, build(a, db.Dialect.sqlite, col, "missing:[1,2]"));
+    try std.testing.expectError(error.BadVector, build(a, db.Dialect.sqlite, col, "n:[1,2]"));
     // A malformed / non-numeric embedding is rejected at build time (-> 400, never a SQLite 500).
-    try std.testing.expectError(error.BadVector, build(a, col, "embedding:not-json"));
-    try std.testing.expectError(error.BadVector, build(a, col, "embedding:[1,\"x\"]"));
-    try std.testing.expectError(error.BadVector, build(a, col, "embedding:{\"a\":1}"));
-    try std.testing.expectError(error.BadVector, build(a, col, "embedding:[]"));
+    try std.testing.expectError(error.BadVector, build(a, db.Dialect.sqlite, col, "embedding:not-json"));
+    try std.testing.expectError(error.BadVector, build(a, db.Dialect.sqlite, col, "embedding:[1,\"x\"]"));
+    try std.testing.expectError(error.BadVector, build(a, db.Dialect.sqlite, col, "embedding:{\"a\":1}"));
+    try std.testing.expectError(error.BadVector, build(a, db.Dialect.sqlite, col, "embedding:[]"));
+}
+
+test "vector build lowers to pgvector operators under the Postgres dialect" {
+    if (comptime !enabled) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = schema.Collection{ .id = "c", .name = "docs", .fields = &[_]schema.Field{
+        .{ .id = "f1", .name = "embedding", .options = .{ .json = .{} } },
+    } };
+    // Cosine (default) → `<=>`; both operands cast to `vector`. WHERE fragment is backend-identical.
+    const v = try build(a, db.Dialect.postgres, col, "embedding:[0.1,0.2,0.3]");
+    try std.testing.expectEqualStrings("\"docs\".\"embedding\" IS NOT NULL", v.where_sql);
+    try std.testing.expectEqualStrings("(\"docs\".\"embedding\")::vector <=> ?::vector", v.order_sql);
+    try std.testing.expectEqualStrings("[0.1,0.2,0.3]", v.param.text);
+    // l2 metric → `<->`.
+    const v2 = try build(a, db.Dialect.postgres, col, "embedding:l2:[1,2,3]");
+    try std.testing.expectEqualStrings("(\"docs\".\"embedding\")::vector <-> ?::vector", v2.order_sql);
+    // Same validation as SQLite: unknown field / malformed embedding rejected at build time.
+    try std.testing.expectError(error.BadVector, build(a, db.Dialect.postgres, col, "missing:[1,2]"));
+    try std.testing.expectError(error.BadVector, build(a, db.Dialect.postgres, col, "embedding:[]"));
+    // The `?::vector` placeholder renumbers to `$n::vector` under the Postgres ParamSink.
+    const param_sink = @import("../sql/param_sink.zig");
+    const rn = try param_sink.renumber(a, db.Dialect.postgres, v.order_sql);
+    try std.testing.expectEqualStrings("(\"docs\".\"embedding\")::vector <=> $1::vector", rn);
 }
 
 test "validEmbedding accepts numeric arrays and rejects malformed input (build-independent)" {
@@ -157,7 +249,6 @@ test "validEmbedding accepts numeric arrays and rejects malformed input (build-i
 
 test "sqlite-vec extension is registered and vec_distance functions evaluate (KNN end-to-end)" {
     if (comptime !enabled) return error.SkipZigTest;
-    const db = @import("../db.zig");
     var d = try db.Db.openMemory();
     defer d.close();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -172,7 +263,7 @@ test "sqlite-vec extension is registered and vec_distance functions evaluate (KN
     // Nearest-neighbor ordering over a JSON embedding column orders the closest row first.
     try d.exec("CREATE TABLE emb (id TEXT, v TEXT);");
     try d.exec("INSERT INTO emb VALUES ('far','[0,1]'),('near','[1,0]'),('mid','[1,1]');");
-    const v = try build(a, schema.Collection{ .id = "e", .name = "emb", .fields = &[_]schema.Field{
+    const v = try build(a, db.Dialect.sqlite, schema.Collection{ .id = "e", .name = "emb", .fields = &[_]schema.Field{
         .{ .id = "f1", .name = "v", .options = .{ .json = .{} } },
     } }, "v:l2:[1,0]");
     const sql = try std.fmt.allocPrintSentinel(a, "SELECT id FROM emb WHERE {s} ORDER BY {s};", .{ v.where_sql, v.order_sql }, 0);

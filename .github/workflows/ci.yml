@@ -125,7 +125,10 @@ jobs:
       ZIGBASE_PG_TEST_URL: postgres://zbpg:zbpg_secret_pw@127.0.0.1:5432/zbpgtest?sslmode=prefer
     services:
       postgres:
-        image: postgres:16
+        # pgvector/pgvector:pg16 = postgres:16 + the pgvector extension AVAILABLE (#159, PR-11), so
+        # the -Dvector live tests can `CREATE EXTENSION vector` (POSTGRES_USER is a superuser here)
+        # and exercise the pgvector KNN lowering. Identical env/health to the stock postgres:16.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: zbpg
           POSTGRES_PASSWORD: zbpg_secret_pw
@@ -156,8 +159,11 @@ jobs:
           restore-keys: |
             zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
             zig-local-postgres-${{ runner.os }}-zig0.16.0-
-      - name: Unit + PostgreSQL driver tests (-Dpostgres=true)
-        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true
+      # -Dvector=true so the live pgvector KNN parity + tenant/ability chokepoint tests run too
+      # (sqlite-vec is also compiled in; the SQLite vector tests run alongside). The pgvector image
+      # above makes `CREATE EXTENSION vector` succeed for the superuser test role.
+      - name: Unit + PostgreSQL driver tests (-Dpostgres=true -Dvector=true)
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true -Dvector=true
 
   # PostgreSQL with server TLS, so the suite runs over a REAL sslmode=require connection —
   # exercising the TLS handshake, the dual-layer flushOut, and TLS partial-read framing (the

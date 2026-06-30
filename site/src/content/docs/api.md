@@ -427,10 +427,11 @@ backend. The exact relevance ORDER can differ between the two ranking functions 
 length-normalizes; `ts_rank` does not), but the matched set is equivalent. `plainto_tsquery` parses
 the plain term (it does not honor the `AND`/`OR`/`NOT`/`*` operators).
 
-**Vector / nearest-neighbor (sqlite-vec) — opt-in `-Dvector` build.** Vector search is **not**
-compiled into the default binary. Build with `-Dvector=true` to vendor and link
-[`sqlite-vec`](https://github.com/asg017/sqlite-vec); ZigBase then registers it on every
-connection and enables KNN ordering over a field that stores a JSON embedding array:
+**Vector / nearest-neighbor — opt-in `-Dvector` build.** Vector search is **not** compiled into the
+default binary. The single `-Dvector=true` flag enables KNN on **both** backends — on SQLite it
+vendors and links [`sqlite-vec`](https://github.com/asg017/sqlite-vec) (registered on every
+connection); on Postgres it emits the [pgvector](https://github.com/pgvector/pgvector) lowering. It
+enables KNN ordering over a field that stores a JSON embedding array:
 
 ```text
 GET /api/collections/docs/records?vector=embedding:cosine:[0.12,0.04,...]
@@ -443,6 +444,26 @@ bound; a malformed or dimension-mismatched embedding returns a clean **400**. In
 build** a `vector` query returns **400** (`"Vector search is not enabled in this build."`), and the
 binary is byte-for-byte unaffected. Vector search runs in offset mode (cursor paging is rejected
 with 400).
+
+The **stored** embedding field must hold a **numeric JSON array of a consistent dimension** across
+the collection's rows — that is the value the distance operator compares against. There is currently
+**no write-time validation** of stored embeddings (planned as future work), so a row whose embedding
+is malformed (valid JSON but not a numeric array) or of a differing dimension makes that scoped
+collection's `?vector=` query **fail closed** — a clean **400** (no data leak; the connection
+recovers), symmetric on both backends — until the offending row is corrected.
+
+**Vector on Postgres (pgvector) — opt-in `-Dvector` build.** On a Postgres backend the SAME
+`?vector=` API is backed by pgvector: the embedding column and the bound query embedding are cast to
+the `vector` type at query time and ordered by the native KNN operators `<=>` (cosine distance) /
+`<->` (L2). The embedding stays in an ordinary JSON field (no schema change) — a brute-force scan,
+exactly symmetric with sqlite-vec's scalar distance (no ANN index either side). A `-Dvector` build
+runs `CREATE EXTENSION IF NOT EXISTS vector` at startup, so the target PostgreSQL must have
+**pgvector available** (e.g. the [`pgvector/pgvector:pgNN`](https://hub.docker.com/r/pgvector/pgvector)
+image, or `apt install postgresql-NN-pgvector`); if the connecting role lacks privilege to create
+the extension, install it once as a superuser (`CREATE EXTENSION vector;`) — startup then logs a
+warning and continues rather than aborting. As with full-text search, the KNN composes with the
+*same composed-`WHERE` scoping* (filter + list rule + abilities + tenant), so a tenant-/ability-scoped
+vector search returns only the rows the caller may view — identically on both backends.
 
 ## Access rules
 

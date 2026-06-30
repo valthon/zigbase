@@ -1836,7 +1836,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     if (q.vectorSpec) |vspec| if (vspec.len > 0) {
         // `vector.build` carries the explicit `error.VectorDisabled` in a default build, so the
         // handler's error mapping stays well-typed regardless of the `-Dvector` flag.
-        const v = try vector.build(alloc, col, vspec);
+        const v = try vector.build(alloc, dialect, col, vspec);
         if (q.cursor != null or q.cursorMode) return error.VectorCursorUnsupported;
         where_sql = if (where_sql.len > 0)
             try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, v.where_sql })
