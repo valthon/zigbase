@@ -283,10 +283,13 @@ fn copyTable(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []cons
     if (cols.items.len == 0) return 0;
 
     // Clear the target table first so a re-run (under --force) is idempotent. Postgres uses
-    // TRUNCATE … CASCADE (so a parent with seeded/old child rows clears cleanly — every table is
-    // reloaded anyway); SQLite has no TRUNCATE, so DELETE FROM.
+    // TRUNCATE … RESTART IDENTITY CASCADE: RESTART IDENTITY resets owned sequences so a --force
+    // re-migration regenerates `_events._seq` (and any IDENTITY) densely from 1 — making repeat
+    // migrations deterministic and preserving the dense-`_seq`-from-1 invariant the rollup
+    // watermark reset relies on; CASCADE clears a parent with seeded/old child rows (every table is
+    // reloaded anyway). SQLite has no TRUNCATE, so DELETE FROM (rowids restart on an emptied table).
     const clear_sql = switch (db.dbBackend(target)) {
-        .postgres => try std.fmt.allocPrintSentinel(al, "TRUNCATE TABLE {s} CASCADE;", .{try ddl.quoteIdent(al, table)}, 0),
+        .postgres => try std.fmt.allocPrintSentinel(al, "TRUNCATE TABLE {s} RESTART IDENTITY CASCADE;", .{try ddl.quoteIdent(al, table)}, 0),
         .sqlite => try std.fmt.allocPrintSentinel(al, "DELETE FROM {s};", .{try ddl.quoteIdent(al, table)}, 0),
     };
     try target.exec(clear_sql);

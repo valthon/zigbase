@@ -108,10 +108,7 @@ test "pg dumpload: SQLite -> Postgres round-trips records, an encrypted field, a
 
     // ---- Migrate ---------------------------------------------------------------------------
     const report = try dumpload.run(a, &source, &target, .{});
-    defer {
-        for (report.tables) |t| a.free(t.name);
-        a.free(report.tables);
-    }
+    defer report.deinit(a);
     // Two user record tables (authors, notes) provisioned; system tables came from migrations.
     try std.testing.expectEqual(@as(usize, 2), report.collections_provisioned);
 
@@ -173,17 +170,13 @@ test "pg dumpload: refuses a non-empty Postgres target without --force, proceeds
     // First migration provisions the schema → target now non-empty.
     {
         const r = try dumpload.run(a, &source, &target, .{});
-        for (r.tables) |t| a.free(t.name);
-        a.free(r.tables);
+        r.deinit(a);
     }
     // A second run without --force is refused…
     try std.testing.expectError(dumpload.Error.TargetNotEmpty, dumpload.run(a, &source, &target, .{}));
     // …and accepted with --force.
     const r2 = try dumpload.run(a, &source, &target, .{ .force = true });
-    defer {
-        for (r2.tables) |t| a.free(t.name);
-        a.free(r2.tables);
-    }
+    defer r2.deinit(a);
     try std.testing.expect(r2.total_rows > 0);
 }
 
@@ -224,4 +217,58 @@ test "pg dumpload: a mid-load failure rolls the whole load back to zero migrated
         try std.testing.expect(try st.step());
         try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
     }
+}
+
+/// Collect `(id, _seq)` for every `_events` row on the target, ordered by id, as `"id=seq"` strings.
+fn eventSeqsById(al: std.mem.Allocator, d: *dbm.Db) ![]const []const u8 {
+    var st = try d.prepare("SELECT \"id\", \"_seq\" FROM \"_events\" ORDER BY \"id\";");
+    defer st.finalize();
+    var out: std.ArrayList([]const u8) = .empty;
+    while (try st.step())
+        try out.append(al, try std.fmt.allocPrint(al, "{s}={d}", .{ st.columnText(0), st.columnInt(1) }));
+    return out.toOwnedSlice(al);
+}
+
+test "pg dumpload: a --force re-migration regenerates IDENTITY densely (RESTART IDENTITY determinism)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var target = (try openTargetOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer target.close();
+    const sname = try enterTempSchema(al, &target);
+    defer dropTempSchema(al, &target, sname);
+
+    // Source with three `_events` rows. On the target, `_events._seq` is a GENERATED ALWAYS AS
+    // IDENTITY column regenerated during the load (the source has no `_seq`).
+    var source = try dbm.Db.openMemory();
+    defer source.close();
+    try migrations.run(&source);
+    try source.exec(
+        \\INSERT INTO "_events" ("id","created","updated","name","payload","account","occurred_at") VALUES
+        \\ ('e1','t','t','x','{}','acc1','2026-01-01T08:00:00Z'),
+        \\ ('e2','t','t','x','{}','acc1','2026-01-01T09:00:00Z'),
+        \\ ('e3','t','t','x','{}','acc1','2026-01-01T10:00:00Z');
+    );
+
+    // First migration → capture the assigned `_seq` per event id.
+    {
+        const r = try dumpload.run(a, &source, &target, .{});
+        r.deinit(a);
+    }
+    const first = try eventSeqsById(al, &target);
+    // Dense from 1: the three rows get _seq 1..3 (deterministic, source rowid order).
+    try std.testing.expectEqual(@as(usize, 3), first.len);
+
+    // A `--force` re-migration must produce the IDENTICAL `_seq` mapping — TRUNCATE … RESTART
+    // IDENTITY resets the sequence so it regenerates 1..N rather than continuing 4..6.
+    {
+        const r2 = try dumpload.run(a, &source, &target, .{ .force = true });
+        r2.deinit(a);
+    }
+    const second = try eventSeqsById(al, &target);
+    try std.testing.expectEqual(first.len, second.len);
+    for (first, second) |x, y| try std.testing.expectEqualStrings(x, y);
 }

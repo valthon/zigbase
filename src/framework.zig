@@ -1421,7 +1421,7 @@ fn migrateDbImpl(allocator: std.mem.Allocator, io: std.Io, ma: cli.MigrateDbArgs
         return error.MissingTo;
     };
     if (!db.connstrLooksLikePostgres(to)) {
-        std.log.err("migrate-db: --to must be a postgres:// URL (got '{s}')", .{to});
+        std.log.err("migrate-db: --to must be a postgres:// or postgresql:// URL (got '{s}')", .{to});
         return error.InvalidTarget;
     }
     if (comptime !build_options.postgres) {
