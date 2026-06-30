@@ -1,6 +1,6 @@
 # Known Limitations
 
-ZigBase v0.8.0 is an early release. The gaps below are known and tracked for future releases.
+ZigBase v0.9.0 is an early release. The gaps below are known and tracked for future releases.
 
 ## Auth & email
 - **Per-device session list/revoke requires opt-in `.session_store = .table`.** The default `App(.{ .session_store = .epoch })` revokes per **principal** via the token epoch — `revokeAllSessions()` ("log out everywhere"), `refresh()`, `rotate()` — stateless, with zero extra DB work and unchanged token format. Opting into `App(.{ .session_store = .table })` adds a server-side `_sessions` store enabling `listActiveSessions()` and per-session `revoke(sessionId)` ("log out THIS device"), at the cost of **one extra read per authenticated request** (the documented trade-off). In `.epoch` mode the two per-device verbs return `error.SessionStoreNotEnabled`.
@@ -44,6 +44,9 @@ ZigBase v0.8.0 is an early release. The gaps below are known and tracked for fut
 - In **dir** mode (`--serve-static` or comptime `.dir`), caching is controlled by
   facil.io's `sendFile` (fixed `Cache-Control: max-age=3600`) — this value is not
   configurable yet.
+
+## Postgres backend
+- **SQLite→Postgres dump/load migration requires a SUPERUSER target for the fast path.** The one-shot migration tool suspends foreign-key enforcement during bulk load via `SET session_replication_role = replica`, which Postgres permits only on a **superuser** connection. Migrating into a non-superuser **managed** Postgres (AWS RDS, Google Cloud SQL, and similar, where the application role is never a true superuser) falls back to loading tables in **topological (dependency) order** so FK constraints are satisfied without suspension. That topological fallback is **lightly tested** and may mishandle cyclic or self-referential FK graphs; verify the result and treat it as a **0.9.x follow-up** to harden. The superuser fast path remains the recommended route where available.
 
 ## Other deferred work
 - Image thumbnails / transforms; an S3 (or other remote) storage backend — a pluggable `.storage` slot exists, but only the local-disk backend ships; `fields=` response projection; resumable/chunked uploads; realtime backfill/replay and per-event-guard load-tuning.
