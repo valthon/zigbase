@@ -853,6 +853,21 @@ must re-fetch the actual state over an authenticated GET. Use the payload-carryi
 `broadcast(topic, payload)` only for data that is safe for **every** subscriber of that
 topic, and use `.canSubscribe` to restrict who may join a private channel.
 
+#### Multi-instance realtime (Postgres)
+
+Realtime delivery is **in-process**: a record write publishes to facil.io's pub/sub inside the
+writing instance, which is complete parity for the single-process SQLite story. When you run
+**several app instances against one shared PostgreSQL** (the reason to use the Postgres backend),
+ZigBase additionally fans record-change events across instances over Postgres **`LISTEN`/`NOTIFY`**
+— a write on instance A reaches subscribers connected to instances B and C. This is **automatic**
+when the active backend is Postgres (no configuration); each instance runs a dedicated listener
+connection, and on a notification it re-fetches the row and runs **its own** per-subscriber
+`viewRule`/ability/tenant authorization before delivering (deletes are authorized against a
+snapshot carried in the notification). On **SQLite** (single-process) nothing changes — there is
+no cross-process step, and the in-process path is byte-identical. Custom-channel
+`ctx.realtime().broadcast`/`signal` events are **per-instance** (not yet fanned out cross-instance);
+record-change events are the cross-instance path.
+
 ### Test-mode capture — assert sent mail + mock outbound HTTP (`zigbase.testcapture`)
 
 For deterministic e2e/integration tests, the framework can capture what it *sent* — an

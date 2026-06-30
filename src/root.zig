@@ -258,6 +258,7 @@ test {
     _ = @import("realtime/connection.zig");
     _ = @import("realtime/hub.zig");
     _ = @import("realtime/ws.zig");
+    _ = @import("realtime/pg_bridge.zig");
     _ = @import("files/naming.zig");
     _ = @import("files/mime.zig");
     _ = @import("files/storage.zig");

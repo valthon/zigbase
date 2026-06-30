@@ -382,6 +382,46 @@ pub inline fn dbDialect(d: *const Db) Dialect {
     });
 }
 
+// ---- LISTEN/NOTIFY seam (#159, PR-6b cross-instance realtime) ---------------
+// Postgres async notifications, exposed through the union seam so the realtime bridge never
+// names a backend type. SQLite is single-process — every helper is a comptime no-op there, so
+// the default build links zero new behavior and the realtime in-process hub is unchanged.
+
+/// An async LISTEN/NOTIFY notification. On Postgres this aliases the driver's type; in the
+/// default (SQLite) build it is a structurally-identical stand-in so callers compile uniformly
+/// (the helpers below only ever return one on a Postgres-backed `Db`).
+pub const Notification = if (build_options.postgres) pg.Db.Notification else struct {
+    pid: i32,
+    channel: []const u8,
+    payload: []const u8,
+};
+
+/// `LISTEN "<channel>"` on a Postgres `Db`. No-op on SQLite (in-process delivery only).
+pub inline fn dbListen(d: *Db, channel: []const u8) DbError!void {
+    if (build_options.postgres) switch (d.*) {
+        .postgres => |*x| return x.listen(channel),
+        .sqlite => {},
+    };
+}
+
+/// `NOTIFY <channel>, '<payload>'` (via `pg_notify`) on a Postgres `Db`. No-op on SQLite.
+pub inline fn dbNotify(d: *Db, arena: std.mem.Allocator, channel: []const u8, payload: []const u8) DbError!void {
+    if (build_options.postgres) switch (d.*) {
+        .postgres => |*x| return x.notify(arena, channel, payload),
+        .sqlite => {},
+    };
+}
+
+/// Block for the next async notification on a Postgres `Db` (copied into `arena`); null if the
+/// next wire message was not a notification. Always null on SQLite.
+pub inline fn dbWaitNotification(d: *Db, arena: std.mem.Allocator) DbError!?Notification {
+    if (build_options.postgres) switch (d.*) {
+        .postgres => |*x| return x.waitNotification(arena),
+        .sqlite => return null,
+    };
+    return null;
+}
+
 // ---- Test discovery --------------------------------------------------------
 // Pull in the relocated SQLite backend's tests + the dialect tests. The Postgres
 // seam-smoke lives in backend/seam_test.zig, referenced from root.zig only under

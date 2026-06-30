@@ -77,4 +77,7 @@ test {
     // PR-10: live full-text-search parity (tsvector/@@/ts_rank) + tenant/ability-scoped search
     // chokepoint composition. Skips if no PG.
     _ = @import("fts_pg_test.zig");
+    // PR-6/6b: live realtime authz parity (create/update/delete delivery + snapshot authz) and
+    // cross-instance LISTEN/NOTIFY (NOTIFY on conn A received by a listener on conn B). Skips if no PG.
+    _ = @import("realtime_pg_test.zig");
 }

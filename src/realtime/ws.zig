@@ -5,7 +5,9 @@ const App = @import("../app.zig").App;
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
+const records = @import("../records.zig");
 const policy = @import("../policy.zig");
+const pg_bridge = @import("pg_bridge.zig");
 const auth = @import("../auth.zig");
 const id = @import("../id.zig");
 const protocol = @import("protocol.zig");
@@ -427,16 +429,60 @@ fn onClose(context: ?*LiveConn, uuid: isize) anyerror!void {
 
 /// Publish a record event to its collection + record channels. Called from the record-writer path
 /// (any thread); `fio_publish` is a non-blocking enqueue. `record` is the full record for
-/// create/update (hidden fields already stripped) and is ignored for delete (id-only).
+/// create/update (hidden fields already stripped) and the deletion snapshot for delete.
+///
+/// On Postgres this ALSO fans the event out to other app instances via `NOTIFY` (#159, PR-6b) so
+/// multi-instance deployments deliver realtime correctly; on SQLite (single-process) `emit` is a
+/// no-op and behavior is byte-identical.
 pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, record_id: []const u8, record: ?std.json.Value) void {
     if (!active) return; // reactor not running (tests/CLI): no-op to avoid "cluster inactive" + UB
-    _ = app;
+    publishFrames(col.name, action, record_id, record);
+    pg_bridge.emit(app, col.name, action, record_id, record);
+}
+
+/// Build + publish the two event frames into the LOCAL in-process hub (no NOTIFY). Shared by the
+/// writer path (`broadcast`) and the cross-instance listener (`onRemoteEvent`), so a notification
+/// from another instance flows through the exact same `onChannelMessage` per-subscriber authz.
+fn publishFrames(collection: []const u8, action: protocol.Action, record_id: []const u8, record: ?std.json.Value) void {
+    if (!active) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const ef = hub.buildEventFrames(a, col.name, action, record_id, record) catch return;
+    const ef = hub.buildEventFrames(a, collection, action, record_id, record) catch return;
     WS.publish(.{ .channel = ef.collection_channel, .message = ef.frame_collection });
     WS.publish(.{ .channel = ef.record_channel, .message = ef.frame_record });
+}
+
+/// Cross-instance bridge callback (#159, PR-6b): a record event NOTIFY'd by ANOTHER instance.
+/// Re-feeds the local hub so each local subscriber's existing view/ability/tenant authz runs in
+/// `onChannelMessage` — create/update re-fetch the live row, delete uses the carried snapshot.
+fn onRemoteEvent(app: *App, ev: pg_bridge.Event) void {
+    if (!active) return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var r = app.pool.acquireReader() catch return;
+    defer app.pool.releaseReader(&r);
+    const col = (collections.get(a, &r, ev.collection) catch return) orelse return;
+    if (ev.action == .delete) {
+        // The live row is gone; deliver the id-only frame carrying the pre-delete snapshot under
+        // the private authz key (stripped before client delivery, exactly as the local path).
+        publishFrames(col.name, .delete, ev.id, ev.snapshot);
+    } else {
+        // Re-fetch the current row (hidden fields stripped, TTL-respecting) so subscribers get the
+        // real payload; skip if it was deleted/expired in the meantime.
+        const rec = (records.get(a, &r, col, ev.id) catch return) orelse return;
+        publishFrames(col.name, ev.action, ev.id, rec);
+    }
+}
+
+/// Start the Postgres cross-instance LISTEN bridge (#159, PR-6b). A no-op on SQLite / when the
+/// active backend is not Postgres. Best-effort: a failure to start logs + leaves single-instance
+/// realtime working. Called once by the server just before `zap.start` (reactor live).
+pub fn startRemoteListener(app: *App) void {
+    pg_bridge.startListener(app, &onRemoteEvent) catch |e| {
+        std.log.warn("realtime: Postgres LISTEN bridge unavailable: {s}", .{@errorName(e)});
+    };
 }
 
 /// Signal-only feature-management push (#128/#129/#130): publish `{"type":"features.changed"}`

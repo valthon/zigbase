@@ -100,6 +100,14 @@ pub fn shouldDeliver(
 /// touching the (now row-less) live DB. Relation-traversing rules resolve against empty target
 /// tables in the temp DB and therefore won't match — a conservative (deny) failure for delete
 /// events, which is the safe direction.
+///
+/// BACKEND-AGNOSTIC (#159, PR-6): the sandbox is `db.Db.openMemory()`, which is ALWAYS the SQLite
+/// union arm (SQLite is compiled into every build; Postgres has no `:memory:` analog). So this
+/// delete-snapshot authz works identically whether the LIVE backend is SQLite or Postgres — it is
+/// a self-contained, SQLite-dialect rule evaluator that never touches the live DB. `matchesRule`
+/// derives its dialect per-`Db` (`db.dbDialect`), so the temp DB compiles SQLite SQL while the
+/// create/update path against the live `reader` compiles Postgres `$n`/`now()` SQL — each
+/// self-consistent.
 fn matchesSnapshot(
     alloc: std.mem.Allocator,
     io: std.Io,
