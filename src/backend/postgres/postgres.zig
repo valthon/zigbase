@@ -71,4 +71,7 @@ test {
     _ = @import("encryption_pg_test.zig");
     // PR-4: live KV store / TTL-GC / sticky-experiment dialect parity. Skips if no PG.
     _ = @import("kvttl_pg_test.zig");
+    // PR-8: live typed-client codegen parity (data-dir adapter opens a postgres:// source;
+    // generated client is byte-identical to SQLite). Skips if no PG.
+    _ = @import("codegen_pg_test.zig");
 }

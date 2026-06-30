@@ -84,7 +84,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, opts: Options) !void {
         return error.BadSource;
     }
     const cols = if (opts.data_dir) |dir|
-        try acquire_datadir.acquire(alloc, dir)
+        try acquire_datadir.acquire(alloc, io, dir)
     else
         try acquireHttp(alloc, io, opts); // implemented in Task 4
 

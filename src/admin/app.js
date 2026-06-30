@@ -18,6 +18,8 @@ async function api(method, path, body, isForm) {
   return data;
 }
 const API = {
+  // Read-only backend badge (no secrets): { status, backend: 'sqlite' | 'postgres' }.
+  health: () => api('GET', '/health'),
   login: (identity, password) => api('POST', '/collections/_superusers/auth-with-password', { identity, password }),
   logout: () => api('POST', '/collections/_superusers/auth-logout'),
   collections: () => api('GET', '/collections'),
@@ -97,9 +99,12 @@ function App() {
 function Shell({ route }) {
   const [cols, setCols] = useState(null);
   const [err, setErr] = useState('');
+  const [backend, setBackend] = useState('');
   const [collapsed, setCollapsed] = useState(localStorage.getItem('zb_sidebar') === '1');
   useEffect(() => {
     API.collections().then(setCols).catch(x => setErr((x.data && x.data.message) || 'Failed to load collections'));
+    // Read-only backend badge; degrade silently if /health is unreachable.
+    API.health().then(h => setBackend(h && h.backend ? h.backend : '')).catch(() => {});
   }, []);
   function toggle() { const v = !collapsed; setCollapsed(v); localStorage.setItem('zb_sidebar', v ? '1' : '0'); }
   async function logout() { try { await API.logout(); } catch (_) {} go('#/login'); }
@@ -108,7 +113,7 @@ function Shell({ route }) {
   return html`
     <div class="shell">
       <div class=${'sidebar' + (collapsed ? ' collapsed' : '')}>
-        <div class="brand"><span class="hide-collapsed">zigbase</span><button class="ghost" data-test="sidebar-toggle" onClick=${toggle}>${collapsed ? '»' : '«'}</button></div>
+        <div class="brand"><span class="hide-collapsed">zigbase</span>${backend ? html`<span class="badge hide-collapsed" data-test="backend-badge" title="Active database backend">${backend === 'postgres' ? 'Postgres' : 'SQLite'}</span>` : ''}<button class="ghost" data-test="sidebar-toggle" onClick=${toggle}>${collapsed ? '»' : '«'}</button></div>
         <div class="hide-collapsed muted" style="font-size:11px;text-transform:uppercase">Collections</div>
         ${cols == null ? html`<div class="muted">…</div>` :
           cols.map(c => html`<a key=${c.id} class=${'navitem' + (c.name === activeCol ? ' active' : '')} data-test=${'nav-' + c.name} href=${'#/collections/' + encodeURIComponent(c.name) + '/records'}>

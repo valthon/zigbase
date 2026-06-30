@@ -11,6 +11,14 @@ def test_login_then_sidebar_lists_builtin_collections(page):
     login(page)
     assert page.locator('[data-test=nav-_superusers]').count() == 1
 
+def test_sidebar_shows_backend_badge(page):
+    # Read-only backend badge sourced from GET /api/health {"backend": "..."}.
+    # The browser suite runs on the default SQLite build, so it reads "SQLite".
+    login(page)
+    badge = page.locator('[data-test=backend-badge]')
+    badge.wait_for(timeout=5000)
+    assert badge.inner_text().strip() == "SQLite"
+
 def test_unauthenticated_deeplink_bounces_to_login(page):
     page.goto("/_/#/collections/_superusers/records")
     page.wait_for_selector('[data-test=email]', timeout=5000)

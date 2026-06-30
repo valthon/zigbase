@@ -1075,6 +1075,20 @@ to view that record — a delete on someone else's record is not leaked to other
 
 Malformed or unknown client frames produce `{ "type": "error", "message": "..." }`.
 
+## Health
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/health` | Liveness probe + the active database backend. No auth. |
+
+```json
+{ "status": "ok", "backend": "sqlite" }
+```
+
+`backend` is `"sqlite"` or `"postgres"` — the *kind* of database the server is running on. It is
+deliberately read-only and carries **no** secrets: the connection string, host, and credentials are
+never exposed. The admin UI reads this to show a small backend badge in the sidebar.
+
 ## See also
 
 - [Tutorial](./tutorial) — build an app on ZigBase, end to end.
