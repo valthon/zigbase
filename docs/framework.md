@@ -900,8 +900,13 @@ row's snapshot in a small server-side table (`_rt_delete_snapshots`), which the 
 over its own DB connection. This is deliberate: putting the deleted row in the `NOTIFY` payload
 would broadcast its column data — including the **decrypted plaintext of `.encrypted` fields** — to
 any DB role that can `LISTEN`, so the snapshot is stored at-rest (ciphertext) in the side table and
-never transits the wire. On **SQLite** (single-process) nothing changes — there is no cross-process
-step, no side table, and the in-process path is byte-identical. Custom-channel
+never transits the wire. Delete **authorization** likewise evaluates the deleted row's `viewRule`
+against the **at-rest (ciphertext)** snapshot on every path — local and cross-instance — matching
+the live create/update path (which compares the ciphertext column); a rule that references an
+`.encrypted` field therefore authorizes a delete identically everywhere. On **SQLite**
+(single-process) nothing changes — there is no cross-process step, no side table, and the in-process
+path is byte-identical (for the common case of no encrypted fields the delete takes no extra read).
+Custom-channel
 `ctx.realtime().broadcast`/`signal` events are **per-instance** (not yet fanned out cross-instance);
 record-change events are the cross-instance path.
 

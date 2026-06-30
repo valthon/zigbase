@@ -83,7 +83,9 @@ pub fn originId(io: std.Io) []const u8 {
     if (origin_ready.load(.acquire)) return &origin_hex;
     while (!origin_mu.tryLock()) std.atomic.spinLoopHint();
     defer origin_mu.unlock();
-    if (!origin_ready.load(.monotonic)) {
+    // `.acquire` (paired with the `.release` store below) so a later lock-free `.acquire` reader
+    // that observes `origin_ready == true` is guaranteed to see the initialized `origin_hex` bytes.
+    if (!origin_ready.load(.acquire)) {
         var raw: [8]u8 = undefined;
         entropy.fill(io, &raw);
         const hex = "0123456789abcdef";

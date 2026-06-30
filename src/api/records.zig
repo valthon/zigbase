@@ -498,11 +498,13 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return hookRejected(ctx);
     };
-    // Cross-instance realtime (#159, PR-6b, Postgres only): capture the deleted row's AT-REST
-    // (ciphertext) snapshot into the side table INSIDE this transaction so it commits atomically
-    // with the delete; the returned token (not the row data) is all that rides the NOTIFY wire.
-    // No-op (null) on SQLite — single-process, byte-identical.
-    const notify_token = realtime_ws.captureDeleteSnapshot(ctx.allocator, app, w, col, rid);
+    // Realtime delete prep (#159, PR-6/PR-6b), INSIDE this transaction so a Postgres side-table
+    // snapshot commits atomically with the delete. Returns the AT-REST (ciphertext) snapshot used
+    // for delete authz — so LOCAL authz matches the cross-instance REMOTE path and the live
+    // create/update path (all compare ciphertext) — plus the cross-instance NOTIFY token (Postgres
+    // only; the wire carries only the token, never the row data). On SQLite with no encrypted
+    // fields this reuses `ex_mut` with no extra read (byte-identical).
+    const rt = realtime_ws.prepareDelete(ctx.allocator, app, w, col, rid, ex_mut);
     if (!try records.deleteInTxn(ctx.allocator, w, col, rid)) {
         w.rollback() catch {};
         return ApiError.notFound().toResponse(ctx.allocator);
@@ -522,7 +524,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // F4: pass the deleted row's snapshot so subscribers to an owner/expression-scoped collection
     // can re-authorize the delete event (the live row is gone). The snapshot rides in the published
     // frame under a private key and is stripped before any client receives the id-only delete frame.
-    realtime_ws.broadcast(app, col, .delete, rid, ex_mut, notify_token);
+    realtime_ws.broadcast(app, col, .delete, rid, rt.snapshot, rt.token);
     return .{ .status = 204, .body = "" };
 }
 

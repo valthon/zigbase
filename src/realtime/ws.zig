@@ -434,7 +434,7 @@ fn onClose(context: ?*LiveConn, uuid: isize) anyerror!void {
 /// On Postgres this ALSO fans the event out to other app instances via `NOTIFY` (#159, PR-6b) so
 /// multi-instance deployments deliver realtime correctly; on SQLite (single-process) `emit` is a
 /// no-op and behavior is byte-identical. `notify_token` (delete only) keys the deleted row's
-/// at-rest snapshot in the side table — see `captureDeleteSnapshot`; null for create/update and on
+/// at-rest snapshot in the side table — see `prepareDelete`; null for create/update and on
 /// SQLite. The NOTIFY carries only the token, never the (possibly encrypted) row data.
 pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, record_id: []const u8, record: ?std.json.Value, notify_token: ?[]const u8) void {
     if (!active) return; // reactor not running (tests/CLI): no-op to avoid "cluster inactive" + UB
@@ -442,18 +442,38 @@ pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, rec
     pg_bridge.emit(app, col.name, action, record_id, notify_token);
 }
 
-/// Capture + persist a deleted row's AT-REST (ciphertext) snapshot for cross-instance delete authz
-/// (#159, PR-6b), returning the random token to carry in the NOTIFY. MUST be called on the writer
-/// INSIDE the delete transaction (before the row is removed) so the snapshot commits atomically
-/// with the delete. A no-op returning null unless the active backend is Postgres — so SQLite is
-/// byte-identical (no extra read/write). `alloc` is the request arena (token lives until broadcast).
-pub fn captureDeleteSnapshot(alloc: std.mem.Allocator, app: *App, w: *db.Db, col: schema.Collection, record_id: []const u8) ?[]const u8 {
-    if (!pg_bridge.crossInstanceEnabled(app)) return null;
-    const snap = (records.getAtRest(alloc, w, col, record_id) catch |e| {
+/// Realtime metadata for a just-deleted row.
+pub const DeleteRealtime = struct {
+    /// The snapshot fed to per-subscriber delete AUTHZ (`hub.matchesSnapshot`). It is the AT-REST
+    /// representation (`.encrypted` fields are CIPHERTEXT, not decrypted) so the LOCAL delete authz
+    /// compares the SAME representation as the cross-instance REMOTE path AND the live create/update
+    /// path (which both compare the ciphertext column) — all three agree. The delivered delete frame
+    /// is id-only regardless (the snapshot is stripped before any client sees it), so the
+    /// representation choice never changes what subscribers receive.
+    snapshot: ?std.json.Value,
+    /// Cross-instance NOTIFY token keying the side-table snapshot (Postgres only; null otherwise).
+    token: ?[]const u8,
+};
+
+/// Prepare a just-deleted row for realtime delivery + cross-instance fan-out (#159, PR-6b). MUST be
+/// called on the writer INSIDE the delete transaction (before the row is removed). `decrypted` is
+/// the snapshot the caller already read for its hooks (hidden fields stripped, `.encrypted` fields
+/// DECRYPTED).
+///
+/// Delete authz must use the AT-REST (ciphertext) snapshot so local == remote == live. We only
+/// re-read it when it could DIFFER from `decrypted` (the collection has an `.encrypted` field) or
+/// when the cross-instance side table needs it (Postgres). Otherwise — the common case: SQLite (or
+/// any collection with no encrypted fields) — `decrypted` IS the at-rest representation, so we reuse
+/// it with NO extra read and SQLite stays byte-identical.
+pub fn prepareDelete(alloc: std.mem.Allocator, app: *App, w: *db.Db, col: schema.Collection, record_id: []const u8, decrypted: ?std.json.Value) DeleteRealtime {
+    const cross = pg_bridge.crossInstanceEnabled(app);
+    if (!cross and !schema.hasEncryptedField(col)) return .{ .snapshot = decrypted, .token = null };
+    const at_rest = (records.getAtRest(alloc, w, col, record_id) catch |e| {
         std.log.warn("realtime: delete-snapshot capture failed for {s}/{s}: {s}", .{ col.name, record_id, @errorName(e) });
-        return null;
-    }) orelse return null;
-    return pg_bridge.storeDeleteSnapshot(alloc, app.io, w, snap);
+        return .{ .snapshot = decrypted, .token = null };
+    }) orelse return .{ .snapshot = decrypted, .token = null };
+    const token = if (cross) pg_bridge.storeDeleteSnapshot(alloc, app.io, w, at_rest) else null;
+    return .{ .snapshot = at_rest, .token = token };
 }
 
 /// Build + publish the two event frames into the LOCAL in-process hub (no NOTIFY). Shared by the

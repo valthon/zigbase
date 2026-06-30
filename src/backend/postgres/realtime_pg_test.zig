@@ -361,3 +361,73 @@ test "pg cross-instance: delete NOTIFY leaks no encrypted plaintext (token-only 
     try std.testing.expect(try hub.shouldDeliver(al, io, &d, col, &owner, 0, .delete, rid, null, back));
     try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &other, 0, .delete, rid, null, back));
 }
+
+test "pg delete authz: local snapshot == remote snapshot (at-rest ciphertext basis; identical authz)" {
+    // Consistency guard (#177 copilot review): the LOCAL delete path now authorizes against the
+    // same AT-REST (ciphertext) snapshot the cross-instance REMOTE path uses (and that the live
+    // create/update path compares), so all paths agree. This pins that (a) the snapshot the local
+    // path delivers for authz is the at-rest representation — an `.encrypted` field is CIPHERTEXT,
+    // never decrypted plaintext, in the authz sandbox — and (b) local and remote authorize an
+    // owner-scoped delete identically (owner allowed, others denied).
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var d = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer d.close();
+    const sname = try enterTempSchema(al, &d);
+    defer dropTempSchema(al, &d, sname);
+    try ensureRtTable(&d);
+
+    var cipher = field_policy.Cipher.fromEnv(io, "rt-consistency-key");
+    dbm.dbSetFieldCipher(&d, @ptrCast(&cipher));
+
+    // A normal owner-scoped rule (decisive authz) on a collection that ALSO has an encrypted field.
+    const col = schema.Collection{
+        .id = "c7",
+        .name = "tokens",
+        .fields = &[_]schema.Field{
+            .{ .id = "f1", .name = "owner", .options = .{ .text = .{} } },
+            .{ .id = "f2", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
+        },
+        .viewRule = "owner = @request.auth.id",
+    };
+    try provisionPg(al, &d, col);
+
+    var data: std.json.ObjectMap = .empty;
+    try data.put(al, "owner", strVal("u1"));
+    try data.put(al, "secret", strVal("classified"));
+    const rec = try records.create(al, io, &d, col, .{ .object = data });
+    const rid = rec.object.get("id").?.string;
+
+    // The local delete path's authz snapshot is the AT-REST representation (what prepareDelete
+    // returns for a collection with an encrypted field): owner plaintext, secret CIPHERTEXT.
+    const local_snapshot = (try records.getAtRest(al, &d, col, rid)).?;
+    try std.testing.expectEqualStrings("u1", local_snapshot.object.get("owner").?.string);
+    const secret_in_snapshot = local_snapshot.object.get("secret").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, secret_in_snapshot, "classified") == null);
+    try std.testing.expect(std.mem.startsWith(u8, secret_in_snapshot, "v1:"));
+
+    // The remote path stores that same at-rest snapshot and reads it back.
+    const token = pg_bridge.storeDeleteSnapshot(al, io, &d, local_snapshot) orelse return error.@"store failed";
+    const remote_snapshot = pg_bridge.readDeleteSnapshot(al, &d, token) orelse return error.@"snapshot not found";
+
+    // local == remote: identical authz on both snapshots, for owner (allow) and non-owner (deny).
+    var owner = try authedConn(al, "u1", false);
+    var other = try authedConn(al, "u2", false);
+    const local_owner = try hub.shouldDeliver(al, io, &d, col, &owner, 0, .delete, rid, null, local_snapshot);
+    const remote_owner = try hub.shouldDeliver(al, io, &d, col, &owner, 0, .delete, rid, null, remote_snapshot);
+    const local_other = try hub.shouldDeliver(al, io, &d, col, &other, 0, .delete, rid, null, local_snapshot);
+    const remote_other = try hub.shouldDeliver(al, io, &d, col, &other, 0, .delete, rid, null, remote_snapshot);
+    try std.testing.expectEqual(local_owner, remote_owner);
+    try std.testing.expectEqual(local_other, remote_other);
+    try std.testing.expect(local_owner); // owner authorized on both
+    try std.testing.expect(!local_other); // non-owner denied on both
+
+    // And the live create/update path (ciphertext column) agrees with the delete basis: owner
+    // allowed, non-owner denied — the same decisions, proving all three paths use one basis.
+    try std.testing.expect(try hub.shouldDeliver(al, io, &d, col, &owner, 0, .create, rid, null, null));
+    try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &other, 0, .create, rid, null, null));
+}
