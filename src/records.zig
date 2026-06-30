@@ -1759,18 +1759,22 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // tenant-/ability-guarded collection still returns only rows the caller may view. A search on a
     // collection with no searchable field is `error.NotSearchable` (handler -> 400).
     var search_order: ?[]const u8 = null;
+    var search_order_param: ?compiler.Param = null; // PG ts_rank re-binds the term in ORDER BY; null on SQLite
     var search_term_hash: ?[]const u8 = null; // the SANITIZED term, folded into the cursor hash
     if (q.search) |sterm| {
         const trimmed = std.mem.trim(u8, sterm, " \t\r\n");
         if (trimmed.len > 0) {
             if (!fts.isSearchable(col)) return error.NotSearchable;
-            if (try fts.build(alloc, col, sterm)) |s| {
-                try j.joins.append(alloc, s.join_sql);
+            if (try fts.build(alloc, dialect, col, sterm)) |s| {
+                // Postgres' tsvector lives on the base table → no JOIN (empty join_sql); SQLite's
+                // FTS5 shadow table needs one. Only append a non-empty join.
+                if (s.join_sql.len > 0) try j.joins.append(alloc, s.join_sql);
                 where_sql = s.where_sql;
                 const p = try alloc.alloc(compiler.Param, 1);
                 p[0] = s.param;
                 params = p;
                 search_order = s.order_sql;
+                search_order_param = s.order_param;
                 search_term_hash = s.param.text;
             } else {
                 // A non-empty search that sanitizes to nothing (operator-/punctuation-only, e.g.
@@ -2022,9 +2026,13 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     var pst = try prep(alloc, conn, page_sql);
     defer pst.finalize();
     var after = try bindParams(&pst, params, 1);
-    // The vector ORDER BY carries one `?` (the query embedding), positioned after the WHERE params
-    // and before LIMIT/OFFSET in the SQL — bind it there so the placeholder indices line up.
+    // The relevance ORDER BY carries up to two `?`s, in the SAME textual order they were prepended
+    // to `offset_order_sql`: vector distance FIRST (`vector_order` is prepended last → leads), then
+    // the Postgres `ts_rank` term (`search_order`), then LIMIT/OFFSET. Bind them in that exact order
+    // so the placeholder indices line up. On SQLite both are null (bm25 `rank` takes no param; the
+    // vector arm needs `-Dvector`), so this is byte-identical to the prior single-vector binding.
     if (vector_param) |vp| after = try bindParams(&pst, &.{vp}, after);
+    if (search_order_param) |sp| after = try bindParams(&pst, &.{sp}, after);
     try pst.bindInt(after, @intCast(per));
     try pst.bindInt(after + 1, offset);
 

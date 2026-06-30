@@ -35,8 +35,8 @@ identical in both directions:
 common boolean, `encrypted` (default `false`), stores the value encrypted at rest and is
 valid only on `text`/`editor`/`json` fields — see
 [Encryption at rest](#encryption-at-rest-encrypted). A fourth, `searchable` (default
-`false`), mirrors a `text`/`editor` field's text into the collection's full-text (FTS5) index
-so it can be matched via the `?search=` list param — see [Search](api.md#search); it is
+`false`), mirrors a `text`/`editor` field's text into the collection's full-text index (SQLite
+FTS5, or a Postgres `tsvector`) so it can be matched via the `?search=` list param — see [Search](api.md#search); it is
 mutually exclusive with `encrypted` (ciphertext is not searchable). The `options`
 object is type-specific; unknown/omitted option keys fall back to the defaults listed for
 each type. A field whose `options` you don't care about can pass `"options": {}` (all

@@ -416,6 +416,17 @@ reduce to nothing (e.g. operator-only, `?search=AND`) matches **no rows** rather
 whole collection. A `search` on a collection with no `searchable` field returns **400**. The
 `_fts` collection-name suffix is reserved (it backs the per-collection shadow tables).
 
+**Full-text on Postgres.** On a Postgres backend the SAME `.searchable` schema flag
+and `?search=` API are backed by PostgreSQL's native full-text search instead of FTS5: each
+searchable collection gets a `STORED` `tsvector` **generated column** (`to_tsvector('simple', …)`
+over the searchable columns) plus a **GIN index**, queried with `@@ plainto_tsquery('simple', $n)`
+and ranked by `ts_rank(…) DESC`. The query surface, the bound-parameter safety, and — critically —
+the *same composed-`WHERE` scoping* (filter + list rule + abilities + tenant) are identical to the
+SQLite path, so a tenant-/ability-scoped search returns only the rows the caller may view on either
+backend. The exact relevance ORDER can differ between the two ranking functions (FTS5 `bm25`
+length-normalizes; `ts_rank` does not), but the matched set is equivalent. `plainto_tsquery` parses
+the plain term (it does not honor the `AND`/`OR`/`NOT`/`*` operators).
+
 **Vector / nearest-neighbor (sqlite-vec) — opt-in `-Dvector` build.** Vector search is **not**
 compiled into the default binary. Build with `-Dvector=true` to vendor and link
 [`sqlite-vec`](https://github.com/asg017/sqlite-vec); ZigBase then registers it on every
