@@ -36,6 +36,9 @@ async function waitForHealthOrExit(url: string, proc: ChildProcess, label: strin
     proc.once("exit", (code, signal) =>
       reject(new Error(`${label} exited before becoming healthy (code=${code} signal=${signal})`)),
     );
+    // A spawn failure (missing binary, permissions, wrong arch) emits "error", not
+    // "exit" — reject fast instead of waiting out the full health deadline.
+    proc.once("error", (err) => reject(new Error(`${label} failed to spawn: ${String(err)}`)));
   });
   exitPromise.catch(() => {}); // avoid an unhandled rejection when health wins the race
   await Promise.race([waitForHealth(url), exitPromise]);
