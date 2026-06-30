@@ -27,6 +27,7 @@ const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
 const ddl = @import("ddl.zig");
 const schema = @import("schema.zig");
+const analytics = @import("analytics/analytics.zig"); // tests only (rollup-watermark reset)
 
 pub const Options = struct {
     /// Overwrite a target that already contains a ZigBase schema. Without it, a non-empty
@@ -66,8 +67,10 @@ pub const Report = struct {
 ///
 /// Steps: (1) refuse a non-empty target unless `opts.force`; (2) run the system migrations on the
 /// target; (3) provision each `_collections` record table that the migrations did not already
-/// create; (4) bulk-copy every target table's rows from the matching source table, carrying every
-/// value (including encrypted TEXT envelopes) verbatim; (5) verify per-table row counts.
+/// create; (4) bulk-copy every target table's rows from the matching source table — wrapped in ONE
+/// transaction so a mid-load failure leaves the target clean — carrying every value (including
+/// encrypted TEXT envelopes) verbatim and verifying the TARGET row count per table; (5) reset the
+/// analytics rollup watermarks so they recompute against the target's regenerated `_seq`.
 pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options) Error!Report {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -77,7 +80,7 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     // (not logged) so callers — and tests — drive the messaging.
     if (!opts.force and try targetHasSchema(a, target)) return Error.TargetNotEmpty;
 
-    // (2) System schema on the target (idempotent; dialect-aware).
+    // (2) System schema on the target (idempotent; dialect-aware). Runs its own transactions.
     try migrations.run(target);
 
     // (3) Provision the record tables declared in the SOURCE `_collections` that the migrations
@@ -85,31 +88,64 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     const src_cols = try collections.list(a, source);
     const collections_provisioned = try provisionRecordTables(a, target, src_cols);
 
-    // (4) Bulk-load. Drive the copy by the TARGET's tables so SQLite-only artifacts (FTS shadow
-    // tables) are never touched and identity columns are skipped. FK enforcement is suspended for
-    // the load so row order / self-references never trip a constraint (best-effort: requires a
-    // superuser target; otherwise we fall back to topological table order).
+    // (4) Bulk-load, ATOMICALLY. Drive the copy by the TARGET's tables so SQLite-only artifacts
+    // (FTS shadow tables) are never touched and identity columns are skipped. The whole load runs
+    // in ONE transaction: a failure on any table rolls the target back to its post-provision state
+    // (schema present, zero migrated rows) rather than leaving it half-populated.
     const target_tables = try listTables(a, target);
+
+    try target.begin();
+    errdefer target.rollback() catch {};
+
+    // FK enforcement is suspended INSIDE the txn so row order / self-references never trip a
+    // constraint (a bare Postgres `SET` is itself transactional, so a rollback reverts it; we also
+    // restore it explicitly before commit). Best-effort: needs a superuser target, otherwise we
+    // fall back to topological table order.
     const fk_suspended = suspendForeignKeys(target);
-    defer if (fk_suspended) restoreForeignKeys(target);
 
     // The returned report outlives this function's arena, so allocate it with the caller's `gpa`.
+    // On the error path (e.g. a rejected row → rollback) free the table names duped so far too.
     var reports: std.ArrayList(TableReport) = .empty;
-    errdefer reports.deinit(gpa);
+    errdefer {
+        for (reports.items) |t| gpa.free(t.name);
+        reports.deinit(gpa);
+    }
     var total: usize = 0;
-    // Copy parents before children when FK enforcement could not be suspended.
     const order = try tableLoadOrder(a, target_tables, src_cols, fk_suspended);
     for (order) |tname| {
+        // Never copy the `_migrations` ledger: the target already applied its OWN migrations during
+        // provisioning. Overwriting it with the source's ledger would desync the recorded version
+        // from the physical schema if the source binary is older. Leave the target ledger intact.
+        if (std.mem.eql(u8, tname, "_migrations")) continue;
         const n = try copyTable(a, source, target, tname);
         try reports.append(gpa, .{ .name = try gpa.dupe(u8, tname), .rows = n });
         total += n;
     }
+
+    // H1: the analytics rollup watermarks in `_kv` (`analytics:rollup:<name>:watermark`) hold an
+    // ABSOLUTE `_seq`/rowid value from the source. The target's `_events._seq` is an IDENTITY column
+    // regenerated 1..N, so a verbatim-copied watermark would exceed `max(_seq)` and every future
+    // rollup pass would silently no-op (`_seq > watermark` matches nothing). Reset the watermarks so
+    // each rollup recomputes cleanly from the dense target `_seq`; the `_rollup_<name>` summaries
+    // (not migrated — absent on a fresh target) are rebuilt from the migrated `_events` on the next
+    // scheduled pass.
+    try resetRollupWatermarks(target);
+
+    if (fk_suspended) restoreForeignKeys(target);
+    try target.commit();
 
     return .{
         .tables = try reports.toOwnedSlice(gpa),
         .collections_provisioned = collections_provisioned,
         .total_rows = total,
     };
+}
+
+/// Reset the analytics rollup watermarks on `target` so each rollup recomputes from the target's
+/// regenerated `_seq` (see H1 in `run`). `_kv` always exists post-migration; the `LIKE` predicate
+/// and `key` column are portable across both backends.
+fn resetRollupWatermarks(target: *db.Db) Error!void {
+    try target.exec("DELETE FROM \"_kv\" WHERE \"key\" LIKE 'analytics:rollup:%:watermark';");
 }
 
 // ===========================================================================
@@ -229,10 +265,18 @@ fn copyTable(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []cons
     // Skip tables the source does not have (target-only: e.g. nothing today, but future-proof).
     if (!try tableExists(al, source, table)) return 0;
 
-    const tgt_cols = try listColumns(al, target, table); // non-identity, ordinal order
-    const src_cols = try listColumns(al, source, table);
+    const tgt_cols = try listColumns(al, target, table, false); // non-identity, ordinal order
+    const tgt_all = try listColumns(al, target, table, true); // incl. identity, for drop detection
+    const src_cols = try listColumns(al, source, table, false);
     var src_set = std.StringHashMap(void).init(al);
     for (src_cols) |c| try src_set.put(c, {});
+    var tgt_all_set = std.StringHashMap(void).init(al);
+    for (tgt_all) |c| try tgt_all_set.put(c, {});
+
+    // Warn (not silently drop) on source-only PHYSICAL columns — raw-SQL escape-hatch additions
+    // not present on the target — so the operator knows their data is not carried over.
+    for (src_cols) |c| if (!tgt_all_set.contains(c))
+        std.log.warn("migrate-db: table '{s}' source column '{s}' has no target column — its data is NOT migrated", .{ table, c });
 
     var cols: std.ArrayList([]const u8) = .empty;
     for (tgt_cols) |c| if (src_set.contains(c)) try cols.append(al, c);
@@ -259,13 +303,16 @@ fn copyTable(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []cons
         try params.appendSlice(al, try std.fmt.allocPrint(al, "?{d}", .{i + 1}));
     }
 
-    const sel_sql = try std.fmt.allocPrintSentinel(al, "SELECT {s} FROM {s};", .{ collist.items, try ddl.quoteIdent(al, table) }, 0);
+    // Deterministic source iteration order so the target's regenerated `_events._seq` IDENTITY is
+    // assigned in source insertion order (SQLite `rowid` is exactly that). Other tables don't need
+    // it (no server-generated ordering column).
+    const order_by = orderClause(table, db.dbBackend(source));
+    const sel_sql = try std.fmt.allocPrintSentinel(al, "SELECT {s} FROM {s}{s};", .{ collist.items, try ddl.quoteIdent(al, table), order_by }, 0);
     const ins_raw = try std.fmt.allocPrint(al, "INSERT INTO {s} ({s}) VALUES ({s});", .{ try ddl.quoteIdent(al, table), collist.items, params.items });
 
     var sel = try source.prepare(sel_sql);
     defer sel.finalize();
 
-    var loaded: usize = 0;
     while (try sel.step()) {
         // Fresh INSERT statement per row keeps the (Postgres) per-statement param arena bounded
         // for large tables; execution cost is dominated by the round-trip regardless.
@@ -277,16 +324,29 @@ fn copyTable(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []cons
             try bindFromColumn(&ins, idx, &sel, @intCast(i));
         }
         _ = try ins.step();
-        loaded += 1;
     }
 
-    // Verify the load matches the source row count for this table.
+    // Real integrity check: count the TARGET (not the source iterator) and assert it equals the
+    // source row count. This catches a silent target-side drop (a rejected row, a missing column,
+    // a unique-collision) that comparing source-to-source never could.
     const want = try countRows(al, source, table);
-    if (want != loaded) {
-        std.log.err("migrate-db: table '{s}' row-count mismatch (source {d}, loaded {d})", .{ table, want, loaded });
+    const got = try countRows(al, target, table);
+    if (want != got) {
+        std.log.err("migrate-db: table '{s}' row-count mismatch (source {d}, target {d})", .{ table, want, got });
         return Error.RowCountMismatch;
     }
-    return loaded;
+    return got;
+}
+
+/// The deterministic source ORDER BY for `table` (so a regenerated target IDENTITY/`_seq` is
+/// assigned in source insertion order), or "" when none is needed. `_events` orders by the SQLite
+/// `rowid` (true insertion order); a non-SQLite source falls back to `occurred_at`,`id`.
+fn orderClause(table: []const u8, source_backend: db.Backend) []const u8 {
+    if (!std.mem.eql(u8, table, "_events")) return "";
+    return switch (source_backend) {
+        .sqlite => " ORDER BY rowid",
+        .postgres => " ORDER BY \"occurred_at\",\"id\"",
+    };
 }
 
 /// Bind column `src_idx` of `src`'s current row into `dst` parameter `dst_idx`, preserving the
@@ -326,10 +386,12 @@ fn listTables(a: std.mem.Allocator, d: *db.Db) Error![]const []const u8 {
     return out.toOwnedSlice(a);
 }
 
-/// List the insertable column names of `table` in ordinal order. On Postgres, IDENTITY columns
-/// (`_migrations.id`, `_events._seq`) are excluded — they are server-generated and rejected by a
-/// plain INSERT.
-fn listColumns(a: std.mem.Allocator, d: *db.Db, table: []const u8) Error![]const []const u8 {
+/// List the column names of `table` in ordinal order. With `include_identity = false` (the
+/// insertable set), Postgres IDENTITY columns (`_migrations.id`, `_events._seq`) are excluded —
+/// they are server-generated and rejected by a plain INSERT. With `true` (used only to detect
+/// source-only dropped columns), every column is returned. SQLite has no identity concept, so the
+/// flag is a no-op there.
+fn listColumns(a: std.mem.Allocator, d: *db.Db, table: []const u8, include_identity: bool) Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     switch (db.dbBackend(d)) {
         .sqlite => {
@@ -340,7 +402,10 @@ fn listColumns(a: std.mem.Allocator, d: *db.Db, table: []const u8) Error![]const
             while (try st.step()) try out.append(a, try a.dupe(u8, st.columnText(1))); // col 1 = name
         },
         .postgres => {
-            const raw = "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?1 AND is_identity = 'NO' ORDER BY ordinal_position;";
+            const raw = if (include_identity)
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?1 ORDER BY ordinal_position;"
+            else
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?1 AND is_identity = 'NO' ORDER BY ordinal_position;";
             const sql = try db.dbDialect(d).renumberPlaceholders(a, raw);
             var st = try d.prepare(sql);
             defer st.finalize();
@@ -481,4 +546,96 @@ test "dumpload: refuses a non-empty target without force" {
     const report = try run(a, &source, &target, .{ .force = true });
     defer report.deinit(a);
     try std.testing.expect(report.total_rows > 0);
+}
+
+test "dumpload: rollup watermark reset counts migrated events correctly (H1)" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // Source: three `user.signup` events + a STALE rollup watermark in `_kv`. The watermark holds a
+    // large source-rowid value; on the target the `_events` rowid/`_seq` is regenerated dense, so a
+    // verbatim-copied watermark would make every rollup pass a silent no-op (H1).
+    var source = try db.Db.openMemory();
+    defer source.close();
+    try migrations.run(&source);
+    try source.exec(
+        \\INSERT INTO "_events" ("id","created","updated","name","payload","account","occurred_at") VALUES
+        \\ ('e1','t','t','user.signup','{}','acc1','2026-01-01T08:00:00Z'),
+        \\ ('e2','t','t','user.signup','{}','acc1','2026-01-01T09:00:00Z'),
+        \\ ('e3','t','t','user.signup','{}','acc1','2026-01-01T10:00:00Z');
+    );
+    try source.exec("INSERT INTO \"_kv\" (\"key\",\"value\",\"created\",\"updated\") VALUES ('analytics:rollup:signups_daily:watermark','999999','t','t');");
+
+    var target = try db.Db.openMemory();
+    defer target.close();
+
+    const report = try run(a, &source, &target, .{});
+    defer report.deinit(a);
+
+    // The watermark key was RESET (deleted) on the target so the rollup starts from 0.
+    var wm = try target.prepare("SELECT COUNT(*) FROM \"_kv\" WHERE \"key\"='analytics:rollup:signups_daily:watermark';");
+    defer wm.finalize();
+    try std.testing.expect(try wm.step());
+    try std.testing.expectEqual(@as(i64, 0), wm.columnInt(0));
+
+    // A rollup pass on the target now COUNTS the three migrated events (it would no-op if the stale
+    // watermark had survived).
+    const spec = analytics.RollupSpec{
+        .name = "signups_daily",
+        .event = "user.signup",
+        .every = .{ .interval = .hourly },
+        .group_account = true,
+        .group_actor = false,
+        .time_bucket = .day,
+        .metric = .count,
+    };
+    try analytics.runRollup(&target, al, spec);
+
+    var rv = try target.prepare("SELECT \"value\" FROM \"_rollup_signups_daily\" WHERE \"account\"='acc1';");
+    defer rv.finalize();
+    try std.testing.expect(try rv.step());
+    try std.testing.expectEqual(@as(i64, 3), rv.columnInt(0));
+}
+
+test "dumpload: per-table report counts equal the real target row counts (M1)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var source = try db.Db.openMemory();
+    defer source.close();
+    try migrations.run(&source);
+    const col = schema.Collection{ .id = "_", .name = "notes", .fields = &[_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+    } };
+    _ = try collections.create(al, io, &source, col);
+    try source.exec("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"title\") VALUES ('r1','t','t','a');");
+    try source.exec("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"title\") VALUES ('r2','t','t','b');");
+
+    var target = try db.Db.openMemory();
+    defer target.close();
+
+    const report = try run(a, &source, &target, .{});
+    defer report.deinit(a);
+
+    // Each reported count is the TARGET's actual COUNT(*), not a source-side tautology. Query the
+    // target independently and assert equality for every reported table (and that `_migrations` —
+    // the freshly-applied target ledger — was NOT copied/clobbered, so it isn't in the report).
+    var saw_migrations = false;
+    for (report.tables) |t| {
+        if (std.mem.eql(u8, t.name, "_migrations")) saw_migrations = true;
+        const got = try countRows(al, &target, t.name);
+        try std.testing.expectEqual(t.rows, got);
+    }
+    try std.testing.expect(!saw_migrations);
+
+    // And the notes table really has the two migrated rows.
+    var n = try target.prepare("SELECT COUNT(*) FROM \"notes\";");
+    defer n.finalize();
+    try std.testing.expect(try n.step());
+    try std.testing.expectEqual(@as(i64, 2), n.columnInt(0));
 }

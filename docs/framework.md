@@ -2648,27 +2648,34 @@ What it does:
    (with indexes and relation foreign keys) from the source's `_collections` metadata.
    This includes collections you created at runtime via the admin UI, not just comptime
    ones.
-2. **Bulk-loads every row** of every system table and record table, **preserving record
-   ids, timestamps, and `_collections` metadata** (collection ids survive verbatim).
-   Server-generated columns (the Postgres `_migrations` identity PK and `_events._seq`)
-   are regenerated on the target.
+2. **Bulk-loads every row atomically.** The entire data load runs in **one transaction**,
+   so a mid-migration failure rolls the target back to a clean state (schema present, zero
+   migrated rows) rather than leaving it half-populated. It **preserves record ids,
+   timestamps, and `_collections` metadata** (collection ids survive verbatim). The target's
+   freshly-applied `_migrations` ledger is **not** overwritten, and server-generated columns
+   (the Postgres `_migrations` identity PK and `_events._seq`) are regenerated.
 3. **Carries encrypted-field envelopes verbatim.** Encrypted cells are backend-neutral
    `vN:<base64>` TEXT envelopes; `migrate-db` copies the ciphertext byte-for-byte and
    never decrypts or re-encrypts, so you do **not** pass `ZIGBASE_FIELD_KEY` to the tool.
    The same key that read the SQLite data reads it on Postgres afterward.
+4. **Resets the analytics rollup watermarks.** A rollup's incremental watermark is an
+   absolute `_events` sequence value; since `_events._seq` is regenerated on the target,
+   the watermarks are cleared so each rollup recomputes from the migrated events on its
+   next scheduled pass (a verbatim watermark would otherwise silently stop counting).
 
 Safety:
 
 - A **non-empty target is refused** (a target that already has a ZigBase schema) unless
   you pass `--force`. With `--force` every target table is truncated and reloaded.
-- It **reports per-table row counts** and **fails loudly** if any table's loaded count
-  does not match the source.
+- It **reports per-table row counts measured on the target** and **fails loudly** if any
+  table's target count does not match the source — rolling back the whole load.
 - The command is present in every binary, but the PostgreSQL side requires `-Dpostgres`;
   a stock binary fails with a clear error rather than silently doing nothing.
 
-Not migrated: SQLite-only physical artifacts (the FTS5 full-text shadow tables). The
-collection's `.searchable` metadata is preserved, so the Postgres full-text index is
-provisioned the first time you `zigbase serve` against the migrated database.
+Not migrated: SQLite-only physical artifacts (the FTS5 full-text shadow tables) and the
+`_rollup_<name>` summary tables (rebuilt from the migrated `_events` after the watermark
+reset). The collection's `.searchable` metadata is preserved, so the Postgres full-text
+index is provisioned the first time you `zigbase serve` against the migrated database.
 
 ## 9. Pluggable storage & mailer backends (`.storage` / `.mailer`)
 

@@ -186,3 +186,42 @@ test "pg dumpload: refuses a non-empty Postgres target without --force, proceeds
     }
     try std.testing.expect(r2.total_rows > 0);
 }
+
+test "pg dumpload: a mid-load failure rolls the whole load back to zero migrated rows (M2 atomicity)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var target = (try openTargetOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer target.close();
+    const sname = try enterTempSchema(al, &target);
+    defer dropTempSchema(al, &target, sname);
+
+    // Source with a `notes` collection whose SECOND row has a NULL id. SQLite tolerates a NULL in a
+    // TEXT PRIMARY KEY; Postgres (NOT NULL PK) rejects it on INSERT — an injected mid-load failure.
+    var source = try dbm.Db.openMemory();
+    defer source.close();
+    try migrations.run(&source);
+    const col = schema.Collection{ .id = "_", .name = "notes", .fields = &[_]schema.Field{
+        .{ .id = "n1", .name = "title", .options = .{ .text = .{} } },
+    } };
+    _ = try collections.create(al, io, &source, col);
+    try source.exec("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"title\") VALUES ('ok','t','t','good');");
+    try source.exec("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"title\") VALUES (NULL,'t','t','bad');");
+
+    // The load fails partway (the NULL-id INSERT) and the whole transaction rolls back.
+    try std.testing.expectError(error.StepFailed, dumpload.run(a, &source, &target, .{}));
+
+    // The target is left CLEAN: the provisioned `notes` table exists but holds ZERO rows (the
+    // committed-before-failure `ok` row was rolled back), and the verbatim `_collections` copy was
+    // rolled back too (no user `notes` metadata persisted — only the migration-seeded system rows).
+    try std.testing.expectEqual(@as(i64, 0), try countPg(al, &target, "notes"));
+    {
+        var st = try target.prepare("SELECT COUNT(*) FROM \"_collections\" WHERE \"name\"='notes';");
+        defer st.finalize();
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+    }
+}
