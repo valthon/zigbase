@@ -168,13 +168,17 @@ pub fn rewrapColumn(
         try ustmt.bindText(1, u.blob);
         try ustmt.bindText(2, u.id);
         _ = try ustmt.step();
-        // Self-verify the write LANDED: a unique-`id`-keyed UPDATE must affect exactly one
-        // row. Zero rows means the row vanished or the id didn't match — the rewrite did not
-        // persist, so fail closed rather than over-report a "rewrapped" cell that is still at
-        // the old generation (which would become unreadable once the old key is dropped).
-        // `changesCount` is `sqlite3_changes64` / the PG CommandComplete row count — exactly 1
-        // for a normal keyed single-row UPDATE on both backends.
-        if (w.changesCount() != 1) {
+        // Self-verify the write LANDED: fail closed only on a genuine ZERO-row match (the
+        // row vanished or the id didn't match), which would over-report a "rewrapped" cell
+        // that is still at the old generation (unreadable once the old key is dropped). We
+        // test `== 0`, NOT `!= 1`, because `changesCount` (`sqlite3_changes64`) COUNTS rows
+        // modified by triggers: a searchable+encrypted collection's FTS5 sync triggers fire
+        // on this UPDATE, so a successful single-row rewrap legitimately reports >1. A 0-row
+        // WHERE matches nothing and fires no triggers, so 0 changes is an unambiguous miss.
+        // (PG's CommandComplete count is the base-table row count, also 0 on a real miss.)
+        // The empty/NULL-id read-loop guard above (RewrapRowUnkeyed) is the primary catch;
+        // this is the backstop for an unexpected mid-run disappearance.
+        if (w.changesCount() == 0) {
             if (failure) |fp| fp.* = .{ .table = table, .column = col, .id = u.id, .version = cipher.primary_gen };
             return error.RewrapWriteFailed;
         }
@@ -507,4 +511,51 @@ test "rewrapAll: end-to-end over the collections store" {
     _ = try sel.step();
     try std.testing.expect(std.mem.startsWith(u8, sel.columnText(1), "v2:"));
     try std.testing.expectEqualStrings("alpha", try ring.open(a, try a.dupe(u8, sel.columnText(1))));
+}
+
+test "rewrapColumn succeeds on a searchable+encrypted collection (FTS triggers inflate changesCount)" {
+    const migrations = @import("migrations.zig");
+    const fts = @import("search/fts.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+
+    // A collection with a SEARCHABLE text field and a SEPARATE encrypted field. The FTS5 sync
+    // triggers fire on EVERY row UPDATE (the `_au` trigger is `AFTER UPDATE ON <col>`, no column
+    // list), so a successful single-row rewrap of "secret" makes `sqlite3_changes64` report >1.
+    // The fail-closed backstop must test `== 0` (a genuine miss), NOT `!= 1`, or it would wrongly
+    // abort here — the regression copilot caught on PR #171.
+    const def = schema.Collection{
+        .id = "",
+        .name = "docs",
+        .fields = &.{
+            .{ .id = "", .name = "title", .searchable = true, .options = .{ .text = .{} } },
+            .{ .id = "", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
+        },
+    };
+    const col = try collections.create(a, io, &d, def);
+    try fts.ensureIndex(a, &d, col); // provision the FTS5 shadow table + AFTER UPDATE trigger
+
+    // Seed a v1 envelope in the encrypted column (with a searchable title present).
+    const old = field_policy.Cipher.fromEnv(io, "oldkey");
+    var ins = try d.prepare("INSERT INTO \"docs\" (\"id\",\"title\",\"secret\") VALUES ('r1', 'hello world', ?1);");
+    try ins.bindText(1, try old.seal(a, "classified"));
+    _ = try ins.step();
+    ins.finalize();
+
+    // Rewrap must SUCCEED despite the trigger-inflated change count, and re-key the cell.
+    const ring = rotatedRing();
+    const cs = try rewrapColumn(a, &d, &ring, "docs", "secret", false, null);
+    try std.testing.expectEqual(@as(usize, 1), cs.rewrapped);
+
+    var sel = try d.prepare("SELECT \"secret\" FROM \"docs\" WHERE \"id\"='r1';");
+    defer sel.finalize();
+    try std.testing.expect(try sel.step());
+    const stored = try a.dupe(u8, sel.columnText(0));
+    try std.testing.expect(std.mem.startsWith(u8, stored, "v2:"));
+    try std.testing.expectEqualStrings("classified", try ring.open(a, stored));
 }
