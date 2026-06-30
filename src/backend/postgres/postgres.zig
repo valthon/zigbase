@@ -80,4 +80,6 @@ test {
     // PR-6/6b: live realtime authz parity (create/update/delete delivery + snapshot authz) and
     // cross-instance LISTEN/NOTIFY (NOTIFY on conn A received by a listener on conn B). Skips if no PG.
     _ = @import("realtime_pg_test.zig");
+    // PR-9: live SQLite -> Postgres dump/load round-trip (counts, encrypted field, relation). Skips if no PG.
+    _ = @import("dumpload_pg_test.zig");
 }

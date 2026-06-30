@@ -269,6 +269,7 @@ test {
     _ = @import("sentry.zig");
     _ = @import("framework.zig");
     _ = @import("provision.zig");
+    _ = @import("dumpload.zig");
     _ = @import("records_hooks_test.zig");
     _ = @import("schedule.zig");
     _ = @import("scheduler.zig");
