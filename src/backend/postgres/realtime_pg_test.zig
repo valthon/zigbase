@@ -11,8 +11,10 @@
 //!
 //!   2. **PR-6b cross-instance LISTEN/NOTIFY.** A change `NOTIFY`'d on connection A is received by a
 //!      listener on connection B (a second app instance sharing one database), decoded, and would be
-//!      delivered to B's subscribers with B's authz applied. This is the capability that makes
-//!      multi-instance Postgres realtime correct.
+//!      delivered to B's subscribers with B's authz applied. The payload carries only `{o,c,a,i[,t]}`
+//!      — for a delete, a random token keying the deleted row's AT-REST (ciphertext) snapshot in the
+//!      `_rt_delete_snapshots` side table, which B reads back over its own DB connection. The
+//!      no-plaintext-in-NOTIFY guarantee (encrypted fields never transit the wire) is under test.
 //!
 //! They run only under `-Dpostgres=true` and require a reachable PostgreSQL; a connectivity/auth
 //! failure SKIPS. Schema isolation mirrors `crud_tests.zig` (throwaway `CREATE SCHEMA` + search_path).
@@ -194,12 +196,22 @@ test "pg realtime: owner-scoped DELETE authz uses the snapshot (no :memory: PG a
     try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &owner, 0, .delete, "GONE", null, null));
 }
 
-// ---- PR-6b: cross-instance LISTEN/NOTIFY ------------------------------------
+// ---- PR-6b: cross-instance LISTEN/NOTIFY (token + side-table snapshot) -------
 
-test "pg cross-instance: a NOTIFY on conn A is received + decoded by a listener on conn B" {
-    // Simulate two app instances sharing one database: instance B LISTENs; instance A commits a
-    // write and NOTIFYs; B receives the notification and decodes the {origin,collection,action,id}
-    // payload that drives its local re-fetch + per-subscriber authz.
+const field_policy = @import("../../field_policy.zig");
+
+/// Create the delete-snapshot side table in the CURRENT search_path (matches migration 0018's DDL).
+/// Idempotent. Used so these tests don't depend on the system migrations having been applied.
+fn ensureRtTable(d: *dbm.Db) !void {
+    try d.exec("CREATE TABLE IF NOT EXISTS \"_rt_delete_snapshots\" (" ++
+        "\"token\" TEXT PRIMARY KEY, \"snapshot\" TEXT NOT NULL, " ++
+        "\"created\" TIMESTAMPTZ NOT NULL DEFAULT now());");
+}
+
+test "pg cross-instance: a create NOTIFY (token-free) is received + decoded by a listener on conn B" {
+    // Two app instances sharing one database: instance B LISTENs; instance A NOTIFYs a create with a
+    // DIFFERENT origin id (a remote instance). B receives + decodes the minimal {o,c,a,i} payload that
+    // drives its local re-fetch + per-subscriber authz. No row data on the wire.
     const a = std.testing.allocator;
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -211,27 +223,27 @@ test "pg cross-instance: a NOTIFY on conn A is received + decoded by a listener 
     var conn_a = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
     defer conn_a.close();
 
-    // B subscribes to the realtime channel.
     try dbm.dbListen(&conn_b, pg_bridge.channel);
 
-    // A emits a create event for a different origin id (a remote instance).
     const payload = try pg_bridge.encode(al, "instanceA", "posts", .create, "REC42", null);
     try dbm.dbNotify(&conn_a, al, pg_bridge.channel, payload);
 
-    // B receives it (blocking read on its dedicated listener connection).
     const note = (try dbm.dbWaitNotification(&conn_b, al)) orelse return error.@"no notification received";
     try std.testing.expectEqualStrings(pg_bridge.channel, note.channel);
-
     const ev = pg_bridge.decode(al, note.payload) orelse return error.@"decode failed";
     try std.testing.expectEqualStrings("instanceA", ev.origin);
     try std.testing.expectEqualStrings("posts", ev.collection);
     try std.testing.expectEqual(protocol.Action.create, ev.action);
     try std.testing.expectEqualStrings("REC42", ev.id);
-    // The event's origin differs from THIS process's id, so the listener would NOT skip it.
+    try std.testing.expect(ev.token == null);
+    // Origin differs from THIS process's id → the listener would NOT skip it.
     try std.testing.expect(!std.mem.eql(u8, ev.origin, pg_bridge.originId(io)));
 }
 
-test "pg cross-instance: a DELETE NOTIFY carries the snapshot so a remote instance can authz it" {
+test "pg cross-instance: a DELETE token is stored on A, NOTIFY'd, read back + authorized on B" {
+    // The headline cross-instance path with the security redesign: A stores the deleted row's at-rest
+    // snapshot in the side table keyed by a random token, NOTIFYs only the token; B receives it, reads
+    // the snapshot back from the SHARED side table, and authorizes the delete for its subscribers.
     const a = std.testing.allocator;
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -242,22 +254,30 @@ test "pg cross-instance: a DELETE NOTIFY carries the snapshot so a remote instan
     defer conn_b.close();
     var conn_a = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
     defer conn_a.close();
+    // Shared system table in the default (public) search_path so A's write is visible to B.
+    try ensureRtTable(&conn_a);
 
     try dbm.dbListen(&conn_b, pg_bridge.channel);
 
+    // A: store the at-rest delete snapshot (owner u9) → token; NOTIFY only the token.
     var snap: std.json.ObjectMap = .empty;
     try snap.put(al, "id", strVal("DEL1"));
     try snap.put(al, "owner", strVal("u9"));
-    const payload = try pg_bridge.encode(al, "instanceA", "notes", .delete, "DEL1", .{ .object = snap });
+    const token = pg_bridge.storeDeleteSnapshot(al, io, &conn_a, .{ .object = snap }) orelse return error.@"store failed";
+    const payload = try pg_bridge.encode(al, "instanceA", "notes", .delete, "DEL1", token);
+    // The payload carries ONLY the token — no owner/row data.
+    try std.testing.expect(std.mem.indexOf(u8, payload, "u9") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, token) != null);
     try dbm.dbNotify(&conn_a, al, pg_bridge.channel, payload);
 
+    // B: receive the token, read the snapshot back from the shared side table.
     const note = (try dbm.dbWaitNotification(&conn_b, al)) orelse return error.@"no notification received";
     const ev = pg_bridge.decode(al, note.payload) orelse return error.@"decode failed";
     try std.testing.expectEqual(protocol.Action.delete, ev.action);
-    try std.testing.expect(ev.snapshot != null);
+    const back = pg_bridge.readDeleteSnapshot(al, &conn_b, ev.token.?) orelse return error.@"snapshot not found";
 
-    // The remote instance authorizes the delete against the carried snapshot (in-memory SQLite
-    // sandbox) — owner u9 is allowed, others denied — WITHOUT the row existing on this PG.
+    // B authorizes the delete against the read-back snapshot — owner u9 allowed, others denied —
+    // WITHOUT the row existing on PG (the in-memory SQLite sandbox evaluates the rule).
     const col = schema.Collection{
         .id = "c5",
         .name = "notes",
@@ -266,6 +286,78 @@ test "pg cross-instance: a DELETE NOTIFY carries the snapshot so a remote instan
     };
     var owner = try authedConn(al, "u9", false);
     var other = try authedConn(al, "u8", false);
-    try std.testing.expect(try hub.shouldDeliver(al, io, &conn_b, col, &owner, 0, .delete, ev.id, null, ev.snapshot));
-    try std.testing.expect(!try hub.shouldDeliver(al, io, &conn_b, col, &other, 0, .delete, ev.id, null, ev.snapshot));
+    try std.testing.expect(try hub.shouldDeliver(al, io, &conn_b, col, &owner, 0, .delete, ev.id, null, back));
+    try std.testing.expect(!try hub.shouldDeliver(al, io, &conn_b, col, &other, 0, .delete, ev.id, null, back));
+
+    // A FORGED NOTIFY with a fabricated token finds no side-table row → no snapshot → no delivery.
+    try std.testing.expect(pg_bridge.readDeleteSnapshot(al, &conn_b, "forged-token-does-not-exist") == null);
+}
+
+test "pg cross-instance: delete NOTIFY leaks no encrypted plaintext (token-only payload; ciphertext at-rest)" {
+    // HIGH security guard (#177 review): the cross-instance delete path must NEVER put a deleted row's
+    // decrypted plaintext on the NOTIFY wire (visible to any LISTENer) NOR store it as plaintext. The
+    // snapshot is captured AT-REST (ciphertext) via records.getAtRest, stored in the side table, and
+    // only a random token rides the wire.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var d = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer d.close();
+    const sname = try enterTempSchema(al, &d);
+    defer dropTempSchema(al, &d, sname);
+    try ensureRtTable(&d); // side table in the temp schema so store/read resolve there
+
+    // Stamp a field cipher on the connection (as framework.zig does in production).
+    var cipher = field_policy.Cipher.fromEnv(io, "rt-crossinstance-key");
+    dbm.dbSetFieldCipher(&d, @ptrCast(&cipher));
+
+    const secret = "TOP-SECRET-PII-9f3a";
+    const col = schema.Collection{
+        .id = "c6",
+        .name = "vault",
+        .fields = &[_]schema.Field{
+            .{ .id = "f1", .name = "owner", .options = .{ .text = .{} } },
+            .{ .id = "f2", .name = "ssn", .encrypted = true, .options = .{ .text = .{} } },
+        },
+        .viewRule = "owner = @request.auth.id",
+    };
+    try provisionPg(al, &d, col);
+
+    // Create a row; the encrypted field is sealed at rest (TEXT envelope), never plaintext.
+    var data: std.json.ObjectMap = .empty;
+    try data.put(al, "owner", strVal("u1"));
+    try data.put(al, "ssn", strVal(secret));
+    const rec = try records.create(al, io, &d, col, .{ .object = data });
+    const rid = rec.object.get("id").?.string;
+
+    // Capture the AT-REST snapshot (encrypted field stays ciphertext) + store it → token.
+    const snap = (try records.getAtRest(al, &d, col, rid)).?;
+    // The captured snapshot's encrypted field is the ciphertext envelope, NOT the plaintext.
+    const ssn_at_rest = snap.object.get("ssn").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, ssn_at_rest, secret) == null);
+    try std.testing.expect(std.mem.startsWith(u8, ssn_at_rest, "v1:"));
+
+    const token = pg_bridge.storeDeleteSnapshot(al, io, &d, snap) orelse return error.@"store failed";
+    const payload = try pg_bridge.encode(al, "instanceA", "vault", .delete, rid, token);
+
+    // THE GUARANTEE: the NOTIFY payload contains the token and NO row data — no plaintext secret AND
+    // no ciphertext envelope (no field data of any kind rides the wire).
+    try std.testing.expect(std.mem.indexOf(u8, payload, secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "v1:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "ssn") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, token) != null);
+
+    // Defense in depth: the side table holds the ciphertext, never the plaintext.
+    const back = pg_bridge.readDeleteSnapshot(al, &d, token) orelse return error.@"snapshot not found";
+    const back_json = try std.json.Stringify.valueAlloc(al, back, .{});
+    try std.testing.expect(std.mem.indexOf(u8, back_json, secret) == null);
+
+    // The remote subscriber still gets correct delete authz from the read-back snapshot.
+    var owner = try authedConn(al, "u1", false);
+    var other = try authedConn(al, "u2", false);
+    try std.testing.expect(try hub.shouldDeliver(al, io, &d, col, &owner, 0, .delete, rid, null, back));
+    try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &other, 0, .delete, rid, null, back));
 }

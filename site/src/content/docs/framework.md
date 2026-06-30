@@ -861,10 +861,17 @@ writing instance, which is complete parity for the single-process SQLite story. 
 ZigBase additionally fans record-change events across instances over Postgres **`LISTEN`/`NOTIFY`**
 — a write on instance A reaches subscribers connected to instances B and C. This is **automatic**
 when the active backend is Postgres (no configuration); each instance runs a dedicated listener
-connection, and on a notification it re-fetches the row and runs **its own** per-subscriber
-`viewRule`/ability/tenant authorization before delivering (deletes are authorized against a
-snapshot carried in the notification). On **SQLite** (single-process) nothing changes — there is
-no cross-process step, and the in-process path is byte-identical. Custom-channel
+connection (which **auto-reconnects with backoff**, logging loudly, if the connection drops on a
+PG restart/failover), and on a notification it runs **its own** per-subscriber
+`viewRule`/ability/tenant authorization before delivering. The notification payload is **minimal
+and carries no row data** — only `{origin, collection, action, id}`; create/update re-fetch the
+live row on the receiving instance, and a delete carries a random **token** that keys the deleted
+row's snapshot in a small server-side table (`_rt_delete_snapshots`), which the receiver reads back
+over its own DB connection. This is deliberate: putting the deleted row in the `NOTIFY` payload
+would broadcast its column data — including the **decrypted plaintext of `.encrypted` fields** — to
+any DB role that can `LISTEN`, so the snapshot is stored at-rest (ciphertext) in the side table and
+never transits the wire. On **SQLite** (single-process) nothing changes — there is no cross-process
+step, no side table, and the in-process path is byte-identical. Custom-channel
 `ctx.realtime().broadcast`/`signal` events are **per-instance** (not yet fanned out cross-instance);
 record-change events are the cross-instance path.
 

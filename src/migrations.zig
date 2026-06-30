@@ -480,6 +480,23 @@ fn init_0017_events_seq(m: *Migrator) db.DbError!void {
     }
 }
 
+fn init_0018_rt_delete_snapshots(m: *Migrator) db.DbError!void {
+    // Cross-instance realtime (#159, PR-6b): a transient side table holding the AT-REST (ciphertext)
+    // snapshot of a just-deleted row, keyed by a RANDOM token that the LISTEN/NOTIFY payload carries.
+    // The decrypted row therefore NEVER transits the NOTIFY wire (any DB role that can `LISTEN
+    // zigbase_rt` would otherwise see it) — only the token does; the receiving instance reads the
+    // ciphertext snapshot back over its own authenticated DB connection for delete authz. Rows are
+    // swept by a short TTL (the writer GCs on insert) and `created` defaults to `now()`.
+    //
+    // POSTGRES-ONLY: SQLite is single-process and delivers the snapshot in-process (never over
+    // NOTIFY), so it needs no side table and stays byte-identical (no new table on SQLite).
+    if (m.dialect.kind != .postgres) return;
+    try m.exec("CREATE TABLE IF NOT EXISTS \"_rt_delete_snapshots\" (" ++
+        "\"token\" TEXT PRIMARY KEY, \"snapshot\" TEXT NOT NULL, " ++
+        "\"created\" TIMESTAMPTZ NOT NULL DEFAULT now());");
+    try m.exec("CREATE INDEX IF NOT EXISTS \"idx_rt_delsnap_created\" ON \"_rt_delete_snapshots\" (\"created\");");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -498,6 +515,7 @@ pub const all = [_]Migration{
     .{ .name = "0015_events", .up = init_0015_events },
     .{ .name = "0016_email", .up = init_0016_email },
     .{ .name = "0017_events_seq", .up = init_0017_events_seq },
+    .{ .name = "0018_rt_delete_snapshots", .up = init_0018_rt_delete_snapshots },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {

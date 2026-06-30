@@ -11,56 +11,79 @@
 //!
 //! ## How (NOTIFY, not logical decoding)
 //! On the SAME after-commit dispatch point, the writer additionally issues
-//! `NOTIFY zigbase_rt, '<payload>'` carrying a MINIMAL `{o,c,a,i[,s]}` body (origin, collection,
-//! action, id, and — for deletes only — the pre-delete snapshot). Every process runs ONE
-//! dedicated listener connection (`startListener`) that `LISTEN`s on the channel and, for each
-//! notification from a DIFFERENT instance, re-feeds the EXISTING in-process hub: it re-fetches the
-//! live row (create/update) or uses the carried snapshot (delete), then `WS.publish`es the same
-//! frames `broadcast` would have — so the unchanged `onChannelMessage` path runs each subscriber's
-//! existing view/ability/tenant authz locally. No large payloads on the wire, no replication
-//! slots, no `wal_level=logical`, and the app's authz is never bypassed.
+//! `NOTIFY zigbase_rt, '<payload>'` carrying a SMALL, FIXED-SIZE `{o,c,a,i[,t]}` body (origin,
+//! collection, action, id, and — for deletes — a random **token**, NOT the row data). Every
+//! process runs ONE dedicated listener connection (`startListener`) that `LISTEN`s on the channel
+//! and, for each notification from a DIFFERENT instance, re-feeds the EXISTING in-process hub: it
+//! re-fetches the live row (create/update) or reads the deleted row's at-rest snapshot from a side
+//! table by token (delete), then `WS.publish`es the same frames `broadcast` would have — so the
+//! unchanged `onChannelMessage` path runs each subscriber's existing view/ability/tenant authz
+//! locally. No replication slots, no `wal_level=logical`, and the app's authz is never bypassed.
+//!
+//! ## Why a side table, not the snapshot inline (security)
+//! A delete authorizes against the deleted row's snapshot (the live row is gone). Putting that
+//! snapshot in the NOTIFY payload would broadcast the row's column data — including the DECRYPTED
+//! plaintext of `.encrypted` fields — to ANY DB role that can `LISTEN zigbase_rt` (a role needing
+//! only CONNECT, not SELECT/RLS/column grants), defeating ciphertext-at-rest. So the snapshot is
+//! written to `_rt_delete_snapshots` (migration 0018, PG-only) as its **at-rest (ciphertext)**
+//! representation, keyed by a random token; only the token rides the wire. The receiving instance
+//! reads it back over its own authenticated DB connection. This also keeps the payload fixed-size
+//! (no 8000-byte NOTIFY overflow) and closes forged-NOTIFY deletes: a fabricated token has no
+//! side-table row, so the delete is never delivered.
 //!
 //! ## Self-delivery
 //! The writer ALSO receives its own NOTIFY (PG delivers to every LISTENer, including the same
-//! process's listener connection). Each payload carries a per-process `origin` id; the listener
-//! drops notifications whose origin is its own, so the writing instance delivers exactly once
+//! process's listener). Each payload carries a per-process `origin` id; the listener drops
+//! notifications whose origin is its own, so the writing instance delivers exactly once
 //! (in-process), and only REMOTE instances act on the NOTIFY.
 //!
 //! ## Gating
 //! The whole module compiles in both builds, but every wire op funnels through the `db.Db` seam
 //! helpers (`db.dbListen`/`dbNotify`/`dbWaitNotification`) which are comptime no-ops on SQLite.
-//! `emit`/`startListener` additionally early-return unless the active backend is Postgres, so the
-//! default single-binary story links zero new behavior and SQLite realtime is byte-identical.
+//! `emit`/`startListener`/`crossInstanceEnabled` additionally early-return unless the active
+//! backend is Postgres, so the default single-binary story links zero new behavior and SQLite
+//! realtime is byte-identical.
 
 const std = @import("std");
 const build_options = @import("build_options");
 const db = @import("../db.zig");
 const App = @import("../app.zig").App;
 const entropy = @import("../entropy.zig");
+const crypto = @import("../crypto.zig");
 const protocol = @import("protocol.zig");
 
 /// The single NOTIFY channel all instances LISTEN on. A valid SQL identifier (the driver
 /// validates it again before interpolating into `LISTEN "<channel>"`).
 pub const channel = "zigbase_rt";
 
-/// NOTIFY's payload hard limit is 8000 bytes; stay comfortably under it. A delete snapshot that
-/// would overflow is dropped (see `encode`) — remote instances then conservatively deny
-/// owner/expression-scoped deletes (the safe direction) while `@public` deletes still deliver.
-const max_payload = 7900;
+/// How long a delete snapshot lives in the side table before the writer GCs it. The cross-instance
+/// propagation window is sub-second (NOTIFY is near-instant; listeners read within ms), so this is
+/// a generous orphan-cleanup bound, not a correctness deadline.
+const snapshot_ttl_seconds = 60;
+
+/// True when cross-instance realtime applies: Postgres is compiled in AND the active backend is
+/// Postgres. Used to gate the delete-snapshot capture on the writer path.
+pub fn crossInstanceEnabled(app: *App) bool {
+    if (!build_options.postgres) return false;
+    return db.poolBackend(app.pool) == .postgres;
+}
 
 // ---- per-process origin id --------------------------------------------------
 
 var origin_hex: [16]u8 = undefined;
-var origin_ready: bool = false;
+var origin_ready = std.atomic.Value(bool).init(false);
 var origin_mu: std.atomic.Mutex = .unlocked;
 
 /// A stable, per-process random id (16 hex chars) tagging every NOTIFY this instance emits, so a
-/// listener can skip its OWN notifications (already delivered in-process). Lazily initialized; the
-/// `io` provides the CSPRNG (and honors the deterministic test seed via `entropy.fill`).
+/// listener can skip its OWN notifications (already delivered in-process). Double-checked locking:
+/// the hot path (called on every broadcast + notification) reads the initialized flag lock-free
+/// and returns; only the first caller takes the lock to fill it. `io` provides the CSPRNG (and
+/// honors the deterministic test seed via `entropy.fill`).
 pub fn originId(io: std.Io) []const u8 {
+    if (origin_ready.load(.acquire)) return &origin_hex;
     while (!origin_mu.tryLock()) std.atomic.spinLoopHint();
     defer origin_mu.unlock();
-    if (!origin_ready) {
+    if (!origin_ready.load(.monotonic)) {
         var raw: [8]u8 = undefined;
         entropy.fill(io, &raw);
         const hex = "0123456789abcdef";
@@ -68,7 +91,7 @@ pub fn originId(io: std.Io) []const u8 {
             origin_hex[i * 2] = hex[b >> 4];
             origin_hex[i * 2 + 1] = hex[b & 0x0f];
         }
-        origin_ready = true;
+        origin_ready.store(true, .release);
     }
     return &origin_hex;
 }
@@ -83,49 +106,34 @@ fn actionStr(a: protocol.Action) []const u8 {
     };
 }
 
-/// Encode the NOTIFY payload. create/update stay minimal (`{o,c,a,i}`) — the remote re-fetches the
-/// live row. delete carries the pre-delete `s`napshot so remote instances can authorize
-/// owner/expression-scoped deletes (the live row is gone). An oversize snapshot is dropped.
+/// Encode the (small, fixed-size) NOTIFY payload: `{o,c,a,i}` plus, for a delete, the side-table
+/// `t`oken. NO row data ever rides the wire — create/update re-fetch the live row remotely; delete
+/// reads the at-rest snapshot from the side table by token.
 pub fn encode(
     a: std.mem.Allocator,
     origin: []const u8,
     collection: []const u8,
     action: protocol.Action,
     record_id: []const u8,
-    record: ?std.json.Value,
-) ![]u8 {
-    const with_snapshot = action == .delete and record != null;
-    const s = try encodeObj(a, origin, collection, action, record_id, if (with_snapshot) record else null);
-    if (s.len <= max_payload) return s;
-    // Oversize (only possible with a snapshot): re-encode minimally without it.
-    if (with_snapshot) return encodeObj(a, origin, collection, action, record_id, null);
-    return s;
-}
-
-fn encodeObj(
-    a: std.mem.Allocator,
-    origin: []const u8,
-    collection: []const u8,
-    action: protocol.Action,
-    record_id: []const u8,
-    snapshot: ?std.json.Value,
+    token: ?[]const u8,
 ) ![]u8 {
     var o: std.json.ObjectMap = .empty;
     try o.put(a, "o", .{ .string = origin });
     try o.put(a, "c", .{ .string = collection });
     try o.put(a, "a", .{ .string = actionStr(action) });
     try o.put(a, "i", .{ .string = record_id });
-    if (snapshot) |snap| try o.put(a, "s", snap);
+    if (token) |t| try o.put(a, "t", .{ .string = t });
     return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = o }, .{});
 }
 
-/// A decoded cross-instance event. `snapshot` is the delete authorization snapshot (delete only).
+/// A decoded cross-instance event. `token` keys the deleted row's at-rest snapshot in the side
+/// table (delete only; null for create/update).
 pub const Event = struct {
     origin: []const u8,
     collection: []const u8,
     action: protocol.Action,
     id: []const u8,
-    snapshot: ?std.json.Value,
+    token: ?[]const u8,
 };
 
 fn strField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -155,72 +163,135 @@ pub fn decode(a: std.mem.Allocator, payload: []const u8) ?Event {
         .collection = collection,
         .action = action,
         .id = record_id,
-        .snapshot = o.get("s"),
+        .token = strField(o, "t"),
     };
+}
+
+// ---- delete-snapshot side table (writer + reader) ---------------------------
+
+/// Persist a deleted row's AT-REST snapshot (from `records.getAtRest` — encrypted fields stay
+/// ciphertext) in `_rt_delete_snapshots`, keyed by a fresh random token returned for the NOTIFY
+/// payload. MUST run on the Postgres writer INSIDE the delete transaction so the row commits
+/// atomically with the delete (and is readable by remote listeners after the post-commit NOTIFY).
+/// Also GCs expired tokens (cheap piggyback). Returns null on any error (cross-instance delete
+/// then degrades to no remote delivery — local subscribers are unaffected).
+pub fn storeDeleteSnapshot(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, snapshot: std.json.Value) ?[]const u8 {
+    const token = crypto.genToken(io, alloc, 32) catch return null;
+    const snap_json = std.json.Stringify.valueAlloc(alloc, snapshot, .{}) catch return null;
+    // GC orphaned tokens first (writers whose listeners never consumed them). Bounds the table to
+    // ~the TTL window of deletes; native PG interval compare on the indexed `created` column.
+    w.exec("DELETE FROM \"_rt_delete_snapshots\" WHERE \"created\" < now() - interval '" ++
+        std.fmt.comptimePrint("{d}", .{snapshot_ttl_seconds}) ++ " seconds';") catch {};
+    var st = w.prepare("INSERT INTO \"_rt_delete_snapshots\" (\"token\",\"snapshot\") VALUES ($1,$2);") catch return null;
+    defer st.finalize();
+    st.bindText(1, token) catch return null;
+    st.bindText(2, snap_json) catch return null;
+    _ = st.step() catch return null;
+    return token;
+}
+
+/// Read a deleted row's at-rest snapshot back by `token` (on the reader `r`). Returns null if the
+/// token has no row — which is exactly how a FORGED NOTIFY delete is rejected (no real delete →
+/// no token row → no delivery). The caller feeds the (ciphertext-preserving) snapshot to the
+/// delete authz; the delivered frame is id-only, so nothing is decrypted here.
+pub fn readDeleteSnapshot(alloc: std.mem.Allocator, r: *db.Db, token: []const u8) ?std.json.Value {
+    var st = r.prepare("SELECT \"snapshot\" FROM \"_rt_delete_snapshots\" WHERE \"token\" = $1;") catch return null;
+    defer st.finalize();
+    st.bindText(1, token) catch return null;
+    const has = st.step() catch return null;
+    if (!has) return null;
+    // Dupe before finalize — `columnText` aliases stmt-owned memory, and the JSON parser may keep
+    // references into its input for string values.
+    const json = alloc.dupe(u8, st.columnText(0)) catch return null;
+    return std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{}) catch null;
 }
 
 // ---- emit (writer → NOTIFY) -------------------------------------------------
 
 /// Fan a just-committed record event out to OTHER instances via `NOTIFY`. Called from
-/// `ws.broadcast` AFTER the local in-process publish. A no-op unless the active backend is
-/// Postgres; failures are swallowed (realtime is best-effort — a missed NOTIFY never fails the
-/// write, and the writing instance already delivered locally).
+/// `ws.broadcast` AFTER the local in-process publish. `notify_token` keys the delete snapshot in
+/// the side table (null for create/update). A no-op unless the active backend is Postgres; a
+/// failure is logged (best-effort — the writing instance already delivered locally).
 pub fn emit(
     app: *App,
     collection: []const u8,
     action: protocol.Action,
     record_id: []const u8,
-    record: ?std.json.Value,
+    notify_token: ?[]const u8,
 ) void {
     if (!build_options.postgres) return;
     if (db.poolBackend(app.pool) != .postgres) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const payload = encode(a, originId(app.io), collection, action, record_id, record) catch return;
-    var c = app.pool.acquireReader() catch return;
+    const payload = encode(a, originId(app.io), collection, action, record_id, notify_token) catch return;
+    var c = app.pool.acquireReader() catch |e| {
+        std.log.warn("realtime: cross-instance NOTIFY skipped (pool acquire failed): {s}", .{@errorName(e)});
+        return;
+    };
     defer app.pool.releaseReader(&c);
-    db.dbNotify(&c, a, channel, payload) catch {};
+    db.dbNotify(&c, a, channel, payload) catch |e| {
+        std.log.warn("realtime: cross-instance NOTIFY failed: {s}", .{@errorName(e)});
+    };
 }
 
 // ---- listener (NOTIFY → in-process hub) -------------------------------------
 
 const ListenerCtx = struct {
     app: *App,
-    conn: db.Db,
     on_event: *const fn (*App, Event) void,
 };
 
-/// Open a dedicated connection, `LISTEN` on the channel, and spawn a detached, process-lifetime
-/// thread that feeds each REMOTE notification to `on_event`. A no-op (returns cleanly) unless the
-/// active backend is Postgres. The thread runs until the connection drops (e.g. process exit);
-/// realtime is best-effort, so a dropped listener simply stops fanning in remote events — the
-/// instance still serves local subscribers.
+/// Spawn a detached, process-lifetime listener thread (Postgres only) that feeds each REMOTE
+/// notification to `on_event`. The thread owns its connection and AUTO-RECONNECTS with capped
+/// backoff on any drop (PG restart/failover/idle timeout) — multi-instance realtime must not stop
+/// silently. A no-op (returns cleanly) unless the active backend is Postgres.
 pub fn startListener(app: *App, on_event: *const fn (*App, Event) void) !void {
     if (!build_options.postgres) return;
     if (db.poolBackend(app.pool) != .postgres) return;
-    // Prime the origin id on the serving thread so `emit` and the listener agree.
-    _ = originId(app.io);
-    var conn = try app.pool.openReader();
-    errdefer conn.close();
-    try db.dbListen(&conn, channel);
+    _ = originId(app.io); // prime on the serving thread so `emit` + the listener agree
     const ctx = try app.allocator.create(ListenerCtx);
     errdefer app.allocator.destroy(ctx);
-    ctx.* = .{ .app = app, .conn = conn, .on_event = on_event };
+    ctx.* = .{ .app = app, .on_event = on_event };
     const t = try std.Thread.spawn(.{}, listenerLoop, .{ctx});
     t.detach();
 }
 
+/// Open a dedicated reader connection and `LISTEN` on the channel.
+fn openListenConn(app: *App) !db.Db {
+    var conn = try app.pool.openReader();
+    errdefer conn.close();
+    try db.dbListen(&conn, channel);
+    return conn;
+}
+
 fn listenerLoop(ctx: *ListenerCtx) void {
-    defer {
-        ctx.conn.close();
-        ctx.app.allocator.destroy(ctx);
+    defer ctx.app.allocator.destroy(ctx);
+    const backoff_min_ms: u64 = 250;
+    const backoff_cap_ms: u64 = 30_000;
+    var backoff_ms: u64 = backoff_min_ms;
+    while (true) {
+        var conn = openListenConn(ctx.app) catch |e| {
+            std.log.err("realtime: PG LISTEN connect failed: {s}; retrying in {d}ms", .{ @errorName(e), backoff_ms });
+            ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
+            backoff_ms = @min(backoff_ms * 2, backoff_cap_ms);
+            continue;
+        };
+        backoff_ms = backoff_min_ms; // reset after a successful (re)connect
+        std.log.info("realtime: PG LISTEN bridge connected on \"{s}\"", .{channel});
+        processUntilDrop(ctx, &conn);
+        conn.close();
+        std.log.err("realtime: PG LISTEN connection dropped; reconnecting (events during the gap are missed)", .{});
     }
+}
+
+/// Consume notifications on `conn` until it errors (returns so the caller reconnects).
+fn processUntilDrop(ctx: *ListenerCtx, conn: *db.Db) void {
     while (true) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const maybe = db.dbWaitNotification(&ctx.conn, a) catch break; // conn dropped → stop
+        const maybe = db.dbWaitNotification(conn, a) catch return; // conn dropped → reconnect
         const n = maybe orelse continue; // a non-notification async message: ignore
         if (!std.mem.eql(u8, n.channel, channel)) continue;
         const ev = decode(a, n.payload) orelse continue;
@@ -231,48 +302,31 @@ fn listenerLoop(ctx: *ListenerCtx) void {
 
 // ---- tests (codec; the live cross-instance path is in backend/postgres/realtime_pg_test.zig) ---
 
-test "encode/decode round-trip: create is minimal (no snapshot)" {
+test "encode/decode round-trip: create is minimal (no token)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const payload = try encode(a, "abc123", "posts", .create, "REC1", null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"s\"") == null); // no snapshot key
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"t\"") == null); // no token key
     const ev = decode(a, payload).?;
     try std.testing.expectEqualStrings("abc123", ev.origin);
     try std.testing.expectEqualStrings("posts", ev.collection);
     try std.testing.expectEqual(protocol.Action.create, ev.action);
     try std.testing.expectEqualStrings("REC1", ev.id);
-    try std.testing.expect(ev.snapshot == null);
+    try std.testing.expect(ev.token == null);
 }
 
-test "encode/decode round-trip: delete carries the authz snapshot" {
+test "encode/decode round-trip: delete carries only a token (no row data)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var snap: std.json.ObjectMap = .empty;
-    try snap.put(a, "id", .{ .string = "REC1" });
-    try snap.put(a, "owner", .{ .string = "u1" });
-    const payload = try encode(a, "o1", "notes", .delete, "REC1", .{ .object = snap });
+    const payload = try encode(a, "o1", "notes", .delete, "REC1", "tok_xyz");
+    // The payload must NOT contain any record/field data — only the token.
+    try std.testing.expect(std.mem.indexOf(u8, payload, "tok_xyz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "owner") == null);
     const ev = decode(a, payload).?;
     try std.testing.expectEqual(protocol.Action.delete, ev.action);
-    try std.testing.expect(ev.snapshot != null);
-    try std.testing.expectEqualStrings("u1", ev.snapshot.?.object.get("owner").?.string);
-}
-
-test "encode: oversize delete snapshot is dropped (NOTIFY 8000-byte limit)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var snap: std.json.ObjectMap = .empty;
-    try snap.put(a, "id", .{ .string = "REC1" });
-    const big = try a.alloc(u8, 9000);
-    @memset(big, 'x');
-    try snap.put(a, "blob", .{ .string = big });
-    const payload = try encode(a, "o1", "notes", .delete, "REC1", .{ .object = snap });
-    try std.testing.expect(payload.len <= max_payload);
-    const ev = decode(a, payload).?;
-    try std.testing.expect(ev.snapshot == null); // dropped → remote conservatively denies
-    try std.testing.expectEqualStrings("REC1", ev.id); // id still present
+    try std.testing.expectEqualStrings("tok_xyz", ev.token.?);
 }
 
 test "decode: malformed / missing fields return null" {

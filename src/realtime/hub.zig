@@ -108,6 +108,15 @@ pub fn shouldDeliver(
 /// derives its dialect per-`Db` (`db.dbDialect`), so the temp DB compiles SQLite SQL while the
 /// create/update path against the live `reader` compiles Postgres `$n`/`now()` SQL — each
 /// self-consistent.
+///
+/// CAVEAT (dialect divergence, not blocking): a DELETE event is therefore ALWAYS authorized in the
+/// SQLite dialect even on a Postgres-backed instance, whereas create/update authorize in the
+/// Postgres dialect against the live row. A rule relying on dialect-divergent SCALAR semantics
+/// (date/time functions, `LIKE` case-sensitivity, boolean coercion) could authorize a delete event
+/// marginally differently than Postgres would authorize a live view. Blast radius is narrow — a
+/// single-row sandbox, relation rules deny against empty target tables, and the typical authz
+/// fields (owner id, tenant key) are plain string equality that is identical across dialects — and
+/// this is pre-existing F4 behavior, not new in PR-6. Owner/tenant-scoped deletes are unaffected.
 fn matchesSnapshot(
     alloc: std.mem.Allocator,
     io: std.Io,

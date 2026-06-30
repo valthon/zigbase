@@ -97,6 +97,44 @@ fn rowToObject(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection)
     return .{ .object = obj };
 }
 
+/// Like `rowToObject`, but encrypted fields are returned as their AT-REST ciphertext envelope
+/// (NEVER decrypted) instead of plaintext. Every other field reads identically. Backs `getAtRest`.
+fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection) !std.json.Value {
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(alloc, "id", .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
+    try obj.put(alloc, "created", .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
+    try obj.put(alloc, "updated", .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
+    for (col.fields, 0..) |f, i| {
+        const idx: c_int = @intCast(3 + i);
+        const v: std.json.Value = if (f.encrypted)
+            // At-rest envelope verbatim (or NULL) — no decryption, so a captured snapshot holds no
+            // plaintext. Authz compares the ciphertext column on the live path too, so this stays
+            // consistent for the (nonsensical) case of a rule referencing an encrypted field.
+            (if (stmt.isNull(idx)) std.json.Value{ .null = {} } else std.json.Value{ .string = try alloc.dupe(u8, stmt.columnText(idx)) })
+        else
+            try values.readValue(alloc, stmt, idx, f);
+        if (!f.hidden) try obj.put(alloc, f.name, v);
+    }
+    return .{ .object = obj };
+}
+
+/// Read a row WITHOUT decrypting its encrypted fields (they come back as the at-rest ciphertext
+/// envelope). Used by the cross-instance realtime DELETE path (#159, PR-6b) to capture a snapshot
+/// that holds NO decrypted plaintext: the snapshot transits a side table (not the NOTIFY wire) and
+/// is used only for the receiving instance's delete authz — which, like the live create/update
+/// path, compares the at-rest (ciphertext) column. No TTL filter (the row is live, captured
+/// pre-delete inside the delete transaction).
+pub fn getAtRest(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) !?std.json.Value {
+    const cols = try columnList(alloc, col);
+    if (!schema.isValidIdentifier(col.name)) return null; // identifier gate before interpolation
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1;", .{ cols, col.name }, 0);
+    var st = try prep(alloc, r, sql);
+    defer st.finalize();
+    try st.bindText(1, id);
+    if (!try st.step()) return null;
+    return try rowToObjectAtRest(alloc, &st, col);
+}
+
 pub fn get(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) RecordError!?std.json.Value {
     const cols = try columnList(alloc, col);
     // TTL read-time exclusion: never return an expired row. Mirrors gcExpiredRecords: both

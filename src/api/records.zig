@@ -359,7 +359,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // the persisted account (id populated); it also seeds the hook's `ctx.user()` identity.
     if (col.type == .auth)
         api_auth.emitAuthLifecycle(ctx, w, col.name, rid, .after_register, &rec_mut, rec_mut);
-    realtime_ws.broadcast(app, col, .create, rid, rec_mut);
+    realtime_ws.broadcast(app, col, .create, rid, rec_mut, null);
     return jsonResponse(ctx, 201, rec_mut);
 }
 
@@ -467,7 +467,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const broadcast_id = ur.object.get("id").?.string;
     var ur_mut = ur;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &ur_mut, .after_update) catch {};
-    realtime_ws.broadcast(app, col, .update, broadcast_id, ur_mut);
+    realtime_ws.broadcast(app, col, .update, broadcast_id, ur_mut, null);
     return jsonResponse(ctx, 200, ur_mut);
 }
 
@@ -498,6 +498,11 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return hookRejected(ctx);
     };
+    // Cross-instance realtime (#159, PR-6b, Postgres only): capture the deleted row's AT-REST
+    // (ciphertext) snapshot into the side table INSIDE this transaction so it commits atomically
+    // with the delete; the returned token (not the row data) is all that rides the NOTIFY wire.
+    // No-op (null) on SQLite — single-process, byte-identical.
+    const notify_token = realtime_ws.captureDeleteSnapshot(ctx.allocator, app, w, col, rid);
     if (!try records.deleteInTxn(ctx.allocator, w, col, rid)) {
         w.rollback() catch {};
         return ApiError.notFound().toResponse(ctx.allocator);
@@ -517,7 +522,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // F4: pass the deleted row's snapshot so subscribers to an owner/expression-scoped collection
     // can re-authorize the delete event (the live row is gone). The snapshot rides in the published
     // frame under a private key and is stripped before any client receives the id-only delete frame.
-    realtime_ws.broadcast(app, col, .delete, rid, ex_mut);
+    realtime_ws.broadcast(app, col, .delete, rid, ex_mut, notify_token);
     return .{ .status = 204, .body = "" };
 }
 
