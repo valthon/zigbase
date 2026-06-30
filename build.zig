@@ -32,11 +32,15 @@ pub fn build(b: *std.Build) void {
     // with -Ddev-clock=true to build a debuggable binary that still honors the env (e2e dev).
     const dev_clock = b.option(bool, "dev-clock", "Compile in the dev-only ZIGBASE_FAKE_NOW test clock (default: on in Debug, off in release)") orelse (optimize == .Debug);
     build_options.addOption(bool, "dev_clock", dev_clock);
-    // Opt-in vector search (#157). OFF by default: the default build does NOT compile or link the
-    // sqlite-vec amalgamation, and every vector code path folds to comptime-dead — the shipped
-    // binary is byte-for-byte unaffected. `-Dvector=true` compiles vendor/sqlite-vec/sqlite-vec.c
-    // into the SQLite build (below) and db.zig registers the extension on each connection.
-    const vector = b.option(bool, "vector", "Compile in opt-in sqlite-vec vector search (default: off)") orelse false;
+    // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
+    // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
+    // comptime-dead — the shipped binary is byte-for-byte unaffected. `-Dvector=true` enables vector
+    // KNN on BOTH backends from this ONE flag: it compiles vendor/sqlite-vec/sqlite-vec.c into the
+    // SQLite build (below; db.zig registers the extension per connection), AND emits the Postgres
+    // pgvector lowering (`?vector=` → `<=>`/`<->`; provision runs `CREATE EXTENSION vector`). pgvector
+    // is a server EXTENSION (no C to compile here); the target PG must have it available (e.g. the
+    // `pgvector/pgvector:pgNN` image). One flag keeps the opt-in symmetric across backends.
+    const vector = b.option(bool, "vector", "Compile in opt-in vector search — sqlite-vec on SQLite, pgvector on Postgres (default: off)") orelse false;
     build_options.addOption(bool, "vector", vector);
     // Opt-in pure-Zig PostgreSQL backend (#159). OFF by default: when false, the entire
     // src/backend/postgres/ subtree is comptime-unreachable (gated in src/root.zig and, in

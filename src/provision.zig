@@ -22,6 +22,7 @@ const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
 const secrets = @import("oauth/secrets.zig");
 const fts = @import("search/fts.zig");
+const vector = @import("search/vector.zig");
 const Migrator = @import("migrator.zig").Migrator;
 
 /// F3 startup lint: log a prominent warning for every `@public` (allow-all) rule on `col`, so a
@@ -804,6 +805,12 @@ pub fn applySpecs(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
+
+    // Opt-in vector search (#157/#159): on Postgres the `?vector=` KNN lowering needs the pgvector
+    // `vector` type + `<=>`/`<->` operators, so ensure the server extension once at startup. A no-op
+    // in a default (non-`-Dvector`) build or on SQLite; best-effort under Postgres (a privilege
+    // failure warns, never aborts).
+    vector.ensureExtension(w);
 
     // Validate all relation targets reference a known comptime collection name up
     // front, so an unknown target is a clear startup error (not a broken relation).

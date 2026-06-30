@@ -82,4 +82,7 @@ test {
     _ = @import("realtime_pg_test.zig");
     // PR-9: live SQLite -> Postgres dump/load round-trip (counts, encrypted field, relation). Skips if no PG.
     _ = @import("dumpload_pg_test.zig");
+    // PR-11: live pgvector KNN parity (?vector= → <=>/<->) + tenant/ability-scoped vector-search
+    // chokepoint composition. Skips if no PG or if -Dvector is off.
+    _ = @import("vector_pg_test.zig");
 }
