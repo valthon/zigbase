@@ -360,7 +360,7 @@ pub const Dialect = struct {
             .sqlite => std.fmt.allocPrint(alloc, "strftime('%Y-%m-%dT%H:%M:%SZ','now') > {s}", .{col}),
             .postgres => std.fmt.allocPrint(
                 alloc,
-                "({s} ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}Z$' AND {s} > {s})",
+                "({s} ~ " ++ iso_z_regex ++ " AND {s} > {s})",
                 .{ col, self.nowIso8601Expr(), col },
             ),
         };
@@ -371,7 +371,14 @@ pub const Dialect = struct {
     /// that doesn't match is treated fail-safe — see below). SQLite uses `strftime` normalization
     /// instead, so this constant is Postgres-only. The braces are DOUBLED because this is spliced
     /// into `std.fmt` format strings (where `{{`/`}}` are the literal-brace escapes).
-    const iso_z_regex = "'^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}Z$'";
+    ///
+    /// The numeric fields are RANGE-BOUNDED (month `01..12`, day `01..31`, hour `00..23`,
+    /// minute/second `00..59`), not just `[0-9]{{2}}` — a well-SHAPED but out-of-range value like
+    /// `2024-99-99T99:99:99Z` would otherwise pass the regex and be lexically aged out, violating
+    /// the fail-safe (SQLite's `strftime` returns NULL → keeps it). Residual: a range-valid but
+    /// calendar-IMPOSSIBLE date (e.g. `2024-02-30`) still passes and compares lexically — accepted,
+    /// because ZigBase only ever writes real `strftime`/`to_char` instants, never such a value.
+    const iso_z_regex = "'^[0-9]{{4}}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])Z$'";
 
     /// A boolean predicate that is TRUE when a row's TTL column `col` means the row is still
     /// VISIBLE (read-time TTL exclusion in `records.get`/`records.list`). Three fail-safe clauses,
@@ -548,6 +555,10 @@ test "dialect: agedBeyondDaysPredicate is fail-safe + relative on both backends"
     // PG gates the compare on the ISO-Z regex (fail-safe) and uses make_interval for the cutoff.
     try std.testing.expect(std.mem.indexOf(u8, p, "\"created\" ~ '^") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "make_interval(days => 90)") != null);
+    // The regex RANGE-BOUNDS each numeric field (so 2024-99-99T… is rejected → kept, not aged out).
+    try std.testing.expect(std.mem.indexOf(u8, p, "(0[1-9]|1[0-2])") != null); // month 01..12
+    try std.testing.expect(std.mem.indexOf(u8, p, "(0[1-9]|[12][0-9]|3[01])") != null); // day 01..31
+    try std.testing.expect(std.mem.indexOf(u8, p, "([01][0-9]|2[0-3])") != null); // hour 00..23
 }
 
 test "dialect: cast + ttl predicate" {

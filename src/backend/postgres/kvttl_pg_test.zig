@@ -41,11 +41,15 @@ const Ctx = struct {
         };
         errdefer conn.close();
         const sn = "zb_pr4_" ++ tag;
-        try conn.exec("DROP SCHEMA IF EXISTS " ++ sn ++ " CASCADE;");
+        const drop = "DROP SCHEMA IF EXISTS " ++ sn ++ " CASCADE;";
+        try conn.exec(drop);
         try conn.exec("CREATE SCHEMA " ++ sn ++ ";");
+        // Drop the just-created schema if SET search_path / migrations fail (errdefers run LIFO, so
+        // this drop runs BEFORE conn.close above), so a partial failure never leaves a schema behind.
+        errdefer conn.exec(drop) catch {};
         try conn.exec("SET search_path TO " ++ sn ++ ";");
         try migrations.run(&conn);
-        return Ctx{ .conn = conn, .drop_sql = "DROP SCHEMA IF EXISTS " ++ sn ++ " CASCADE;" };
+        return Ctx{ .conn = conn, .drop_sql = drop };
     }
 
     fn deinit(self: *Ctx) void {
@@ -85,10 +89,12 @@ test "pg: _kv set/get/delete round-trip, upsert preserves created, prefix scan (
     try std.testing.expectEqualStrings("hello", (try d.kvGet("greeting")).?);
 
     // Capture created, update value, assert created preserved + updated bumped is value-changed.
-    var st = try ctx.w().prepare("SELECT created FROM \"_kv\" WHERE key='greeting';");
-    try std.testing.expect(try st.step());
-    const created0 = try al.dupe(u8, st.columnText(0));
-    st.finalize();
+    const created0 = blk: {
+        var st = try ctx.w().prepare("SELECT created FROM \"_kv\" WHERE key='greeting';");
+        defer st.finalize(); // scoped: finalized even if step/dupe fails
+        try std.testing.expect(try st.step());
+        break :blk try al.dupe(u8, st.columnText(0));
+    };
     // created is the ISO-8601 `Z` shape from nowTextExpr (to_char) on PG.
     try std.testing.expectEqual(@as(usize, 20), created0.len);
     try std.testing.expectEqual(@as(u8, 'Z'), created0[19]);
@@ -124,21 +130,24 @@ test "pg: gcExpiredAssignments reaps aged rows, keeps fresh + malformed (fail-sa
     defer ctx.deinit();
     const w = ctx.w();
 
-    // Three rows: an ancient one (reaped), a far-future one (kept), and a malformed timestamp
-    // (kept — the fail-safe: a value failing the ISO-`Z` regex can never be aged out).
+    // Four rows: an ancient one (reaped), a far-future one (kept), a non-ISO malformed timestamp
+    // (kept), and a well-SHAPED but out-of-RANGE timestamp `2024-99-99T99:99:99Z` (kept — the
+    // range-bounded regex rejects it, so a lexically-"old" garbage value is never aged out).
     try w.exec(
         \\INSERT INTO "_experiment_assignments" ("experiment","subject","variant","created") VALUES
         \\  ('layout','old','control','2000-01-01T00:00:00Z'),
         \\  ('layout','fresh','compact','2999-01-01T00:00:00Z'),
-        \\  ('layout','bad','control','not-a-timestamp');
+        \\  ('layout','bad','control','not-a-timestamp'),
+        \\  ('layout','oor','control','2024-99-99T99:99:99Z');
     );
 
     const reaped = try features_resolver.gcExpiredAssignments(w, 90);
     try std.testing.expectEqual(@as(usize, 1), reaped); // only the 2000 row aged out
 
-    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w, "SELECT count(*) FROM \"_experiment_assignments\";"));
-    // The malformed row specifically survived (fail-safe), as did the future one.
+    try std.testing.expectEqual(@as(i64, 3), try scalarCount(w, "SELECT count(*) FROM \"_experiment_assignments\";"));
+    // The malformed + out-of-range rows specifically survived (fail-safe), as did the future one.
     try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM \"_experiment_assignments\" WHERE \"subject\"='bad';"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM \"_experiment_assignments\" WHERE \"subject\"='oor';"));
     try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM \"_experiment_assignments\" WHERE \"subject\"='fresh';"));
     try std.testing.expectEqual(@as(i64, 0), try scalarCount(w, "SELECT count(*) FROM \"_experiment_assignments\" WHERE \"subject\"='old';"));
 }

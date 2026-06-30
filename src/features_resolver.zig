@@ -226,8 +226,10 @@ pub fn gcExpiredAssignments(conn: *db.Db, ttl_days: u32) !usize {
     // diverge by backend, so route them through the dialect. SQLite keeps the `strftime`
     // normalization + `rowid`; Postgres uses the ISO-`Z` regex gate + `make_interval` cutoff +
     // `ctid`. No bind placeholders (the cutoff is inlined, the trusted `ttl_days` config value),
-    // so no `$n` renumber is required. The SQL is small and bounded → a stack allocator suffices.
-    var buf: [1024]u8 = undefined;
+    // so no `$n` renumber is required. The SQL is small and bounded → a stack allocator suffices
+    // (the PG arm's range-bounded ISO regex + make_interval cutoff is the largest, well under 4 KiB
+    // even with the Allocating writer's growth slack).
+    var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const a = fba.allocator();
     const dialect = db.dbDialect(conn);
