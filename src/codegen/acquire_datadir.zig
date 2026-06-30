@@ -86,19 +86,62 @@ pub fn acquire(alloc: std.mem.Allocator, io: std.Io, target: []const u8) ![]sche
 
     const path = try std.fmt.allocPrintSentinel(alloc, "{s}/data.db", .{target}, 0);
     defer alloc.free(path);
+    // A URL-like target (a malformed `postgres:/user:pass@host/db` that escaped the `postgres://`
+    // detection above, etc.) may carry credentials — NEVER echo it in a log. A plain filesystem
+    // path is not a secret, so we show it (and the derived `<path>/data.db`) verbatim.
+    const url_like = looksUrlLike(target);
     var w = db.Db.open(path) catch |e| {
-        std.log.err("typegen: cannot open '{s}': {s}", .{ path, @errorName(e) });
-        // A `postgres:/host/db` (single slash) or other URL-ish target is not a directory; nudge
-        // toward the correct scheme rather than just reporting a confusing file-open error.
-        if (std.mem.indexOfScalar(u8, target, ':') != null and !db.connstrLooksLikePostgres(target))
-            std.log.err("typegen: '{s}' looks like a URL — did you mean a 'postgres://…' connection string?", .{target});
+        if (url_like) {
+            std.log.err("typegen: cannot open the data source ({s}): {s}", .{ redacted, @errorName(e) });
+            // Nudge toward the right scheme — without echoing the (possibly credential-bearing) target.
+            std.log.err("typegen: the target looks like a URL — did you mean a 'postgres://…' connection string?", .{});
+        } else {
+            std.log.err("typegen: cannot open '{s}': {s}", .{ path, @errorName(e) });
+        }
         return error.DataDirOpenFailed;
     };
     defer w.close();
     return acquireFromDb(alloc, &w) catch |e| {
-        std.log.err("typegen: cannot read _collections from '{s}': {s} (has the server provisioned this data dir?)", .{ path, @errorName(e) });
+        const shown: []const u8 = if (url_like) redacted else path;
+        std.log.err("typegen: cannot read _collections from '{s}': {s} (has the server provisioned this data dir?)", .{ shown, @errorName(e) });
         return error.DataDirReadFailed;
     };
+}
+
+/// The placeholder logged in place of a URL-like target (which may carry credentials).
+const redacted = "<redacted url-like target>";
+
+/// True if `s` looks like a URL / connection string (so it must NOT be logged raw): it contains
+/// `://`, contains an `@` (a `user:pass@host` credential pattern), or begins with an RFC-3986 URI
+/// scheme (`scheme:` where `scheme` is `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`). A plain
+/// filesystem path (`/var/data`, `./out`, `mydir`) is none of these and is safe to log.
+fn looksUrlLike(s: []const u8) bool {
+    if (std.mem.indexOf(u8, s, "://") != null) return true;
+    if (std.mem.indexOfScalar(u8, s, '@') != null) return true;
+    // Leading `scheme:` (e.g. `postgres:/…` with a single slash, which is URL-ish but not `://`).
+    if (s.len == 0 or !std.ascii.isAlphabetic(s[0])) return false;
+    var i: usize = 1;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == ':') return true; // a scheme delimiter before any other terminator
+        if (!(std.ascii.isAlphanumeric(c) or c == '+' or c == '-' or c == '.')) return false;
+    }
+    return false;
+}
+
+test "looksUrlLike: redacts URL/credential targets, allows plain paths" {
+    // URL-like → must be treated as a secret (redacted in logs).
+    try std.testing.expect(looksUrlLike("postgres://u:p@h/db"));
+    try std.testing.expect(looksUrlLike("postgresql://h:5432/db"));
+    try std.testing.expect(looksUrlLike("postgres:/u:p@h/db")); // malformed single-slash, scheme prefix
+    try std.testing.expect(looksUrlLike("u:p@host/db")); // credential pattern, no scheme
+    try std.testing.expect(looksUrlLike("scheme:rest"));
+    // Plain filesystem paths → not secrets, safe to log verbatim.
+    try std.testing.expect(!looksUrlLike("/var/data"));
+    try std.testing.expect(!looksUrlLike("./out"));
+    try std.testing.expect(!looksUrlLike("mydir"));
+    try std.testing.expect(!looksUrlLike("data_dir/sub"));
+    try std.testing.expect(!looksUrlLike(""));
 }
 
 test "acquireFromDb returns user collections (sorted, system excluded, auth stripped)" {
