@@ -74,4 +74,7 @@ test {
     // PR-8: live typed-client codegen parity (data-dir adapter opens a postgres:// source;
     // generated client is byte-identical to SQLite). Skips if no PG.
     _ = @import("codegen_pg_test.zig");
+    // PR-10: live full-text-search parity (tsvector/@@/ts_rank) + tenant/ability-scoped search
+    // chokepoint composition. Skips if no PG.
+    _ = @import("fts_pg_test.zig");
 }
