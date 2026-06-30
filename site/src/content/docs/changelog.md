@@ -11,7 +11,59 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.0] - 2026-06-30
+
+A large release: a **PostgreSQL backend** alongside the default embedded SQLite, plus multi-tenancy, relationship-based authorization, full-text & vector search, product analytics, a transactional email subsystem, background job queues, outbound webhooks, CAPTCHA verification, and a realtime broadcast API.
+
+### Breaking
+
+- **Consumer migrations** (`.migrations`) now receive a `*zigbase.Migrator` instead of `(alloc, io, w)`. Change each `up` to `fn (m: *zigbase.Migrator) anyerror!void`: the writer is `m.db`, the arena `m.arena`, the request `std.Io` is `m.io`. `Migrator` carries the active SQL **dialect** so one migration runs on either backend — `m.execLowered(sql)` lowers SQLite-flavored DDL/seeds to the active backend (byte-identical on SQLite), `m.exec(sql)` runs raw backend-specific SQL, and `m.dialect.kind` / `m.rawFor(.postgres, …)` branch per backend. SQLite-only consumers just swap `w` → `m.db`.
+- `ErrorPhase` gained a `.webhook` variant (additive). An `onError` handler that switches exhaustively over `ErrorPhase` must add a `.webhook` arm.
+
+### Features
+
+- **PostgreSQL backend (opt-in).** ZigBase can now run on PostgreSQL instead of the default embedded SQLite, selected by configuration alone — a `postgres://` `ZIGBASE_DB_URL` in a `-Dpostgres` build; application code and collection definitions are unchanged.
+  - **Full feature parity:** record CRUD and the typed filter/sort/expand/search query engine, the access-rule + abilities + tenancy authorization stack, analytics rollups, the KV/TTL/rate-limit/feature-flag stores, field encryption + key rotation, the deterministic test-clock, and typed-client codegen all work identically on Postgres — verified against a live server in CI.
+  - **Realtime across app instances:** a Postgres deployment can run multiple stateless app instances against one database, and record-change events fan out to subscribers on every instance via `LISTEN/NOTIFY`. The NOTIFY payload carries only an opaque token — never row data — so encrypted fields never leave the database in plaintext.
+  - **Pure-Zig wire driver:** no libpq, C, or OpenSSL dependency (TLS via `std.crypto.tls.Client`, SCRAM-SHA-256 via `std.crypto`); the default SQLite build links zero new symbols. *Transport is encrypted but the server certificate is not yet verified in any sslmode (`verify-full` is a tracked follow-up) — use the Postgres backend over a trusted network path until then.*
+  - **`migrate-db` CLI:** `zigbase migrate-db --from ./data.db --to "postgres://…"` copies an existing SQLite instance (schema **and** data) into a fresh Postgres database — provisions the equivalent schema, bulk-loads every table in one atomic transaction, preserves ids/timestamps/metadata, and carries encrypted-field envelopes byte-for-byte (no key needed). *FK suspension requires a superuser target; a managed non-superuser Postgres uses a lightly-tested topological-order fallback.*
+  - **Vector search on Postgres** via pgvector, behind the same `-Dvector` flag and `?vector=` API as SQLite's sqlite-vec — one flag enables KNN on both backends.
+  - **Admin backend badge:** the admin UI shows a "SQLite"/"Postgres" badge, sourced from a new `backend` field on `GET /api/health` (the kind only — never the connection string or credentials).
+  - The default SQLite single-file deployment is unchanged. One safeguard: a stock (non-`-Dpostgres`) binary now reads `ZIGBASE_DB_URL` and logs a prominent warning if it is a `postgres://` URL, rather than silently writing to local SQLite.
+- **Account-scoped multi-tenancy (#156).** `App(.{ .tenancy = .{ .enabled = true, .auth_collection = "users" } })` plus a collection's `.tenant_field = "account"` auto-scopes every read/write (and realtime delivery) of a tenant-owned collection to the request's active account via a bound `tenant_field = ?` predicate; create stamps the owning account and update rejects cross-tenant moves. The active account resolves from an `X-Account-Id` header or a signed `zb_account` cookie, verified against an active `_memberships` row (fail-closed). Adds built-in `_accounts`/`_memberships`/`_invitations` collections, a configurable role order (`viewer < editor < admin < owner`), `POST /api/accounts/:id/activate`, and the `@request.account.id`/`.role`/`.ids` rule macros. Superusers bypass; `zigbase.crossTenant(rctx)` is the explicit admin override. Apps with no `.tenancy` are byte-identical to before.
+- **Relationship-based row abilities (#155).** Declare per-collection, per-action authorization by the principal's relationship to the row: `App(.{ .abilities = .{ .projects = .{ .update = .{ .relationship = .{ .via = "account", .min_role = .editor } } } } })` authorizes a row when the principal holds a membership (role ≥ `.min_role`) of the account it belongs to. Abilities compose into the existing guard stack, narrow the LIST endpoint, are fail-closed and comptime-validated, and `ctx.can(.action, "col", id)` + `GET …/records/:id/abilities` expose them to custom routes. Collections with no `.abilities` are byte-identical to before.
+- **Search on the list endpoint (#157).**
+  - **Full-text search** ships in the default build: mark a `text`/`editor` field `.searchable = true` and query with `?search=<terms>` — ranked by relevance, with `AND`/`OR`/`NOT`/prefix operators, provisioned automatically (SQLite FTS5; Postgres `tsvector` + GIN). Search composes with the full authorization stack and structured filters: `?search=X&filter=Y` returns the scoped intersection (never an unscoped query) and terms are always bound (no injection).
+  - **Vector / nearest-neighbor search** behind an opt-in `-Dvector` flag: `?vector=<field>[:cosine|:l2]:<embedding>` KNN ordering composed into the same scoped query (sqlite-vec on SQLite, pgvector on Postgres). Not compiled into the default build.
+- **Product analytics (#158).** `ctx.track("user.signup", .{ .plan = "pro" })` appends an immutable event — actor, tenant, and timestamp stamped server-side — to the new `_events` collection. Declarative rollups (`App(.{ .analytics = .{ .rollups = … } })`) incrementally aggregate events into summary tables on the scheduler. Tenant-scoped, fail-closed read API: `GET /api/analytics/events` (raw feed) and `GET /api/analytics/rollups/:name`. Usable standalone with no config.
+- **Email subsystem (#154)** on `ctx.mail()`:
+  - A safe multipart HTML + plain-text **template engine** (HTML-escaped by default, named partials + shared layout, no code evaluation).
+  - First-class **SES** and **Postmark** HTTP providers behind the `Mailer` vtable (SMTP/Command unchanged), a per-message `From` override, and a `CaptureMailer` for asserting outbound mail in tests with no network.
+  - **Verified per-account sender identities** and **bounce/complaint suppression** with an inbound provider webhook, all tenant-scoped. Enforcement (`.mail.require_verified_sender`, `.check_suppression`) defaults off, so an app that only calls the existing mailer is unaffected.
+  - `ctx.mail().send(...)` / `.enqueue(...)` / `.deliverLater(...)`; `mail.Email` gains `html_body`/`reply_to`; the framework owns header-injection (CRLF) defense for every backend.
+- **Background jobs & queues.** A generic multi-queue/worker/job engine: declare named `.queues` (memory or durable, prioritized, per-queue retry), `.workers` (bound to queues, strict-priority drain, concurrency), and a `.jobs` kind→handler registry, then enqueue from anywhere with `ctx.enqueue(.queue, .kind, payload)`. Durable queues persist to `_queue_jobs` with at-least-once delivery, crash-reclaim, and GC; memory queues need zero schema. Powers the built-in `"mail"` and `"webhook"` job kinds.
+- **Outbound webhooks.** `ctx.webhook(url, payload, .{…})` delivers in the background on the queue engine with retry/backoff (honoring `Retry-After`, capped), optional HMAC-SHA256 signing, and a stable per-delivery `Idempotency-Key`; TLS certificate verification stays on.
+- **Realtime broadcast API** for custom (non-record) channels, from a route or job: `ctx.realtime().signal(topic)` (a payload-less re-fetch trigger, the default for private state) and `.broadcast(topic, payload)` (delivered verbatim), over the same WebSocket subscribe protocol clients already use. New `App(.{ .realtime = .{ .canSubscribe = fn } })` gates custom-topic subscriptions; a custom topic can never reach a real collection's record channel.
+- **CAPTCHA verification (#140).** `ctx.verifyCaptcha(provider, token)` for reCAPTCHA v2/v3, hCaptcha, and Cloudflare Turnstile, configured via `App(.{ .captcha = … })` (dev-bypass when the secret is empty).
+- **Custom-route ergonomics.** Response builders (`ctx.json` / `jsonError` / `html` / `redirect` / `notFound`), deferred `ctx.setCookie` / `addHeader` (merged on both the success and error paths), lazy `ctx.query()`, `ctx.randomToken` / `randomHex`, and `ctx.subjectCookie` (an anonymous per-visitor id). A declarative route **guard pipeline**: `.auth` now also accepts a `path_secret` guard (constant-time shared-secret gate, bare-404 on mismatch) and `.rate_limit` adds per-route buckets keyed on the trust-proxy client IP. `http.Cookie` gains an optional `domain`.
+- **Filter/rule grammar:** a new `in` set-membership operator (`field in ("a", "b")`, compiled to a bound `IN (?, …)`, empty set fail-closed) and the `@request.account.id` / `.role` / `.ids` macros that underpin tenancy and abilities.
+
+### Changed
+
+- A `.nocase` (case-insensitive) index now makes both **uniqueness and lookups** case-insensitive on SQLite. Previously a `.nocase` UNIQUE index treated `Bob@x.com`/`bob@x.com` as the same identity, but the lookup was case-sensitive — so a user registered as `Bob@x.com` could not log in as `bob@x.com`. Identity/email lookups and `=`/`!=`/`in` comparisons against a `.nocase` column are now case-insensitive, agreeing with the index (and matching the Postgres backend, which uses a `lower()` functional index). The built-in auth identity index remains case-sensitive — case-insensitive identity stays opt-in via a `.nocase` index.
+
+### Security
+
+- The shared one-time-code comparison was unified on the audited constant-time `crypto.timingSafeEql` primitive (the OTP auth method now uses it too).
+- Webhook retry backoff (including a server-supplied `Retry-After`) is capped at the queue's maximum, so a hostile or misconfigured receiver cannot park a worker thread and starve the background pool.
+- The new subsystems are fail-closed by design — tenant/ability/search scoping, the email verified-sender + suppression + CRLF-injection defenses, the realtime no-row-data-on-the-NOTIFY-wire guarantee, the `path_secret` constant-time gate, and per-route rate-limit IP keying are detailed under their features above.
+
+### Internal
+
+- CI now runs a `-Ddev-clock=false` production-gate test pass, so the tests asserting that `ZIGBASE_FAKE_NOW`/`ZIGBASE_FAKE_SEED`/test-capture are compiled out of production builds actually execute (they were previously skipped in the only CI test run).
+- The e2e test harnesses now retry server startup on a port-bind race (fresh OS-assigned port + fast `ListenError` detection + cleanup between attempts), fixing an intermittent `ListenError` → "server did not become healthy" flake in the `ts-sdk`/`browser` jobs.
+- New `policy.zig` authorization-composition layer and `src/sql/dialect.zig` SQL-dialect layer are the architectural seams the abilities/tenancy and the Postgres backend compose through.
+- GitHub release descriptions now contain only the released version's changelog section (`scripts/extract-release-notes.sh`), not the entire `CHANGELOG.md`.
 
 ## [0.8.0] - 2026-06-28
 
