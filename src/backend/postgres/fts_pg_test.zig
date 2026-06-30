@@ -58,14 +58,23 @@ fn dropTempSchema(a: std.mem.Allocator, d: *dbm.Db, name: []const u8) void {
 fn provisionFts(a: std.mem.Allocator, d: *dbm.Db, col: schema.Collection) !void {
     const tc = Dialect.postgres.textCollate();
     var sql: std.ArrayList(u8) = .empty;
-    try sql.appendSlice(a, try std.fmt.allocPrint(a, "CREATE TABLE \"{s}\" (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ col.name, tc, tc, tc }));
+    defer sql.deinit(a);
+    {
+        const head = try std.fmt.allocPrint(a, "CREATE TABLE \"{s}\" (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ col.name, tc, tc, tc });
+        defer a.free(head);
+        try sql.appendSlice(a, head);
+    }
     for (col.fields) |f| {
         const ty = Dialect.postgres.sqlType(f.storageClass());
         const collate = if (std.mem.eql(u8, ty, "TEXT")) tc else "";
-        try sql.appendSlice(a, try std.fmt.allocPrint(a, ", \"{s}\" {s}{s}", .{ f.name, ty, collate }));
+        const frag = try std.fmt.allocPrint(a, ", \"{s}\" {s}{s}", .{ f.name, ty, collate });
+        defer a.free(frag);
+        try sql.appendSlice(a, frag);
     }
     try sql.appendSlice(a, ");");
-    try d.exec(try std.fmt.allocPrintSentinel(a, "{s}", .{sql.items}, 0));
+    const ddl = try std.fmt.allocPrintSentinel(a, "{s}", .{sql.items}, 0);
+    defer a.free(ddl);
+    try d.exec(ddl);
     try fts.ensureIndex(a, d, col); // build the tsvector generated column + GIN index
 }
 
@@ -289,4 +298,35 @@ test "pg-fts: ensureIndex rebuilds the index when the searchable column SET drif
     const res = try records.list(al, &d, c2, .{ .search = "zebra", .perPage = 50 });
     try std.testing.expectEqual(@as(usize, 1), res.items.len);
     try std.testing.expectEqualStrings("alpha", getStr(res.items[0], "title"));
+}
+
+test "pg-fts: a >256-byte search term ending mid-codepoint does not error (UTF-8-safe cap)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var d = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer d.close();
+    const sname = try enterTempSchema(al, &d);
+    defer dropTempSchema(al, &d, sname);
+
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .searchable = true, .options = .{ .text = .{} } }};
+    const col = schema.Collection{ .id = "c1", .name = "items", .fields = &fields };
+    try provisionFts(al, &d, col);
+    _ = try records.create(al, io, &d, col, try obj(al, .{.{ "title", std.json.Value{ .string = "hello world" } }}));
+
+    // Craft a term longer than the byte cap whose byte at the cut index is a UTF-8 CONTINUATION
+    // byte: (max_term_len-1) ASCII bytes + a 2-byte 'é'. A naive `term[0..max_term_len]` would slice
+    // through the 'é' → invalid UTF-8 → Postgres rejects the bound text param → 500. The UTF-8-safe
+    // cap backs off to the codepoint boundary, so the search runs cleanly (and simply matches
+    // nothing here).
+    var term: std.ArrayList(u8) = .empty;
+    try term.appendNTimes(al, 'a', fts.max_term_len - 1);
+    try term.appendSlice(al, "\u{E9}"); // C3 A9 — the cut at max_term_len lands on the A9 byte
+    try std.testing.expect(term.items.len > fts.max_term_len);
+
+    const res = try records.list(al, &d, col, .{ .search = term.items, .perPage = 50 });
+    try std.testing.expectEqual(@as(usize, 0), res.items.len); // no row contains the long token
 }

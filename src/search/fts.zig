@@ -37,6 +37,30 @@ pub const suffix = schema.fts_suffix;
 /// Defensive cap on a user search term we process (bounds work; longer input is truncated).
 pub const max_term_len = 256;
 
+/// Truncate `s` to at most `max` BYTES without splitting a multi-byte UTF-8 codepoint. A bare
+/// byte-slice `s[0..max]` can cut mid-sequence, yielding invalid UTF-8 — which Postgres rejects on
+/// a bound `text` param (a 500 on a crafted long-unicode search term); SQLite is byte-tolerant but
+/// we back off there too for one consistent rule. If the cut lands on a UTF-8 continuation byte
+/// (`0b10xxxxxx`), walk back to the start of that codepoint so the returned prefix is always valid
+/// UTF-8. ASCII input is unaffected (every byte is its own boundary).
+fn utf8SafeCap(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var end = max;
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return s[0..end];
+}
+
+test "utf8SafeCap never splits a codepoint; passes ASCII + short input through" {
+    try std.testing.expectEqualStrings("abc", utf8SafeCap("abc", 8)); // short → unchanged
+    try std.testing.expectEqualStrings("abcd", utf8SafeCap("abcdef", 4)); // ASCII cut on boundary
+    // "é" is 2 bytes (C3 A9). A cap of 3 over "aéé" (a,C3,A9,C3,A9) would split the 2nd é → back off.
+    try std.testing.expectEqualStrings("a\u{E9}", utf8SafeCap("a\u{E9}\u{E9}", 3));
+    // A cap landing exactly after a full codepoint keeps it ("aéb" cut at 3 → "aé").
+    try std.testing.expectEqualStrings("a\u{E9}", utf8SafeCap("a\u{E9}b", 3));
+    // A 4-byte emoji (😀 = F0 9F 98 80) cut at 2 bytes backs off to empty (its lead byte excluded).
+    try std.testing.expectEqual(@as(usize, 0), utf8SafeCap("\u{1F600}", 2).len);
+}
+
 /// The FTS5 shadow-table name for `col_name` (`"<col_name>_fts"`), on `alloc`. On Postgres the
 /// same name identifies the STORED `tsvector` generated column on the base table.
 pub fn tableName(alloc: std.mem.Allocator, col_name: []const u8) ![]u8 {
@@ -120,7 +144,7 @@ fn buildSqlite(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []con
 /// no FTS5-style `sanitize` is needed. Returns null only when the trimmed term is empty.
 fn buildPostgres(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []const u8) !?Search {
     const trimmed = std.mem.trim(u8, raw_term, " \t\r\n");
-    const capped = if (trimmed.len > max_term_len) trimmed[0..max_term_len] else trimmed;
+    const capped = utf8SafeCap(trimmed, max_term_len); // cap on a UTF-8 boundary (never mid-codepoint)
     if (capped.len == 0) return null;
     const term = try alloc.dupe(u8, capped);
     const tsv = try tableName(alloc, col.name); // the generated tsvector column name
@@ -142,7 +166,7 @@ fn buildPostgres(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []c
 /// AND. This is defense-in-depth ON TOP OF parameter binding (which already prevents injection).
 pub fn sanitize(alloc: std.mem.Allocator, raw: []const u8) !?[]const u8 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    const capped = if (trimmed.len > max_term_len) trimmed[0..max_term_len] else trimmed;
+    const capped = utf8SafeCap(trimmed, max_term_len); // cap on a UTF-8 boundary (never mid-codepoint)
 
     var out: std.ArrayList(u8) = .empty;
     var emitted_term = false;
@@ -259,18 +283,30 @@ pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) 
 /// targets the collection's table in the active schema.
 fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !void {
     if (!schema.isValidIdentifier(col.name)) return;
+    // These provisioning temporaries are explicitly freed (the SQL strings are copied by
+    // `prepare`/`exec`, and `bindText` dupes its arg, so freeing after the call is safe). In the
+    // startup `applySpecs` path the caller's allocator is an arena reclaimed wholesale, so the
+    // frees are no-ops there; they keep this correct under a general-purpose allocator too.
     const tsv = try tableName(alloc, col.name); // "<col>_fts" — the generated tsvector column
+    defer alloc.free(tsv);
     const idx = try pgIndexName(alloc, col.name); // "<col>_fts_idx" — the GIN index
+    defer alloc.free(idx);
     const cols = try searchableColumns(alloc, col);
+    defer alloc.free(cols); // the element strings are borrowed field names; free only the slice
     const want_marker = try pgMarker(alloc, cols);
+    defer alloc.free(want_marker);
 
     if (cols.len == 0) {
         // Not searchable: drop a stale column/index only if one actually exists.
-        if ((try pgColumnMarker(alloc, w, col.name, tsv)) != null) try dropIndexPg(alloc, w, col.name, tsv, idx);
+        if (try pgColumnMarker(alloc, w, col.name, tsv)) |have| {
+            alloc.free(have);
+            try dropIndexPg(alloc, w, col.name, tsv, idx);
+        }
         return;
     }
 
     if (try pgColumnMarker(alloc, w, col.name, tsv)) |have_marker| {
+        defer alloc.free(have_marker);
         if (std.mem.eql(u8, have_marker, want_marker) and (try pgRelExists(alloc, w, idx)))
             return; // up to date — idempotent no-op
         try dropIndexPg(alloc, w, col.name, tsv, idx); // drift / missing index — rebuild
@@ -281,22 +317,41 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
     // The 2-arg to_tsvector(regconfig, text) with a literal config is IMMUTABLE (required for a
     // generated column); coalesce keeps NULL columns from voiding the whole vector.
     var expr: std.ArrayList(u8) = .empty;
-    try expr.appendSlice(alloc, try std.fmt.allocPrint(alloc, "to_tsvector('{s}', ", .{pg_ts_config}));
+    defer expr.deinit(alloc);
+    {
+        const head = try std.fmt.allocPrint(alloc, "to_tsvector('{s}', ", .{pg_ts_config});
+        defer alloc.free(head);
+        try expr.appendSlice(alloc, head);
+    }
     for (cols, 0..) |cn, i| {
         if (i > 0) try expr.appendSlice(alloc, " || ' ' || ");
-        try expr.appendSlice(alloc, try std.fmt.allocPrint(alloc, "coalesce(\"{s}\",'')", .{cn}));
+        const frag = try std.fmt.allocPrint(alloc, "coalesce(\"{s}\",'')", .{cn});
+        defer alloc.free(frag);
+        try expr.appendSlice(alloc, frag);
     }
     try expr.appendSlice(alloc, ")");
 
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc,
-        "ALTER TABLE \"{s}\" ADD COLUMN \"{s}\" tsvector GENERATED ALWAYS AS ({s}) STORED;",
-        .{ col.name, tsv, expr.items })));
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc,
-        "CREATE INDEX \"{s}\" ON \"{s}\" USING GIN (\"{s}\");", .{ idx, col.name, tsv })));
-    // Record the searchable column set as a marker comment so a later additive change that adds or
-    // removes a `.searchable` field is detected as drift and rebuilds the column.
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc,
-        "COMMENT ON COLUMN \"{s}\".\"{s}\" IS '{s}';", .{ col.name, tsv, want_marker })));
+    {
+        const sql = try std.fmt.allocPrintSentinel(alloc,
+            "ALTER TABLE \"{s}\" ADD COLUMN \"{s}\" tsvector GENERATED ALWAYS AS ({s}) STORED;",
+            .{ col.name, tsv, expr.items }, 0);
+        defer alloc.free(sql);
+        try w.exec(sql);
+    }
+    {
+        const sql = try std.fmt.allocPrintSentinel(alloc,
+            "CREATE INDEX \"{s}\" ON \"{s}\" USING GIN (\"{s}\");", .{ idx, col.name, tsv }, 0);
+        defer alloc.free(sql);
+        try w.exec(sql);
+    }
+    {
+        // Record the searchable column set as a marker comment so a later additive change that adds
+        // or removes a `.searchable` field is detected as drift and rebuilds the column.
+        const sql = try std.fmt.allocPrintSentinel(alloc,
+            "COMMENT ON COLUMN \"{s}\".\"{s}\" IS '{s}';", .{ col.name, tsv, want_marker }, 0);
+        defer alloc.free(sql);
+        try w.exec(sql);
+    }
 
     std.log.info("provision: ensured tsvector search index '{s}' (GIN '{s}') on '{s}' ({d} field(s))", .{ tsv, idx, col.name, cols.len });
 }
@@ -304,11 +359,22 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
 /// The drift marker stored as a COMMENT on the generated tsvector column: a stable, comma-joined
 /// list of the searchable column names (already identifier-gated, so no quote/`'` escaping needed —
 /// a valid SQL identifier contains none). Re-deriving it and comparing detects an added/removed
-/// `.searchable` field across startups.
+/// `.searchable` field across startups. The names are SORTED first so the marker is independent of
+/// field declaration order — merely REORDERING the same searchable fields does not trip a spurious
+/// drop+recreate at startup (only adding/removing one does). The generated-column EXPRESSION still
+/// follows field order, which is harmless: it's a different concatenation of the same lexemes.
 fn pgMarker(alloc: std.mem.Allocator, cols: []const []const u8) ![]const u8 {
+    const sorted = try alloc.dupe([]const u8, cols);
+    defer alloc.free(sorted);
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(alloc, "zbfts:");
-    for (cols, 0..) |cn, i| {
+    for (sorted, 0..) |cn, i| {
         if (i > 0) try out.append(alloc, ',');
         try out.appendSlice(alloc, cn);
     }
@@ -323,9 +389,12 @@ fn pgColumnMarker(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv
     const sql = try std.fmt.allocPrintSentinel(alloc,
         "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a " ++
             "WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped;", .{}, 0);
+    defer alloc.free(sql);
     var st = try w.prepare(sql);
     defer st.finalize();
-    try st.bindText(1, try std.fmt.allocPrint(alloc, "\"{s}\"", .{col_name}));
+    const quoted = try std.fmt.allocPrint(alloc, "\"{s}\"", .{col_name});
+    defer alloc.free(quoted); // bindText dupes its arg, so freeing after the bind is safe
+    try st.bindText(1, quoted);
     try st.bindText(2, tsv);
     if (!try st.step()) return null; // no such column
     if (st.isNull(0)) return null; // column exists but no comment → treat as drift (rebuild)
@@ -335,9 +404,13 @@ fn pgColumnMarker(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv
 /// True iff a relation named `rel` is visible on the active `search_path` (used to confirm the GIN
 /// index exists). `to_regclass` returns NULL for an absent name instead of raising.
 fn pgRelExists(alloc: std.mem.Allocator, w: *db.Db, rel: []const u8) !bool {
-    var st = try w.prepare(try std.fmt.allocPrintSentinel(alloc, "SELECT to_regclass($1) IS NOT NULL;", .{}, 0));
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT to_regclass($1) IS NOT NULL;", .{}, 0);
+    defer alloc.free(sql);
+    var st = try w.prepare(sql);
     defer st.finalize();
-    try st.bindText(1, try std.fmt.allocPrint(alloc, "\"{s}\"", .{rel}));
+    const quoted = try std.fmt.allocPrint(alloc, "\"{s}\"", .{rel});
+    defer alloc.free(quoted); // bindText dupes its arg, so freeing after the bind is safe
+    try st.bindText(1, quoted);
     if (!try st.step()) return false;
     return st.columnInt(0) != 0;
 }
@@ -346,8 +419,16 @@ fn pgRelExists(alloc: std.mem.Allocator, w: *db.Db, rel: []const u8) !bool {
 /// the column cascades the index, but the explicit DROP INDEX keeps it robust to either existing
 /// alone. (`col_name` is the base table.)
 fn dropIndexPg(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: []const u8, idx: []const u8) !void {
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "DROP INDEX IF EXISTS \"{s}\";", .{idx})));
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE \"{s}\" DROP COLUMN IF EXISTS \"{s}\";", .{ col_name, tsv })));
+    {
+        const sql = try std.fmt.allocPrintSentinel(alloc, "DROP INDEX IF EXISTS \"{s}\";", .{idx}, 0);
+        defer alloc.free(sql);
+        try w.exec(sql);
+    }
+    {
+        const sql = try std.fmt.allocPrintSentinel(alloc, "ALTER TABLE \"{s}\" DROP COLUMN IF EXISTS \"{s}\";", .{ col_name, tsv }, 0);
+        defer alloc.free(sql);
+        try w.exec(sql);
+    }
 }
 
 /// A comma-separated quoted column list, optionally prefixed (`new.`/`old.`) for trigger bodies.
