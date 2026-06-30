@@ -106,6 +106,67 @@ pub const Dialect = struct {
         };
     }
 
+    /// The operator for a **case-sensitive** prefix scan (`key <op> '<prefix><wildcard>'`),
+    /// paired with `prefixWildcard`. SQLite uses `GLOB` (case-sensitive, wildcard `*`); Postgres
+    /// uses `LIKE` (case-sensitive, wildcard `%`). The backends MUST use different operators to
+    /// keep identical semantics: SQLite's `LIKE` is ASCII-case-INSENSITIVE, so swapping `GLOB`
+    /// for `LIKE` on SQLite would silently change behavior — hence the dialect split. (The KV
+    /// prefix scan's prefixes are internal constants like `flag:`/`exp:` that contain no wildcard
+    /// metacharacters, so no pattern escaping is needed — matching the historical GLOB behavior.)
+    pub fn prefixMatchOp(self: Dialect) []const u8 {
+        return switch (self.kind) {
+            .sqlite => "GLOB",
+            .postgres => "LIKE",
+        };
+    }
+
+    /// The trailing wildcard appended to a prefix for `prefixMatchOp` (`*` for SQLite's `GLOB`,
+    /// `%` for Postgres's `LIKE`).
+    pub fn prefixWildcard(self: Dialect) []const u8 {
+        return switch (self.kind) {
+            .sqlite => "*",
+            .postgres => "%",
+        };
+    }
+
+    /// The physical-row-identifier pseudo-column used to address a row for a bounded batched
+    /// DELETE (`DELETE … WHERE <rowid> IN (SELECT <rowid> … LIMIT n)`). SQLite exposes `rowid`;
+    /// Postgres has no `rowid` but exposes the equivalent physical tuple id `ctid`. Stable only
+    /// for the duration of one statement/transaction (a row's `ctid` moves on UPDATE), which is
+    /// exactly the lifetime these batched GC deletes need. Trusted constant — never interpolated
+    /// from user input.
+    pub fn physicalRowId(self: Dialect) []const u8 {
+        return switch (self.kind) {
+            .sqlite => "rowid",
+            .postgres => "ctid",
+        };
+    }
+
+    /// A boolean predicate that is TRUE when the ISO-8601 TEXT timestamp in `col` is OLDER than
+    /// `days` days (a relative-age GC cutoff, e.g. the sticky `_experiment_assignments` reaper).
+    /// `col` is a trusted, already-quoted identifier; `days` is a trusted config value.
+    ///
+    /// **Fail-safe:** like `ttlExpiredDeletePredicate`, this feeds a DELETE, so a malformed `col`
+    /// value must be treated as NOT-expired (kept). SQLite normalizes both sides via `strftime`
+    /// (a non-canonical value compares correctly; an unparseable one yields NULL → the `<=` is
+    /// NULL → the row is kept). The Postgres arm gates the text `<=` compare on the ISO-`Z` regex
+    /// (an unmatched value can't be aged out) and compares against `now() - make_interval(days)`
+    /// rendered to the same ISO-`Z` TEXT shape, so the lexical `<=` is a valid instant compare.
+    pub fn agedBeyondDaysPredicate(self: Dialect, alloc: std.mem.Allocator, col: []const u8, days: u32) ![]u8 {
+        return switch (self.kind) {
+            .sqlite => std.fmt.allocPrint(
+                alloc,
+                "strftime('%Y-%m-%dT%H:%M:%SZ', {s}) IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%SZ', {s}) <= strftime('%Y-%m-%dT%H:%M:%SZ','now','-{d} days')",
+                .{ col, col, days },
+            ),
+            .postgres => std.fmt.allocPrint(
+                alloc,
+                "{s} ~ " ++ iso_z_regex ++ " AND {s} <= to_char((now() - make_interval(days => {d})) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+                .{ col, col, days },
+            ),
+        };
+    }
+
     /// A trailing `COLLATE` clause giving case-insensitive ordering/comparison for a text
     /// column, or "" when the backend has no direct analog. SQLite ships `NOCASE`; Postgres has
     /// no built-in case-insensitive collation (citext / a `lower()` expression index is the
@@ -299,7 +360,7 @@ pub const Dialect = struct {
             .sqlite => std.fmt.allocPrint(alloc, "strftime('%Y-%m-%dT%H:%M:%SZ','now') > {s}", .{col}),
             .postgres => std.fmt.allocPrint(
                 alloc,
-                "({s} ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}Z$' AND {s} > {s})",
+                "({s} ~ " ++ iso_z_regex ++ " AND {s} > {s})",
                 .{ col, self.nowIso8601Expr(), col },
             ),
         };
@@ -310,7 +371,14 @@ pub const Dialect = struct {
     /// that doesn't match is treated fail-safe — see below). SQLite uses `strftime` normalization
     /// instead, so this constant is Postgres-only. The braces are DOUBLED because this is spliced
     /// into `std.fmt` format strings (where `{{`/`}}` are the literal-brace escapes).
-    const iso_z_regex = "'^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}Z$'";
+    ///
+    /// The numeric fields are RANGE-BOUNDED (month `01..12`, day `01..31`, hour `00..23`,
+    /// minute/second `00..59`), not just `[0-9]{{2}}` — a well-SHAPED but out-of-range value like
+    /// `2024-99-99T99:99:99Z` would otherwise pass the regex and be lexically aged out, violating
+    /// the fail-safe (SQLite's `strftime` returns NULL → keeps it). Residual: a range-valid but
+    /// calendar-IMPOSSIBLE date (e.g. `2024-02-30`) still passes and compares lexically — accepted,
+    /// because ZigBase only ever writes real `strftime`/`to_char` instants, never such a value.
+    const iso_z_regex = "'^[0-9]{{4}}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])Z$'";
 
     /// A boolean predicate that is TRUE when a row's TTL column `col` means the row is still
     /// VISIBLE (read-time TTL exclusion in `records.get`/`records.list`). Three fail-safe clauses,
@@ -463,6 +531,34 @@ test "dialect: lowerMigrationSql is identity on SQLite, lowers the three isms on
         "INSERT INTO \"c\" (\"id\",\"note\") VALUES ('a','hello; world') ON CONFLICT DO NOTHING;",
         pt,
     );
+}
+
+test "dialect: prefix-scan operator/wildcard + physical row id differ per backend" {
+    // SQLite keeps case-sensitive GLOB+`*` (LIKE would be case-insensitive); PG uses LIKE+`%`.
+    try std.testing.expectEqualStrings("GLOB", Dialect.sqlite.prefixMatchOp());
+    try std.testing.expectEqualStrings("*", Dialect.sqlite.prefixWildcard());
+    try std.testing.expectEqualStrings("LIKE", Dialect.postgres.prefixMatchOp());
+    try std.testing.expectEqualStrings("%", Dialect.postgres.prefixWildcard());
+    try std.testing.expectEqualStrings("rowid", Dialect.sqlite.physicalRowId());
+    try std.testing.expectEqualStrings("ctid", Dialect.postgres.physicalRowId());
+}
+
+test "dialect: agedBeyondDaysPredicate is fail-safe + relative on both backends" {
+    const a = std.testing.allocator;
+    const s = try Dialect.sqlite.agedBeyondDaysPredicate(a, "\"created\"", 90);
+    defer a.free(s);
+    // SQLite normalizes via strftime + the relative '-90 days' modifier; NULL guard keeps it fail-safe.
+    try std.testing.expect(std.mem.indexOf(u8, s, "'-90 days'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "IS NOT NULL") != null);
+    const p = try Dialect.postgres.agedBeyondDaysPredicate(a, "\"created\"", 90);
+    defer a.free(p);
+    // PG gates the compare on the ISO-Z regex (fail-safe) and uses make_interval for the cutoff.
+    try std.testing.expect(std.mem.indexOf(u8, p, "\"created\" ~ '^") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "make_interval(days => 90)") != null);
+    // The regex RANGE-BOUNDS each numeric field (so 2024-99-99T… is rejected → kept, not aged out).
+    try std.testing.expect(std.mem.indexOf(u8, p, "(0[1-9]|1[0-2])") != null); // month 01..12
+    try std.testing.expect(std.mem.indexOf(u8, p, "(0[1-9]|[12][0-9]|3[01])") != null); // day 01..31
+    try std.testing.expect(std.mem.indexOf(u8, p, "([01][0-9]|2[0-3])") != null); // hour 00..23
 }
 
 test "dialect: cast + ttl predicate" {
