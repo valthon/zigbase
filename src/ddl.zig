@@ -25,9 +25,10 @@ pub fn quoteIdent(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// True when `name` is a column covered by a `.nocase` index on `c`. Such a column intentionally
-/// needs case-insensitive collation (the proper `lower()`/citext route is a tracked follow-up), so
-/// the byte-order `COLLATE "C"` parity pin is NOT applied to it.
+/// True when `name` is a column covered by a `.nocase` index on `c`. Such a column is matched
+/// case-insensitively (SQLite via the COLLATE NOCASE index, Postgres via a `lower()` functional
+/// index — see `createIndexSql` / `dialect.nocaseEqOperand`), so the byte-order `COLLATE "C"`
+/// parity pin is NOT applied to it.
 pub fn isNocaseField(c: schema.Collection, name: []const u8) bool {
     for (c.indexes) |ix| {
         if (ix.collation != .nocase) continue;
@@ -45,9 +46,16 @@ pub fn columnDef(alloc: std.mem.Allocator, f: schema.Field, d: dialect.Dialect, 
 /// The byte-order collation suffix to attach to field `f`'s column DDL: `d.textCollate()` for a
 /// plain TEXT column (so PG matches SQLite's BINARY ordering), or "" for non-text storage or a
 /// `.nocase`-indexed column (see `isNocaseField`).
+///
+/// DO NOT pin a `.nocase` column to `COLLATE "C"` (#159): its `lower()` functional index (PG) /
+/// COLLATE NOCASE index (SQLite) and the matching `lower()`/`COLLATE NOCASE` *lookups* must agree
+/// to keep case-insensitive uniqueness ⇔ lookup consistent. A `COLLATE "C"` byte-order pin on the
+/// column would not break the functional index itself, but it signals the WRONG intent for a
+/// case-insensitive column — so the `.nocase` guard below stays even if a future change pins ALL
+/// other text columns to "C".
 fn fieldCollate(c: schema.Collection, f: schema.Field, d: dialect.Dialect) []const u8 {
     if (f.storageClass() != .text) return "";
-    if (isNocaseField(c, f.name)) return "";
+    if (isNocaseField(c, f.name)) return ""; // .nocase column: never pinned to COLLATE "C" (see above)
     return d.textCollate();
 }
 

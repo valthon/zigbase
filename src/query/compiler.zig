@@ -179,15 +179,18 @@ fn emitIn(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arra
         else => return error.BadFilter, // parser only yields list/list_macro on the RHS of `in`
     }
     if (n == 0) return alloc.dupe(u8, dialect.constFalse()); // empty set -> constant-false, fail-closed
-    // IN is set-equality, so a `.nocase` column lowers the column AND every placeholder so each
-    // membership test matches the case-insensitive uniqueness (PG `lower()`; SQLite unchanged) (#159).
+    // IN is set-equality, so a `.nocase` column makes the column AND every placeholder
+    // case-insensitive so each membership test matches the case-insensitive uniqueness (PG
+    // `lower()`; SQLite COLLATE NOCASE) (#159). `ph` is computed ONCE and reused for all n
+    // placeholders (it is loop-invariant), avoiding n allocations.
     const ci = col.nocase;
+    const ph = if (ci) try dialect.nocaseEqOperand(alloc, "?") else "?";
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(alloc, if (ci) try dialect.nocaseEqOperand(alloc, col.sql) else col.sql);
     try buf.appendSlice(alloc, " IN (");
     for (0..n) |i| {
         if (i > 0) try buf.append(alloc, ',');
-        if (ci) try buf.appendSlice(alloc, try dialect.nocaseEqOperand(alloc, "?")) else try buf.append(alloc, '?');
+        try buf.appendSlice(alloc, ph);
     }
     try buf.append(alloc, ')');
     return buf.toOwnedSlice(alloc);
@@ -257,7 +260,7 @@ test "compile text equality binds the literal" {
     try std.testing.expectEqualStrings("hi", c.params[0].text);
 }
 
-test "compile lowers a .nocase column equality/IN on Postgres, unchanged on SQLite (#159)" {
+test "compile makes a .nocase column equality/IN case-insensitive on BOTH backends (#159)" {
     const migrations = @import("../migrations.zig");
     const collections = @import("../collections.zig");
     var d = try db.Db.openMemory();
@@ -278,15 +281,18 @@ test "compile lowers a .nocase column equality/IN on Postgres, unchanged on SQLi
     });
     const Case = struct { filter: []const u8, dia: Dialect, want: []const u8 };
     const cases = [_]Case{
-        // SQLite: byte-identical binary compare (the .nocase column's case-insensitivity comes from
-        // the COLLATE NOCASE index, not the compare — SQLite behavior is pinned).
-        .{ .filter = "addr = \"Bob@x.com\"", .dia = Dialect.sqlite, .want = "\"people\".\"addr\" = ?" },
+        // SQLite: BOTH sides get COLLATE NOCASE so the compare is case-insensitive and uses the
+        // COLLATE NOCASE index — parity with Postgres (no per-backend divergence).
+        .{ .filter = "addr = \"Bob@x.com\"", .dia = Dialect.sqlite, .want = "\"people\".\"addr\" COLLATE NOCASE = ? COLLATE NOCASE" },
         // Postgres: lower() BOTH sides so the compare matches the lower(addr) functional index.
         .{ .filter = "addr = \"Bob@x.com\"", .dia = Dialect.postgres, .want = "lower(\"people\".\"addr\") = lower(?)" },
-        // != lowers too (the equality family); a NON-nocase column (label) is unchanged on PG.
+        // != is wrapped too (the equality family); a NON-nocase column (label) is unchanged.
+        .{ .filter = "addr != \"Bob@x.com\"", .dia = Dialect.sqlite, .want = "\"people\".\"addr\" COLLATE NOCASE != ? COLLATE NOCASE" },
         .{ .filter = "addr != \"Bob@x.com\"", .dia = Dialect.postgres, .want = "lower(\"people\".\"addr\") != lower(?)" },
+        .{ .filter = "label = \"Bob\"", .dia = Dialect.sqlite, .want = "\"people\".\"label\" = ?" },
         .{ .filter = "label = \"Bob\"", .dia = Dialect.postgres, .want = "\"people\".\"label\" = ?" },
-        // IN lowers the column + every placeholder on PG.
+        // IN wraps the column + every placeholder on both backends.
+        .{ .filter = "addr in (\"A@x\", \"b@x\")", .dia = Dialect.sqlite, .want = "\"people\".\"addr\" COLLATE NOCASE IN (? COLLATE NOCASE,? COLLATE NOCASE)" },
         .{ .filter = "addr in (\"A@x\", \"b@x\")", .dia = Dialect.postgres, .want = "lower(\"people\".\"addr\") IN (lower(?),lower(?))" },
     };
     for (cases) |cs| {

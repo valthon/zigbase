@@ -2587,16 +2587,17 @@ index marked `.collation = .nocase` is case-INSENSITIVE on **both** backends: SQ
 `COLLATE NOCASE`, while Postgres (which has no built-in NOCASE collation) provisions a
 `lower("col")` **functional index** — a built-in, no `citext`/extension dependency. So a
 `.nocase` UNIQUE index rejects case-variant duplicates (`Bob@x.com` vs `bob@x.com`) on
-Postgres exactly as on SQLite (#159). Identity/email lookups against a `.nocase` column are
-correspondingly case-insensitive on Postgres (`lower("col") = lower($1)`, using that
-functional index), and filter/rule equality (`=`/`!=`/`in`) against a `.nocase` column is
-lowered on Postgres to agree with the index. The built-in auth identity uniqueness is a
-plain (case-sensitive) partial-unique index, not `.nocase`, and is identical on both
-backends. Residual: on SQLite the case-insensitivity of a `.nocase` column comes from the
-index/collation, so plain `=` *lookups* keep their historical binary (case-sensitive)
-comparison unless they go through an identity lookup; on Postgres the `lower()` wrapping
-makes those lookups case-insensitive. Postgres `lower()` is locale-aware (folds non-ASCII),
-whereas SQLite `NOCASE` folds ASCII A–Z only.
+Postgres exactly as on SQLite (#159). **Lookups and comparisons are case-insensitive on
+BOTH backends**, so a `.nocase` column behaves identically everywhere: identity/email
+lookups (`findByIdentity`/`findByEmail`) and filter/rule equality (`=`/`!=`/`in`) against a
+`.nocase` column emit `lower("col") = lower($1)` on Postgres (the `lower()` functional
+index) and `"col" COLLATE NOCASE = ?1 COLLATE NOCASE` on SQLite (the COLLATE NOCASE index) —
+so a user registered as `Bob@x.com` can log in as `bob@x.com` on either backend (the
+uniqueness ⇔ lookup consistency holds). The built-in auth identity uniqueness (the partial
+unique index auto-created for each `identityFields` entry) is a plain CASE-SENSITIVE index
+on both backends; case-insensitive identity is opt-in by declaring a `.nocase` index on the
+field (the pattern the example apps use). One nuance: Postgres `lower()` is locale-aware
+(folds non-ASCII, e.g. `É`→`é`), whereas SQLite `NOCASE` folds ASCII A–Z only.
 
 ## 9. Pluggable storage & mailer backends (`.storage` / `.mailer`)
 

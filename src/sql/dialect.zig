@@ -195,15 +195,21 @@ pub const Dialect = struct {
     }
 
     /// Wrap an SQL scalar (a quoted column reference OR a `?`/`$n` placeholder) so an equality
-    /// compare is case-insensitive in a way that AGREES with `nocaseIndexExpr` — and so a lookup
-    /// against a `.nocase` column uses that index and matches its case-insensitive uniqueness.
-    /// Postgres returns `lower(<expr>)` (using the `lower()` functional index); SQLite returns
-    /// `<expr>` UNCHANGED — the historical binary compare is preserved byte-for-byte so SQLite
-    /// behavior is never altered by this PR (its case-insensitive UNIQUENESS already comes from
-    /// the COLLATE NOCASE index). Both sides of the `=` are wrapped by the caller (#159).
+    /// compare is case-insensitive in a way that AGREES with `nocaseIndexExpr` — so a lookup
+    /// against a `.nocase` column uses that index and matches its case-insensitive uniqueness, and
+    /// so BOTH backends behave identically (no per-backend auth divergence). Postgres returns
+    /// `lower(<expr>)` (using the `lower()` functional index); SQLite returns `<expr> COLLATE
+    /// NOCASE` (the postfix COLLATE operator makes the compare case-insensitive and uses the
+    /// COLLATE NOCASE index — ASCII A–Z fold, matching the index's own folding). Both sides of the
+    /// `=`/`!=`/`in` are wrapped by the caller. ALLOCATES on both arms, so callers free it (#159).
+    ///
+    /// NOTE: this CHANGES SQLite `.nocase` equality *lookups* from the historical binary
+    /// (case-sensitive) compare to case-insensitive — a deliberate parity fix: a `.nocase` UNIQUE
+    /// index already made `Bob@x.com`/`bob@x.com` the same identity for uniqueness, so the lookup
+    /// must agree, or a user registered as one case could not log in as the other on SQLite.
     pub fn nocaseEqOperand(self: Dialect, alloc: std.mem.Allocator, expr: []const u8) ![]u8 {
         return switch (self.kind) {
-            .sqlite => alloc.dupe(u8, expr),
+            .sqlite => std.fmt.allocPrint(alloc, "{s} COLLATE NOCASE", .{expr}),
             .postgres => std.fmt.allocPrint(alloc, "lower({s})", .{expr}),
         };
     }
@@ -506,13 +512,14 @@ test "dialect: nocase index expr + eq operand — SQLite COLLATE NOCASE, PG lowe
     const pi = try Dialect.postgres.nocaseIndexExpr(a, "\"email\"");
     defer a.free(pi);
     try std.testing.expectEqualStrings("lower(\"email\")", pi);
-    // Equality operand: SQLite leaves it untouched (byte-identical compare); PG lowers it.
+    // Equality operand: SQLite collates the operand NOCASE (case-insensitive lookup, parity with
+    // PG); PG lowers it. Both arms allocate.
     const sc = try Dialect.sqlite.nocaseEqOperand(a, "\"email\"");
     defer a.free(sc);
-    try std.testing.expectEqualStrings("\"email\"", sc);
+    try std.testing.expectEqualStrings("\"email\" COLLATE NOCASE", sc);
     const sp = try Dialect.sqlite.nocaseEqOperand(a, "?1");
     defer a.free(sp);
-    try std.testing.expectEqualStrings("?1", sp);
+    try std.testing.expectEqualStrings("?1 COLLATE NOCASE", sp);
     const pc = try Dialect.postgres.nocaseEqOperand(a, "\"email\"");
     defer a.free(pc);
     try std.testing.expectEqualStrings("lower(\"email\")", pc);

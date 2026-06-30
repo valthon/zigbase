@@ -115,24 +115,78 @@ pub fn nowUnix(conn: *db.Db) db.DbError!i64 {
 /// Try each identity field in order; return the matching non-empty row id, or null.
 ///
 /// When an identity field is covered by a `.nocase` index, the comparison is case-INSENSITIVE so
-/// the lookup uses that index and AGREES with its case-insensitive uniqueness (#159): on Postgres
-/// `lower("idf") = lower($1)` (matching the `lower()` functional index), on SQLite the historical
-/// binary `"idf" = ?1` (its case-insensitive uniqueness already coming from COLLATE NOCASE). A
-/// non-`.nocase` identity field keeps the exact (case-sensitive) compare on both backends.
+/// the lookup uses that index and AGREES with its case-insensitive uniqueness (#159), IDENTICALLY
+/// on both backends: Postgres `lower("idf") = lower($1)` (the `lower()` functional index), SQLite
+/// `"idf" COLLATE NOCASE = ?1 COLLATE NOCASE` (the COLLATE NOCASE index). A non-`.nocase` identity
+/// field keeps the exact (case-sensitive) compare on both backends.
 pub fn findByIdentity(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, identity: []const u8) !?[]const u8 {
     const d = db.dbDialect(conn);
     for (col.options.auth.identityFields) |idf| {
         const col_quoted = try std.fmt.allocPrint(alloc, "\"{s}\"", .{idf});
+        defer alloc.free(col_quoted);
         const ci = ddl.isNocaseField(col, idf);
+        // `lhs`/`rhs` are freshly allocated ONLY on the `ci` arm (nocaseEqOperand allocates on both
+        // backends); otherwise they borrow `col_quoted` / a string literal, so the frees are
+        // guarded to `ci` to avoid double-freeing `col_quoted` or freeing a literal.
         const lhs = if (ci) try d.nocaseEqOperand(alloc, col_quoted) else col_quoted;
+        defer if (ci) alloc.free(lhs);
         const rhs = if (ci) try d.nocaseEqOperand(alloc, "?1") else "?1";
+        defer if (ci) alloc.free(rhs);
         const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE {s} = {s} AND \"{s}\" != '' LIMIT 1;", .{ col.name, lhs, rhs, idf }, 0);
+        defer alloc.free(sql);
         var st = try prep(conn, sql);
         defer st.finalize();
         try st.bindText(1, identity);
         if (try st.step()) return try alloc.dupe(u8, st.columnText(0));
     }
     return null;
+}
+
+test "findByIdentity: a .nocase email index makes the SQLite lookup case-insensitive (#159)" {
+    // Mirror of the Postgres auth_pg_test case: with a `.nocase` UNIQUE index on email, finding by
+    // a DIFFERENT case must resolve the stored record on SQLite too (COLLATE NOCASE index), so both
+    // backends behave identically — a user registered as `Bob@x.com` can log in as `bob@x.com`.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+
+    const col = try collections.create(a, std.testing.io, &d, .{
+        .id = "",
+        .name = "users",
+        .type = .auth,
+        .fields = &[_]schema.Field{.{ .id = "f1", .name = "name", .options = .{ .text = .{} } }},
+        .indexes = &[_]schema.Index{.{ .name = "idx_users_email_nocase", .fields = &.{"email"}, .unique = true, .collation = .nocase }},
+        .listRule = "",
+        .viewRule = "",
+        .createRule = "",
+        .updateRule = "",
+        .deleteRule = "",
+    });
+
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "email", .{ .string = "Bob@x.com" });
+    try data.put(a, "password", .{ .string = "correct horse battery" });
+    const prepared = try auth.applyCreate(std.testing.io, a, .{ .object = data }, col.options.auth.minPasswordLength);
+    const rec = try records.create(a, std.testing.io, &d, col, prepared);
+    const rid = rec.object.get("id").?.string;
+
+    // Case-INSENSITIVE lookup: different cases all resolve the same record.
+    try std.testing.expectEqualStrings(rid, (try findByIdentity(a, &d, col, "bob@x.com")).?);
+    try std.testing.expectEqualStrings(rid, (try findByIdentity(a, &d, col, "BOB@X.COM")).?);
+    try std.testing.expectEqualStrings(rid, (try findByIdentity(a, &d, col, "Bob@x.com")).?);
+    // A non-matching identity still returns null.
+    try std.testing.expect((try findByIdentity(a, &d, col, "carol@x.com")) == null);
+
+    // Case-variant uniqueness: a second record with a case-variant email is rejected by the
+    // COLLATE NOCASE unique index (duplicate identity) — parity with the Postgres lower() index.
+    var data2: std.json.ObjectMap = .empty;
+    try data2.put(a, "email", .{ .string = "bob@x.com" });
+    try data2.put(a, "password", .{ .string = "another good passphrase" });
+    const prepared2 = try auth.applyCreate(std.testing.io, a, .{ .object = data2 }, col.options.auth.minPasswordLength);
+    try std.testing.expectError(error.StepFailed, records.create(a, std.testing.io, &d, col, prepared2));
 }
 
 pub fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
@@ -734,12 +788,17 @@ pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
 
 fn findByEmail(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, email: []const u8) !?[]const u8 {
     // Case-insensitive when `email` is `.nocase`-indexed, mirroring findByIdentity (#159): PG
-    // `lower("email") = lower($1)` (the `lower()` functional index); SQLite the binary `"email" = ?1`.
+    // `lower("email") = lower($1)`; SQLite `"email" COLLATE NOCASE = ?1 COLLATE NOCASE` — both use
+    // the `.nocase` index. `lhs`/`rhs` allocate only on the `ci` arm; the frees are guarded to it
+    // (otherwise they borrow string literals).
     const d = db.dbDialect(conn);
     const ci = ddl.isNocaseField(col, "email");
     const lhs = if (ci) try d.nocaseEqOperand(alloc, "\"email\"") else "\"email\"";
+    defer if (ci) alloc.free(lhs);
     const rhs = if (ci) try d.nocaseEqOperand(alloc, "?1") else "?1";
+    defer if (ci) alloc.free(rhs);
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE {s} = {s} AND \"email\" != '' LIMIT 1;", .{ col.name, lhs, rhs }, 0);
+    defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, email);
