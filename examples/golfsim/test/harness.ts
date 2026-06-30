@@ -1,8 +1,45 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+/** Number of times to retry a failed server start (fresh port each attempt). */
+const START_ATTEMPTS = 5;
+
+/**
+ * Ask the OS for a free loopback TCP port (bind :0, read the assignment, release).
+ * Shrinks the collision window; the retry loop in startGolfsim() is the real guard.
+ */
+async function freePort(): Promise<number> {
+  return await new Promise<number>((resolvePort) => {
+    const srv = createServer();
+    srv.on("error", () => resolvePort(20000 + Math.floor(Math.random() * 20000)));
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      srv.close(() => resolvePort(port || 20000 + Math.floor(Math.random() * 20000)));
+    });
+  });
+}
+
+/**
+ * Resolve once healthy; reject FAST if the child exits first (e.g. zap `ListenError`
+ * on a port collision) so the caller can retry instead of waiting out the deadline.
+ */
+async function waitForHealthOrExit(url: string, proc: ChildProcess, label: string): Promise<void> {
+  const exitPromise = new Promise<never>((_, reject) => {
+    proc.once("exit", (code, signal) =>
+      reject(new Error(`${label} exited before becoming healthy (code=${code} signal=${signal})`)),
+    );
+    // A spawn failure (missing binary, permissions, wrong arch) emits "error", not
+    // "exit" — reject fast instead of waiting out the full health deadline.
+    proc.once("error", (err) => reject(new Error(`${label} failed to spawn: ${String(err)}`)));
+  });
+  exitPromise.catch(() => {}); // avoid an unhandled rejection when health wins the race
+  await Promise.race([waitForHealth(url), exitPromise]);
+}
 
 const HERE = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const EXAMPLE_ROOT = resolve(HERE, ".."); // examples/golfsim
@@ -73,56 +110,65 @@ export async function startGolfsim(opts: StartOptions = {}): Promise<GolfServer>
   // The Astro frontend is built unconditionally: the binary serves frontend/dist
   // at runtime regardless of how the binary itself was produced.
   ensureFrontend();
-  const dataDir = mkdtempSync(join(tmpdir(), "golf-it-"));
-  const port = 20000 + Math.floor(Math.random() * 20000);
-  const su = spawnSync(BIN, ["superuser", "create", "--email", "admin@golf.local", "--password", "test-password-123", "--data-dir", dataDir], { stdio: "inherit" });
-  if (su.status !== 0) { try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } throw new Error("superuser create failed"); }
-  // cwd MUST be EXAMPLE_ROOT: the comptime `.static_files = .{ .dir = "frontend/dist" }`
-  // is resolved relative to the server's working directory.
-  // stderr is piped so captureVerificationToken() can read LogMailer output;
-  // stdout (facil.io startup banner) is inherited for visibility.
-  const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], {
-    cwd: EXAMPLE_ROOT,
-    stdio: ["inherit", "inherit", "pipe"],
-    env: { ...process.env, ...(opts.env ?? {}) },
-  });
-  const url = `http://127.0.0.1:${port}`;
 
-  // Accumulate all server stderr text for token extraction; mirror to process stderr.
-  let stderrText = "";
-  proc.stderr!.on("data", (chunk: Buffer) => {
-    const text = chunk.toString();
-    process.stderr.write(text);
-    stderrText += text;
-  });
+  // Retry on a fresh port each attempt: a port collision makes the zap listener fail
+  // to bind, so the server exits early. Detect that exit fast and retry.
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
+    const dataDir = mkdtempSync(join(tmpdir(), "golf-it-"));
+    const su = spawnSync(BIN, ["superuser", "create", "--email", "admin@golf.local", "--password", "test-password-123", "--data-dir", dataDir], { stdio: "inherit" });
+    if (su.status !== 0) { try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } throw new Error("superuser create failed"); }
+    const port = await freePort();
+    // cwd MUST be EXAMPLE_ROOT: the comptime `.static_files = .{ .dir = "frontend/dist" }`
+    // is resolved relative to the server's working directory.
+    // stderr is piped so captureVerificationToken() can read LogMailer output;
+    // stdout (facil.io startup banner) is inherited for visibility.
+    const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], {
+      cwd: EXAMPLE_ROOT,
+      stdio: ["inherit", "inherit", "pipe"],
+      env: { ...process.env, ...(opts.env ?? {}) },
+    });
+    const url = `http://127.0.0.1:${port}`;
 
-  try {
-    await waitForHealth(url);
-  } catch (err) {
-    proc.kill("SIGKILL");
-    try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
-    throw err;
+    // Accumulate all server stderr text for token extraction; mirror to process stderr.
+    let stderrText = "";
+    proc.stderr!.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      process.stderr.write(text);
+      stderrText += text;
+    });
+
+    try {
+      await waitForHealthOrExit(url, proc, "golfsim");
+    } catch (err) {
+      lastErr = err;
+      proc.kill("SIGKILL");
+      try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      continue;
+    }
+
+    return {
+      url,
+      stop() { proc.kill("SIGTERM"); try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } },
+      async captureVerificationToken(email: string, timeoutMs = 5_000): Promise<string> {
+        // The LogMailer emits (via std.log.info, writing to stderr):
+        //   info: [mail] to=<email> subject=Verify your email body=Verify your email (users). Your verification token:\n\nTOKEN\n
+        // The body newlines are literal — the log entry spans multiple lines in stderr.
+        const marker = `[mail] to=${email} subject=Verify your email body=`;
+        const tokenRe = /Your verification token:\s*\n+([A-Za-z0-9._\-]+)/;
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          const idx = stderrText.indexOf(marker);
+          if (idx !== -1) {
+            const m = stderrText.slice(idx).match(tokenRe);
+            if (m) return m[1]!;
+          }
+          if (Date.now() > deadline) throw new Error(`No verification token logged for ${email} within ${timeoutMs}ms`);
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      },
+    };
   }
 
-  return {
-    url,
-    stop() { proc.kill("SIGTERM"); try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } },
-    async captureVerificationToken(email: string, timeoutMs = 5_000): Promise<string> {
-      // The LogMailer emits (via std.log.info, writing to stderr):
-      //   info: [mail] to=<email> subject=Verify your email body=Verify your email (users). Your verification token:\n\nTOKEN\n
-      // The body newlines are literal — the log entry spans multiple lines in stderr.
-      const marker = `[mail] to=${email} subject=Verify your email body=`;
-      const tokenRe = /Your verification token:\s*\n+([A-Za-z0-9._\-]+)/;
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        const idx = stderrText.indexOf(marker);
-        if (idx !== -1) {
-          const m = stderrText.slice(idx).match(tokenRe);
-          if (m) return m[1]!;
-        }
-        if (Date.now() > deadline) throw new Error(`No verification token logged for ${email} within ${timeoutMs}ms`);
-        await new Promise((r) => setTimeout(r, 100));
-      }
-    },
-  };
+  throw new Error(`golfsim did not start after ${START_ATTEMPTS} attempts; last error: ${String(lastErr)}`);
 }

@@ -1,8 +1,48 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+/** Number of times to retry a failed server start (fresh port each attempt). */
+const START_ATTEMPTS = 5;
+
+/**
+ * Ask the OS for a free loopback TCP port (bind :0, read the assignment, release).
+ * This shrinks the collision window vs. a blind random port; the retry loop in the
+ * start* helpers is the actual guarantee against a lost race. Falls back to a random
+ * high port if the probe fails.
+ */
+async function freePort(): Promise<number> {
+  return await new Promise<number>((resolvePort) => {
+    const srv = createServer();
+    srv.on("error", () => resolvePort(20000 + Math.floor(Math.random() * 20000)));
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      srv.close(() => resolvePort(port || 20000 + Math.floor(Math.random() * 20000)));
+    });
+  });
+}
+
+/**
+ * Resolve once the server is healthy; reject FAST if the child exits before then.
+ * An early non-bind start failure (e.g. zap `ListenError` on a port collision) exits
+ * the process, so we surface it immediately instead of waiting out the health deadline.
+ */
+async function waitForHealthOrExit(url: string, proc: ChildProcess, label: string): Promise<void> {
+  const exitPromise = new Promise<never>((_, reject) => {
+    proc.once("exit", (code, signal) =>
+      reject(new Error(`${label} exited before becoming healthy (code=${code} signal=${signal})`)),
+    );
+    // A spawn failure (missing binary, permissions, wrong arch) emits "error", not
+    // "exit" — reject fast instead of waiting out the full health deadline.
+    proc.once("error", (err) => reject(new Error(`${label} failed to spawn: ${String(err)}`)));
+  });
+  exitPromise.catch(() => {}); // avoid an unhandled rejection when health wins the race
+  await Promise.race([waitForHealth(url), exitPromise]);
+}
 
 // This file lives at clients/typescript/test/integration/harness.ts, so the repo
 // root (the dir containing build.zig / zig-out) is four levels up.
@@ -75,44 +115,56 @@ export async function startAppServer(opts: {
 }): Promise<TestServer> {
   ensureBuilt();
   const bin = opts.bin.includes("/") ? opts.bin : join(REPO_ROOT, "zig-out", "bin", opts.bin);
-  const dataDir = mkdtempSync(join(tmpdir(), "zb-it-"));
-  const port = 20000 + Math.floor(Math.random() * 20000);
   const { email, password } = opts.seedSuperuser ?? {
     email: "admin@test.local",
     password: "test-password-123",
   };
 
-  const su = spawnSync(
-    bin,
-    ["superuser", "create", "--email", email, "--password", password, "--data-dir", dataDir],
-    { stdio: "inherit" },
-  );
-  if (su.status !== 0) throw new Error("superuser create failed");
+  // Retry the spawn on a fresh port each attempt: a port collision (concurrent test,
+  // TIME_WAIT, another process) makes the zap listener fail to bind, so the server
+  // exits early. We detect that exit fast and retry instead of failing the test.
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
+    const dataDir = mkdtempSync(join(tmpdir(), "zb-it-"));
+    const su = spawnSync(
+      bin,
+      ["superuser", "create", "--email", email, "--password", password, "--data-dir", dataDir],
+      { stdio: "inherit" },
+    );
+    if (su.status !== 0) {
+      try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      throw new Error("superuser create failed");
+    }
 
-  const proc: ChildProcess = spawn(
-    bin,
-    ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"],
-    { stdio: "inherit" },
-  );
+    const port = await freePort();
+    const proc: ChildProcess = spawn(
+      bin,
+      ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"],
+      { stdio: "inherit" },
+    );
+    const url = `http://127.0.0.1:${port}`;
 
-  const url = `http://127.0.0.1:${port}`;
-  try {
-    await waitForHealth(url);
-  } catch (err) {
-    proc.kill("SIGKILL");
-    try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
-    throw err;
+    try {
+      await waitForHealthOrExit(url, proc, "server");
+      return {
+        url,
+        superuser: { email, password },
+        dataDir,
+        stop() {
+          proc.kill("SIGTERM");
+          try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        },
+      };
+    } catch (err) {
+      lastErr = err;
+      proc.kill("SIGKILL");
+      try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   }
 
-  return {
-    url,
-    superuser: { email, password },
-    dataDir,
-    stop() {
-      proc.kill("SIGTERM");
-      try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
-    },
-  };
+  throw new Error(
+    `server did not start after ${START_ATTEMPTS} attempts; last error: ${String(lastErr)}`,
+  );
 }
 
 /** Backward-compatible: spawn the generic zigbase binary (runtime-created collections). */
