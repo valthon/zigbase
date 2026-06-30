@@ -276,11 +276,13 @@ pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) 
 
 /// Provision (idempotently) the Postgres `tsvector` full-text index for `col`: a STORED generated
 /// column `"<col>_fts"` over the searchable columns plus a GIN index on it. A no-op when `col` has
-/// no searchable fields (any stale column/index from a prior schema is dropped). Re-creates when the
-/// searchable column SET drifts (detected via a marker comment on the generated column) or the GIN
-/// index is missing. All identifiers are gated through `schema.isValidIdentifier`; the column set is
-/// embedded only after that gate, never from user input. Search-path-aware (`to_regclass`) so it
-/// targets the collection's table in the active schema.
+/// no searchable fields (any stale column/index from a prior schema is dropped). Decides off the
+/// column's three-state probe (`pgColumnState`): absent → create; present+matching-marker → no-op
+/// (or recreate JUST the GIN index if only it is missing, NEVER re-touching the costly generated
+/// column); present+mismatched/absent-marker (a searchable-column-SET drift) → drop + recreate. All
+/// identifiers are gated through `schema.isValidIdentifier`; the column set is embedded only after
+/// that gate, never from user input. Search-path-aware (`to_regclass`) so it targets the
+/// collection's table in the active schema.
 fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !void {
     if (!schema.isValidIdentifier(col.name)) return;
     // These provisioning temporaries are explicitly freed (the SQL strings are copied by
@@ -296,20 +298,36 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
     const want_marker = try pgMarker(alloc, cols);
     defer alloc.free(want_marker);
 
+    const state = try pgColumnState(alloc, w, col.name, tsv);
+    defer switch (state) {
+        .present => |m| if (m) |mk| alloc.free(mk),
+        .absent => {},
+    };
+
     if (cols.len == 0) {
-        // Not searchable: drop a stale column/index only if one actually exists.
-        if (try pgColumnMarker(alloc, w, col.name, tsv)) |have| {
-            alloc.free(have);
-            try dropIndexPg(alloc, w, col.name, tsv, idx);
-        }
+        // Not searchable: drop a stale column/index only if the column actually exists.
+        if (state == .present) try dropIndexPg(alloc, w, col.name, tsv, idx);
         return;
     }
 
-    if (try pgColumnMarker(alloc, w, col.name, tsv)) |have_marker| {
-        defer alloc.free(have_marker);
-        if (std.mem.eql(u8, have_marker, want_marker) and (try pgRelExists(alloc, w, idx)))
-            return; // up to date — idempotent no-op
-        try dropIndexPg(alloc, w, col.name, tsv, idx); // drift / missing index — rebuild
+    switch (state) {
+        .present => |have_marker| {
+            const marker_ok = have_marker != null and std.mem.eql(u8, have_marker.?, want_marker);
+            if (marker_ok) {
+                // The generated column + its marker are correct. If the GIN index is also present,
+                // we are fully provisioned — no-op. If ONLY the index is missing, recreate JUST the
+                // index: dropping+rebuilding the STORED generated column would take a strong table
+                // lock and re-tokenize every row for nothing.
+                if (try pgRelExists(alloc, w, idx)) return; // fully up to date — idempotent no-op
+                try createGinIndexPg(alloc, w, col.name, tsv, idx);
+                std.log.info("provision: recreated missing GIN index '{s}' on '{s}'.'{s}'", .{ idx, col.name, tsv });
+                return;
+            }
+            // Column present but marker missing/different → drift → DROP the column+index, then
+            // recreate below (never `ADD COLUMN` onto the existing one).
+            try dropIndexPg(alloc, w, col.name, tsv, idx);
+        },
+        .absent => {}, // nothing to drop — create below
     }
 
     // ALTER TABLE "<col>" ADD COLUMN "<tsv>" tsvector
@@ -338,12 +356,7 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
         defer alloc.free(sql);
         try w.exec(sql);
     }
-    {
-        const sql = try std.fmt.allocPrintSentinel(alloc,
-            "CREATE INDEX \"{s}\" ON \"{s}\" USING GIN (\"{s}\");", .{ idx, col.name, tsv }, 0);
-        defer alloc.free(sql);
-        try w.exec(sql);
-    }
+    try createGinIndexPg(alloc, w, col.name, tsv, idx);
     {
         // Record the searchable column set as a marker comment so a later additive change that adds
         // or removes a `.searchable` field is detected as drift and rebuilds the column.
@@ -381,9 +394,23 @@ fn pgMarker(alloc: std.mem.Allocator, cols: []const []const u8) ![]const u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// The marker COMMENT currently on `col`.`tsv`, or null when the column does not exist (or carries
-/// no comment). Resolves the table via `to_regclass` so it respects the active `search_path`.
-fn pgColumnMarker(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: []const u8) !?[]const u8 {
+/// The state of the generated `tsvector` column on a collection's table — DISTINGUISHING the three
+/// cases the idempotency logic must treat differently (the two-state "marker or null" form silently
+/// conflated "absent" with "present-but-no-marker", which made `ensureIndexPg` fall through to
+/// `ADD COLUMN` on an already-existing column → a hard "column already exists" startup failure):
+///   * `.absent` — no `<col>_fts` column → safe to `ADD COLUMN`.
+///   * `.present` with `marker == want` — fully provisioned (only the GIN index might be missing).
+///   * `.present` with `marker != want` (incl. a missing/empty COMMENT) — drift → DROP + recreate.
+const PgColumnState = union(enum) {
+    absent,
+    /// The generated column exists; `marker` is its drift-marker COMMENT (owned by `alloc`), or
+    /// null when the column carries no/empty comment.
+    present: ?[]const u8,
+};
+
+/// Probe the generated `tsvector` column's state on `col`.`tsv`. Resolves the table via
+/// `to_regclass` so it respects the active `search_path`. The caller owns `present.?` (frees it).
+fn pgColumnState(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: []const u8) !PgColumnState {
     // Postgres-only path → the native `$n` placeholders are written directly (this never flows
     // through the `?`→`$n` ParamSink renumber that the cross-backend CRUD/query producers use).
     const sql = try std.fmt.allocPrintSentinel(alloc,
@@ -396,9 +423,9 @@ fn pgColumnMarker(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv
     defer alloc.free(quoted); // bindText dupes its arg, so freeing after the bind is safe
     try st.bindText(1, quoted);
     try st.bindText(2, tsv);
-    if (!try st.step()) return null; // no such column
-    if (st.isNull(0)) return null; // column exists but no comment → treat as drift (rebuild)
-    return try alloc.dupe(u8, st.columnText(0));
+    if (!try st.step()) return .absent; // no such column
+    if (st.isNull(0)) return .{ .present = null }; // column exists but no marker comment
+    return .{ .present = try alloc.dupe(u8, st.columnText(0)) };
 }
 
 /// True iff a relation named `rel` is visible on the active `search_path` (used to confirm the GIN
@@ -413,6 +440,16 @@ fn pgRelExists(alloc: std.mem.Allocator, w: *db.Db, rel: []const u8) !bool {
     try st.bindText(1, quoted);
     if (!try st.step()) return false;
     return st.columnInt(0) != 0;
+}
+
+/// CREATE the GIN index `idx` over the generated tsvector column `tsv` on `col_name`. Used both on
+/// a fresh provision and to recreate JUST the index when the column is already correct but the index
+/// went missing (so we never drop+rebuild the expensive STORED generated column for an index-only gap).
+fn createGinIndexPg(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: []const u8, idx: []const u8) !void {
+    const sql = try std.fmt.allocPrintSentinel(alloc,
+        "CREATE INDEX \"{s}\" ON \"{s}\" USING GIN (\"{s}\");", .{ idx, col_name, tsv }, 0);
+    defer alloc.free(sql);
+    try w.exec(sql);
 }
 
 /// DROP the Postgres GIN index + the generated tsvector column if present (idempotent). Dropping

@@ -95,6 +95,30 @@ fn valueSet(a: std.mem.Allocator, items: []std.json.Value, key: []const u8) !std
     return set;
 }
 
+/// The `pg_attribute.attnum` of `table`.`col`, or null if the column is absent. Postgres NEVER
+/// reuses an attnum, so a stable attnum across a provision call proves the column was NOT
+/// dropped+recreated (it distinguishes "recreated just the index" from "rebuilt the column").
+fn colAttnum(a: std.mem.Allocator, d: *dbm.Db, table: []const u8, col: []const u8) !?i64 {
+    const sql = try std.fmt.allocPrintSentinel(a,
+        "SELECT a.attnum FROM pg_attribute a WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped;", .{}, 0);
+    var st = try d.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, try std.fmt.allocPrint(a, "\"{s}\"", .{table}));
+    try st.bindText(2, col);
+    if (!try st.step()) return null;
+    return st.columnInt(0);
+}
+
+/// True iff a relation named `rel` resolves on the active search_path (e.g. the GIN index exists).
+fn relExists(a: std.mem.Allocator, d: *dbm.Db, rel: []const u8) !bool {
+    const sql = try std.fmt.allocPrintSentinel(a, "SELECT to_regclass($1) IS NOT NULL;", .{}, 0);
+    var st = try d.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, try std.fmt.allocPrint(a, "\"{s}\"", .{rel}));
+    if (!try st.step()) return false;
+    return st.columnInt(0) != 0;
+}
+
 // ---- tests ------------------------------------------------------------------
 
 test "pg-fts: provisions a tsvector index and ranks `?search=` matches (parity with SQLite)" {
@@ -329,4 +353,73 @@ test "pg-fts: a >256-byte search term ending mid-codepoint does not error (UTF-8
 
     const res = try records.list(al, &d, col, .{ .search = term.items, .perPage = 50 });
     try std.testing.expectEqual(@as(usize, 0), res.items.len); // no row contains the long token
+}
+
+test "pg-fts: a pre-existing tsvector column WITHOUT the marker is rebuilt, not ADD-errored" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var d = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer d.close();
+    const sname = try enterTempSchema(al, &d);
+    defer dropTempSchema(al, &d, sname);
+
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .searchable = true, .options = .{ .text = .{} } }};
+    const col = schema.Collection{ .id = "c1", .name = "docs", .fields = &fields };
+
+    // Provision the base table, then plant a LEGACY generated `docs_fts` column with NO marker
+    // comment (the exact state the old two-state probe conflated with "absent" → it fell through to
+    // ADD COLUMN → "column already exists" startup failure).
+    try d.exec("CREATE TABLE \"docs\" (\"id\" TEXT PRIMARY KEY, \"created\" TEXT, \"updated\" TEXT, \"title\" TEXT);");
+    try d.exec("ALTER TABLE \"docs\" ADD COLUMN \"docs_fts\" tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(\"title\",''))) STORED;");
+    try std.testing.expect((try colAttnum(al, &d, "docs", "docs_fts")) != null); // column is present, unmarked
+    _ = try records.create(al, io, &d, col, try obj(al, .{.{ "title", std.json.Value{ .string = "hello world" } }}));
+
+    // Must NOT raise "column already exists" — the unmarked column is treated as drift and rebuilt.
+    try fts.ensureIndex(al, &d, col);
+
+    // After the rebuild: the GIN index exists and search works.
+    try std.testing.expect(try relExists(al, &d, "docs_fts_idx"));
+    const res = try records.list(al, &d, col, .{ .search = "hello", .perPage = 50 });
+    try std.testing.expectEqual(@as(usize, 1), res.items.len);
+    // Idempotent on a second call (now the marker is present → no-op).
+    try fts.ensureIndex(al, &d, col);
+    try std.testing.expectEqual(@as(usize, 1), (try records.list(al, &d, col, .{ .search = "world", .perPage = 50 })).items.len);
+}
+
+test "pg-fts: a missing GIN index is recreated WITHOUT rebuilding the generated column" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var d = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer d.close();
+    const sname = try enterTempSchema(al, &d);
+    defer dropTempSchema(al, &d, sname);
+
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .searchable = true, .options = .{ .text = .{} } }};
+    const col = schema.Collection{ .id = "c1", .name = "items", .fields = &fields };
+    try provisionFts(al, &d, col);
+    _ = try records.create(al, io, &d, col, try obj(al, .{.{ "title", std.json.Value{ .string = "hello world" } }}));
+
+    // Record the generated column's attnum, then drop ONLY the GIN index (column intact + marked).
+    const before = (try colAttnum(al, &d, "items", "items_fts")).?;
+    try std.testing.expect(try relExists(al, &d, "items_fts_idx"));
+    try d.exec("DROP INDEX \"items_fts_idx\";");
+    try std.testing.expect(!try relExists(al, &d, "items_fts_idx"));
+
+    // ensureIndex must recreate JUST the index — the STORED generated column is left in place.
+    try fts.ensureIndex(al, &d, col);
+    try std.testing.expect(try relExists(al, &d, "items_fts_idx")); // index back
+
+    const after = (try colAttnum(al, &d, "items", "items_fts")).?;
+    try std.testing.expectEqual(before, after); // attnum unchanged → column was NOT dropped+recreated
+
+    // Search still works through the recreated index.
+    try std.testing.expectEqual(@as(usize, 1), (try records.list(al, &d, col, .{ .search = "hello", .perPage = 50 })).items.len);
 }
