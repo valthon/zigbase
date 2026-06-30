@@ -10,10 +10,16 @@ const App = @import("app.zig").App;
 
 /// Prepare a placeholder-bearing statement through the `$n` renumber chokepoint, so the SAME
 /// SQLite-flavored SQL (`?1..?N`) prepares correctly on either backend (a no-op slice on SQLite,
-/// the `$n` rewrite on Postgres). Mirrors `records.prep`. `alloc` only does work on the Postgres
-/// arm (the rewritten SQL); on SQLite it returns the input slice unchanged.
+/// the `$n` rewrite on Postgres). On the Postgres arm `renumberZ` allocates the rewritten SQL;
+/// the DB copies the statement text at prepare time (SQLite compiles it; the PG driver puts it in
+/// a Parse message), so the rewritten buffer is freed right after `prepare`. On SQLite `renumberZ`
+/// returns the input slice (no allocation), so the free is guarded to the Postgres arm — this is
+/// what keeps the KV paths leak-free even when called with the GPA (the `ev.writer/reader` path).
 fn prep(alloc: std.mem.Allocator, conn: *db.Db, sql: [:0]const u8) !db.Stmt {
-    return conn.prepare(try param_sink.renumberZ(alloc, db.dbDialect(conn), sql));
+    const dialect = db.dbDialect(conn);
+    const sql_p = try param_sink.renumberZ(alloc, dialect, sql);
+    defer if (dialect.kind == .postgres) alloc.free(sql_p); // SQLite returns the input slice
+    return conn.prepare(sql_p);
 }
 
 /// Connection-bound, curated record operations. Hooks, custom routes, and jobs
