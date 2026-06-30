@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const schema = @import("../schema.zig");
 const db = @import("../db.zig");
 const migrations = @import("../migrations.zig");
@@ -56,10 +57,34 @@ pub fn acquireFromDb(alloc: std.mem.Allocator, w: *db.Db) ![]schema.Collection {
     return cols;
 }
 
-/// Open `<data_dir>/data.db` and acquire its collections. Errors if the data
-/// dir has no provisioned `_collections` (start the server once first).
-pub fn acquire(alloc: std.mem.Allocator, data_dir: []const u8) ![]schema.Collection {
-    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/data.db", .{data_dir}, 0);
+/// Acquire collections from a backend-agnostic data source `target`. Two shapes:
+///   - a `postgres://…` / `postgresql://…` URI  → opens a PG handle and reads `_collections`
+///     (requires a `-Dpostgres` build; the metadata is backend-neutral, so codegen output is
+///     identical to the SQLite path).
+///   - anything else (a data-dir path)          → opens `<target>/data.db` (SQLite).
+/// Errors if the source has no provisioned `_collections` (start the server once first).
+pub fn acquire(alloc: std.mem.Allocator, io: std.Io, target: []const u8) ![]schema.Collection {
+    if (db.connstrLooksLikePostgres(target)) {
+        // The `openPostgres` constructor only exists when Postgres is compiled in; the comptime
+        // branch keeps the default (`-Dpostgres=false`) build from referencing the PG subtree.
+        if (build_options.postgres) {
+            var w = db.Db.openPostgres(alloc, io, target) catch |e| {
+                // `target` is a postgres:// URI that may carry credentials — never log it.
+                std.log.err("typegen: cannot connect to the Postgres data source: {s}", .{@errorName(e)});
+                return error.DataDirOpenFailed;
+            };
+            defer w.close();
+            return acquireFromDb(alloc, &w) catch |e| {
+                std.log.err("typegen: cannot read _collections from the Postgres data source: {s} (has the server provisioned this database?)", .{@errorName(e)});
+                return error.DataDirReadFailed;
+            };
+        } else {
+            std.log.err("typegen: a postgres:// data source requires a -Dpostgres build", .{});
+            return error.PostgresNotBuilt;
+        }
+    }
+
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/data.db", .{target}, 0);
     var w = db.Db.open(path) catch |e| {
         std.log.err("typegen: cannot open '{s}': {s}", .{ path, @errorName(e) });
         return error.DataDirOpenFailed;
