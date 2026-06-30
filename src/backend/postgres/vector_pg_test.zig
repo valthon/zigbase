@@ -48,14 +48,25 @@ var schema_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 fn enterTempSchema(a: std.mem.Allocator, d: *dbm.Db) ![:0]const u8 {
     const n = schema_counter.fetchAdd(1, .monotonic);
     const name = try std.fmt.allocPrint(a, "zb_vec_{d}", .{n});
-    try d.exec(try std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0));
-    try d.exec(try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA \"{s}\";", .{name}, 0));
-    try d.exec(try std.fmt.allocPrintSentinel(a, "SET search_path TO \"{s}\", public;", .{name}, 0));
+    defer a.free(name); // borrowed into each SQL string + the returned name below; freed after.
+    // Each DDL string is copied by `exec` (the wire driver sends it immediately), so freeing it
+    // right after the call is safe even under a checked allocator (the tests run on an arena, so
+    // these frees are no-ops there, but keep the helper leak-correct regardless).
+    inline for (.{
+        "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;",
+        "CREATE SCHEMA \"{s}\";",
+        "SET search_path TO \"{s}\", public;",
+    }) |tmpl| {
+        const sql = try std.fmt.allocPrintSentinel(a, tmpl, .{name}, 0);
+        defer a.free(sql);
+        try d.exec(sql);
+    }
     return std.fmt.allocPrintSentinel(a, "{s}", .{name}, 0);
 }
 
 fn dropTempSchema(a: std.mem.Allocator, d: *dbm.Db, name: []const u8) void {
     const sql = std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
+    defer a.free(sql);
     d.exec(sql) catch {};
 }
 

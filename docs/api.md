@@ -448,6 +448,13 @@ build** a `vector` query returns **400** (`"Vector search is not enabled in this
 binary is byte-for-byte unaffected. Vector search runs in offset mode (cursor paging is rejected
 with 400).
 
+The **stored** embedding field must hold a **numeric JSON array of a consistent dimension** across
+the collection's rows — that is the value the distance operator compares against. There is currently
+**no write-time validation** of stored embeddings (planned as future work), so a row whose embedding
+is malformed (valid JSON but not a numeric array) or of a differing dimension makes that scoped
+collection's `?vector=` query **fail closed** — a clean **400** (no data leak; the connection
+recovers), symmetric on both backends — until the offending row is corrected.
+
 **Vector on Postgres (pgvector) — opt-in `-Dvector` build.** On a Postgres backend the SAME
 `?vector=` API is backed by pgvector: the embedding column and the bound query embedding are cast to
 the `vector` type at query time and ordered by the native KNN operators `<=>` (cosine distance) /
