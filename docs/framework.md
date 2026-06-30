@@ -2626,6 +2626,50 @@ on both backends; case-insensitive identity is opt-in by declaring a `.nocase` i
 field (the pattern the example apps use). One nuance: Postgres `lower()` is locale-aware
 (folds non-ASCII, e.g. `É`→`é`), whereas SQLite `NOCASE` folds ASCII A–Z only.
 
+#### Migrating an existing SQLite instance to Postgres (`migrate-db`)
+
+Once you have built a `-Dpostgres` binary, the `migrate-db` subcommand copies an
+existing SQLite-backed instance into a fresh PostgreSQL database — schema **and** data:
+
+```sh
+# Build with the PostgreSQL backend compiled in.
+zig build -Dpostgres=true
+
+# Point it at your existing data.db and an empty target database.
+zigbase migrate-db \
+  --from ./zb_data/data.db \
+  --to "postgres://user:pass@db.example.com:5432/zigbase?sslmode=require"
+```
+
+What it does:
+
+1. **Provisions the equivalent schema** on the target via the same code paths the server
+   uses — it runs the system migrations, then creates each collection's record table
+   (with indexes and relation foreign keys) from the source's `_collections` metadata.
+   This includes collections you created at runtime via the admin UI, not just comptime
+   ones.
+2. **Bulk-loads every row** of every system table and record table, **preserving record
+   ids, timestamps, and `_collections` metadata** (collection ids survive verbatim).
+   Server-generated columns (the Postgres `_migrations` identity PK and `_events._seq`)
+   are regenerated on the target.
+3. **Carries encrypted-field envelopes verbatim.** Encrypted cells are backend-neutral
+   `vN:<base64>` TEXT envelopes; `migrate-db` copies the ciphertext byte-for-byte and
+   never decrypts or re-encrypts, so you do **not** pass `ZIGBASE_FIELD_KEY` to the tool.
+   The same key that read the SQLite data reads it on Postgres afterward.
+
+Safety:
+
+- A **non-empty target is refused** (a target that already has a ZigBase schema) unless
+  you pass `--force`. With `--force` every target table is truncated and reloaded.
+- It **reports per-table row counts** and **fails loudly** if any table's loaded count
+  does not match the source.
+- The command is present in every binary, but the PostgreSQL side requires `-Dpostgres`;
+  a stock binary fails with a clear error rather than silently doing nothing.
+
+Not migrated: SQLite-only physical artifacts (the FTS5 full-text shadow tables). The
+collection's `.searchable` metadata is preserved, so the Postgres full-text index is
+provisioned the first time you `zigbase serve` against the migrated database.
+
 ## 9. Pluggable storage & mailer backends (`.storage` / `.mailer`)
 
 `.storage` and `.mailer` each select a comptime **plugin type**. The defaults

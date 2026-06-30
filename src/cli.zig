@@ -23,6 +23,16 @@ pub const RewrapArgs = struct {
     dry_run: bool = false,
 };
 
+/// `migrate-db`: copy an existing SQLite instance into a PostgreSQL target (issue #159).
+pub const MigrateDbArgs = struct {
+    /// Source SQLite `data.db` path (required).
+    from: ?[]const u8 = null,
+    /// Target `postgres://…` connection URL (required).
+    to: ?[]const u8 = null,
+    /// Overwrite a target that already contains a ZigBase schema.
+    force: bool = false,
+};
+
 pub const TypegenArgs = struct {
     data_dir: ?[]const u8 = null,
     url: ?[]const u8 = null,
@@ -35,7 +45,7 @@ pub const TypegenArgs = struct {
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap };
+pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap, migrate_db };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -47,6 +57,7 @@ pub const Command = union(enum) {
     superuser_create: SuperuserArgs,
     typegen: TypegenArgs,
     rewrap: RewrapArgs,
+    migrate_db: MigrateDbArgs,
 };
 
 /// True when an arg is a help flag (`--help` or `-h`).
@@ -71,6 +82,27 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         std.mem.eql(u8, args[0], "--version") or
         std.mem.eql(u8, args[0], "-V"))
         return .{ .version = {} };
+    if (std.mem.eql(u8, args[0], "migrate-db")) {
+        var ma = MigrateDbArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .migrate_db };
+            } else if (std.mem.eql(u8, a, "--from")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ma.from = args[i];
+            } else if (std.mem.eql(u8, a, "--to")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ma.to = args[i];
+            } else if (std.mem.eql(u8, a, "--force")) {
+                ma.force = true;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .migrate_db = ma };
+    }
     if (std.mem.eql(u8, args[0], "migrate")) {
         var sa = ServeArgs{};
         var i: usize = 1;
@@ -255,6 +287,23 @@ test "rewrap --help routes to rewrap help topic" {
 
 test "rewrap rejects unknown flags" {
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "rewrap", "--nope" }, .{}));
+}
+
+test "migrate-db parses --from/--to/--force" {
+    const cmd = try parse(&.{ "migrate-db", "--from", "/tmp/zb/data.db", "--to", "postgres://h/db", "--force" }, .{});
+    try std.testing.expect(std.meta.activeTag(cmd) == .migrate_db);
+    try std.testing.expectEqualStrings("/tmp/zb/data.db", cmd.migrate_db.from.?);
+    try std.testing.expectEqualStrings("postgres://h/db", cmd.migrate_db.to.?);
+    try std.testing.expect(cmd.migrate_db.force);
+}
+
+test "migrate-db --help routes to its help topic" {
+    try std.testing.expectEqual(HelpTopic.migrate_db, (try parse(&.{ "migrate-db", "--help" }, .{})).help);
+}
+
+test "migrate-db rejects unknown flags and missing values" {
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate-db", "--nope" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "migrate-db", "--from" }, .{}));
 }
 
 test "unknown command errors" {

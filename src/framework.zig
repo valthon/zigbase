@@ -1030,6 +1030,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .rewrap => printRewrapUsage(init.io, std.Io.File.stdout()),
             .superuser_create => printSuperuserUsage(init.io, std.Io.File.stdout()),
             .typegen => printTypegenUsage(init.io, std.Io.File.stdout()),
+            .migrate_db => printMigrateDbUsage(init.io, std.Io.File.stdout()),
         },
         .version => printVersion(init.io, std.Io.File.stdout()),
         .serve => |sa| {
@@ -1038,6 +1039,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         },
         .migrate => |sa| try migrateImpl(allocator, init.io, init.environ_map, sa),
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
+        .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
         .typegen => |ta| {
             if (opts.enable_typegen) {
@@ -1095,6 +1097,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool) void {
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
         \\  migrate             Apply database migrations, then exit.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
+        \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
         \\  superuser create    Create an admin (superuser) account.
         \\  help                Show this help. Also: --help, -h, or no arguments.
         \\  version             Print version + build provenance. Also: --version, -V.
@@ -1398,6 +1401,97 @@ fn rewrapImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.proc
         "rewrap {s}: {d} collection(s), {d} field(s); {d} re-encrypted, {d} plaintext migrated, {d} already current",
         .{ if (ra.dry_run) "dry-run complete" else "complete", stats.collections, stats.fields, stats.rewrapped, stats.plaintext_migrated, stats.skipped },
     );
+}
+
+/// `zigbase migrate-db --from <data.db> --to <postgres://…>`: copy an existing SQLite instance
+/// into a PostgreSQL target (issue #159). Provisions the equivalent schema on the target via the
+/// system migrations + the source's `_collections` record tables, then bulk-loads every row,
+/// carrying encrypted-field envelopes verbatim and preserving ids/timestamps/metadata.
+///
+/// The subcommand is ALWAYS present, but the Postgres side requires a binary built with
+/// `-Dpostgres`. Built without it, the command fails loudly (the target URL cannot be opened) —
+/// it never silently no-ops.
+fn migrateDbImpl(allocator: std.mem.Allocator, io: std.Io, ma: cli.MigrateDbArgs) !void {
+    const from = ma.from orelse {
+        std.log.err("migrate-db: --from <sqlite data.db path> is required", .{});
+        return error.MissingFrom;
+    };
+    const to = ma.to orelse {
+        std.log.err("migrate-db: --to <postgres://…> is required", .{});
+        return error.MissingTo;
+    };
+    if (!db.connstrLooksLikePostgres(to)) {
+        std.log.err("migrate-db: --to must be a postgres:// URL (got '{s}')", .{to});
+        return error.InvalidTarget;
+    }
+    if (comptime !build_options.postgres) {
+        std.log.err("migrate-db: this binary was built WITHOUT -Dpostgres, so it cannot open a PostgreSQL target. Rebuild with `zig build -Dpostgres=true`.", .{});
+        return error.PostgresSupportNotBuilt;
+    } else {
+        const dumpload = @import("dumpload.zig");
+        const from_z = try allocator.dupeZ(u8, from);
+        defer allocator.free(from_z);
+        const to_z = try allocator.dupeZ(u8, to);
+        defer allocator.free(to_z);
+
+        var source = db.Db.open(from_z) catch |e| {
+            std.log.err("migrate-db: cannot open source SQLite '{s}': {s}", .{ from, @errorName(e) });
+            return e;
+        };
+        defer source.close();
+        var target = db.Db.openPostgres(allocator, io, to_z) catch |e| {
+            std.log.err("migrate-db: cannot connect to target Postgres: {s}", .{@errorName(e)});
+            return e;
+        };
+        defer target.close();
+
+        std.log.info("migrate-db: migrating '{s}' -> PostgreSQL{s}", .{ from, if (ma.force) " (--force)" else "" });
+        const report = dumpload.run(allocator, &source, &target, .{ .force = ma.force }) catch |e| switch (e) {
+            error.TargetNotEmpty => {
+                std.log.err("migrate-db: the target already contains a ZigBase schema (refusing to overwrite). Pass --force to load into it anyway.", .{});
+                return e;
+            },
+            error.RowCountMismatch => {
+                std.log.err("migrate-db: aborted — a table's loaded row count did not match the source (see the error above).", .{});
+                return e;
+            },
+            else => return e,
+        };
+        defer report.deinit(allocator);
+        for (report.tables) |t| {
+            if (t.rows > 0) std.log.info("migrate-db:   {s}: {d} row(s)", .{ t.name, t.rows });
+        }
+        std.log.info(
+            "migrate-db: complete — {d} record table(s) provisioned, {d} table(s) loaded, {d} total row(s)",
+            .{ report.collections_provisioned, report.tables.len, report.total_rows },
+        );
+    }
+}
+
+fn printMigrateDbUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase migrate-db — copy an existing SQLite instance into PostgreSQL.
+        \\
+        \\USAGE:
+        \\  zigbase migrate-db --from PATH --to URL [--force]
+        \\
+        \\FLAGS:
+        \\  --from PATH   Source SQLite database file (e.g. ./zb_data/data.db). REQUIRED.
+        \\  --to URL      Target postgres://… connection URL. REQUIRED.
+        \\  --force       Overwrite a target that already contains a ZigBase schema.
+        \\
+        \\It provisions the equivalent schema on the target (system migrations + every
+        \\collection's record table) and bulk-loads every row, carrying encrypted-field
+        \\envelopes VERBATIM (no decrypt/re-encrypt) and preserving ids, timestamps, and
+        \\collection metadata. A non-empty target is refused unless --force.
+        \\
+        \\Requires a binary built with -Dpostgres (the pure-Zig PostgreSQL backend).
+        \\
+        \\EXAMPLE:
+        \\  zigbase migrate-db --from ./zb_data/data.db \
+        \\    --to "postgres://user:pass@db.example.com:5432/zigbase?sslmode=require"
+        \\
+    , .{});
 }
 
 /// Minimum acceptable length for an operator-provided JWT secret.
