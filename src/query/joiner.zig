@@ -2,10 +2,14 @@ const std = @import("std");
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
+const ddl = @import("../ddl.zig");
 
 pub const JoinError = error{ UnknownField, NotARelation, MultiRelationTraversal, EncryptedField } || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".return_type.?).error_union.error_set;
 
-pub const ColumnRef = struct { sql: []const u8, field: ?schema.Field };
+/// A resolved column reference. `nocase` is true when the column is covered by a `.nocase` index
+/// on its (possibly joined) collection — the compiler then lowers an equality/IN compare so it
+/// agrees with the case-insensitive uniqueness (Postgres `lower()`; SQLite unchanged) (#159).
+pub const ColumnRef = struct { sql: []const u8, field: ?schema.Field, nocase: bool = false };
 
 pub const Joiner = struct {
     alloc: std.mem.Allocator,
@@ -37,7 +41,7 @@ pub const Joiner = struct {
                 // filter/sort over them can never match correctly — reject closed.
                 if (field) |fl| if (fl.encrypted) return error.EncryptedField;
                 const ref = try std.fmt.allocPrint(self.alloc, "{s}.\"{s}\"", .{ cur_alias, seg });
-                return .{ .sql = ref, .field = field };
+                return .{ .sql = ref, .field = field, .nocase = ddl.isNocaseField(cur_col, seg) };
             }
             const rf = schema.fieldByName(cur_col, seg) orelse return error.UnknownField;
             if (rf.fieldType() != .relation) return error.NotARelation;

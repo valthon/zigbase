@@ -246,6 +246,53 @@ test "pg: auth identity lookup + login credential check + consumeToken + session
     try std.testing.expect(!try auth_api.deleteSession(w, "sid1")); // already gone
 }
 
+test "pg: .nocase identity — case-insensitive lookup + case-variant duplicate rejected (#159)" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "nocase_id")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+    try migrations.run(w);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // A users auth collection whose `email` carries a `.nocase` UNIQUE index — the documented
+    // email-uniqueness pattern the example apps use. On PG this provisions as `lower(email)`.
+    _ = try collections.create(al, std.testing.io, w, .{
+        .id = "", .name = "users", .type = .auth,
+        .fields = &[_]schema.Field{.{ .id = "f1", .name = "name", .options = .{ .text = .{} } }},
+        .indexes = &[_]schema.Index{.{ .name = "idx_users_email_nocase", .fields = &.{"email"}, .unique = true, .collation = .nocase }},
+        .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+    });
+    const col = (try collections.get(al, w, "users")).?;
+
+    // Store one record with a MIXED-CASE email.
+    var data: std.json.ObjectMap = .empty;
+    try data.put(al, "email", .{ .string = "Bob@x.com" });
+    try data.put(al, "password", .{ .string = "correct horse battery" });
+    const prepared = try auth_core.applyCreate(std.testing.io, al, .{ .object = data }, col.options.auth.minPasswordLength);
+    const rec = try records.create(al, std.testing.io, w, col, prepared);
+    const rid = rec.object.get("id").?.string;
+
+    // Case-INSENSITIVE lookup: finding by a DIFFERENT case (lower, UPPER) resolves the same record,
+    // because findByIdentity lowers both sides on PG to match the `lower(email)` index (#159).
+    try std.testing.expectEqualStrings(rid, (try auth_api.findByIdentity(al, w, col, "bob@x.com")).?);
+    try std.testing.expectEqualStrings(rid, (try auth_api.findByIdentity(al, w, col, "BOB@X.COM")).?);
+    try std.testing.expectEqualStrings(rid, (try auth_api.findByIdentity(al, w, col, "Bob@x.com")).?);
+    // A non-matching identity still returns null.
+    try std.testing.expect((try auth_api.findByIdentity(al, w, col, "carol@x.com")) == null);
+
+    // Case-variant uniqueness: creating a second record with a case-variant email is REJECTED by
+    // the `lower(email)` unique index (duplicate identity), exactly like SQLite's COLLATE NOCASE.
+    var data2: std.json.ObjectMap = .empty;
+    try data2.put(al, "email", .{ .string = "bob@x.com" });
+    try data2.put(al, "password", .{ .string = "another good passphrase" });
+    const prepared2 = try auth_core.applyCreate(std.testing.io, al, .{ .object = data2 }, col.options.auth.minPasswordLength);
+    // The INSERT … RETURNING is a PREPARED statement, so the unique violation surfaces at step().
+    try std.testing.expectError(error.StepFailed, records.create(al, std.testing.io, w, col, prepared2));
+}
+
 // ---------------------------------------------------------------------------
 // Auth VERIFY path (src/auth.zig) on Postgres — the core middleware hit on EVERY authenticated
 // request. Its three reads (tokenKeyEpochFor / sessionActive / superuserRecord) emitted raw `?N`
