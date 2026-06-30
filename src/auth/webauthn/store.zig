@@ -1,6 +1,17 @@
 const std = @import("std");
 const db = @import("../../db.zig");
 const id_gen = @import("../../id.zig");
+const param_sink = @import("../../sql/param_sink.zig");
+
+/// Lower + renumber a curated `_webauthnCredentials` statement for `conn`'s backend, then prepare.
+/// SQLite gets verbatim `?N`/`datetime('now')` (zero-cost); Postgres gets `$n` + `now()`. A stack
+/// arena bounds the lowered SQL; `Db.prepare` copies it, so the buffer need only outlive this call.
+fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const lowered = param_sink.lowerStmtZ(fba.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
+    return conn.prepare(lowered);
+}
 
 /// A single registered WebAuthn credential as returned by `getByCredentialId`.
 pub const Credential = struct {
@@ -38,7 +49,7 @@ pub const CredentialStore = struct {
     ) !void {
         _ = alloc;
         var rid = id_gen.collectionId(io);
-        var st = try self.conn.prepare(
+        var st = try prep(self.conn,
             \\INSERT INTO "_webauthnCredentials"
             \\  ("id","collectionRef","recordRef","credentialId","publicKey","alg","signCount","aaguid","transports","created","updated")
             \\ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,datetime('now'),datetime('now'));
@@ -63,7 +74,7 @@ pub const CredentialStore = struct {
         alloc: std.mem.Allocator,
         credential_id_b64: []const u8,
     ) !?Credential {
-        var st = try self.conn.prepare(
+        var st = try prep(self.conn,
             \\SELECT "id","collectionRef","recordRef","credentialId","publicKey","alg","signCount","aaguid"
             \\ FROM "_webauthnCredentials" WHERE "credentialId"=?1;
         );
@@ -88,7 +99,7 @@ pub const CredentialStore = struct {
         credential_id_b64: []const u8,
         new_count: u32,
     ) !void {
-        var st = try self.conn.prepare(
+        var st = try prep(self.conn,
             \\UPDATE "_webauthnCredentials"
             \\ SET "signCount"=?1,"updated"=datetime('now')
             \\ WHERE "credentialId"=?2;
@@ -105,7 +116,7 @@ pub const CredentialStore = struct {
         self: CredentialStore,
         credential_id_b64: []const u8,
     ) !bool {
-        var st = try self.conn.prepare(
+        var st = try prep(self.conn,
             \\SELECT 1 FROM "_webauthnCredentials" WHERE "credentialId"=?1 LIMIT 1;
         );
         defer st.finalize();

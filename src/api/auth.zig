@@ -14,6 +14,20 @@ const session = @import("../session.zig");
 const id_gen = @import("../id.zig");
 const Ctx = @import("../ctx.zig").Ctx;
 const ApiError = @import("error.zig").ApiError;
+const param_sink = @import("../sql/param_sink.zig");
+
+/// Lower + renumber a curated auth/session/token statement for `conn`'s backend, then prepare it.
+/// SQLite gets the verbatim `?N`/`datetime('now')` SQL (zero-cost — the same slice); Postgres gets
+/// `$n` placeholders + `now()` expressions (`sql/param_sink.lowerStmtZ`). Every placeholder-bearing
+/// CRUD `prepare` in the auth subsystem routes through here so the `$n` rework has one chokepoint.
+/// A stack arena bounds the lowered SQL (these statements are short, including the few built with a
+/// runtime collection/table name); `Db.prepare` copies it, so the buffer need only outlive the call.
+fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const lowered = param_sink.lowerStmtZ(fba.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
+    return conn.prepare(lowered);
+}
 
 fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value, cookies: []const http.Cookie) !http.Response {
     return .{ .status = status, .body = try std.json.Stringify.valueAlloc(ctx.allocator, v, .{}), .cookies = cookies };
@@ -98,7 +112,7 @@ pub fn nowUnix(conn: *db.Db) db.DbError!i64 {
 pub fn findByIdentity(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, identity: []const u8) !?[]const u8 {
     for (col.options.auth.identityFields) |idf| {
         const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE \"{s}\" = ?1 AND \"{s}\" != '' LIMIT 1;", .{ col.name, idf, idf }, 0);
-        var st = try conn.prepare(sql);
+        var st = try prep(conn, sql);
         defer st.finalize();
         try st.bindText(1, identity);
         if (try st.step()) return try alloc.dupe(u8, st.columnText(0));
@@ -108,7 +122,7 @@ pub fn findByIdentity(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collec
 
 pub fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
-    var st = try conn.prepare(sql);
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
     if (!try st.step()) return null;
@@ -117,7 +131,7 @@ pub fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8
 
 pub fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\" FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
-    var st = try conn.prepare(sql);
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
     if (!try st.step()) return null;
@@ -132,7 +146,7 @@ pub const KeyEpoch = struct { token_key: []const u8, epoch: i64 };
 /// own epoch SELECT, it takes the epoch from here. NULL epoch reads as 0 (back-compat).
 pub fn tokenKeyAndEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?KeyEpoch {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
-    var st = try conn.prepare(sql);
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
     if (!try st.step()) return null;
@@ -145,7 +159,7 @@ pub fn tokenKeyAndEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []cons
 /// row exists.
 pub fn tokenEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?i64 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
-    var st = try conn.prepare(sql);
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
     if (!try st.step()) return null;
@@ -157,7 +171,7 @@ pub fn tokenEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, 
 /// run under the writer lock. `table` is the physical auth table. Returns the new epoch.
 pub fn bumpTokenEpoch(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !i64 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET \"token_epoch\" = COALESCE(\"token_epoch\", 0) + 1 WHERE \"id\" = ?1;", .{table}, 0);
-    var st = try conn.prepare(sql);
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
     _ = try st.step();
@@ -187,7 +201,7 @@ pub fn recordSession(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8
     var idbuf: [15]u8 = undefined;
     id_gen.generate(app.io, &idbuf);
     const sid = try ctx.allocator.dupe(u8, &idbuf);
-    var st = try conn.prepare(
+    var st = try prep(conn, 
         \\INSERT INTO "_sessions" ("id","collectionRef","recordRef","created","lastSeen","expires","userAgent","ip")
         \\ VALUES (?1,?2,?3,datetime('now'),datetime('now'),?4,?5,?6);
     );
@@ -204,7 +218,7 @@ pub fn recordSession(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8
 
 /// Delete one session row by id. Returns whether a row existed. Writer required.
 pub fn deleteSession(conn: *db.Db, sid: []const u8) !bool {
-    var st = try conn.prepare("DELETE FROM \"_sessions\" WHERE \"id\" = ?1 RETURNING \"id\";");
+    var st = try prep(conn, "DELETE FROM \"_sessions\" WHERE \"id\" = ?1 RETURNING \"id\";");
     defer st.finalize();
     try st.bindText(1, sid);
     return try st.step();
@@ -214,7 +228,7 @@ pub fn deleteSession(conn: *db.Db, sid: []const u8) !bool {
 /// refresh/rotate to carry the true session-start time forward onto the replacement row.
 /// Null when no row existed. Writer required.
 pub fn deleteSessionReturningCreated(alloc: std.mem.Allocator, conn: *db.Db, sid: []const u8) !?[]const u8 {
-    var st = try conn.prepare("DELETE FROM \"_sessions\" WHERE \"id\" = ?1 RETURNING \"created\";");
+    var st = try prep(conn, "DELETE FROM \"_sessions\" WHERE \"id\" = ?1 RETURNING \"created\";");
     defer st.finalize();
     try st.bindText(1, sid);
     if (!try st.step()) return null;
@@ -230,7 +244,7 @@ pub fn carrySessionCreated(alloc: std.mem.Allocator, conn: *db.Db, new_token: []
     const claims = jwt.peekClaims(alloc, new_token) catch return;
     const ns = claims.sid orelse return;
     if (ns.len == 0) return;
-    var st = try conn.prepare("UPDATE \"_sessions\" SET \"created\" = ?2 WHERE \"id\" = ?1;");
+    var st = try prep(conn, "UPDATE \"_sessions\" SET \"created\" = ?2 WHERE \"id\" = ?1;");
     defer st.finalize();
     try st.bindText(1, ns);
     try st.bindText(2, oc);
@@ -254,7 +268,7 @@ pub fn gcExpiredSessions(conn: *db.Db) !usize {
         // `session_gc_batch` is the single source of truth for the batch size: it is the SQL
         // LIMIT (interpolated at comptime — a comptime int constant, no injection surface) AND
         // the loop-termination threshold below, so the two can never desync.
-        var st = try conn.prepare(comptime std.fmt.comptimePrint(
+        var st = try prep(conn, comptime std.fmt.comptimePrint(
             \\DELETE FROM "_sessions"
             \\ WHERE "id" IN (SELECT "id" FROM "_sessions" WHERE "expires" IS NOT NULL AND "expires" <= ?1 LIMIT {d})
             \\ RETURNING "id";
@@ -271,7 +285,7 @@ pub fn gcExpiredSessions(conn: *db.Db) !usize {
 
 /// Delete EVERY session row for a principal (revoke-all cleanliness). Writer required.
 pub fn deleteSessionsForPrincipal(conn: *db.Db, collection: []const u8, rid: []const u8) !void {
-    var st = try conn.prepare("DELETE FROM \"_sessions\" WHERE \"collectionRef\" = ?1 AND \"recordRef\" = ?2;");
+    var st = try prep(conn, "DELETE FROM \"_sessions\" WHERE \"collectionRef\" = ?1 AND \"recordRef\" = ?2;");
     defer st.finalize();
     try st.bindText(1, collection);
     try st.bindText(2, rid);
@@ -281,7 +295,7 @@ pub fn deleteSessionsForPrincipal(conn: *db.Db, collection: []const u8, rid: []c
 /// The (collection, record) owner of a session row, or null if absent. Used to AUTHORIZE
 /// `revoke(sid)`: a non-superuser may only revoke a session they own.
 pub fn sessionOwner(alloc: std.mem.Allocator, conn: *db.Db, sid: []const u8) !?struct { collection: []const u8, record: []const u8 } {
-    var st = try conn.prepare("SELECT \"collectionRef\", \"recordRef\" FROM \"_sessions\" WHERE \"id\" = ?1;");
+    var st = try prep(conn, "SELECT \"collectionRef\", \"recordRef\" FROM \"_sessions\" WHERE \"id\" = ?1;");
     defer st.finalize();
     try st.bindText(1, sid);
     if (!try st.step()) return null;
@@ -291,7 +305,7 @@ pub fn sessionOwner(alloc: std.mem.Allocator, conn: *db.Db, sid: []const u8) !?s
 /// List a principal's active (unexpired) sessions, newest first. Caller adds `is_current`.
 pub fn listSessions(alloc: std.mem.Allocator, conn: *db.Db, collection: []const u8, rid: []const u8) ![]SessionRow {
     const now = try nowUnix(conn);
-    var st = try conn.prepare(
+    var st = try prep(conn, 
         \\SELECT "id","created","lastSeen","userAgent","ip" FROM "_sessions"
         \\ WHERE "collectionRef" = ?1 AND "recordRef" = ?2 AND ("expires" IS NULL OR "expires" > ?3)
         \\ ORDER BY "created" DESC;
@@ -705,7 +719,7 @@ pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
 
 fn findByEmail(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, email: []const u8) !?[]const u8 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE \"email\" = ?1 AND \"email\" != '' LIMIT 1;", .{col.name}, 0);
-    var st = try conn.prepare(sql);
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, email);
     if (try st.step()) return try alloc.dupe(u8, st.columnText(0));
@@ -751,12 +765,12 @@ pub fn consumeToken(conn: *db.Db, claims: jwt.Claims) !void {
     // lets a genuine INSERT failure below (disk-full, I/O error, etc.) PROPAGATE as an
     // internal error instead of masquerading as error.AlreadyConsumed (a 400).
     {
-        var sel = try conn.prepare("SELECT 1 FROM \"_consumedTokens\" WHERE \"jti\" = ?1;");
+        var sel = try prep(conn, "SELECT 1 FROM \"_consumedTokens\" WHERE \"jti\" = ?1;");
         defer sel.finalize();
         try sel.bindText(1, claims.jti);
         if (try sel.step()) return error.AlreadyConsumed; // a row exists => already redeemed
     }
-    var st = try conn.prepare("INSERT INTO \"_consumedTokens\" (\"jti\",\"expires\",\"consumed\") VALUES (?1,?2,datetime('now'));");
+    var st = try prep(conn, "INSERT INTO \"_consumedTokens\" (\"jti\",\"expires\",\"consumed\") VALUES (?1,?2,datetime('now'));");
     defer st.finalize();
     try st.bindText(1, claims.jti);
     try st.bindInt(2, claims.exp);
@@ -827,7 +841,7 @@ pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
     consumeToken(w, claims) catch
         return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
     const sql = try std.fmt.allocPrintSentinel(ctx.allocator, "UPDATE \"{s}\" SET \"verified\" = 1 WHERE \"id\" = ?1;", .{col.name}, 0);
-    var st = try w.prepare(sql);
+    var st = try prep(w, sql);
     defer st.finalize();
     try st.bindText(1, claims.id);
     _ = try st.step();

@@ -136,11 +136,68 @@ pub fn renumberZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8) 
     return std.fmt.allocPrintSentinel(alloc, "{s}", .{rewritten}, 0);
 }
 
+/// Lower a curated auth/oauth/analytics/session DML statement from the SQLite flavor to
+/// `dialect`, returning a NUL-terminated string ready for `Db.prepare`. Two transforms, both
+/// no-ops on SQLite (so the SQLite result is byte-identical — the input slice is returned
+/// unchanged, zero-cost):
+///   1. the two server-`now` expressions these subsystems use — `datetime('now')` (a TEXT
+///      timestamp column) and `strftime('%Y-%m-%dT%H:%M:%SZ','now')` (an ISO-8601 capture) — are
+///      replaced with the dialect's `nowTextExpr()` / `nowIso8601Expr()` (the same ISO `Z` text
+///      on both backends);
+///   2. `?N`/`?` placeholders are renumbered to `$n` (`ParamSink`, document-order, mixed-form).
+///
+/// These are the ONLY SQLite-isms in the curated auth/session/token/oauth/analytics/webauthn/
+/// challenge statements; the DDL-keyword / `GLOB` / `INSERT OR IGNORE` isms live in the system
+/// migrations (lowered by `Dialect.lowerMigrationSql`). A `strftime` over a COLUMN (e.g. the
+/// analytics time-bucket `strftime('%Y-%m-%d',"occurred_at")`) is NOT a `now` form, is left
+/// untouched here, and its caller dialect-branches it directly. The placeholder renumber relies
+/// on the same scanner invariants documented on `ParamSink.rewrite`.
+pub fn lowerStmtZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8) std.mem.Allocator.Error![:0]const u8 {
+    if (dialect.kind == .sqlite) return sql; // byte-identical — nothing to lower
+    const s1 = try std.mem.replaceOwned(u8, alloc, sql, "strftime('%Y-%m-%dT%H:%M:%SZ','now')", dialect.nowIso8601Expr());
+    defer alloc.free(s1);
+    const s2 = try std.mem.replaceOwned(u8, alloc, s1, "datetime('now')", dialect.nowTextExpr());
+    defer alloc.free(s2);
+    var sink = ParamSink.init(dialect);
+    const renumbered = try sink.rewrite(alloc, s2);
+    defer alloc.free(renumbered);
+    return std.fmt.allocPrintSentinel(alloc, "{s}", .{renumbered}, 0);
+}
+
 // ---------------------------------------------------------------------------
 // Tests — pure string assertions; run in EVERY build (no backend needed).
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "param_sink: lowerStmtZ is identity on SQLite (same slice, no alloc)" {
+    const sql: [:0]const u8 = "INSERT INTO \"_sessions\" (\"id\",\"created\") VALUES (?1,datetime('now'));";
+    const out = try lowerStmtZ(testing.allocator, Dialect.sqlite, sql);
+    try testing.expectEqual(sql.ptr, out.ptr); // unchanged slice, nothing to free
+}
+
+test "param_sink: lowerStmtZ lowers datetime('now') + renumbers on Postgres" {
+    const sql: [:0]const u8 =
+        "INSERT INTO \"_sessions\" (\"id\",\"created\",\"lastSeen\",\"expires\") VALUES (?1,datetime('now'),datetime('now'),?2);";
+    const out = try lowerStmtZ(testing.allocator, Dialect.postgres, sql);
+    defer testing.allocator.free(out);
+    const now_pg = Dialect.postgres.nowTextExpr();
+    const want = std.fmt.allocPrint(testing.allocator,
+        "INSERT INTO \"_sessions\" (\"id\",\"created\",\"lastSeen\",\"expires\") VALUES ($1,{s},{s},$2);",
+        .{ now_pg, now_pg }) catch unreachable;
+    defer testing.allocator.free(want);
+    try testing.expectEqualStrings(want, out);
+    try testing.expectEqual(@as(u8, 0), out.ptr[out.len]); // NUL-terminated
+}
+
+test "param_sink: lowerStmtZ lowers the strftime ISO 'now' capture on Postgres" {
+    const sql: [:0]const u8 = "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now');";
+    const out = try lowerStmtZ(testing.allocator, Dialect.postgres, sql);
+    defer testing.allocator.free(out);
+    // The strftime-now becomes the to_char ISO form; no placeholders to renumber.
+    try testing.expect(std.mem.indexOf(u8, out, "to_char(now()") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "strftime") == null);
+}
 
 test "param_sink: sqlite is identity (byte-for-byte, same slice)" {
     const sql = "SELECT * FROM t WHERE a = ? AND b IN (?,?,?)";

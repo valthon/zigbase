@@ -447,6 +447,13 @@ fn init_0015_events(m: *Migrator) db.DbError!void {
         \\  "occurred_at" TEXT NOT NULL DEFAULT ''
         \\);
     );
+    // The incremental rollup watermark advances over a MONOTONIC insertion-order column. SQLite
+    // has the implicit `rowid`; Postgres has none, so add an identity column `_seq` there (the
+    // app `id` is a RANDOM base36 string, not monotonic, so it cannot serve). `analytics.seqCol`
+    // selects `rowid`/`_seq` per backend. Adding it before any rows exist keeps the migration cheap.
+    if (m.dialect.kind == .postgres) {
+        try m.db.exec("ALTER TABLE \"_events\" ADD COLUMN IF NOT EXISTS \"_seq\" BIGINT GENERATED ALWAYS AS IDENTITY;");
+    }
     // (account,name,occurred_at) serves the per-event-name rollup scan + a name-filtered feed;
     // (account,occurred_at) serves the account-scoped activity feed (newest-first by occurred_at).
     try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_events_account_name_occurred\" ON \"_events\" (\"account\",\"name\",\"occurred_at\");");
