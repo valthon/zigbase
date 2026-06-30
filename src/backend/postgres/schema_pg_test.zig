@@ -226,15 +226,13 @@ test "pg: provisioned TEXT columns order by byte value (COLLATE \"C\"), matching
     try std.testing.expectEqualStrings("Zzz", idq.columnText(0)); // 'Z' < 'a' in byte order
 }
 
-test "pg: a consumer .nocase UNIQUE index provisions case-SENSITIVELY (warned weakening)" {
+test "pg: a consumer .nocase UNIQUE index provisions case-INSENSITIVELY via lower() (#159)" {
     const a = std.testing.allocator;
     var ctx = (try Ctx.open(a, std.testing.io, "nocase")) orelse return error.SkipZigTest;
     defer ctx.deinit();
     const w = ctx.w();
 
     try migrations.run(w);
-    // Provisioning logs a prominent std.log.warn for this .nocase index under PG (see
-    // provision.warnNocaseIndexesUnderPg) — visible in the test output.
     const specs = comptime provision.buildCollections(.{
         .contacts = .{ .fields = .{.{ .name = "addr", .type = .text }}, .indexes = .{
             .{ .name = "idx_contacts_addr", .fields = .{"addr"}, .unique = true, .collation = .nocase },
@@ -242,18 +240,23 @@ test "pg: a consumer .nocase UNIQUE index provisions case-SENSITIVELY (warned we
     });
     try provision.applySpecs(a, std.testing.io, w, specs);
 
-    // The .nocase-indexed column is left at the DB default collation (NOT pinned to "C"), so the
-    // case-insensitive follow-up can take it over.
+    // The .nocase index provisions as a `lower(addr)` FUNCTIONAL index (an expression index, so
+    // it carries no column collation — the column itself stays at the DB default, NOT pinned "C").
     try std.testing.expectEqual(@as(i64, 0), try scalarCount(w,
         "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() " ++
         "AND table_name='contacts' AND column_name='addr' AND collation_name='C';"));
+    // A functional `lower()` index over `addr` really exists (pg_indexes records its definition).
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w,
+        "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND tablename='contacts' " ++
+        "AND indexname='idx_contacts_addr' AND indexdef ILIKE '%lower%';"));
 
-    // The known (warned, pre-GA follow-up) weakening: case-variant values are NOT deduped on PG,
-    // because PG has no NOCASE collation yet — so both rows insert.
+    // PARITY (#159): case-variant values are now REJECTED — `Bob@x.com` then `bob@x.com` collide on
+    // `lower(addr)`, exactly like SQLite's COLLATE NOCASE. Only the first row inserts.
     try w.exec("INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c1','','','Bob@x.com');");
-    try w.exec("INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c2','','','bob@x.com');");
-    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w, "SELECT count(*) FROM \"contacts\";"));
-    // The exact-duplicate IS still rejected (the index is unique, just case-sensitive).
     try std.testing.expectError(error.ExecFailed, w.exec(
-        "INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c3','','','bob@x.com');"));
+        "INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c2','','','bob@x.com');"));
+    // The exact-duplicate is likewise rejected.
+    try std.testing.expectError(error.ExecFailed, w.exec(
+        "INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c3','','','Bob@x.com');"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM \"contacts\";"));
 }

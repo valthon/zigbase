@@ -54,6 +54,13 @@ fn opSql(op: lexer.TokKind, dialect: Dialect) []const u8 {
     };
 }
 
+/// `=`/`!=` are the equality family whose result must agree with a `.nocase` column's
+/// case-insensitive uniqueness; only these get `lower()`-wrapped (#159). Ordering ops keep their
+/// historical (binary on SQLite) semantics; `~`/`!~` are already case-insensitive (ILIKE on PG).
+fn isEqNe(op: lexer.TokKind) bool {
+    return op == .eq or op == .ne;
+}
+
 /// LIKE only makes sense on text-stored columns; reject it on number/bool fields.
 fn likeAllowed(field: ?schema.Field) bool {
     const f = field orelse return true; // system columns (id/created/updated) are text
@@ -104,7 +111,12 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
     if (l_col and r_col) {
         const lc = try j.resolve(c.lhs.path);
         const rc = try j.resolve(c.rhs.path);
-        return std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ lc.sql, opSql(c.op, dialect), rc.sql });
+        // Column-vs-column equality on a `.nocase` column lowers BOTH sides so the compare matches
+        // its case-insensitive uniqueness (PG `lower()`; SQLite unchanged) (#159).
+        const ci = (lc.nocase or rc.nocase) and isEqNe(c.op);
+        const lsql = if (ci) try dialect.nocaseEqOperand(alloc, lc.sql) else lc.sql;
+        const rsql = if (ci) try dialect.nocaseEqOperand(alloc, rc.sql) else rc.sql;
+        return std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ lsql, opSql(c.op, dialect), rsql });
     }
 
     if (l_col or r_col) {
@@ -117,8 +129,14 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
             return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op, dialect) });
         }
         try params.append(alloc, try operandToParam(col.field, val_op, rctx));
-        if (l_col) return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op, dialect) });
-        return std.fmt.allocPrint(alloc, "? {s} {s}", .{ opSql(c.op, dialect), col.sql });
+        // Case-insensitive equality against a `.nocase` column: lower the column AND the placeholder
+        // so it uses the `lower()` functional index and agrees with uniqueness (PG only; SQLite
+        // returns the operand unchanged, keeping the SQL byte-identical) (#159).
+        const ci = col.nocase and isEqNe(c.op);
+        const col_sql = if (ci) try dialect.nocaseEqOperand(alloc, col.sql) else col.sql;
+        const ph = if (ci) try dialect.nocaseEqOperand(alloc, "?") else "?";
+        if (l_col) return std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ col_sql, opSql(c.op, dialect), ph });
+        return std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ ph, opSql(c.op, dialect), col_sql });
     }
 
     // neither side is a column: both are macros/literals -> bind both as text
@@ -161,12 +179,15 @@ fn emitIn(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arra
         else => return error.BadFilter, // parser only yields list/list_macro on the RHS of `in`
     }
     if (n == 0) return alloc.dupe(u8, dialect.constFalse()); // empty set -> constant-false, fail-closed
+    // IN is set-equality, so a `.nocase` column lowers the column AND every placeholder so each
+    // membership test matches the case-insensitive uniqueness (PG `lower()`; SQLite unchanged) (#159).
+    const ci = col.nocase;
     var buf: std.ArrayList(u8) = .empty;
-    try buf.appendSlice(alloc, col.sql);
+    try buf.appendSlice(alloc, if (ci) try dialect.nocaseEqOperand(alloc, col.sql) else col.sql);
     try buf.appendSlice(alloc, " IN (");
     for (0..n) |i| {
         if (i > 0) try buf.append(alloc, ',');
-        try buf.append(alloc, '?');
+        if (ci) try buf.appendSlice(alloc, try dialect.nocaseEqOperand(alloc, "?")) else try buf.append(alloc, '?');
     }
     try buf.append(alloc, ')');
     return buf.toOwnedSlice(alloc);
@@ -234,6 +255,47 @@ test "compile text equality binds the literal" {
     try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
     try std.testing.expectEqual(@as(usize, 1), c.params.len);
     try std.testing.expectEqualStrings("hi", c.params[0].text);
+}
+
+test "compile lowers a .nocase column equality/IN on Postgres, unchanged on SQLite (#159)" {
+    const migrations = @import("../migrations.zig");
+    const collections = @import("../collections.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const idx = [_]schema.Index{.{ .name = "idx_people_addr", .fields = &.{"addr"}, .unique = true, .collation = .nocase }};
+    const people = try collections.create(a, std.testing.io, &d, .{
+        .id = "",
+        .name = "people",
+        .fields = &[_]schema.Field{
+            .{ .id = "e1", .name = "addr", .options = .{ .text = .{} } }, // .nocase-indexed (case-insensitive)
+            .{ .id = "n1", .name = "label", .options = .{ .text = .{} } }, // plain text (case-sensitive)
+        },
+        .indexes = &idx,
+    });
+    const Case = struct { filter: []const u8, dia: Dialect, want: []const u8 };
+    const cases = [_]Case{
+        // SQLite: byte-identical binary compare (the .nocase column's case-insensitivity comes from
+        // the COLLATE NOCASE index, not the compare — SQLite behavior is pinned).
+        .{ .filter = "addr = \"Bob@x.com\"", .dia = Dialect.sqlite, .want = "\"people\".\"addr\" = ?" },
+        // Postgres: lower() BOTH sides so the compare matches the lower(addr) functional index.
+        .{ .filter = "addr = \"Bob@x.com\"", .dia = Dialect.postgres, .want = "lower(\"people\".\"addr\") = lower(?)" },
+        // != lowers too (the equality family); a NON-nocase column (label) is unchanged on PG.
+        .{ .filter = "addr != \"Bob@x.com\"", .dia = Dialect.postgres, .want = "lower(\"people\".\"addr\") != lower(?)" },
+        .{ .filter = "label = \"Bob\"", .dia = Dialect.postgres, .want = "\"people\".\"label\" = ?" },
+        // IN lowers the column + every placeholder on PG.
+        .{ .filter = "addr in (\"A@x\", \"b@x\")", .dia = Dialect.postgres, .want = "lower(\"people\".\"addr\") IN (lower(?),lower(?))" },
+    };
+    for (cases) |cs| {
+        const toks = try lexer.lex(a, cs.filter);
+        const ast = try parser.parse(a, toks);
+        var j = joiner.Joiner.init(a, &d, people);
+        const c = try compile(a, &j, ast, null, cs.dia);
+        try std.testing.expectEqualStrings(cs.want, c.where_sql);
+    }
 }
 
 test "compile fixed comparison scales the numeric literal to an int param" {

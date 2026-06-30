@@ -2145,7 +2145,7 @@ A collection may declare `.indexes` — a tuple of index literals provisioned as
 .indexes = .{
     // unique, case-sensitive (default collation)
     .{ .name = "idx_users_handle", .fields = .{"handle"}, .unique = true },
-    // case-insensitive: emits ("email" COLLATE NOCASE)
+    // case-insensitive: SQLite emits ("email" COLLATE NOCASE); Postgres a lower("email") functional index
     .{ .name = "idx_users_email",  .fields = .{"email"}, .unique = true, .collation = .nocase },
     // partial / conditional-unique: emits ... WHERE deleted_at IS NULL
     .{ .name = "idx_active_slug",  .fields = .{"slug"}, .unique = true, .where = "deleted_at IS NULL" },
@@ -2581,15 +2581,22 @@ ZigBase deliberately does **not** transpile SQL between dialects — it is fragi
 silently mis-handles the edges that matter (collation, `strftime`, `GLOB`). A
 SQLite-only consumer that never builds with `-Dpostgres` keeps working unchanged.
 
-**Postgres collation caveats (pre-GA).** Provisioned TEXT columns are pinned to
-`COLLATE "C"` so text ordering / keyset pagination matches SQLite's BINARY byte order
-across backends. A comptime index marked `.collation = .nocase` is case-INSENSITIVE on
-SQLite but currently provisions **case-SENSITIVELY** on Postgres (no built-in NOCASE
-collation yet; the `lower()`/citext fix is tracked for pre-GA) — so a `.nocase` UNIQUE
-index does **not** reject case-variant duplicates there. Provisioning logs a prominent
-startup warning for every `.nocase` index under Postgres. The built-in auth identity
-uniqueness is a plain partial-unique index (not `.nocase`) and behaves identically on
-both backends.
+**Postgres collation.** Provisioned TEXT columns are pinned to `COLLATE "C"` so text
+ordering / keyset pagination matches SQLite's BINARY byte order across backends. A comptime
+index marked `.collation = .nocase` is case-INSENSITIVE on **both** backends: SQLite uses
+`COLLATE NOCASE`, while Postgres (which has no built-in NOCASE collation) provisions a
+`lower("col")` **functional index** — a built-in, no `citext`/extension dependency. So a
+`.nocase` UNIQUE index rejects case-variant duplicates (`Bob@x.com` vs `bob@x.com`) on
+Postgres exactly as on SQLite (#159). Identity/email lookups against a `.nocase` column are
+correspondingly case-insensitive on Postgres (`lower("col") = lower($1)`, using that
+functional index), and filter/rule equality (`=`/`!=`/`in`) against a `.nocase` column is
+lowered on Postgres to agree with the index. The built-in auth identity uniqueness is a
+plain (case-sensitive) partial-unique index, not `.nocase`, and is identical on both
+backends. Residual: on SQLite the case-insensitivity of a `.nocase` column comes from the
+index/collation, so plain `=` *lookups* keep their historical binary (case-sensitive)
+comparison unless they go through an identity lookup; on Postgres the `lower()` wrapping
+makes those lookups case-insensitive. Postgres `lower()` is locale-aware (folds non-ASCII),
+whereas SQLite `NOCASE` folds ASCII A–Z only.
 
 ## 9. Pluggable storage & mailer backends (`.storage` / `.mailer`)
 

@@ -4,6 +4,7 @@ const db = @import("../db.zig");
 const collections = @import("../collections.zig");
 const records = @import("../records.zig");
 const schema = @import("../schema.zig");
+const ddl = @import("../ddl.zig");
 const crypto = @import("../crypto.zig");
 const jwt = @import("../jwt.zig");
 const auth = @import("../auth.zig");
@@ -112,9 +113,20 @@ pub fn nowUnix(conn: *db.Db) db.DbError!i64 {
 }
 
 /// Try each identity field in order; return the matching non-empty row id, or null.
+///
+/// When an identity field is covered by a `.nocase` index, the comparison is case-INSENSITIVE so
+/// the lookup uses that index and AGREES with its case-insensitive uniqueness (#159): on Postgres
+/// `lower("idf") = lower($1)` (matching the `lower()` functional index), on SQLite the historical
+/// binary `"idf" = ?1` (its case-insensitive uniqueness already coming from COLLATE NOCASE). A
+/// non-`.nocase` identity field keeps the exact (case-sensitive) compare on both backends.
 pub fn findByIdentity(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, identity: []const u8) !?[]const u8 {
+    const d = db.dbDialect(conn);
     for (col.options.auth.identityFields) |idf| {
-        const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE \"{s}\" = ?1 AND \"{s}\" != '' LIMIT 1;", .{ col.name, idf, idf }, 0);
+        const col_quoted = try std.fmt.allocPrint(alloc, "\"{s}\"", .{idf});
+        const ci = ddl.isNocaseField(col, idf);
+        const lhs = if (ci) try d.nocaseEqOperand(alloc, col_quoted) else col_quoted;
+        const rhs = if (ci) try d.nocaseEqOperand(alloc, "?1") else "?1";
+        const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE {s} = {s} AND \"{s}\" != '' LIMIT 1;", .{ col.name, lhs, rhs, idf }, 0);
         var st = try prep(conn, sql);
         defer st.finalize();
         try st.bindText(1, identity);
@@ -721,7 +733,13 @@ pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
 // ----------------------------------------------------------------------------
 
 fn findByEmail(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, email: []const u8) !?[]const u8 {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE \"email\" = ?1 AND \"email\" != '' LIMIT 1;", .{col.name}, 0);
+    // Case-insensitive when `email` is `.nocase`-indexed, mirroring findByIdentity (#159): PG
+    // `lower("email") = lower($1)` (the `lower()` functional index); SQLite the binary `"email" = ?1`.
+    const d = db.dbDialect(conn);
+    const ci = ddl.isNocaseField(col, "email");
+    const lhs = if (ci) try d.nocaseEqOperand(alloc, "\"email\"") else "\"email\"";
+    const rhs = if (ci) try d.nocaseEqOperand(alloc, "?1") else "?1";
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE {s} = {s} AND \"email\" != '' LIMIT 1;", .{ col.name, lhs, rhs }, 0);
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, email);

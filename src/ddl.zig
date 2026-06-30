@@ -82,13 +82,11 @@ pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel
 pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.Index, d: dialect.Dialect) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    // Case-insensitive collation routes through the dialect: SQLite ` COLLATE NOCASE`; Postgres
-    // has no built-in NOCASE collation, so the suffix is "" there (a `citext`/`lower()` expression
-    // index is the portable route — a documented PR-10/follow-up; PR-2 keeps the index valid).
-    const collate = switch (idx.collation) {
-        .binary => "",
-        .nocase => d.collateNocase(),
-    };
+    // Case-insensitive collation routes through the dialect (#159): SQLite collates each column
+    // in place (`"col" COLLATE NOCASE`); Postgres has no built-in NOCASE collation, so it indexes
+    // the LOWER-cased value (`lower("col")`) — a built-in functional index (no citext extension),
+    // and a UNIQUE one over `lower("col")` rejects case-variant duplicates just like SQLite's. A
+    // `.binary` index is the plain quoted column on both backends.
     try out.appendSlice(alloc, if (idx.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
     try out.appendSlice(alloc, try quoteIdent(alloc, idx.name));
     try out.appendSlice(alloc, " ON ");
@@ -97,8 +95,11 @@ pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.I
     try out.append(alloc, '(');
     for (idx.fields, 0..) |fname, i| {
         if (i > 0) try out.append(alloc, ',');
-        try out.appendSlice(alloc, try quoteIdent(alloc, fname));
-        try out.appendSlice(alloc, collate);
+        const col_quoted = try quoteIdent(alloc, fname);
+        switch (idx.collation) {
+            .binary => try out.appendSlice(alloc, col_quoted),
+            .nocase => try out.appendSlice(alloc, try d.nocaseIndexExpr(alloc, col_quoted)),
+        }
     }
     try out.append(alloc, ')');
     if (idx.where) |w| {
@@ -324,9 +325,14 @@ test "createIndexSql emits COLLATE NOCASE and a partial WHERE predicate" {
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_e\" ON \"t\" (\"a\");", empty);
     const ws = try createIndexSql(a, "t", .{ .name = "idx_w", .fields = &.{"a"}, .where = "  \t\n" }, .sqlite);
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_w\" ON \"t\" (\"a\");", ws);
-    // Postgres: no built-in NOCASE collation, so the suffix is dropped (index stays valid).
+    // Postgres: no built-in NOCASE collation, so `.nocase` becomes a `lower()` FUNCTIONAL index
+    // (#159) — a UNIQUE one over `lower("email")` rejects case-variant duplicates, giving PG the
+    // same case-insensitive uniqueness SQLite gets from COLLATE NOCASE.
     const pg_ci = try createIndexSql(a, "customers", .{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase }, .postgres);
-    try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_email\" ON \"customers\" (\"email\");", pg_ci);
+    try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_email\" ON \"customers\" (lower(\"email\"));", pg_ci);
+    // Multi-column `.nocase` lowers each column independently on Postgres.
+    const pg_both = try createIndexSql(a, "t", .{ .name = "idx_both", .fields = &.{ "a", "b" }, .collation = .nocase, .where = "a IS NOT NULL" }, .postgres);
+    try std.testing.expectEqualStrings("CREATE INDEX \"idx_both\" ON \"t\" (lower(\"a\"),lower(\"b\")) WHERE a IS NOT NULL;", pg_both);
 }
 
 test "rebuildPlan copies retained columns by field id, adds new, drops removed" {
