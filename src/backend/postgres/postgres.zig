@@ -66,4 +66,6 @@ test {
     _ = @import("pool.zig");
     _ = @import("tests.zig");
     _ = @import("crud_tests.zig");
+    // PR-5: live field-encryption + key-rotation rewrap verification (rowid→id fix). Skips if no PG.
+    _ = @import("encryption_pg_test.zig");
 }

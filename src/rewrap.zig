@@ -15,11 +15,17 @@ const ddl = @import("ddl.zig");
 // and supply the old key as ZIGBASE_FIELD_KEY_V<old>) and the supported way to
 // enable `.encrypted` on a column that already holds plaintext under strict mode.
 //
-// It works on RAW SQL cells (SELECT rowid, "<col>" / UPDATE … WHERE rowid=?),
+// It works on RAW SQL cells (SELECT "id", "<col>" / UPDATE … WHERE "id"=?),
 // deliberately bypassing the value-layer strict decrypt so it can read mixed
 // generations and legacy plaintext directly. Decryption uses the resolved
 // key-ring (`field_policy.Cipher`): each cell is decrypted with the key of its
 // own envelope version, then re-sealed under the primary generation.
+//
+// Rows are keyed by the app-generated string PRIMARY KEY `id` — NOT SQLite's
+// implicit `rowid` — so the same statements run on both the SQLite and Postgres
+// backends (Postgres has no `rowid`). Placeholders flow through the active
+// dialect (`?n` → `$n` on Postgres). The AEAD envelope itself is a backend-neutral
+// TEXT value, so nothing else in this path is backend-specific.
 //
 // FAIL-CLOSED: a cell that cannot be decrypted (unknown/missing generation,
 // wrong key, tamper) aborts the run with the offending row reported; the
@@ -55,20 +61,21 @@ pub const Stats = struct {
     skipped: usize = 0,
 };
 
-const Update = struct { rowid: i64, blob: []const u8 };
+const Update = struct { id: []const u8, blob: []const u8 };
 
 /// Details of the cell that triggered a fail-closed abort, filled into the
 /// caller's out-param so the caller (not this leaf function) does the logging.
 pub const Failure = struct {
     table: []const u8 = "",
     column: []const u8 = "",
-    rowid: i64 = 0,
+    id: []const u8 = "",
     version: u16 = 0,
 };
 
 /// Rewrap a single encrypted column. Reads every non-null cell, decrypts it by
 /// its envelope version (or takes legacy plaintext as-is), re-seals under the
-/// primary generation, and (unless `dry_run`) writes it back by rowid. All work
+/// primary generation, and (unless `dry_run`) writes it back keyed by the row's
+/// `id` PRIMARY KEY (works on both SQLite and Postgres). All work
 /// uses `arena` (caller-scoped). Runs inside the caller's transaction. On a
 /// fail-closed decrypt error, `failure` (when non-null) is filled with the
 /// offending cell's details and `error.RewrapDecryptFailed` is returned.
@@ -85,7 +92,7 @@ pub fn rewrapColumn(
     const tq = try ddl.quoteIdent(arena, table);
     const cq = try ddl.quoteIdent(arena, col);
 
-    const sel = try std.fmt.allocPrintSentinel(arena, "SELECT rowid, {s} FROM {s};", .{ cq, tq }, 0);
+    const sel = try std.fmt.allocPrintSentinel(arena, "SELECT \"id\", {s} FROM {s};", .{ cq, tq }, 0);
     var updates: std.ArrayList(Update) = .empty;
 
     var stmt = try w.prepare(sel);
@@ -93,7 +100,9 @@ pub fn rewrapColumn(
         defer stmt.finalize();
         while (try stmt.step()) {
             if (stmt.isNull(1)) continue;
-            const rowid = stmt.columnInt(0);
+            // `id` is the app-generated string PRIMARY KEY; dupe it into the arena
+            // since columnText borrows the statement's transient row buffer.
+            const id = try arena.dupe(u8, stmt.columnText(0));
             const stored = try arena.dupe(u8, stmt.columnText(1));
             const ver = aead.parseVersion(stored);
 
@@ -112,7 +121,7 @@ pub fn rewrapColumn(
                     // (Return the narrowed literal — `return err` would carry the whole
                     // aead error set, incl. BadEnvelope, which is not in `Error`.)
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    if (failure) |fp| fp.* = .{ .table = table, .column = col, .rowid = rowid, .version = ver.? };
+                    if (failure) |fp| fp.* = .{ .table = table, .column = col, .id = id, .version = ver.? };
                     return error.RewrapDecryptFailed;
                 };
                 stats.rewrapped += 1;
@@ -123,7 +132,7 @@ pub fn rewrapColumn(
             }
 
             const blob = try cipher.seal(arena, plaintext);
-            try updates.append(arena, .{ .rowid = rowid, .blob = blob });
+            try updates.append(arena, .{ .id = id, .blob = blob });
         }
     }
 
@@ -131,13 +140,16 @@ pub fn rewrapColumn(
     // (the common idempotent-rerun path). Skip preparing the UPDATE statement.
     if (dry_run or updates.items.len == 0) return stats;
 
-    const upd = try std.fmt.allocPrintSentinel(arena, "UPDATE {s} SET {s}=?1 WHERE rowid=?2;", .{ tq, cq }, 0);
+    // Key the write by the string `id` PK and renumber placeholders for the active
+    // backend (`?n` stays `?n` on SQLite, becomes `$n` on Postgres).
+    const upd_tmpl = try std.fmt.allocPrint(arena, "UPDATE {s} SET {s}=?1 WHERE \"id\"=?2;", .{ tq, cq });
+    const upd = try db.dbDialect(w).renumberPlaceholders(arena, upd_tmpl);
     var ustmt = try w.prepare(upd);
     defer ustmt.finalize();
     for (updates.items) |u| {
         ustmt.reset();
         try ustmt.bindText(1, u.blob);
-        try ustmt.bindInt(2, u.rowid);
+        try ustmt.bindText(2, u.id);
         _ = try ustmt.step();
     }
     return stats;
@@ -186,8 +198,8 @@ pub fn rewrapAll(
             const cs = rewrapColumn(col_arena.allocator(), w, cipher, c.name, f.name, dry_run, &failure) catch |e| {
                 if (e == error.RewrapDecryptFailed) {
                     std.log.err(
-                        "rewrap: cannot decrypt {s}.{s} rowid={d} (envelope v{d}: missing generation key, wrong key, or tampered) — aborting, no rows changed in this collection",
-                        .{ failure.table, failure.column, failure.rowid, failure.version },
+                        "rewrap: cannot decrypt {s}.{s} id={s} (envelope v{d}: missing generation key, wrong key, or tampered) — aborting, no rows changed in this collection",
+                        .{ failure.table, failure.column, failure.id, failure.version },
                     );
                     std.log.err(
                         "rewrap: configure the missing generation key (ZIGBASE_FIELD_KEY_V{d}) and re-run — rewrap is idempotent, so already-committed collections are not redone",
@@ -229,8 +241,8 @@ fn rotatedRing() field_policy.Cipher {
     return field_policy.Cipher.resolve(std.testing.io, getter, "newkey", 2) catch unreachable;
 }
 
-fn cellText(a: std.mem.Allocator, d: *db.Db, table: [:0]const u8, rowid: i64) ![]u8 {
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT v FROM {s} WHERE rowid={d};", .{ table, rowid }, 0);
+fn cellText(a: std.mem.Allocator, d: *db.Db, table: [:0]const u8, id: []const u8) ![]u8 {
+    const sql = try std.fmt.allocPrintSentinel(a, "SELECT v FROM {s} WHERE \"id\"='{s}';", .{ table, id }, 0);
     var s = try d.prepare(sql);
     defer s.finalize();
     _ = try s.step();
@@ -243,12 +255,12 @@ test "rewrapColumn: v1 envelope re-encrypted to primary (v2) and still decrypts"
     const a = arena.allocator();
     var d = try db.Db.openMemory();
     defer d.close();
-    try d.exec("CREATE TABLE t (v TEXT);");
+    try d.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT);");
 
     // Seed a v1: cell written by the old single-key build.
     const old = field_policy.Cipher.fromEnv(std.testing.io, "oldkey");
     const v1 = try old.seal(a, "the-secret");
-    var ins = try d.prepare("INSERT INTO t (v) VALUES (?1);");
+    var ins = try d.prepare("INSERT INTO t (id, v) VALUES ('r1', ?1);");
     try ins.bindText(1, v1);
     _ = try ins.step();
     ins.finalize();
@@ -259,7 +271,7 @@ test "rewrapColumn: v1 envelope re-encrypted to primary (v2) and still decrypts"
     try std.testing.expectEqual(@as(usize, 0), cs.plaintext_migrated);
 
     // At rest the cell is now a v2: envelope (version bumped, plaintext absent)…
-    const after = try cellText(a, &d, "t", 1);
+    const after = try cellText(a, &d, "t", "r1");
     try std.testing.expect(std.mem.startsWith(u8, after, "v2:"));
     try std.testing.expect(std.mem.indexOf(u8, after, "the-secret") == null);
     // …and decrypts under the primary generation.
@@ -272,15 +284,15 @@ test "rewrapColumn: legacy plaintext migrated into a v2 envelope" {
     const a = arena.allocator();
     var d = try db.Db.openMemory();
     defer d.close();
-    try d.exec("CREATE TABLE t (v TEXT);");
-    try d.exec("INSERT INTO t (v) VALUES ('plain-text-value');");
+    try d.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT);");
+    try d.exec("INSERT INTO t (id, v) VALUES ('r1', 'plain-text-value');");
 
     const ring = rotatedRing();
     const cs = try rewrapColumn(a, &d, &ring, "t", "v", false, null);
     try std.testing.expectEqual(@as(usize, 1), cs.plaintext_migrated);
     try std.testing.expectEqual(@as(usize, 0), cs.rewrapped);
 
-    const after = try cellText(a, &d, "t", 1);
+    const after = try cellText(a, &d, "t", "r1");
     try std.testing.expect(std.mem.startsWith(u8, after, "v2:"));
     try std.testing.expect(std.mem.indexOf(u8, after, "plain-text-value") == null);
     try std.testing.expectEqualStrings("plain-text-value", try ring.open(a, after));
@@ -292,10 +304,10 @@ test "rewrapColumn is idempotent: a second pass skips everything" {
     const a = arena.allocator();
     var d = try db.Db.openMemory();
     defer d.close();
-    try d.exec("CREATE TABLE t (v TEXT);");
-    try d.exec("INSERT INTO t (v) VALUES ('one');");
+    try d.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT);");
+    try d.exec("INSERT INTO t (id, v) VALUES ('r1', 'one');");
     const old = field_policy.Cipher.fromEnv(std.testing.io, "oldkey");
-    var ins = try d.prepare("INSERT INTO t (v) VALUES (?1);");
+    var ins = try d.prepare("INSERT INTO t (id, v) VALUES ('r2', ?1);");
     try ins.bindText(1, try old.seal(a, "two"));
     _ = try ins.step();
     ins.finalize();
@@ -316,28 +328,30 @@ test "rewrapColumn no-op path: all cells already primary -> nothing written" {
     const a = arena.allocator();
     var d = try db.Db.openMemory();
     defer d.close();
-    try d.exec("CREATE TABLE t (v TEXT);");
+    try d.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT);");
 
     // Seed two cells already at the primary generation (v2).
     const ring = rotatedRing();
-    var ins = try d.prepare("INSERT INTO t (v) VALUES (?1);");
-    try ins.bindText(1, try ring.seal(a, "alpha"));
+    var ins = try d.prepare("INSERT INTO t (id, v) VALUES (?1, ?2);");
+    try ins.bindText(1, "r1");
+    try ins.bindText(2, try ring.seal(a, "alpha"));
     _ = try ins.step();
     ins.reset();
-    try ins.bindText(1, try ring.seal(a, "beta"));
+    try ins.bindText(1, "r2");
+    try ins.bindText(2, try ring.seal(a, "beta"));
     _ = try ins.step();
     ins.finalize();
 
     // Capture the exact at-rest bytes so we can assert no UPDATE ran (no re-seal,
     // which would change the nonce/ciphertext even though the version stays v2).
-    const before0 = try cellText(a, &d, "t", 1);
-    const before1 = try cellText(a, &d, "t", 2);
+    const before0 = try cellText(a, &d, "t", "r1");
+    const before1 = try cellText(a, &d, "t", "r2");
 
     const cs = try rewrapColumn(a, &d, &ring, "t", "v", false, null);
     try std.testing.expectEqual(@as(usize, 2), cs.skipped);
     try std.testing.expectEqual(@as(usize, 0), cs.rewrapped + cs.plaintext_migrated);
-    try std.testing.expectEqualStrings(before0, try cellText(a, &d, "t", 1));
-    try std.testing.expectEqualStrings(before1, try cellText(a, &d, "t", 2));
+    try std.testing.expectEqualStrings(before0, try cellText(a, &d, "t", "r1"));
+    try std.testing.expectEqualStrings(before1, try cellText(a, &d, "t", "r2"));
 }
 
 test "rewrapColumn fails closed on an unknown generation (no rows changed)" {
@@ -346,11 +360,11 @@ test "rewrapColumn fails closed on an unknown generation (no rows changed)" {
     const a = arena.allocator();
     var d = try db.Db.openMemory();
     defer d.close();
-    try d.exec("CREATE TABLE t (v TEXT);");
+    try d.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT);");
 
     // A v1 cell, but the ring (primary v2) has NO generation-1 key.
     const old = field_policy.Cipher.fromEnv(std.testing.io, "oldkey");
-    var ins = try d.prepare("INSERT INTO t (v) VALUES (?1);");
+    var ins = try d.prepare("INSERT INTO t (id, v) VALUES ('r1', ?1);");
     try ins.bindText(1, try old.seal(a, "unreadable"));
     _ = try ins.step();
     ins.finalize();
@@ -360,7 +374,7 @@ test "rewrapColumn fails closed on an unknown generation (no rows changed)" {
     try std.testing.expectError(error.RewrapDecryptFailed, rewrapColumn(a, &d, &ring, "t", "v", false, null));
 
     // The cell is untouched (still the original v1 envelope) — no data loss.
-    const after = try cellText(a, &d, "t", 1);
+    const after = try cellText(a, &d, "t", "r1");
     try std.testing.expect(std.mem.startsWith(u8, after, "v1:"));
 }
 
@@ -370,14 +384,14 @@ test "rewrapColumn dry-run reports but writes nothing" {
     const a = arena.allocator();
     var d = try db.Db.openMemory();
     defer d.close();
-    try d.exec("CREATE TABLE t (v TEXT);");
-    try d.exec("INSERT INTO t (v) VALUES ('plain');");
+    try d.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT);");
+    try d.exec("INSERT INTO t (id, v) VALUES ('r1', 'plain');");
 
     const ring = rotatedRing();
     const cs = try rewrapColumn(a, &d, &ring, "t", "v", true, null);
     try std.testing.expectEqual(@as(usize, 1), cs.plaintext_migrated);
     // Dry-run: the cell is still plaintext on disk.
-    const after = try cellText(a, &d, "t", 1);
+    const after = try cellText(a, &d, "t", "r1");
     try std.testing.expectEqualStrings("plain", after);
 }
 
