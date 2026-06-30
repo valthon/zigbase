@@ -40,9 +40,9 @@ fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
 }
 
 /// The monotonic insertion-order column the rollup watermark advances over. SQLite has the
-/// implicit `rowid`; Postgres has no rowid, so migration `0015_events` adds an identity column
-/// `_seq` (`BIGINT GENERATED ALWAYS AS IDENTITY`) that serves the identical purpose. The app's
-/// `id` is a RANDOM base36 string (not monotonic), so it cannot stand in here.
+/// implicit `rowid`; Postgres has no rowid, so migration `0017_events_seq` adds an identity column
+/// `_seq` (`BIGINT GENERATED ALWAYS AS IDENTITY`) to `_events` that serves the identical purpose.
+/// The app's `id` is a RANDOM base36 string (not monotonic), so it cannot stand in here.
 fn seqCol(conn: *db.Db) []const u8 {
     return switch (db.dbDialect(conn).kind) {
         .sqlite => "\"rowid\"",

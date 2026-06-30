@@ -154,12 +154,29 @@ pub fn renumberZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8) 
 /// on the same scanner invariants documented on `ParamSink.rewrite`.
 pub fn lowerStmtZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8) std.mem.Allocator.Error![:0]const u8 {
     if (dialect.kind == .sqlite) return sql; // byte-identical — nothing to lower
-    const s1 = try std.mem.replaceOwned(u8, alloc, sql, "strftime('%Y-%m-%dT%H:%M:%SZ','now')", dialect.nowIso8601Expr());
-    defer alloc.free(s1);
-    const s2 = try std.mem.replaceOwned(u8, alloc, s1, "datetime('now')", dialect.nowTextExpr());
-    defer alloc.free(s2);
+    // Substitute the two server-`now` expressions, but ONLY when actually present:
+    // `std.mem.replaceOwned` allocates + copies the whole string even on zero matches, so an
+    // unconditional pass costs two full-string copies on every prepare — including the
+    // placeholder-only statements on the hot auth-VERIFY path, which carry NEITHER `now` form.
+    // A cheap `indexOf` guard skips the copy when the pattern is absent. `cur` tracks the live
+    // string; `owned` is non-null only when `cur` is a copy we own and must free.
+    var cur: []const u8 = sql;
+    var owned: ?[]u8 = null;
+    defer if (owned) |o| alloc.free(o);
+    inline for (.{
+        .{ "strftime('%Y-%m-%dT%H:%M:%SZ','now')", dialect.nowIso8601Expr() },
+        .{ "datetime('now')", dialect.nowTextExpr() },
+    }) |pair| {
+        if (std.mem.indexOf(u8, cur, pair[0]) != null) {
+            const next = try std.mem.replaceOwned(u8, alloc, cur, pair[0], pair[1]);
+            if (owned) |o| alloc.free(o); // free the prior intermediate before re-pointing
+            owned = next;
+            cur = next;
+        }
+    }
+    // The placeholder renumber always runs on the Postgres arm.
     var sink = ParamSink.init(dialect);
-    const renumbered = try sink.rewrite(alloc, s2);
+    const renumbered = try sink.rewrite(alloc, cur);
     defer alloc.free(renumbered);
     return std.fmt.allocPrintSentinel(alloc, "{s}", .{renumbered}, 0);
 }
