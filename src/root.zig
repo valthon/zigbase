@@ -343,5 +343,7 @@ test {
         // PR-2: live-PG schema/DDL + migration parity (all 16 migrations, full provision,
         // additive-rebuild ALTER). Skips if no PG.
         _ = @import("backend/postgres/schema_pg_test.zig");
+        // Wave B: live-PG auth / oauth / analytics / challenge / session end-to-end. Skips if no PG.
+        _ = @import("backend/postgres/auth_pg_test.zig");
     }
 }

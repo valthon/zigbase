@@ -6,7 +6,7 @@
 //! ## The cross-backend migration contract
 //!
 //! ZigBase runs on SQLite (default) or, when built with `-Dpostgres`, PostgreSQL — chosen at
-//! startup from the connection string. The framework's OWN 16 system migrations are written ONCE
+//! startup from the connection string. The framework's OWN system migrations are written ONCE
 //! and lowered to the active backend by the dialect (`execLowered`), so they provision cleanly on
 //! both. A **consumer** `.migrations` entry's `up(m: *Migrator)` likewise receives the dialect:
 //!

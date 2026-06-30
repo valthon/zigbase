@@ -465,6 +465,21 @@ fn init_0015_events(m: *Migrator) db.DbError!void {
     );
 }
 
+fn init_0017_events_seq(m: *Migrator) db.DbError!void {
+    // The incremental analytics rollup watermark advances over a MONOTONIC insertion-order column.
+    // SQLite has the implicit `rowid`; Postgres has none, and the app `id` is a RANDOM base36 string
+    // (not monotonic) so it cannot serve. On Postgres only, add an identity column `_seq` to the
+    // `_events` table (created by 0015). `analytics.seqCol` then selects `rowid`/`_seq` per backend.
+    //
+    // This is its OWN additive migration (not folded into 0015) so a Postgres database that already
+    // applied 0015 — which the version-tracking ledger will NOT re-run — still gets `_seq` as a fresh
+    // additive step. On SQLite this migration is a no-op (the rowid already exists), keeping SQLite
+    // byte-identical. `IF NOT EXISTS` makes it safe even where a prior hand-applied column exists.
+    if (m.dialect.kind == .postgres) {
+        try m.db.exec("ALTER TABLE \"_events\" ADD COLUMN IF NOT EXISTS \"_seq\" BIGINT GENERATED ALWAYS AS IDENTITY;");
+    }
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -482,6 +497,7 @@ pub const all = [_]Migration{
     .{ .name = "0014_tenancy", .up = init_0014_tenancy },
     .{ .name = "0015_events", .up = init_0015_events },
     .{ .name = "0016_email", .up = init_0016_email },
+    .{ .name = "0017_events_seq", .up = init_0017_events_seq },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {

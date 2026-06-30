@@ -2,6 +2,20 @@ const std = @import("std");
 const db = @import("../db.zig");
 const id_gen = @import("../id.zig");
 const clock = @import("../clock.zig");
+const param_sink = @import("../sql/param_sink.zig");
+
+/// Lower + renumber a curated `_authChallenges` statement for `conn`'s backend, then prepare it.
+/// SQLite gets the verbatim `?N`/`datetime('now')` SQL (zero-cost); Postgres gets `$n` + `now()`.
+/// The lowered SQL lives in a transient arena (`Db.prepare` copies it), so it need only outlive the call.
+fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
+    // Arena over the page allocator: no fixed ceiling (lowerStmtZ makes several intermediate
+    // allocations that the arena frees together on return), and on SQLite lowerStmtZ is a no-op
+    // returning the input slice, so this costs one empty arena. `Db.prepare` copies the text.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const lowered = param_sink.lowerStmtZ(arena.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
+    return conn.prepare(lowered);
+}
 
 /// Server-side TTL'd single-use challenge store backed by the `_authChallenges` table
 /// (created by migration 0007). Challenges are minted by `put` and redeemed exactly once
@@ -29,7 +43,7 @@ pub const ChallengeStore = struct {
         id_gen.generate(io, &id_buf);
         const cid = try alloc.dupe(u8, &id_buf);
         const now = try nowUnixDb(self.conn);
-        var st = try self.conn.prepare(
+        var st = try prep(self.conn,
             \\INSERT INTO "_authChallenges"
             \\  ("id","collectionRef","method","identity","payload","expires","consumed","created")
             \\ VALUES (?1,?2,?3,?4,?5,?6,0,datetime('now'));
@@ -59,7 +73,7 @@ pub const ChallengeStore = struct {
         // (a future SELECT here would reset it).
         var changed: i64 = 0;
         {
-            var upd = try self.conn.prepare(
+            var upd = try prep(self.conn,
                 \\UPDATE "_authChallenges" SET "consumed"=1
                 \\ WHERE "id"=?1 AND "method"=?2 AND "consumed"=0 AND "expires" > ?3;
             );
@@ -72,7 +86,7 @@ pub const ChallengeStore = struct {
         }
         if (changed != 1) return null;
         // The UPDATE succeeded — fetch the payload.
-        var sel = try self.conn.prepare(
+        var sel = try prep(self.conn,
             \\SELECT "payload" FROM "_authChallenges" WHERE "id"=?1;
         );
         defer sel.finalize();
@@ -97,7 +111,7 @@ pub const ChallengeStore = struct {
         // Two concurrent takes for the same identity compete on the UPDATE; exactly one wins
         // (changesCount == 1), the other sees 0 changes and returns null.
         const cid = blk: {
-            var sel = try self.conn.prepare(
+            var sel = try prep(self.conn,
                 \\SELECT "id" FROM "_authChallenges"
                 \\ WHERE "collectionRef"=?1 AND "method"=?2 AND "identity"=?3
                 \\   AND "consumed"=0 AND "expires" > ?4
@@ -115,7 +129,7 @@ pub const ChallengeStore = struct {
         // before finalize so the single-use gate never depends on statement-finalize ordering.
         var changed: i64 = 0;
         {
-            var upd = try self.conn.prepare(
+            var upd = try prep(self.conn,
                 \\UPDATE "_authChallenges" SET "consumed"=1
                 \\ WHERE "id"=?1 AND "consumed"=0 AND "expires" > ?2;
             );
@@ -127,7 +141,7 @@ pub const ChallengeStore = struct {
         }
         if (changed != 1) return null;
         // Fetch the payload for the consumed row.
-        var sel2 = try self.conn.prepare(
+        var sel2 = try prep(self.conn,
             \\SELECT "payload" FROM "_authChallenges" WHERE "id"=?1;
         );
         defer sel2.finalize();
@@ -141,7 +155,7 @@ pub const ChallengeStore = struct {
 /// or at startup. Removes both consumed=1 rows (already redeemed, no longer useful) and
 /// rows whose TTL has elapsed (expired, unredeemable regardless of consumed state).
 pub fn gcAuthChallenges(w: *db.Db) db.DbError!void {
-    var st = try w.prepare(
+    var st = try prep(w,
         \\DELETE FROM "_authChallenges"
         \\ WHERE "expires" <= ?1 OR "consumed"=1;
     );

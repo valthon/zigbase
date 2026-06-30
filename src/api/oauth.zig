@@ -11,6 +11,20 @@ const auth = @import("../auth.zig");
 const auth_api = @import("auth.zig");
 const secrets = @import("../oauth/secrets.zig");
 const id = @import("../id.zig");
+const param_sink = @import("../sql/param_sink.zig");
+
+/// Lower + renumber a curated `_oauthStates`/`_externalAuths` statement for `conn`'s backend, then
+/// prepare it. SQLite gets verbatim `?N`/`datetime('now')` (zero-cost); Postgres gets `$n` +
+/// `now()`. The lowered SQL lives in a transient arena (`Db.prepare` copies it).
+fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
+    // Arena over the page allocator: no fixed ceiling (lowerStmtZ makes several intermediate
+    // allocations that the arena frees together on return), and on SQLite lowerStmtZ is a no-op
+    // returning the input slice, so this costs one empty arena. `Db.prepare` copies the text.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const lowered = param_sink.lowerStmtZ(arena.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
+    return conn.prepare(lowered);
+}
 
 /// Build the effective provider endpoints for a configured provider:
 /// presets supply endpoints (optionally overridden); generic providers must supply all three.
@@ -94,7 +108,7 @@ pub fn issueState(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, pro
     const app = ctx.app.?;
     const state = try crypto.genToken(app.io, ctx.allocator, 40);
     const now = try auth_api.nowUnix(conn);
-    var st = try conn.prepare(
+    var st = try prep(conn,
         \\INSERT INTO "_oauthStates" ("state","collectionRef","provider","expires","created")
         \\ VALUES (?1,?2,?3,?4,datetime('now'));
     );
@@ -112,7 +126,7 @@ pub fn issueState(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, pro
 /// second call finds no row and returns false). Missing/mismatched/expired => false.
 pub fn consumeState(conn: *db.Db, col_name: []const u8, provider: []const u8, state: []const u8) !bool {
     const now = try auth_api.nowUnix(conn);
-    var st = try conn.prepare(
+    var st = try prep(conn,
         \\DELETE FROM "_oauthStates"
         \\ WHERE "state"=?1 AND "collectionRef"=?2 AND "provider"=?3 AND "expires" > ?4
         \\ RETURNING "state";
@@ -125,10 +139,10 @@ pub fn consumeState(conn: *db.Db, col_name: []const u8, provider: []const u8, st
     return try st.step(); // true iff a matching, unexpired row was deleted
 }
 
-const Link = struct { collectionRef: []const u8, recordRef: []const u8 };
+pub const Link = struct { collectionRef: []const u8, recordRef: []const u8 };
 
-fn findLink(alloc: std.mem.Allocator, conn: *db.Db, provider: []const u8, provider_id: []const u8) !?Link {
-    var st = try conn.prepare("SELECT \"collectionRef\",\"recordRef\" FROM \"_externalAuths\" WHERE \"provider\"=?1 AND \"providerId\"=?2;");
+pub fn findLink(alloc: std.mem.Allocator, conn: *db.Db, provider: []const u8, provider_id: []const u8) !?Link {
+    var st = try prep(conn, "SELECT \"collectionRef\",\"recordRef\" FROM \"_externalAuths\" WHERE \"provider\"=?1 AND \"providerId\"=?2;");
     defer st.finalize();
     try st.bindText(1, provider);
     try st.bindText(2, provider_id);
@@ -136,10 +150,10 @@ fn findLink(alloc: std.mem.Allocator, conn: *db.Db, provider: []const u8, provid
     return .{ .collectionRef = try alloc.dupe(u8, st.columnText(0)), .recordRef = try alloc.dupe(u8, st.columnText(1)) };
 }
 
-fn insertLink(io: std.Io, alloc: std.mem.Allocator, conn: *db.Db, collection_ref: []const u8, record_ref: []const u8, provider: []const u8, provider_id: []const u8) !void {
+pub fn insertLink(io: std.Io, alloc: std.mem.Allocator, conn: *db.Db, collection_ref: []const u8, record_ref: []const u8, provider: []const u8, provider_id: []const u8) !void {
     _ = alloc;
     var rid = id.collectionId(io);
-    var st = try conn.prepare(
+    var st = try prep(conn,
         \\INSERT INTO "_externalAuths" ("id","collectionRef","recordRef","provider","providerId","created","updated")
         \\ VALUES (?1,?2,?3,?4,?5,datetime('now'),datetime('now'));
     );
@@ -273,7 +287,7 @@ pub fn resolveRecordFromIdentity(ctx: *http.RequestCtx, conn: *db.Db, col: schem
 
 fn linkCount(alloc: std.mem.Allocator, conn: *db.Db, collection_ref: []const u8, record_ref: []const u8) !i64 {
     _ = alloc;
-    var st = try conn.prepare("SELECT COUNT(*) FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
+    var st = try prep(conn, "SELECT COUNT(*) FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
     defer st.finalize();
     try st.bindText(1, collection_ref);
     try st.bindText(2, record_ref);
@@ -283,7 +297,7 @@ fn linkCount(alloc: std.mem.Allocator, conn: *db.Db, collection_ref: []const u8,
 
 fn passwordIsSet(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !bool {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM \"{s}\" WHERE \"id\"=?1;", .{table}, 0);
-    var st = try conn.prepare(sql);
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
     if (!try st.step()) return false;
@@ -309,7 +323,7 @@ pub fn unlinkProvider(ctx: *http.RequestCtx) anyerror!http.Response {
     if ((try linkCount(ctx.allocator, w, col.name, rid)) <= 1 and !(try passwordIsSet(ctx.allocator, w, col.name, rid)))
         return (ApiError{ .status = 400, .message = "Cannot remove the last credential." }).toResponse(ctx.allocator);
 
-    var st = try w.prepare("DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2 AND \"provider\"=?3 RETURNING \"id\";");
+    var st = try prep(w, "DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2 AND \"provider\"=?3 RETURNING \"id\";");
     defer st.finalize();
     try st.bindText(1, col.name);
     try st.bindText(2, rid);

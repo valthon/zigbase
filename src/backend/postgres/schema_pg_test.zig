@@ -54,7 +54,7 @@ fn scalarCount(w: *db.Db, sql: [:0]const u8) !i64 {
     return st.columnInt(0);
 }
 
-test "pg: all 16 system migrations apply on a fresh database (tables + seeds + ledger)" {
+test "pg: all system migrations apply on a fresh database (tables + seeds + ledger)" {
     const a = std.testing.allocator;
     var ctx = (try Ctx.open(a, std.testing.io, "mig")) orelse return error.SkipZigTest;
     defer ctx.deinit();
@@ -64,7 +64,7 @@ test "pg: all 16 system migrations apply on a fresh database (tables + seeds + l
     // Idempotent: a second run is a clean no-op (the ledger guard + ON CONFLICT seeds).
     try migrations.run(w);
 
-    // The ledger recorded exactly the 16 system migrations.
+    // The ledger recorded exactly the full set of system migrations.
     try std.testing.expectEqual(@as(i64, migrations.all.len), try scalarCount(w,
         "SELECT count(*) FROM \"_migrations\";"));
 

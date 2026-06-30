@@ -22,7 +22,33 @@ const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const schedule = @import("../schedule.zig");
 const id_gen = @import("../id.zig");
+const param_sink = @import("../sql/param_sink.zig");
 const App = @import("../app.zig").App;
+
+/// Lower + renumber a curated `_events`/`_kv` statement for `conn`'s active backend, then prepare
+/// it. SQLite gets the verbatim `?N`/`datetime`/`strftime` SQL (zero-cost); Postgres gets the
+/// dialect's now-expressions + `$n` placeholders. The lowered SQL lives in a transient arena
+/// (`Db.prepare` copies it), so it need only outlive this call.
+fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
+    // Arena over the page allocator: no fixed ceiling (lowerStmtZ makes several intermediate
+    // allocations that the arena frees together on return), and on SQLite lowerStmtZ is a no-op
+    // returning the input slice, so this costs one empty arena. `Db.prepare` copies the text.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const lowered = param_sink.lowerStmtZ(arena.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
+    return conn.prepare(lowered);
+}
+
+/// The monotonic insertion-order column the rollup watermark advances over. SQLite has the
+/// implicit `rowid`; Postgres has no rowid, so migration `0017_events_seq` adds an identity column
+/// `_seq` (`BIGINT GENERATED ALWAYS AS IDENTITY`) to `_events` that serves the identical purpose.
+/// The app's `id` is a RANDOM base36 string (not monotonic), so it cannot stand in here.
+fn seqCol(conn: *db.Db) []const u8 {
+    return switch (db.dbDialect(conn).kind) {
+        .sqlite => "\"rowid\"",
+        .postgres => "\"_seq\"",
+    };
+}
 
 /// The aggregate computed by a rollup. Only `count` ships; the enum leaves room for `sum`/`avg`
 /// over a numeric payload field later without reshaping the config surface.
@@ -86,7 +112,7 @@ pub const EventContext = struct {
 pub fn insertEvent(conn: *db.Db, io: std.Io, ev: EventContext) !void {
     var idbuf: [15]u8 = undefined;
     id_gen.generate(io, &idbuf);
-    var st = try conn.prepare(
+    var st = try prep(conn,
         \\INSERT INTO "_events"
         \\  ("id","created","updated","name","payload","actor_collection","actor","account","occurred_at")
         \\ VALUES (?1,
@@ -119,11 +145,22 @@ pub fn summaryTable(alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
 }
 
 /// The SQL expression for a rollup's `bucket` value (a constant fragment, never user input).
-fn bucketExpr(tb: TimeBucket) []const u8 {
-    return switch (tb) {
-        .none => "'all'",
-        .day => "strftime('%Y-%m-%d',\"occurred_at\")",
-        .hour => "strftime('%Y-%m-%dT%H:00:00Z',\"occurred_at\")",
+/// `occurred_at` is stored as an ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` TEXT instant on both backends, so
+/// the day/hour bucket is a fixed-width prefix of that text: SQLite normalizes it via `strftime`;
+/// Postgres (no `strftime`) takes the prefix directly (`left(...)`, re-appending the fixed hour
+/// suffix) — equivalent for well-formed ISO `Z` values, which is all `insertEvent` ever writes.
+fn bucketExpr(conn: *db.Db, tb: TimeBucket) []const u8 {
+    return switch (db.dbDialect(conn).kind) {
+        .sqlite => switch (tb) {
+            .none => "'all'",
+            .day => "strftime('%Y-%m-%d',\"occurred_at\")",
+            .hour => "strftime('%Y-%m-%dT%H:00:00Z',\"occurred_at\")",
+        },
+        .postgres => switch (tb) {
+            .none => "'all'",
+            .day => "left(\"occurred_at\",10)", // YYYY-MM-DD
+            .hour => "(left(\"occurred_at\",13) || ':00:00Z')", // YYYY-MM-DDTHH -> ...:00:00Z
+        },
     };
 }
 
@@ -133,16 +170,19 @@ fn bucketExpr(tb: TimeBucket) []const u8 {
 /// grouping are stored as `''` so the key is uniform across all `group_by` shapes.
 pub fn provisionSummary(conn: *db.Db, alloc: std.mem.Allocator, name: []const u8) !void {
     const table = try summaryTable(alloc, name);
+    // `value` accumulates COUNT(*) sums across passes; bind values are i64, so use the dialect's
+    // integer type (BIGINT on Postgres, where INTEGER is only 32-bit; INTEGER on SQLite).
+    const int_ty = db.dbDialect(conn).sqlType(.integer);
     const create = try std.fmt.allocPrintSentinel(alloc,
         \\CREATE TABLE IF NOT EXISTS "{s}" (
         \\  "bucket" TEXT NOT NULL DEFAULT '',
         \\  "account" TEXT NOT NULL DEFAULT '',
         \\  "actor" TEXT NOT NULL DEFAULT '',
-        \\  "value" INTEGER NOT NULL DEFAULT 0,
+        \\  "value" {s} NOT NULL DEFAULT 0,
         \\  "computed_at" TEXT NOT NULL DEFAULT '',
         \\  PRIMARY KEY ("bucket","account","actor")
         \\);
-    , .{table}, 0);
+    , .{ table, int_ty }, 0);
     try conn.exec(create);
 }
 
@@ -150,9 +190,10 @@ pub fn provisionSummary(conn: *db.Db, alloc: std.mem.Allocator, name: []const u8
 /// table, then aggregates the disjoint window `watermark < rowid <= max_rowid` of this rollup's
 /// events into the summary (UPSERT, `count` metric) and advances the watermark to `max_rowid`.
 ///
-/// The watermark is the monotonically-increasing `_events.rowid` — NOT the timestamp — so the
-/// boundary is exact regardless of `occurred_at` granularity: an event inserted in the same
-/// wall-clock second as a prior run still gets a strictly-greater rowid and is counted next pass
+/// The watermark is the monotonically-increasing insertion-order column (`seqCol`: `rowid` on
+/// SQLite, the `_seq` identity column on Postgres) — NOT the timestamp — so the boundary is exact
+/// regardless of `occurred_at` granularity: an event inserted in the same wall-clock second as a
+/// prior run still gets a strictly-greater seq and is counted next pass
 /// (the timestamp scheme could silently DROP it). The job holds the EXCLUSIVE pool writer for the
 /// whole pass, so no row is inserted between snapshotting `max_rowid` and aggregating — the window
 /// neither double-counts nor drops. Idempotent: a re-run with no new events (max_rowid unchanged)
@@ -176,18 +217,25 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
 
     const account_expr: []const u8 = if (spec.group_account) "\"account\"" else "''";
     const actor_expr: []const u8 = if (spec.group_actor) "\"actor\"" else "''";
+    const seq = seqCol(conn);
 
+    // In the ON CONFLICT DO UPDATE, an UNQUALIFIED `"value"` on the RHS is ambiguous on Postgres
+    // (it exists in BOTH the target row scope AND the `excluded` pseudo-relation → "column reference
+    // value is ambiguous"); SQLite tolerates it but also accepts the qualified form. So qualify the
+    // existing-row reference with the target table name and the conflict-source with `excluded.` —
+    // ONE statement valid on both backends. (The SELECT aggregate is aliased `AS "value"` too so the
+    // projection is unambiguous.)
     const sql = try std.fmt.allocPrintSentinel(alloc,
         \\INSERT INTO "{s}" ("bucket","account","actor","value","computed_at")
-        \\ SELECT {s} AS b, {s} AS a, {s} AS ac, COUNT(*) AS v, ?2
+        \\ SELECT {s} AS b, {s} AS a, {s} AS ac, COUNT(*) AS "value", ?2
         \\ FROM "_events"
-        \\ WHERE "name" = ?1 AND "rowid" > ?3 AND "rowid" <= ?4
+        \\ WHERE "name" = ?1 AND {s} > ?3 AND {s} <= ?4
         \\ GROUP BY b, a, ac
         \\ ON CONFLICT("bucket","account","actor")
-        \\   DO UPDATE SET "value" = "value" + excluded."value", "computed_at" = excluded."computed_at";
-    , .{ table, bucketExpr(spec.time_bucket), account_expr, actor_expr }, 0);
+        \\   DO UPDATE SET "value" = "{s}"."value" + excluded."value", "computed_at" = excluded."computed_at";
+    , .{ table, bucketExpr(conn, spec.time_bucket), account_expr, actor_expr, seq, seq, table }, 0);
 
-    var st = try conn.prepare(sql);
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, spec.event);
     try st.bindText(2, computed_at);
@@ -202,16 +250,19 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
 /// The current max `rowid` among `_events` rows of `event` name (0 when none), snapshotted on the
 /// writer. The monotonic high-water mark the incremental aggregation advances to.
 fn scalarMaxRowid(conn: *db.Db, event: []const u8) !i64 {
-    var st = try conn.prepare("SELECT COALESCE(MAX(\"rowid\"),0) FROM \"_events\" WHERE \"name\" = ?1;");
+    var sqlbuf: [128]u8 = undefined;
+    const sql = std.fmt.bufPrintZ(&sqlbuf, "SELECT COALESCE(MAX({s}),0) FROM \"_events\" WHERE \"name\" = ?1;", .{seqCol(conn)}) catch unreachable;
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, event);
     _ = try st.step();
     return st.columnInt(0);
 }
 
-/// Capture SQLite's current ISO-8601 UTC second (honors the dev-only frozen clock VFS).
+/// Capture the backend's current ISO-8601 UTC second (SQLite honors the dev-only frozen clock VFS;
+/// the Postgres `now()` is not frozen until the deterministic-clock parity work lands — PR-7).
 fn scalarNow(conn: *db.Db, alloc: std.mem.Allocator) ![]const u8 {
-    var st = try conn.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now');");
+    var st = try prep(conn, "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now');");
     defer st.finalize();
     _ = try st.step();
     return alloc.dupe(u8, st.columnText(0));
@@ -219,7 +270,7 @@ fn scalarNow(conn: *db.Db, alloc: std.mem.Allocator) ![]const u8 {
 
 /// Minimal `_kv` read (the watermark store). Returns null when the key is absent.
 fn kvGet(conn: *db.Db, alloc: std.mem.Allocator, key: []const u8) !?[]const u8 {
-    var st = try conn.prepare("SELECT \"value\" FROM \"_kv\" WHERE \"key\" = ?1;");
+    var st = try prep(conn, "SELECT \"value\" FROM \"_kv\" WHERE \"key\" = ?1;");
     defer st.finalize();
     try st.bindText(1, key);
     if (!try st.step()) return null;
@@ -229,7 +280,7 @@ fn kvGet(conn: *db.Db, alloc: std.mem.Allocator, key: []const u8) !?[]const u8 {
 /// Minimal `_kv` upsert (the watermark store). Preserves `created`, bumps `updated`.
 fn kvSet(conn: *db.Db, alloc: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     _ = alloc;
-    var st = try conn.prepare(
+    var st = try prep(conn,
         \\INSERT INTO "_kv" ("key","value","created","updated")
         \\ VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         \\ ON CONFLICT("key") DO UPDATE SET "value" = excluded."value", "updated" = excluded."updated";
