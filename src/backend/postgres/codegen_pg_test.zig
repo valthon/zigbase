@@ -101,13 +101,14 @@ test "pg: the data-dir codegen adapter opens a postgres:// source and reads _col
     setup.exec("DROP TABLE IF EXISTS \"users\" CASCADE;") catch {};
     setup.exec("DELETE FROM \"_collections\" WHERE name IN ('posts','users');") catch {};
     try migrations.run(&setup);
-    const specs = demoSpecs();
-    try provision.applySpecs(al, io, &setup, &specs);
+    // Register cleanup BEFORE provisioning so a mid-provision failure still leaves public clean.
     defer {
         setup.exec("DROP TABLE IF EXISTS \"posts\" CASCADE;") catch {};
         setup.exec("DROP TABLE IF EXISTS \"users\" CASCADE;") catch {};
         setup.exec("DELETE FROM \"_collections\" WHERE name IN ('posts','users');") catch {};
     }
+    const specs = demoSpecs();
+    try provision.applySpecs(al, io, &setup, &specs);
 
     // The adapter routes the postgres:// target to the PG arm (NOT `<target>/data.db`), opens a
     // fresh connection, and reads the user collections back — name-sorted, system rows excluded.

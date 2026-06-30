@@ -85,8 +85,13 @@ pub fn acquire(alloc: std.mem.Allocator, io: std.Io, target: []const u8) ![]sche
     }
 
     const path = try std.fmt.allocPrintSentinel(alloc, "{s}/data.db", .{target}, 0);
+    defer alloc.free(path);
     var w = db.Db.open(path) catch |e| {
         std.log.err("typegen: cannot open '{s}': {s}", .{ path, @errorName(e) });
+        // A `postgres:/host/db` (single slash) or other URL-ish target is not a directory; nudge
+        // toward the correct scheme rather than just reporting a confusing file-open error.
+        if (std.mem.indexOfScalar(u8, target, ':') != null and !db.connstrLooksLikePostgres(target))
+            std.log.err("typegen: '{s}' looks like a URL — did you mean a 'postgres://…' connection string?", .{target});
         return error.DataDirOpenFailed;
     };
     defer w.close();
