@@ -103,6 +103,9 @@ pub const Server = struct {
         try listener.listen();
         std.log.info("zigbase listening on http://{s}:{d}", .{ self.host, self.port });
         realtime_ws.active = true; // reactor about to run; allow broadcast to publish
+        // #159, PR-6b: on Postgres, fan realtime across app instances via LISTEN/NOTIFY. A no-op
+        // on SQLite (single-process) — self-gated, so no backend branch is needed here.
+        realtime_ws.startRemoteListener(self.app);
         zap.start(.{ .threads = 4, .workers = 1 });
     }
 };

@@ -92,4 +92,33 @@ pub const Db = struct {
     pub fn changesCount(self: *Db) i64 {
         return self.conn.last_changes;
     }
+
+    // --- LISTEN/NOTIFY (#159, PR-6b cross-instance realtime) --------------------
+    // Thin wrappers over the conn-level primitives, mapping `ConnError` → `DbError` so the
+    // `db.Db` seam (`db.dbListen`/`dbNotify`/`dbWaitNotification`) stays backend-uniform. Only
+    // ever reached on a Postgres-backed `Db`; SQLite stays single-process (in-process hub).
+
+    pub const Notification = conn_mod.Conn.Notification;
+
+    /// `LISTEN "<channel>"` — subscribe this connection to async notifications.
+    pub fn listen(self: *Db, channel: []const u8) DbError!void {
+        self.conn.listen(channel) catch return DbError.ExecFailed;
+    }
+
+    /// `NOTIFY` on `channel` carrying `payload` (bound via `pg_notify`, parameter-safe).
+    pub fn notify(self: *Db, arena: std.mem.Allocator, channel: []const u8, payload: []const u8) DbError!void {
+        self.conn.notify(arena, channel, payload) catch return DbError.ExecFailed;
+    }
+
+    /// Block for the next async notification (copied into `arena`), draining any already
+    /// queued during prior query drains first. Null when the next wire message is not one.
+    pub fn waitNotification(self: *Db, arena: std.mem.Allocator) DbError!?Notification {
+        return self.conn.waitNotification(arena) catch return DbError.ExecFailed;
+    }
+
+    /// Non-blocking: pop the next already-captured notification, or null. Pair with a trivial
+    /// round-trip query to force the server to flush pending notifications into the queue.
+    pub fn takePending(self: *Db, arena: std.mem.Allocator) DbError!?Notification {
+        return self.conn.takePending(arena) catch return DbError.ExecFailed;
+    }
 };

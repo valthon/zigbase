@@ -853,6 +853,33 @@ must re-fetch the actual state over an authenticated GET. Use the payload-carryi
 `broadcast(topic, payload)` only for data that is safe for **every** subscriber of that
 topic, and use `.canSubscribe` to restrict who may join a private channel.
 
+#### Multi-instance realtime (Postgres)
+
+Realtime delivery is **in-process**: a record write publishes to facil.io's pub/sub inside the
+writing instance, which is complete parity for the single-process SQLite story. When you run
+**several app instances against one shared PostgreSQL** (the reason to use the Postgres backend),
+ZigBase additionally fans record-change events across instances over Postgres **`LISTEN`/`NOTIFY`**
+— a write on instance A reaches subscribers connected to instances B and C. This is **automatic**
+when the active backend is Postgres (no configuration); each instance runs a dedicated listener
+connection (which **auto-reconnects with backoff**, logging loudly, if the connection drops on a
+PG restart/failover), and on a notification it runs **its own** per-subscriber
+`viewRule`/ability/tenant authorization before delivering. The notification payload is **minimal
+and carries no row data** — only `{origin, collection, action, id}`; create/update re-fetch the
+live row on the receiving instance, and a delete carries a random **token** that keys the deleted
+row's snapshot in a small server-side table (`_rt_delete_snapshots`), which the receiver reads back
+over its own DB connection. This is deliberate: putting the deleted row in the `NOTIFY` payload
+would broadcast its column data — including the **decrypted plaintext of `.encrypted` fields** — to
+any DB role that can `LISTEN`, so the snapshot is stored at-rest (ciphertext) in the side table and
+never transits the wire. Delete **authorization** likewise evaluates the deleted row's `viewRule`
+against the **at-rest (ciphertext)** snapshot on every path — local and cross-instance — matching
+the live create/update path (which compares the ciphertext column); a rule that references an
+`.encrypted` field therefore authorizes a delete identically everywhere. On **SQLite**
+(single-process) nothing changes — there is no cross-process step, no side table, and the in-process
+path is byte-identical (for the common case of no encrypted fields the delete takes no extra read).
+Custom-channel
+`ctx.realtime().broadcast`/`signal` events are **per-instance** (not yet fanned out cross-instance);
+record-change events are the cross-instance path.
+
 ### Test-mode capture — assert sent mail + mock outbound HTTP (`zigbase.testcapture`)
 
 For deterministic e2e/integration tests, the framework can capture what it *sent* — an

@@ -5,7 +5,9 @@ const App = @import("../app.zig").App;
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
+const records = @import("../records.zig");
 const policy = @import("../policy.zig");
+const pg_bridge = @import("pg_bridge.zig");
 const auth = @import("../auth.zig");
 const id = @import("../id.zig");
 const protocol = @import("protocol.zig");
@@ -427,16 +429,111 @@ fn onClose(context: ?*LiveConn, uuid: isize) anyerror!void {
 
 /// Publish a record event to its collection + record channels. Called from the record-writer path
 /// (any thread); `fio_publish` is a non-blocking enqueue. `record` is the full record for
-/// create/update (hidden fields already stripped) and is ignored for delete (id-only).
-pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, record_id: []const u8, record: ?std.json.Value) void {
+/// create/update (hidden fields already stripped) and the deletion snapshot for delete.
+///
+/// On Postgres this ALSO fans the event out to other app instances via `NOTIFY` (#159, PR-6b) so
+/// multi-instance deployments deliver realtime correctly; on SQLite (single-process) `emit` is a
+/// no-op and behavior is byte-identical. `notify_token` (delete only) keys the deleted row's
+/// at-rest snapshot in the side table — see `prepareDelete`; null for create/update and on
+/// SQLite. The NOTIFY carries only the token, never the (possibly encrypted) row data.
+pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, record_id: []const u8, record: ?std.json.Value, notify_token: ?[]const u8) void {
     if (!active) return; // reactor not running (tests/CLI): no-op to avoid "cluster inactive" + UB
-    _ = app;
+    publishFrames(col.name, action, record_id, record);
+    pg_bridge.emit(app, col.name, action, record_id, notify_token);
+}
+
+/// Realtime metadata for a just-deleted row.
+pub const DeleteRealtime = struct {
+    /// The snapshot fed to per-subscriber delete AUTHZ (`hub.matchesSnapshot`). It is the AT-REST
+    /// representation (`.encrypted` fields are CIPHERTEXT, not decrypted) so the LOCAL delete authz
+    /// compares the SAME representation as the cross-instance REMOTE path AND the live create/update
+    /// path (which both compare the ciphertext column) — all three agree. The delivered delete frame
+    /// is id-only regardless (the snapshot is stripped before any client sees it), so the
+    /// representation choice never changes what subscribers receive.
+    snapshot: ?std.json.Value,
+    /// Cross-instance NOTIFY token keying the side-table snapshot (Postgres only; null otherwise).
+    token: ?[]const u8,
+};
+
+/// Prepare a just-deleted row for realtime delivery + cross-instance fan-out (#159, PR-6b). MUST be
+/// called on the writer INSIDE the delete transaction (before the row is removed). `decrypted` is
+/// the snapshot the caller already read for its hooks (hidden fields stripped, `.encrypted` fields
+/// DECRYPTED).
+///
+/// Delete authz must use the AT-REST (ciphertext) snapshot so local == remote == live. We only
+/// re-read it when it could DIFFER from `decrypted` (the collection has an `.encrypted` field) or
+/// when the cross-instance side table needs it (Postgres). Otherwise — the common case: SQLite (or
+/// any collection with no encrypted fields) — `decrypted` IS the at-rest representation, so we reuse
+/// it with NO extra read and SQLite stays byte-identical.
+pub fn prepareDelete(alloc: std.mem.Allocator, app: *App, w: *db.Db, col: schema.Collection, record_id: []const u8, decrypted: ?std.json.Value) DeleteRealtime {
+    const cross = pg_bridge.crossInstanceEnabled(app);
+    if (!cross and !schema.hasEncryptedField(col)) return .{ .snapshot = decrypted, .token = null };
+    const at_rest = (records.getAtRest(alloc, w, col, record_id) catch |e| {
+        std.log.warn("realtime: delete-snapshot capture failed for {s}/{s}: {s}", .{ col.name, record_id, @errorName(e) });
+        return .{ .snapshot = decrypted, .token = null };
+    }) orelse return .{ .snapshot = decrypted, .token = null };
+    const token = if (cross) pg_bridge.storeDeleteSnapshot(alloc, app.io, w, at_rest) else null;
+    return .{ .snapshot = at_rest, .token = token };
+}
+
+/// Build + publish the two event frames into the LOCAL in-process hub (no NOTIFY). Shared by the
+/// writer path (`broadcast`) and the cross-instance listener (`onRemoteEvent`), so a notification
+/// from another instance flows through the exact same `onChannelMessage` per-subscriber authz.
+fn publishFrames(collection: []const u8, action: protocol.Action, record_id: []const u8, record: ?std.json.Value) void {
+    if (!active) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const ef = hub.buildEventFrames(a, col.name, action, record_id, record) catch return;
+    const ef = hub.buildEventFrames(a, collection, action, record_id, record) catch return;
     WS.publish(.{ .channel = ef.collection_channel, .message = ef.frame_collection });
     WS.publish(.{ .channel = ef.record_channel, .message = ef.frame_record });
+}
+
+/// Cross-instance bridge callback (#159, PR-6b): a record event NOTIFY'd by ANOTHER instance.
+/// Re-feeds the local hub so each local subscriber's existing view/ability/tenant authz runs in
+/// `onChannelMessage` — create/update re-fetch the live row, delete reads the at-rest snapshot from
+/// the side table by token. Swallowed failures are logged so a silently-undelivered remote event is
+/// visible to operators.
+fn onRemoteEvent(app: *App, ev: pg_bridge.Event) void {
+    if (!active) return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var r = app.pool.acquireReader() catch |e| {
+        std.log.err("realtime: remote event dropped (pool acquire failed): {s}", .{@errorName(e)});
+        return;
+    };
+    defer app.pool.releaseReader(&r);
+    const col = (collections.get(a, &r, ev.collection) catch |e| {
+        std.log.err("realtime: remote event dropped (collection lookup failed for {s}): {s}", .{ ev.collection, @errorName(e) });
+        return;
+    }) orelse return; // not a real collection (or dropped): nothing to deliver
+    if (ev.action == .delete) {
+        // The live row is gone; read its at-rest snapshot back by token. A missing token / no
+        // side-table row means either a non-cross-instance writer or a FORGED NOTIFY — deny
+        // delivery (fail closed). The snapshot rides the published frame under a private authz key
+        // and is stripped before any client receives the id-only delete frame.
+        const token = ev.token orelse return;
+        const snapshot = pg_bridge.readDeleteSnapshot(a, &r, token) orelse return;
+        publishFrames(col.name, .delete, ev.id, snapshot);
+    } else {
+        // Re-fetch the current row (hidden fields stripped, TTL-respecting) so subscribers get the
+        // real payload; skip if it was deleted/expired in the meantime.
+        const rec = (records.get(a, &r, col, ev.id) catch |e| {
+            std.log.err("realtime: remote event dropped (record fetch failed for {s}/{s}): {s}", .{ col.name, ev.id, @errorName(e) });
+            return;
+        }) orelse return;
+        publishFrames(col.name, ev.action, ev.id, rec);
+    }
+}
+
+/// Start the Postgres cross-instance LISTEN bridge (#159, PR-6b). A no-op on SQLite / when the
+/// active backend is not Postgres. Best-effort: a failure to start logs + leaves single-instance
+/// realtime working. Called once by the server just before `zap.start` (reactor live).
+pub fn startRemoteListener(app: *App) void {
+    pg_bridge.startListener(app, &onRemoteEvent) catch |e| {
+        std.log.warn("realtime: Postgres LISTEN bridge unavailable: {s}", .{@errorName(e)});
+    };
 }
 
 /// Signal-only feature-management push (#128/#129/#130): publish `{"type":"features.changed"}`
@@ -498,7 +595,7 @@ test "broadcast is a no-op when inactive" {
     // active defaults to false; broadcast must return immediately without touching the reactor.
     try std.testing.expect(!active);
     var app: App = undefined;
-    broadcast(&app, undefined, .create, "rec1", null); // would crash if it didn't early-return
+    broadcast(&app, undefined, .create, "rec1", null, null); // would crash if it didn't early-return
 }
 
 test "broadcastFeaturesChanged is a no-op when inactive" {

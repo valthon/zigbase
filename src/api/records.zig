@@ -359,7 +359,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // the persisted account (id populated); it also seeds the hook's `ctx.user()` identity.
     if (col.type == .auth)
         api_auth.emitAuthLifecycle(ctx, w, col.name, rid, .after_register, &rec_mut, rec_mut);
-    realtime_ws.broadcast(app, col, .create, rid, rec_mut);
+    realtime_ws.broadcast(app, col, .create, rid, rec_mut, null);
     return jsonResponse(ctx, 201, rec_mut);
 }
 
@@ -467,7 +467,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const broadcast_id = ur.object.get("id").?.string;
     var ur_mut = ur;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &ur_mut, .after_update) catch {};
-    realtime_ws.broadcast(app, col, .update, broadcast_id, ur_mut);
+    realtime_ws.broadcast(app, col, .update, broadcast_id, ur_mut, null);
     return jsonResponse(ctx, 200, ur_mut);
 }
 
@@ -498,6 +498,13 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return hookRejected(ctx);
     };
+    // Realtime delete prep (#159, PR-6/PR-6b), INSIDE this transaction so a Postgres side-table
+    // snapshot commits atomically with the delete. Returns the AT-REST (ciphertext) snapshot used
+    // for delete authz — so LOCAL authz matches the cross-instance REMOTE path and the live
+    // create/update path (all compare ciphertext) — plus the cross-instance NOTIFY token (Postgres
+    // only; the wire carries only the token, never the row data). On SQLite with no encrypted
+    // fields this reuses `ex_mut` with no extra read (byte-identical).
+    const rt = realtime_ws.prepareDelete(ctx.allocator, app, w, col, rid, ex_mut);
     if (!try records.deleteInTxn(ctx.allocator, w, col, rid)) {
         w.rollback() catch {};
         return ApiError.notFound().toResponse(ctx.allocator);
@@ -517,7 +524,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // F4: pass the deleted row's snapshot so subscribers to an owner/expression-scoped collection
     // can re-authorize the delete event (the live row is gone). The snapshot rides in the published
     // frame under a private key and is stripped before any client receives the id-only delete frame.
-    realtime_ws.broadcast(app, col, .delete, rid, ex_mut);
+    realtime_ws.broadcast(app, col, .delete, rid, rt.snapshot, rt.token);
     return .{ .status = 204, .body = "" };
 }
 
