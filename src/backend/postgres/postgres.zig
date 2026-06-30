@@ -69,4 +69,6 @@ test {
     _ = @import("crud_tests.zig");
     // PR-5: live field-encryption + key-rotation rewrap verification (rowid→id fix). Skips if no PG.
     _ = @import("encryption_pg_test.zig");
+    // PR-4: live KV store / TTL-GC / sticky-experiment dialect parity. Skips if no PG.
+    _ = @import("kvttl_pg_test.zig");
 }

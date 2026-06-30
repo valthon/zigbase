@@ -18,6 +18,7 @@
 const std = @import("std");
 const features = @import("features.zig");
 const db = @import("db.zig");
+const param_sink = @import("sql/param_sink.zig");
 
 pub const FlagDef = features.FlagDef;
 pub const ExperimentDef = features.ExperimentDef;
@@ -121,7 +122,7 @@ pub fn resolveExperiment(
     // is stable across weight changes. An empty subject always maps to variant 0 and is
     // never persisted; a non-sticky experiment always follows the live weights.
     if (def.sticky and subject.len > 0) {
-        if (sticky) |sc| return stickyVariant(sc, def, subject, weights);
+        if (sticky) |sc| return stickyVariant(alloc, sc, def, subject, weights);
     }
 
     const idx = bucket(def.name, subject, weights);
@@ -147,9 +148,9 @@ pub const StickyConns = struct {
 ///      BACK on the writer — so a concurrent winner that inserted first is honored — and
 ///      release the writer. The returned slice is mapped back to the static `def.variants`
 ///      so it outlives any row buffer; a stored variant no longer declared is recomputed.
-fn stickyVariant(sc: StickyConns, def: ExperimentDef, subject: []const u8, weights: []const u16) ![]const u8 {
+fn stickyVariant(alloc: std.mem.Allocator, sc: StickyConns, def: ExperimentDef, subject: []const u8, weights: []const u16) ![]const u8 {
     // 1. Reader-first: a stored assignment short-circuits without touching the writer.
-    if (try stickyLookup(sc.read, def, subject)) |hit| return hit;
+    if (try stickyLookup(alloc, sc.read, def, subject)) |hit| return hit;
 
     // 2. Miss: briefly take the writer (or reuse the bound writer) to persist + read back.
     const writer = if (sc.pool) |p| p.acquireWriter() else sc.read;
@@ -157,20 +158,27 @@ fn stickyVariant(sc: StickyConns, def: ExperimentDef, subject: []const u8, weigh
 
     const idx = bucket(def.name, subject, weights);
     const computed = def.variants[idx];
-    var ins = try writer.prepare(
-        \\INSERT OR IGNORE INTO "_experiment_assignments" ("experiment","subject","variant","created")
-        \\ VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ','now'));
-    );
+    // Dialect-ize the conflict-ignoring insert: `INSERT OR IGNORE` (SQLite) ⇄ `INSERT … ON
+    // CONFLICT DO NOTHING` (Postgres), `strftime` ISO now ⇄ `to_char(now())`, `?N` ⇄ `$n`.
+    // `created` is the ISO-8601 `Z` shape (matches the records autodate format) → `nowIso8601Expr`.
+    const dialect = db.dbDialect(writer);
+    const ins_tmpl = try std.fmt.allocPrintSentinel(alloc,
+        "{s} INTO \"_experiment_assignments\" (\"experiment\",\"subject\",\"variant\",\"created\") VALUES (?1, ?2, ?3, {s}){s};",
+        .{ dialect.insertVerb(true), dialect.nowIso8601Expr(), dialect.onConflictDoNothing() }, 0);
+    defer alloc.free(ins_tmpl);
+    const ins_sql = try param_sink.renumberZ(alloc, dialect, ins_tmpl);
+    defer if (dialect.kind == .postgres) alloc.free(ins_sql); // SQLite returns the input slice
+    var ins = try writer.prepare(ins_sql);
     defer ins.finalize();
     try ins.bindText(1, def.name);
     try ins.bindText(2, subject);
     try ins.bindText(3, computed);
     _ = try ins.step();
 
-    // Read back the AUTHORITATIVE variant on the writer: under `INSERT OR IGNORE`, a row
+    // Read back the AUTHORITATIVE variant on the writer: under conflict-ignore, a row
     // another request persisted first (between our reader miss and acquiring the writer)
     // is the one that wins, and we must return it for consistency with `App.experiment`.
-    if (try stickyLookup(writer, def, subject)) |stored| return stored;
+    if (try stickyLookup(alloc, writer, def, subject)) |stored| return stored;
     return computed; // unreachable in practice (we just inserted), but a safe fallback.
 }
 
@@ -178,11 +186,14 @@ fn stickyVariant(sc: StickyConns, def: ExperimentDef, subject: []const u8, weigh
 /// mapped back to the static `def.variants` slice (so it outlives the row buffer), or
 /// null on a miss / a stored variant that is no longer declared (the variant set changed).
 /// Pure read — no writes — so it is safe on a pooled reader.
-fn stickyLookup(conn: *db.Db, def: ExperimentDef, subject: []const u8) !?[]const u8 {
-    var st = try conn.prepare(
+fn stickyLookup(alloc: std.mem.Allocator, conn: *db.Db, def: ExperimentDef, subject: []const u8) !?[]const u8 {
+    const dialect = db.dbDialect(conn);
+    const sql_p = try param_sink.renumberZ(alloc, dialect,
         \\SELECT "variant" FROM "_experiment_assignments"
         \\ WHERE "experiment" = ?1 AND "subject" = ?2;
     );
+    defer if (dialect.kind == .postgres) alloc.free(sql_p); // SQLite returns the input slice
+    var st = try conn.prepare(sql_p);
     defer st.finalize();
     try st.bindText(1, def.name);
     try st.bindText(2, subject);
@@ -202,28 +213,39 @@ pub const assignment_gc_batch: usize = 1000;
 
 /// Garbage-collect `_experiment_assignments` rows older than `ttl_days`, in bounded
 /// batches (mirrors `gcExpiredSessions`). Each batch is its own autocommit
-/// `DELETE … RETURNING`, so the writer is never held across the whole sweep. The cutoff
-/// is `strftime(…, 'now', '-<ttl_days> days')`; both sides are normalized via strftime so
-/// a non-canonical `created` compares correctly and an unparseable one (strftime → NULL)
-/// is kept (fail-safe). Returns the total rows deleted. Writer required.
+/// `DELETE … RETURNING`, so the writer is never held across the whole sweep. The cutoff and
+/// physical-row addressing are dialect-selected (`dialect.agedBeyondDaysPredicate` +
+/// `dialect.physicalRowId`): on SQLite both sides are normalized via `strftime` (a non-canonical
+/// `created` compares correctly; an unparseable one → NULL → kept, fail-safe) addressed by
+/// `rowid`; on Postgres the compare is gated on the ISO-`Z` regex (an unparseable value can't be
+/// aged out) against a `make_interval` cutoff, addressed by `ctid`. Returns the total rows
+/// deleted. Writer required.
 pub fn gcExpiredAssignments(conn: *db.Db, ttl_days: u32) !usize {
-    var buf: [32]u8 = undefined;
-    // "-<u32> days" is at most "-4294967295 days" (16 chars) — never overflows buf.
-    const modifier = std.fmt.bufPrint(&buf, "-{d} days", .{ttl_days}) catch unreachable;
+    // Build the backend-correct DELETE once: the relative-age cutoff (`created` older than
+    // `ttl_days`, fail-safe on a malformed value) and the physical-row addressing column both
+    // diverge by backend, so route them through the dialect. SQLite keeps the `strftime`
+    // normalization + `rowid`; Postgres uses the ISO-`Z` regex gate + `make_interval` cutoff +
+    // `ctid`. No bind placeholders (the cutoff is inlined, the trusted `ttl_days` config value),
+    // so no `$n` renumber is required. The SQL is small and bounded → a stack allocator suffices.
+    var buf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    const dialect = db.dbDialect(conn);
+    const aged = try dialect.agedBeyondDaysPredicate(a, "\"created\"", ttl_days);
+    const rid = dialect.physicalRowId();
+    const sql = try std.fmt.allocPrintSentinel(
+        a,
+        "DELETE FROM \"_experiment_assignments\" WHERE {s} IN (" ++
+            "SELECT {s} FROM \"_experiment_assignments\" WHERE {s} LIMIT {d}" ++
+            ") RETURNING \"experiment\";",
+        .{ rid, rid, aged, assignment_gc_batch },
+        0,
+    );
+
     var total: usize = 0;
     while (true) {
-        var st = try conn.prepare(comptime std.fmt.comptimePrint(
-            \\DELETE FROM "_experiment_assignments"
-            \\ WHERE rowid IN (
-            \\   SELECT rowid FROM "_experiment_assignments"
-            \\    WHERE strftime('%Y-%m-%dT%H:%M:%SZ', "created") IS NOT NULL
-            \\      AND strftime('%Y-%m-%dT%H:%M:%SZ', "created") <= strftime('%Y-%m-%dT%H:%M:%SZ','now',?1)
-            \\    LIMIT {d}
-            \\ )
-            \\ RETURNING "experiment";
-        , .{assignment_gc_batch}));
+        var st = try conn.prepare(sql);
         defer st.finalize();
-        try st.bindText(1, modifier);
         var batch: usize = 0;
         while (try st.step()) batch += 1;
         total += batch;

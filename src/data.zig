@@ -5,7 +5,16 @@ const collections = @import("collections.zig");
 const records = @import("records.zig");
 const migrations = @import("migrations.zig");
 const auth = @import("auth.zig");
+const param_sink = @import("sql/param_sink.zig");
 const App = @import("app.zig").App;
+
+/// Prepare a placeholder-bearing statement through the `$n` renumber chokepoint, so the SAME
+/// SQLite-flavored SQL (`?1..?N`) prepares correctly on either backend (a no-op slice on SQLite,
+/// the `$n` rewrite on Postgres). Mirrors `records.prep`. `alloc` only does work on the Postgres
+/// arm (the rewritten SQL); on SQLite it returns the input slice unchanged.
+fn prep(alloc: std.mem.Allocator, conn: *db.Db, sql: [:0]const u8) !db.Stmt {
+    return conn.prepare(try param_sink.renumberZ(alloc, db.dbDialect(conn), sql));
+}
 
 /// Connection-bound, curated record operations. Hooks, custom routes, and jobs
 /// receive a `Data` rather than a raw connection. Ops run on the passed `conn`
@@ -88,7 +97,7 @@ pub const Data = struct {
     /// onto `self.alloc` (the caller-chosen lifetime: the per-invocation arena on
     /// the ctx path) so it outlives the finalized statement.
     pub fn kvGet(self: Data, key: []const u8) !?[]const u8 {
-        var st = try self.conn.prepare("SELECT value FROM \"_kv\" WHERE key = ?1;");
+        var st = try prep(self.alloc, self.conn, "SELECT value FROM \"_kv\" WHERE key = ?1;");
         defer st.finalize();
         try st.bindText(1, key);
         if (!(try st.step())) return null;
@@ -98,11 +107,21 @@ pub const Data = struct {
     /// Upsert `key`→`value`. Preserves the original `created` timestamp across updates
     /// and bumps `updated`.
     pub fn kvSet(self: Data, key: []const u8, value: []const u8) !void {
-        var st = try self.conn.prepare(
+        // `_kv.created`/`updated` are TEXT ISO timestamps → `nowTextExpr` (byte-identical
+        // `datetime('now')` on SQLite, the ISO `to_char` form on Postgres). The upsert's
+        // `ON CONFLICT(key)` target is the `_kv` PRIMARY KEY (migration 0009), valid on both
+        // backends; `excluded` is the standard conflict-row alias on SQLite and Postgres.
+        const dialect = db.dbDialect(self.conn);
+        const now = dialect.nowTextExpr();
+        const sql = try std.fmt.allocPrintSentinel(self.alloc,
             \\INSERT INTO "_kv"(key,value,created,updated)
-            \\VALUES(?1,?2,datetime('now'),datetime('now'))
-            \\ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated=datetime('now');
-        );
+            \\VALUES(?1,?2,{s},{s})
+            \\ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated={s};
+        , .{ now, now, now }, 0);
+        defer self.alloc.free(sql);
+        const sql_p = try param_sink.renumberZ(self.alloc, dialect, sql);
+        defer if (dialect.kind == .postgres) self.alloc.free(sql_p); // SQLite returns the input slice
+        var st = try self.conn.prepare(sql_p);
         defer st.finalize();
         try st.bindText(1, key);
         try st.bindText(2, value);
@@ -111,7 +130,7 @@ pub const Data = struct {
 
     /// Delete `key`. Returns whether a row existed.
     pub fn kvDelete(self: Data, key: []const u8) !bool {
-        var st = try self.conn.prepare("DELETE FROM \"_kv\" WHERE key = ?1;");
+        var st = try prep(self.alloc, self.conn, "DELETE FROM \"_kv\" WHERE key = ?1;");
         defer st.finalize();
         try st.bindText(1, key);
         _ = try st.step();
@@ -138,32 +157,44 @@ pub const Data = struct {
         return out.toOwnedSlice(self.alloc);
     }
 
-    /// Scan `_kv` for every entry whose key GLOB-matches one of `prefixes` (each
-    /// matched as `<prefix>*`), in a single parameter-bound query. Used by the
+    /// Scan `_kv` for every entry whose key prefix-matches one of `prefixes` (each
+    /// matched as `<prefix><wildcard>`), in a single parameter-bound query. Used by the
     /// feature-flag resolver to batch the `flag:*` / `exp:*` reads. Each field is
     /// duped onto `self.alloc`; results are ordered by key.
+    ///
+    /// The prefix-match operator is dialect-selected (`GLOB '<p>*'` on SQLite — case-sensitive;
+    /// `LIKE '<p>%'` on Postgres — also case-sensitive). SQLite's `LIKE` is case-INSENSITIVE, so
+    /// the two backends must use different operators to keep identical semantics; the prefixes are
+    /// internal constants without wildcard metacharacters, so no pattern escaping is needed.
     pub fn kvScanPrefix(self: Data, prefixes: []const []const u8) ![]KvEntry {
         if (prefixes.len == 0) return &.{};
+        const dialect = db.dbDialect(self.conn);
+        const op = dialect.prefixMatchOp();
         var sql: std.ArrayList(u8) = .empty;
         defer sql.deinit(self.alloc);
         try sql.appendSlice(self.alloc, "SELECT key, value, created, updated FROM \"_kv\" WHERE ");
         for (prefixes, 0..) |_, i| {
             if (i > 0) try sql.appendSlice(self.alloc, " OR ");
-            const clause = try std.fmt.allocPrint(self.alloc, "key GLOB ?{d}", .{i + 1});
+            const clause = try std.fmt.allocPrint(self.alloc, "key {s} ?{d}", .{ op, i + 1 });
             defer self.alloc.free(clause); // copied by appendSlice; only a build-time temporary
             try sql.appendSlice(self.alloc, clause);
         }
         try sql.appendSlice(self.alloc, " ORDER BY key;");
-        // sqlite copies the SQL text at prepare time, so the duped buffer is just a
-        // build-time temporary — free it once the function returns.
         const sql_z = try self.alloc.dupeZ(u8, sql.items);
         defer self.alloc.free(sql_z);
 
-        var st = try self.conn.prepare(sql_z);
+        // Route the assembled, placeholder-bearing SQL through the `$n` renumber chokepoint
+        // (`?N`→`$N` on Postgres, unchanged on SQLite). The DB copies the SQL text at prepare
+        // time, so both buffers are build-time temporaries.
+        const sql_p = try param_sink.renumberZ(self.alloc, dialect, sql_z);
+        defer if (dialect.kind == .postgres) self.alloc.free(sql_p); // SQLite returns sql_z (freed above)
+
+        var st = try self.conn.prepare(sql_p);
         defer st.finalize();
+        const wild = dialect.prefixWildcard();
         for (prefixes, 0..) |p, i| {
-            const pat = try std.fmt.allocPrint(self.alloc, "{s}*", .{p});
-            defer self.alloc.free(pat); // bindText binds SQLITE_TRANSIENT (copies at bind time)
+            const pat = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ p, wild });
+            defer self.alloc.free(pat); // bind copies the bytes at bind time
             try st.bindText(@intCast(i + 1), pat);
         }
 
