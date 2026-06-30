@@ -35,8 +35,18 @@ const ddl = @import("ddl.zig");
 
 pub const Error = error{
     /// A stored cell could not be decrypted with the configured key generations.
-    /// Details (collection.field rowid version) are logged before returning.
+    /// Details (collection.field id version) are logged before returning.
     RewrapDecryptFailed,
+    /// A row carries an empty/NULL `id`, so it cannot be safely re-keyed: a keyed
+    /// `UPDATE … WHERE "id"=''` would match zero rows and silently leave the cell at the
+    /// OLD generation (permanent data loss once the old key is dropped). Fail closed.
+    /// (SQLite permits NULL in a `TEXT PRIMARY KEY`; the records layer never writes one,
+    /// so this is a fail-safe against a corrupt/hand-edited row, not an expected state.)
+    RewrapRowUnkeyed,
+    /// A keyed single-row rewrap `UPDATE` reported that it matched no row (the row vanished
+    /// or its `id` did not match). The write did NOT land, so the run fails closed rather
+    /// than over-reporting a rewrap that silently lost data.
+    RewrapWriteFailed,
     // `collections.EngineError` (which already includes `db.DbError` and
     // `std.mem.Allocator.Error`) is unioned in so enumerating the collection store
     // propagates its real error type instead of being masked.
@@ -104,6 +114,13 @@ pub fn rewrapColumn(
             // since columnText borrows the statement's transient row buffer.
             const id = try arena.dupe(u8, stmt.columnText(0));
             const stored = try arena.dupe(u8, stmt.columnText(1));
+            // A NULL/empty id cannot be the target of a keyed UPDATE (it would match zero
+            // rows and silently drop the rewrite). Fail closed before we count or write it —
+            // an encrypted cell on an unkeyable row must be surfaced, not lost.
+            if (id.len == 0 or stmt.isNull(0)) {
+                if (failure) |fp| fp.* = .{ .table = table, .column = col, .id = id, .version = aead.parseVersion(stored) orelse 0 };
+                return error.RewrapRowUnkeyed;
+            }
             const ver = aead.parseVersion(stored);
 
             // Already at the primary version → no-op (this is what makes rewrap idempotent).
@@ -151,6 +168,16 @@ pub fn rewrapColumn(
         try ustmt.bindText(1, u.blob);
         try ustmt.bindText(2, u.id);
         _ = try ustmt.step();
+        // Self-verify the write LANDED: a unique-`id`-keyed UPDATE must affect exactly one
+        // row. Zero rows means the row vanished or the id didn't match — the rewrite did not
+        // persist, so fail closed rather than over-report a "rewrapped" cell that is still at
+        // the old generation (which would become unreadable once the old key is dropped).
+        // `changesCount` is `sqlite3_changes64` / the PG CommandComplete row count — exactly 1
+        // for a normal keyed single-row UPDATE on both backends.
+        if (w.changesCount() != 1) {
+            if (failure) |fp| fp.* = .{ .table = table, .column = col, .id = u.id, .version = cipher.primary_gen };
+            return error.RewrapWriteFailed;
+        }
     }
     return stats;
 }
@@ -196,15 +223,26 @@ pub fn rewrapAll(
             defer col_arena.deinit();
             var failure: Failure = .{};
             const cs = rewrapColumn(col_arena.allocator(), w, cipher, c.name, f.name, dry_run, &failure) catch |e| {
-                if (e == error.RewrapDecryptFailed) {
-                    std.log.err(
-                        "rewrap: cannot decrypt {s}.{s} id={s} (envelope v{d}: missing generation key, wrong key, or tampered) — aborting, no rows changed in this collection",
-                        .{ failure.table, failure.column, failure.id, failure.version },
-                    );
-                    std.log.err(
-                        "rewrap: configure the missing generation key (ZIGBASE_FIELD_KEY_V{d}) and re-run — rewrap is idempotent, so already-committed collections are not redone",
-                        .{failure.version},
-                    );
+                switch (e) {
+                    error.RewrapDecryptFailed => {
+                        std.log.err(
+                            "rewrap: cannot decrypt {s}.{s} id={s} (envelope v{d}: missing generation key, wrong key, or tampered) — aborting, no rows changed in this collection",
+                            .{ failure.table, failure.column, failure.id, failure.version },
+                        );
+                        std.log.err(
+                            "rewrap: configure the missing generation key (ZIGBASE_FIELD_KEY_V{d}) and re-run — rewrap is idempotent, so already-committed collections are not redone",
+                            .{failure.version},
+                        );
+                    },
+                    error.RewrapRowUnkeyed => std.log.err(
+                        "rewrap: {s}.{s} has a row with an empty/NULL id — cannot safely re-key it; fix the row's id before rewrapping (aborting, no rows changed in this collection)",
+                        .{ failure.table, failure.column },
+                    ),
+                    error.RewrapWriteFailed => std.log.err(
+                        "rewrap: {s}.{s} id={s}: keyed UPDATE matched no row (row vanished or id mismatch) — aborting, no rows changed in this collection",
+                        .{ failure.table, failure.column, failure.id },
+                    ),
+                    else => {},
                 }
                 return e;
             };
@@ -242,10 +280,14 @@ fn rotatedRing() field_policy.Cipher {
 }
 
 fn cellText(a: std.mem.Allocator, d: *db.Db, table: [:0]const u8, id: []const u8) ![]u8 {
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT v FROM {s} WHERE \"id\"='{s}';", .{ table, id }, 0);
+    // Bind `id` (defense-in-depth; never interpolate even a DB-sourced value) and route the
+    // placeholder through the dialect renumber like production rewrap does.
+    const tmpl = try std.fmt.allocPrint(a, "SELECT v FROM {s} WHERE \"id\"=?1;", .{table});
+    const sql = try db.dbDialect(d).renumberPlaceholders(a, tmpl);
     var s = try d.prepare(sql);
     defer s.finalize();
-    _ = try s.step();
+    try s.bindText(1, id);
+    if (!try s.step()) return error.RowNotFound;
     return a.dupe(u8, s.columnText(0));
 }
 
@@ -376,6 +418,35 @@ test "rewrapColumn fails closed on an unknown generation (no rows changed)" {
     // The cell is untouched (still the original v1 envelope) — no data loss.
     const after = try cellText(a, &d, "t", "r1");
     try std.testing.expect(std.mem.startsWith(u8, after, "v1:"));
+}
+
+test "rewrapColumn fails closed on a row with a NULL/empty id (no silent data loss)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d = try db.Db.openMemory();
+    defer d.close();
+    // SQLite permits NULL in a `TEXT PRIMARY KEY`; seed a row whose id is NULL but whose cell
+    // is a legitimate older-generation envelope that WOULD otherwise be rewrapped.
+    try d.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT);");
+    const old = field_policy.Cipher.fromEnv(std.testing.io, "oldkey");
+    var ins = try d.prepare("INSERT INTO t (id, v) VALUES (NULL, ?1);");
+    try ins.bindText(1, try old.seal(a, "stranded"));
+    _ = try ins.step();
+    ins.finalize();
+
+    // The keyed UPDATE could never match this row, so rewrap must NOT report success — it
+    // fails closed (RewrapRowUnkeyed) before counting or writing anything.
+    const ring = rotatedRing();
+    var failure: Failure = .{};
+    try std.testing.expectError(error.RewrapRowUnkeyed, rewrapColumn(a, &d, &ring, "t", "v", false, &failure));
+    try std.testing.expectEqualStrings("", failure.id);
+
+    // The cell is untouched (still the original v1 envelope) — no data loss, no over-report.
+    var sel = try d.prepare("SELECT v FROM t;");
+    defer sel.finalize();
+    try std.testing.expect(try sel.step());
+    try std.testing.expect(std.mem.startsWith(u8, sel.columnText(0), "v1:"));
 }
 
 test "rewrapColumn dry-run reports but writes nothing" {

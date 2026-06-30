@@ -72,7 +72,7 @@ fn cellById(a: std.mem.Allocator, d: *dbm.Db, table: []const u8, id: []const u8)
     var s = try d.prepare(sql);
     defer s.finalize();
     try s.bindText(1, id);
-    _ = try s.step();
+    if (!try s.step()) return error.RowNotFound;
     return a.dupe(u8, s.columnText(0));
 }
 
