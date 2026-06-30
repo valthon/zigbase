@@ -79,30 +79,17 @@ pub fn install(conn: *conn_mod.Conn) void {
 // crud_tests.zig). A connectivity/auth failure SKIPS so the suite still runs where no PG exists.
 // ---------------------------------------------------------------------------
 const dialect_mod = @import("../../sql/dialect.zig");
+// Shared live-PG test plumbing — one definition for the whole subtree (see tests.zig),
+// rather than re-deriving `getEnv`/`testUrl`/`default_url` per file.
+const pgtests = @import("tests.zig");
 
 const frozen_iso = "2029-03-07T16:00:00Z";
 const frozen_unix: i64 = 1867593600; // = datetime.parse(frozen_iso)
 
-const default_url = "postgres://zbpg:zbpg_secret_pw@[::1]:5432/zbpgtest?sslmode=require";
-
-fn getEnv(key: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (std.c.environ[i]) |entry| : (i += 1) {
-        const e = std.mem.span(entry);
-        if (e.len > key.len and std.mem.startsWith(u8, e, key) and e[key.len] == '=')
-            return e[key.len + 1 ..];
-    }
-    return null;
-}
-
-fn testUrl() []const u8 {
-    return getEnv("ZIGBASE_PG_TEST_URL") orelse default_url;
-}
-
 /// Open a raw `Conn`, or null to signal "no reachable PG → skip" (only a connect failure skips).
 fn connectOrSkip(a: std.mem.Allocator, io: std.Io) !?*conn_mod.Conn {
     const connstr = @import("connstr.zig");
-    var cfg = connstr.parse(a, testUrl()) catch return null;
+    var cfg = connstr.parse(a, pgtests.testUrl()) catch return null;
     defer cfg.deinit();
     return conn_mod.Conn.connect(a, io, cfg) catch null;
 }
