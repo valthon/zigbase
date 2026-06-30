@@ -20,12 +20,15 @@ const param_sink = @import("../sql/param_sink.zig");
 /// SQLite gets the verbatim `?N`/`datetime('now')` SQL (zero-cost — the same slice); Postgres gets
 /// `$n` placeholders + `now()` expressions (`sql/param_sink.lowerStmtZ`). Every placeholder-bearing
 /// CRUD `prepare` in the auth subsystem routes through here so the `$n` rework has one chokepoint.
-/// A stack arena bounds the lowered SQL (these statements are short, including the few built with a
-/// runtime collection/table name); `Db.prepare` copies it, so the buffer need only outlive the call.
+/// The lowered SQL lives in a transient arena (`Db.prepare` copies it), so it need only outlive the
+/// call; this covers the few statements built with a runtime collection/table name too.
 fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
-    var buf: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const lowered = param_sink.lowerStmtZ(fba.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
+    // Arena over the page allocator: no fixed ceiling (lowerStmtZ makes several intermediate
+    // allocations that the arena frees together on return), and on SQLite lowerStmtZ is a no-op
+    // returning the input slice, so this costs one empty arena. `Db.prepare` copies the text.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const lowered = param_sink.lowerStmtZ(arena.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
     return conn.prepare(lowered);
 }
 

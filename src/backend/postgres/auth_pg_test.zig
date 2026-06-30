@@ -22,6 +22,8 @@ const jwt = @import("../../jwt.zig");
 const oauth_api = @import("../../api/oauth.zig");
 const analytics = @import("../../analytics/analytics.zig");
 const challenge_store = @import("../../auth/challenge_store.zig");
+const app_mod = @import("../../app.zig");
+const clock = @import("../../clock.zig");
 
 fn testUrlZ() ?[:0]const u8 {
     return std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL");
@@ -242,4 +244,77 @@ test "pg: auth identity lookup + login credential check + consumeToken + session
     try std.testing.expectEqualStrings("sid1", sessions[0].id);
     try std.testing.expect(try auth_api.deleteSession(w, "sid1"));
     try std.testing.expect(!try auth_api.deleteSession(w, "sid1")); // already gone
+}
+
+// ---------------------------------------------------------------------------
+// Auth VERIFY path (src/auth.zig) on Postgres — the core middleware hit on EVERY authenticated
+// request. Its three reads (tokenKeyEpochFor / sessionActive / superuserRecord) emitted raw `?N`
+// before this fix, so on PG they failed at prepare → `verifyToken` returned null → a user could
+// log in but no token could be verified. This mints a token AND round-trips it through
+// `auth.verifyToken` for epoch mode, table-mode session gating, and superuser auth.
+// FAILS-BEFORE (verify returns null on PG), PASSES-AFTER the `src/auth.zig` lowering.
+
+/// Mint a signed `.auth` token for (collection, rid, token_key) with the given sid/epoch.
+fn mintAuth(al: std.mem.Allocator, secret: []const u8, collection: []const u8, rid: []const u8, token_key: []const u8, sid: ?[]const u8, epoch: i64) ![]u8 {
+    const key = crypto.deriveKey(secret, token_key);
+    return jwt.sign(al, .{
+        .id = rid, .collection = collection, .type = .auth,
+        .token_epoch = epoch, .sid = sid, .iat = 1, .exp = 9999999999,
+    }, &key);
+}
+
+test "pg: token mint + VERIFY round-trip (epoch, table-session, superuser) on Postgres" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "verify")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+    try migrations.run(w);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    const secret = "pg-verify-test-secret-0123456789";
+
+    // A real users record + its server-generated tokenKey (the signing-key material).
+    _ = try collections.create(al, std.testing.io, w, .{
+        .id = "", .name = "users", .type = .auth,
+        .fields = &[_]schema.Field{.{ .id = "f1", .name = "name", .options = .{ .text = .{} } }},
+        .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+    });
+    const col = (try collections.get(al, w, "users")).?;
+    var data: std.json.ObjectMap = .empty;
+    try data.put(al, "email", .{ .string = "verify@example.com" });
+    try data.put(al, "password", .{ .string = "correct horse battery" });
+    const prepared = try auth_core.applyCreate(std.testing.io, al, .{ .object = data }, col.options.auth.minPasswordLength);
+    const rec = try records.create(al, std.testing.io, w, col, prepared);
+    const rid = rec.object.get("id").?.string;
+    const ke = (try auth_api.tokenKeyAndEpochFor(al, w, "users", rid)).?;
+
+    // (1) EPOCH MODE: verifyToken reads tokenKeyEpochFor("users") on PG and accepts the token.
+    const app_epoch = .{ .jwt_secret = @as([]const u8, secret), .session_store = app_mod.SessionStore.epoch };
+    const tok_epoch = try mintAuth(al, secret, "users", rid, ke.token_key, null, 0);
+    const v1 = auth_core.verifyToken(al, app_epoch, w, tok_epoch) orelse return error.TestUnexpectedResult; // null BEFORE fix
+    try std.testing.expectEqualStrings(rid, v1.record.object.get("id").?.string);
+    try std.testing.expect(!v1.is_superuser);
+
+    // (2) TABLE MODE: a token carrying a `sid` must reference a live `_sessions` row — verify calls
+    // sessionActive on PG. Present+unexpired → accept; missing → fail-closed (null).
+    const app_table = .{ .jwt_secret = @as([]const u8, secret), .session_store = app_mod.SessionStore.table };
+    try w.exec(try std.fmt.allocPrintSentinel(al,
+        "INSERT INTO \"_sessions\" (\"id\",\"collectionRef\",\"recordRef\",\"created\",\"lastSeen\",\"expires\",\"userAgent\",\"ip\") VALUES ('sidLive','users','{s}','','',9999999999,'ua','ip');",
+        .{rid}, 0));
+    const tok_live = try mintAuth(al, secret, "users", rid, ke.token_key, "sidLive", 0);
+    const v2 = auth_core.verifyToken(al, app_table, w, tok_live) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sidLive", v2.sid);
+    // A token whose sid has no `_sessions` row is rejected (sessionActive ran and gated → fail-closed).
+    const tok_dead = try mintAuth(al, secret, "users", rid, ke.token_key, "sidGONE", 0);
+    try std.testing.expect(auth_core.verifyToken(al, app_table, w, tok_dead) == null);
+
+    // (3) SUPERUSER: verify resolves the principal via superuserRecord("_superusers") on PG.
+    try w.exec("INSERT INTO \"_superusers\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('su1','','','root@example.com','su-token-key',1);");
+    const tok_super = try mintAuth(al, secret, "_superusers", "su1", "su-token-key", null, 0);
+    const v3 = auth_core.verifyToken(al, app_epoch, w, tok_super) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(v3.is_superuser);
+    try std.testing.expectEqualStrings("root@example.com", v3.record.object.get("email").?.string);
 }

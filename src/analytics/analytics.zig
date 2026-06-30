@@ -27,12 +27,15 @@ const App = @import("../app.zig").App;
 
 /// Lower + renumber a curated `_events`/`_kv` statement for `conn`'s active backend, then prepare
 /// it. SQLite gets the verbatim `?N`/`datetime`/`strftime` SQL (zero-cost); Postgres gets the
-/// dialect's now-expressions + `$n` placeholders. A stack arena bounds the lowered SQL (statements
-/// are short); `Db.prepare` copies it, so the buffer need only outlive this call.
+/// dialect's now-expressions + `$n` placeholders. The lowered SQL lives in a transient arena
+/// (`Db.prepare` copies it), so it need only outlive this call.
 fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
-    var buf: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const lowered = param_sink.lowerStmtZ(fba.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
+    // Arena over the page allocator: no fixed ceiling (lowerStmtZ makes several intermediate
+    // allocations that the arena frees together on return), and on SQLite lowerStmtZ is a no-op
+    // returning the input slice, so this costs one empty arena. `Db.prepare` copies the text.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const lowered = param_sink.lowerStmtZ(arena.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
     return conn.prepare(lowered);
 }
 
@@ -216,15 +219,21 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
     const actor_expr: []const u8 = if (spec.group_actor) "\"actor\"" else "''";
     const seq = seqCol(conn);
 
+    // In the ON CONFLICT DO UPDATE, an UNQUALIFIED `"value"` on the RHS is ambiguous on Postgres
+    // (it exists in BOTH the target row scope AND the `excluded` pseudo-relation → "column reference
+    // value is ambiguous"); SQLite tolerates it but also accepts the qualified form. So qualify the
+    // existing-row reference with the target table name and the conflict-source with `excluded.` —
+    // ONE statement valid on both backends. (The SELECT aggregate is aliased `AS "value"` too so the
+    // projection is unambiguous.)
     const sql = try std.fmt.allocPrintSentinel(alloc,
         \\INSERT INTO "{s}" ("bucket","account","actor","value","computed_at")
-        \\ SELECT {s} AS b, {s} AS a, {s} AS ac, COUNT(*) AS v, ?2
+        \\ SELECT {s} AS b, {s} AS a, {s} AS ac, COUNT(*) AS "value", ?2
         \\ FROM "_events"
         \\ WHERE "name" = ?1 AND {s} > ?3 AND {s} <= ?4
         \\ GROUP BY b, a, ac
         \\ ON CONFLICT("bucket","account","actor")
-        \\   DO UPDATE SET "value" = "value" + excluded."value", "computed_at" = excluded."computed_at";
-    , .{ table, bucketExpr(conn, spec.time_bucket), account_expr, actor_expr, seq, seq }, 0);
+        \\   DO UPDATE SET "value" = "{s}"."value" + excluded."value", "computed_at" = excluded."computed_at";
+    , .{ table, bucketExpr(conn, spec.time_bucket), account_expr, actor_expr, seq, seq, table }, 0);
 
     var st = try prep(conn, sql);
     defer st.finalize();

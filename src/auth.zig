@@ -7,7 +7,21 @@ const clock = @import("clock.zig");
 const http = @import("http.zig");
 const collections = @import("collections.zig");
 const migrations = @import("migrations.zig");
+const param_sink = @import("sql/param_sink.zig");
 const App = @import("app.zig").App;
+
+/// Lower + renumber a curated token-VERIFICATION statement for `conn`'s backend, then prepare it.
+/// SQLite gets the verbatim `?N` SQL (zero-cost — the same slice); Postgres gets `$n` placeholders
+/// (`sql/param_sink.lowerStmtZ`). The verify path (`verifyTokenOfTypes`, hit on every authenticated
+/// request) reads `_sessions`/auth-record/`_superusers` through here so it works on Postgres — the
+/// mint path in `api/auth.zig` was already lowered, but verify lives here. The lowered SQL lives in
+/// a transient arena (`Db.prepare` copies it), so it need only outlive the call.
+fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const lowered = param_sink.lowerStmtZ(arena.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
+    return conn.prepare(lowered);
+}
 
 const HashPasswordError = @typeInfo(@typeInfo(@TypeOf(crypto.hashPassword)).@"fn".return_type.?).error_union.error_set;
 const GenTokenError = @typeInfo(@typeInfo(@TypeOf(crypto.genToken)).@"fn".return_type.?).error_union.error_set;
@@ -379,7 +393,7 @@ pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, 
 /// Variant B: true iff session `sid` exists and is unexpired (`expires IS NULL OR expires > now`).
 /// Table-mode verify only — never called in epoch mode (gated by `session_store == .table`).
 fn sessionActive(conn: *db.Db, sid: []const u8, now: i64) !bool {
-    var st = try conn.prepare("SELECT 1 FROM \"_sessions\" WHERE \"id\" = ?1 AND (\"expires\" IS NULL OR \"expires\" > ?2);");
+    var st = try prep(conn, "SELECT 1 FROM \"_sessions\" WHERE \"id\" = ?1 AND (\"expires\" IS NULL OR \"expires\" > ?2);");
     defer st.finalize();
     try st.bindText(1, sid);
     try st.bindInt(2, now);
@@ -403,7 +417,7 @@ const KeyEpoch = struct { token_key: []const u8, epoch: i64 };
 /// migration 0010. Null when the row is absent.
 fn tokenKeyEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?KeyEpoch {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
-    var st = try conn.prepare(sql);
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
     if (!try st.step()) return null;
@@ -427,7 +441,7 @@ fn ctEqlSlices(x: []const u8, y: []const u8) bool {
 
 /// Build a record object for a _superusers row (id/email/verified; secrets excluded).
 fn superuserRecord(alloc: std.mem.Allocator, conn: *db.Db, rid: []const u8) !?std.json.Value {
-    var st = try conn.prepare("SELECT \"id\",\"email\",\"verified\" FROM \"_superusers\" WHERE \"id\" = ?1;");
+    var st = try prep(conn, "SELECT \"id\",\"email\",\"verified\" FROM \"_superusers\" WHERE \"id\" = ?1;");
     defer st.finalize();
     try st.bindText(1, rid);
     if (!try st.step()) return null;
