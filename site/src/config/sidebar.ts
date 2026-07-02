@@ -34,6 +34,8 @@ export const sidebar: SidebarGroup[] = [
     label: 'Feature guides',
     entries: [
       { slug: 'postgres', label: 'PostgreSQL backend' },
+      { slug: 'tenancy', label: 'Multi-tenancy' },
+      { slug: 'abilities', label: 'Relationship abilities' },
     ],
   },
   {
