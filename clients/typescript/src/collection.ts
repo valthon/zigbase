@@ -10,6 +10,7 @@ import {
   toFormData,
 } from "./records.js";
 import { type CursorPage } from "./cursor.js";
+import { vectorSpec } from "./query.js";
 
 export interface AuthResponse {
   token: string;
@@ -152,6 +153,8 @@ export class CollectionService {
         expand: opts.expand,
         fields: opts.fields,
         skipTotal: opts.skipTotal ? 1 : undefined,
+        search: opts.search,
+        vector: opts.vector ? vectorSpec(opts.vector) : undefined,
       },
       signal: opts.signal,
       requestKey: opts.requestKey,
@@ -233,6 +236,7 @@ export class CollectionService {
     expand?: string;
     fields?: string;
     withTotal?: boolean;
+    search?: string;
     signal?: AbortSignal;
     requestKey?: string;
   } = {}): Promise<CursorPage<T>> {
@@ -255,6 +259,7 @@ export class CollectionService {
         sort: opts.sort,
         expand: opts.expand,
         fields: opts.fields,
+        search: opts.search,
       },
       signal: opts.signal,
       requestKey: opts.requestKey,
@@ -277,6 +282,7 @@ export class CollectionService {
     expand?: string;
     fields?: string;
     batch?: number;
+    search?: string;
     signal?: AbortSignal;
     requestKey?: string;
   } = {}): AsyncIterableIterator<T> {
@@ -286,6 +292,7 @@ export class CollectionService {
       sort: opts.sort,
       expand: opts.expand,
       fields: opts.fields,
+      search: opts.search,
       signal: opts.signal,
       requestKey: opts.requestKey,
     });
@@ -299,6 +306,7 @@ export class CollectionService {
         sort: opts.sort,
         expand: opts.expand,
         fields: opts.fields,
+        search: opts.search,
         signal: opts.signal,
         requestKey: opts.requestKey,
       });
@@ -312,6 +320,7 @@ export class CollectionService {
     expand?: string;
     fields?: string;
     batch?: number;
+    search?: string;
     signal?: AbortSignal;
     requestKey?: string;
   } = {}): Promise<T[]> {

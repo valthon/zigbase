@@ -2,6 +2,7 @@ import type { Client } from "../client.js";
 import type { CollectionService } from "../collection.js";
 import type { ListResult, ZbRecord } from "../records.js";
 import type { CursorPage } from "../cursor.js";
+import type { VectorQuery } from "../query.js";
 import { ZigbaseError } from "../errors.js";
 import { compileWhere, type RelationResolver } from "./where.js";
 import { makeFilterBuilder, type FilterRoot, type Expr } from "./fluent.js";
@@ -15,6 +16,8 @@ export interface TypedListOptions {
   page?: number;
   limit?: number;
   fields?: string;
+  search?: string;
+  vector?: VectorQuery;
   signal?: AbortSignal;
   requestKey?: string;
 }
@@ -33,6 +36,7 @@ export interface TypedPageOptions {
   limit?: number;
   cursor?: string;
   withTotal?: boolean;
+  search?: string;
   signal?: AbortSignal;
   requestKey?: string;
 }
@@ -90,6 +94,8 @@ export function makeRecordService(
     sort: opts?.sort,
     expand: expandList(opts?.expand),
     fields: opts?.fields,
+    search: opts?.search,
+    vector: opts?.vector,
     signal: opts?.signal,
     requestKey: opts?.requestKey,
   });
@@ -148,6 +154,7 @@ export function makeRecordService(
         sort: opts?.sort,
         expand: expandList(opts?.expand),
         fields: opts?.fields,
+        search: opts?.search,
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       };
@@ -178,6 +185,7 @@ export function makeRecordService(
         limit: opts?.limit,
         cursor: opts?.cursor,
         withTotal: opts?.withTotal,
+        search: opts?.search,
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
@@ -189,6 +197,7 @@ export function makeRecordService(
         sort: opts?.sort,
         expand: expandList(opts?.expand),
         fields: opts?.fields,
+        search: opts?.search,
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
@@ -204,6 +213,7 @@ export function makeRecordService(
         sort: opts?.sort,
         expand: expandList(opts?.expand),
         fields: opts?.fields,
+        search: opts?.search,
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });

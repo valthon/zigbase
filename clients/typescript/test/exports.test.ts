@@ -6,6 +6,7 @@ describe("public exports (Plan 2)", () => {
     expect(typeof zb.filter).toBe("function");
     expect(typeof zb.parseSort).toBe("function");
     expect(typeof zb.compareBySort).toBe("function");
+    expect(typeof zb.vectorSpec).toBe("function");
   });
 
   it("no longer exports client-side cursor synthesis helpers", () => {

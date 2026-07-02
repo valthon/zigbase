@@ -1,3 +1,5 @@
+import type { VectorQuery } from "./query.js";
+
 /** Permissive default record shape used by the dynamic base SDK. SP2 substitutes real types. */
 export interface ZbRecord {
   id: string;
@@ -20,6 +22,11 @@ export interface ListOpts {
   expand?: string;
   fields?: string;
   skipTotal?: boolean;
+  /** Full-text search terms (FTS5 / Postgres FTS); AND-composes with `filter`. Requires ZigBase >= 0.9.0. */
+  search?: string;
+  /** Nearest-neighbor search (server `-Dvector` builds only; offset mode only — the server
+   *  rejects vector + cursor). Requires ZigBase >= 0.9.0. */
+  vector?: VectorQuery;
   signal?: AbortSignal;
   /** Opt-in de-duplication key; a new request aborts any in-flight one with the same key. */
   requestKey?: string;
