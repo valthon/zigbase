@@ -823,7 +823,7 @@ await zb.realtime.subscribe("posts/REC123", (e) => {
   /* fires on update/delete of one record */
 });
 
-await unsub(); // stop this callback (the socket closes when the last topic goes away)
+unsub(); // stop this callback (the socket closes when the last topic goes away)
 ```
 
 A **single shared WebSocket** to `/api/realtime` is created lazily on the first `subscribe`
@@ -855,7 +855,7 @@ const unsub = await zb.realtime.subscribeTopic("availability", (msg) => {
   if (msg.kind === "message") msg.data; // the broadcast payload
 });
 
-await unsub(); // or: zb.realtime.unsubscribeTopic("availability", cb);
+unsub(); // or: zb.realtime.unsubscribeTopic("availability", cb);
 ```
 
 `kind` mirrors the wire frame's `type` field verbatim: `{"type":"signal","topic":"…"}` delivers
