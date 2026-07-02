@@ -146,6 +146,53 @@ res.setHeader("Set-Cookie", store.exportToCookie({ secure: true, sameSite: "stri
 store.loadFromCookie(req.headers.cookie ?? "");
 ```
 
+## Account scoping (multi-tenancy)
+
+*Requires ZigBase >= 0.9.0 with `.tenancy` enabled.*
+
+Every request can carry an `X-Account-Id` header to scope reads/writes to one of the
+principal's memberships. Two ways to set it:
+
+```ts
+// 1. Bake it into the client at creation time.
+const zb = createClient(url, { accountId: "acc_123" });
+
+// 2. withAccount(id) — a sibling client scoped to a (possibly different) account.
+const scoped = zb.withAccount("acc_123");
+await scoped.collection("notes").getList(); // every request carries X-Account-Id: acc_123
+```
+
+`withAccount` **shares the same `AuthStore`** as the client it was derived from — one
+principal, many scopes. Logging in or out on either view updates both. `withAccount` calls
+**replace** the account id rather than stacking: `zb.withAccount("a").withAccount("b")` is
+scoped to `"b"` only, not both.
+
+```ts
+// accounts.activate(id) — verify membership + set the zb_account cookie (browser apps).
+const scope = await zb.accounts.activate("acc_123");
+scope.account; // "acc_123"
+scope.role;    // the caller's role on that account
+```
+
+> **The `zb_account` cookie is a same-origin browser convenience only.** `activate()` sets a
+> signed cookie the server reads as a fallback when no `X-Account-Id` header is present — handy
+> for a same-origin SPA that just wants "switch active account" to persist across reloads. It
+> does **not** work cross-origin, and the **header always wins** over the cookie when both are
+> present. API clients and SSR code should prefer `withAccount(id)` / the `accountId` option
+> instead — **the SDK itself never reads the cookie.**
+
+> **Known limitation: no realtime tenant scoping.** Browser WebSockets cannot carry custom
+> headers, so `X-Account-Id` has no realtime equivalent — a subscribed connection's delivery
+> authorization is whatever the server's connection-level resolution does, independent of any
+> `withAccount` scoping you've done on the REST side. This is a documented limitation, not a bug.
+
+**Typed tier.** Tenant-owned collections carry a `tenant?: string` metadata field; the generated
+`*Create`/`*Update` payload types **omit** the tenant field entirely (the server stamps it from
+the active account and rejects cross-tenant moves — offering the key would only invite dead
+writes). It stays readable on the record interface and filterable in `*Where`/`*Fields`/sort. The
+generated client also gets `withAccount(id)` (rebuilding the typed facade over the base client's
+`withAccount`) and a pass-through `accounts` service.
+
 ## Records
 
 The base SDK is **dynamically typed**: a plain `ZbRecord` has `id: string` and every other field
@@ -213,6 +260,48 @@ filter`title = ${`he said "hi" to O'Brien`}`;
 > **Injection safety.** The closing single quote can only appear escaped, so an interpolated
 > value can never break out of its literal — even `' || 1=1 --` becomes one inert token.
 
+## Search & vector
+
+*Requires ZigBase >= 0.9.0.*
+
+`getList` (and every list-ish read — `getPage` / `iterate` / `getFullList`) accepts `search` for
+full-text search (FTS5 / Postgres FTS) and `vector` for nearest-neighbor search on `-Dvector`
+server builds. Both work in offset mode; `vector` is **offset-only** (the server rejects it in
+cursor mode).
+
+```ts
+// Full-text search — ANDs with `filter`; works in offset AND cursor mode.
+const hits = await posts.getList<Post>(1, 30, { search: "zig sqlite" });
+
+// Vector search — structured query + the exported vectorSpec builder, offset mode only.
+import { vectorSpec, type VectorQuery } from "@zigbase/client";
+
+const q: VectorQuery = { field: "embedding", metric: "cosine", values: [0.12, 0.34, /* … */] };
+const nearest = await posts.getList<Post>(1, 10, { vector: q });
+```
+
+`vectorSpec(q)` serializes a `VectorQuery` to the wire's `<field>[:metric]:<json-embedding>`
+mini-grammar (used internally by `getList({ vector })`); it throws if any embedding value is
+non-finite (same posture as `filter`'s operand check). `field` is passed through verbatim — the
+server gates identifiers, not the client.
+
+> **No client-side pre-flight.** Whether vector search is compiled in, which fields are
+> searchable, and embedding dimensions are all server-side facts the client can't know in
+> advance — it does not try to validate them. You'll see the server's 400s verbatim as
+> `ZigbaseError{status: 400}`:
+> - `"This collection has no searchable fields; \`search\` is not supported here."`
+> - `"Vector search is not enabled in this build."` (server not built with `-Dvector`)
+> - `"Vector search does not support cursor pagination; use offset paging."`
+> - `"Invalid vector search query: the query embedding's dimension may not match the stored
+>   embeddings (or a stored embedding is malformed)."`
+> - `"Vector search is unavailable: the pgvector extension is not installed on this database
+>   (run \`CREATE EXTENSION vector\`)."` (Postgres only)
+
+**Typed tier.** The generated concrete service interfaces only expose `search?: string` on
+collections with at least one searchable field, and `vector?: { field: <json-field-union>; … }`
+on collections with at least one `json` field — a collection with neither simply lacks the key,
+so `zb.db.tags.getList({ search: "x" })` is a compile error mirroring the server's 400.
+
 ## Pagination — offset + cursor
 
 ```ts
@@ -266,6 +355,85 @@ const protectedUrl = zb.files.getUrl(record, record.cover, { token });
 const url2 = zb.files.getUrl("posts", "REC123", "cover.png", { download: true });
 ```
 
+## Abilities
+
+*Requires ZigBase >= 0.9.0.*
+
+`getAbilities(id)` reports the actions the current principal may perform on a specific record —
+useful for conditionally rendering edit/delete UI without guessing at rule outcomes:
+
+```ts
+const abilities = await posts.getAbilities("REC123");
+abilities.view;   // always true on a 200 — you couldn't have fetched abilities otherwise
+abilities.update; // boolean
+abilities.delete; // boolean
+```
+
+`getAbilities` is available on the base `CollectionService` and on every generated collection
+service (it is emitted unconditionally — rules and tenancy answer even without an explicit
+`.abilities` config on the collection). **404, not 403, when the record isn't viewable** — the
+endpoint is a deliberate non-oracle: a `ZigbaseError{status: 404}` never tells you whether the
+record exists and you lack access, or it simply doesn't exist.
+
+## Analytics
+
+*Requires ZigBase >= 0.9.0.*
+
+`client.analytics` exposes two read APIs over the tenant-scoped `_events` activity feed and any
+declared rollups:
+
+```ts
+// GET /api/analytics/events — the active account's activity feed.
+const feed = await zb.analytics.events({ name: "signup", since: new Date("2026-01-01"), limit: 50 });
+feed.items[0]?.payload; // unknown (JSON value; null when unparseable/empty)
+
+// GET /api/analytics/rollups/:name — a declared rollup's summary rows.
+const rollup = await zb.analytics.rollup("daily_signups", { from: weekAgo, to: new Date() });
+rollup.items[0]?.value;
+```
+
+Wire field names stay **snake_case** as the server sends them (`actor_collection`, `occurred_at`,
+`computed_at`, …) — the SDK does not rename server fields anywhere else and doesn't start here.
+`from`/`to`/`since` accept either an ISO string or a `Date`; a `Date` is serialized with
+`toISOString()`, same as `filter`. **Passing an invalid `Date` (e.g. `new Date("not a date")`)
+throws a `RangeError` client-side** — `toISOString()` rejects it before a request is ever sent.
+
+`events()` is `401` for an anonymous caller, returns empty `items` when there's no active
+account, and a superuser sees every account's events. `rollup(name)` is `404` for an undeclared
+rollup name and `403` when a non-superuser queries a rollup that isn't grouped by account.
+
+## Senders
+
+*`list` requires ZigBase >= 0.10.0; `create`/`verify` require >= 0.9.0.*
+
+`client.senders` manages verified From-address identities for outbound mail, scoped to the
+active account exactly like the record API (`withAccount` / the `zb_account` cookie / a
+superuser's explicit header):
+
+```ts
+// POST /api/senders — request verification. The token is EMAILED to the address, never
+// returned in the response.
+const pending = await zb.senders.create("orders@my-shop.example");
+pending.status; // "pending" (201) or already-verified (200)
+
+// POST /api/senders/:id/verify — confirm with the token from the email.
+await zb.senders.verify(pending.id, tokenFromEmail);
+
+// GET /api/senders — the active account's identities (requires server >= 0.10.0).
+const { items } = await zb.senders.list();
+items[0]?.verified_at;
+```
+
+A re-send of `create()` for the same `(account, email)` within the server's throttle window
+rejects with a `429` `ZigbaseError`. `verify()` returns `404` — never a distinguishing error —
+for a wrong token, wrong account, or wrong id, so the endpoint can't be used to probe for valid
+identities.
+
+> **Breaking (0.10.0):** `GET /api/senders` used to return a bare JSON array; as of server
+> 0.10.0 it returns `{ "items": [...] }`, matching the analytics endpoints' envelope. The SDK's
+> `list()` types only the fixed shape — against a 0.9.0-only server the response shape won't
+> match what `list()` expects, so `senders.list()` requires **>= 0.10.0**.
+
 ## Typed client — `@zigbase/client/typed`
 
 `@zigbase/client/typed` is the **generic typed core** that a generated `zbase.gen.ts` file
@@ -286,7 +454,7 @@ The subpath exports runtime factories and type utilities:
 | `makeTypedFiles` | factory | Build a typed file-URL helper. |
 | `makeFilterBuilder` | factory | Build a fluent filter builder (a `Proxy` over field names). |
 | `compileWhere` | function | Compile a `where`-DSL object into an SP1 filter string. |
-| `compileIn` | function | Compile an `in`-list into a disjunction of `<field> = <value>` clauses (OR-joined). |
+| `compileIn` | function | Compile an `in`-list to the native `field in (...)` filter operator. |
 | `OP_MAP` | object | Operator-to-filter-operator mapping (e.g. `eq` → `=`). |
 | `fieldMeta` | helper | Look up a `FieldMeta` by name from a `CollectionMeta` (`fieldMeta(meta, name): FieldMeta \| undefined`). |
 | `Expr`, `FieldExpr` | classes | Fluent filter expression nodes. |
@@ -334,6 +502,37 @@ const post = await posts.getOne("REC123", { expand: ["author"] });
 The `@zigbase/client/typed` subpath tree-shakes independently of `@zigbase/client/realtime` —
 importing just the typed core adds only the where-compiler and factory code, not the
 realtime / live-store graph.
+
+### Typed sort & native `in`
+
+*Requires ZigBase >= 0.9.0.*
+
+In newly generated files, `sort` is narrowed per collection instead of a bare `string`:
+
+```ts
+export type ProfileSortField = "email" | "username" | "age" | "id" | "created" | "updated";
+export type ProfileSort = SortExpr<ProfileSortField>; // ProfileSortField | `-${ProfileSortField}`
+
+// every opts object that had `sort?: string` now has:
+sort?: ProfileSort | ProfileSort[];
+
+await zb.db.profiles.getList({ sort: "-age" });               // ok
+await zb.db.profiles.getList({ sort: ["-age", "username"] });  // ok, multi-key
+await zb.db.profiles.getList({ sort: "-nope" });                // compile error
+```
+
+The `where`-DSL's `in` operator now compiles to the filter grammar's **native** `field in (...)`
+operator instead of the old `||`-chain desugar:
+
+```ts
+compileIn("status", ["draft", "published"]);
+// => status in ('draft', 'published')
+```
+
+> **This is a behavior change against old servers, not just a client refactor.** A `{ in: [...] }`
+> where-clause now **400s against a server older than 0.9.0** (its filter grammar doesn't accept
+> `in (...)`) — there is no version sniff or client-side fallback. If you regenerate against a
+> 0.9.0+ server you're already on the floor this needs.
 
 ## Runtime introspection (`zigbase typegen`)
 
@@ -632,6 +831,47 @@ Anonymous subscriptions are allowed only for collections with a `@public` view r
 (server-enforced). The client does not pre-gate — it surfaces the server's `error` frame
 (rejecting the pending `subscribe()` and/or calling your `onError` hook).
 
+### Custom topics — `subscribeTopic`
+
+*Requires ZigBase >= 0.9.0 for custom-route `signal`/`message` broadcasts; the built-in
+`__features` signal requires >= 0.10.0.*
+
+Beyond per-collection record events, the server lets custom routes push arbitrary topic
+broadcasts (`ctx.realtime().signal(topic)` / `.broadcast(topic, payload)`). Subscribe with
+`subscribeTopic`, which delivers the same **enveloped frames** as everything else on the
+socket — `signal` (no payload; a re-fetch hint) or `message` (payload-carrying):
+
+```ts
+const unsub = await zb.realtime.subscribeTopic("availability", (msg) => {
+  msg.topic;          // "availability"
+  msg.kind;            // "signal" | "message"
+  if (msg.kind === "message") msg.data; // the broadcast payload
+});
+
+await unsub(); // or: zb.realtime.unsubscribeTopic("availability", cb);
+```
+
+`kind` mirrors the wire frame's `type` field verbatim: `{"type":"signal","topic":"…"}` delivers
+`kind: "signal"` with no `data`, and `{"type":"message","topic":"…","data":…}` delivers
+`kind: "message"` with `data` set. Topic subscriptions reuse the same shared-socket machinery as
+record subscriptions (ack/pending/resubscribe/backoff) but take no `filter`; a topic that rejects
+the subscribe (not `canSubscribeTopic`-eligible) rejects the `subscribeTopic()` promise the same
+way an invalid collection subscribe does.
+
+**Feature-flag changes are just a topic.** There's no dedicated flags-changed API — the server's
+built-in `__features` channel is an ordinary signal topic:
+
+```ts
+await zb.realtime.subscribeTopic("__features", () => {
+  // re-fetch zb.flags.resolveAll(subject) — the signal carries no data
+});
+```
+
+> **Breaking (0.10.0):** before 0.10.0 this channel emitted a bespoke, topic-less
+> `{"type":"features.changed"}` frame that `subscribeTopic` cannot deliver. As of server 0.10.0
+> it emits the standard `{"type":"signal","topic":"__features"}` frame like every other topic, so
+> `subscribeTopic("__features", cb)` requires **>= 0.10.0**.
+
 ### High-level live store — "same API, now live"
 
 `zb.realtime.collection(name)` mirrors the record read API but returns **live** objects that
@@ -801,6 +1041,47 @@ if (res.ok) {
   console.log(res.headers.get("content-type"));
 }
 ```
+
+## Server compatibility
+
+`@zigbase/client` 0.3.0's new surfaces have **two server floors** — most of them land at 0.9.0,
+but two wire shapes were fixed for consistency and only exist as of 0.10.0:
+
+| client 0.3.0 feature | server < 0.9.0 | 0.9.0 | >= 0.10.0 |
+|---|---|---|---|
+| existing (0.2.x) API surface | works | works | works |
+| search/vector, `withAccount`/`activate`, abilities, analytics, typed sort, `subscribeTopic` (signals + `message` broadcasts) | 404 / 400, loudly | works | works |
+| native `in` where-DSL | 400 parse error | works | works |
+| `senders.*` (`{items}` envelope) | 404 | shape mismatch (bare array) — do not use | works |
+| `subscribeTopic("__features")` feature-change signals | nothing delivered | nothing delivered (old `features.changed` frame is dropped) | works |
+| client 0.2.x against >= 0.9.0 / 0.10.0 | — | works | works (it never consumed the two changed wire shapes) |
+
+The behavior change against **old** servers is the where-DSL `in` operator switching to native
+emission: a `{ in: [...] }` where-clause sent to a pre-0.9.0 server now 400s instead of working
+via the old `||` desugar. There's no version sniff — the typed tier has always tracked the
+current server release, and adding a startup request just to detect this isn't worth it. Per
+ZigBase's pre-1.0 breaking-changes policy, the client also ships **no shims for the pre-0.10.0
+wire shapes** — it speaks only the fixed formats, so `senders.*` and the `__features` signal
+simply require 0.10.0.
+
+**Generated-code ↔ core coupling.** Files generated by the **0.10.0** codegen binary reference
+new typed-core exports and `CollectionMeta` keys that don't exist on `@zigbase/client` 0.2.0 —
+against that old core they fail typecheck with opaque excess-property errors. To make the
+failure self-explaining, the typed core exports a marker type and every generated file imports
+it right under the header:
+
+```ts
+// @zigbase/client/typed
+export type CoreSupports_0_3 = true;
+
+// generated zbase.gen.ts, right under the header:
+// requires @zigbase/client >= 0.3.0
+type _RequiresCore = import("@zigbase/client/typed").CoreSupports_0_3;
+```
+
+On `@zigbase/client` 0.2.0 the resulting compile error literally names `CoreSupports_0_3`,
+pointing you at the fix (upgrade the client package). **Old generated files keep working on the
+new core** — every core change in 0.3.0 is additive, and new `CollectionMeta` keys are optional.
 
 ## See also
 

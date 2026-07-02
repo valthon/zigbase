@@ -16,6 +16,15 @@ Published on npm as `@zigbase/client`. Three tiers — the base dynamic client (
 the comptime-generated typed client (`zig build gen-client`), and runtime introspection
 (`npx @zigbase/typegen`). See the [TypeScript SDK docs](../../docs/typescript-sdk.md).
 
+**New in 0.3.0** — full-text `search` + structured `vector` queries on list reads, multi-tenant
+account scoping (`accountId`, `client.withAccount(id)`, `accounts.activate`), per-record
+`getAbilities(id)`, analytics read APIs (`client.analytics.events`/`.rollup`), verified sender
+management (`client.senders.list/create/verify`), realtime custom topics
+(`subscribeTopic`/`unsubscribeTopic`), and typed sort + a native `in` where-DSL operator in
+generated clients. **Requires ZigBase >= 0.9.0 for the new surfaces; senders and the
+`__features` signal require >= 0.10.0.** See the [TypeScript SDK docs](../../docs/typescript-sdk.md)
+for the full write-up.
+
 ## Quick start
 
 ```ts
