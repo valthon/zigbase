@@ -82,7 +82,7 @@ const unsub = await client.realtime.subscribeTopic('orders', (msg) => {
   // msg is the enveloped frame: { topic, kind: "signal" | "message", data? }
   if (msg.kind === 'message') console.log(msg.data);
 });
-// later: await unsub();
+// later: unsub();
 ```
 
 `subscribeTopic` requires client **0.3.0 or newer** — older `@zigbase/client` versions only expose
