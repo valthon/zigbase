@@ -1,4 +1,6 @@
 ---
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
 const points = [
   {
     title: 'One static binary',
@@ -51,6 +53,10 @@ const points = [
       ))
     }
   </div>
+
+  <p class="why__compare">
+    <a href={`${base}compare`}>How ZigBase compares →</a>
+  </p>
 </section>
 
 <style>
@@ -88,5 +94,11 @@ const points = [
     color: var(--color-muted);
     font-size: var(--text-sm);
     line-height: var(--leading-normal);
+  }
+
+  .why__compare {
+    text-align: center;
+    margin-top: var(--space-6);
+    font-weight: 600;
   }
 </style>

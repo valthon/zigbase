@@ -351,6 +351,13 @@ option tables; they teach one happy path plus the caveats.
 
 ## 6. Comparison page
 
+**Amendment (2026-07-02, owner request): add TrailBase (trailbase.io) as a fourth
+competitor column** — the closest-in-kind comparison (single-binary, SQLite-based,
+PocketBase-inspired, Rust with a V8/ES JS runtime for extensions). Every TrailBase cell
+is ⚠-verify: research trailbase.io and its docs at implementation time; do not assert
+from memory. The "choose X if…" closing paragraphs gain a TrailBase entry (likely:
+"choose TrailBase if you want a Rust core with a TypeScript extension runtime").
+
 **Placement decision: site-only**, at `site/src/pages/compare.astro` (precedent:
 `download.astro` is already a site-only page outside the docs collection). Justification:
 it describes *competitors'* current state, which drifts on a different clock than
