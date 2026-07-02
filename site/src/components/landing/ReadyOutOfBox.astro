@@ -8,14 +8,34 @@ const modules = [
     href: base + 'docs/api',
   },
   {
+    title: 'PostgreSQL backend',
+    body: 'Opt-in -Dpostgres build: same app on Postgres, record changes fan out across instances, migrate-db to move existing data.',
+    href: base + 'docs/postgres',
+  },
+  {
+    title: 'Multi-tenancy',
+    body: 'Account-scoped reads, writes, and realtime; built-in accounts, memberships, invitations, and role checks.',
+    href: base + 'docs/tenancy',
+  },
+  {
+    title: 'Full-text search',
+    body: '.searchable fields, ranked ?search= queries with operators; opt-in vector KNN.',
+    href: base + 'docs/search',
+  },
+  {
+    title: 'Jobs, webhooks & email',
+    body: 'Durable queues with retries, signed outbound webhooks, and a templated multi-provider email subsystem.',
+    href: base + 'docs/jobs-and-webhooks',
+  },
+  {
     title: 'User management + OAuth2',
     body: 'argon2id passwords, JWT, verification & reset flows, OAuth2 + PKCE login.',
     href: base + 'docs/api',
   },
   {
     title: 'Realtime subscriptions',
-    body: 'Subscribe to create / update / delete events on records over WebSocket.',
-    href: base + 'docs/api',
+    body: 'Subscribe to create / update / delete events on records over WebSocket — plus signal/broadcast on custom channels.',
+    href: base + 'docs/realtime-broadcast',
   },
   {
     title: 'Local (pluggable) file storage',
@@ -54,7 +74,7 @@ const modules = [
   },
   {
     title: 'Auth lifecycle hooks',
-    body: 'Magic-link, OTP, and WebAuthn passkeys. beforeAuthSuccess and beforeRegister run inside the login transaction.',
+    body: 'Magic-link, OTP, and WebAuthn passkeys. beforeAuthSuccess and beforeRegister run inside the login and registration transactions.',
     href: base + 'docs/framework',
   },
 ];
