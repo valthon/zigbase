@@ -22,15 +22,13 @@ const Ctx = @import("../ctx.zig").Ctx;
 pub var active: bool = false;
 
 /// Fixed PUBLIC realtime channel for the feature-management "changed" signal
-/// (#128/#129/#130). It is signal-only: a frame `{"type":"features.changed"}` is
-/// published whenever any flag/experiment override changes; clients re-`GET /api/state`
-/// on receipt. No per-subject state or experiment assignment is ever pushed. It is NOT
-/// a collection — the subscribe path allows anonymous subscription to it explicitly and
-/// the delivery path forwards its frames verbatim.
+/// (#128/#129/#130). It is signal-only: the STANDARD signal frame
+/// `{"type":"signal","topic":"__features"}` is published whenever any flag/experiment
+/// override changes (0.10.0 — the bespoke `{"type":"features.changed"}` frame is gone);
+/// clients re-`GET /api/state` on receipt. No per-subject state or experiment assignment
+/// is ever pushed. It is NOT a collection — the subscribe path allows anonymous
+/// subscription to it explicitly and the delivery path forwards its frames unchanged.
 pub const FEATURES_CHANNEL = "__features";
-
-/// The exact signal frame published on `FEATURES_CHANNEL`.
-const FEATURES_CHANGED_FRAME = "{\"type\":\"features.changed\"}";
 
 /// Max concurrent subscriptions per connection (bounds per-conn facil.io subscription state).
 const MAX_SUBS = 256;
@@ -536,27 +534,57 @@ pub fn startRemoteListener(app: *App) void {
     };
 }
 
-/// Signal-only feature-management push (#128/#129/#130): publish `{"type":"features.changed"}`
-/// on the public `FEATURES_CHANNEL` so subscribed clients re-`GET /api/state`. Called from
-/// every override write path (`ctx.setFlag`/`App.setFlag` and the admin settings verbs).
-/// A no-op when the reactor isn't running (tests/CLI). NEVER pushes per-subject state or
-/// experiment assignments — those stay behind the authenticated `/api/state` projection.
-pub fn broadcastFeaturesChanged() void {
-    if (!active) return; // reactor not running (tests/CLI): no-op
-    WS.publish(.{ .channel = FEATURES_CHANNEL, .message = FEATURES_CHANGED_FRAME });
+/// Build the standard signal frame `{"type":"signal","topic":"<json-escaped topic>"}`.
+fn signalFrameAlloc(a: std.mem.Allocator, topic: []const u8) ![]const u8 {
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "type", .{ .string = "signal" });
+    try o.put(a, "topic", .{ .string = topic });
+    return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = o }, .{});
 }
 
-/// #143: consumer broadcast. Publish an already-serialized `message` VERBATIM to every
-/// subscriber of a custom `topic`. There is NO per-record viewRule on delivery — subscription
-/// authorization is enforced once, at subscribe time, by `canSubscribeTopic`. EXPLICIT opt-in:
-/// `message` must be safe for every subscriber of `topic` (gate private channels with a
-/// `.realtime = .{ .canSubscribe = fn }` predicate; prefer `signalTopic` + an authenticated
-/// re-fetch for per-subject state). A no-op when the reactor isn't running (tests/CLI), like
-/// `broadcast`. `topic` is a consumer channel name, not a collection name. Callable from any
-/// thread (incl. a background job): `fio_publish` is a non-blocking enqueue that copies `message`.
-pub fn broadcastTopic(topic: []const u8, message: []const u8) void {
+/// Splice pre-serialized payload bytes into the standard message envelope:
+/// `{"type":"message","topic":"<json-escaped topic>","data":<data_json>}`.
+/// `data_json` MUST already be valid JSON (ctx.RealtimeApi.broadcast produces it via
+/// std.json.Stringify) — it is spliced verbatim, never re-parsed or re-serialized.
+fn messageEnvelopeAlloc(a: std.mem.Allocator, topic: []const u8, data_json: []const u8) ![]const u8 {
+    var w: std.ArrayList(u8) = .empty;
+    try w.appendSlice(a, "{\"type\":\"message\",\"topic\":");
+    try w.appendSlice(a, try std.json.Stringify.valueAlloc(a, std.json.Value{ .string = topic }, .{}));
+    try w.appendSlice(a, ",\"data\":");
+    try w.appendSlice(a, data_json);
+    try w.appendSlice(a, "}");
+    return w.toOwnedSlice(a);
+}
+
+/// Signal-only feature-management push (#128/#129/#130): publish the STANDARD signal frame
+/// `{"type":"signal","topic":"__features"}` on the public `FEATURES_CHANNEL` so subscribed
+/// clients re-`GET /api/state`. One frame grammar for every topic push (0.10.0, Breaking:
+/// replaces the bespoke `{"type":"features.changed"}` frame). Called from every override
+/// write path (`ctx.setFlag`/`App.setFlag` and the admin settings verbs). A no-op when the
+/// reactor isn't running (tests/CLI). NEVER pushes per-subject state or experiment
+/// assignments — those stay behind the authenticated `/api/state` projection.
+pub fn broadcastFeaturesChanged() void {
+    signalTopic(FEATURES_CHANNEL);
+}
+
+/// #143: consumer broadcast. Wrap `data_json` — an ALREADY-SERIALIZED JSON value — in the
+/// standard `{"type":"message","topic":…,"data":…}` envelope and publish it to every
+/// subscriber of a custom `topic`. The envelope is structural (0.10.0): no consumer-reachable
+/// path can publish an unenveloped frame, and a non-JSON payload is impossible by
+/// construction (the public `ctx.realtime().broadcast` serializes via std.json.Stringify and
+/// errors at the call site). There is NO per-record viewRule on delivery — subscription
+/// authorization is enforced once, at subscribe time, by `canSubscribeTopic`. EXPLICIT
+/// opt-in: `data_json` must be safe for every subscriber of `topic` (gate private channels
+/// with `.realtime = .{ .canSubscribe = fn }`; prefer `signalTopic` + an authenticated
+/// re-fetch for per-subject state). A no-op when the reactor isn't running (tests/CLI).
+/// `topic` is a consumer channel name, not a collection name. Callable from any thread
+/// (incl. a background job): `fio_publish` is a non-blocking enqueue that copies the frame.
+pub fn broadcastTopic(topic: []const u8, data_json: []const u8) void {
     if (!active) return; // reactor not running (tests/CLI): no-op
-    WS.publish(.{ .channel = topic, .message = message });
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const frame = messageEnvelopeAlloc(arena.allocator(), topic, data_json) catch return;
+    WS.publish(.{ .channel = topic, .message = frame });
 }
 
 /// #143: signal-only consumer push. Publish `{"type":"signal","topic":"<topic>"}` on a custom
@@ -566,11 +594,7 @@ pub fn signalTopic(topic: []const u8) void {
     if (!active) return; // reactor not running (tests/CLI): no-op
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const a = arena.allocator();
-    var o: std.json.ObjectMap = .empty;
-    o.put(a, "type", .{ .string = "signal" }) catch return;
-    o.put(a, "topic", .{ .string = topic }) catch return;
-    const frame = std.json.Stringify.valueAlloc(a, std.json.Value{ .object = o }, .{}) catch return;
+    const frame = signalFrameAlloc(arena.allocator(), topic) catch return;
     WS.publish(.{ .channel = topic, .message = frame });
 }
 
@@ -624,8 +648,34 @@ test "broadcastTopic/signalTopic are no-ops when inactive (#143)" {
     // Like broadcast/broadcastFeaturesChanged, the consumer publish entry points must early-return
     // when the reactor isn't running so ctx.realtime() is safe to call from tests/CLI/background jobs.
     try std.testing.expect(!active);
-    broadcastTopic("orders", "{\"type\":\"message\",\"topic\":\"orders\"}"); // would touch the inactive cluster (UB) otherwise
+    broadcastTopic("orders", "{\"n\":1}"); // pre-serialized payload; enveloped internally
     signalTopic("availability"); // builds + would publish a signal frame; must early-return
+}
+
+test "messageEnvelopeAlloc splices the standard message envelope + JSON-escapes the topic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"message\",\"topic\":\"orders\",\"data\":{\"id\":\"r1\"}}",
+        try messageEnvelopeAlloc(a, "orders", "{\"id\":\"r1\"}"),
+    );
+    // topic escaping: a quote in the topic must not break the frame
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"message\",\"topic\":\"a\\\"b\",\"data\":1}",
+        try messageEnvelopeAlloc(a, "a\"b", "1"),
+    );
+}
+
+test "broadcastFeaturesChanged uses the standard signal frame (0.10.0 wire fix)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // broadcastFeaturesChanged delegates to signalTopic(FEATURES_CHANNEL); this pins the frame.
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"signal\",\"topic\":\"__features\"}",
+        try signalFrameAlloc(a, FEATURES_CHANNEL),
+    );
 }
 
 test "subscribeDecision: collection topics ALWAYS use collection authz, custom topics use the predicate (#143)" {

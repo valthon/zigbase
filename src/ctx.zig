@@ -1057,20 +1057,15 @@ pub const RealtimeApi = struct {
     }
 
     /// Payload-carrying broadcast (EXPLICIT opt-in): subscribers of `topic` receive
-    /// `{"type":"message","topic":"<topic>","data":<payload>}` VERBATIM. `payload` is any
-    /// JSON-serializable value. Only broadcast data that is safe for EVERY subscriber of
-    /// `topic`; gate private channels with `.realtime = .{ .canSubscribe = fn }`, or prefer
-    /// `signal` + an authenticated re-fetch for per-subject state.
+    /// `{"type":"message","topic":"<topic>","data":<payload>}`. `payload` is any
+    /// JSON-serializable value (an unserializable value errors HERE, at the call site —
+    /// the envelope itself is applied structurally by the realtime layer). Only broadcast
+    /// data that is safe for EVERY subscriber of `topic`; gate private channels with
+    /// `.realtime = .{ .canSubscribe = fn }`, or prefer `signal` + an authenticated
+    /// re-fetch for per-subject state.
     pub fn broadcast(self: RealtimeApi, topic: []const u8, payload: anytype) !void {
-        const a = self.ctx.arena;
-        const data_json = try std.json.Stringify.valueAlloc(a, payload, .{});
-        const data_val = (try std.json.parseFromSlice(std.json.Value, a, data_json, .{})).value;
-        var o: std.json.ObjectMap = .empty;
-        try o.put(a, "type", .{ .string = "message" });
-        try o.put(a, "topic", .{ .string = topic });
-        try o.put(a, "data", data_val);
-        const frame = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = o }, .{});
-        realtime_ws.broadcastTopic(topic, frame);
+        const data_json = try std.json.Stringify.valueAlloc(self.ctx.arena, payload, .{});
+        realtime_ws.broadcastTopic(topic, data_json);
     }
 };
 
@@ -2185,4 +2180,13 @@ test "#140 ctx.verifyCaptcha errors on a provider that differs from the configur
     env.app.captcha_secret = "";
     const r = try ctx.verifyCaptcha(.hcaptcha, "token");
     try std.testing.expect(r.ok);
+}
+
+test "#143 ctx.realtime(): signal + broadcast serialize and are safe no-ops when the reactor is inactive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = .{} };
+    cx.realtime().signal("availability");
+    // Serialization happens at the call site; the publish itself is a no-op (inactive reactor).
+    try cx.realtime().broadcast("orders", .{ .kind = "order.shipped", .id = "r1" });
 }

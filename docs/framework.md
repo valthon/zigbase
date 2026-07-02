@@ -1241,18 +1241,22 @@ event, so an app without `.onFeatureExposure` pays nothing on the read path.
 
 Any override change — `ctx.setFlag`/`App.setFlag`, or an admin `PUT`/`DELETE` of a
 `flag:<name>` / `exp:<name>:weights` setting — broadcasts a single frame
-`{"type":"features.changed"}` on the fixed **public** realtime channel `__features` (over the
-existing WebSocket). It is **signal-only**: no per-subject state or experiment assignment is
-ever pushed. Clients subscribe anonymously to `__features` and re-`GET /api/state` (or call
-`ctx.flags().resolveAll`) on receipt to pull fresh resolved values:
+`{"type":"signal","topic":"__features"}` on the fixed **public** realtime channel `__features`
+(over the existing WebSocket). It is **signal-only**: no per-subject state or experiment
+assignment is ever pushed. Clients subscribe anonymously to `__features` and re-`GET
+/api/state` (or call `ctx.flags().resolveAll`) on receipt to pull fresh resolved values:
 
 ```js
 const ws = new WebSocket(`ws://${location.host}/api/realtime`);
 ws.onopen = () => ws.send(JSON.stringify({ action: "subscribe", topic: "__features" }));
 ws.onmessage = (e) => {
-  if (JSON.parse(e.data).type === "features.changed") refetchState();
+  const m = JSON.parse(e.data);
+  if (m.type === "signal" && m.topic === "__features") refetchState();
 };
 ```
+
+Changed in 0.10.0: this channel previously emitted a bespoke `{"type":"features.changed"}`
+frame; it now uses the same standard signal frame as every custom topic.
 
 ### Superuser settings HTTP API
 

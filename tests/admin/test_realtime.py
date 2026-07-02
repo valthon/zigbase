@@ -3,7 +3,8 @@ from conftest import login, api_request
 def test_features_changed_signal_on_override(page):
     """The signal-only feature channel: an ANONYMOUS client may subscribe to the
     public `__features` channel, and writing a flag/experiment override broadcasts
-    `{"type":"features.changed"}` on it (clients then re-GET /api/state)."""
+    the standard signal frame `{"type":"signal","topic":"__features"}` on it
+    (clients then re-GET /api/state)."""
     login(page)  # superuser session, for the override PUT below
     # Open a SEPARATE, anonymous WS (no auth frame) subscribed to __features. Same-origin
     # (location.host) so the upgrade's Origin check passes without an allowlist.
@@ -24,14 +25,14 @@ def test_features_changed_signal_on_override(page):
     # Writing a feature override (superuser) fans out the signal on __features.
     api_request(page, "PUT", "/api/settings/flag:rt_signal_test", {"value": "true"})
     page.wait_for_function(
-        "window.__featFrames && window.__featFrames.some(f => f.includes('features.changed'))",
+        "window.__featFrames && window.__featFrames.some(f => f.includes('\"type\":\"signal\"') && f.includes('\"topic\":\"__features\"'))",
         timeout=8000,
     )
     # Clearing the override also signals.
     page.evaluate("() => { window.__featFrames = []; }")
     api_request(page, "DELETE", "/api/settings/flag:rt_signal_test")
     page.wait_for_function(
-        "window.__featFrames && window.__featFrames.some(f => f.includes('features.changed'))",
+        "window.__featFrames && window.__featFrames.some(f => f.includes('\"type\":\"signal\"') && f.includes('\"topic\":\"__features\"'))",
         timeout=8000,
     )
 
