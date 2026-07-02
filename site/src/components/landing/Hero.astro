@@ -15,22 +15,24 @@ const installCmd = 'zig fetch --save git+https://github.com/valthon/zigbase';
   <div class="container hero__inner">
     <span class="hero__badge">
       <span class="hero__spark" aria-hidden="true">⚡</span>
-      {version} · Apache-2.0
+      {version} · Apache-2.0 · Linux &amp; macOS
     </span>
 
     <h1 class="hero__title">
       Open-source backend in a
-      <span class="hero__accent">single binary</span>
+      <span class="hero__accent">single binary</span>.
       <span class="hero__sub-line">
-        — and an embeddable <span class="hero__accent">Zig</span> framework.
+        <span class="hero__accent">SQLite</span> to start.
+        <span class="hero__accent">Postgres</span> when you grow. Same code.
       </span>
     </h1>
 
     <p class="hero__subhead">
-      Collections &amp; schema, magic-link / OTP / WebAuthn auth, session management,
-      field encryption, realtime over WebSocket, feature flags, and an embedded admin
-      UI — one SQLite-backed executable. Import it as a library and extend the server
-      in <strong>typed Zig</strong> with comptime hooks, routes, and jobs.
+      Collections and access rules, auth from passwords to passkeys, realtime, full-text
+      search, multi-tenancy, background jobs, transactional email, and an embedded admin
+      UI — one executable, no runtime dependencies. Flip one build flag and the same app
+      runs on PostgreSQL. And it's an embeddable <strong>Zig framework</strong>: extend
+      the server with comptime hooks, routes, and jobs, checked at compile time.
     </p>
 
     <div class="hero__cta">
