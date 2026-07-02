@@ -35,9 +35,9 @@ describe("makeFilterBuilder", () => {
     ).toBe("(status = 'published' && price >= 5)");
   });
 
-  it("in expands to an OR chain", () => {
+  it("in compiles to the native operator", () => {
     expect(b.tags!.in(["t1", "t2"]).toString()).toBe(
-      "(tags = 't1' || tags = 't2')",
+      "tags in ('t1', 't2')",
     );
   });
 

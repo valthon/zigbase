@@ -1,8 +1,9 @@
-export const VERSION = "0.1.0";
+export const VERSION = "0.3.0";
 
 export { createClient } from "./client.js";
 export type { Client, ClientOptions, SendOptions } from "./client.js";
 export { CollectionService } from "./collection.js";
+export type { RecordAbilities } from "./collection.js";
 export {
   BaseAuthStore,
   MemoryAuthStore,
@@ -18,11 +19,17 @@ export { createPkceChallenge, randomState } from "./pkce.js";
 // --- Plan 2: records, pagination, files ---
 export { hasBlob, toFormData } from "./records.js";
 export type { ZbRecord, ListResult, ListOpts, RecordCrudOpts } from "./records.js";
-export { filter, filterValue, quoteFilterValue, parseSort, compareBySort } from "./query.js";
-export type { SortTerm } from "./query.js";
+export { filter, filterValue, quoteFilterValue, vectorSpec, parseSort, compareBySort } from "./query.js";
+export type { SortTerm, VectorQuery } from "./query.js";
 export type { CursorPage } from "./cursor.js";
 export { FilesService } from "./files.js";
 export type { FileRecordRef, FileUrlOptions } from "./files.js";
+export { AccountsService } from "./accounts.js";
+export type { AccountScope } from "./accounts.js";
+export { AnalyticsService } from "./analytics.js";
+export type { AnalyticsEvent, RollupBucket } from "./analytics.js";
+export { SendersService } from "./senders.js";
+export type { SenderIdentity } from "./senders.js";
 
 // --- Plan 3: realtime + live store ---
 // The realtime / live-store / filter-eval graph lives behind the dedicated

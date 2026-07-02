@@ -123,6 +123,11 @@ test "equivalence: data-dir runtime path reproduces the comptime collection surf
             .{ .id = "", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users" } } },
             .{ .id = "", .name = "status", .options = .{ .select = .{ .values = &.{ "draft", "published" }, .maxSelect = 1 } } },
             .{ .id = "", .name = "cover", .options = .{ .file = .{ .maxSelect = 1 } } },
+            .{ .id = "", .name = "summary", .options = .{ .text = .{} }, .searchable = true },
+        } },
+        .{ .id = "", .name = "projects", .options = .{ .tenant_field = "account" }, .fields = &.{
+            .{ .id = "", .name = "title", .options = .{ .text = .{} } },
+            .{ .id = "", .name = "account", .options = .{ .text = .{} } },
         } },
     };
 

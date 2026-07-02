@@ -43,8 +43,9 @@ export function filterValue(value: unknown): string {
  * Serialize a single value into a safe ZigBase filter operand. Alias of
  * `filterValue`, named for use by the typed core (`@zigbase/client/typed`):
  * strings/Dates are single-quoted + escaped (injection-safe), numbers/booleans
- * pass bare, and array/object operands are rejected (callers expand `in` lists
- * into `||` chains themselves).
+ * pass bare, and array/object operands are rejected — `in` lists are not
+ * expanded here; the typed `where()` layer emits a native `in (...)` clause
+ * (see `typed/where.ts`'s `compileIn`), quoting each element via this function.
  */
 export function quoteFilterValue(value: unknown): string {
   return filterValue(value);
@@ -62,6 +63,33 @@ export function filter(strings: TemplateStringsArray, ...values: unknown[]): str
     out += filterValue(values[i]) + (strings[i + 1] ?? "");
   }
   return out;
+}
+
+/** A structured nearest-neighbor query for `getList` (server `-Dvector` builds only). */
+export interface VectorQuery {
+  /** The json field holding the stored embeddings. Passed through verbatim (the server gates identifiers). */
+  field: string;
+  /** Distance metric; the server defaults to cosine when omitted. */
+  metric?: "cosine" | "l2";
+  /** The query embedding. Every element must be a finite number. */
+  values: number[];
+}
+
+/**
+ * Serialize a {@link VectorQuery} to the `<field>[:metric]:<json-embedding>` wire spec of
+ * `GET /api/collections/:col/records?vector=…`. Requires ZigBase >= 0.9.0 built with
+ * `-Dvector=true` (a default build answers 400 "Vector search is not enabled in this build.").
+ * Vector search is offset-only — the server rejects it in cursor mode. Throws on non-finite
+ * values (same posture as `filterValue`).
+ */
+export function vectorSpec(q: VectorQuery): string {
+  for (const v of q.values) {
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      throw new Error(`vectorSpec: non-finite embedding value: ${v}`);
+    }
+  }
+  const metric = q.metric ? `:${q.metric}` : "";
+  return `${q.field}${metric}:${JSON.stringify(q.values)}`;
 }
 
 export interface SortTerm {

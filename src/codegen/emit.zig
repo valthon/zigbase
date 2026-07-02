@@ -83,6 +83,42 @@ fn hasSingleFileFields(c: schema.Collection) bool {
     return false;
 }
 
+/// True when any visible field is full-text searchable (#157) — gates the generated
+/// `search?: string` option and the meta `searchable` key.
+fn isSearchableCollection(c: schema.Collection) bool {
+    for (c.fields) |f| if (!f.hidden and f.searchable) return true;
+    return false;
+}
+
+/// True when any visible field is a json field — gates the generated `vector` option.
+fn hasJsonFields(c: schema.Collection) bool {
+    for (c.fields) |f| if (!f.hidden and f.options == .json) return true;
+    return false;
+}
+
+/// The `search?: string;` opts line for searchable collections ("" otherwise).
+fn searchLine(c: schema.Collection) []const u8 {
+    return if (isSearchableCollection(c)) "    search?: string;\n" else "";
+}
+
+/// The narrowed `vector?: { field: "a" | "b"; … };` opts line for json-bearing
+/// collections ("" otherwise). getList-only (the server rejects vector + cursor).
+fn vectorLine(alloc: std.mem.Allocator, c: schema.Collection) ![]const u8 {
+    if (!hasJsonFields(c)) return "";
+    var u: std.ArrayList(u8) = .empty;
+    var first = true;
+    for (c.fields) |f| {
+        if (f.hidden or f.options != .json) continue;
+        if (!first) try u.appendSlice(alloc, " | ");
+        first = false;
+        try u.append(alloc, '"');
+        try u.appendSlice(alloc, f.name);
+        try u.append(alloc, '"');
+    }
+    return std.fmt.allocPrint(alloc,
+        "    vector?: {{ field: {s}; metric?: \"cosine\" | \"l2\"; values: number[] }};\n", .{u.items});
+}
+
 /// The visible synthesized auth fields for an auth collection record.
 /// Always emits email + username + verified (B3: unconditional synthesis —
 /// buildCollections does not propagate identityFields at comptime, so we cannot
@@ -135,6 +171,8 @@ pub fn emitRecord(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const rec = try ident.recordName(alloc, c.name);
     try putf(alloc, w, "export interface {s} {{\n", .{rec});
     for (try recordFields(alloc, c)) |f| {
+        if (c.options.tenant_field) |tf| if (std.mem.eql(u8, f.name, tf))
+            try putf(alloc, w, "  /** Tenant-owned: `{s}` is server-stamped from the active account. */\n", .{tf});
         const ty = try tt.tsTypeOf(alloc, c.name, f);
         try putf(alloc, w, "  {s}: {s};\n", .{ f.name, ty });
     }
@@ -156,6 +194,7 @@ fn createFieldType(alloc: std.mem.Allocator, col: []const u8, f: schema.Field) !
 
 pub fn emitCreate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const cn = try ident.createName(alloc, c.name);
+    const tenant_field = c.options.tenant_field;
     try putf(alloc, w, "export interface {s} {{\n", .{cn});
     if (c.type == .auth) {
         try put(alloc, w, "  email: string;\n  password: string;\n  passwordConfirm: string;\n");
@@ -163,10 +202,12 @@ pub fn emitCreate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     // Required user fields first (no '?'), then optionals.
     for (c.fields) |f| {
         if (f.hidden or isReadOnlySystem(f.name) or !f.required) continue;
+        if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
         try putf(alloc, w, "  {s}: {s};\n", .{ f.name, try createFieldType(alloc, c.name, f) });
     }
     for (c.fields) |f| {
         if (f.hidden or isReadOnlySystem(f.name) or f.required) continue;
+        if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
         try putf(alloc, w, "  {s}?: {s};\n", .{ f.name, try createFieldType(alloc, c.name, f) });
     }
     try put(alloc, w, "}\n");
@@ -271,17 +312,24 @@ pub fn emitRelations(alloc: std.mem.Allocator, w: *W, cols: []const schema.Colle
     try put(alloc, w, " };\n");
 }
 
-pub fn emitExpandKeys(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
+pub fn emitExpandKeys(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, c: schema.Collection) !void {
     if (!hasRelations(c)) return;
     const en = try ident.expandName(alloc, c.name);
     try putf(alloc, w, "export type {s} = ", .{en});
     var first = true;
     for (c.fields) |f| {
         if (f.options != .relation) continue;
+        // Mirror emitRelations' filter: a relation to a collection outside `cols`
+        // (e.g. a live system collection like `_accounts`) has no entry in the
+        // paired `*Relations` map, so it must be excluded here too — otherwise
+        // `WithExpand<Rec, Relations, K>`'s `K extends keyof Relations` constraint
+        // rejects the wider Expand union at the TS type-check level.
+        if (!collectionExists(cols, f.options.relation.targetCollectionId)) continue;
         if (!first) try put(alloc, w, " | ");
         first = false;
         try putf(alloc, w, "\"{s}\"", .{f.name});
     }
+    if (first) try put(alloc, w, "never");
     try put(alloc, w, ";\n");
 }
 
@@ -322,6 +370,45 @@ pub fn emitFields(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Per-collection sort union
+// ---------------------------------------------------------------------------
+
+/// Per-collection sortable-field union + sort alias (spec §5.2): every field in the
+/// *Fields fluent accessors MINUS json, multi-value and file fields — what the server
+/// can meaningfully ORDER BY and what cursor mode accepts (dotted relation paths are
+/// deliberately not included).
+pub fn emitSortUnion(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
+    const rec = try ident.recordName(alloc, c.name);
+    try putf(alloc, w, "export type {s}SortField =", .{rec});
+    var first = true;
+    if (c.type == .auth) {
+        inline for (.{ "email", "username", "verified" }) |n| {
+            try put(alloc, w, if (first) " " else " | ");
+            first = false;
+            try putf(alloc, w, "\"{s}\"", .{n});
+        }
+    }
+    for (c.fields) |f| {
+        if (f.hidden) continue;
+        if (c.type == .auth and isAuthSynthesized(f.name)) continue;
+        if (isSystemFieldName(f.name)) continue; // synthesized below
+        if (tt.kindOf(f) == .file_name) continue;
+        if (f.options == .json) continue;
+        if (f.isMultiValue()) continue;
+        try put(alloc, w, if (first) " " else " | ");
+        first = false;
+        try putf(alloc, w, "\"{s}\"", .{f.name});
+    }
+    inline for (.{ "id", "created", "updated" }) |n| {
+        try put(alloc, w, if (first) " " else " | ");
+        first = false;
+        try putf(alloc, w, "\"{s}\"", .{n});
+    }
+    try put(alloc, w, ";\n");
+    try putf(alloc, w, "export type {s}Sort = SortExpr<{s}SortField>;\n", .{ rec, rec });
+}
+
+// ---------------------------------------------------------------------------
 // Concrete service interfaces
 // ---------------------------------------------------------------------------
 
@@ -330,6 +417,19 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
     const rec = try ident.recordName(alloc, c.name);
     const wn = try ident.whereName(alloc, c.name);
     const fld = try ident.fieldsName(alloc, c.name);
+    const sort_ty = try std.fmt.allocPrint(alloc, "{s}Sort | {s}Sort[]", .{ rec, rec });
+    const search = searchLine(c);
+    const vector = try vectorLine(alloc, c);
+    // Row-abilities doc comment (#155): action names only — the rule ASTs are server business.
+    if (c.options.abilities) |ab| {
+        var names: std.ArrayList(u8) = .empty;
+        if (ab.view != null) try names.appendSlice(alloc, "view, ");
+        if (ab.create != null) try names.appendSlice(alloc, "create, ");
+        if (ab.update != null) try names.appendSlice(alloc, "update, ");
+        if (ab.delete != null) try names.appendSlice(alloc, "delete, ");
+        const trimmed = std.mem.trimEnd(u8, names.items, ", ");
+        try putf(alloc, w, "/** Row abilities configured for: {s}. Check per record via getAbilities(). */\n", .{trimmed});
+    }
     try putf(alloc, w, "export interface {s} {{\n", .{svc});
     if (hasRelations(c)) {
         const exp = try ident.expandName(alloc, c.name);
@@ -341,8 +441,8 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  ): Promise<WithExpand<{1s}, {2s}, K>>;
             \\  getList<K extends {0s} = never>(opts?: {{
             \\    where?: {3s};
-            \\    sort?: string;
-            \\    expand?: K[];
+            \\    sort?: {7s};
+            \\{8s}{9s}    expand?: K[];
             \\    page?: number;
             \\    limit?: number;
             \\    fields?: string;
@@ -351,16 +451,16 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  }}): Promise<ListResult<WithExpand<{1s}, {2s}, K>>>;
             \\  getFirstListItem<K extends {0s} = never>(opts?: {{
             \\    where?: {3s};
-            \\    sort?: string;
-            \\    expand?: K[];
+            \\    sort?: {7s};
+            \\{8s}    expand?: K[];
             \\    fields?: string;
             \\    signal?: AbortSignal;
             \\    requestKey?: string;
             \\  }}): Promise<WithExpand<{1s}, {2s}, K>>;
             \\  getPage(opts?: {{
             \\    where?: {3s};
-            \\    sort?: string;
-            \\    limit?: number;
+            \\    sort?: {7s};
+            \\{8s}    limit?: number;
             \\    cursor?: string;
             \\    withTotal?: boolean;
             \\    signal?: AbortSignal;
@@ -368,15 +468,15 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  }}): Promise<CursorPage<{1s}>>;
             \\  iterate(opts?: {{
             \\    where?: {3s};
-            \\    sort?: string;
-            \\    fields?: string;
+            \\    sort?: {7s};
+            \\{8s}    fields?: string;
             \\    signal?: AbortSignal;
             \\    requestKey?: string;
             \\  }}): AsyncIterableIterator<{1s}>;
             \\  getFullList(opts?: {{
             \\    where?: {3s};
-            \\    sort?: string;
-            \\    fields?: string;
+            \\    sort?: {7s};
+            \\{8s}    fields?: string;
             \\    signal?: AbortSignal;
             \\    requestKey?: string;
             \\  }}): Promise<{1s}[]>;
@@ -392,14 +492,14 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  delete(id: string): Promise<void>;
             \\  filter(fn: (f: {6s}) => Expr): string;
             \\
-        , .{ exp, rec, rel, wn, try ident.createName(alloc, c.name), try ident.updateName(alloc, c.name), fld });
+        , .{ exp, rec, rel, wn, try ident.createName(alloc, c.name), try ident.updateName(alloc, c.name), fld, sort_ty, search, vector });
     } else {
         try putf(alloc, w,
             \\  getOne(id: string, opts?: {{ fields?: string; signal?: AbortSignal; requestKey?: string }}): Promise<{0s}>;
             \\  getList(opts?: {{
             \\    where?: {1s};
-            \\    sort?: string;
-            \\    page?: number;
+            \\    sort?: {5s};
+            \\{6s}{7s}    page?: number;
             \\    limit?: number;
             \\    fields?: string;
             \\    signal?: AbortSignal;
@@ -407,15 +507,15 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  }}): Promise<ListResult<{0s}>>;
             \\  getFirstListItem(opts?: {{
             \\    where?: {1s};
-            \\    sort?: string;
-            \\    fields?: string;
+            \\    sort?: {5s};
+            \\{6s}    fields?: string;
             \\    signal?: AbortSignal;
             \\    requestKey?: string;
             \\  }}): Promise<{0s}>;
             \\  getPage(opts?: {{
             \\    where?: {1s};
-            \\    sort?: string;
-            \\    limit?: number;
+            \\    sort?: {5s};
+            \\{6s}    limit?: number;
             \\    cursor?: string;
             \\    withTotal?: boolean;
             \\    signal?: AbortSignal;
@@ -423,15 +523,15 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  }}): Promise<CursorPage<{0s}>>;
             \\  iterate(opts?: {{
             \\    where?: {1s};
-            \\    sort?: string;
-            \\    fields?: string;
+            \\    sort?: {5s};
+            \\{6s}    fields?: string;
             \\    signal?: AbortSignal;
             \\    requestKey?: string;
             \\  }}): AsyncIterableIterator<{0s}>;
             \\  getFullList(opts?: {{
             \\    where?: {1s};
-            \\    sort?: string;
-            \\    fields?: string;
+            \\    sort?: {5s};
+            \\{6s}    fields?: string;
             \\    signal?: AbortSignal;
             \\    requestKey?: string;
             \\  }}): Promise<{0s}[]>;
@@ -447,8 +547,9 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  delete(id: string): Promise<void>;
             \\  filter(fn: (f: {4s}) => Expr): string;
             \\
-        , .{ rec, wn, try ident.createName(alloc, c.name), try ident.updateName(alloc, c.name), fld });
+        , .{ rec, wn, try ident.createName(alloc, c.name), try ident.updateName(alloc, c.name), fld, sort_ty, search, vector });
     }
+    try put(alloc, w, "  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;\n");
     if (c.type == .auth) {
         try putf(alloc, w,
             \\  authWithPassword(
@@ -525,7 +626,22 @@ pub fn emitMeta(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
         first = false;
         try putf(alloc, w, "\"{s}\"", .{f.name});
     }
-    try putf(alloc, w, "],\n  isAuth: {s},\n}};\n", .{if (c.type == .auth) "true" else "false"});
+    try putf(alloc, w, "],\n  isAuth: {s},\n", .{if (c.type == .auth) "true" else "false"});
+    if (isSearchableCollection(c)) {
+        try put(alloc, w, "  searchable: [");
+        first = true;
+        for (c.fields) |f| {
+            if (f.hidden or !f.searchable) continue;
+            if (!first) try put(alloc, w, ", ");
+            first = false;
+            try putf(alloc, w, "\"{s}\"", .{f.name});
+        }
+        try put(alloc, w, "],\n");
+    }
+    if (c.options.tenant_field) |tf| {
+        try putf(alloc, w, "  tenant: \"{s}\",\n", .{tf});
+    }
+    try put(alloc, w, "};\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -539,7 +655,7 @@ pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool, needs_send_op
     const send_opts = if (needs_send_opts) ", type SendOptions" else "";
     if (in_repo) {
         const imports = try std.fmt.allocPrint(alloc,
-            \\import {{ createClient as baseCreateClient, type Client{s} }} from "../../../src/index.js";
+            \\import {{ createClient as baseCreateClient, type Client, type RecordAbilities{s} }} from "../../../src/index.js";
             \\import {{ withRealtime, type RealtimeEnabledClient }} from "../../../src/realtime-entry.js";
             \\import type {{ ListResult }} from "../../../src/records.js";
             \\import type {{ CursorPage }} from "../../../src/cursor.js";
@@ -558,14 +674,18 @@ pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool, needs_send_op
             \\  type TypedFieldExpr,
             \\  type RelationResolver,
             \\  type RawTypedRealtime,
+            \\  type SortExpr,
             \\}} from "../../../src/typed/index.js";
+            \\
+            \\// requires @zigbase/client >= 0.3.0
+            \\export type _RequiresCore = import("../../../src/typed/index.js").CoreSupports_0_3;
             \\
         , .{send_opts});
         defer alloc.free(imports);
         try w.appendSlice(alloc, imports);
     } else {
         const imports = try std.fmt.allocPrint(alloc,
-            \\import {{ createClient as baseCreateClient, type Client{s} }} from "@zigbase/client";
+            \\import {{ createClient as baseCreateClient, type Client, type RecordAbilities{s} }} from "@zigbase/client";
             \\import {{ withRealtime, type RealtimeEnabledClient }} from "@zigbase/client/realtime";
             \\import type {{ ListResult, CursorPage, FilesService, FileUrlOptions }} from "@zigbase/client";
             \\import {{
@@ -582,7 +702,11 @@ pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool, needs_send_op
             \\  type TypedFieldExpr,
             \\  type RelationResolver,
             \\  type RawTypedRealtime,
+            \\  type SortExpr,
             \\}} from "@zigbase/client/typed";
+            \\
+            \\// requires @zigbase/client >= 0.3.0
+            \\export type _RequiresCore = import("@zigbase/client/typed").CoreSupports_0_3;
             \\
         , .{send_opts});
         defer alloc.free(imports);
@@ -745,6 +869,26 @@ test "emitWhere matches PostWhere (nested relation, multi id-only, file omitted,
     try std.testing.expect(contains(out, "AND?: PostWhere[];"));
     try std.testing.expect(contains(out, "OR?: PostWhere[];"));
     try std.testing.expect(!contains(out, "cover")); // file omitted from where
+}
+
+test "emitExpandKeys falls back to never when every relation targets a collection outside the set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `orphan`'s only relation targets `_accounts`, a live system collection that is
+    // never part of the generated set (`cols` below deliberately omits it) — mirrors
+    // emitRelations' filter (see its comment above) so the paired *Relations map and
+    // Expand union stay consistent; without the fallback this would emit a bare
+    // `export type OrphanExpand = ;`, which is invalid TS.
+    const fields = [_]schema.Field{
+        .{ .id = "a", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "_accounts", .maxSelect = 1 } } },
+    };
+    const orphan = schema.Collection{ .id = "", .name = "orphan", .fields = &fields };
+    const cols = [_]schema.Collection{orphan};
+    var w: std.ArrayList(u8) = .empty;
+    try emitExpandKeys(a, &w, &cols, orphan);
+    const out = w.items;
+    try std.testing.expect(contains(out, "export type OrphanExpand = never;"));
 }
 
 test "emitService (expandable) has the getOne<K extends PostExpand = never> shape" {
@@ -976,6 +1120,114 @@ test "emitTypedFiles emits only FileField unions (no global TypedFiles / makeFil
     try std.testing.expect(!contains(out, "export interface TypedFiles"));
     try std.testing.expect(!contains(out, "makeFilesSurface"));
     try std.testing.expect(!contains(out, "_colMap"));
+}
+
+test "emitMeta emits searchable + tenant keys when configured" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]schema.Field{
+        .{ .id = "a", .name = "title", .options = .{ .text = .{} }, .searchable = true },
+        .{ .id = "b", .name = "account", .options = .{ .text = .{} } },
+    };
+    const col = schema.Collection{ .id = "", .name = "notes", .fields = &fields, .options = .{ .tenant_field = "account" } };
+    var w: std.ArrayList(u8) = .empty;
+    try emitMeta(a, &w, col);
+    try std.testing.expect(contains(w.items, "searchable: [\"title\"],"));
+    try std.testing.expect(contains(w.items, "tenant: \"account\","));
+    // A collection without either feature emits NEITHER key (absent = feature not present).
+    var w2: std.ArrayList(u8) = .empty;
+    try emitMeta(a, &w2, blogPosts());
+    try std.testing.expect(!contains(w2.items, "searchable:"));
+    try std.testing.expect(!contains(w2.items, "tenant:"));
+}
+
+test "emitSortUnion: visible scalars minus json/multi/file, plus system fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var w: std.ArrayList(u8) = .empty;
+    try emitSortUnion(a, &w, blogPosts());
+    const out = w.items;
+    // blogPosts: title(text) status(select) price(number) author(single rel) tags(multi rel)
+    //            cover(file) created(user autodate, deduped into system fields)
+    try std.testing.expect(contains(out,
+        "export type PostSortField = \"title\" | \"status\" | \"price\" | \"author\" | \"id\" | \"created\" | \"updated\";"));
+    try std.testing.expect(contains(out, "export type PostSort = SortExpr<PostSortField>;"));
+    try std.testing.expect(!contains(out, "\"tags\"")); // multi-value excluded
+    try std.testing.expect(!contains(out, "\"cover\"")); // file excluded
+}
+
+test "emitService: search/vector gating, narrowed sort, unconditional getAbilities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Searchable + json collection
+    const fields = [_]schema.Field{
+        .{ .id = "a", .name = "body", .options = .{ .text = .{} }, .searchable = true },
+        .{ .id = "b", .name = "embedding", .options = .{ .json = .{} } },
+        .{ .id = "c", .name = "metadata", .options = .{ .json = .{} } },
+    };
+    const docs = schema.Collection{ .id = "", .name = "docs", .fields = &fields };
+    var w: std.ArrayList(u8) = .empty;
+    try emitService(a, &w, docs);
+    const out = w.items;
+    try std.testing.expect(contains(out, "search?: string;"));
+    try std.testing.expect(contains(out,
+        "vector?: { field: \"embedding\" | \"metadata\"; metric?: \"cosine\" | \"l2\"; values: number[] };"));
+    try std.testing.expect(contains(out, "sort?: DocSort | DocSort[];"));
+    try std.testing.expect(contains(out,
+        "getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;"));
+    // vector appears ONLY in getList (one occurrence)
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "vector?:"));
+    // search appears in all five list-ish blocks
+    try std.testing.expectEqual(@as(usize, 5), countOccurrences(out, "search?: string;"));
+
+    // A collection with neither searchable nor json fields gets neither key, still getAbilities.
+    var w2: std.ArrayList(u8) = .empty;
+    try emitService(a, &w2, blogPosts());
+    try std.testing.expect(!contains(w2.items, "search?:"));
+    try std.testing.expect(!contains(w2.items, "vector?:"));
+    try std.testing.expect(contains(w2.items, "getAbilities(id: string"));
+    try std.testing.expect(contains(w2.items, "sort?: PostSort | PostSort[];"));
+}
+
+test "emitService: abilities doc comment lists configured actions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Abilities = @import("../authz/abilities.zig");
+    const fields = [_]schema.Field{
+        .{ .id = "a", .name = "account", .options = .{ .relation = .{ .targetCollectionId = "accounts", .maxSelect = 1 } } },
+    };
+    const col = schema.Collection{ .id = "", .name = "notes", .fields = &fields, .options = .{ .abilities = .{
+        .update = .{ .relationship = .{ .via = "account", .min_role = "editor" } },
+        .delete = .{ .relationship = .{ .via = "account", .min_role = "admin" } },
+    } } };
+    var w: std.ArrayList(u8) = .empty;
+    try emitService(a, &w, col);
+    try std.testing.expect(contains(w.items,
+        "/** Row abilities configured for: update, delete. Check per record via getAbilities(). */"));
+    _ = Abilities;
+}
+
+test "emitCreate omits the tenant field (server-stamped); emitRecord keeps + documents it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]schema.Field{
+        .{ .id = "a", .name = "title", .required = true, .options = .{ .text = .{} } },
+        .{ .id = "b", .name = "account", .options = .{ .text = .{} } },
+    };
+    const col = schema.Collection{ .id = "", .name = "notes", .fields = &fields, .options = .{ .tenant_field = "account" } };
+    var w: std.ArrayList(u8) = .empty;
+    try emitCreate(a, &w, col);
+    try std.testing.expect(!contains(w.items, "account"));
+    try std.testing.expect(contains(w.items, "title: string;"));
+    var w2: std.ArrayList(u8) = .empty;
+    try emitRecord(a, &w2, col);
+    try std.testing.expect(contains(w2.items, "account: string;"));
+    try std.testing.expect(contains(w2.items, "Tenant-owned: `account` is server-stamped"));
 }
 
 test "emitTypedFiles skips collections without file fields" {

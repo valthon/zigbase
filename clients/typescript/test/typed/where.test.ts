@@ -64,14 +64,13 @@ describe("compileWhere", () => {
     expect(compile({ author: { neq: "u1" } })).toBe("author != 'u1'");
   });
 
-  it("`in` expands to an OR chain; empty `in` is always-false", () => {
-    expect(compile({ status: { in: ["a", "b"] } })).toBe(
-      "(status = 'a' || status = 'b')",
-    );
-    expect(compile({ tags: { in: ["t1", "t2"] } })).toBe(
-      "(tags = 't1' || tags = 't2')",
-    );
-    expect(compile({ status: { in: [] } })).toBe("1 = 2");
+  it("`in` compiles to the native operator; empty `in` is constant-false `in ()`", () => {
+    expect(compile({ status: { in: ["a", "b"] } })).toBe("status in ('a', 'b')");
+    expect(compile({ tags: { in: ["t1", "t2"] } })).toBe("tags in ('t1', 't2')");
+    expect(compile({ price: { in: [1, 2, 3] } })).toBe("price in (1, 2, 3)");
+    expect(compile({ status: { in: [] } })).toBe("status in ()");
+    // injection-safe: elements go through quoteFilterValue
+    expect(compile({ status: { in: ["a'b"] } })).toBe("status in ('a\\'b')");
   });
 
   it("AND/OR arrays combine sub-wheres", () => {
@@ -111,11 +110,11 @@ describe("compileWhere", () => {
     expect(compile({ price: {} })).toBe("");
   });
 
-  it("`in` on a resolvable relation field produces id-level OR (not nested where)", () => {
+  it("`in` on a resolvable relation field produces id-level `in` (not nested where)", () => {
     // { author: { in: ['u1','u2'] } } — `in` is an operator key, so looksLikeOps
     // is true and this is treated as a relation-id operator, NOT a nested where.
     expect(compile({ author: { in: ["u1", "u2"] } })).toBe(
-      "(author = 'u1' || author = 'u2')",
+      "author in ('u1', 'u2')",
     );
   });
 
@@ -167,9 +166,9 @@ describe("bool and date neq/in ops", () => {
     expect(compileItems({ created: { neq: "2026-01-01" } })).toBe("created != '2026-01-01'");
   });
 
-  it("date in expands to OR-joined equality clauses", () => {
+  it("date in compiles to the native operator", () => {
     expect(compileItems({ created: { in: ["2026-01-01", "2026-02-01"] } })).toBe(
-      "(created = '2026-01-01' || created = '2026-02-01')",
+      "created in ('2026-01-01', '2026-02-01')",
     );
   });
 });

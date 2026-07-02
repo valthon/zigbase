@@ -10,6 +10,7 @@ import {
   toFormData,
 } from "./records.js";
 import { type CursorPage } from "./cursor.js";
+import { vectorSpec } from "./query.js";
 
 export interface AuthResponse {
   token: string;
@@ -44,6 +45,13 @@ export interface OAuth2Args {
   codeVerifier: string;
   redirectUrl: string;
   state?: string;
+}
+
+/** The actions the current principal may perform on a specific record (#155). */
+export interface RecordAbilities {
+  view: boolean;
+  update: boolean;
+  delete: boolean;
 }
 
 export class CollectionService {
@@ -152,6 +160,8 @@ export class CollectionService {
         expand: opts.expand,
         fields: opts.fields,
         skipTotal: opts.skipTotal ? 1 : undefined,
+        search: opts.search,
+        vector: opts.vector ? vectorSpec(opts.vector) : undefined,
       },
       signal: opts.signal,
       requestKey: opts.requestKey,
@@ -218,6 +228,22 @@ export class CollectionService {
   }
 
   /**
+   * GET /api/collections/:col/records/:id/abilities — the actions the current principal
+   * may perform on this record (requires ZigBase >= 0.9.0). Rejects with a 404
+   * `ZigbaseError` when the record is not viewable — the endpoint never reveals a
+   * record's existence, so `view` is always `true` on a success.
+   */
+  getAbilities(
+    id: string,
+    opts: { signal?: AbortSignal; requestKey?: string } = {},
+  ): Promise<RecordAbilities> {
+    return this.transport.send<RecordAbilities>(
+      `${this.recordsBase()}/${encodeURIComponent(id)}/abilities`,
+      { method: "GET", signal: opts.signal, requestKey: opts.requestKey },
+    );
+  }
+
+  /**
    * Native server-side cursor (keyset) pagination. The server mints the opaque
    * `nextCursor`/`prevCursor` tokens (src/query/keyset.zig); the client forwards
    * whatever it received and never decodes or synthesizes one. Sending `limit`
@@ -233,6 +259,7 @@ export class CollectionService {
     expand?: string;
     fields?: string;
     withTotal?: boolean;
+    search?: string;
     signal?: AbortSignal;
     requestKey?: string;
   } = {}): Promise<CursorPage<T>> {
@@ -255,6 +282,7 @@ export class CollectionService {
         sort: opts.sort,
         expand: opts.expand,
         fields: opts.fields,
+        search: opts.search,
       },
       signal: opts.signal,
       requestKey: opts.requestKey,
@@ -277,6 +305,7 @@ export class CollectionService {
     expand?: string;
     fields?: string;
     batch?: number;
+    search?: string;
     signal?: AbortSignal;
     requestKey?: string;
   } = {}): AsyncIterableIterator<T> {
@@ -286,6 +315,7 @@ export class CollectionService {
       sort: opts.sort,
       expand: opts.expand,
       fields: opts.fields,
+      search: opts.search,
       signal: opts.signal,
       requestKey: opts.requestKey,
     });
@@ -299,6 +329,7 @@ export class CollectionService {
         sort: opts.sort,
         expand: opts.expand,
         fields: opts.fields,
+        search: opts.search,
         signal: opts.signal,
         requestKey: opts.requestKey,
       });
@@ -312,6 +343,7 @@ export class CollectionService {
     expand?: string;
     fields?: string;
     batch?: number;
+    search?: string;
     signal?: AbortSignal;
     requestKey?: string;
   } = {}): Promise<T[]> {

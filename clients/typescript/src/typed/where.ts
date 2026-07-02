@@ -35,11 +35,12 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v) && !(v instanceof Date);
 }
 
-/** Build `(f = a || f = b || …)`; empty list is the always-false sentinel `1 = 2`. */
+/** Compile a native `in` clause: `field in ('a', 'b', 3)`. An empty list emits `field in ()`
+ *  — the server parser compiles it to constant-false. Requires ZigBase >= 0.9.0 (the native
+ *  `in` filter operator); each element is quoted via `quoteFilterValue` (injection-safe:
+ *  single-quoted + backslash-escaped, the same string-literal form the server lexer unescapes). */
 export function compileIn(field: string, values: unknown[]): string {
-  if (values.length === 0) return "1 = 2";
-  const parts = values.map((v) => `${field} = ${quoteFilterValue(v)}`);
-  return parts.length === 1 ? (parts[0] as string) : `(${parts.join(" || ")})`;
+  return `${field} in (${values.map(quoteFilterValue).join(", ")})`;
 }
 
 /** Join compiled clauses with a boolean op, parenthesizing when more than one. */
@@ -135,7 +136,7 @@ function compileNode(
  * - scalar shorthand: `{ status: 'published' }` -> `status = 'published'`
  * - operator objects: `{ price: { gte: 10 } }` -> `price >= 10`
  * - relation-by-id: `{ author: 'u1' }` -> `author = 'u1'`
- * - `in`: `{ status: { in: ['a','b'] } }` -> `(status = 'a' || status = 'b')`
+ * - `in`: `{ status: { in: ['a','b'] } }` -> `status in ('a', 'b')` (native operator; server >= 0.9.0)
  * - AND/OR arrays of sub-wheres
  * - ONE level of nested relation where: `{ author: { name: { like: 'A' } } }`
  *   -> `author.name ~ 'A'` (cycle-guarded by the `depth` budget; default 1)

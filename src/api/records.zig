@@ -103,40 +103,10 @@ fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) requ
     rctx.auth = a.record;
     rctx.is_superuser = a.is_superuser;
     rctx.collection = a.collection;
-    // Superusers bypass tenancy (consistent with rules.decide); skip the resolution query for them.
-    // A resolution error keeps the fail-closed empty scope (request scoped to no account → tenant-
-    // owned data denies), but is logged for observability rather than silently swallowed.
-    if (app.tenancy.enabled and !a.is_superuser)
-        resolveTenant(ctx, conn, app, &rctx, a) catch |e|
-            std.log.warn("tenant resolution failed (request scoped to no account): {}", .{e});
+    // Superusers bypass tenancy (consistent with rules.decide); resolution is skipped for them and
+    // the fail-closed empty scope is kept on any resolution error — see `tenancy.resolveRequest`.
+    tenancy.resolveRequest(ctx, conn, app, a, &rctx);
     return rctx;
-}
-
-/// The account id the request is asking to act within: the `X-Account-Id` header, else the signed
-/// `zb_account` cookie (browser apps that called `activate`). The header is unsigned but safe — a
-/// forged value only grants scope if `resolveTenant` finds an ACTIVE membership for it. Resolver
-/// is an enum so `.subdomain`/`.path` can be added here later without touching callers.
-fn requestedAccount(ctx: *http.RequestCtx, app: *app_mod.App) ?[]const u8 {
-    switch (app.tenancy.resolver) {
-        .header => {
-            if (ctx.header(tenancy.account_header)) |h| if (h.len > 0) return h;
-            if (ctx.cookie(tenancy.account_cookie)) |c| if (c.len > 0) return tenancy.verifyAccount(app.jwt_secret, c);
-            return null;
-        },
-    }
-}
-
-/// Resolve + cache the active account scope onto `rctx` (verified membership, fail closed).
-fn resolveTenant(ctx: *http.RequestCtx, conn: *db.Db, app: *app_mod.App, rctx: *request.RequestContext, a: auth.Authed) !void {
-    const rec = a.record;
-    if (rec != .object) return;
-    const id_v = rec.object.get("id") orelse return;
-    if (id_v != .string) return;
-    const requested = requestedAccount(ctx, app) orelse "";
-    const res = try tenancy.resolve(ctx.allocator, conn, a.collection, id_v.string, requested);
-    rctx.account_id = res.account_id;
-    rctx.account_role = res.account_role;
-    rctx.memberships = res.memberships;
 }
 
 fn forbidden(ctx: *http.RequestCtx) !http.Response {

@@ -36,6 +36,10 @@ export interface CollectionMeta {
   fileFields: string[];
   expandable: string[];
   isAuth: boolean;
+  /** Field names with full-text search enabled (server >= 0.9.0). Absent = no FTS. */
+  searchable?: string[];
+  /** Tenant-owning field name; the server stamps it on create. Absent = not tenant-owned. */
+  tenant?: string;
 }
 
 /** Safe field lookup honoring `noUncheckedIndexedAccess`. */

@@ -53,6 +53,15 @@ describe("makeRecordService", () => {
     expect(opts).toMatchObject({ filter: "(status = 'published' && price >= 5)", sort: "-created" });
   });
 
+  it("joins an array sort with commas before hitting SP1", async () => {
+    const { client, inner } = mockClient();
+    const svc = makeRecordService(client, postsMeta);
+    await svc.getList({ sort: ["-age", "created"] });
+    const call = inner.getList.mock.calls[0];
+    const [, , opts] = call as ListArgs;
+    expect(opts).toMatchObject({ sort: "-age,created" });
+  });
+
   it("forwards `page` as the first arg to inner.getList", async () => {
     const { client, inner } = mockClient();
     const svc = makeRecordService(client, postsMeta);

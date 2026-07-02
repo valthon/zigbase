@@ -4,6 +4,7 @@ import type {
   Profile, Tag, Photo, PrivatePhoto, Subscription,
   ProfileCreate, PhotoCreate, ProfileGender, SubscriptionPlan,
   DeviceLinkInitiateResp, DeviceLinkCompleteReq, DeviceLinkSession,
+  Note, NoteCreate, ProfileSort,
 } from "./zbase.gen.js";
 
 const zb = createClient("http://api.test", { WebSocket: globalThis.WebSocket });
@@ -177,6 +178,60 @@ function fileUrlTyping() {
   zb.db.privatePhotos.fileUrl(priv, "image");
 }
 
+// --- search & vector gating (0.3.0) ------------------------------------------
+async function searchAndVector() {
+  await zb.db.messages.getList({ search: "hello world" }); // messages.body is searchable
+  await zb.db.profiles.getPage({ search: "bio words" });   // search works in cursor mode
+  // @ts-expect-error tags has no searchable fields -> no `search` key
+  await zb.db.tags.getList({ search: "x" });
+  await zb.db.subscriptions.getList({ vector: { field: "metadata", metric: "cosine", values: [0.1] } });
+  // @ts-expect-error vector.field is narrowed to the collection's json fields
+  await zb.db.subscriptions.getList({ vector: { field: "plan", values: [0.1] } });
+  // @ts-expect-error messages has no json fields -> no `vector` key
+  await zb.db.messages.getList({ vector: { field: "body", values: [1] } });
+  // @ts-expect-error vector is offset-only -> absent from getPage
+  await zb.db.subscriptions.getPage({ vector: { field: "metadata", values: [1] } });
+}
+
+// --- typed sort (0.3.0) -------------------------------------------------------
+async function typedSort() {
+  await zb.db.profiles.getList({ sort: "-age" });
+  await zb.db.profiles.getList({ sort: ["-age", "created"] });
+  expectTypeOf<ProfileSort>().toMatchTypeOf<string>();
+  // @ts-expect-error "nope" is not a sortable field
+  await zb.db.profiles.getList({ sort: "nope" });
+  // @ts-expect-error json fields are not sortable
+  await zb.db.subscriptions.getList({ sort: "metadata" });
+}
+
+// --- tenancy (0.3.0) ----------------------------------------------------------
+function tenancyTypes() {
+  // The tenant field is readable on the record...
+  expectTypeOf<Note["account"]>().toEqualTypeOf<string>();
+  // ...but absent from the create payload (server-stamped).
+  // @ts-expect-error `account` is server-stamped; NoteCreate omits it entirely
+  const bad: NoteCreate = { title: "t", account: "a1" };
+  void bad;
+  // withAccount returns the SAME typed client shape.
+  const scoped = zb.withAccount("acct1");
+  expectTypeOf(scoped).toEqualTypeOf<typeof zb>();
+  void scoped.db.notes;
+}
+
+// --- abilities (0.3.0): present on EVERY generated service --------------------
+async function abilities() {
+  const ab = await zb.db.notes.getAbilities("n1");
+  expectTypeOf(ab).toEqualTypeOf<{ view: boolean; update: boolean; delete: boolean }>();
+  await zb.db.tags.getAbilities("t1", { requestKey: "ab" });
+}
+
+// --- pass-through services (0.3.0) --------------------------------------------
+async function passthroughs() {
+  await zb.accounts.activate("acct1");
+  await zb.analytics.events({ name: "note.created", since: new Date() });
+  await zb.senders.list();
+}
+
 // Reference the fns so they aren't flagged unused by the type checker.
 export const _typeTests = [
   recordShapes, expandSingle, expandMulti, expandList, noExpand,
@@ -184,4 +239,5 @@ export const _typeTests = [
   createOk, fileTyping, createMissingRequired, createRejectsUnknown, updateOmitsPassword,
   fluentOk, fluentBadEnum, fluentUnknownField,
   serviceShapes, relationLessReadMethods, readOptionSurface, fileUrlTyping,
+  searchAndVector, typedSort, tenancyTypes, abilities, passthroughs,
 ];

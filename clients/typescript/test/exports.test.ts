@@ -6,6 +6,7 @@ describe("public exports (Plan 2)", () => {
     expect(typeof zb.filter).toBe("function");
     expect(typeof zb.parseSort).toBe("function");
     expect(typeof zb.compareBySort).toBe("function");
+    expect(typeof zb.vectorSpec).toBe("function");
   });
 
   it("no longer exports client-side cursor synthesis helpers", () => {
@@ -23,5 +24,11 @@ describe("public exports (Plan 2)", () => {
   it("re-exports record/multipart helpers", () => {
     expect(typeof zb.hasBlob).toBe("function");
     expect(typeof zb.toFormData).toBe("function");
+  });
+
+  it("re-exports AnalyticsService, SendersService, AccountsService", () => {
+    expect(typeof zb.AnalyticsService).toBe("function");
+    expect(typeof zb.SendersService).toBe("function");
+    expect(typeof zb.AccountsService).toBe("function");
   });
 });

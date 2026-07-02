@@ -1,7 +1,8 @@
 import type { Client } from "../client.js";
-import type { CollectionService } from "../collection.js";
+import type { CollectionService, RecordAbilities } from "../collection.js";
 import type { ListResult, ZbRecord } from "../records.js";
 import type { CursorPage } from "../cursor.js";
+import type { VectorQuery } from "../query.js";
 import { ZigbaseError } from "../errors.js";
 import { compileWhere, type RelationResolver } from "./where.js";
 import { makeFilterBuilder, type FilterRoot, type Expr } from "./fluent.js";
@@ -10,11 +11,14 @@ import type { CollectionMeta } from "./meta.js";
 /** Options the typed list/read surface accepts (loosely typed; narrowed by the generated file). */
 export interface TypedListOptions {
   where?: unknown;
-  sort?: string;
+  /** Sort expression(s); an array is joined with "," (multi-key sort). */
+  sort?: string | string[];
   expand?: string[];
   page?: number;
   limit?: number;
   fields?: string;
+  search?: string;
+  vector?: VectorQuery;
   signal?: AbortSignal;
   requestKey?: string;
 }
@@ -28,11 +32,13 @@ export interface TypedReadOptions {
 
 export interface TypedPageOptions {
   where?: unknown;
-  sort?: string;
+  /** Sort expression(s); an array is joined with "," (multi-key sort). */
+  sort?: string | string[];
   expand?: string[];
   limit?: number;
   cursor?: string;
   withTotal?: boolean;
+  search?: string;
   signal?: AbortSignal;
   requestKey?: string;
 }
@@ -52,11 +58,15 @@ export interface RawTypedService {
   create(data: Record<string, unknown>, opts?: TypedReadOptions): Promise<ZbRecord>;
   update(id: string, data: Record<string, unknown>, opts?: TypedReadOptions): Promise<ZbRecord>;
   delete(id: string): Promise<void>;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
   filter(fn: (b: FilterRoot) => Expr): string;
 }
 
 const expandList = (e: string[] | undefined): string | undefined =>
   e && e.length > 0 ? e.join(",") : undefined;
+
+const sortJoin = (s: string | string[] | undefined): string | undefined =>
+  Array.isArray(s) ? (s.length > 0 ? s.join(",") : undefined) : s;
 
 /**
  * Build a typed record service over SP1's `client.collection(meta.name)`. A
@@ -87,9 +97,11 @@ export function makeRecordService(
 
   const listOpts = (opts?: TypedListOptions) => ({
     filter: whereToFilter(opts?.where),
-    sort: opts?.sort,
+    sort: sortJoin(opts?.sort),
     expand: expandList(opts?.expand),
     fields: opts?.fields,
+    search: opts?.search,
+    vector: opts?.vector,
     signal: opts?.signal,
     requestKey: opts?.requestKey,
   });
@@ -145,9 +157,10 @@ export function makeRecordService(
     async getFirstListItem(opts) {
       const filter = whereToFilter(opts?.where);
       const listOpts2 = {
-        sort: opts?.sort,
+        sort: sortJoin(opts?.sort),
         expand: expandList(opts?.expand),
         fields: opts?.fields,
+        search: opts?.search,
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       };
@@ -173,11 +186,12 @@ export function makeRecordService(
     async getPage(opts) {
       const page = await inner.getPage({
         filter: whereToFilter(opts?.where),
-        sort: opts?.sort,
+        sort: sortJoin(opts?.sort),
         expand: expandList(opts?.expand),
         limit: opts?.limit,
         cursor: opts?.cursor,
         withTotal: opts?.withTotal,
+        search: opts?.search,
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
@@ -186,9 +200,10 @@ export function makeRecordService(
     iterate(opts) {
       const innerIter = inner.iterate({
         filter: whereToFilter(opts?.where),
-        sort: opts?.sort,
+        sort: sortJoin(opts?.sort),
         expand: expandList(opts?.expand),
         fields: opts?.fields,
+        search: opts?.search,
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
@@ -201,9 +216,10 @@ export function makeRecordService(
     async getFullList(opts) {
       const list = await inner.getFullList({
         filter: whereToFilter(opts?.where),
-        sort: opts?.sort,
+        sort: sortJoin(opts?.sort),
         expand: expandList(opts?.expand),
         fields: opts?.fields,
+        search: opts?.search,
         signal: opts?.signal,
         requestKey: opts?.requestKey,
       });
@@ -217,6 +233,9 @@ export function makeRecordService(
     },
     delete(id) {
       return inner.delete(id);
+    },
+    getAbilities(id, opts) {
+      return inner.getAbilities(id, opts);
     },
     filter(fn) {
       return fn(builder).compile();

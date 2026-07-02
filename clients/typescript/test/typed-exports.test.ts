@@ -4,7 +4,7 @@ import * as typed from "../src/typed/index.js";
 describe("@zigbase/client/typed public exports", () => {
   it("exports TYPED_CORE_VERSION", () => {
     expect(typeof typed.TYPED_CORE_VERSION).toBe("string");
-    expect(typed.TYPED_CORE_VERSION).toBe("0.1.0");
+    expect(typed.TYPED_CORE_VERSION).toBe("0.2.0");
   });
 
   it("exports runtime factory functions", () => {

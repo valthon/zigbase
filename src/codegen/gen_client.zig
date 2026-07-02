@@ -29,6 +29,7 @@ pub fn schemaHash(cols: []const schema.Collection) u64 {
             h.update(@tagName(std.meta.activeTag(f.options)));
             if (f.required) h.update("!");
             if (f.isMultiValue()) h.update("*");
+            if (f.searchable) h.update("?");
             switch (f.options) {
                 .select => |o| for (o.values) |v| {
                     h.update(",");
@@ -40,6 +41,10 @@ pub fn schemaHash(cols: []const schema.Collection) u64 {
                 },
                 else => {},
             }
+        }
+        if (c.options.tenant_field) |tf| {
+            h.update("\x01tenant:");
+            h.update(tf);
         }
     }
     return h.final();
@@ -117,10 +122,13 @@ pub fn generate(
     try section(alloc, &w, "Relations + expand keys");
     for (cols) |c| {
         try emit.emitRelations(alloc, &w, cols, c);
-        try emit.emitExpandKeys(alloc, &w, c);
+        try emit.emitExpandKeys(alloc, &w, cols, c);
     }
     try section(alloc, &w, "Fluent accessor types");
-    for (cols) |c| try emit.emitFields(alloc, &w, c);
+    for (cols) |c| {
+        try emit.emitFields(alloc, &w, c);
+        try emit.emitSortUnion(alloc, &w, c);
+    }
     try section(alloc, &w, "Concrete service interfaces");
     for (cols) |c| try emit.emitService(alloc, &w, c);
     try section(alloc, &w, "Per-collection metadata");
@@ -213,23 +221,31 @@ fn emitClientFactory(
         );
         try w.appendSlice(alloc, "\n  rpc: {\n");
         try w.appendSlice(alloc, rpc_section.iface_member);
-        try w.appendSlice(alloc,
-            \\  };
+        try w.appendSlice(alloc, try std.fmt.allocPrint(alloc,
+            \\  }};
+            \\  accounts: Client["accounts"];
+            \\  analytics: Client["analytics"];
+            \\  senders: Client["senders"];
+            \\  withAccount(accountId: string): {0s};
             \\  authStore: Client["authStore"];
             \\  send: Client["send"];
             \\  fetch: Client["fetch"];
-            \\}
+            \\}}
             \\
-        );
+        , .{client_name}));
     } else {
-        try w.appendSlice(alloc,
+        try w.appendSlice(alloc, try std.fmt.allocPrint(alloc,
             \\  files: FilesService;
+            \\  accounts: Client["accounts"];
+            \\  analytics: Client["analytics"];
+            \\  senders: Client["senders"];
+            \\  withAccount(accountId: string): {0s};
             \\  authStore: Client["authStore"];
             \\  send: Client["send"];
             \\  fetch: Client["fetch"];
-            \\}
+            \\}}
             \\
-        );
+        , .{client_name}));
     }
     // options interface
     try w.appendSlice(alloc, try std.fmt.allocPrint(alloc,
@@ -250,7 +266,12 @@ fn emitClientFactory(
         \\      authCollection: opts.authCollection ?? "{1s}",
         \\    }}),
         \\  );
+        \\  return makeClient(base);
+        \\}}
         \\
+        \\/** Build the typed facade over a realtime-enabled base client. All facades are
+        \\ *  stateless wrappers, so `withAccount` can rebuild them cheaply per scope. */
+        \\function makeClient(base: RealtimeEnabledClient): {0s} {{
         \\  return {{
         \\    db: {{
         \\
@@ -336,14 +357,18 @@ fn emitClientFactory(
         try w.appendSlice(alloc, rpc_section.factory_member);
         try w.appendSlice(alloc, "    },\n");
     }
-    try w.appendSlice(alloc,
+    try w.appendSlice(alloc, try std.fmt.allocPrint(alloc,
+        \\    accounts: base.accounts,
+        \\    analytics: base.analytics,
+        \\    senders: base.senders,
+        \\    withAccount: (accountId: string): {0s} => makeClient(withRealtime(base.withAccount(accountId))),
         \\    authStore: base.authStore,
         \\    send: base.send.bind(base),
         \\    fetch: base.fetch.bind(base),
-        \\  };
-        \\}
+        \\  }};
+        \\}}
         \\
-    );
+    , .{client_name}));
 }
 
 /// Emit `export interface FeatureState { … }` for the public `zb.flags.resolveAll`
@@ -1234,6 +1259,65 @@ test "feature state: flags-only app yields Record<string, never> experiments" {
     const out = try generate(a, cols, &.{}, &.{}, &flags, &.{}, true, "users", "ZbClient", "/api");
     try std.testing.expect(std.mem.indexOf(u8, out, "    promo_banner: boolean;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "  experiments: Record<string, never>;") != null);
+}
+
+test "schemaHash changes when searchable or tenant_field toggles" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try miniBlog(a);
+    const base = schemaHash(cols);
+    // Toggle searchable on one field.
+    var cols2 = try a.dupe(schema.Collection, cols);
+    var f2 = try a.dupe(schema.Field, cols2[0].fields);
+    f2[0].searchable = true;
+    cols2[0].fields = f2;
+    try std.testing.expect(base != schemaHash(cols2));
+    // Set a tenant field.
+    var cols3 = try a.dupe(schema.Collection, cols);
+    cols3[0].options.tenant_field = "account";
+    try std.testing.expect(base != schemaHash(cols3));
+}
+
+test "generate emits sort unions, the _RequiresCore guard, and SortExpr/RecordAbilities imports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try miniBlog(a);
+    const out = try generate(a, cols, &.{}, &.{}, &.{}, &.{}, true, "users", "BlogClient", "/api");
+    inline for (.{
+        "export type PostSortField =",
+        "export type PostSort = SortExpr<PostSortField>;",
+        "export type _RequiresCore = import(\"../../../src/typed/index.js\").CoreSupports_0_3;",
+        "type SortExpr,",
+        "type RecordAbilities",
+    }) |needle| try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
+    // Non-in-repo emission uses the package path.
+    const pkg = try generate(a, cols, &.{}, &.{}, &.{}, &.{}, false, "users", "BlogClient", "/api");
+    try std.testing.expect(std.mem.indexOf(u8, pkg,
+        "export type _RequiresCore = import(\"@zigbase/client/typed\").CoreSupports_0_3;") != null);
+}
+
+test "generated client wires accounts/analytics/senders/withAccount" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try miniBlog(a);
+    const out = try generate(a, cols, &.{}, &.{}, &.{}, &.{}, true, "users", "BlogClient", "/api");
+    inline for (.{
+        // interface members (indexed-access types keep the import surface small)
+        "  accounts: Client[\"accounts\"];",
+        "  analytics: Client[\"analytics\"];",
+        "  senders: Client[\"senders\"];",
+        "  withAccount(accountId: string): BlogClient;",
+        // factory: createClient delegates to a rebuildable makeClient
+        "return makeClient(base);",
+        "function makeClient(base: RealtimeEnabledClient): BlogClient {",
+        "    accounts: base.accounts,",
+        "    analytics: base.analytics,",
+        "    senders: base.senders,",
+        "    withAccount: (accountId: string): BlogClient => makeClient(withRealtime(base.withAccount(accountId))),",
+    }) |needle| try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
 }
 
 test "customAuthMeta reflects struct entries and skips bare strings" {

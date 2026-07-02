@@ -11,7 +11,7 @@ const jwt = @import("../jwt.zig");
 const realtime_ws = @import("../realtime/ws.zig");
 
 /// True for the feature-management override keys (`flag:<name>` and `exp:<name>:weights`),
-/// the only `_kv` writes that must fan out the realtime `features.changed` signal. Distinct
+/// the only `_kv` writes that must fan out the realtime `__features` signal. Distinct
 /// prefixes mean an arbitrary setting never triggers a broadcast.
 fn isFeatureOverrideKey(key: []const u8) bool {
     if (std.mem.startsWith(u8, key, "flag:")) return true;

@@ -25,6 +25,8 @@ export interface TransportConfig {
   autoRefresh: boolean;
   maxRetries: number;
   lang?: string;
+  /** Send X-Account-Id on every request (multi-tenant scoping); per-request headers win. */
+  accountId?: string;
   refresh?: () => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -105,6 +107,9 @@ export class Transport {
       headers.set("Authorization", `Bearer ${this.cfg.authStore.token}`);
     }
     if (this.cfg.lang) headers.set("Accept-Language", this.cfg.lang);
+    if (this.cfg.accountId && !headers.has("X-Account-Id")) {
+      headers.set("X-Account-Id", this.cfg.accountId);
+    }
 
     let body: BodyInit | undefined;
     if (opts.body !== undefined && opts.method && opts.method !== "GET") {

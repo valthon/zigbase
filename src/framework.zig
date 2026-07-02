@@ -481,15 +481,24 @@ pub fn App(comptime cfg: anytype) type {
         /// One non-reactive aggregation job per rollup (`_rollup:<name>`), scheduled on the
         /// rollup's `.every` cadence. Empty when no rollup is declared. The handler resolves the
         /// spec by `ev.name` from `app.analytics` (mirrors the durable-queue worker poller).
+        /// `analyticsRollupRun` is `anyerror!void` (non-reactive); `RuntimeJob.run` requires the
+        /// uniform `anyerror!?schedule.Reactive` signature, so it is wrapped the same way
+        /// `scheduler.buildJobs` wraps non-reactive handlers.
         const analytics_jobs: []const scheduler.RuntimeJob = blk: {
             if (analytics_rollups.len == 0) break :blk &.{};
+            const Wrap = struct {
+                fn run(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!?schedule.Reactive {
+                    try analyticsRollupRun(ctx, ev);
+                    return null;
+                }
+            };
             const Holder = struct {
                 const table: [analytics_rollups.len]scheduler.RuntimeJob = tbl: {
                     var t: [analytics_rollups.len]scheduler.RuntimeJob = undefined;
                     for (analytics_rollups, 0..) |r, i| t[i] = .{
                         .name = "_rollup:" ++ r.name,
                         .schedule = r.every,
-                        .run = analyticsRollupRun,
+                        .run = Wrap.run,
                     };
                     break :tbl t;
                 };
