@@ -34,6 +34,11 @@ pub const Source = union(enum) {
     embedded: []const StaticFile,
 };
 
+/// One Tier-2 rewrite (issue #183): a comptime-validated `match` pattern -> a fixed
+/// `serve` target. Both start with '/'; `serve` names a real document in the active
+/// static source (proven at comptime for embedded manifests, at startup for dirs).
+pub const StaticRoute = struct { match: []const u8, serve: []const u8 };
+
 const nosniff = http.Header{ .name = "X-Content-Type-Options", .value = "nosniff" };
 
 /// Normalize a request path into a root-relative, '/'-separated file path.
@@ -159,6 +164,30 @@ fn matchSpaRoot(roots: []const []const u8, rel: []const u8) ?[]const u8 {
             (rel.len == root.len or rel[root.len] == '/')) return root;
     }
     return null;
+}
+
+/// Minimal segment matcher for Tier-2 `static_routes` (issue #183). `pattern` is a
+/// comptime-validated route pattern (leading '/'; segments are literals, ":name", or a
+/// terminal "*"/"**"); `rel` is a sanitize()d root-relative path ("" = the root).
+///   :name — exactly one segment (capture discarded; `serve` is a fixed path)
+///   *     — one or more remaining segments (the bare prefix does NOT match)
+///   **    — zero or more remaining segments (the bare prefix DOES match)
+/// First-match-wins ordering is the caller's job; this answers a single pattern.
+pub fn matchRoute(pattern: []const u8, rel: []const u8) bool {
+    if (pattern.len <= 1) return rel.len == 0; // "/" matches only the root
+    var pit = std.mem.splitScalar(u8, pattern[1..], '/');
+    var rit = std.mem.splitScalar(u8, rel, '/');
+    // splitScalar("") still yields one "" segment; treat the root as zero segments.
+    const rel_empty = rel.len == 0;
+    while (pit.next()) |pseg| {
+        if (std.mem.eql(u8, pseg, "**")) return true; // rest-matcher, zero or more
+        if (std.mem.eql(u8, pseg, "*")) // rest-matcher, one or more
+            return !rel_empty and rit.next() != null;
+        const rseg = (if (rel_empty) null else rit.next()) orelse return false;
+        if (pseg.len > 1 and pseg[0] == ':') continue; // one segment, any (non-empty) value
+        if (!std.mem.eql(u8, pseg, rseg)) return false;
+    }
+    return rit.next() == null; // pattern exhausted: match iff the path has no segments left either
 }
 
 /// Startup derivation (Tier 1, EMBEDDED source only, issue #183): collect every
@@ -503,4 +532,25 @@ test "spa marker path detection: final segment '.spa' only, case-insensitive" {
     try std.testing.expect(isSpaMarkerPath(".Spa"));
     try std.testing.expect(isSpaMarkerPath("app/.SPA"));
     try std.testing.expect(!isSpaMarkerPath("app/.SPARE"));
+}
+
+test "static_routes matcher: ':name' one segment, '*' one-or-more, '**' zero-or-more" {
+    // The design-spec examples table, as assertions.
+    try std.testing.expect(matchRoute("/app/orders/:id", "app/orders/42"));
+    try std.testing.expect(!matchRoute("/app/orders/:id", "app/orders/42/edit")); // :id is ONE segment
+    try std.testing.expect(!matchRoute("/app/orders/:id", "app/orders"));
+    try std.testing.expect(matchRoute("/admin/*", "admin/x"));
+    try std.testing.expect(matchRoute("/admin/*", "admin/x/y"));
+    try std.testing.expect(!matchRoute("/admin/*", "admin")); // '*' needs >= 1 segment
+    try std.testing.expect(matchRoute("/app/**", "app")); // '**' matches the bare prefix
+    try std.testing.expect(matchRoute("/app/**", "app/a/b/c"));
+    try std.testing.expect(matchRoute("/app/a/b/c", "app/a/b/c")); // exact literal
+    try std.testing.expect(!matchRoute("/app/a/b/c", "app/a/b"));
+    try std.testing.expect(!matchRoute("/app/x", "app/y"));
+    // Root-form patterns against the root path ("" after sanitize).
+    try std.testing.expect(matchRoute("/**", ""));
+    try std.testing.expect(!matchRoute("/*", "")); // one-or-more can't match zero
+    try std.testing.expect(matchRoute("/", ""));
+    try std.testing.expect(!matchRoute("/", "x"));
+    try std.testing.expect(!matchRoute("/app/**", "application")); // segment-wise, not prefix-wise
 }
