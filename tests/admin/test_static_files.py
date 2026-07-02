@@ -137,3 +137,178 @@ def test_embedded_static_in_plugins_example():
             assert st == 304
         finally:
             proc.terminate(); proc.wait(timeout=10)
+
+
+def test_spa_marker_fallback():
+    """Issue #183 AC1 + AC4: 'Shipped binary, public/app/.spa present: hard GET
+    /app/orders/1234 -> public/app/index.html (200); /app/assets/app.js and other real
+    files serve directly; / and other paths outside /app/ are unaffected.' And: 'The
+    marker never rewrites a request that an API route handles.'"""
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
+    with tempfile.TemporaryDirectory() as static, tempfile.TemporaryDirectory() as data:
+        pub = pathlib.Path(static)
+        (pub / "index.html").write_text("<h1>site home</h1>")
+        (pub / "app").mkdir()
+        (pub / "app" / "index.html").write_text("<h1>app shell</h1>")
+        (pub / "app" / ".spa").write_text("MARKER-SECRET")  # contents are ignored (presence-only)
+        (pub / "app" / "assets").mkdir()
+        (pub / "app" / "assets" / "app.js").write_text("console.log('real asset')")
+        port = _free_port()
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--http-port", str(port), "--data-dir", data,
+             "--serve-static", static],
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            _wait_up(f"{base}/api/health")
+
+            # AC1: deep link under the marked dir -> the app shell, 200 text/html
+            st, hdr, body = _get(f"{base}/app/orders/1234")
+            assert st == 200 and b"app shell" in body
+            assert "text/html" in _hdr(hdr, "content-type")
+
+            # AC1: real files under the marked dir serve directly
+            st, _, body = _get(f"{base}/app/assets/app.js")
+            assert st == 200 and b"real asset" in body
+
+            # an extension-bearing MISS under the root still gets the shell (200 HTML)
+            st, hdr, body = _get(f"{base}/app/assets/gone.js")
+            assert st == 200 and b"app shell" in body
+
+            # AC1: / serves the real root index; misses OUTSIDE /app/ still 404
+            st, _, body = _get(f"{base}/")
+            assert st == 200 and b"site home" in body
+            st, hdr, _ = _get(f"{base}/pricing")
+            assert st == 404
+            assert "application/json" not in _hdr(hdr, "content-type")
+            # '/'-bounded: /application is outside the app/ subtree
+            st, _, _ = _get(f"{base}/application")
+            assert st == 404
+
+            # the marker file itself is never served (falls through to the shell)
+            st, _, body = _get(f"{base}/app/.spa")
+            assert b"MARKER-SECRET" not in body
+            assert st == 200 and b"app shell" in body
+
+            # AC4: unknown /api paths keep the JSON 404 envelope
+            st, hdr, _ = _get(f"{base}/api/definitely-missing")
+            assert st == 404
+            assert "application/json" in _hdr(hdr, "content-type")
+        finally:
+            proc.terminate(); proc.wait(timeout=10)
+
+
+def test_spa_marker_live_dir_mode_no_restart():
+    """Owner revision (2026-07-02): in dir mode the marker is resolved LIVE against the
+    filesystem on every miss, not scanned once at startup — dropping a NEW '.spa' (+
+    index.html) into the served tree after the server is already running must start
+    serving the shell on the very next request, with no restart."""
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
+    with tempfile.TemporaryDirectory() as static, tempfile.TemporaryDirectory() as data:
+        pub = pathlib.Path(static)
+        (pub / "index.html").write_text("<h1>site home</h1>")
+        (pub / "app").mkdir()
+        (pub / "app" / "index.html").write_text("<h1>app shell</h1>")
+        # deliberately NO app/.spa yet — the marker is added after boot, below
+        port = _free_port()
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--http-port", str(port), "--data-dir", data,
+             "--serve-static", static],
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            _wait_up(f"{base}/api/health")
+
+            # before the marker exists: a miss under app/ is a plain 404, not the shell
+            st, hdr, _ = _get(f"{base}/app/orders/1234")
+            assert st == 404
+            assert "application/json" not in _hdr(hdr, "content-type")
+
+            # simulate a post-boot deploy: drop the marker WITHOUT restarting the server
+            (pub / "app" / ".spa").write_text("")
+
+            # the very next request picks it up live
+            st, hdr, body = _get(f"{base}/app/orders/1234")
+            assert st == 200 and b"app shell" in body
+            assert "text/html" in _hdr(hdr, "content-type")
+
+            # removing the marker again (still live, still no restart) stops the fallback
+            (pub / "app" / ".spa").unlink()
+            st, _, _ = _get(f"{base}/app/orders/5678")
+            assert st == 404
+        finally:
+            proc.terminate(); proc.wait(timeout=10)
+
+
+def test_spa_marker_missing_index_is_fatal_at_startup():
+    """Owner revision (2026-07-02): a '.spa'-marked directory with no index.html is a
+    FATAL startup error (changed from warn-and-drop) — the process must exit non-zero
+    with a clear, actionable message naming the offending path."""
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
+    with tempfile.TemporaryDirectory() as static, tempfile.TemporaryDirectory() as data:
+        pub = pathlib.Path(static)
+        (pub / "index.html").write_text("<h1>site home</h1>")
+        (pub / "broken").mkdir()
+        (pub / "broken" / ".spa").write_text("")  # no broken/index.html
+        port = _free_port()
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--http-port", str(port), "--data-dir", data,
+             "--serve-static", static],
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        try:
+            code = proc.wait(timeout=20)
+            out = proc.stdout.read().decode("utf-8", errors="replace")
+            assert code != 0, f"expected a non-zero exit; stdout/stderr was:\n{out}"
+            assert "broken" in out, f"expected the offending path 'broken' named in the error; got:\n{out}"
+            assert "index.html" in out, f"expected the error to mention the missing index.html; got:\n{out}"
+        finally:
+            if proc.poll() is None:
+                proc.terminate(); proc.wait(timeout=10)
+
+
+def test_spa_marker_root():
+    """Issue #183 AC2 + AC4: 'public/.spa present: any miss under / -> /index.html
+    (200); real files still win.' API misses keep the JSON envelope."""
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
+    with tempfile.TemporaryDirectory() as static, tempfile.TemporaryDirectory() as data:
+        pub = pathlib.Path(static)
+        (pub / "index.html").write_text("<h1>spa root shell</h1>")
+        (pub / ".spa").write_text("")
+        (pub / "assets").mkdir()
+        (pub / "assets" / "app.js").write_text("console.log('root asset')")
+        port = _free_port()
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--http-port", str(port), "--data-dir", data,
+             "--serve-static", static],
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            _wait_up(f"{base}/api/health")
+
+            # AC2: any miss -> the root shell (200)
+            st, hdr, body = _get(f"{base}/some/deep/client/route")
+            assert st == 200 and b"spa root shell" in body
+            assert "text/html" in _hdr(hdr, "content-type")
+
+            # AC2: real files still win
+            st, _, body = _get(f"{base}/assets/app.js")
+            assert st == 200 and b"root asset" in body
+
+            # AC4: the root marker must NOT swallow the API namespace
+            st, hdr, _ = _get(f"{base}/api/definitely-missing")
+            assert st == 404
+            assert "application/json" in _hdr(hdr, "content-type")
+            st, hdr, _ = _get(f"{base}/api")
+            assert st == 404
+            assert "application/json" in _hdr(hdr, "content-type")
+
+            # the admin SPA still wins over the root marker
+            st, hdr, _ = _get(f"{base}/_/")
+            assert st == 200 and "text/html" in _hdr(hdr, "content-type")
+        finally:
+            proc.terminate(); proc.wait(timeout=10)
