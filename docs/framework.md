@@ -813,7 +813,7 @@ non-verdict (an error) and decide fail-open vs fail-closed: `error.TransportFail
 const r = ctx.verifyCaptcha(.turnstile, token) catch |e| {
     std.log.warn("captcha provider unreachable: {s}", .{@errorName(e)});
     // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable") to fail-closed
-    return process(ctx, ev);
+    return process(ctx);
 };
 ```
 
