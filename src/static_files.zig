@@ -128,6 +128,87 @@ fn withinRoot(root: []const u8, candidate: []const u8) bool {
     return candidate[r.len] == '/'; // boundary must be a separator (so "/a/rootEVIL" is rejected)
 }
 
+/// "" for a root marker (".spa"), "app/x" for "app/x/.spa", null when `path` is not
+/// a marker file path. `path` is root-relative and '/'-separated.
+fn markerPrefix(path: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, path, ".spa")) return "";
+    if (std.mem.endsWith(u8, path, "/.spa")) return path[0 .. path.len - "/.spa".len];
+    return null;
+}
+
+/// True when the sanitized path's final segment is ".spa" (ASCII case-insensitive) —
+/// the marker file itself is never servable (its bytes are meaningless and dir/embedded
+/// sources would otherwise happily serve it). Other dotfiles (.well-known/...) are
+/// unaffected. Case-insensitive because dir-mode stat on a case-insensitive filesystem
+/// (macOS's default APFS/HFS+ volumes) resolves "GET /.SPA" to the same file as ".spa",
+/// so the "never servable" invariant must hold regardless of request-path casing —
+/// otherwise the marker's contents (deliberately meaningless, but still readable server
+/// state) would leak on those platforms.
+fn isSpaMarkerPath(rel: []const u8) bool {
+    const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |i| rel[i + 1 ..] else rel;
+    return std.ascii.eqlIgnoreCase(base, ".spa");
+}
+
+/// The longest scanned SPA root that is a '/'-bounded prefix of the sanitized `rel`
+/// ("" matches everything). `roots` is sorted longest-first, so the first hit wins
+/// (nested markers: the innermost marker claims the miss).
+fn matchSpaRoot(roots: []const []const u8, rel: []const u8) ?[]const u8 {
+    for (roots) |root| {
+        if (root.len == 0) return root;
+        if (std.mem.startsWith(u8, rel, root) and
+            (rel.len == root.len or rel[root.len] == '/')) return root;
+    }
+    return null;
+}
+
+/// Startup derivation (Tier 1, EMBEDDED source only, issue #183): collect every
+/// directory in the manifest containing a file named exactly `.spa`, as root-relative
+/// '/'-separated prefixes ("" = the static root itself), sorted longest-first. An
+/// embedded manifest is comptime-static (baked into the binary), so this set never goes
+/// stale — there's no live filesystem to re-check per request, unlike dir mode below.
+/// A marked directory without an `index.html` gets a startup warning and is dropped
+/// (degrades to unmarked — misses there 404 or fall through to an enclosing marker).
+/// Caller frees via `freeSpaRoots`.
+pub fn deriveEmbeddedSpaRoots(alloc: std.mem.Allocator, files: []const StaticFile) ![]const []const u8 {
+    var roots: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (roots.items) |r| alloc.free(r);
+        roots.deinit(alloc);
+    }
+    for (files) |f| {
+        const prefix = markerPrefix(f.path) orelse continue;
+        const has_index = if (prefix.len == 0)
+            findEmbedded(files, "index.html") != null
+        else blk: {
+            const idx = try std.fmt.allocPrint(alloc, "{s}/index.html", .{prefix});
+            defer alloc.free(idx);
+            break :blk findEmbedded(files, idx) != null;
+        };
+        if (!has_index) {
+            std.log.warn("SPA marker at '{s}/' has no index.html; marker ignored", .{prefix});
+            continue;
+        }
+        try roots.append(alloc, try alloc.dupe(u8, prefix));
+    }
+    // Longest-first so the first '/'-bounded hit in matchSpaRoot is the innermost
+    // marker; equal-length ties break lexically for determinism.
+    std.mem.sort([]const u8, roots.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            if (x.len != y.len) return x.len > y.len;
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return try roots.toOwnedSlice(alloc);
+}
+
+/// Free a `deriveEmbeddedSpaRoots` result. Safe to call on the comptime-empty slice the
+/// marker-disabled path uses (no-op).
+pub fn freeSpaRoots(alloc: std.mem.Allocator, roots: []const []const u8) void {
+    if (roots.len == 0) return;
+    for (roots) |r| alloc.free(r);
+    alloc.free(roots);
+}
+
 fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8) !?http.Response {
     const first = if (rel.len == 0) "index.html" else rel;
     var full = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ root, first });
@@ -361,4 +442,65 @@ test "dir: a symlink inside the root pointing OUTSIDE it is refused (F10)" {
     const r = (try serve(std.testing.io, &ok, src)).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expect(r.file_path != null);
+}
+
+// ── Tier-1 SPA marker fixtures + tests (issue #183) ─────────────────────────
+
+const spa_fixture = [_]StaticFile{
+    .{ .path = "index.html", .bytes = "<h1>home</h1>", .etag = "\"aaaaaaaa\"" },
+    .{ .path = ".spa", .bytes = "MARKER-SECRET", .etag = "\"eeeeeeee\"" },
+    .{ .path = "app/index.html", .bytes = "<h1>app shell</h1>", .etag = "\"bbbbbbbb\"" },
+    .{ .path = "app/.spa", .bytes = "MARKER-SECRET", .etag = "\"ffffffff\"" },
+    .{ .path = "app/assets/app.js", .bytes = "console.log(2)", .etag = "\"cccccccc\"" },
+    // a marker whose directory has NO index.html — must be warned about and dropped
+    .{ .path = "bare/.spa", .bytes = "MARKER-SECRET", .etag = "\"dddddddd\"" },
+    // a REAL static file that happens to live under an "api/" prefix — proves the
+    // api-guard refuses it even though a normal file lookup would otherwise find it.
+    .{ .path = "api/x", .bytes = "not-the-api", .etag = "\"11111111\"" },
+};
+
+test "spa scan: embedded manifest markers derive roots (missing index.html dropped)" {
+    const a = std.testing.allocator;
+    const roots = try deriveEmbeddedSpaRoots(a, &spa_fixture);
+    defer freeSpaRoots(a, roots);
+    // "bare" is dropped (no bare/index.html); longest-first order: "app" then "".
+    try std.testing.expectEqual(@as(usize, 2), roots.len);
+    try std.testing.expectEqualStrings("app", roots[0]);
+    try std.testing.expectEqualStrings("", roots[1]);
+}
+
+test "spa scan: .none / plain embedded source yields an empty (freeable) root set" {
+    const a = std.testing.allocator;
+    const plain = try deriveEmbeddedSpaRoots(a, &fixture);
+    defer freeSpaRoots(a, plain);
+    try std.testing.expectEqual(@as(usize, 0), plain.len);
+}
+
+test "spa prefix: '/'-bounded longest match; marker at app/ does not claim /application" {
+    const roots = [_][]const u8{ "app/admin", "app", "" };
+    try std.testing.expectEqualStrings("app/admin", matchSpaRoot(&roots, "app/admin/x/y").?);
+    try std.testing.expectEqualStrings("app", matchSpaRoot(&roots, "app/orders/1").?);
+    try std.testing.expectEqualStrings("app", matchSpaRoot(&roots, "app").?);
+    try std.testing.expectEqualStrings("", matchSpaRoot(&roots, "pricing").?);
+    try std.testing.expectEqualStrings("", matchSpaRoot(&roots, "application/x").?); // root marker, NOT "app"
+    const app_only = [_][]const u8{"app"};
+    try std.testing.expect(matchSpaRoot(&app_only, "application/x") == null);
+    try std.testing.expect(matchSpaRoot(&app_only, "pricing") == null);
+    try std.testing.expect(matchSpaRoot(&.{}, "anything") == null);
+}
+
+test "spa marker path detection: final segment '.spa' only, case-insensitive" {
+    try std.testing.expect(isSpaMarkerPath(".spa"));
+    try std.testing.expect(isSpaMarkerPath("app/.spa"));
+    try std.testing.expect(!isSpaMarkerPath("app/.spare"));
+    try std.testing.expect(!isSpaMarkerPath(".spa/x"));
+    try std.testing.expect(!isSpaMarkerPath(".well-known/security.txt"));
+    try std.testing.expect(!isSpaMarkerPath(""));
+    // ASCII-case-insensitive: macOS's default (case-insensitive) APFS/HFS+ volumes stat
+    // ".SPA"/".Spa" as the same file as ".spa" in dir mode, so "GET /.SPA" must be
+    // refused too — otherwise the "never servable" invariant would be platform-dependent.
+    try std.testing.expect(isSpaMarkerPath(".SPA"));
+    try std.testing.expect(isSpaMarkerPath(".Spa"));
+    try std.testing.expect(isSpaMarkerPath("app/.SPA"));
+    try std.testing.expect(!isSpaMarkerPath("app/.SPARE"));
 }
