@@ -860,7 +860,11 @@ fn onRequest(r: zap.Request) !void {
             !std.mem.startsWith(u8, ctx.path, "/api/") and
             !std.mem.eql(u8, ctx.path, "/api"))
         {
-            if (static_files.serve(self.app.io, &ctx, self.app.static_source) catch null) |hit| break :blk hit;
+            if (static_files.serve(self.app.io, &ctx, self.app.static_source, .{
+                .routes = self.app.static_routes,
+                .spa_roots = self.app.spa_roots,
+                .spa_marker_enabled = self.app.spa_marker_enabled,
+            }) catch null) |hit| break :blk hit;
             // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.
             break :blk http.Response{ .status = 404, .body = "not found", .content_type = "text/plain; charset=utf-8" };
         }

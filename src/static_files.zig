@@ -39,6 +39,26 @@ pub const Source = union(enum) {
 /// static source (proven at comptime for embedded manifests, at startup for dirs).
 pub const StaticRoute = struct { match: []const u8, serve: []const u8 };
 
+/// Miss-handler inputs threaded into `serve` by server.zig (issue #183).
+/// `routes` is the comptime-lowered App.static_routes (Tier 2, checked first).
+///
+/// Tier 1 (the `.spa` marker) resolves differently per source, both gated by
+/// `spa_marker_enabled` (mirrors comptime `enable_spa_marker`, default true absent
+/// `static_routes`):
+///   - **embedded**: the manifest is comptime-static, so `spa_roots` is the startup-
+///     derived root set (see `deriveEmbeddedSpaRoots`), matched via `matchSpaRoot`.
+///   - **dir**: resolved LIVE, per miss, straight off the filesystem (see
+///     `resolveSpaMarkerDirLive`) — adding/removing a `.spa` (or its `index.html`)
+///     takes effect on the very next request, no restart, no cache to invalidate.
+///     `spa_roots` is unused for `.dir` sources.
+///
+/// All fields default empty/false: `serve(.., .{})` behaves exactly as before the feature.
+pub const Fallback = struct {
+    routes: []const StaticRoute = &.{},
+    spa_roots: []const []const u8 = &.{},
+    spa_marker_enabled: bool = false,
+};
+
 const nosniff = http.Header{ .name = "X-Content-Type-Options", .value = "nosniff" };
 
 /// Normalize a request path into a root-relative, '/'-separated file path.
@@ -238,6 +258,82 @@ pub fn freeSpaRoots(alloc: std.mem.Allocator, roots: []const []const u8) void {
     alloc.free(roots);
 }
 
+/// Cap on the number of ancestor levels `resolveSpaMarkerDirLive` will `statFile` before
+/// giving up on the "walk every level" strategy and jumping straight to the root check —
+/// deeper than any plausible static tree (a real SPA route nesting 64+ segments deep does
+/// not exist in practice). Bounds the per-request-miss filesystem cost to O(1) `statFile`
+/// calls regardless of how deep a crafted request path claims to be, instead of O(path
+/// length): every cache-miss on a dir-mode static tree pays this walk, so an attacker
+/// sending a request path with thousands of `/`-separated segments must not be able to
+/// turn that into thousands of syscalls per request.
+const spa_marker_walk_cap = 64;
+
+/// Live per-miss resolution (Tier 1, DIR source only, issue #183 — owner revision):
+/// walk `rel`'s ancestor directories from deepest to the static root (inclusive),
+/// stat'ing each candidate for a `.spa` marker; the first (deepest, i.e. innermost)
+/// marked ancestor wins — this preserves the same longest-'/'-bounded-prefix semantics
+/// `matchSpaRoot` gives the embedded/comptime root set, but reads the filesystem fresh
+/// on every miss instead of consulting a startup-cached list. That means a `.spa` (or
+/// its `index.html`) added, removed, or edited after boot takes effect on the very next
+/// request — no restart, no watcher, no cache invalidation.
+///
+/// Bounded to `spa_marker_walk_cap` ancestor levels (see its doc comment): if `rel` is
+/// deeper than that, only the `spa_marker_walk_cap` innermost ancestors are actually
+/// `statFile`'d for a marker — deepest-wins semantics are preserved exactly among those
+/// checked levels — and then the walk jumps straight to the static root ("") as the
+/// final check, skipping the (attacker-controlled, unboundedly many) intermediate levels
+/// between the cap and the root. This never breaks a legitimate deployment: no real
+/// static tree nests a `.spa` marker 64+ directories deep, and the root marker — the most
+/// common case, "the whole site is one SPA" — is still always checked.
+///
+/// Returns the root-relative shell path to serve (e.g. "app/index.html", or
+/// "index.html" for a root marker) via `serveRel`, or `null` when no ancestor is marked
+/// OR the deepest marked ancestor's `index.html` is missing/unreadable (treated as "no
+/// marker here", consistent with "unreadable = doesn't exist" — it does NOT fall
+/// through to try the next-outer ancestor, mirroring the startup-scan precedent where a
+/// missing index drops that one marker rather than promoting an enclosing one).
+/// Every stat failure (`AccessDenied`, `FileNotFound`, ...) is swallowed as "absent"; a
+/// permission problem here degrades to a plain 404, exactly like `serveDir` already does
+/// for an ordinary unreadable file — it is never a request-time error.
+fn resolveSpaMarkerDirLive(io: std.Io, alloc: std.mem.Allocator, root: []const u8, rel: []const u8) !?[]const u8 {
+    var dir_root = std.Io.Dir.cwd().openDir(io, root, .{}) catch return null;
+    defer dir_root.close(io);
+
+    // Start at `rel`'s OWN containing directory (a miss at "app/orders/1" first checks
+    // "app/orders", not "app/orders/1" — the marker lives in a directory, never beside a
+    // file), then walk upward one segment at a time to "" (the static root), inclusive.
+    var dir_rel: []const u8 = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |i| rel[0..i] else "";
+    var levels_checked: u32 = 0;
+    while (true) {
+        levels_checked += 1;
+        // Cap hit before reaching the root: skip directly to the root as the final,
+        // deepest-remaining check rather than continuing to walk the unboundedly many
+        // intermediate levels a crafted path could otherwise force.
+        if (levels_checked > spa_marker_walk_cap and dir_rel.len != 0) dir_rel = "";
+
+        const marker_path = try std.fmt.allocPrint(alloc, "{s}{s}.spa", .{ dir_rel, if (dir_rel.len == 0) "" else "/" });
+        defer alloc.free(marker_path);
+        const marked = blk: {
+            const st = dir_root.statFile(io, marker_path, .{}) catch break :blk false;
+            break :blk st.kind == .file;
+        };
+        if (marked) {
+            const idx_path = try std.fmt.allocPrint(alloc, "{s}{s}index.html", .{ dir_rel, if (dir_rel.len == 0) "" else "/" });
+            errdefer alloc.free(idx_path);
+            const has_index = blk: {
+                const ist = dir_root.statFile(io, idx_path, .{}) catch break :blk false;
+                break :blk ist.kind == .file;
+            };
+            if (has_index) return idx_path;
+            alloc.free(idx_path);
+            return null; // marked but no index.html: absent, do not fall through outward
+        }
+
+        if (dir_rel.len == 0) return null; // reached the root; no marker anywhere
+        dir_rel = if (std.mem.lastIndexOfScalar(u8, dir_rel, '/')) |i| dir_rel[0..i] else "";
+    }
+}
+
 fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8) !?http.Response {
     const first = if (rel.len == 0) "index.html" else rel;
     var full = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ root, first });
@@ -270,19 +366,72 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
     };
 }
 
-/// Serve `ctx.path` from `source`. Returns null when no file matches (the caller
-/// emits its 404), including for non-GET/HEAD methods and `.none` sources.
-/// HEAD gets the same response as GET (status + headers + body/file_path);
-/// stripping the body for HEAD is the transport layer's (zap/facil.io) job.
-pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source) !?http.Response {
-    if (ctx.method != .GET and ctx.method != .HEAD) return null;
-    if (std.meta.activeTag(source) == .none) return null;
-    const rel = (try sanitize(ctx.allocator, ctx.path)) orelse return null;
+/// Resolve `source` to serve one relative path (shared by the direct lookup and both
+/// fallback tiers, so fallback documents inherit ETag/304/HEAD/nosniff/F10 for free).
+fn serveRel(io: std.Io, ctx: *http.RequestCtx, source: Source, rel: []const u8) !?http.Response {
     return switch (source) {
-        .none => unreachable,
+        .none => unreachable, // gated in serve()
         .embedded => |files| serveEmbedded(ctx, files, rel),
         .dir => |root| serveDir(io, ctx, root, rel),
     };
+}
+
+/// Serve `ctx.path` from `source`. Returns null when nothing matches (the caller
+/// emits its 404), including for non-GET/HEAD methods and `.none` sources.
+/// HEAD gets the same response as GET (status + headers + body/file_path);
+/// stripping the body for HEAD is the transport layer's (zap/facil.io) job.
+///
+/// Miss resolution (issue #183, owner revision — dir-mode markers are LIVE), in order:
+///   1. api-prefixed misses NEVER reach ANY static content (defense-in-depth, see below);
+///   2. the '.spa' marker file itself is never servable (skips the file lookup);
+///   3. a real file always wins (incl. directory -> index.html resolution);
+///   4. Tier 2: the first matching `fb.routes` entry serves its fixed target —
+///      terminal even if the target went missing after startup validation;
+///   5. Tier 1: **embedded** — the longest '/'-bounded `fb.spa_roots` prefix (a startup-
+///      derived, comptime-static set) serves `<root>/index.html`. **dir** — resolved
+///      LIVE off the filesystem every miss (`resolveSpaMarkerDirLive`): no cached root
+///      set, so a `.spa` added/removed/edited after boot takes effect immediately;
+///   6. null (the caller's plain-text 404, unchanged).
+pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback) !?http.Response {
+    if (ctx.method != .GET and ctx.method != .HEAD) return null;
+    if (std.meta.activeTag(source) == .none) return null;
+    const rel = (try sanitize(ctx.allocator, ctx.path)) orelse return null;
+    // Defense-in-depth (final review; hoisted per follow-up review — owner decision):
+    // server.zig already keeps the whole `/api` namespace out of static serving by
+    // gating on the RAW request path, but that gate and this fallback's normalization
+    // (sanitize() collapses "//api/x" -> "api/x") can disagree — a raw "//api/x" fails
+    // the byte-literal "/api/" prefix check upstream yet normalizes to an api-looking
+    // `rel` here. Refuse it on the normalized path BEFORE any file lookup (real file,
+    // Tier 2, or Tier 1), so no such disagreement can ever serve an api-looking miss —
+    // real static file or fallback document alike — instead of a 404. In the normal
+    // (non-normalized) case this is a no-op: `/api/*` never reaches this function at
+    // all, since server.zig's raw-path gate already routes it to the API's JSON 404.
+    if (std.mem.eql(u8, rel, "api") or std.mem.startsWith(u8, rel, "api/")) return null;
+    if (!isSpaMarkerPath(rel)) {
+        if (try serveRel(io, ctx, source, rel)) |hit| return hit;
+    }
+    for (fb.routes) |rt| {
+        if (matchRoute(rt.match, rel))
+            return serveRel(io, ctx, source, std.mem.trimStart(u8, rt.serve, "/"));
+    }
+    if (!fb.spa_marker_enabled) return null;
+    switch (source) {
+        .embedded => {
+            if (matchSpaRoot(fb.spa_roots, rel)) |root| {
+                const shell = if (root.len == 0)
+                    "index.html"
+                else
+                    try std.fmt.allocPrint(ctx.allocator, "{s}/index.html", .{root});
+                return serveRel(io, ctx, source, shell);
+            }
+            return null;
+        },
+        .dir => |root| {
+            const shell = (try resolveSpaMarkerDirLive(io, ctx.allocator, root, rel)) orelse return null;
+            return serveRel(io, ctx, source, shell);
+        },
+        .none => unreachable, // gated above
+    }
 }
 
 test "withinRoot: exact path, trailing-slash root, and sibling rejection (F10)" {
@@ -341,7 +490,7 @@ test "embedded: exact file, root index, directory index, miss" {
     const src = Source{ .embedded = &fixture };
 
     var ctx = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = arena.allocator() };
-    const r = (try serve(std.testing.io, &ctx, src)).?;
+    const r = (try serve(std.testing.io, &ctx, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expectEqualStrings("console.log(1)", r.body);
     try std.testing.expectEqualStrings("application/javascript", r.content_type);
@@ -350,19 +499,19 @@ test "embedded: exact file, root index, directory index, miss" {
     try std.testing.expectEqualStrings("\"22222222\"", r.extra_headers[0].value);
 
     var root = http.RequestCtx{ .method = .GET, .path = "/", .allocator = arena.allocator() };
-    try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &root, src)).?.body);
+    try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &root, src, .{})).?.body);
 
     var d1 = http.RequestCtx{ .method = .GET, .path = "/docs", .allocator = arena.allocator() };
-    try std.testing.expectEqualStrings("<h1>docs</h1>", (try serve(std.testing.io, &d1, src)).?.body);
+    try std.testing.expectEqualStrings("<h1>docs</h1>", (try serve(std.testing.io, &d1, src, .{})).?.body);
     var d2 = http.RequestCtx{ .method = .GET, .path = "/docs/", .allocator = arena.allocator() };
-    try std.testing.expectEqualStrings("<h1>docs</h1>", (try serve(std.testing.io, &d2, src)).?.body);
+    try std.testing.expectEqualStrings("<h1>docs</h1>", (try serve(std.testing.io, &d2, src, .{})).?.body);
 
     var miss = http.RequestCtx{ .method = .GET, .path = "/nope.png", .allocator = arena.allocator() };
-    try std.testing.expect((try serve(std.testing.io, &miss, src)) == null);
+    try std.testing.expect((try serve(std.testing.io, &miss, src, .{})) == null);
 
     // HEAD is served like GET (the transport strips the body).
     var head = http.RequestCtx{ .method = .HEAD, .path = "/assets/app.js", .allocator = arena.allocator() };
-    const hr = (try serve(std.testing.io, &head, src)).?;
+    const hr = (try serve(std.testing.io, &head, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), hr.status);
     try std.testing.expectEqualStrings("application/javascript", hr.content_type);
     try std.testing.expectEqual(@as(usize, 2), hr.extra_headers.len);
@@ -375,14 +524,14 @@ test "embedded: If-None-Match yields 304; non-GET/HEAD and .none yield null" {
     const src = Source{ .embedded = &fixture };
 
     var ctx = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = arena.allocator(), .if_none_match = "\"22222222\"" };
-    const r = (try serve(std.testing.io, &ctx, src)).?;
+    const r = (try serve(std.testing.io, &ctx, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 304), r.status);
     try std.testing.expectEqualStrings("", r.body);
 
     var post = http.RequestCtx{ .method = .POST, .path = "/index.html", .allocator = arena.allocator() };
-    try std.testing.expect((try serve(std.testing.io, &post, src)) == null);
+    try std.testing.expect((try serve(std.testing.io, &post, src, .{})) == null);
     var none = http.RequestCtx{ .method = .GET, .path = "/index.html", .allocator = arena.allocator() };
-    try std.testing.expect((try serve(std.testing.io, &none, Source.none)) == null);
+    try std.testing.expect((try serve(std.testing.io, &none, Source.none, .{})) == null);
 }
 
 test "etagMatches uses RFC 7232 weak comparison (W/ prefix ignored)" {
@@ -407,7 +556,7 @@ test "dir: serves files via file_path; index resolution; miss; traversal" {
     const src = Source{ .dir = root };
 
     var ctx = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = arena.allocator() };
-    const r = (try serve(std.testing.io, &ctx, src)).?;
+    const r = (try serve(std.testing.io, &ctx, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expect(r.file_path != null);
     try std.testing.expect(std.mem.endsWith(u8, r.file_path.?, "assets/app.js"));
@@ -416,16 +565,16 @@ test "dir: serves files via file_path; index resolution; miss; traversal" {
     try std.testing.expectEqualStrings("X-Content-Type-Options", r.extra_headers[0].name);
 
     var root_req = http.RequestCtx{ .method = .GET, .path = "/", .allocator = arena.allocator() };
-    const ri = (try serve(std.testing.io, &root_req, src)).?;
+    const ri = (try serve(std.testing.io, &root_req, src, .{})).?;
     try std.testing.expect(std.mem.endsWith(u8, ri.file_path.?, "index.html"));
 
     var dir_req = http.RequestCtx{ .method = .GET, .path = "/assets", .allocator = arena.allocator() };
-    try std.testing.expect((try serve(std.testing.io, &dir_req, src)) == null);
+    try std.testing.expect((try serve(std.testing.io, &dir_req, src, .{})) == null);
 
     var miss = http.RequestCtx{ .method = .GET, .path = "/nope.css", .allocator = arena.allocator() };
-    try std.testing.expect((try serve(std.testing.io, &miss, src)) == null);
+    try std.testing.expect((try serve(std.testing.io, &miss, src, .{})) == null);
     var trav = http.RequestCtx{ .method = .GET, .path = "/../secret", .allocator = arena.allocator() };
-    try std.testing.expect((try serve(std.testing.io, &trav, src)) == null);
+    try std.testing.expect((try serve(std.testing.io, &trav, src, .{})) == null);
 }
 
 test "withinRoot: prefix must be '/'-bounded (no sibling-prefix bypass)" {
@@ -464,11 +613,11 @@ test "dir: a symlink inside the root pointing OUTSIDE it is refused (F10)" {
 
     // The escaping symlink is refused (404 / null).
     var leak = http.RequestCtx{ .method = .GET, .path = "/leak.txt", .allocator = a };
-    try std.testing.expect((try serve(std.testing.io, &leak, src)) == null);
+    try std.testing.expect((try serve(std.testing.io, &leak, src, .{})) == null);
 
     // The legitimate file is unaffected.
     var ok = http.RequestCtx{ .method = .GET, .path = "/ok.txt", .allocator = a };
-    const r = (try serve(std.testing.io, &ok, src)).?;
+    const r = (try serve(std.testing.io, &ok, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expect(r.file_path != null);
 }
@@ -553,4 +702,376 @@ test "static_routes matcher: ':name' one segment, '*' one-or-more, '**' zero-or-
     try std.testing.expect(matchRoute("/", ""));
     try std.testing.expect(!matchRoute("/", "x"));
     try std.testing.expect(!matchRoute("/app/**", "application")); // segment-wise, not prefix-wise
+}
+
+// ── serve() miss-path fallback wiring (issue #183, Task 3) ─────────────────
+
+test "spa fallback: miss under marked root serves its index.html (embedded: 200/html/ETag)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = Source{ .embedded = &spa_fixture };
+    const fb = Fallback{ .spa_roots = &.{ "app", "" }, .spa_marker_enabled = true };
+
+    var deep = http.RequestCtx{ .method = .GET, .path = "/app/orders/1234", .allocator = arena.allocator() };
+    const r = (try serve(std.testing.io, &deep, src, fb)).?;
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("<h1>app shell</h1>", r.body);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", r.content_type);
+    try std.testing.expectEqualStrings("ETag", r.extra_headers[0].name);
+    try std.testing.expectEqualStrings("\"bbbbbbbb\"", r.extra_headers[0].value);
+
+    // Extension-bearing misses under the root get the shell too (deliberate: one
+    // fixed behavior, same as try_files $uri /index.html).
+    var stale = http.RequestCtx{ .method = .GET, .path = "/app/assets/old.js", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("<h1>app shell</h1>", (try serve(std.testing.io, &stale, src, fb)).?.body);
+
+    // Real files always win over the fallback.
+    var real = http.RequestCtx{ .method = .GET, .path = "/app/assets/app.js", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("console.log(2)", (try serve(std.testing.io, &real, src, fb)).?.body);
+}
+
+test "spa fallback: root marker catches every miss; nested markers longest-prefix-wins" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = Source{ .embedded = &spa_fixture };
+    const fb = Fallback{ .spa_roots = &.{ "app", "" }, .spa_marker_enabled = true };
+
+    var out = http.RequestCtx{ .method = .GET, .path = "/pricing/enterprise", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &out, src, fb)).?.body);
+    var in = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("<h1>app shell</h1>", (try serve(std.testing.io, &in, src, fb)).?.body);
+    // '/'-bounded: /application/x belongs to the ROOT marker, not app/.
+    var appl = http.RequestCtx{ .method = .GET, .path = "/application/x", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &appl, src, fb)).?.body);
+    // A dropped inner root (fb without "app") falls through to the outer marker.
+    const outer_only = Fallback{ .spa_roots = &.{""}, .spa_marker_enabled = true };
+    var fell = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &fell, src, outer_only)).?.body);
+}
+
+test "spa fallback: no marker/no routes => serve returns null (miss 404s, AC3)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var miss = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    try std.testing.expect((try serve(std.testing.io, &miss, Source{ .embedded = &spa_fixture }, .{})) == null);
+}
+
+test "spa fallback: spa_marker_enabled=false suppresses the marker even with roots present" {
+    // A dropped-flag safety net: `spa_roots`/on-disk markers alone must not be enough —
+    // `.enable_spa_marker = false` (mirrored at runtime by `spa_marker_enabled`) has to
+    // actually gate the tier, not just be documentation.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var miss = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    const fb = Fallback{ .spa_roots = &.{ "app", "" }, .spa_marker_enabled = false };
+    try std.testing.expect((try serve(std.testing.io, &miss, Source{ .embedded = &spa_fixture }, fb)) == null);
+}
+
+test "spa fallback: an api-looking miss never reaches the fallback, even double-slashed" {
+    // Defense-in-depth (final review, finding 3): server.zig's own "/api" gate is
+    // byte-literal on the RAW path, which "//api/x" (a leading double slash) bypasses —
+    // sanitize() here normalizes it to "api/x" all the same, so this second, normalized
+    // check must independently refuse it, regardless of what the caller's raw-path gate
+    // did or didn't catch upstream.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = Source{ .embedded = &spa_fixture };
+    const fb = Fallback{ .spa_roots = &.{""}, .spa_marker_enabled = true }; // root marker would otherwise catch every miss
+
+    var dbl = http.RequestCtx{ .method = .GET, .path = "//api/x", .allocator = arena.allocator() };
+    try std.testing.expect((try serve(std.testing.io, &dbl, src, fb)) == null);
+    var bare = http.RequestCtx{ .method = .GET, .path = "/api", .allocator = arena.allocator() };
+    try std.testing.expect((try serve(std.testing.io, &bare, src, fb)) == null);
+    var normal = http.RequestCtx{ .method = .GET, .path = "/api/x", .allocator = arena.allocator() };
+    try std.testing.expect((try serve(std.testing.io, &normal, src, fb)) == null);
+    // Non-api misses under the same root marker are unaffected (sanity: the guard is scoped).
+    var other = http.RequestCtx{ .method = .GET, .path = "/pricing", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &other, src, fb)).?.body);
+}
+
+test "spa fallback: //api/x refuses even when a REAL file exists at api/x (hoisted guard, review)" {
+    // The gap the guard used to have: the normalized api-refusal ran AFTER the real-file
+    // lookup in serve(), so a raw "//api/x" (which bypasses server.zig's byte-literal
+    // "/api/" gate, then sanitizes to "api/x") could serve a genuine static file living
+    // under an "api/" prefix in the static source — even though the equivalent normal-form
+    // "/api/x" request never reaches this function at all (server.zig routes it to the
+    // API's JSON 404 first). The guard must now run BEFORE any file lookup, so this must
+    // be null for BOTH sources despite "api/x" being a real, servable file.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var dbl_embedded = http.RequestCtx{ .method = .GET, .path = "//api/x", .allocator = a };
+    try std.testing.expect((try serve(std.testing.io, &dbl_embedded, Source{ .embedded = &spa_fixture }, .{})) == null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "api");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "api/x", .data = "not-the-api" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var dbl_dir = http.RequestCtx{ .method = .GET, .path = "//api/x", .allocator = a };
+    try std.testing.expect((try serve(std.testing.io, &dbl_dir, Source{ .dir = root }, .{})) == null);
+}
+
+test "spa fallback: '.spa' itself is never served (embedded + dir, incl. dir live resolution)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Embedded: the marker bytes must never appear; with the marker active the
+    // request falls through to the shell.
+    const src = Source{ .embedded = &spa_fixture };
+    var m1 = http.RequestCtx{ .method = .GET, .path = "/app/.spa", .allocator = a };
+    const r1 = (try serve(std.testing.io, &m1, src, .{ .spa_roots = &.{"app"}, .spa_marker_enabled = true })).?;
+    try std.testing.expectEqualStrings("<h1>app shell</h1>", r1.body);
+    // ...and with NO fallback configured it is a plain miss (null), not the bytes.
+    var m2 = http.RequestCtx{ .method = .GET, .path = "/app/.spa", .allocator = a };
+    try std.testing.expect((try serve(std.testing.io, &m2, src, .{})) == null);
+    // Other dotfiles keep serving (.well-known must not break): add none here — the
+    // refusal is scoped to the literal '.spa' final segment (see isSpaMarkerPath test).
+
+    // Dir mode (live resolution): a real .spa file on disk is refused too.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".spa", .data = "MARKER-SECRET" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var m3 = http.RequestCtx{ .method = .GET, .path = "/.spa", .allocator = a };
+    const r3 = (try serve(std.testing.io, &m3, Source{ .dir = root }, .{ .spa_marker_enabled = true })).?;
+    try std.testing.expect(r3.file_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, r3.file_path.?, "index.html"));
+}
+
+test "spa fallback: If-None-Match on the embedded fallback yields 304; HEAD mirrors GET" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = Source{ .embedded = &spa_fixture };
+    const fb = Fallback{ .spa_roots = &.{"app"}, .spa_marker_enabled = true };
+    var cond = http.RequestCtx{ .method = .GET, .path = "/app/deep/link", .allocator = arena.allocator(), .if_none_match = "\"bbbbbbbb\"" };
+    try std.testing.expectEqual(@as(u16, 304), (try serve(std.testing.io, &cond, src, fb)).?.status);
+    var head = http.RequestCtx{ .method = .HEAD, .path = "/app/deep/link", .allocator = arena.allocator() };
+    const hr = (try serve(std.testing.io, &head, src, fb)).?;
+    try std.testing.expectEqual(@as(u16, 200), hr.status);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", hr.content_type);
+}
+
+test "spa fallback: dir-mode fallback streams via file_path (facil.io owns caching)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "app");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/index.html", .data = "<h1>dir shell</h1>" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/.spa", .data = "" });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    var deep = http.RequestCtx{ .method = .GET, .path = "/app/orders/1234", .allocator = arena.allocator() };
+    const r = (try serve(std.testing.io, &deep, Source{ .dir = root }, .{ .spa_marker_enabled = true })).?;
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(r.file_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, r.file_path.?, "app/index.html"));
+    // Dir mode emits ONLY nosniff; ETag/304 belong to facil.io sendFile.
+    try std.testing.expectEqual(@as(usize, 1), r.extra_headers.len);
+    try std.testing.expectEqualStrings("X-Content-Type-Options", r.extra_headers[0].name);
+}
+
+// ── Dir-mode LIVE marker resolution (owner revision, 2026-07-02) ────────────
+// No cached root set for dir mode: `resolveSpaMarkerDirLive` re-reads the filesystem
+// on every miss, so these tests specifically prove markers/index.html files created
+// (or removed) AFTER the serve context existed still resolve correctly on the next
+// call — the whole point of going live instead of a startup-only scan.
+
+test "spa live (dir): a marker created AFTER boot is picked up on the very next miss" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
+    try tmp.dir.createDirPath(std.testing.io, "app");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/index.html", .data = "<h1>app shell</h1>" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const src = Source{ .dir = root };
+    const fb = Fallback{ .spa_marker_enabled = true };
+
+    // Before the marker exists: a miss under "app/" does NOT get the shell (404/null) —
+    // "app" isn't marked yet, and the root has no marker either.
+    var before = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    try std.testing.expect((try serve(std.testing.io, &before, src, fb)) == null);
+
+    // Simulates a post-boot deploy: the marker is dropped WITHOUT restarting the server
+    // (no re-scan, no cache to invalidate — `serve` is never told this happened).
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/.spa", .data = "" });
+
+    // The very next miss under "app/" now gets the shell.
+    var after = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    const r = (try serve(std.testing.io, &after, src, fb)).?;
+    try std.testing.expect(r.file_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, r.file_path.?, "app/index.html"));
+}
+
+test "spa live (dir): removing a marker post-boot stops the fallback on the next miss" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
+    try tmp.dir.createDirPath(std.testing.io, "app");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/index.html", .data = "<h1>app shell</h1>" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/.spa", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const src = Source{ .dir = root };
+    const fb = Fallback{ .spa_marker_enabled = true };
+
+    var before = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    try std.testing.expect((try serve(std.testing.io, &before, src, fb)) != null);
+
+    try tmp.dir.deleteFile(std.testing.io, "app/.spa");
+
+    var after = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    try std.testing.expect((try serve(std.testing.io, &after, src, fb)) == null);
+}
+
+test "spa live (dir): deepest marker wins; vanished index.html on the deepest marker is null (no fall-through)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".spa", .data = "" });
+    try tmp.dir.createDirPath(std.testing.io, "app/admin");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/index.html", .data = "<h1>app shell</h1>" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/.spa", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/admin/index.html", .data = "<h1>admin shell</h1>" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/admin/.spa", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const src = Source{ .dir = root };
+    const fb = Fallback{ .spa_marker_enabled = true };
+
+    // Deepest ("app/admin") wins over "app" and the root.
+    var deep = http.RequestCtx{ .method = .GET, .path = "/app/admin/orders/1", .allocator = arena.allocator() };
+    try std.testing.expect(std.mem.endsWith(u8, (try serve(std.testing.io, &deep, src, fb)).?.file_path.?, "app/admin/index.html"));
+    // A miss under "app/" (but not "app/admin/") gets the "app" shell.
+    var mid = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    try std.testing.expect(std.mem.endsWith(u8, (try serve(std.testing.io, &mid, src, fb)).?.file_path.?, "app/index.html"));
+    // A miss elsewhere gets the root shell.
+    var out = http.RequestCtx{ .method = .GET, .path = "/pricing", .allocator = arena.allocator() };
+    try std.testing.expect(std.mem.endsWith(u8, (try serve(std.testing.io, &out, src, fb)).?.file_path.?, "index.html"));
+
+    // Now delete the DEEPEST marker's index.html (post-boot, live): a miss under
+    // "app/admin/" must resolve to null — NOT fall through to the "app" marker. This
+    // mirrors validateSpaMarkersDir/deriveEmbeddedSpaRoots: a marked-but-indexless
+    // directory is "absent", not "defer to the next ancestor".
+    try tmp.dir.deleteFile(std.testing.io, "app/admin/index.html");
+    var vanished = http.RequestCtx{ .method = .GET, .path = "/app/admin/orders/1", .allocator = arena.allocator() };
+    try std.testing.expect((try serve(std.testing.io, &vanished, src, fb)) == null);
+    // A sibling still under "app/" (not "app/admin/") is unaffected.
+    var sibling = http.RequestCtx{ .method = .GET, .path = "/app/orders/2", .allocator = arena.allocator() };
+    try std.testing.expect(std.mem.endsWith(u8, (try serve(std.testing.io, &sibling, src, fb)).?.file_path.?, "app/index.html"));
+}
+
+test "spa live (dir): a request path deeper than the ancestor-walk cap still resolves the root marker" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".spa", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const src = Source{ .dir = root };
+    const fb = Fallback{ .spa_marker_enabled = true };
+
+    // Build a request path with far more than `spa_marker_walk_cap` (64) segments —
+    // none of the intermediate directories exist on disk, so every one of those levels
+    // is a miss; only the root ".spa" marker can satisfy this. This proves the capped
+    // walk still reaches (and checks) the root rather than erroring out or silently
+    // giving up once the cap is hit.
+    var path_buf: std.ArrayList(u8) = .empty;
+    defer path_buf.deinit(arena.allocator());
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        try path_buf.appendSlice(arena.allocator(), "/seg");
+    }
+    const path = try path_buf.toOwnedSlice(arena.allocator());
+
+    var deep = http.RequestCtx{ .method = .GET, .path = path, .allocator = arena.allocator() };
+    const r = (try serve(std.testing.io, &deep, src, fb)).?;
+    try std.testing.expect(r.file_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, r.file_path.?, "index.html"));
+}
+
+test "spa live (dir): a marker just past the ancestor-walk cap depth is NOT found (documents the bound)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
+
+    // A shallow, real marker directory (5 levels) that WOULD be found by an unbounded
+    // walk-up. The request path descends far below it (200+ extra segments, none of
+    // which exist on disk), which pushes the marker's ancestor level past the 64-level
+    // cap: the capped walk checks only the innermost 64 levels below the request before
+    // jumping straight to the root, so it never reaches this marker. This documents the
+    // tradeoff: only the innermost `spa_marker_walk_cap` ancestor levels of a miss are
+    // actually checked; the marker resolves to null (root has no marker either) rather
+    // than erroring or scanning unboundedly many levels.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var marker_rel: std.ArrayList(u8) = .empty;
+    defer marker_rel.deinit(arena.allocator());
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        if (i != 0) try marker_rel.append(arena.allocator(), '/');
+        try marker_rel.appendSlice(arena.allocator(), "seg");
+    }
+    try tmp.dir.createDirPath(std.testing.io, marker_rel.items);
+    const marker_path = try std.fmt.allocPrint(arena.allocator(), "{s}/.spa", .{marker_rel.items});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = marker_path, .data = "" });
+    const idx_path = try std.fmt.allocPrint(arena.allocator(), "{s}/index.html", .{marker_rel.items});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = idx_path, .data = "<h1>deep shell</h1>" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const src = Source{ .dir = root };
+    const fb = Fallback{ .spa_marker_enabled = true };
+
+    // Request path: the 5-level marker dir + 200 more (nonexistent) segments below it,
+    // so the marker sits far past the 64-level cap counted up from the request.
+    var req_buf: std.ArrayList(u8) = .empty;
+    defer req_buf.deinit(arena.allocator());
+    try req_buf.appendSlice(arena.allocator(), marker_rel.items);
+    var j: usize = 0;
+    while (j < 200) : (j += 1) {
+        try req_buf.appendSlice(arena.allocator(), "/deep");
+    }
+    const req_path = try std.fmt.allocPrint(arena.allocator(), "/{s}", .{req_buf.items});
+
+    var deep = http.RequestCtx{ .method = .GET, .path = req_path, .allocator = arena.allocator() };
+    // No root marker exists here, so the capped walk (jumping to root once exhausted)
+    // finds nothing: null, not the deep marker's shell and not an error.
+    try std.testing.expect((try serve(std.testing.io, &deep, src, fb)) == null);
+}
+
+test "static_routes: matched on miss only (real file wins); routes beat the marker" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = Source{ .embedded = &spa_fixture };
+    const routes = [_]StaticRoute{
+        .{ .match = "/app/orders/:id", .serve = "/app/index.html" },
+        .{ .match = "/app/**", .serve = "/index.html" },
+    };
+    const fb = Fallback{ .routes = &routes, .spa_roots = &.{"app"}, .spa_marker_enabled = true };
+
+    // Real file wins over a matching route.
+    var real = http.RequestCtx{ .method = .GET, .path = "/app/assets/app.js", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("console.log(2)", (try serve(std.testing.io, &real, src, fb)).?.body);
+    // First matching route wins, in declaration order.
+    var order = http.RequestCtx{ .method = .GET, .path = "/app/orders/42", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("<h1>app shell</h1>", (try serve(std.testing.io, &order, src, fb)).?.body);
+    // Routes are consulted BEFORE the marker: /app/x matches /app/** -> root index,
+    // even though the "app" marker would have served the app shell.
+    var routed = http.RequestCtx{ .method = .GET, .path = "/app/x", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &routed, src, fb)).?.body);
+    // Trailing slash never changes the outcome (sanitize normalizes): /app/ == /app.
+    var slash = http.RequestCtx{ .method = .GET, .path = "/app/orders/42/", .allocator = arena.allocator() };
+    try std.testing.expectEqualStrings("<h1>app shell</h1>", (try serve(std.testing.io, &slash, src, fb)).?.body);
 }
