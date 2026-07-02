@@ -30,6 +30,7 @@ const request = @import("request.zig");
 const Ctx = @import("ctx.zig").Ctx;
 const crypto = @import("crypto.zig");
 const clock = @import("clock.zig");
+const tenancy = @import("tenancy/tenancy.zig");
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
     return health.handle(ctx);
@@ -330,6 +331,21 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 .method = @tagName(ctx.method),
                 .session_id = if (authed) |a| a.sid else "",
             };
+            // Resolve the active tenant scope via tenancy.resolveRequest, the same
+            // chokepoint api/records.zig and api/files.zig call, so a custom route's
+            // `ctx.track`/`ctx.can`/any tenant-scoped ability check sees the caller's
+            // verified active account instead of always stamping account "". (Note:
+            // api/senders.zig and analytics/api.zig do NOT call resolveRequest — they
+            // share its underlying primitives but apply their own scope policy.)
+            // Anonymous requests (authed == null) still get `tenancy_enabled`/
+            // `role_ranking` copied (an unresolved, fail-closed scope), matching an
+            // anonymous REST request.
+            if (authed) |a| {
+                tenancy.resolveRequest(ctx, &reader, app, a, &rctx);
+            } else {
+                rctx.tenancy_enabled = app.tenancy.enabled;
+                rctx.role_ranking = app.role_ranking;
+            }
             var cx = Ctx{ .app = app, .arena = ctx.allocator, .rctx = rctx, .request = ctx, .bound_conn = null };
             defer cx.deinit();
             // Ordered route-guard chain (#139/#142): path-secret + per-route rate limit, run

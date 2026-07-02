@@ -12,6 +12,7 @@ const crypto = @import("../crypto.zig");
 const auth_api = @import("auth.zig");
 const params_mod = @import("../query/params.zig");
 const events = @import("../events.zig");
+const tenancy = @import("../tenancy/tenancy.zig");
 const ApiError = @import("error.zig").ApiError;
 
 /// Extensions safe to render inline in a browser (no script execution). Everything else downloads.
@@ -41,15 +42,37 @@ fn recordReferencesFile(col: schema.Collection, rec: std.json.Value, name: []con
     return false;
 }
 
-fn fileIdentity(ctx: *http.RequestCtx, conn: *db.Db) ?auth.Verified {
+/// Cache-Control for a file download. A `@public` viewRule alone does not make the response
+/// publicly cacheable: on a tenant-owned collection the same URL serves different bytes per
+/// active account, so a shared cache/CDN keyed only on the URL could replay tenant A's file to
+/// tenant B.
+///
+/// Invariant: tenant-owned collections are NEVER publicly cacheable — full stop, regardless of
+/// the requester. The Cache-Control header is a property of the URL, not the request, so it must
+/// not vary by requester privilege: a superuser or explicit cross-tenant bypass fetching a
+/// tenant-owned `@public` collection's file must NOT earn `public`, or a shared cache/CDN would
+/// replay that superuser-fetched copy to any other tenant hitting the same URL. Only a
+/// non-tenant-owned collection with a genuinely account-independent `@public` rule is
+/// shared-cacheable.
+fn cacheControlFor(col: schema.Collection) []const u8 {
+    return if (policy.isPublic(col.viewRule) and col.options.tenant_field == null)
+        "public, max-age=3600"
+    else
+        "private";
+}
+
+/// Resolve the requester's identity for a file download: either a `?token=` file/auth JWT, or
+/// the normal bearer/cookie auth. Returns an `auth.Authed` (not `auth.Verified`) so the caller
+/// can feed it straight into `tenancy.resolveRequest` — mirroring `dispatchCustom` and
+/// `api/records.zig`'s `buildContext`, the other REST chokepoints that resolve tenant scope.
+fn fileIdentity(ctx: *http.RequestCtx, conn: *db.Db) ?auth.Authed {
     const app = ctx.app.?;
     const qp = params_mod.parse(ctx.allocator, ctx.query) catch null;
     if (qp) |p| if (p.get("token")) |tok| {
-        if (auth.verifyTokenOfTypes(ctx.allocator, app, conn, tok, &.{ .auth, .file })) |v| return v;
+        if (auth.verifyTokenOfTypes(ctx.allocator, app, conn, tok, &.{ .auth, .file })) |v|
+            return .{ .record = v.record, .collection = v.collection, .is_superuser = v.is_superuser, .sid = v.sid };
     };
-    if (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null) |aa|
-        return .{ .record = aa.record, .collection = aa.collection, .is_superuser = aa.is_superuser, .exp = 0 };
-    return null;
+    return auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null;
 }
 
 /// GET /api/files/:col/:rec/:name
@@ -67,12 +90,27 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     if (!recordReferencesFile(col, rec, name)) return ApiError.notFound().toResponse(ctx.allocator);
 
     const ident = fileIdentity(ctx, &r);
-    const rctx = request.RequestContext{
+    var rctx = request.RequestContext{
         .auth = if (ident) |i| i.record else null,
         .is_superuser = if (ident) |i| i.is_superuser else false,
         .collection = if (ident) |i| i.collection else "",
         .method = "GET",
+        // session_id intentionally omitted, matching api/records.zig's buildContext (the REST
+        // chokepoint this fn's rctx construction otherwise mirrors) — no hook/ability surface here
+        // keys off it today, unlike server.zig's dispatchCustom which threads authed.sid through.
     };
+    // Resolve the active tenant scope EXACTLY like the other REST chokepoints
+    // (api/records.zig's buildContext, server.zig's dispatchCustom) so a tenant-owned
+    // collection's viewRule/scope predicate sees the caller's verified active account
+    // instead of always stamping account "". Anonymous requests (ident == null) still get
+    // `tenancy_enabled`/`role_ranking` copied (an unresolved, fail-closed scope), matching
+    // an anonymous REST request.
+    if (ident) |i| {
+        tenancy.resolveRequest(ctx, &r, app, i, &rctx);
+    } else {
+        rctx.tenancy_enabled = app.tenancy.enabled;
+        rctx.role_ranking = app.role_ranking;
+    }
     switch (policy.decide(col, .view, &rctx)) {
         .deny_locked => return ApiError.notFound().toResponse(ctx.allocator),
         .allow => {},
@@ -101,7 +139,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     const disp_kind: []const u8 = if (force_download or !inline_safe) "attachment" else "inline";
     const disposition = try std.fmt.allocPrint(ctx.allocator, "{s}; filename=\"{s}\"", .{ disp_kind, name });
 
-    const cache: []const u8 = if (policy.isPublic(col.viewRule)) "public, max-age=3600" else "private";
+    const cache = cacheControlFor(col);
     const headers = try ctx.allocator.dupe(http.Header, &.{
         .{ .name = "Referrer-Policy", .value = "no-referrer" },
         .{ .name = "X-Content-Type-Options", .value = "nosniff" },
@@ -145,6 +183,38 @@ test "PIN: file-download view-authz + cache route through policy byte-identicall
         // The Cache-Control public/private decision is identical too.
         try std.testing.expectEqual(rules.isPublic(col.viewRule), policy.isPublic(col.viewRule));
     }
+}
+
+// Guards the security-review fix: a `@public` viewRule must NOT make a TENANT-OWNED collection's
+// file response publicly cacheable, since the same URL serves different bytes per active account.
+// A shared cache/CDN keyed only on the URL could otherwise replay tenant A's file to tenant B.
+// Cache-Control is a property of the URL, not the requester: it must come out identically for a
+// superuser and for an ordinary member on the very same tenant-owned collection+file — otherwise
+// a superuser's fetch would poison a shared cache/CDN with a copy any other tenant could then hit.
+test "PIN: cacheControlFor forces private for a tenant-owned @public collection, for every requester" {
+    const fields = [_]schema.Field{
+        .{ .id = "d1", .name = "owner", .options = .{ .text = .{} } },
+        .{ .id = "d2", .name = "file", .options = .{ .file = .{ .maxSelect = 1 } } },
+    };
+    var col = schema.Collection{ .id = "c1", .name = "docs", .fields = &fields, .viewRule = "@public" };
+    col.options.tenant_field = "owner"; // tenant-owned
+
+    // Tenant-owned + @public MUST be private regardless of who's asking: requester identity
+    // (member vs. superuser vs. cross-tenant bypass) must play no part in the header.
+    try std.testing.expectEqualStrings("private", cacheControlFor(col));
+
+    // A non-tenant-owned collection with a genuinely account-independent @public rule stays
+    // shared-cacheable.
+    var untenanted = col;
+    untenanted.options.tenant_field = null;
+    try std.testing.expectEqualStrings("public, max-age=3600", cacheControlFor(untenanted));
+
+    // A locked/owner-scoped rule (not @public) stays private regardless of tenancy.
+    var locked = col;
+    locked.viewRule = "owner = @request.auth.id";
+    try std.testing.expectEqualStrings("private", cacheControlFor(locked));
+    locked.options.tenant_field = null;
+    try std.testing.expectEqualStrings("private", cacheControlFor(locked));
 }
 
 test "isInlineSafeExt allows only known-safe types" {

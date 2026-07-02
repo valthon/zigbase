@@ -1,16 +1,9 @@
-// KNOWN SERVER BUG (filed for controller review, not fixed here per Task 14's no-Zig-changes
-// constraint): `dispatchCustom` (src/server.zig, the AuthLevel-only dispatch table for
-// comptime `.routes`) never runs tenancy resolution — it fills `RequestContext.auth`/
-// `.is_superuser`/`.collection`/`.session_id` but leaves `.account_id` at its zero-value
-// default `""`, unlike the built-in `/api/*` handlers (records.zig/senders.zig/analytics/api.zig),
-// each of which locally resolves `X-Account-Id`/`zb_account` -> `tenancy.resolve(...)` before
-// calling their own logic. `docs/framework.md` documents the OPPOSITE ("custom routes... the
-// same policy... tenant scope... the REST chokepoints use"), so this is a genuine undocumented
-// gap, not intentional. Confirmed by direct repro (curl + sqlite3 read of `_events.account`):
-// a custom-route handler calling `ctx.track(...)` (fixtures/dating/schema.zig's `testingTrack`)
-// always stamps `account = ""`, even with a valid `Authorization` bearer + `X-Account-Id` header
-// naming an account the caller has an active membership in. Any custom-route `Ctx` method that
-// reads `rctx.account_id` (`ctx.track`, `ctx.can`, tenant-scoped ability checks, …) is affected.
+// Task 14b: `dispatchCustom` (src/server.zig) now resolves the active tenant scope for comptime
+// `.routes` EXACTLY like the REST chokepoints (`tenancy.resolveRequest`, shared with
+// api/records.zig/api/senders.zig/analytics/api.zig — see src/tenancy/tenancy.zig). A custom
+// route's `ctx.track(...)` (fixtures/dating/schema.zig's `testingTrack`) now stamps the caller's
+// verified active account, so the events-feed content assertion below (previously `it.todo`,
+// blocked on this bug) is live again.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { startAppServer, superuserToken, DATING_BIN, type TestServer } from "./harness.js";
 import { createClient } from "../codegen/dating/zbase.gen.js";
@@ -49,22 +42,17 @@ async function authedProfile(email: string) {
 }
 
 describe("analytics + senders (live)", () => {
-  // Split from the brief's single scenario: the account-attributed feed-content assertion
-  // (`feed.items[0].account === acct`) cannot pass today because of the dispatchCustom
-  // tenancy gap documented at the top of this file — `ctx.track` from ANY custom route always
-  // records `account: ""`. `.todo` keeps the intended assertion visible (and vitest fails the
-  // suite loudly if it starts passing without the annotation being updated) instead of quietly
-  // deleting real coverage. The anon-401 / undeclared-404 / declared-envelope assertions the
-  // server DOES support correctly are kept live below.
-  it.todo(
-    "events feed reflects a seeded event's account (blocked: dispatchCustom doesn't resolve tenancy, see file-top comment)",
-  );
-
-  it("anon 401; rollup 404-undeclared + declared envelope", async () => {
+  it("events feed reflects a seeded event's account; anon 401; rollup 404-undeclared + declared envelope", async () => {
     const { zb, profile } = await authedProfile("ana@t.app");
     const acct = await seedAccount("analytics-acct");
     await seedMembership(acct, profile.id, "editor");
     const scoped = zb.withAccount(acct);
+
+    // A custom route (`/api/testing/track`, dispatched through dispatchCustom) calling
+    // `ctx.track(...)` now stamps the request's resolved active account (Task 14b).
+    await scoped.rpc.testingTrack({ name: "note.created" });
+    const feed = await scoped.analytics.events({ name: "note.created" });
+    expect(feed.items[0]).toMatchObject({ name: "note.created", account: acct });
 
     // anonymous -> 401
     await expect(createBaseClient(server.url).analytics.events()).rejects.toMatchObject({ status: 401 });

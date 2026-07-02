@@ -235,11 +235,15 @@ pub const App = zigbase.App(.{
         },
         // Tenant-owned (gap-closure coverage): `account` is a RELATION (abilities .via requires
         // one) to the live `_accounts` system collection; the server stamps it on create.
+        // `attachment` (gap-closure coverage): a file field on a tenant-owned collection, so
+        // GET /api/files/notes/:rec/:name exercises the tenancy-scoped file-serving chokepoint
+        // (cross-tenant fetch denied even though `view` has no membership-aware rule of its own).
         .notes = .{
             .fields = .{
                 .{ .name = "account", .type = .relation, .target = "_accounts" },
                 .{ .name = "title", .type = .text, .required = true },
                 .{ .name = "body", .type = .text },
+                .{ .name = "attachment", .type = .file },
             },
             .tenant_field = "account",
             .rules = .{ .list = "@request.auth.id != \"\"", .view = "@request.auth.id != \"\"", .create = "@request.auth.id != \"\"", .update = "@request.auth.id != \"\"", .delete = "@request.auth.id != \"\"" },

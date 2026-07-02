@@ -21,6 +21,9 @@ const request = @import("../request.zig");
 const compiler = @import("../query/compiler.zig");
 const db = @import("../db.zig");
 const crypto = @import("../crypto.zig");
+const http = @import("../http.zig");
+const app_mod = @import("../app.zig");
+const auth = @import("../auth.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
@@ -158,6 +161,78 @@ pub fn resolve(
     return out;
 }
 
+// ---- Request-level tenancy resolution (shared chokepoint helper) -----------
+
+/// The account id a request is asking to act within: the `X-Account-Id` header, else the signed
+/// `zb_account` cookie (browser apps that called `activate`). The header is unsigned but safe — a
+/// forged value only grants scope if `resolveRequest` finds an ACTIVE membership for it. Resolver
+/// is an enum on `app.tenancy.resolver` so `.subdomain`/`.path` can be added here later without
+/// touching callers.
+pub fn requestedAccount(ctx: *const http.RequestCtx, app: *app_mod.App) ?[]const u8 {
+    switch (app.tenancy.resolver) {
+        .header => {
+            if (ctx.header(account_header)) |h| if (h.len > 0) return h;
+            if (ctx.cookie(account_cookie)) |c| if (c.len > 0) return verifyAccount(app.jwt_secret, c);
+            return null;
+        },
+    }
+}
+
+/// Resolve + fill the active tenant scope (`tenancy_enabled`/`role_ranking`/`account_id`/
+/// `account_role`/`memberships`) onto `rctx` for an authenticated principal. Called directly by
+/// the REST/custom-route chokepoints that need the FULL resolved scope on `RequestContext`
+/// (`api/records.zig`'s `buildContext`, `server.zig`'s `dispatchCustom`, `api/files.zig`'s
+/// `serve`). `api/senders.zig` and `analytics/api.zig` do NOT call this function — they share
+/// the underlying `requestedAccount`/`resolve` primitives but apply their own scope policy on
+/// top (e.g. broader/narrower than "the caller's active account"), so do not fold them into this
+/// chokepoint as a "unification" cleanup. Semantics:
+///
+///   * `rctx.tenancy_enabled`/`rctx.role_ranking` are always copied from `app` (byte-identical
+///     no-tenancy path when `app.tenancy.enabled == false`).
+///   * A superuser bypasses resolution entirely (consistent with `rules.decide`'s superuser bypass)
+///     — `account_id` stays at its zero-value `""` (global scope, not a specific tenant).
+///   * Otherwise, when tenancy is enabled: the `X-Account-Id` header / `zb_account` cookie names
+///     the desired account; `tenancy.resolve` grants scope ONLY if the principal has a verified
+///     ACTIVE `_memberships` row for that account. No match (wrong account, no header/cookie,
+///     inactive/invited/suspended membership) leaves `account_id` empty — fail closed, never an
+///     error surfaced to the caller.
+///   * A resolution error (e.g. a transient DB error) is swallowed the same way: the fail-closed
+///     empty scope is kept and the error is logged (never account ids at error level — see the
+///     no-credential-logging rule) so a bug here denies tenant-owned data rather than leaking it.
+///
+/// Callers that already hold an `auth.Authed` (every chokepoint authenticates first) pass it in;
+/// this function does no authentication of its own.
+pub fn resolveRequest(
+    ctx: *const http.RequestCtx,
+    conn: *db.Db,
+    app: *app_mod.App,
+    a: auth.Authed,
+    rctx: *request.RequestContext,
+) void {
+    rctx.tenancy_enabled = app.tenancy.enabled;
+    rctx.role_ranking = app.role_ranking; // ability `.min_role` comparisons (#155)
+    if (!app.tenancy.enabled or a.is_superuser) return;
+    resolveRequestInner(ctx, conn, app, a, rctx) catch |e|
+        std.log.warn("tenant resolution failed (request scoped to no account): {}", .{e});
+}
+
+fn resolveRequestInner(
+    ctx: *const http.RequestCtx,
+    conn: *db.Db,
+    app: *app_mod.App,
+    a: auth.Authed,
+    rctx: *request.RequestContext,
+) !void {
+    if (a.record != .object) return;
+    const id_v = a.record.object.get("id") orelse return;
+    if (id_v != .string) return;
+    const requested = requestedAccount(ctx, app) orelse "";
+    const res = try resolve(ctx.allocator, conn, a.collection, id_v.string, requested);
+    rctx.account_id = res.account_id;
+    rctx.account_role = res.account_role;
+    rctx.memberships = res.memberships;
+}
+
 // ---- Signed `zb_account` cookie (browser activation) ------------------------
 
 /// Sign `account_id` into the opaque `zb_account` cookie value `"<account_id>.<hex-hmac>"`, using
@@ -260,6 +335,134 @@ test "resolve: only active memberships; requested account must be a member" {
     // Unknown user -> empty.
     const r4 = try resolve(a, &d, "users", "ghost", "acc1");
     try std.testing.expectEqual(@as(usize, 0), r4.memberships.len);
+}
+
+test "requestedAccount: header wins over the signed cookie; unsigned/bad cookie is ignored" {
+    var app = app_mod.App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined, .jwt_secret = "test-secret" };
+
+    // Neither header nor cookie -> null.
+    {
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator };
+        try std.testing.expect(requestedAccount(&ctx, &app) == null);
+    }
+    // Header present -> wins outright (even with a cookie also present).
+    {
+        const signed = try signAccount(std.testing.allocator, app.jwt_secret, "acc-cookie");
+        defer std.testing.allocator.free(signed);
+        var hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "acc-header" }};
+        var ctx = http.RequestCtx{
+            .method = .GET,
+            .path = "/",
+            .allocator = std.testing.allocator,
+            .headers = &hdrs,
+        };
+        // cookie name is "zb_account"; wrap it as "zb_account=<signed>" for the cookie parser.
+        const cookie_hdr = try std.fmt.allocPrint(std.testing.allocator, "{s}={s}", .{ account_cookie, signed });
+        defer std.testing.allocator.free(cookie_hdr);
+        ctx.cookie_header = cookie_hdr;
+        try std.testing.expectEqualStrings("acc-header", requestedAccount(&ctx, &app).?);
+    }
+    // No header, valid signed cookie -> the cookie's account.
+    {
+        const signed = try signAccount(std.testing.allocator, app.jwt_secret, "acc-cookie");
+        defer std.testing.allocator.free(signed);
+        const cookie_hdr = try std.fmt.allocPrint(std.testing.allocator, "{s}={s}", .{ account_cookie, signed });
+        defer std.testing.allocator.free(cookie_hdr);
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .cookie_header = cookie_hdr };
+        try std.testing.expectEqualStrings("acc-cookie", requestedAccount(&ctx, &app).?);
+    }
+    // No header, tampered cookie (wrong secret's signature) -> null (fail closed, not the forged id).
+    {
+        const forged = try signAccount(std.testing.allocator, "wrong-secret", "acc-evil");
+        defer std.testing.allocator.free(forged);
+        const cookie_hdr = try std.fmt.allocPrint(std.testing.allocator, "{s}={s}", .{ account_cookie, forged });
+        defer std.testing.allocator.free(cookie_hdr);
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .cookie_header = cookie_hdr };
+        try std.testing.expect(requestedAccount(&ctx, &app) == null);
+    }
+}
+
+test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try d.exec("INSERT INTO \"_memberships\" (\"id\",\"created\",\"updated\",\"account\",\"user_collection\",\"user\",\"role\",\"status\") VALUES " ++
+        "('m1','','','acc1','profiles','u1','editor','active')," ++
+        "('m2','','','acc2','profiles','u1','admin','invited');"); // acc2's membership is NOT active
+
+    // Everything the resolution path allocates (memberships, account/role dupes) is arena-scoped —
+    // matches how a real request's `ctx.allocator` is request-arena-backed, and avoids per-case
+    // manual frees in this test.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var app = app_mod.App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined, .jwt_secret = "s" };
+    app.tenancy = .{ .enabled = true, .auth_collection = "profiles" };
+
+    const authed_record = std.json.Value{ .object = blk: {
+        var o: std.json.ObjectMap = .empty;
+        try o.put(alloc, "id", .{ .string = "u1" });
+        break :blk o;
+    } };
+
+    // Tenancy disabled -> byte-identical no-tenancy path: no resolution query, scope untouched,
+    // but tenancy_enabled/role_ranking are still copied from `app` (both false/default here).
+    {
+        var off = app;
+        off.tenancy = .{};
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = alloc };
+        var rctx = request.RequestContext{};
+        const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
+        resolveRequest(&ctx, &d, &off, a, &rctx);
+        try std.testing.expect(!rctx.tenancy_enabled);
+        try std.testing.expectEqualStrings("", rctx.account_id);
+    }
+
+    // Superuser bypasses resolution entirely (no query, account_id stays "" = global scope) even
+    // when a matching X-Account-Id header is present — the superuser bypass never LEAKS a specific
+    // scope by accident; callers that want a superuser to target an account read the header
+    // themselves (as senders.zig does), this helper's contract is just "don't force a query".
+    {
+        var hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "acc1" }};
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = alloc, .headers = &hdrs };
+        var rctx = request.RequestContext{};
+        const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = true };
+        resolveRequest(&ctx, &d, &app, a, &rctx);
+        try std.testing.expect(rctx.tenancy_enabled);
+        try std.testing.expectEqualStrings("", rctx.account_id);
+    }
+
+    // Non-superuser, requested account is an ACTIVE membership -> scope granted.
+    {
+        var hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "acc1" }};
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = alloc, .headers = &hdrs };
+        var rctx = request.RequestContext{};
+        const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
+        resolveRequest(&ctx, &d, &app, a, &rctx);
+        try std.testing.expectEqualStrings("acc1", rctx.account_id);
+        try std.testing.expectEqualStrings("editor", rctx.account_role);
+    }
+
+    // Non-superuser, requested account exists but membership is NOT active -> fail closed (empty
+    // scope), never an error surfaced.
+    {
+        var hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "acc2" }};
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = alloc, .headers = &hdrs };
+        var rctx = request.RequestContext{};
+        const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
+        resolveRequest(&ctx, &d, &app, a, &rctx);
+        try std.testing.expectEqualStrings("", rctx.account_id);
+    }
+
+    // No header/cookie at all -> no active scope (unresolved, fail closed).
+    {
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = alloc };
+        var rctx = request.RequestContext{};
+        const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
+        resolveRequest(&ctx, &d, &app, a, &rctx);
+        try std.testing.expectEqualStrings("", rctx.account_id);
+    }
 }
 
 test "signAccount/verifyAccount round-trip; tamper fails closed" {

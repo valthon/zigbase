@@ -31,13 +31,6 @@ fn forbidden(ctx: *http.RequestCtx) !http.Response {
     return (ApiError{ .status = 403, .message = "Not a member of this account." }).toResponse(ctx.allocator);
 }
 
-/// The requested account id (X-Account-Id header, else the signed zb_account cookie).
-fn requestedAccount(ctx: *http.RequestCtx, app: *app_mod.App) ?[]const u8 {
-    if (ctx.header(tenancy.account_header)) |h| if (h.len > 0) return h;
-    if (ctx.cookie(tenancy.account_cookie)) |c| if (c.len > 0) return tenancy.verifyAccount(app.jwt_secret, c);
-    return null;
-}
-
 /// Resolve the account this request may manage senders for. Returns null + a stashed response on a
 /// failure (401/403) that the caller should return.
 fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, reader: *db.Db, out: *?http.Response) !?Scope {
@@ -47,7 +40,7 @@ fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, reader: *db.Db, out: *
     };
     if (a.is_superuser) {
         // Superuser may target a specific account (header) or operate globally ("").
-        return Scope{ .account = requestedAccount(ctx, app) orelse "", .is_superuser = true };
+        return Scope{ .account = tenancy.requestedAccount(ctx, app) orelse "", .is_superuser = true };
     }
     // Regular principal: require tenancy + an ACTIVE membership of the requested account.
     if (!app.tenancy.enabled) {
@@ -66,7 +59,7 @@ fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, reader: *db.Db, out: *
         out.* = try forbidden(ctx);
         return null;
     }
-    const requested = requestedAccount(ctx, app) orelse "";
+    const requested = tenancy.requestedAccount(ctx, app) orelse "";
     const res = try tenancy.resolve(ctx.allocator, reader, a.collection, id_v.string, requested);
     if (res.account_id.len == 0) {
         out.* = try forbidden(ctx);

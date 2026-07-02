@@ -101,4 +101,44 @@ describe("tenancy + abilities (live)", () => {
       expect((e as { status: number }).status).toBe(404);
     }
   });
+
+  // Finding 1 (gap-closure final review): file serving (GET /api/files/:col/:rec/:name) must
+  // resolve tenant scope EXACTLY like records/dispatchCustom, so a tenant-owned collection's
+  // file field is not reachable cross-tenant by a principal who merely knows col/rid/filename.
+  // `notes.viewRule` is `@request.auth.id != ""` (any authed user) with NO membership check of
+  // its own — isolation here can ONLY come from the tenancy scope predicate applied to `.view`.
+  it("file serving on a tenant-owned collection: same-tenant fetch works, cross-tenant is denied", async () => {
+    const { zb: alice, profile: aliceP } = await authedProfile("alice-files@t.app");
+    const { zb: mallory, profile: malloryP } = await authedProfile("mallory-files@t.app");
+    const acctA = await seedAccount("files-acme");
+    const acctB = await seedAccount("files-beta");
+    await seedMembership(acctA, aliceP.id, "editor");
+    await seedMembership(acctB, malloryP.id, "editor");
+
+    const inA = alice.withAccount(acctA);
+    const blob = new Blob(["tenant-file-contents"], { type: "text/plain" });
+    const note = await inA.db.notes.create({ title: "with-attachment", attachment: blob });
+    expect(note.attachment).toBeTruthy();
+    const filename = note.attachment as string;
+
+    // Same-tenant fetch (alice, active account A, the note's owning account): 200 + body.
+    const okRes = await inA.fetch("GET", `/api/files/notes/${note.id}/${filename}`);
+    expect(okRes.status).toBe(200);
+    expect(await okRes.text()).toBe("tenant-file-contents");
+
+    // Cross-tenant fetch: mallory is authenticated and knows col/rid/filename, but her active
+    // account (B) is not the note's owning account (A) — must be denied (404, hides existence)
+    // even though `viewRule` alone (`@request.auth.id != ""`) would allow any authed user.
+    const crossRes = await mallory.withAccount(acctB).fetch("GET", `/api/files/notes/${note.id}/${filename}`);
+    expect(crossRes.status).toBe(404);
+
+    // Mallory with NO active account (never activated/withAccount'd to A) is equally denied.
+    const noScopeRes = await mallory.fetch("GET", `/api/files/notes/${note.id}/${filename}`);
+    expect(noScopeRes.status).toBe(404);
+
+    // Fully unauthenticated (no bearer/cookie/token at all): fail-closed the same way, pinning
+    // the anonymous path empirically rather than inferring it from the authed-no-scope case above.
+    const anonRes = await fetch(`${server.url}/api/files/notes/${note.id}/${filename}`);
+    expect(anonRes.status).toBe(404);
+  });
 });

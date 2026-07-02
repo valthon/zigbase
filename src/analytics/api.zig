@@ -54,24 +54,12 @@ fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, conn: *db.Db) !?Scope 
     }
     var account: []const u8 = "";
     if (app.tenancy.enabled and !a.is_superuser and actor.len > 0) {
-        const requested = requestedAccount(ctx, app) orelse "";
+        const requested = tenancy.requestedAccount(ctx, app) orelse "";
         const res = tenancy.resolve(ctx.allocator, conn, a.collection, actor, requested) catch
             tenancy.Resolution{};
         account = res.account_id;
     }
     return .{ .is_superuser = a.is_superuser, .actor = actor, .actor_collection = a.collection, .account = account };
-}
-
-/// The requested account id (header, else signed cookie) — verified into a real scope only when
-/// `tenancy.resolve` finds an active membership. Mirrors `api/records.zig`'s resolver.
-fn requestedAccount(ctx: *http.RequestCtx, app: *app_mod.App) ?[]const u8 {
-    switch (app.tenancy.resolver) {
-        .header => {
-            if (ctx.header(tenancy.account_header)) |h| if (h.len > 0) return h;
-            if (ctx.cookie(tenancy.account_cookie)) |c| if (c.len > 0) return tenancy.verifyAccount(app.jwt_secret, c);
-            return null;
-        },
-    }
 }
 
 /// A bound-parameter SQL builder: accumulates `WHERE` conditions and their text params so the
