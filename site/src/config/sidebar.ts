@@ -38,6 +38,9 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'abilities', label: 'Relationship abilities' },
       { slug: 'search', label: 'Full-text & vector search' },
       { slug: 'analytics', label: 'Product analytics' },
+      { slug: 'email', label: 'Email' },
+      { slug: 'jobs-and-webhooks', label: 'Jobs & webhooks' },
+      { slug: 'realtime-broadcast', label: 'Realtime broadcast' },
     ],
   },
   {
