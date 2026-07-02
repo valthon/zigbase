@@ -181,6 +181,73 @@ fn migrationsCoerce(comptime M: type) bool {
     return false;
 }
 
+/// Comptime grammar check for one `.static_routes` match pattern (issue #183):
+/// leading '/'; segments are literals, ':name' (one segment), or a TERMINAL '*'
+/// (one-or-more) / '**' (zero-or-more); wildcards/':' never mix with literal text.
+/// Rejecting a non-terminal '*'/'**' here is load-bearing: `static_files.matchRoute`
+/// short-circuits at the FIRST '*'/'**' segment it sees (by design, for O(1) rest-match)
+/// and does not check any pattern segments after it — an unvalidated pattern like
+/// "/a/**/x" would silently match every path under "/a/", ignoring "/x" entirely.
+fn validateRoutePattern(comptime m: []const u8) void {
+    if (m.len == 0 or m[0] != '/')
+        @compileError(".static_routes: match pattern '" ++ m ++ "' must start with '/'");
+    if (m.len == 1) return; // "/" — the bare root literal
+    var it = std.mem.splitScalar(u8, m[1..], '/');
+    var rest_seen = false;
+    while (it.next()) |seg| {
+        if (rest_seen)
+            @compileError(".static_routes: '*'/'**' must be the FINAL segment in '" ++ m ++ "'");
+        if (seg.len == 0)
+            @compileError(".static_routes: empty segment ('//' or trailing '/') in '" ++ m ++ "'");
+        if (std.mem.eql(u8, seg, "*") or std.mem.eql(u8, seg, "**")) {
+            rest_seen = true;
+            continue;
+        }
+        if (std.mem.indexOfScalar(u8, seg, '*') != null)
+            @compileError(".static_routes: '*' cannot mix with literal text in segment '" ++ seg ++ "' of '" ++ m ++ "'");
+        if (seg[0] == ':') {
+            if (seg.len == 1)
+                @compileError(".static_routes: ':' needs a name in '" ++ m ++ "'");
+            continue;
+        }
+        if (std.mem.indexOfScalar(u8, seg, ':') != null)
+            @compileError(".static_routes: ':' must start its own segment in '" ++ m ++ "' (got '" ++ seg ++ "')");
+    }
+}
+
+/// Comptime check for one `.static_routes` serve target: a fixed leading-'/' path,
+/// no ':'/'*' and no '..' (targets are trusted literals interpolated into the
+/// static source, so wildcards and traversal are rejected outright). No empty segments
+/// either (`//`/trailing `/`) — final-review symmetry fix: `validateRoutePattern` above
+/// already rejects those in `match`, but a `serve` target like "/app//x" or "/app/" used
+/// to slip through here; embedded mode's `manifestHas` comptime lookup would then simply
+/// miss (a proper compile error, just a confusing one), while dir mode's
+/// `validateRouteTargetsDir` builds the on-disk path with a literal double slash /
+/// trailing slash and gets an inconsistent pass/fail depending on the OS's stat()
+/// tolerance for those forms. Rejecting both shapes here at comptime removes that
+/// discrepancy for both sources.
+fn validateServeTarget(comptime sv: []const u8) void {
+    if (sv.len == 0 or sv[0] != '/')
+        @compileError(".static_routes: serve target '" ++ sv ++ "' must start with '/'");
+    if (std.mem.indexOfScalar(u8, sv, ':') != null or std.mem.indexOfScalar(u8, sv, '*') != null)
+        @compileError(".static_routes: serve target '" ++ sv ++ "' must be a fixed path (no ':' or '*')");
+    if (sv.len > 1) {
+        var it = std.mem.splitScalar(u8, sv[1..], '/');
+        while (it.next()) |seg| {
+            if (seg.len == 0)
+                @compileError(".static_routes: empty segment ('//' or trailing '/') in serve target '" ++ sv ++ "'");
+            if (std.mem.eql(u8, seg, ".."))
+                @compileError(".static_routes: serve target '" ++ sv ++ "' must not contain '..'");
+        }
+    }
+}
+
+/// Comptime manifest membership test for embedded serve-target validation.
+fn manifestHas(files: []const static_files.StaticFile, path: []const u8) bool {
+    for (files) |f| if (std.mem.eql(u8, f.path, path)) return true;
+    return false;
+}
+
 /// `@compileError` unless plugin type `P` (selected via `.storage`/`.mailer`) declares
 /// the three contract methods. Without this, a missing method surfaces as a generic
 /// "no member named 'deinit'" at the instantiation site rather than a contract message.
@@ -207,7 +274,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail", "analytics" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -560,6 +627,83 @@ pub fn App(comptime cfg: anytype) type {
             @compileError("static_files: expected .disabled, .{ .dir = \"<path>\" }, or .{ .embedded = &<manifest>.files }");
         };
 
+        /// Tier-2 comptime static rewrites (issue #183): `.static_routes` lowered into a
+        /// typed slice (empty when absent). Validates entry shape + pattern grammar with
+        /// loud @compileErrors; in `.embedded` mode also proves every serve target exists
+        /// in the manifest ("validated at build time"). Dir-mode targets are startup-
+        /// validated in serveImpl instead (comptime can't see the filesystem).
+        pub const static_routes: []const static_files.StaticRoute = blk: {
+            if (!@hasField(@TypeOf(cfg), "static_routes")) break :blk &.{};
+            const raw = cfg.static_routes;
+            const RT = @TypeOf(raw);
+            const list = lst: {
+                switch (@typeInfo(RT)) {
+                    .pointer => |p| switch (p.size) {
+                        .one => break :lst raw.*, // &.{ ... } tuple/array pointer
+                        .slice => break :lst raw,
+                        else => {},
+                    },
+                    .@"struct" => |s| if (s.is_tuple) break :lst raw,
+                    else => {},
+                }
+                @compileError(".static_routes must be a list of '.{ .match = \"/…\", .serve = \"/…\" }' entries; got '" ++ @typeName(RT) ++ "'");
+            };
+            const n = switch (@typeInfo(@TypeOf(list))) {
+                .@"struct" => std.meta.fields(@TypeOf(list)).len,
+                .array => |a| a.len,
+                .pointer => list.len,
+                else => unreachable,
+            };
+            if (n == 0) break :blk &.{};
+            if (std.meta.activeTag(static_mode) == .disabled)
+                @compileError(".static_routes requires static serving, but '.static_files = .disabled'; drop one of them");
+            var out: [n]static_files.StaticRoute = undefined;
+            for (0..n) |i| {
+                const e = list[i];
+                const ET = @TypeOf(e);
+                if (ET != static_files.StaticRoute) {
+                    if (@typeInfo(ET) != .@"struct")
+                        @compileError(".static_routes: each entry must be '.{ .match = \"/…\", .serve = \"/…\" }'");
+                    for (std.meta.fields(ET)) |f| {
+                        if (!std.mem.eql(u8, f.name, "match") and !std.mem.eql(u8, f.name, "serve"))
+                            @compileError(".static_routes: unknown key '." ++ f.name ++ "' (recognized: .match, .serve)");
+                    }
+                    if (!@hasField(ET, "match") or !@hasField(ET, "serve"))
+                        @compileError(".static_routes: each entry needs BOTH .match and .serve");
+                }
+                const m: []const u8 = e.match;
+                const sv: []const u8 = e.serve;
+                validateRoutePattern(m);
+                validateServeTarget(sv);
+                out[i] = .{ .match = m, .serve = sv };
+            }
+            const final = out;
+            if (std.meta.activeTag(static_mode) == .embedded) {
+                const files = static_mode.embedded;
+                for (final) |rt| {
+                    const rel = rt.serve[1..];
+                    const found = manifestHas(files, if (rel.len == 0) "index.html" else rel) or
+                        (rel.len > 0 and manifestHas(files, rel ++ "/index.html"));
+                    if (!found)
+                        @compileError("static_routes: serve target '" ++ rt.serve ++ "' not in the embedded manifest");
+                }
+            }
+            break :blk &final;
+        };
+
+        /// Tier-1 `.spa` marker enablement (issue #183). Default: ON when `static_routes`
+        /// is absent/empty (a plain custom build stays byte-identical to the shipped
+        /// binary), OFF when routes are declared (explicit config shouldn't gain stray-
+        /// dotfile behavior). An explicit `.enable_spa_marker = true|false` always wins.
+        pub const enable_spa_marker: bool = blk: {
+            if (@hasField(@TypeOf(cfg), "enable_spa_marker")) {
+                if (@TypeOf(cfg.enable_spa_marker) != bool)
+                    @compileError(".enable_spa_marker must be a bool; got '" ++ @typeName(@TypeOf(cfg.enable_spa_marker)) ++ "'");
+                break :blk cfg.enable_spa_marker;
+            }
+            break :blk static_routes.len == 0;
+        };
+
         /// Comptime-lowered collection specs from `.collections` (empty when absent).
         /// Relation fields carry their target collection BY NAME in `targetCollectionId`;
         /// `provision.applySpecs` resolves names -> ids at startup. When empty, no
@@ -835,6 +979,8 @@ pub fn App(comptime cfg: anytype) type {
             .job_stack_size = job_stack_size,
             .cache_kib = cache_kib,
             .static_mode = static_mode,
+            .static_routes = static_routes,
+            .enable_spa_marker = enable_spa_marker,
             .pagination = pagination_config,
             .session_store = session_store_config,
             .enable_typegen = enable_typegen,
@@ -961,6 +1107,13 @@ pub const ServeOpts = struct {
     job_stack_size: usize = scheduler.default_job_stack_size,
     cache_kib: u32 = db.default_cache_kib,
     static_mode: static_files.Mode = .default,
+    /// Tier-2 comptime static rewrites (issue #183), threaded into `app.static_routes`.
+    /// Embedded serve targets were proven at comptime; dir targets are startup-validated
+    /// in serveImpl (missing target = fatal, like a missing static dir).
+    static_routes: []const static_files.StaticRoute = &.{},
+    /// Tier-1 `.spa` marker gate (issue #183); false skips the startup scan entirely
+    /// (a `.spa` file is then just another never-served dotfile).
+    enable_spa_marker: bool = true,
     pagination: pagination.Config = .{},
     /// Selected session-management model (#99); threaded into `App.session_store`.
     session_store: app_mod.SessionStore = .epoch,
@@ -1701,6 +1854,65 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         else => {},
     }
 
+    // Tier-2 startup validation (issue #183): embedded serve targets were proven at
+    // comptime; dir targets are statted here (missing = fatal, like a missing static
+    // dir). Routes with NO active source could never serve anything — also fatal.
+    if (opts.static_routes.len > 0) switch (static_source) {
+        .none => {
+            std.log.err("static_routes is configured but no static source is active (run with --serve-static <dir> or set a comptime .static_files source)", .{});
+            return error.StaticRoutesRequireStaticSource;
+        },
+        .dir => |dir_path| {
+            if (try static_files.validateRouteTargetsDir(io, allocator, dir_path, opts.static_routes)) |missing| {
+                std.log.err("static_routes: serve target '{s}' not found under static dir '{s}'", .{ missing.serve, dir_path });
+                return error.StaticRouteTargetMissing;
+            }
+        },
+        .embedded => {},
+    };
+    // Tier-1 `.spa` marker (issue #183, owner revision): the two sources are handled
+    // differently, because only the embedded manifest is comptime-static.
+    //
+    // - **embedded**: derive the root set once at startup (it can never go stale — the
+    //   manifest is baked into the binary) and hand it to `app.spa_roots`.
+    // - **dir**: NOT scanned into a cached set — markers are resolved LIVE, per miss,
+    //   straight off the filesystem (`static_files.resolveSpaMarkerDirLive`, called from
+    //   `serve()`), so adding/removing a `.spa`/`index.html` after boot needs no restart.
+    //   Startup only VALIDATES: a `.spa`-marked directory with no `index.html` is a
+    //   FATAL startup error (almost certainly a build/deploy mistake — nothing to serve
+    //   as the shell); an unreadable subdirectory is skipped with a warning, exactly
+    //   like dir-mode serving already treats an unreadable file as if it doesn't exist.
+    var spa_validate_failure: static_files.SpaValidateFailure = undefined;
+    const spa_roots: []const []const u8 = if (opts.enable_spa_marker) blk: {
+        switch (static_source) {
+            .embedded => |files| break :blk try static_files.deriveEmbeddedSpaRoots(allocator, files),
+            .dir => |dir_path| {
+                static_files.validateSpaMarkersDir(io, allocator, dir_path, &spa_validate_failure) catch |err| {
+                    if (err == error.SpaValidationFailed) {
+                        // `spa_validate_failure.path` was alloc.dupe'd by validateSpaMarkersDir
+                        // for this log line only (this is a fail-fast startup path — nothing
+                        // downstream reads it, so it doesn't outlive this catch block).
+                        defer allocator.free(spa_validate_failure.path);
+                        std.log.err(
+                            "SPA marker at '{s}/' has no index.html: fix the build/deploy output or remove the marker " ++
+                                "(refusing to start — a .spa-marked directory with no shell to serve is treated as fatal, not silently dropped)",
+                            .{spa_validate_failure.path},
+                        );
+                    } else {
+                        std.log.err(
+                            "SPA marker validation failed on '{s}' ({t}): fix permissions on the static tree or remove the .spa marker",
+                            .{ dir_path, err },
+                        );
+                    }
+                    return err;
+                };
+                break :blk &.{};
+            },
+            .none => break :blk &.{},
+        }
+    } else &.{};
+    defer static_files.freeSpaRoots(allocator, spa_roots);
+
     var app = app_mod.App{
         .allocator = allocator,
         .io = io,
@@ -1720,6 +1932,9 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .file_token_ttl_s = cfg.file_token_ttl_s,
         .sentry_dsn = cfg.sentry_dsn,
         .static_source = static_source,
+        .static_routes = opts.static_routes,
+        .spa_roots = spa_roots,
+        .spa_marker_enabled = opts.enable_spa_marker,
         .pagination = .{
             .offset_enabled = opts.pagination.offset,
             .cursor_enabled = opts.pagination.cursor,
@@ -2315,6 +2530,59 @@ test "App(cfg) static_files modes: default, disabled, dir, embedded (with coerci
     try std.testing.expectEqual(@as(usize, 1), E.static_mode.embedded.len);
     try std.testing.expectEqualStrings("index.html", E.static_mode.embedded[0].path);
     try std.testing.expectEqualStrings("\"abc\"", E.static_mode.embedded[0].etag);
+}
+
+test "App(cfg) static_routes lowering: absent => empty; entries coerced; order preserved" {
+    try std.testing.expectEqual(@as(usize, 0), App(.{}).static_routes.len);
+
+    const manifest = struct {
+        const F = struct { path: []const u8, bytes: []const u8, etag: []const u8 };
+        pub const files = [_]F{
+            .{ .path = "index.html", .bytes = "<p>hi</p>", .etag = "\"abc\"" },
+            .{ .path = "app/index.html", .bytes = "<p>app</p>", .etag = "\"def\"" },
+        };
+    };
+    const R = App(.{
+        .static_files = .{ .embedded = &manifest.files },
+        .static_routes = &.{
+            .{ .match = "/app/orders/:id", .serve = "/app/index.html" },
+            .{ .match = "/app/**", .serve = "/app" }, // directory target -> app/index.html
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 2), R.static_routes.len);
+    try std.testing.expectEqualStrings("/app/orders/:id", R.static_routes[0].match);
+    try std.testing.expectEqualStrings("/app/index.html", R.static_routes[0].serve);
+    try std.testing.expectEqualStrings("/app/**", R.static_routes[1].match);
+    try std.testing.expectEqualStrings("/app", R.static_routes[1].serve);
+
+    // Dir mode: no comptime manifest to check against (targets are startup-validated).
+    const D = App(.{
+        .static_files = .{ .dir = "frontend/dist" },
+        .static_routes = &.{.{ .match = "/**", .serve = "/index.html" }},
+    });
+    try std.testing.expectEqual(@as(usize, 1), D.static_routes.len);
+}
+
+test "App(cfg) enable_spa_marker default: true without routes, false with routes, explicit wins" {
+    try std.testing.expect(App(.{}).enable_spa_marker);
+    try std.testing.expect(!App(.{ .enable_spa_marker = false }).enable_spa_marker);
+
+    const manifest = struct {
+        const F = struct { path: []const u8, bytes: []const u8, etag: []const u8 };
+        pub const files = [_]F{.{ .path = "index.html", .bytes = "<p>hi</p>", .etag = "\"abc\"" }};
+    };
+    const WithRoutes = App(.{
+        .static_files = .{ .embedded = &manifest.files },
+        .static_routes = &.{.{ .match = "/**", .serve = "/index.html" }},
+    });
+    try std.testing.expect(!WithRoutes.enable_spa_marker); // routes flip the default off
+
+    const Explicit = App(.{
+        .static_files = .{ .embedded = &manifest.files },
+        .static_routes = &.{.{ .match = "/**", .serve = "/index.html" }},
+        .enable_spa_marker = true,
+    });
+    try std.testing.expect(Explicit.enable_spa_marker); // explicit always wins
 }
 
 test "App exposes route metadata for codegen" {

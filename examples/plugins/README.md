@@ -108,6 +108,17 @@ configures in code:
     physical columns ARE named by their human field name (`contact_email`), not an
     internal id.
 
+12. **Tier-2 SPA fallback routing** via `.static_routes` (issue #183). A single
+    `.{ .match = "/app/**", .serve = "/index.html" }` entry serves the embedded
+    frontend shell for any GET/HEAD static miss below `/app/`, so client-side
+    deep links (e.g. `/app/some/deep/route`) resolve to the SPA shell instead of
+    a 404. The serve target is validated against the embedded `static_assets`
+    manifest **at compile time** — a typo'd path is a build error, not a runtime
+    surprise. Declaring `.static_routes` also flips the Tier-1 `.spa`-marker
+    default off (set `.enable_spa_marker = true` to run both tiers together).
+    The `/api/**` namespace is never rewritten, so a missing API route still
+    returns the JSON 404 envelope. See `test/spa.e2e.test.ts`.
+
 ## Auth methods in this example
 
 Three collections use four auth methods, all disambiguated by `onAuth`:

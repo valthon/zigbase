@@ -50,7 +50,7 @@ with `mise exec zig@0.16.0 --`.
   offset + cursor pagination, files, realtime + live store — plus a fully-typed client
   generated from your schema (`zig build gen-client`) or from any running instance
   (`npx @zigbase/typegen`). → [docs/typescript-sdk.md](docs/typescript-sdk.md)
-- **Static files** — serve a frontend from the same binary: `--serve-static <dir>` at runtime, or pin/embed it at comptime. → [docs/framework.md](docs/framework.md)
+- **Static files** — serve a frontend from the same binary: `--serve-static <dir>` at runtime, or pin/embed it at comptime, with `.spa` SPA-fallback markers for client-routed apps. → [docs/framework.md](docs/framework.md)
 - **Admin UI** — embedded single-page app served at `/_/`, including a Settings / Feature-Flags screen. → [docs/api.md](docs/api.md)
 - **Framework** — `ctx`-first hooks, routes, and jobs expose a structured capability object (`ctx.records()`, `ctx.auth()`, `ctx.tx()`, `ctx.http()`, `ctx.kv()`) alongside comptime schema, additive auto-migration, and pluggable storage/mailer backends. → [docs/framework.md](docs/framework.md)
 - **Determinism & test seam** — `ZIGBASE_FAKE_NOW` freezes the framework clock and all SQLite `'now'` paths; `ZIGBASE_FAKE_SEED` makes ID/token generation reproducible; `testcapture` intercepts sent mail and outbound HTTP in tests. Compiled out on production builds. → [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)

@@ -36,7 +36,13 @@ Running `zigbase` with no recognised command prints usage.
   serving from `DIR` at the root path (anything not matching `/api/`, `/_/`, or custom
   routes). Only available when the app uses the default static-files mode (field absent in
   `App(.{...})`); rejected as an unknown flag when the mode is comptime-hardcoded
-  (`.disabled`, `.dir`, or `.embedded`). See
+  (`.disabled`, `.dir`, or `.embedded`).
+  A directory in the static tree containing an empty file named `.spa` becomes an
+  SPA root: any GET/HEAD miss at or below it serves that directory's `index.html`
+  (200) so client-routed apps survive deep links and hard refreshes — resolved live
+  against the filesystem on every miss (add/remove a marker with no restart needed);
+  startup only fails fast if a marker has no `index.html`. Real files and
+  `/api`/admin paths always win. See
   [Framework → Static files](./framework#13-serve-a-frontend-static-files).
 - **`migrate`** — run schema migrations against the data directory and exit.
 - **`superuser create`** — create a superuser (required before managing collections).

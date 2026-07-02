@@ -2823,6 +2823,112 @@ The build fails with a clear error when `frontend/dist` is missing — build the
 first (e.g. `npm run build`). A hardcoded or `--serve-static` directory that is missing or
 unreadable at startup is a **fatal startup error** naming the path.
 
+### SPA fallback: the `.spa` marker
+
+Client-routed apps (History-API SPAs) break on deep links: `/app/orders/42` is a
+real URL in the browser but not a real file. Drop an empty file named **`.spa`**
+into any directory of your static tree to mark it as an SPA root: any GET/HEAD
+**miss** at or below that directory serves that directory's `index.html` with
+status **200** (real files always win; every miss under the root gets the shell,
+including extension-bearing paths like a stale hashed asset). The marker is
+**presence-only** — its contents are ignored, and case-sensitively named `.spa`
+(matched case-*insensitively* against the request path, so it stays unservable on
+case-insensitive filesystems too — see below).
+
+- Works in **both** static sources: a `--serve-static`/`.dir` tree on disk, and an
+  `embedStaticDir` **embedded** manifest (bundlers that emit `dist/.spa` work in
+  both, but resolve differently — see "Dir mode: markers are live" below).
+- Markers **nest**: with `/.spa` and `/app/.spa`, a miss at `/app/orders/1` serves
+  `app/index.html` and a miss at `/pricing` serves the root `index.html`
+  (longest `/`-bounded prefix wins — `/application` is *not* under `app/`).
+- The `.spa` file itself is **never served**, on any filesystem — the check on the
+  request path's final segment is ASCII case-insensitive, so `GET /.SPA` is refused
+  even where dir-mode `stat` is case-insensitive (macOS's default APFS/HFS+
+  volumes). Other dotfiles (`.well-known/`...) are unaffected. The `/api`
+  namespace, the admin UI (`/_/`), and all custom routes always win over the
+  fallback (checked on the normalized path too, so no raw-vs-normalized-path
+  disagreement — e.g. a doubled leading slash — can route an api-looking miss to a
+  fallback document); non-GET/HEAD methods never reach it.
+- Fallback responses ride the normal static pipeline: ETag/304 (embedded),
+  facil.io caching (dir), `nosniff`, and HEAD-mirrors-GET all apply.
+
+**Embedded mode: markers are resolved once, at startup.** The manifest is
+comptime-static (baked into the binary), so the marker root set is derived once and
+reused for the process lifetime — there's no live filesystem to go stale. A marked
+directory with no `index.html` logs a startup warning and is dropped (degrades to
+unmarked).
+
+**Dir mode: markers are resolved LIVE, per request.** A `--serve-static`/`.dir`
+source has no cached marker set at all — every miss re-checks the filesystem
+(walking the missed path's ancestor directories from deepest to the root, so the
+innermost marker still wins), which means adding, removing, or editing a `.spa` (or
+its `index.html`) takes effect on the very next request, with **no restart** and no
+cache to invalidate. Startup still validates the tree once, but only for the one
+mistake that must never reach production silently:
+
+- A `.spa`-marked directory with **no `index.html`** is a **fatal startup error**
+  naming the path — almost certainly a build/deploy mistake (nothing to serve as
+  the shell), so it aborts boot rather than silently degrading.
+- An **unreadable** subdirectory encountered during that startup check (permission
+  bits, a root-owned `0700` dir, `lost+found`, ...) is **not** fatal — it's skipped
+  with a startup warning naming the path, and behaves like it doesn't exist both at
+  startup and on every later live lookup, exactly like dir-mode serving already
+  treats an ordinary unreadable file as a plain 404 rather than an error.
+- A directory that vanishes, becomes unreadable, or loses its `index.html` **after**
+  boot never fails a request. If the *deepest matching* marker's `index.html` is
+  gone, that miss resolves to a plain 404 (it does **not** fall through to an
+  enclosing marker — a marked-but-indexless directory means "absent", same rule the
+  startup checks use); if the marker itself is gone, the walk simply continues
+  outward to the next ancestor as if it had never been marked.
+- The per-miss ancestor walk is capped at 64 levels (far deeper than any real static
+  tree); once exhausted it jumps straight to checking the static root as the final
+  candidate, bounding the filesystem cost of a crafted, very-deep request path.
+
+### SPA fallback: comptime `static_routes`
+
+Custom builds can declare explicit `match → serve` rewrites instead of (or on top
+of) the marker:
+
+```zig
+zigbase.App(.{
+    .static_files = .{ .embedded = &@import("static_assets").files },
+    .static_routes = &.{
+        .{ .match = "/app/orders/:id", .serve = "/app/orders/_shell.html" },
+        .{ .match = "/app/**",         .serve = "/app/index.html" },
+    },
+})
+```
+
+Patterns are matched segment-wise against the normalized path (trailing slashes
+never matter), **first match wins in declaration order**, and only on a real-file
+miss (real files always win). Routes are consulted **before** the marker.
+
+| Segment | Matches |
+|---|---|
+| literal | exactly that segment |
+| `:name` | exactly **one** segment (capture discarded — `serve` is a fixed path) |
+| `*` | terminal only; **one or more** remaining segments (`/admin/*` does **not** match `/admin`) |
+| `**` | terminal only; **zero or more** remaining segments (`/app/**` **does** match `/app`) |
+
+Malformed patterns (wildcards mid-pattern or mixed with text, `//`, bare `:`),
+entries without exactly `.match` + `.serve`, `serve` targets containing
+`:`/`*`/`..`/empty segments (`//` or a trailing `/`), and `.static_routes`
+alongside `.static_files = .disabled` are all **compile errors**. In **embedded**
+mode every `serve` target is proven against the manifest **at comptime**; in
+**dir** mode targets are checked **at startup** (missing target = fatal, like a
+missing static dir), and declaring routes while starting with no static source at
+all is also fatal.
+
+### `enable_spa_marker`
+
+`.enable_spa_marker = true|false` gates the marker tier — the startup derivation
+(embedded) / startup validation and live per-miss resolution (dir). Default:
+**true** when `static_routes` is absent/empty (the shipped-binary behavior),
+**false** when routes are declared (explicit config shouldn't gain stray-dotfile
+behavior). An explicit value always wins; with both enabled, routes match first and
+the marker is the residual fallback. When false, a `.spa` file is just another
+never-served dotfile.
+
 See the [blog example](../examples/blog) (runtime flag), [golfsim example](../examples/golfsim)
 (hardcoded dir), and [plugins example](../examples/plugins) (embedded).
 

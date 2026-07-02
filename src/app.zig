@@ -43,6 +43,20 @@ pub const App = struct {
     public_url: []const u8 = "",
     /// Static-file source resolved by framework.serveImpl (.none = no static serving).
     static_source: @import("static_files.zig").Source = .none,
+    /// Tier-2 comptime static rewrites (issue #183), lowered from `App(.{ .static_routes })`
+    /// by framework.zig and threaded here by serveImpl. Comptime constant slice
+    /// (static lifetime); empty = no routes.
+    static_routes: []const @import("static_files.zig").StaticRoute = &.{},
+    /// Tier-1 `.spa` marker roots (issue #183) — EMBEDDED source only: startup-derived
+    /// root-relative prefixes ("" = the static root), sorted longest-first. Owned/freed
+    /// by serveImpl; empty = marker disabled, no markers, or a dir-mode source (dir mode
+    /// resolves markers LIVE per request instead — see `spa_marker_enabled` and
+    /// `static_files.resolveSpaMarkerDirLive`).
+    spa_roots: []const []const u8 = &.{},
+    /// Tier-1 `.spa` marker enablement (issue #183), mirrors comptime `enable_spa_marker`.
+    /// Gates BOTH the embedded `spa_roots` match and the dir-mode live filesystem
+    /// resolution — false means a `.spa` is just another never-served dotfile.
+    spa_marker_enabled: bool = false,
     storage: ?*const @import("files/storage.zig").Storage = null,
     /// Pluggable mailer (resolved from the comptime mailer plugin in serveImpl).
     /// Default = LogMailer (logs); set SMTP config to upgrade to SmtpMailer. null in
