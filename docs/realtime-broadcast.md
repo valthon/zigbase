@@ -77,13 +77,12 @@ ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.topic === "availabil
 
 `@zigbase/client` 0.3.0+ wraps this in a typed helper, `subscribeTopic`, for custom channels:
 
-<!-- RE-VERIFY: written against the @zigbase/client 0.3.0 spec (subscribeTopic); confirm against the released SDK before/at 0.3.0 merge. -->
 ```js
-const unsub = client.realtime.subscribeTopic('orders', (msg) => {
-  // msg is the enveloped frame: { type: "message" | "signal", topic, data? }
-  console.log(msg);
+const unsub = await client.realtime.subscribeTopic('orders', (msg) => {
+  // msg is the enveloped frame: { topic, kind: "signal" | "message", data? }
+  if (msg.kind === 'message') console.log(msg.data);
 });
-// later: unsub();
+// later: await unsub();
 ```
 
 `subscribeTopic` requires client **0.3.0 or newer** — older `@zigbase/client` versions only expose
