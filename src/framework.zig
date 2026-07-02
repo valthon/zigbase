@@ -1854,6 +1854,65 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         else => {},
     }
 
+    // Tier-2 startup validation (issue #183): embedded serve targets were proven at
+    // comptime; dir targets are statted here (missing = fatal, like a missing static
+    // dir). Routes with NO active source could never serve anything — also fatal.
+    if (opts.static_routes.len > 0) switch (static_source) {
+        .none => {
+            std.log.err("static_routes is configured but no static source is active (run with --serve-static <dir> or set a comptime .static_files source)", .{});
+            return error.StaticRoutesRequireStaticSource;
+        },
+        .dir => |dir_path| {
+            if (try static_files.validateRouteTargetsDir(io, allocator, dir_path, opts.static_routes)) |missing| {
+                std.log.err("static_routes: serve target '{s}' not found under static dir '{s}'", .{ missing.serve, dir_path });
+                return error.StaticRouteTargetMissing;
+            }
+        },
+        .embedded => {},
+    };
+    // Tier-1 `.spa` marker (issue #183, owner revision): the two sources are handled
+    // differently, because only the embedded manifest is comptime-static.
+    //
+    // - **embedded**: derive the root set once at startup (it can never go stale — the
+    //   manifest is baked into the binary) and hand it to `app.spa_roots`.
+    // - **dir**: NOT scanned into a cached set — markers are resolved LIVE, per miss,
+    //   straight off the filesystem (`static_files.resolveSpaMarkerDirLive`, called from
+    //   `serve()`), so adding/removing a `.spa`/`index.html` after boot needs no restart.
+    //   Startup only VALIDATES: a `.spa`-marked directory with no `index.html` is a
+    //   FATAL startup error (almost certainly a build/deploy mistake — nothing to serve
+    //   as the shell); an unreadable subdirectory is skipped with a warning, exactly
+    //   like dir-mode serving already treats an unreadable file as if it doesn't exist.
+    var spa_validate_failure: static_files.SpaValidateFailure = undefined;
+    const spa_roots: []const []const u8 = if (opts.enable_spa_marker) blk: {
+        switch (static_source) {
+            .embedded => |files| break :blk try static_files.deriveEmbeddedSpaRoots(allocator, files),
+            .dir => |dir_path| {
+                static_files.validateSpaMarkersDir(io, allocator, dir_path, &spa_validate_failure) catch |err| {
+                    if (err == error.SpaValidationFailed) {
+                        // `spa_validate_failure.path` was alloc.dupe'd by validateSpaMarkersDir
+                        // for this log line only (this is a fail-fast startup path — nothing
+                        // downstream reads it, so it doesn't outlive this catch block).
+                        defer allocator.free(spa_validate_failure.path);
+                        std.log.err(
+                            "SPA marker at '{s}/' has no index.html: fix the build/deploy output or remove the marker " ++
+                                "(refusing to start — a .spa-marked directory with no shell to serve is treated as fatal, not silently dropped)",
+                            .{spa_validate_failure.path},
+                        );
+                    } else {
+                        std.log.err(
+                            "SPA marker validation failed on '{s}' ({t}): fix permissions on the static tree or remove the .spa marker",
+                            .{ dir_path, err },
+                        );
+                    }
+                    return err;
+                };
+                break :blk &.{};
+            },
+            .none => break :blk &.{},
+        }
+    } else &.{};
+    defer static_files.freeSpaRoots(allocator, spa_roots);
+
     var app = app_mod.App{
         .allocator = allocator,
         .io = io,
@@ -1873,6 +1932,9 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .file_token_ttl_s = cfg.file_token_ttl_s,
         .sentry_dsn = cfg.sentry_dsn,
         .static_source = static_source,
+        .static_routes = opts.static_routes,
+        .spa_roots = spa_roots,
+        .spa_marker_enabled = opts.enable_spa_marker,
         .pagination = .{
             .offset_enabled = opts.pagination.offset,
             .cursor_enabled = opts.pagination.cursor,

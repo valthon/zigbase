@@ -258,6 +258,68 @@ pub fn freeSpaRoots(alloc: std.mem.Allocator, roots: []const []const u8) void {
     alloc.free(roots);
 }
 
+/// A `validateSpaMarkersDir` startup failure: the offending `.spa`-marked directory
+/// (root-relative, '/'-separated; "" = the static root) and why it's fatal.
+pub const SpaValidateFailure = struct {
+    /// Allocated with the `alloc` passed to `validateSpaMarkersDir` (alloc.dupe); only
+    /// populated when that call returns `error.SpaValidationFailed`. The caller owns it
+    /// and must free it once done (e.g. after logging it).
+    path: []const u8,
+    reason: enum { missing_index },
+};
+
+/// Startup VALIDATION (Tier 1, DIR source only, issue #183 — owner revision): unlike
+/// embedded mode, dir-mode markers are resolved LIVE at request time (see
+/// `resolveSpaMarkerDirLive`) — this function does NOT build a cached root set. Its only
+/// job is to catch, once at startup, the one dir-mode marker mistake that must never
+/// reach production silently: a `.spa`-marked directory with no `index.html` (nothing to
+/// serve as the shell — almost certainly a build/deploy mistake). That is FATAL,
+/// returned via `out_failure` + `error.SpaValidationFailed` (mirrors
+/// `validateRouteTargetsDir`'s pattern: return the failure instead of logging directly,
+/// so the caller can log — logging in here would trip the unit test runner's "logged N
+/// errors" failure on the expected-failure test path).
+///
+/// A subdirectory the walk can't enter (permission-denied, vanished, symlink loop, ...)
+/// is explicitly NOT fatal here — see the owner's failure matrix: unreadable content is
+/// treated exactly like it doesn't exist (skipped, with a `std.log.warn` naming the
+/// skipped path), matching how dir-mode serving already 404s cleanly on an unreadable
+/// file rather than erroring. The root `openDir` probe in framework.zig remains the
+/// fatal gate for an inaccessible static dir itself.
+pub fn validateSpaMarkersDir(io: std.Io, alloc: std.mem.Allocator, root: []const u8, out_failure: ?*SpaValidateFailure) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    // SelectiveWalker (not the plain Walker) so `enter()` is called explicitly, per
+    // entry — its failure is caught and skipped (warn + continue) rather than aborting
+    // the whole validation pass, per the owner's "unreadable = act like it doesn't
+    // exist" rule.
+    var walker = try dir.walkSelectively(alloc);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            walker.enter(io, entry) catch |err| {
+                std.log.warn("SPA marker scan: skipping unreadable path '{s}' ({t})", .{ entry.path, err });
+                continue;
+            };
+            continue;
+        }
+        if (entry.kind != .file) continue;
+        const prefix = markerPrefix(entry.path) orelse continue;
+        const has_index = blk: {
+            const idx = if (prefix.len == 0)
+                try alloc.dupe(u8, "index.html")
+            else
+                try std.fmt.allocPrint(alloc, "{s}/index.html", .{prefix});
+            defer alloc.free(idx);
+            const st = dir.statFile(io, idx, .{}) catch break :blk false;
+            break :blk st.kind == .file;
+        };
+        if (!has_index) {
+            if (out_failure) |of| of.* = .{ .path = try alloc.dupe(u8, prefix), .reason = .missing_index };
+            return error.SpaValidationFailed;
+        }
+    }
+}
+
 /// Cap on the number of ancestor levels `resolveSpaMarkerDirLive` will `statFile` before
 /// giving up on the "walk every level" strategy and jumping straight to the root check —
 /// deeper than any plausible static tree (a real SPA route nesting 64+ segments deep does
@@ -332,6 +394,40 @@ fn resolveSpaMarkerDirLive(io: std.Io, alloc: std.mem.Allocator, root: []const u
         if (dir_rel.len == 0) return null; // reached the root; no marker anywhere
         dir_rel = if (std.mem.lastIndexOfScalar(u8, dir_rel, '/')) |i| dir_rel[0..i] else "";
     }
+}
+
+/// Startup validation (Tier 2, dir mode; issue #183): every `serve` target must resolve
+/// to a real file under `root` — the exact path, its `/index.html` when it names a
+/// directory, or the root `index.html` for "/". A missing target is a FATAL startup
+/// error, mirroring the missing-static-dir precedent (embedded targets are proven at
+/// comptime instead; comptime can't see the filesystem).
+///
+/// Deliberately silent: unlike the sibling comptime `@compileError`s in framework.zig,
+/// this returns the offending route (or `null` when every target resolves) instead of
+/// logging directly, like `std.Io.Dir.openDir` failing for the missing-static-dir check
+/// in `serveImpl`. The caller (the real startup path) logs and turns it into
+/// `error.StaticRouteTargetMissing`; unit tests exercise the return value without
+/// tripping the test runner's "logged N errors" failure on the expected-failure path.
+pub fn validateRouteTargetsDir(io: std.Io, alloc: std.mem.Allocator, root: []const u8, routes: []const StaticRoute) !?StaticRoute {
+    for (routes) |rt| {
+        const rel = std.mem.trimStart(u8, rt.serve, "/");
+        const full = if (rel.len == 0)
+            try std.fmt.allocPrint(alloc, "{s}/index.html", .{root})
+        else
+            try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, rel });
+        defer alloc.free(full);
+        const ok = blk: {
+            const st = std.Io.Dir.cwd().statFile(io, full, .{}) catch break :blk false;
+            if (st.kind == .file) break :blk true;
+            if (st.kind != .directory) break :blk false;
+            const idx = try std.fmt.allocPrint(alloc, "{s}/index.html", .{full});
+            defer alloc.free(idx);
+            const ist = std.Io.Dir.cwd().statFile(io, idx, .{}) catch break :blk false;
+            break :blk ist.kind == .file;
+        };
+        if (!ok) return rt;
+    }
+    return null;
 }
 
 fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8) !?http.Response {
@@ -652,6 +748,77 @@ test "spa scan: .none / plain embedded source yields an empty (freeable) root se
     const plain = try deriveEmbeddedSpaRoots(a, &fixture);
     defer freeSpaRoots(a, plain);
     try std.testing.expectEqual(@as(usize, 0), plain.len);
+}
+
+test "spa validate (dir): passes for a clean marked tree; unused for embedded" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".spa", .data = "" });
+    try tmp.dir.createDirPath(std.testing.io, "app/admin");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/index.html", .data = "<h1>app</h1>" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/.spa", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/admin/index.html", .data = "<h1>admin</h1>" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/admin/.spa", .data = "" });
+
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+
+    // No error: every `.spa` in this tree has a sibling index.html.
+    try validateSpaMarkersDir(std.testing.io, a, root, null);
+}
+
+test "spa validate (dir): a marker with NO index.html is FATAL (owner revision)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
+    try tmp.dir.createDirPath(std.testing.io, "broken");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "broken/.spa", .data = "" });
+
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+
+    // Fatal, not a warn+drop: a `.spa`-marked directory with nothing to serve as the
+    // shell is treated as a build/deploy mistake that must abort startup (owner's
+    // failure matrix), not silently degrade to "unmarked" the way it used to.
+    var failure: SpaValidateFailure = undefined;
+    try std.testing.expectError(error.SpaValidationFailed, validateSpaMarkersDir(std.testing.io, a, root, &failure));
+    defer a.free(failure.path);
+    try std.testing.expectEqualStrings("broken", failure.path);
+    try std.testing.expectEqual(.missing_index, failure.reason);
+}
+
+test "spa validate (dir): an unreadable subdirectory is SKIPPED, not fatal (owner revision)" {
+    // chmod(0o000) is a no-op for root (root bypasses DAC permission checks), so this
+    // assertion only holds for a non-root test runner — skip gracefully under root
+    // (e.g. some CI/sandbox containers) rather than false-fail.
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".spa", .data = "" });
+    try tmp.dir.createDirPath(std.testing.io, "locked");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "locked/.spa", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "locked/index.html", .data = "<h1>locked</h1>" });
+    // Lock the subdirectory AFTER populating it: no read/exec means the walker can list
+    // the root fine but fails to open/enter "locked" (AccessDenied), same shape as a
+    // root-owned 0700 dir or a "lost+found"-style directory under --serve-static.
+    try tmp.dir.setFilePermissions(std.testing.io, "locked", .fromMode(0o000), .{});
+    defer tmp.dir.setFilePermissions(std.testing.io, "locked", .fromMode(0o755), .{}) catch {};
+
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+
+    // NOT fatal: unreadable content is treated as if it doesn't exist (owner's failure
+    // matrix) — validation completes successfully despite "locked" being unenterable.
+    try validateSpaMarkersDir(std.testing.io, a, root, null);
 }
 
 test "spa prefix: '/'-bounded longest match; marker at app/ does not claim /application" {
@@ -1074,4 +1241,35 @@ test "static_routes: matched on miss only (real file wins); routes beat the mark
     // Trailing slash never changes the outcome (sanitize normalizes): /app/ == /app.
     var slash = http.RequestCtx{ .method = .GET, .path = "/app/orders/42/", .allocator = arena.allocator() };
     try std.testing.expectEqualStrings("<h1>app shell</h1>", (try serve(std.testing.io, &slash, src, fb)).?.body);
+}
+
+test "static_routes startup validation (dir): present + dir-index targets pass; missing is fatal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
+    try tmp.dir.createDirPath(std.testing.io, "app");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/index.html", .data = "<h1>app</h1>" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+
+    // Exact-file target, directory target (resolves to app/index.html), and "/" (root index).
+    const good = [_]StaticRoute{
+        .{ .match = "/a/**", .serve = "/app/index.html" },
+        .{ .match = "/b/**", .serve = "/app" },
+        .{ .match = "/c/**", .serve = "/" },
+    };
+    try std.testing.expectEqual(@as(?StaticRoute, null), try validateRouteTargetsDir(std.testing.io, a, root, &good));
+
+    const bad = [_]StaticRoute{.{ .match = "/x/**", .serve = "/missing.html" }};
+    const missing = (try validateRouteTargetsDir(std.testing.io, a, root, &bad)).?;
+    try std.testing.expectEqualStrings("/missing.html", missing.serve);
+
+    // A directory target WITHOUT an index.html is missing too.
+    try tmp.dir.createDirPath(std.testing.io, "empty");
+    const bad_dir = [_]StaticRoute{.{ .match = "/y/**", .serve = "/empty" }};
+    const missing_dir = (try validateRouteTargetsDir(std.testing.io, a, root, &bad_dir)).?;
+    try std.testing.expectEqualStrings("/empty", missing_dir.serve);
 }
