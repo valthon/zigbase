@@ -55,6 +55,11 @@
 //!  11. COMPTIME `.indexes` with `.collation = .nocase` on `authors.contact_email`.
 //!      Demonstrates the correct tool for indexing comptime-managed collections
 //!      (field columns are human-named, not id-named -- see migration 0002 comment).
+//!
+//!  12. TIER-2 SPA FALLBACK ROUTING via `.static_routes` (issue #183): a `/app/**`
+//!      catch-all serves the embedded frontend shell for any static miss below
+//!      `/app/`. The serve target is validated against the embedded manifest AT
+//!      COMPTIME. Declaring routes flips the Tier-1 `.spa` marker default OFF.
 
 const std = @import("std");
 const zigbase = @import("zigbase");
@@ -658,5 +663,14 @@ pub fn main(init: std.process.Init) !void {
 
         // 8. Fully embedded static frontend (see build.zig embedStaticDir).
         .static_files = .{ .embedded = &@import("static_assets").files },
+
+        // 12. Tier-2 SPA fallback routing (issue #183): any GET/HEAD static MISS below
+        //     /app/ serves the embedded frontend shell. The serve target is validated
+        //     against the embedded manifest AT COMPTIME — misspell it and the build
+        //     fails. Declaring routes also flips the Tier-1 `.spa` marker default OFF
+        //     (set `.enable_spa_marker = true` to combine both).
+        .static_routes = &.{
+            .{ .match = "/app/**", .serve = "/index.html" },
+        },
     }).runCli(init);
 }
