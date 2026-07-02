@@ -2,6 +2,7 @@ import { Transport } from "./transport.js";
 import { MemoryAuthStore, type AuthStore } from "./auth-store.js";
 import { CollectionService } from "./collection.js";
 import { FilesService } from "./files.js";
+import { AccountsService } from "./accounts.js";
 import { INTERNALS, type ClientInternals, type InternalReader } from "./internal.js";
 
 export interface ClientOptions {
@@ -13,6 +14,10 @@ export interface ClientOptions {
   maxRetries?: number;
   /** Collection used for automatic token refresh on 401 (e.g. "users"). */
   authCollection?: string;
+  /** Send `X-Account-Id: <id>` on every request (multi-tenant scoping; server >= 0.9.0).
+   *  The server grants scope only via a verified ACTIVE membership — fail closed — so
+   *  no client-side validation. */
+  accountId?: string;
 }
 
 export interface SendOptions {
@@ -28,6 +33,7 @@ export interface Client {
   readonly baseUrl: string;
   readonly authStore: AuthStore;
   readonly files: FilesService;
+  readonly accounts: AccountsService;
   collection(name: string): CollectionService;
   send<T>(method: string, path: string, opts?: SendOptions): Promise<T>;
   /**
@@ -37,6 +43,9 @@ export interface Client {
    * returned as-is (no throw), and there is no auto-refresh/429-retry on this path.
    */
   fetch(method: string, path: string, opts?: SendOptions): Promise<Response>;
+  /** A view of this client whose every request carries `X-Account-Id: <id>`. Shares the
+   *  AuthStore (login/logout propagate both ways) and the fetch/WebSocket implementations. */
+  withAccount(accountId: string): Client;
 }
 
 export function createClient(baseUrl: string, opts: ClientOptions = {}): Client {
@@ -53,6 +62,7 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
     autoRefresh: opts.autoRefresh ?? false,
     maxRetries: opts.maxRetries ?? 3,
     lang: opts.lang,
+    accountId: opts.accountId,
     refresh: opts.authCollection
       ? async () => {
           await new CollectionService(transport, authStore, opts.authCollection!).authRefresh();
@@ -61,6 +71,7 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
   });
 
   let filesService: FilesService | undefined;
+  let accountsService: AccountsService | undefined;
 
   const wsImpl = opts.WebSocket ?? (globalThis.WebSocket as typeof WebSocket | undefined);
 
@@ -82,6 +93,9 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
     get files() {
       return (filesService ??= new FilesService(transport, normalizedBase));
     },
+    get accounts() {
+      return (accountsService ??= new AccountsService(transport));
+    },
     collection(name: string) {
       return new CollectionService(transport, authStore, name);
     },
@@ -90,6 +104,11 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
     },
     fetch(method: string, path: string, sendOpts?: SendOptions) {
       return transport.raw(path, { method, ...sendOpts });
+    },
+    withAccount(accountId: string) {
+      // Sibling client: SAME AuthStore instance (explicitly forwarded), same fetch/WS impls,
+      // a new Transport with the account header baked in.
+      return createClient(baseUrl, { ...opts, authStore, accountId });
     },
   };
 

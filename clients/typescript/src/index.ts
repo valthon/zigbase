@@ -23,6 +23,8 @@ export type { SortTerm, VectorQuery } from "./query.js";
 export type { CursorPage } from "./cursor.js";
 export { FilesService } from "./files.js";
 export type { FileRecordRef, FileUrlOptions } from "./files.js";
+export { AccountsService } from "./accounts.js";
+export type { AccountScope } from "./accounts.js";
 
 // --- Plan 3: realtime + live store ---
 // The realtime / live-store / filter-eval graph lives behind the dedicated
