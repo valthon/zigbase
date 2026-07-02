@@ -631,7 +631,7 @@ Routes (tenant-scoped, fail closed):
 
 - `POST /api/senders` `{ "email": "from@acct.com" }` — request verification (emails a single-use token).
 - `POST /api/senders/:id/verify` `{ "token": "…" }` — confirm.
-- `GET /api/senders` — list the active account's identities.
+- `GET /api/senders` — list the active account's identities: `{ "items": [ … ] }`.
 
 A send whose From is not a verified identity for the account is **rejected** (`error.SenderNotVerified`).
 Addresses are compared **case-insensitively** (normalized/lowercased on store and lookup), so

@@ -1,7 +1,7 @@
 //! Verified per-account sender-identity routes (#154). Mounted in server.zig:
 //!   POST /api/senders            — request verification of a From address for the active account
 //!                                  (mints a token, EMAILS it to that address) → {id,email,status}.
-//!   GET  /api/senders            — list the active account's sender identities.
+//!   GET  /api/senders            — list the active account's sender identities → {"items":[…]}.
 //!   POST /api/senders/:id/verify — confirm a pending identity with its token → {verified:true}.
 //!
 //! TENANT-SCOPED + FAIL CLOSED. A non-superuser resolves the active account exactly like the record
@@ -75,6 +75,24 @@ fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, reader: *db.Db, out: *
     return Scope{ .account = res.account_id, .is_superuser = false };
 }
 
+/// Build the `{"items":[{id,email,status,verified_at},…]}` list envelope. 0.10.0, Breaking:
+/// was a bare JSON array in 0.9.0 — unified with the analytics endpoints' `{items}` shape
+/// (and leaves room for future paging keys).
+fn listBody(alloc: std.mem.Allocator, ids: []const senders.Identity) ![]const u8 {
+    var arr = std.json.Array.init(alloc);
+    for (ids) |it| {
+        var o: std.json.ObjectMap = .empty;
+        try o.put(alloc, "id", .{ .string = it.id });
+        try o.put(alloc, "email", .{ .string = it.email });
+        try o.put(alloc, "status", .{ .string = it.status });
+        try o.put(alloc, "verified_at", .{ .string = it.verified_at });
+        try arr.append(.{ .object = o });
+    }
+    var root: std.json.ObjectMap = .empty;
+    try root.put(alloc, "items", .{ .array = arr });
+    return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
+}
+
 /// GET /api/senders — list the active account's sender identities.
 pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator);
@@ -85,19 +103,10 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const scope = (try resolveScope(ctx, app, &r, &early)) orelse return early.?;
 
     const ids = try senders.listForAccount(ctx.allocator, &r, scope.account);
-    var arr = std.json.Array.init(ctx.allocator);
-    for (ids) |it| {
-        var o: std.json.ObjectMap = .empty;
-        try o.put(ctx.allocator, "id", .{ .string = it.id });
-        try o.put(ctx.allocator, "email", .{ .string = it.email });
-        try o.put(ctx.allocator, "status", .{ .string = it.status });
-        try o.put(ctx.allocator, "verified_at", .{ .string = it.verified_at });
-        try arr.append(.{ .object = o });
-    }
     return .{
         .status = 200,
         .content_type = "application/json",
-        .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .array = arr }, .{}),
+        .body = try listBody(ctx.allocator, ids),
     };
 }
 
@@ -222,4 +231,19 @@ test "verify requires authentication (401 without auth)" {
     };
     const res = try verify(&ctx);
     try testing.expectEqual(@as(u16, 401), res.status);
+}
+
+test "list envelope: {items:[...]} wraps the identities (0.10.0 wire shape)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ids = [_]senders.Identity{
+        .{ .id = "s1", .email = "a@x.io", .status = "verified", .verified_at = "2026-01-01 00:00:00", .created = "2026-01-01 00:00:00" },
+    };
+    try testing.expectEqualStrings(
+        "{\"items\":[{\"id\":\"s1\",\"email\":\"a@x.io\",\"status\":\"verified\",\"verified_at\":\"2026-01-01 00:00:00\"}]}",
+        try listBody(a, &ids),
+    );
+    // Empty account -> empty items array, still enveloped.
+    try testing.expectEqualStrings("{\"items\":[]}", try listBody(a, &.{}));
 }
