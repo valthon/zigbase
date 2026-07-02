@@ -729,7 +729,7 @@ Key behaviours to note:
 - **`onAuth` fires on confirm.** `zigbase.auth.issueSession` routes through the same seam as
   password and OAuth2 logins, so your `onAuth` handler (if registered) is called on
   every magic-link sign-in. There is no way to mint a session via this path — or any
-  custom path — that bypasses it. See [framework.md §6 Custom auth flows](framework.md#custom-auth-flows).
+  custom path — that bypasses it. See [framework.md → Tier 3: escape hatch for exotic flows](framework.md#tier-3-escape-hatch-for-exotic-flows).
 - **Rate limiting.** The request route calls `zigbase.auth.rateLimit` keyed on the
   parsed email (not the raw body). The built-in scope key `"magic-request"` is app-defined;
   use a descriptive scope per endpoint. Adjust the window and cap via the standard
@@ -944,6 +944,59 @@ screen. To expose one value publicly, write a one-line custom route that reads i
 `ctx.flagByName(name)` (returns `?bool`, null when undeclared) or `ctx.kv()` — exposing a flag
 is then an explicit choice, not the default.
 
+## Recipe: gate a public form with CAPTCHA
+
+Verify a browser-submitted CAPTCHA token against `recaptcha_v2`, `recaptcha_v3`,
+`hcaptcha`, or `turnstile` before honoring a public write (signup, contact form, booking
+request, ...).
+
+Configure the provider + secret in `App(cfg)`:
+
+```zig
+pub const app = zigbase.App(.{
+    .captcha = .{
+        .provider = .recaptcha_v3,   // .recaptcha_v2 | .recaptcha_v3 | .hcaptcha | .turnstile
+        .secret   = "6LeXXXXXXXXX",  // server-side site-verify secret
+    },
+    // ...
+});
+```
+
+Verify the token in the route/hook that handles the submission, and reject the write if
+it fails:
+
+```zig
+fn submitHandler(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const token = (try ctx.query()).get("captcha") orelse "";
+    const r = try ctx.verifyCaptcha(.recaptcha_v3, token);
+    if (!r.ok) return ctx.jsonError(403, "captcha_required");
+    // reCAPTCHA v3: score 0.0 (bot) → 1.0 (human); block suspicious traffic.
+    if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request");
+    // ... proceed with the submission ...
+}
+```
+
+`verifyCaptcha` can also fail with a Zig error (`error.TransportFailed`,
+`error.CaptchaProviderError`, `error.CaptchaParseError`) rather than returning `ok=false` —
+catch it to choose fail-open vs fail-closed:
+
+```zig
+const r = ctx.verifyCaptcha(.turnstile, token) catch |e| {
+    std.log.warn("captcha provider unreachable: {s}", .{@errorName(e)});
+    // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable") to fail-closed
+    return process(ctx);
+};
+```
+
+With an empty/unset secret, `ctx.verifyCaptcha` returns `.{ .ok = true }` immediately —
+no network call, no live key needed — which keeps local dev and unit tests working
+without a real provider.
+
+> **Never deploy with an empty secret** — every `verifyCaptcha` call returns `ok=true`
+> without contacting the provider.
+
+Full option table: [ctx.verifyCaptcha reference](framework.md#ctxverifycaptcha--captcha-verification-140).
+
 ## Recipe: deterministic tests (frozen clock, seeded IDs, captured mail/HTTP)
 
 Dev builds expose three determinism seams (all compiled out of release binaries). Freeze the
@@ -977,6 +1030,6 @@ tc.http.mock("api.stripe.com", .{ .status = 200, .body = "{\"paid\":true}" });
 See [framework.md §14](framework.md#14-test--dev-mode-determinism-seams) and the
 testcapture section for `mail.entries()` / `http.requests()` and the full API.
 
-See also: [fields.md](fields.md) · [tutorial.md](tutorial.md) ·
-[api.md](api.md) · [framework.md](framework.md)
-</content>
+## See also
+
+[fields.md](fields.md) · [tutorial.md](tutorial.md) · [api.md](api.md) · [framework.md](framework.md)
