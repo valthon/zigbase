@@ -1024,7 +1024,7 @@ the comptime modes and the `--serve-static <dir>` flag), GET and HEAD requests t
 none of the admin UI (`/_/`), the built-in API, or the app's custom routes are served from
 the static root. The `/api` namespace (the bare `/api` path and everything under `/api/`) is
 never served statically — an unmatched API path keeps the JSON 404 envelope, while a static
-miss returns a plain-text 404 (`text/plain`).
+miss returns a plain-text 404 (`text/plain`) — unless an [SPA fallback](#spa-fallback) applies.
 
 Static files are served **without authentication** — collection access rules do not apply to
 the static root, so never place secrets there. For access-controlled file delivery, use
@@ -1041,6 +1041,15 @@ the static root, so never place secrets there. For access-controlled file delive
   ico, woff/woff2, ttf, wasm, txt, xml, pdf, mp4, webm; unknown → `application/octet-stream`).
 - Paths containing `..`, backslashes, or NUL bytes are rejected (404). There are no
   directory listings and no `Range`/partial-content support.
+- **SPA fallback:** a directory containing a file named `.spa` is an SPA root —
+  GET/HEAD misses at or below it serve that directory's `index.html` with 200
+  (real files always win; the `.spa` file itself is never served). In **embedded**
+  mode the marker set is derived once at startup (the manifest can't change at
+  runtime); in **dir** mode it's resolved **live** against the filesystem on every
+  miss, so adding/removing a marker needs no restart (startup only fails fast if a
+  `.spa` has no `index.html`). Custom builds can also declare comptime
+  `static_routes` rewrites, consulted before the marker. See
+  [Framework → Static files](./framework#13-serve-a-frontend-static-files) for details. <a id="spa-fallback"></a>
 
 ## Realtime (WebSocket)
 
