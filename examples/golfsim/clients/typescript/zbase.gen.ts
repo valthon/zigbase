@@ -3,7 +3,7 @@
 //
 // This client imports its runtime and types from the "@zigbase/client"
 // and "@zigbase/client/typed" packages.
-import { createClient as baseCreateClient, type Client, type SendOptions } from "@zigbase/client";
+import { createClient as baseCreateClient, type Client, type RecordAbilities, type SendOptions } from "@zigbase/client";
 import { withRealtime, type RealtimeEnabledClient } from "@zigbase/client/realtime";
 import type { ListResult, CursorPage, FilesService, FileUrlOptions } from "@zigbase/client";
 import {
@@ -20,7 +20,11 @@ import {
   type TypedFieldExpr,
   type RelationResolver,
   type RawTypedRealtime,
+  type SortExpr,
 } from "@zigbase/client/typed";
+
+// requires @zigbase/client >= 0.3.0
+export type _RequiresCore = import("@zigbase/client/typed").CoreSupports_0_3;
 
 // ---- Records ----
 
@@ -228,6 +232,8 @@ export interface UserFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type UserSortField = "email" | "username" | "verified" | "name" | "loginCount" | "id" | "created" | "updated";
+export type UserSort = SortExpr<UserSortField>;
 export interface SimulatorFields {
   label: TypedFieldExpr<string>;
   owner: TypedFieldExpr<string>;
@@ -235,6 +241,8 @@ export interface SimulatorFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type SimulatorSortField = "label" | "owner" | "id" | "created" | "updated";
+export type SimulatorSort = SortExpr<SimulatorSortField>;
 export interface ListingFields {
   title: TypedFieldExpr<string>;
   price_per_hour: TypedFieldExpr<number>;
@@ -244,6 +252,8 @@ export interface ListingFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type ListingSortField = "title" | "price_per_hour" | "status" | "simulator" | "id" | "created" | "updated";
+export type ListingSort = SortExpr<ListingSortField>;
 export interface BookingFields {
   listing: TypedFieldExpr<string>;
   guest: TypedFieldExpr<string>;
@@ -255,6 +265,8 @@ export interface BookingFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type BookingSortField = "listing" | "guest" | "starts_at" | "ends_at" | "price_total" | "status" | "id" | "created" | "updated";
+export type BookingSort = SortExpr<BookingSortField>;
 export interface ReviewFields {
   booking: TypedFieldExpr<string>;
   author: TypedFieldExpr<string>;
@@ -264,6 +276,8 @@ export interface ReviewFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type ReviewSortField = "booking" | "author" | "rating" | "body" | "id" | "created" | "updated";
+export type ReviewSort = SortExpr<ReviewSortField>;
 export interface HoldFields {
   listing: TypedFieldExpr<string>;
   guest: TypedFieldExpr<string>;
@@ -272,6 +286,8 @@ export interface HoldFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type HoldSortField = "listing" | "guest" | "expires_at" | "id" | "created" | "updated";
+export type HoldSort = SortExpr<HoldSortField>;
 
 // ---- Concrete service interfaces ----
 
@@ -279,7 +295,7 @@ export interface UsersService {
   getOne(id: string, opts?: { fields?: string; signal?: AbortSignal; requestKey?: string }): Promise<User>;
   getList(opts?: {
     where?: UserWhere;
-    sort?: string;
+    sort?: UserSort | UserSort[];
     page?: number;
     limit?: number;
     fields?: string;
@@ -288,14 +304,14 @@ export interface UsersService {
   }): Promise<ListResult<User>>;
   getFirstListItem(opts?: {
     where?: UserWhere;
-    sort?: string;
+    sort?: UserSort | UserSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): Promise<User>;
   getPage(opts?: {
     where?: UserWhere;
-    sort?: string;
+    sort?: UserSort | UserSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -304,14 +320,14 @@ export interface UsersService {
   }): Promise<CursorPage<User>>;
   iterate(opts?: {
     where?: UserWhere;
-    sort?: string;
+    sort?: UserSort | UserSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<User>;
   getFullList(opts?: {
     where?: UserWhere;
-    sort?: string;
+    sort?: UserSort | UserSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -327,6 +343,7 @@ export interface UsersService {
   ): Promise<User>;
   delete(id: string): Promise<void>;
   filter(fn: (f: UserFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
   authWithPassword(
     identity: string,
     password: string,
@@ -339,7 +356,7 @@ export interface SimulatorsService {
   ): Promise<WithExpand<Simulator, SimulatorRelations, K>>;
   getList<K extends SimulatorExpand = never>(opts?: {
     where?: SimulatorWhere;
-    sort?: string;
+    sort?: SimulatorSort | SimulatorSort[];
     expand?: K[];
     page?: number;
     limit?: number;
@@ -349,7 +366,7 @@ export interface SimulatorsService {
   }): Promise<ListResult<WithExpand<Simulator, SimulatorRelations, K>>>;
   getFirstListItem<K extends SimulatorExpand = never>(opts?: {
     where?: SimulatorWhere;
-    sort?: string;
+    sort?: SimulatorSort | SimulatorSort[];
     expand?: K[];
     fields?: string;
     signal?: AbortSignal;
@@ -357,7 +374,7 @@ export interface SimulatorsService {
   }): Promise<WithExpand<Simulator, SimulatorRelations, K>>;
   getPage(opts?: {
     where?: SimulatorWhere;
-    sort?: string;
+    sort?: SimulatorSort | SimulatorSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -366,14 +383,14 @@ export interface SimulatorsService {
   }): Promise<CursorPage<Simulator>>;
   iterate(opts?: {
     where?: SimulatorWhere;
-    sort?: string;
+    sort?: SimulatorSort | SimulatorSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Simulator>;
   getFullList(opts?: {
     where?: SimulatorWhere;
-    sort?: string;
+    sort?: SimulatorSort | SimulatorSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -389,6 +406,7 @@ export interface SimulatorsService {
   ): Promise<WithExpand<Simulator, SimulatorRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: SimulatorFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
 export interface ListingsService {
   getOne<K extends ListingExpand = never>(
@@ -397,7 +415,7 @@ export interface ListingsService {
   ): Promise<WithExpand<Listing, ListingRelations, K>>;
   getList<K extends ListingExpand = never>(opts?: {
     where?: ListingWhere;
-    sort?: string;
+    sort?: ListingSort | ListingSort[];
     expand?: K[];
     page?: number;
     limit?: number;
@@ -407,7 +425,7 @@ export interface ListingsService {
   }): Promise<ListResult<WithExpand<Listing, ListingRelations, K>>>;
   getFirstListItem<K extends ListingExpand = never>(opts?: {
     where?: ListingWhere;
-    sort?: string;
+    sort?: ListingSort | ListingSort[];
     expand?: K[];
     fields?: string;
     signal?: AbortSignal;
@@ -415,7 +433,7 @@ export interface ListingsService {
   }): Promise<WithExpand<Listing, ListingRelations, K>>;
   getPage(opts?: {
     where?: ListingWhere;
-    sort?: string;
+    sort?: ListingSort | ListingSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -424,14 +442,14 @@ export interface ListingsService {
   }): Promise<CursorPage<Listing>>;
   iterate(opts?: {
     where?: ListingWhere;
-    sort?: string;
+    sort?: ListingSort | ListingSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Listing>;
   getFullList(opts?: {
     where?: ListingWhere;
-    sort?: string;
+    sort?: ListingSort | ListingSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -447,6 +465,7 @@ export interface ListingsService {
   ): Promise<WithExpand<Listing, ListingRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: ListingFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
 export interface BookingsService {
   getOne<K extends BookingExpand = never>(
@@ -455,7 +474,7 @@ export interface BookingsService {
   ): Promise<WithExpand<Booking, BookingRelations, K>>;
   getList<K extends BookingExpand = never>(opts?: {
     where?: BookingWhere;
-    sort?: string;
+    sort?: BookingSort | BookingSort[];
     expand?: K[];
     page?: number;
     limit?: number;
@@ -465,7 +484,7 @@ export interface BookingsService {
   }): Promise<ListResult<WithExpand<Booking, BookingRelations, K>>>;
   getFirstListItem<K extends BookingExpand = never>(opts?: {
     where?: BookingWhere;
-    sort?: string;
+    sort?: BookingSort | BookingSort[];
     expand?: K[];
     fields?: string;
     signal?: AbortSignal;
@@ -473,7 +492,7 @@ export interface BookingsService {
   }): Promise<WithExpand<Booking, BookingRelations, K>>;
   getPage(opts?: {
     where?: BookingWhere;
-    sort?: string;
+    sort?: BookingSort | BookingSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -482,14 +501,14 @@ export interface BookingsService {
   }): Promise<CursorPage<Booking>>;
   iterate(opts?: {
     where?: BookingWhere;
-    sort?: string;
+    sort?: BookingSort | BookingSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Booking>;
   getFullList(opts?: {
     where?: BookingWhere;
-    sort?: string;
+    sort?: BookingSort | BookingSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -505,6 +524,7 @@ export interface BookingsService {
   ): Promise<WithExpand<Booking, BookingRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: BookingFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
 export interface ReviewsService {
   getOne<K extends ReviewExpand = never>(
@@ -513,7 +533,7 @@ export interface ReviewsService {
   ): Promise<WithExpand<Review, ReviewRelations, K>>;
   getList<K extends ReviewExpand = never>(opts?: {
     where?: ReviewWhere;
-    sort?: string;
+    sort?: ReviewSort | ReviewSort[];
     expand?: K[];
     page?: number;
     limit?: number;
@@ -523,7 +543,7 @@ export interface ReviewsService {
   }): Promise<ListResult<WithExpand<Review, ReviewRelations, K>>>;
   getFirstListItem<K extends ReviewExpand = never>(opts?: {
     where?: ReviewWhere;
-    sort?: string;
+    sort?: ReviewSort | ReviewSort[];
     expand?: K[];
     fields?: string;
     signal?: AbortSignal;
@@ -531,7 +551,7 @@ export interface ReviewsService {
   }): Promise<WithExpand<Review, ReviewRelations, K>>;
   getPage(opts?: {
     where?: ReviewWhere;
-    sort?: string;
+    sort?: ReviewSort | ReviewSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -540,14 +560,14 @@ export interface ReviewsService {
   }): Promise<CursorPage<Review>>;
   iterate(opts?: {
     where?: ReviewWhere;
-    sort?: string;
+    sort?: ReviewSort | ReviewSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Review>;
   getFullList(opts?: {
     where?: ReviewWhere;
-    sort?: string;
+    sort?: ReviewSort | ReviewSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -563,6 +583,7 @@ export interface ReviewsService {
   ): Promise<WithExpand<Review, ReviewRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: ReviewFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
 export interface HoldsService {
   getOne<K extends HoldExpand = never>(
@@ -571,7 +592,7 @@ export interface HoldsService {
   ): Promise<WithExpand<Hold, HoldRelations, K>>;
   getList<K extends HoldExpand = never>(opts?: {
     where?: HoldWhere;
-    sort?: string;
+    sort?: HoldSort | HoldSort[];
     expand?: K[];
     page?: number;
     limit?: number;
@@ -581,7 +602,7 @@ export interface HoldsService {
   }): Promise<ListResult<WithExpand<Hold, HoldRelations, K>>>;
   getFirstListItem<K extends HoldExpand = never>(opts?: {
     where?: HoldWhere;
-    sort?: string;
+    sort?: HoldSort | HoldSort[];
     expand?: K[];
     fields?: string;
     signal?: AbortSignal;
@@ -589,7 +610,7 @@ export interface HoldsService {
   }): Promise<WithExpand<Hold, HoldRelations, K>>;
   getPage(opts?: {
     where?: HoldWhere;
-    sort?: string;
+    sort?: HoldSort | HoldSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -598,14 +619,14 @@ export interface HoldsService {
   }): Promise<CursorPage<Hold>>;
   iterate(opts?: {
     where?: HoldWhere;
-    sort?: string;
+    sort?: HoldSort | HoldSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Hold>;
   getFullList(opts?: {
     where?: HoldWhere;
-    sort?: string;
+    sort?: HoldSort | HoldSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -621,6 +642,7 @@ export interface HoldsService {
   ): Promise<WithExpand<Hold, HoldRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: HoldFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
 
 // ---- Per-collection metadata ----
@@ -817,6 +839,10 @@ export interface ZbClient {
     golfsimSessionsRevoke(params: { id: string }, opts?: SendOptions): Promise<RevokeOut>;
     golfsimHealth(opts?: SendOptions): Promise<HealthOut>;
   };
+  accounts: Client["accounts"];
+  analytics: Client["analytics"];
+  senders: Client["senders"];
+  withAccount(accountId: string): ZbClient;
   authStore: Client["authStore"];
   send: Client["send"];
   fetch: Client["fetch"];
@@ -834,7 +860,12 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       authCollection: opts.authCollection ?? "users",
     }),
   );
+  return makeClient(base);
+}
 
+/** Build the typed facade over a realtime-enabled base client. All facades are
+ *  stateless wrappers, so `withAccount` can rebuild them cheaply per scope. */
+function makeClient(base: RealtimeEnabledClient): ZbClient {
   return {
     db: {
       users: Object.assign(
@@ -896,6 +927,10 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
         return base.send("GET", `/api/golfsim/health`, opts);
       },
     },
+    accounts: base.accounts,
+    analytics: base.analytics,
+    senders: base.senders,
+    withAccount: (accountId: string): ZbClient => makeClient(withRealtime(base.withAccount(accountId))),
     authStore: base.authStore,
     send: base.send.bind(base),
     fetch: base.fetch.bind(base),

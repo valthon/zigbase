@@ -4,7 +4,7 @@
 // In a consumer repo this file imports from "@zigbase/client" and
 // "@zigbase/client/typed". In this in-repo snapshot we import from the
 // package source so it typechecks against the working tree without a built dist.
-import { createClient as baseCreateClient, type Client, type SendOptions } from "../../../src/index.js";
+import { createClient as baseCreateClient, type Client, type RecordAbilities, type SendOptions } from "../../../src/index.js";
 import { withRealtime, type RealtimeEnabledClient } from "../../../src/realtime-entry.js";
 import type { ListResult } from "../../../src/records.js";
 import type { CursorPage } from "../../../src/cursor.js";
@@ -23,7 +23,11 @@ import {
   type TypedFieldExpr,
   type RelationResolver,
   type RawTypedRealtime,
+  type SortExpr,
 } from "../../../src/typed/index.js";
+
+// requires @zigbase/client >= 0.3.0
+export type _RequiresCore = import("../../../src/typed/index.js").CoreSupports_0_3;
 
 // ---- Records ----
 
@@ -263,6 +267,8 @@ export interface MessageFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type MessageSortField = "from" | "to" | "body" | "sentAt" | "read" | "id" | "created" | "updated";
+export type MessageSort = SortExpr<MessageSortField>;
 export interface PhotoFields {
   owner: TypedFieldExpr<string>;
   caption: TypedFieldExpr<string>;
@@ -271,6 +277,8 @@ export interface PhotoFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type PhotoSortField = "owner" | "caption" | "id" | "created" | "updated";
+export type PhotoSort = SortExpr<PhotoSortField>;
 export interface PrivatePhotoFields {
   owner: TypedFieldExpr<string>;
   caption: TypedFieldExpr<string>;
@@ -278,6 +286,8 @@ export interface PrivatePhotoFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type PrivatePhotoSortField = "owner" | "caption" | "id" | "created" | "updated";
+export type PrivatePhotoSort = SortExpr<PrivatePhotoSortField>;
 export interface ProfileFields {
   email: TypedFieldExpr<string>;
   username: TypedFieldExpr<string>;
@@ -291,6 +301,8 @@ export interface ProfileFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type ProfileSortField = "email" | "username" | "verified" | "name" | "bio" | "website" | "age" | "gender" | "id" | "created" | "updated";
+export type ProfileSort = SortExpr<ProfileSortField>;
 export interface SubscriptionFields {
   profile: TypedFieldExpr<string>;
   plan: TypedFieldExpr<SubscriptionPlan>;
@@ -302,12 +314,16 @@ export interface SubscriptionFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type SubscriptionSortField = "profile" | "plan" | "price" | "renewsAt" | "active" | "id" | "created" | "updated";
+export type SubscriptionSort = SortExpr<SubscriptionSortField>;
 export interface TagFields {
   label: TypedFieldExpr<string>;
   id: TypedFieldExpr<string>;
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type TagSortField = "label" | "id" | "created" | "updated";
+export type TagSort = SortExpr<TagSortField>;
 export interface WinkFields {
   from: TypedFieldExpr<string>;
   to: TypedFieldExpr<string>;
@@ -316,6 +332,8 @@ export interface WinkFields {
   created: TypedFieldExpr<string>;
   updated: TypedFieldExpr<string>;
 }
+export type WinkSortField = "from" | "to" | "createdAt" | "id" | "created" | "updated";
+export type WinkSort = SortExpr<WinkSortField>;
 
 // ---- Concrete service interfaces ----
 
@@ -326,7 +344,7 @@ export interface MessagesService {
   ): Promise<WithExpand<Message, MessageRelations, K>>;
   getList<K extends MessageExpand = never>(opts?: {
     where?: MessageWhere;
-    sort?: string;
+    sort?: MessageSort | MessageSort[];
     expand?: K[];
     page?: number;
     limit?: number;
@@ -336,7 +354,7 @@ export interface MessagesService {
   }): Promise<ListResult<WithExpand<Message, MessageRelations, K>>>;
   getFirstListItem<K extends MessageExpand = never>(opts?: {
     where?: MessageWhere;
-    sort?: string;
+    sort?: MessageSort | MessageSort[];
     expand?: K[];
     fields?: string;
     signal?: AbortSignal;
@@ -344,7 +362,7 @@ export interface MessagesService {
   }): Promise<WithExpand<Message, MessageRelations, K>>;
   getPage(opts?: {
     where?: MessageWhere;
-    sort?: string;
+    sort?: MessageSort | MessageSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -353,14 +371,14 @@ export interface MessagesService {
   }): Promise<CursorPage<Message>>;
   iterate(opts?: {
     where?: MessageWhere;
-    sort?: string;
+    sort?: MessageSort | MessageSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Message>;
   getFullList(opts?: {
     where?: MessageWhere;
-    sort?: string;
+    sort?: MessageSort | MessageSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -376,6 +394,7 @@ export interface MessagesService {
   ): Promise<WithExpand<Message, MessageRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: MessageFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
 export interface PhotosService {
   getOne<K extends PhotoExpand = never>(
@@ -384,7 +403,7 @@ export interface PhotosService {
   ): Promise<WithExpand<Photo, PhotoRelations, K>>;
   getList<K extends PhotoExpand = never>(opts?: {
     where?: PhotoWhere;
-    sort?: string;
+    sort?: PhotoSort | PhotoSort[];
     expand?: K[];
     page?: number;
     limit?: number;
@@ -394,7 +413,7 @@ export interface PhotosService {
   }): Promise<ListResult<WithExpand<Photo, PhotoRelations, K>>>;
   getFirstListItem<K extends PhotoExpand = never>(opts?: {
     where?: PhotoWhere;
-    sort?: string;
+    sort?: PhotoSort | PhotoSort[];
     expand?: K[];
     fields?: string;
     signal?: AbortSignal;
@@ -402,7 +421,7 @@ export interface PhotosService {
   }): Promise<WithExpand<Photo, PhotoRelations, K>>;
   getPage(opts?: {
     where?: PhotoWhere;
-    sort?: string;
+    sort?: PhotoSort | PhotoSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -411,14 +430,14 @@ export interface PhotosService {
   }): Promise<CursorPage<Photo>>;
   iterate(opts?: {
     where?: PhotoWhere;
-    sort?: string;
+    sort?: PhotoSort | PhotoSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Photo>;
   getFullList(opts?: {
     where?: PhotoWhere;
-    sort?: string;
+    sort?: PhotoSort | PhotoSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -434,6 +453,7 @@ export interface PhotosService {
   ): Promise<WithExpand<Photo, PhotoRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: PhotoFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
   fileUrl(record: Photo, field: PhotoFileField, opts?: FileUrlOptions): string;
 }
 export interface PrivatePhotosService {
@@ -443,7 +463,7 @@ export interface PrivatePhotosService {
   ): Promise<WithExpand<PrivatePhoto, PrivatePhotoRelations, K>>;
   getList<K extends PrivatePhotoExpand = never>(opts?: {
     where?: PrivatePhotoWhere;
-    sort?: string;
+    sort?: PrivatePhotoSort | PrivatePhotoSort[];
     expand?: K[];
     page?: number;
     limit?: number;
@@ -453,7 +473,7 @@ export interface PrivatePhotosService {
   }): Promise<ListResult<WithExpand<PrivatePhoto, PrivatePhotoRelations, K>>>;
   getFirstListItem<K extends PrivatePhotoExpand = never>(opts?: {
     where?: PrivatePhotoWhere;
-    sort?: string;
+    sort?: PrivatePhotoSort | PrivatePhotoSort[];
     expand?: K[];
     fields?: string;
     signal?: AbortSignal;
@@ -461,7 +481,7 @@ export interface PrivatePhotosService {
   }): Promise<WithExpand<PrivatePhoto, PrivatePhotoRelations, K>>;
   getPage(opts?: {
     where?: PrivatePhotoWhere;
-    sort?: string;
+    sort?: PrivatePhotoSort | PrivatePhotoSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -470,14 +490,14 @@ export interface PrivatePhotosService {
   }): Promise<CursorPage<PrivatePhoto>>;
   iterate(opts?: {
     where?: PrivatePhotoWhere;
-    sort?: string;
+    sort?: PrivatePhotoSort | PrivatePhotoSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<PrivatePhoto>;
   getFullList(opts?: {
     where?: PrivatePhotoWhere;
-    sort?: string;
+    sort?: PrivatePhotoSort | PrivatePhotoSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -493,13 +513,14 @@ export interface PrivatePhotosService {
   ): Promise<WithExpand<PrivatePhoto, PrivatePhotoRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: PrivatePhotoFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
   fileUrl(record: PrivatePhoto, field: PrivatePhotoFileField, opts?: FileUrlOptions): string;
 }
 export interface ProfilesService {
   getOne(id: string, opts?: { fields?: string; signal?: AbortSignal; requestKey?: string }): Promise<Profile>;
   getList(opts?: {
     where?: ProfileWhere;
-    sort?: string;
+    sort?: ProfileSort | ProfileSort[];
     page?: number;
     limit?: number;
     fields?: string;
@@ -508,14 +529,14 @@ export interface ProfilesService {
   }): Promise<ListResult<Profile>>;
   getFirstListItem(opts?: {
     where?: ProfileWhere;
-    sort?: string;
+    sort?: ProfileSort | ProfileSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): Promise<Profile>;
   getPage(opts?: {
     where?: ProfileWhere;
-    sort?: string;
+    sort?: ProfileSort | ProfileSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -524,14 +545,14 @@ export interface ProfilesService {
   }): Promise<CursorPage<Profile>>;
   iterate(opts?: {
     where?: ProfileWhere;
-    sort?: string;
+    sort?: ProfileSort | ProfileSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Profile>;
   getFullList(opts?: {
     where?: ProfileWhere;
-    sort?: string;
+    sort?: ProfileSort | ProfileSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -547,6 +568,7 @@ export interface ProfilesService {
   ): Promise<Profile>;
   delete(id: string): Promise<void>;
   filter(fn: (f: ProfileFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
   authWithPassword(
     identity: string,
     password: string,
@@ -560,7 +582,8 @@ export interface SubscriptionsService {
   ): Promise<WithExpand<Subscription, SubscriptionRelations, K>>;
   getList<K extends SubscriptionExpand = never>(opts?: {
     where?: SubscriptionWhere;
-    sort?: string;
+    sort?: SubscriptionSort | SubscriptionSort[];
+    vector?: { field: "metadata"; metric?: "cosine" | "l2"; values: number[] };
     expand?: K[];
     page?: number;
     limit?: number;
@@ -570,7 +593,7 @@ export interface SubscriptionsService {
   }): Promise<ListResult<WithExpand<Subscription, SubscriptionRelations, K>>>;
   getFirstListItem<K extends SubscriptionExpand = never>(opts?: {
     where?: SubscriptionWhere;
-    sort?: string;
+    sort?: SubscriptionSort | SubscriptionSort[];
     expand?: K[];
     fields?: string;
     signal?: AbortSignal;
@@ -578,7 +601,7 @@ export interface SubscriptionsService {
   }): Promise<WithExpand<Subscription, SubscriptionRelations, K>>;
   getPage(opts?: {
     where?: SubscriptionWhere;
-    sort?: string;
+    sort?: SubscriptionSort | SubscriptionSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -587,14 +610,14 @@ export interface SubscriptionsService {
   }): Promise<CursorPage<Subscription>>;
   iterate(opts?: {
     where?: SubscriptionWhere;
-    sort?: string;
+    sort?: SubscriptionSort | SubscriptionSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Subscription>;
   getFullList(opts?: {
     where?: SubscriptionWhere;
-    sort?: string;
+    sort?: SubscriptionSort | SubscriptionSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -610,12 +633,13 @@ export interface SubscriptionsService {
   ): Promise<WithExpand<Subscription, SubscriptionRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: SubscriptionFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
 export interface TagsService {
   getOne(id: string, opts?: { fields?: string; signal?: AbortSignal; requestKey?: string }): Promise<Tag>;
   getList(opts?: {
     where?: TagWhere;
-    sort?: string;
+    sort?: TagSort | TagSort[];
     page?: number;
     limit?: number;
     fields?: string;
@@ -624,14 +648,14 @@ export interface TagsService {
   }): Promise<ListResult<Tag>>;
   getFirstListItem(opts?: {
     where?: TagWhere;
-    sort?: string;
+    sort?: TagSort | TagSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): Promise<Tag>;
   getPage(opts?: {
     where?: TagWhere;
-    sort?: string;
+    sort?: TagSort | TagSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -640,14 +664,14 @@ export interface TagsService {
   }): Promise<CursorPage<Tag>>;
   iterate(opts?: {
     where?: TagWhere;
-    sort?: string;
+    sort?: TagSort | TagSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Tag>;
   getFullList(opts?: {
     where?: TagWhere;
-    sort?: string;
+    sort?: TagSort | TagSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -663,6 +687,7 @@ export interface TagsService {
   ): Promise<Tag>;
   delete(id: string): Promise<void>;
   filter(fn: (f: TagFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
 export interface WinksService {
   getOne<K extends WinkExpand = never>(
@@ -671,7 +696,7 @@ export interface WinksService {
   ): Promise<WithExpand<Wink, WinkRelations, K>>;
   getList<K extends WinkExpand = never>(opts?: {
     where?: WinkWhere;
-    sort?: string;
+    sort?: WinkSort | WinkSort[];
     expand?: K[];
     page?: number;
     limit?: number;
@@ -681,7 +706,7 @@ export interface WinksService {
   }): Promise<ListResult<WithExpand<Wink, WinkRelations, K>>>;
   getFirstListItem<K extends WinkExpand = never>(opts?: {
     where?: WinkWhere;
-    sort?: string;
+    sort?: WinkSort | WinkSort[];
     expand?: K[];
     fields?: string;
     signal?: AbortSignal;
@@ -689,7 +714,7 @@ export interface WinksService {
   }): Promise<WithExpand<Wink, WinkRelations, K>>;
   getPage(opts?: {
     where?: WinkWhere;
-    sort?: string;
+    sort?: WinkSort | WinkSort[];
     limit?: number;
     cursor?: string;
     withTotal?: boolean;
@@ -698,14 +723,14 @@ export interface WinksService {
   }): Promise<CursorPage<Wink>>;
   iterate(opts?: {
     where?: WinkWhere;
-    sort?: string;
+    sort?: WinkSort | WinkSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
   }): AsyncIterableIterator<Wink>;
   getFullList(opts?: {
     where?: WinkWhere;
-    sort?: string;
+    sort?: WinkSort | WinkSort[];
     fields?: string;
     signal?: AbortSignal;
     requestKey?: string;
@@ -721,6 +746,7 @@ export interface WinksService {
   ): Promise<WithExpand<Wink, WinkRelations, K>>;
   delete(id: string): Promise<void>;
   filter(fn: (f: WinkFields) => Expr): string;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
 
 // ---- Per-collection metadata ----
@@ -895,6 +921,10 @@ export interface ZbClient {
     };
   };
   files: FilesService;
+  accounts: Client["accounts"];
+  analytics: Client["analytics"];
+  senders: Client["senders"];
+  withAccount(accountId: string): ZbClient;
   authStore: Client["authStore"];
   send: Client["send"];
   fetch: Client["fetch"];
@@ -912,7 +942,12 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       authCollection: opts.authCollection ?? "profiles",
     }),
   );
+  return makeClient(base);
+}
 
+/** Build the typed facade over a realtime-enabled base client. All facades are
+ *  stateless wrappers, so `withAccount` can rebuild them cheaply per scope. */
+function makeClient(base: RealtimeEnabledClient): ZbClient {
   return {
     db: {
       messages: makeRecordService(base, messagesMeta, relationResolver) as unknown as MessagesService,
@@ -963,6 +998,10 @@ export function createClient(url: string, opts: ZbClientOptions = {}): ZbClient 
       },
     },
     files: base.files,
+    accounts: base.accounts,
+    analytics: base.analytics,
+    senders: base.senders,
+    withAccount: (accountId: string): ZbClient => makeClient(withRealtime(base.withAccount(accountId))),
     authStore: base.authStore,
     send: base.send.bind(base),
     fetch: base.fetch.bind(base),
