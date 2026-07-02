@@ -26,6 +26,10 @@ export { FilesService } from "./files.js";
 export type { FileRecordRef, FileUrlOptions } from "./files.js";
 export { AccountsService } from "./accounts.js";
 export type { AccountScope } from "./accounts.js";
+export { AnalyticsService } from "./analytics.js";
+export type { AnalyticsEvent, RollupBucket } from "./analytics.js";
+export { SendersService } from "./senders.js";
+export type { SenderIdentity } from "./senders.js";
 
 // --- Plan 3: realtime + live store ---
 // The realtime / live-store / filter-eval graph lives behind the dedicated

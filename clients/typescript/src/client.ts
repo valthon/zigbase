@@ -3,6 +3,8 @@ import { MemoryAuthStore, type AuthStore } from "./auth-store.js";
 import { CollectionService } from "./collection.js";
 import { FilesService } from "./files.js";
 import { AccountsService } from "./accounts.js";
+import { AnalyticsService } from "./analytics.js";
+import { SendersService } from "./senders.js";
 import { INTERNALS, type ClientInternals, type InternalReader } from "./internal.js";
 
 export interface ClientOptions {
@@ -34,6 +36,8 @@ export interface Client {
   readonly authStore: AuthStore;
   readonly files: FilesService;
   readonly accounts: AccountsService;
+  readonly analytics: AnalyticsService;
+  readonly senders: SendersService;
   collection(name: string): CollectionService;
   send<T>(method: string, path: string, opts?: SendOptions): Promise<T>;
   /**
@@ -72,6 +76,8 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
 
   let filesService: FilesService | undefined;
   let accountsService: AccountsService | undefined;
+  let analyticsService: AnalyticsService | undefined;
+  let sendersService: SendersService | undefined;
 
   const wsImpl = opts.WebSocket ?? (globalThis.WebSocket as typeof WebSocket | undefined);
 
@@ -95,6 +101,12 @@ export function createClient(baseUrl: string, opts: ClientOptions = {}): Client 
     },
     get accounts() {
       return (accountsService ??= new AccountsService(transport));
+    },
+    get analytics() {
+      return (analyticsService ??= new AnalyticsService(transport));
+    },
+    get senders() {
+      return (sendersService ??= new SendersService(transport));
     },
     collection(name: string) {
       return new CollectionService(transport, authStore, name);

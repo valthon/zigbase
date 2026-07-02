@@ -25,4 +25,10 @@ describe("public exports (Plan 2)", () => {
     expect(typeof zb.hasBlob).toBe("function");
     expect(typeof zb.toFormData).toBe("function");
   });
+
+  it("re-exports AnalyticsService, SendersService, AccountsService", () => {
+    expect(typeof zb.AnalyticsService).toBe("function");
+    expect(typeof zb.SendersService).toBe("function");
+    expect(typeof zb.AccountsService).toBe("function");
+  });
 });
