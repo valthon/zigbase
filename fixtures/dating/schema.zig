@@ -53,6 +53,22 @@ fn winksRaw(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     _ = req;
     return .{ .bool = true };
 }
+// Realtime custom-topic publish (gap-closure integration coverage): fires BOTH verbs so a
+// client sees a `signal` and a `message` frame on `topic`.
+const PublishIn = struct { topic: []const u8, note: []const u8 };
+fn testingPublish(req: *zigbase.Req(PublishIn)) zigbase.RouteError!SendWinkOut {
+    req.ctx.realtime().signal(req.input.topic);
+    req.ctx.realtime().broadcast(req.input.topic, .{ .note = req.input.note }) catch
+        return req.fail(500, "broadcast failed");
+    return .{ .ok = true, .note = req.input.note };
+}
+// Analytics capture (gap-closure integration coverage): appends one `_events` row attributed
+// to the caller + active account.
+const TrackIn = struct { name: []const u8 };
+fn testingTrack(req: *zigbase.Req(TrackIn)) zigbase.RouteError!SendWinkOut {
+    req.ctx.track(req.input.name, .{ .via = "route" }) catch return req.fail(500, "track failed");
+    return .{ .ok = true, .note = req.input.name };
+}
 
 // ---------------------------------------------------------------------------
 // Custom auth method with DECLARED comptime I/O types (issue #119).
@@ -116,13 +132,32 @@ pub const App = zigbase.App(.{
         .{ .method = .GET, .path = "/api/messages/search", .handler = messagesSearch, .auth = .public },
         .{ .method = .GET, .path = "/api/winks/status", .handler = winksStatus, .auth = .public },
         .{ .method = .GET, .path = "/api/winks/raw", .handler = winksRaw, .auth = .public },
+        .{ .method = .POST, .path = "/api/testing/publish", .handler = testingPublish, .auth = .public },
+        .{ .method = .POST, .path = "/api/testing/track", .handler = testingTrack, .auth = .public },
+    },
+    .tenancy = .{ .enabled = true, .auth_collection = "profiles" },
+    .abilities = .{
+        .notes = .{
+            .update = .{ .relationship = .{ .via = "account", .min_role = .editor } },
+            .delete = .{ .relationship = .{ .via = "account", .min_role = .admin } },
+        },
+    },
+    .analytics = .{
+        .rollups = .{
+            .notes_daily = .{
+                .event = "note.created",
+                .every = .{ .interval = .hourly },
+                .group_by = .{ .account = true, .time_bucket = .day },
+                .metric = .count,
+            },
+        },
     },
     .collections = .{
         .profiles = .{
             .type = .auth,
             .fields = .{
                 .{ .name = "name", .type = .text },
-                .{ .name = "bio", .type = .editor },
+                .{ .name = "bio", .type = .editor, .searchable = true },
                 .{ .name = "website", .type = .url },
                 .{ .name = "age", .type = .number, .mode = .int },
                 .{ .name = "gender", .type = .select, .values = .{ "female", "male", "nonbinary", "other" } },
@@ -173,7 +208,7 @@ pub const App = zigbase.App(.{
             .fields = .{
                 .{ .name = "from", .type = .relation, .target = "profiles" },
                 .{ .name = "to", .type = .relation, .target = "profiles" },
-                .{ .name = "body", .type = .text, .required = true },
+                .{ .name = "body", .type = .text, .required = true, .searchable = true },
                 .{ .name = "sentAt", .type = .autodate, .onCreate = true },
                 .{ .name = "read", .type = .@"bool" },
             },
@@ -197,6 +232,17 @@ pub const App = zigbase.App(.{
                 .{ .name = "metadata", .type = .json },
             },
             .rules = .{ .list = "@public", .view = "@public", .create = "@request.auth.id != \"\"", .update = "@request.auth.id != \"\"", .delete = "@request.auth.id != \"\"" },
+        },
+        // Tenant-owned (gap-closure coverage): `account` is a RELATION (abilities .via requires
+        // one) to the live `_accounts` system collection; the server stamps it on create.
+        .notes = .{
+            .fields = .{
+                .{ .name = "account", .type = .relation, .target = "_accounts" },
+                .{ .name = "title", .type = .text, .required = true },
+                .{ .name = "body", .type = .text },
+            },
+            .tenant_field = "account",
+            .rules = .{ .list = "@request.auth.id != \"\"", .view = "@request.auth.id != \"\"", .create = "@request.auth.id != \"\"", .update = "@request.auth.id != \"\"", .delete = "@request.auth.id != \"\"" },
         },
     },
 });
