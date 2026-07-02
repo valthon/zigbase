@@ -7,7 +7,7 @@ const docs = defineCollection({
     title: z.string(),
     description: z.string(),
     order: z.number(),
-    group: z.enum(['getting-started', 'guides', 'reference']),
+    group: z.enum(['getting-started', 'guides', 'features', 'reference']),
   }),
 });
 
