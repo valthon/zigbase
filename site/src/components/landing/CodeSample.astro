@@ -41,6 +41,22 @@ pub fn main(init: std.process.Init) !void {
     }).runCli(init);
 }`;
 
+const ctxCode = `fn onSignup(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    _ = ev;
+    // Immutable analytics event — actor, tenant, timestamp stamped server-side.
+    try ctx.track("user.signup", .{ .plan = "free" });
+
+    // Welcome email via the durable "emails" queue (SES/Postmark/SMTP behind one vtable).
+    try ctx.mail().enqueue(.{
+        .to = "user@example.com",
+        .subject = "Welcome!",
+        .html = "<h1>You're in.</h1>",
+    }, .{ .queue = "emails" });
+
+    // Signed outbound webhook with retry/backoff and an idempotency key.
+    try ctx.webhook("https://hooks.example.com/zigbase", .{ .event = "signup" }, .{});
+}`;
+
 const restCode = `# Create a record
 curl -X POST http://127.0.0.1:8090/api/collections/posts/records \\
   -H 'Content-Type: application/json' \\
@@ -58,20 +74,28 @@ console.log(items);`;
   <header class="codesample__head">
     <h2>One backend, two ways in</h2>
     <p>
-      Extend the server in typed Zig, or talk to it over a plain REST API —
-      the same collections, the same access rules.
+      Extend the server in typed Zig, or talk to it over a plain REST API — the
+      same collections, the same access rules, on SQLite or Postgres.
     </p>
   </header>
 
   <CodeTabs
     tabs={[
       { id: 'zig', label: 'Extend it in Zig' },
+      { id: 'ctx', label: 'Ship real features' },
       { id: 'rest', label: 'Use the REST API' },
     ]}
   >
     <Fragment slot="zig">
       <div class="codesample__panel">
         <Code code={zigCode} lang="zig" />
+        <CopyButton class="codesample__copy" />
+      </div>
+    </Fragment>
+
+    <Fragment slot="ctx">
+      <div class="codesample__panel">
+        <Code code={ctxCode} lang="zig" />
         <CopyButton class="codesample__copy" />
       </div>
     </Fragment>
