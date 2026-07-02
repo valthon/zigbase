@@ -47,6 +47,13 @@ export interface OAuth2Args {
   state?: string;
 }
 
+/** The actions the current principal may perform on a specific record (#155). */
+export interface RecordAbilities {
+  view: boolean;
+  update: boolean;
+  delete: boolean;
+}
+
 export class CollectionService {
   constructor(
     protected readonly transport: Transport,
@@ -218,6 +225,22 @@ export class CollectionService {
     await this.transport.send<void>(`${this.recordsBase()}/${encodeURIComponent(id)}`, {
       method: "DELETE",
     });
+  }
+
+  /**
+   * GET /api/collections/:col/records/:id/abilities — the actions the current principal
+   * may perform on this record (requires ZigBase >= 0.9.0). Rejects with a 404
+   * `ZigbaseError` when the record is not viewable — the endpoint never reveals a
+   * record's existence, so `view` is always `true` on a success.
+   */
+  getAbilities(
+    id: string,
+    opts: { signal?: AbortSignal; requestKey?: string } = {},
+  ): Promise<RecordAbilities> {
+    return this.transport.send<RecordAbilities>(
+      `${this.recordsBase()}/${encodeURIComponent(id)}/abilities`,
+      { method: "GET", signal: opts.signal, requestKey: opts.requestKey },
+    );
   }
 
   /**

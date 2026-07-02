@@ -1,5 +1,5 @@
 import type { Client } from "../client.js";
-import type { CollectionService } from "../collection.js";
+import type { CollectionService, RecordAbilities } from "../collection.js";
 import type { ListResult, ZbRecord } from "../records.js";
 import type { CursorPage } from "../cursor.js";
 import type { VectorQuery } from "../query.js";
@@ -58,6 +58,7 @@ export interface RawTypedService {
   create(data: Record<string, unknown>, opts?: TypedReadOptions): Promise<ZbRecord>;
   update(id: string, data: Record<string, unknown>, opts?: TypedReadOptions): Promise<ZbRecord>;
   delete(id: string): Promise<void>;
+  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
   filter(fn: (b: FilterRoot) => Expr): string;
 }
 
@@ -232,6 +233,9 @@ export function makeRecordService(
     },
     delete(id) {
       return inner.delete(id);
+    },
+    getAbilities(id, opts) {
+      return inner.getAbilities(id, opts);
     },
     filter(fn) {
       return fn(builder).compile();
