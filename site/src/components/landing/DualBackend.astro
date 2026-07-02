@@ -1,0 +1,191 @@
+---
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
+const steps = [
+  {
+    title: 'Ship day one',
+    code: './zigbase serve   # embedded SQLite, WAL, one file',
+  },
+  {
+    title: 'Opt in to Postgres',
+    code: 'zig build -Dpostgres=true\nexport ZIGBASE_DB_URL="postgres://…?sslmode=require"',
+  },
+  {
+    title: 'Move your data',
+    code: 'zigbase migrate-db --from ./data.db --to "postgres://…"',
+  },
+];
+
+const proofs = [
+  {
+    title: 'Multi-instance realtime',
+    body: 'Run several stateless app instances against one database; record events fan out to every instance over LISTEN/NOTIFY — never carrying row data.',
+  },
+  {
+    title: 'Pure-Zig driver',
+    body: 'No libpq, no OpenSSL. The default SQLite build links zero new symbols.',
+  },
+  {
+    title: 'Full parity',
+    body: 'CRUD, filter/sort/expand/search, access rules + abilities + tenancy, analytics, encryption, and typed codegen — verified against a live Postgres in CI.',
+  },
+];
+---
+
+<section class="dual">
+  <div class="container">
+    <header class="dual__head">
+      <h2>Start on SQLite. Grow to Postgres. Change nothing.</h2>
+      <p>
+        The default deployment is one file on embedded SQLite — easy to run, easy to
+        back up. When one box isn't enough, the same application runs on PostgreSQL:
+        opt in at build time, point at a URL, and move your data with one command.
+      </p>
+    </header>
+
+    <ol class="dual__steps">
+      {
+        steps.map((s, i) => (
+          <li class="dual__step">
+            <span class="dual__num" aria-hidden="true">{i + 1}</span>
+            <div class="dual__step-body">
+              <h3 class="dual__step-title">{s.title}</h3>
+              <pre class="dual__code"><code>{s.code}</code></pre>
+            </div>
+          </li>
+        ))
+      }
+    </ol>
+
+    <div class="dual__proofs">
+      {
+        proofs.map((p) => (
+          <div class="dual__proof">
+            <h3 class="dual__proof-title">{p.title}</h3>
+            <p class="dual__proof-body">{p.body}</p>
+          </div>
+        ))
+      }
+    </div>
+
+    <p class="dual__cta">
+      <a href={`${base}docs/postgres`}>Read the PostgreSQL guide →</a>
+    </p>
+
+    <p class="dual__caveat">
+      Postgres support is opt-in and new in 0.9.0: transport is TLS-encrypted but
+      server certificates are not yet verified (verify-full is a tracked follow-up) —
+      run it over a trusted network path. Details in the
+      <a href={`${base}docs/postgres`}>PostgreSQL guide</a>.
+    </p>
+  </div>
+</section>
+
+<style>
+  .dual {
+    padding-block: var(--space-8);
+    background-color: var(--color-surface);
+    border-block: 1px solid var(--color-border);
+  }
+
+  .dual__head {
+    text-align: center;
+    max-width: 60ch;
+    margin: 0 auto var(--space-6);
+  }
+
+  .dual__head p {
+    color: var(--color-muted);
+    margin-top: var(--space-3);
+  }
+
+  .dual__steps {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+    gap: var(--space-4);
+    list-style: none;
+    margin: 0 0 var(--space-6);
+    padding: 0;
+  }
+
+  .dual__step {
+    display: flex;
+    gap: var(--space-3);
+    padding: var(--space-5);
+    background-color: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+  }
+
+  .dual__num {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: var(--radius-full);
+    background-color: color-mix(in srgb, var(--color-accent) 15%, transparent);
+    color: var(--color-accent);
+    font-weight: 700;
+    font-size: var(--text-sm);
+  }
+
+  .dual__step-body {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .dual__step-title {
+    font-size: var(--text-lg);
+    margin: 0;
+  }
+
+  .dual__code {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    background-color: var(--color-surface);
+    overflow-x: auto;
+  }
+
+  .dual__proofs {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: var(--space-5);
+    margin-bottom: var(--space-6);
+  }
+
+  .dual__proof {
+    border-left: 3px solid var(--color-accent);
+    padding-left: var(--space-4);
+  }
+
+  .dual__proof-title {
+    font-size: var(--text-lg);
+    margin-bottom: var(--space-2);
+  }
+
+  .dual__proof-body {
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+    line-height: var(--leading-normal);
+  }
+
+  .dual__cta {
+    text-align: center;
+    font-weight: 600;
+    margin-bottom: var(--space-4);
+  }
+
+  .dual__caveat {
+    text-align: center;
+    max-width: 70ch;
+    margin: 0 auto;
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+    line-height: var(--leading-normal);
+  }
+</style>

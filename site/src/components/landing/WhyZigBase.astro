@@ -1,12 +1,18 @@
 ---
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
 const points = [
   {
     title: 'One static binary',
     body: 'A single statically-linked executable with no runtime dependencies — copy it to a server and run it.',
   },
   {
-    title: 'SQLite-backed',
-    body: 'All data lives in one SQLite file with WAL enabled. Easy to back up, easy to reason about.',
+    title: 'Embedded database, real database',
+    body: 'All data in one SQLite file with WAL by default — easy to back up, easy to reason about. The same code runs on PostgreSQL (opt-in) when you outgrow one box.',
+  },
+  {
+    title: 'A scale path, not a rewrite',
+    body: 'zigbase migrate-db moves an existing SQLite instance to Postgres — schema and data, ids and timestamps preserved, encrypted-field envelopes byte-for-byte.',
   },
   {
     title: 'Comptime framework',
@@ -18,7 +24,7 @@ const points = [
   },
   {
     title: 'Safe by default',
-    body: 'Blank access rules lock a collection (superusers only); only the explicit "@public" sentinel opens it. Rate limiting, field encryption, and CSRF protection are on by default.',
+    body: 'Blank access rules lock a collection (superusers only); only the explicit "@public" sentinel opens it. Rate limiting, field encryption, and CSRF protection are on by default. Tenancy, abilities, and search scoping are fail-closed — a misconfiguration denies, never leaks.',
   },
   {
     title: 'Full auth stack',
@@ -47,6 +53,10 @@ const points = [
       ))
     }
   </div>
+
+  <p class="why__compare">
+    <a href={`${base}compare`}>How ZigBase compares →</a>
+  </p>
 </section>
 
 <style>
@@ -84,5 +94,11 @@ const points = [
     color: var(--color-muted);
     font-size: var(--text-sm);
     line-height: var(--leading-normal);
+  }
+
+  .why__compare {
+    text-align: center;
+    margin-top: var(--space-6);
+    font-weight: 600;
   }
 </style>

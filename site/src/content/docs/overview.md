@@ -10,8 +10,8 @@ group: getting-started
 **ZigBase is a single-binary, open-source backend** — collections and schema, a typed
 records query API, per-collection access rules, authentication (argon2id password plus
 OAuth2 with PKCE), realtime updates over WebSocket, local file storage, and an embedded
-admin UI — all in one statically-linked executable backed by SQLite, written in **Zig
-0.16**.
+admin UI — all in one statically-linked executable — embedded SQLite by default,
+PostgreSQL opt-in — written in **Zig 0.16**.
 
 It is PocketBase-*inspired* but **not** API-compatible.
 
@@ -60,38 +60,59 @@ There are two ways to use ZigBase:
 - **Ctx capability layer** — a single `*Ctx` passed to every hook, route, and job wraps
   records, auth, KV, flags, outbound HTTP, and atomic transactions; connection pooling
   is handled for you. → [Framework](./framework)
-- **Realtime** — subscribe to record changes over WebSocket. → [API](./api#realtime-websocket)
+- **Realtime** — subscribe to record changes over WebSocket, broadcast on custom channels
+  from routes and jobs; record-change delivery fans out across app instances on Postgres.
+  → [Realtime broadcast](./realtime-broadcast)
+- **PostgreSQL backend (opt-in)** — build with `-Dpostgres` and point `ZIGBASE_DB_URL` at a
+  `postgres://` URL; `zigbase migrate-db` moves an existing SQLite instance across.
+  → [PostgreSQL](./postgres)
+- **Multi-tenancy** — account-scoped collections with built-in accounts, memberships,
+  invitations, and roles; fail-closed. → [Multi-tenancy](./tenancy)
+- **Relationship abilities** — authorize by the caller's relationship to the row,
+  comptime-validated and fail-closed. → [Abilities](./abilities)
+- **Full-text & vector search** — ranked `?search=` queries on `.searchable` fields;
+  opt-in `-Dvector` KNN. → [Search](./search)
+- **Product analytics** — immutable `ctx.track` events, declarative rollups, and a
+  tenant-scoped read API. → [Analytics](./analytics)
+- **Background jobs & queues** — durable or in-memory queues with priorities and retries;
+  `ctx.enqueue` from anywhere. → [Jobs & webhooks](./jobs-and-webhooks)
+- **Outbound webhooks** — signed, idempotent deliveries with retries and capped backoff.
+  → [Jobs & webhooks](./jobs-and-webhooks)
+- **CAPTCHA** — `ctx.verifyCaptcha` for reCAPTCHA, hCaptcha, and Turnstile.
+  → [Recipes](./recipes#recipe-gate-a-public-form-with-captcha)
 - **Files** — local (pluggable) file storage with serving and short-lived file-access
   tokens. → [API](./api#files)
 - **Admin UI** — embedded single-page app served at `/_/`, including a Settings screen
   for managing KV/feature flags.
 - **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema
   (with additive auto-migration), and pluggable storage/mailer backends. → [Framework](./framework)
-- **Email** — pluggable SMTP mailer (STARTTLS / implicit TLS / plaintext) delivering
-  verification, password-reset, magic-link, and OTP email; logs tokens in dev when SMTP
-  is unset.
+- **Email** — transactional mail with multipart HTML+text templates, SES / Postmark / SMTP
+  providers, verified per-account senders, and bounce suppression. → [Email](./email)
 - **Deterministic testing** — freeze time (`ZIGBASE_FAKE_NOW`), fix randomness
   (`ZIGBASE_FAKE_SEED`), and capture outbound mail in test suites — all gated off in
   production builds.
 
 ## When to use ZigBase
 
-ZigBase fits when you want a backend that ships as **one file**, runs on **SQLite**, and
-either (a) gives you a REST/realtime/auth surface with zero glue, or (b) lets you grow
-custom server logic **in Zig** without standing up a separate service. The architecture
-favors a small footprint: a warm reader-connection pool, a blocking-mutex writer, and
-comptime "footprint levers" you can tune.
+ZigBase fits when you want a backend that ships as **one file** — embedded SQLite to
+start, the same code on **PostgreSQL** when you outgrow one box — and either (a) gives
+you a REST/realtime/auth surface with zero glue, or (b) lets you grow custom server logic
+**in Zig** without standing up a separate service. The architecture favors a small
+footprint: a warm reader-connection pool, a blocking-mutex writer, and comptime
+"footprint levers" you can tune.
 
 It is an **early release** (Apache-2.0). Read the
 [known limitations](./known-limitations) before deploying — notably that SMTP must be
 configured for email delivery in production, rate limiting ignores proxy-supplied client
 IPs unless `--trust-proxy` is set, comptime auto-migration is additive-only, and the
-scheduler is single-process.
+scheduler is single-process, and the PostgreSQL backend is new in 0.9.0 (TLS is encrypted
+but not yet certificate-verified).
 
 ## Where to go next
 
 - **[Quick start](./quick-start)** — install, create a superuser, serve, hit the API.
 - **[Tutorial](./tutorial)** — build a backend end to end (provision → rules → signup →
   records + file upload → custom route → cron).
+- **[PostgreSQL](./postgres)** — take the same app to Postgres when you outgrow one box.
 - **[Framework](./framework)** — the full hook / route / job / schema / plugin surface.
 - **[API](./api)** — the REST + WebSocket reference.

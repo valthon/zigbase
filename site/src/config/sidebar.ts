@@ -4,7 +4,7 @@ export interface SidebarEntry {
 }
 
 export interface SidebarGroup {
-  id: 'getting-started' | 'guides' | 'reference';
+  id: 'getting-started' | 'guides' | 'features' | 'reference';
   label: string;
   entries: SidebarEntry[];
 }
@@ -27,6 +27,20 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'framework', label: 'Framework' },
       { slug: 'typescript-sdk', label: 'TypeScript SDK' },
       { slug: 'configuration', label: 'Configuration' },
+    ],
+  },
+  {
+    id: 'features',
+    label: 'Feature guides',
+    entries: [
+      { slug: 'postgres', label: 'PostgreSQL backend' },
+      { slug: 'tenancy', label: 'Multi-tenancy' },
+      { slug: 'abilities', label: 'Relationship abilities' },
+      { slug: 'search', label: 'Full-text & vector search' },
+      { slug: 'analytics', label: 'Product analytics' },
+      { slug: 'email', label: 'Email' },
+      { slug: 'jobs-and-webhooks', label: 'Jobs & webhooks' },
+      { slug: 'realtime-broadcast', label: 'Realtime broadcast' },
     ],
   },
   {
