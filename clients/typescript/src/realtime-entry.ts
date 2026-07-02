@@ -1,12 +1,18 @@
 import type { Client } from "./client.js";
 import { INTERNALS, type WithInternals } from "./internal.js";
-import { RealtimeService, type RealtimeEvent } from "./realtime.js";
+import { RealtimeService, type RealtimeEvent, type TopicMessage } from "./realtime.js";
 import { LiveCollection, type LiveReader, type LiveSubscriber } from "./live/live-collection.js";
 
 // Re-export the realtime / live-store / filter-eval public surface from this entry,
 // so everything that pulls in that graph is reachable only via `@zigbase/client/realtime`.
 export { RealtimeService } from "./realtime.js";
-export type { RealtimeEvent, RealtimeCallback, RealtimeAction } from "./realtime.js";
+export type {
+  RealtimeEvent,
+  RealtimeCallback,
+  RealtimeAction,
+  TopicMessage,
+  TopicCallback,
+} from "./realtime.js";
 export { LiveCollection, LiveList } from "./live/live-collection.js";
 export type {
   LiveReader,
@@ -27,6 +33,8 @@ export interface RealtimeClient extends LiveSubscriber {
     opts?: { filter?: string },
   ): Promise<() => void>;
   unsubscribe(topic: string, cb?: (e: RealtimeEvent) => void): void;
+  subscribeTopic(topic: string, cb: (msg: TopicMessage) => void): Promise<() => void>;
+  unsubscribeTopic(topic: string, cb?: (msg: TopicMessage) => void): void;
   collection(name: string): LiveCollection;
 }
 
@@ -67,6 +75,8 @@ export function withRealtime<C extends Client>(client: C): C & { readonly realti
   const realtime: RealtimeClient = {
     subscribe: (topic, cb, subOpts) => getService().subscribe(topic, cb, subOpts),
     unsubscribe: (topic, cb) => getService().unsubscribe(topic, cb),
+    subscribeTopic: (topic, cb) => getService().subscribeTopic(topic, cb),
+    unsubscribeTopic: (topic, cb) => getService().unsubscribeTopic(topic, cb),
     collection: (name) =>
       new LiveCollection(name, internals.makeReader(name) as unknown as LiveReader, getService()),
   };

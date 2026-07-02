@@ -15,6 +15,18 @@ export interface RealtimeEvent {
 
 export type RealtimeCallback = (event: RealtimeEvent) => void;
 
+/** A frame delivered on a custom (non-collection) topic (server >= 0.10.0 for `__features`;
+ *  custom `ctx.realtime()` topics exist as of 0.9.0). */
+export interface TopicMessage {
+  topic: string;
+  /** "signal" = re-fetch hint (no payload); "message" = payload-carrying broadcast. */
+  kind: "signal" | "message";
+  /** The envelope's `data` value; absent for signals. */
+  data?: unknown;
+}
+
+export type TopicCallback = (msg: TopicMessage) => void;
+
 export interface RealtimeServiceConfig {
   baseUrl: string;
   authStore: AuthStore;
@@ -30,11 +42,17 @@ export interface RealtimeServiceConfig {
 
 interface Subscription {
   topic: string;
+  /** "records" = collection subscription (event frames); "topic" = custom topic (signal/message). */
+  kind: "records" | "topic";
   filter?: string;
   callbacks: Set<RealtimeCallback>;
+  topicCallbacks: Set<TopicCallback>;
   /** Resolvers waiting for the `ack` of the in-flight subscribe frame. */
   pending: Array<{ resolve: () => void; reject: (e: Error) => void }>;
   acked: boolean;
+  /** A subscribe frame is on the wire awaiting its ack — concurrent subscribers
+   *  must join `pending` without sending a duplicate frame. */
+  inflight: boolean;
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -68,7 +86,16 @@ export class RealtimeService {
     const key = subKey(topic, opts.filter);
     let sub = this.subscriptions.get(key);
     if (!sub) {
-      sub = { topic, filter: opts.filter, callbacks: new Set(), pending: [], acked: false };
+      sub = {
+        topic,
+        kind: "records",
+        filter: opts.filter,
+        callbacks: new Set(),
+        topicCallbacks: new Set(),
+        pending: [],
+        acked: false,
+        inflight: false,
+      };
       this.subscriptions.set(key, sub);
     }
     sub.callbacks.add(cb);
@@ -82,8 +109,9 @@ export class RealtimeService {
 
     await new Promise<void>((resolve, reject) => {
       sub!.pending.push({ resolve, reject });
-      // If the socket is already open, (re)send the subscribe frame now.
-      if (this.opened) this.sendSubscribe(sub!);
+      // If the socket is already open and no subscribe frame is awaiting its
+      // ack, send one now; concurrent callers just join `pending`.
+      if (this.opened && !sub!.inflight) this.sendSubscribe(sub!);
     });
 
     return () => this.unsubscribe(topic, cb, opts.filter);
@@ -114,6 +142,51 @@ export class RealtimeService {
     // Send a single unsubscribe frame once the topic has no live variants left.
     if (removedSub && this.opened && this.ws && !this.hasTopic(topic)) {
       this.send({ action: "unsubscribe", topic });
+    }
+  }
+
+  /**
+   * Subscribe to a custom (non-collection) topic. Delivers the standard topic frames:
+   * `{"type":"signal","topic"}` (kind "signal", no payload — re-fetch hint) and
+   * `{"type":"message","topic","data"}` (kind "message" — `ctx.realtime().broadcast`
+   * payloads). Feature-change notifications are `subscribeTopic("__features", cb)`
+   * (server >= 0.10.0). Same wire frame, ack, resubscribe and backoff machinery as
+   * record subscriptions; a server-rejected subscribe rejects the returned promise.
+   */
+  async subscribeTopic(topic: string, cb: TopicCallback): Promise<() => void> {
+    const key = topicKey(topic);
+    let sub = this.subscriptions.get(key);
+    if (!sub) {
+      sub = { topic, kind: "topic", callbacks: new Set(), topicCallbacks: new Set(), pending: [], acked: false, inflight: false };
+      this.subscriptions.set(key, sub);
+    }
+    sub.topicCallbacks.add(cb);
+
+    this.ensureConnected();
+
+    if (sub.acked) {
+      return () => this.unsubscribeTopic(topic, cb);
+    }
+    await new Promise<void>((resolve, reject) => {
+      sub!.pending.push({ resolve, reject });
+      // Same dedup as `subscribe`: don't re-send while a frame awaits its ack.
+      if (this.opened && !sub!.inflight) this.sendSubscribe(sub!);
+    });
+    return () => this.unsubscribeTopic(topic, cb);
+  }
+
+  /** Remove a topic callback (all of them when `cb` is omitted); sends one unsubscribe
+   *  frame when the topic has no live subscription variants left. */
+  unsubscribeTopic(topic: string, cb?: TopicCallback): void {
+    const sub = this.subscriptions.get(topicKey(topic));
+    if (!sub) return;
+    if (cb) sub.topicCallbacks.delete(cb);
+    else sub.topicCallbacks.clear();
+    if (sub.topicCallbacks.size === 0) {
+      this.subscriptions.delete(topicKey(topic));
+      if (this.opened && this.ws && !this.hasTopic(topic)) {
+        this.send({ action: "unsubscribe", topic });
+      }
     }
   }
 
@@ -209,6 +282,7 @@ export class RealtimeService {
   }
 
   private sendSubscribe(sub: Subscription): void {
+    sub.inflight = true;
     const frame: Record<string, unknown> = { action: "subscribe", topic: sub.topic };
     if (sub.filter !== undefined) frame.filter = sub.filter;
     this.send(frame);
@@ -240,6 +314,10 @@ export class RealtimeService {
       case "event":
         this.onEvent(frame);
         break;
+      case "signal":
+      case "message":
+        this.onTopicFrame(frame);
+        break;
       case "error":
         this.onErrorFrame((frame.message as string) ?? "realtime error");
         break;
@@ -250,6 +328,7 @@ export class RealtimeService {
     for (const sub of this.subscriptions.values()) {
       if (sub.topic !== topic) continue;
       sub.acked = true;
+      sub.inflight = false;
       const pending = sub.pending.splice(0);
       for (const p of pending) p.resolve();
     }
@@ -269,12 +348,25 @@ export class RealtimeService {
     }
   }
 
+  private onTopicFrame(frame: Record<string, unknown>): void {
+    const topic = frame.topic;
+    if (typeof topic !== "string") return; // malformed (missing topic) -> dropped
+    const kind = frame.type as "signal" | "message";
+    const msg: TopicMessage =
+      kind === "message" ? { topic, kind, data: frame.data } : { topic, kind };
+    for (const sub of this.subscriptions.values()) {
+      if (sub.kind !== "topic" || sub.topic !== topic) continue;
+      for (const cb of sub.topicCallbacks) cb(msg);
+    }
+  }
+
   private onErrorFrame(message: string): void {
     // Reject any still-pending subscribe so the awaiting caller learns of it
     // (e.g. anonymous subscribe to a non-public collection).
     let rejected = false;
     for (const sub of this.subscriptions.values()) {
       if (sub.acked || sub.pending.length === 0) continue;
+      sub.inflight = false; // allow a later subscribe to retry with a fresh frame
       const pending = sub.pending.splice(0);
       for (const p of pending) p.reject(new Error(message));
       rejected = true;
@@ -305,8 +397,15 @@ export class RealtimeService {
   }
 }
 
+// Record-subscription and topic-subscription keys share one Map, so their key spaces
+// must be structurally disjoint: `r:`/`t:` prefixes guarantee no record key (however
+// adversarial the topic/filter text) can ever collide with a topic key, or vice versa.
 function subKey(topic: string, filter?: string): string {
-  return filter === undefined ? topic : `${topic} ${filter}`;
+  return filter === undefined ? `r:${topic}` : `r:${topic} ${filter}`;
+}
+
+function topicKey(topic: string): string {
+  return `t:${topic}`;
 }
 
 function wsUrl(baseUrl: string): string {

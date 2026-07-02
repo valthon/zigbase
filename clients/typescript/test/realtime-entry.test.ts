@@ -53,6 +53,36 @@ describe("withRealtime", () => {
     expect(typeof live.getList).toBe("function");
   });
 
+  it("delegates subscribeTopic/unsubscribeTopic to the underlying RealtimeService", async () => {
+    const factory = new FakeWebSocketFactory();
+    const zb = withRealtime(
+      createClient("http://api.test", {
+        fetch: (async () => new Response("{}")) as unknown as typeof fetch,
+        WebSocket: factory.WebSocket,
+      }),
+    );
+
+    expect(typeof zb.realtime.subscribeTopic).toBe("function");
+
+    const cb = vi.fn();
+    const subPromise = zb.realtime.subscribeTopic("orders", cb);
+    const ws = factory.last;
+    expect(ws.url).toBe("ws://api.test/api/realtime");
+
+    ws.emitOpen();
+    expect(ws.sentFrames).toContainEqual({ action: "subscribe", topic: "orders" });
+    ws.emitMessage({ type: "ack", action: "subscribe", topic: "orders" });
+    await subPromise;
+
+    ws.emitMessage({ type: "signal", topic: "orders" });
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith({ topic: "orders", kind: "signal" });
+
+    zb.realtime.unsubscribeTopic("orders", cb);
+    ws.emitMessage({ type: "signal", topic: "orders" });
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
   it("base client (without withRealtime) does NOT expose .realtime", () => {
     const zb = createClient("http://api.test", {
       fetch: (async () => new Response("{}")) as unknown as typeof fetch,
