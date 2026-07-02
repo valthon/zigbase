@@ -43,8 +43,9 @@ export function filterValue(value: unknown): string {
  * Serialize a single value into a safe ZigBase filter operand. Alias of
  * `filterValue`, named for use by the typed core (`@zigbase/client/typed`):
  * strings/Dates are single-quoted + escaped (injection-safe), numbers/booleans
- * pass bare, and array/object operands are rejected (callers expand `in` lists
- * into `||` chains themselves).
+ * pass bare, and array/object operands are rejected — `in` lists are not
+ * expanded here; the typed `where()` layer emits a native `in (...)` clause
+ * (see `typed/where.ts`'s `compileIn`), quoting each element via this function.
  */
 export function quoteFilterValue(value: unknown): string {
   return filterValue(value);

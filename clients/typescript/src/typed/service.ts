@@ -11,7 +11,8 @@ import type { CollectionMeta } from "./meta.js";
 /** Options the typed list/read surface accepts (loosely typed; narrowed by the generated file). */
 export interface TypedListOptions {
   where?: unknown;
-  sort?: string;
+  /** Sort expression(s); an array is joined with "," (multi-key sort). */
+  sort?: string | string[];
   expand?: string[];
   page?: number;
   limit?: number;
@@ -31,7 +32,8 @@ export interface TypedReadOptions {
 
 export interface TypedPageOptions {
   where?: unknown;
-  sort?: string;
+  /** Sort expression(s); an array is joined with "," (multi-key sort). */
+  sort?: string | string[];
   expand?: string[];
   limit?: number;
   cursor?: string;
@@ -62,6 +64,9 @@ export interface RawTypedService {
 const expandList = (e: string[] | undefined): string | undefined =>
   e && e.length > 0 ? e.join(",") : undefined;
 
+const sortJoin = (s: string | string[] | undefined): string | undefined =>
+  Array.isArray(s) ? (s.length > 0 ? s.join(",") : undefined) : s;
+
 /**
  * Build a typed record service over SP1's `client.collection(meta.name)`. A
  * `where` option is compiled to an SP1 `filter` string via `compileWhere`
@@ -91,7 +96,7 @@ export function makeRecordService(
 
   const listOpts = (opts?: TypedListOptions) => ({
     filter: whereToFilter(opts?.where),
-    sort: opts?.sort,
+    sort: sortJoin(opts?.sort),
     expand: expandList(opts?.expand),
     fields: opts?.fields,
     search: opts?.search,
@@ -151,7 +156,7 @@ export function makeRecordService(
     async getFirstListItem(opts) {
       const filter = whereToFilter(opts?.where);
       const listOpts2 = {
-        sort: opts?.sort,
+        sort: sortJoin(opts?.sort),
         expand: expandList(opts?.expand),
         fields: opts?.fields,
         search: opts?.search,
@@ -180,7 +185,7 @@ export function makeRecordService(
     async getPage(opts) {
       const page = await inner.getPage({
         filter: whereToFilter(opts?.where),
-        sort: opts?.sort,
+        sort: sortJoin(opts?.sort),
         expand: expandList(opts?.expand),
         limit: opts?.limit,
         cursor: opts?.cursor,
@@ -194,7 +199,7 @@ export function makeRecordService(
     iterate(opts) {
       const innerIter = inner.iterate({
         filter: whereToFilter(opts?.where),
-        sort: opts?.sort,
+        sort: sortJoin(opts?.sort),
         expand: expandList(opts?.expand),
         fields: opts?.fields,
         search: opts?.search,
@@ -210,7 +215,7 @@ export function makeRecordService(
     async getFullList(opts) {
       const list = await inner.getFullList({
         filter: whereToFilter(opts?.where),
-        sort: opts?.sort,
+        sort: sortJoin(opts?.sort),
         expand: expandList(opts?.expand),
         fields: opts?.fields,
         search: opts?.search,
