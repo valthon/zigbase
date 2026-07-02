@@ -36,6 +36,8 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'postgres', label: 'PostgreSQL backend' },
       { slug: 'tenancy', label: 'Multi-tenancy' },
       { slug: 'abilities', label: 'Relationship abilities' },
+      { slug: 'search', label: 'Full-text & vector search' },
+      { slug: 'analytics', label: 'Product analytics' },
     ],
   },
   {
