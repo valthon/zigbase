@@ -208,6 +208,14 @@ fn ensureRtTable(d: *dbm.Db) !void {
         "\"created\" TIMESTAMPTZ NOT NULL DEFAULT now());");
 }
 
+/// Create the custom-topic broadcast side table in the CURRENT search_path (matches migration
+/// 0021's DDL). Idempotent. Used so these tests don't depend on the system migrations.
+fn ensureBroadcastTable(d: *dbm.Db) !void {
+    try d.exec("CREATE TABLE IF NOT EXISTS \"_rt_broadcasts\" (" ++
+        "\"token\" TEXT PRIMARY KEY, \"topic\" TEXT NOT NULL, \"frame\" TEXT NOT NULL, " ++
+        "\"created\" TIMESTAMPTZ NOT NULL DEFAULT now());");
+}
+
 test "pg cross-instance: a create NOTIFY (token-free) is received + decoded by a listener on conn B" {
     // Two app instances sharing one database: instance B LISTENs; instance A NOTIFYs a create with a
     // DIFFERENT origin id (a remote instance). B receives + decodes the minimal {o,c,a,i} payload that
@@ -430,4 +438,74 @@ test "pg delete authz: local snapshot == remote snapshot (at-rest ciphertext bas
     // allowed, non-owner denied — the same decisions, proving all three paths use one basis.
     try std.testing.expect(try hub.shouldDeliver(al, io, &d, col, &owner, 0, .create, rid, null, null));
     try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &other, 0, .create, rid, null, null));
+}
+
+// ---- PR-4a: cross-instance custom topics (signal + message side-table) -------
+
+test "pg cross-instance: signal NOTIFY round-trips conn A -> conn B and decodes as .signal" {
+    // A payload-less custom-topic signal: instance A NOTIFYs {o,s} with a DIFFERENT origin, and
+    // instance B's listener receives + decodes it as a .signal carrying only origin + topic.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var conn_b = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer conn_b.close();
+    var conn_a = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer conn_a.close();
+
+    try dbm.dbListen(&conn_b, pg_bridge.channel);
+
+    const payload = try pg_bridge.encodeSignal(al, "instanceA", "orders");
+    // Payload-less: only origin + topic ride the wire — no frame, no data.
+    try std.testing.expect(std.mem.indexOf(u8, payload, "data") == null);
+    try dbm.dbNotify(&conn_a, al, pg_bridge.channel, payload);
+
+    const note = (try dbm.dbWaitNotification(&conn_b, al)) orelse return error.@"no notification received";
+    try std.testing.expectEqualStrings(pg_bridge.channel, note.channel);
+    const p = pg_bridge.decodeAny(al, note.payload) orelse return error.@"decode failed";
+    try std.testing.expectEqualStrings("orders", p.signal.topic);
+    try std.testing.expectEqualStrings("instanceA", p.signal.origin);
+    // Origin differs from THIS process's id → the listener would NOT skip it.
+    try std.testing.expect(!std.mem.eql(u8, p.signal.origin, pg_bridge.originId(io)));
+}
+
+test "pg cross-instance: _rt_broadcasts store/read round-trip; forged token drops; TTL GC reaps" {
+    // The message-broadcast path: A stores the ENVELOPED frame in _rt_broadcasts keyed by a random
+    // CSPRNG token, NOTIFYs only the token; B reads the frame back by token. A forged token finds no
+    // row (fail closed). A stale row (older than the TTL) is GC'd on the next store.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var d = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer d.close();
+    const sname = try enterTempSchema(al, &d);
+    defer dropTempSchema(al, &d, sname);
+    try ensureBroadcastTable(&d);
+
+    const topic = "orders";
+    const frame = "{\"type\":\"message\",\"topic\":\"orders\",\"data\":{\"n\":1}}";
+
+    // store → read round-trip: topic + frame come back byte-identical.
+    const token = pg_bridge.storeBroadcast(al, io, &d, topic, frame) orelse return error.@"store failed";
+    const back = pg_bridge.readBroadcast(al, &d, token) orelse return error.@"frame not found";
+    try std.testing.expectEqualStrings(topic, back.topic);
+    try std.testing.expectEqualStrings(frame, back.frame);
+    // The token is high-entropy (32 random base36 chars from the CSPRNG seam), so it is unguessable.
+    try std.testing.expectEqual(@as(usize, 32), token.len);
+
+    // A FORGED / guessed token resolves to no row → drop (fail closed).
+    try std.testing.expect(pg_bridge.readBroadcast(al, &d, "forged-token-does-not-exist") == null);
+
+    // TTL GC: seed a stale row (created 120s ago > 60s TTL), then the next store reaps it.
+    try d.exec("INSERT INTO \"_rt_broadcasts\" (\"token\",\"topic\",\"frame\",\"created\") " ++
+        "VALUES ('stale-token','orders','{}', now() - interval '120 seconds');");
+    try std.testing.expect(pg_bridge.readBroadcast(al, &d, "stale-token") != null); // present before GC
+    _ = pg_bridge.storeBroadcast(al, io, &d, topic, frame) orelse return error.@"store failed";
+    try std.testing.expect(pg_bridge.readBroadcast(al, &d, "stale-token") == null); // reaped by GC
 }

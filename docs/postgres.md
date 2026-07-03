@@ -134,6 +134,14 @@ including the decrypted plaintext of `.encrypted` fields — to any DB role that
 the snapshot stays at-rest (ciphertext) in the side table and never transits the wire. On SQLite
 (single-process) nothing changes — there is no cross-process step and no side table.
 
+Custom-topic realtime — `ctx.realtime().signal(topic)` / `broadcast(topic, payload)` and the
+`__features` flag/experiment signal — fans out across instances the same way (best-effort,
+at-most-once, unordered). A `signal` puts only the topic name on the wire; a `broadcast` stores its
+enveloped frame in a second side table (`_rt_broadcasts`, keyed by a random token, TTL-GC'd) and
+NOTIFYs only the token, so no payload bytes ever transit the wire. The receiver reads the frame back
+over its own connection and re-delivers it through the same per-subscriber authorization path; a
+forged or expired token finds no row and is dropped.
+
 ## Vector search with pgvector
 
 Vector/nearest-neighbor search is the same opt-in feature on both backends, gated by a single

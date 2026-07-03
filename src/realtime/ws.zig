@@ -314,7 +314,7 @@ pub fn prepareDelete(alloc: std.mem.Allocator, app: *App, w: *db.Db, col: schema
 }
 
 /// Build + publish the two event frames into the LOCAL in-process hub (no NOTIFY). Shared by the
-/// writer path (`broadcast`) and the cross-instance listener (`onRemoteEvent`), so a notification
+/// writer path (`broadcast`) and the cross-instance listener (`onRemoteRecordEvent`), so a notification
 /// from another instance flows through the exact same `onChannelMessage` per-subscriber authz.
 fn publishFrames(collection: []const u8, action: protocol.Action, record_id: []const u8, record: ?std.json.Value) void {
     if (!active) return;
@@ -326,12 +326,44 @@ fn publishFrames(collection: []const u8, action: protocol.Action, record_id: []c
     WS.publish(.{ .channel = ef.record_channel, .message = ef.frame_record });
 }
 
-/// Cross-instance bridge callback (#159, PR-6b): a record event NOTIFY'd by ANOTHER instance.
-/// Re-feeds the local hub so each local subscriber's existing view/ability/tenant authz runs in
-/// `onChannelMessage` — create/update re-fetch the live row, delete reads the at-rest snapshot from
-/// the side table by token. Swallowed failures are logged so a silently-undelivered remote event is
-/// visible to operators.
-fn onRemoteEvent(app: *App, ev: pg_bridge.Event) void {
+/// Cross-instance bridge callback: a payload NOTIFY'd by ANOTHER instance. Record events re-feed
+/// the local hub (unchanged); signals rebuild the byte-identical frame with the SAME
+/// signalFrameAlloc builder; message broadcasts read the enveloped frame back from _rt_broadcasts
+/// by token (no row = forged/expired = drop, fail closed). All three re-publish into the LOCAL
+/// hub, so each is delivered through the SAME per-subscriber authz chokepoint (`onChannelMessage`
+/// → `hub.frameForDelivery`): a remote origin never bypasses per-record/per-topic authorization,
+/// which was already enforced at subscribe time on THIS (receiving) instance.
+fn onRemotePayload(app: *App, p: pg_bridge.Payload) void {
+    if (!active) return;
+    switch (p) {
+        .record => |ev| onRemoteRecordEvent(app, ev),
+        .signal => |s| {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const frame = signalFrameAlloc(arena.allocator(), s.topic) catch return;
+            WS.publish(.{ .channel = s.topic, .message = frame });
+        },
+        .message => |m| {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var r = app.pool.acquireReader() catch |e| {
+                std.log.err("realtime: remote broadcast dropped (pool acquire failed): {s}", .{@errorName(e)});
+                return;
+            };
+            defer app.pool.releaseReader(&r);
+            const b = pg_bridge.readBroadcast(a, &r, m.token) orelse return; // forged/expired: drop
+            WS.publish(.{ .channel = b.topic, .message = b.frame });
+        },
+    }
+}
+
+/// A record event NOTIFY'd by ANOTHER instance (#159, PR-6b). Re-feeds the local hub so each
+/// local subscriber's existing view/ability/tenant authz runs in `onChannelMessage` —
+/// create/update re-fetch the live row, delete reads the at-rest snapshot from the side table by
+/// token. Swallowed failures are logged so a silently-undelivered remote event is visible to
+/// operators.
+fn onRemoteRecordEvent(app: *App, ev: pg_bridge.Event) void {
     if (!active) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -369,7 +401,7 @@ fn onRemoteEvent(app: *App, ev: pg_bridge.Event) void {
 /// active backend is not Postgres. Best-effort: a failure to start logs + leaves single-instance
 /// realtime working. Called once by the server just before `zap.start` (reactor live).
 pub fn startRemoteListener(app: *App) void {
-    pg_bridge.startListener(app, &onRemoteEvent) catch |e| {
+    pg_bridge.startListener(app, &onRemotePayload) catch |e| {
         std.log.warn("realtime: Postgres LISTEN bridge unavailable: {s}", .{@errorName(e)});
     };
 }
@@ -403,8 +435,11 @@ fn messageEnvelopeAlloc(a: std.mem.Allocator, topic: []const u8, data_json: []co
 /// write path (`ctx.setFlag`/`App.setFlag` and the admin settings verbs). A no-op when the
 /// reactor isn't running (tests/CLI). NEVER pushes per-subject state or experiment
 /// assignments — those stay behind the authenticated `/api/state` projection.
-pub fn broadcastFeaturesChanged() void {
-    signalTopic(FEATURES_CHANNEL);
+///
+/// On Postgres this fans the `__features` signal out across instances (#188 theme), so a flag
+/// or experiment override on one instance re-syncs every instance's subscribers automatically.
+pub fn broadcastFeaturesChanged(app: *App) void {
+    signalTopic(app, FEATURES_CHANNEL);
 }
 
 /// #143: consumer broadcast. Wrap `data_json` — an ALREADY-SERIALIZED JSON value — in the
@@ -419,23 +454,41 @@ pub fn broadcastFeaturesChanged() void {
 /// re-fetch for per-subject state). A no-op when the reactor isn't running (tests/CLI).
 /// `topic` is a consumer channel name, not a collection name. Callable from any thread
 /// (incl. a background job): `fio_publish` is a non-blocking enqueue that copies the frame.
-pub fn broadcastTopic(topic: []const u8, data_json: []const u8) void {
+///
+/// On Postgres this ALSO fans the ENVELOPED frame out across instances (#188 theme) — never
+/// payload bytes on the NOTIFY wire: the frame is stored in `_rt_broadcasts` keyed by a random
+/// token, and only the token is NOTIFY'd; the receiving instance reads the frame back over its
+/// own connection and re-publishes it through the unchanged per-subscriber delivery path.
+/// Byte-identical no-op on SQLite (single-process).
+///
+/// `bound_conn`, when the caller already holds the pool writer (e.g. a record hook's
+/// `Ctx.bound_conn`), MUST be threaded through — the side-table write reuses it instead of
+/// acquiring a second writer, which would deadlock the single non-reentrant writer lock.
+pub fn broadcastTopic(app: *App, bound_conn: ?*db.Db, topic: []const u8, data_json: []const u8) void {
     if (!active) return; // reactor not running (tests/CLI): no-op
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const frame = messageEnvelopeAlloc(arena.allocator(), topic, data_json) catch return;
     WS.publish(.{ .channel = topic, .message = frame });
+    // #188 theme: on Postgres, fan the ENVELOPED frame out via token + _rt_broadcasts —
+    // never payload bytes on the NOTIFY wire. Byte-identical no-op on SQLite.
+    pg_bridge.emitMessage(app, bound_conn, topic, frame);
 }
 
 /// #143: signal-only consumer push. Publish `{"type":"signal","topic":"<topic>"}` on a custom
 /// `topic` so subscribers re-fetch over an authenticated GET — the recommended default for
 /// private/per-subject state (carries NO payload). A no-op when the reactor isn't running.
-pub fn signalTopic(topic: []const u8) void {
+///
+/// On Postgres the signal fans out across instances (#188 theme): only the topic name rides the
+/// NOTIFY wire (payload-less), so every instance's subscribers are told to re-fetch. Byte-identical
+/// no-op on SQLite.
+pub fn signalTopic(app: *App, topic: []const u8) void {
     if (!active) return; // reactor not running (tests/CLI): no-op
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const frame = signalFrameAlloc(arena.allocator(), topic) catch return;
     WS.publish(.{ .channel = topic, .message = frame });
+    pg_bridge.emitSignal(app, topic); // payload-less: only the topic name rides the wire
 }
 
 test "originAllowed: empty allowlist denies cross-origin browser upgrades (F12); same-origin + CSV allowed" {
@@ -489,15 +542,17 @@ test "broadcastFeaturesChanged is a no-op when inactive" {
     // Like broadcast, the feature signal must early-return when the reactor isn't running
     // so the override write paths (ctx.setFlag / admin settings) are safe in tests/CLI.
     try std.testing.expect(!active);
-    broadcastFeaturesChanged(); // would touch the inactive cluster (UB) if it didn't early-return
+    var app: App = undefined;
+    broadcastFeaturesChanged(&app); // would touch the inactive cluster (UB) if it didn't early-return
 }
 
 test "broadcastTopic/signalTopic are no-ops when inactive (#143)" {
     // Like broadcast/broadcastFeaturesChanged, the consumer publish entry points must early-return
     // when the reactor isn't running so ctx.realtime() is safe to call from tests/CLI/background jobs.
     try std.testing.expect(!active);
-    broadcastTopic("orders", "{\"n\":1}"); // pre-serialized payload; enveloped internally
-    signalTopic("availability"); // builds + would publish a signal frame; must early-return
+    var app: App = undefined;
+    broadcastTopic(&app, null, "orders", "{\"n\":1}"); // pre-serialized payload; enveloped internally
+    signalTopic(&app, "availability"); // builds + would publish a signal frame; must early-return
 }
 
 test "messageEnvelopeAlloc splices the standard message envelope + JSON-escapes the topic" {

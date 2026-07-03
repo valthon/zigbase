@@ -583,6 +583,18 @@ fn init_0020_sessions_seq(m: *Migrator) db.DbError!void {
     }
 }
 
+fn init_0021_rt_broadcasts(m: *Migrator) db.DbError!void {
+    // Cross-instance custom-topic broadcast side table (#188 theme, spec §2.2). PG-only, like
+    // _rt_delete_snapshots and for the same reason: NO app data ever rides the NOTIFY wire — the
+    // wire carries a random token; receivers read the enveloped frame back over their own
+    // authenticated connection. Rows are GC'd by writers after the shared 60s TTL.
+    if (m.dialect.kind != .postgres) return;
+    try m.exec("CREATE TABLE IF NOT EXISTS \"_rt_broadcasts\" (" ++
+        "\"token\" TEXT PRIMARY KEY, \"topic\" TEXT NOT NULL, \"frame\" TEXT NOT NULL, " ++
+        "\"created\" TIMESTAMPTZ NOT NULL DEFAULT now());");
+    try m.exec("CREATE INDEX IF NOT EXISTS \"idx_rt_broadcasts_created\" ON \"_rt_broadcasts\" (\"created\");");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -604,6 +616,7 @@ pub const all = [_]Migration{
     .{ .name = "0018_rt_delete_snapshots", .up = init_0018_rt_delete_snapshots },
     .{ .name = "0019_bulk_mail", .up = init_0019_bulk_mail },
     .{ .name = "0020_sessions_seq", .up = init_0020_sessions_seq },
+    .{ .name = "0021_rt_broadcasts", .up = init_0021_rt_broadcasts },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {

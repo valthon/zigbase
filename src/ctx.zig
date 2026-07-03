@@ -223,8 +223,8 @@ pub const Ctx = struct {
         const key = try std.fmt.allocPrint(self.arena, "flag:{s}", .{name});
         try self.kv().set(key, if (enabled) "true" else "false");
         // Signal-only realtime push: tell subscribers to re-GET /api/state. No-op when
-        // the reactor isn't running (tests/CLI).
-        realtime_ws.broadcastFeaturesChanged();
+        // the reactor isn't running (tests/CLI). Cross-instance on Postgres (#188 theme).
+        realtime_ws.broadcastFeaturesChanged(self.app);
     }
 
     /// Runtime escape hatch: resolve a flag by string name. Returns `null` when the
@@ -1140,9 +1140,12 @@ pub const RealtimeApi = struct {
     /// and should re-fetch over an authenticated GET. The RECOMMENDED default for private or
     /// per-subject state — it carries NO payload, so nothing sensitive is pushed to a channel
     /// any subscriber can join.
+    ///
+    /// On Postgres the signal fans out across instances (best-effort, at-most-once, unordered):
+    /// every instance's subscribers of `topic` are told to re-fetch. On SQLite (single-process)
+    /// it is delivered in-process only.
     pub fn signal(self: RealtimeApi, topic: []const u8) void {
-        _ = self;
-        realtime_ws.signalTopic(topic);
+        realtime_ws.signalTopic(self.ctx.app, topic);
     }
 
     /// Payload-carrying broadcast (EXPLICIT opt-in): subscribers of `topic` receive
@@ -1152,9 +1155,16 @@ pub const RealtimeApi = struct {
     /// data that is safe for EVERY subscriber of `topic`; gate private channels with
     /// `.realtime = .{ .canSubscribe = fn }`, or prefer `signal` + an authenticated
     /// re-fetch for per-subject state.
+    ///
+    /// On Postgres the enveloped frame fans out across instances (best-effort, at-most-once,
+    /// unordered) via a random-token side table — never payload bytes on the NOTIFY wire — so
+    /// every instance's subscribers of `topic` receive it. On SQLite it is delivered in-process.
     pub fn broadcast(self: RealtimeApi, topic: []const u8, payload: anytype) !void {
         const data_json = try std.json.Stringify.valueAlloc(self.ctx.arena, payload, .{});
-        realtime_ws.broadcastTopic(topic, data_json);
+        // Thread `bound_conn` through: if this Ctx is already bound to the writer (a record
+        // hook, or inside `ctx.tx`), the Postgres side-table write MUST reuse it rather than
+        // acquire a second writer — the pool writer is a single non-reentrant lock.
+        realtime_ws.broadcastTopic(self.ctx.app, self.ctx.bound_conn, topic, data_json);
     }
 };
 

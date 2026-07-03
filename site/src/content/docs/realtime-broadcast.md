@@ -112,10 +112,13 @@ const unsub = await client.realtime.subscribeTopic('orders', (msg) => {
 `subscribeTopic` requires client **0.3.0 or newer** — older `@zigbase/client` versions only expose
 the record-subscription helpers.
 
-Custom-channel `broadcast`/`signal` events are currently **per-instance** — they are not (yet)
-fanned out across app instances when running on the Postgres backend. Record-change events remain
-the cross-instance path (see [Multi-instance realtime](./framework#multi-instance-realtime-postgres));
-if you need a custom event to reach every instance, model it as a record write instead.
+On the **Postgres** backend, custom-channel `broadcast`/`signal` events fan out across app instances
+(best-effort, at-most-once, unordered): a `signal` puts only the topic name on the `LISTEN`/`NOTIFY`
+wire, while a `broadcast` stores its enveloped frame in the `_rt_broadcasts` side table keyed by a
+random token and NOTIFYs only the token — the receiving instance reads the frame back over its own
+connection and re-delivers it through the same per-subscriber authorization path (a forged or expired
+token finds no row and is dropped). See [Multi-instance realtime](./framework#multi-instance-realtime-postgres).
+On **SQLite** (single-process) delivery is in-process only.
 
 ## Reference
 
