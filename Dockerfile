@@ -2,9 +2,12 @@
 #
 # Official ZigBase image. Ships the ALREADY-BUILT static-musl release binary —
 # this Dockerfile never invokes Zig or compiles anything. The CI workflow
-# (.github/workflows/release.yml, `docker` job) stages the correct-arch binary
-# at ./context/<arch>/zigbase before `docker buildx build` runs; local manual
-# builds must do the same (see docs/docker.md).
+# (.github/workflows/release.yml, `docker` job) stages both arches' binaries in
+# a single build context (./docker-ctx/amd64/zigbase, ./docker-ctx/arm64/zigbase)
+# before `docker buildx build --platform linux/amd64,linux/arm64` runs; buildx
+# sets the TARGETARCH build-arg to "amd64"/"arm64" per target platform, and the
+# COPY below picks the matching subdirectory. Local manual builds must stage the
+# same layout (see docs/docker.md).
 #
 # Base: distroless static (not `scratch`) — ZigBase makes outbound TLS calls
 # (SMTP/STARTTLS, Postgres sslmode=require, OAuth2 token exchange, Sentry) via
@@ -29,7 +32,12 @@ ENV ZIGBASE_HTTP_HOST=0.0.0.0 \
 # /data is declared as a volume so `docker run -v zigbase_data:/data` (a named
 # volume, auto-created and owned by root by the Docker engine) or a pre-chowned
 # bind mount both work; see docs/docker.md for the bind-mount chown caveat.
-COPY --chown=65532:65532 zigbase /zigbase
+#
+# ARG TARGETARCH is set automatically by buildx during a multi-platform build
+# (resolves to "amd64" or "arm64" per --platform target); the build context
+# must contain a matching ${TARGETARCH}/zigbase subpath for each platform built.
+ARG TARGETARCH
+COPY --chown=65532:65532 ${TARGETARCH}/zigbase /zigbase
 VOLUME ["/data"]
 WORKDIR /data
 USER 65532:65532
