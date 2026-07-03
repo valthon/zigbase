@@ -132,7 +132,7 @@ export class CollectionService {
     });
   }
 
-  confirmVerification(token: string): Promise<{ verified: boolean }> {
+  confirmVerification(token: string): Promise<void> {
     return this.transport.send(`${this.base()}/confirm-verification`, {
       method: "POST",
       body: { token },
@@ -147,7 +147,7 @@ export class CollectionService {
     });
   }
 
-  confirmPasswordReset(token: string, password: string): Promise<{ success: boolean }> {
+  confirmPasswordReset(token: string, password: string): Promise<void> {
     return this.transport.send(`${this.base()}/confirm-password-reset`, {
       method: "POST",
       body: { token, password },

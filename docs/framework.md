@@ -1510,7 +1510,7 @@ Guarantees:
   reflects the just-authenticated principal.
 
 Where it fires: the unified `POST /api/collections/:col/auth/:method/complete` endpoint
-(password / otp / webauthn / oauth2 / custom), the magic-link `GET …/auth/magic_link/consume`
+(password / otp / webauthn / oauth2 / custom), the magic-link `GET …/auth/magic-link/consume`
 link, and — since 0.10.0 — the legacy `POST …/auth-with-password` (tag `.password`) and
 `POST …/auth-refresh` (tag `.refresh`, in the same transaction as `beforeRefresh`, lifecycle
 phase first). **This includes `_superusers`: the admin SPA logs in through

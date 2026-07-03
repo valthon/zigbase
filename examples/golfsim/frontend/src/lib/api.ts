@@ -130,7 +130,7 @@ export async function requestVerification(email: string): Promise<void> {
   });
 }
 
-/** Confirm email verification with the token from the verification email (→ 200 {verified:true}). */
+/** Confirm email verification with the token from the verification email (→ 204). */
 export async function confirmVerification(token: string): Promise<void> {
   await req('/api/collections/users/confirm-verification', {
     method: 'POST',

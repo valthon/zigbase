@@ -42,11 +42,11 @@ describe("auth service", () => {
   it("listAuthProviders fetches provider metadata", async () => {
     const fetchMock = vi.fn(async (url: string) => {
       expect(url).toBe("http://api.test/api/collections/users/auth/oauth2/providers");
-      return jsonResponse({ providers: [{ name: "google", authURL: "https://g", clientId: "cid" }] });
+      return jsonResponse({ items: [{ name: "google", authURL: "https://g", clientId: "cid" }] });
     }) as unknown as typeof fetch;
     const zb = createClient("http://api.test", { fetch: fetchMock });
     const out = await zb.collection("users").listAuthProviders();
-    expect(out.providers[0]?.name).toBe("google");
+    expect(out.items[0]?.name).toBe("google");
   });
 
   it("oauth2Init posts provider and returns initiate response", async () => {

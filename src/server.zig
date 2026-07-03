@@ -153,7 +153,7 @@ pub fn Server(comptime gates: Gates) type {
                 .{ .method = .GET, .pattern = "/api/features", .handler = features_api.get },
             };
             if (gates.magic_link) t = t ++ &[_]router.Route{
-                .{ .method = .GET, .pattern = "/api/collections/:col/auth/magic_link/consume", .handler = magic_link_consume_api.consume },
+                .{ .method = .GET, .pattern = "/api/collections/:col/auth/magic-link/consume", .handler = magic_link_consume_api.consume },
             };
             if (gates.webauthn) t = t ++ &[_]router.Route{
                 .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/begin", .handler = webauthn_register_api.begin },

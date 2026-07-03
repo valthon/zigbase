@@ -96,7 +96,7 @@ The blog uses the built-in magic-link method — no custom routes or backend cod
 2. The frontend POSTs to `POST /api/collections/users/auth/magic_link/initiate` — the server always returns 204 (enumeration-safe: no indication of whether the email exists).
 3. The server sends an email (or logs the link to the server console in local dev) containing a link to:
    ```
-   GET <public_url>/api/collections/users/auth/magic_link/consume?token=…&redirect=/
+   GET <public_url>/api/collections/users/auth/magic-link/consume?token=…&redirect=/
    ```
 4. The user clicks the link. The server validates the token, sets `zb_auth` and `zb_csrf` session cookies, and 302-redirects to `/`. No token-handling page is needed in the frontend.
 5. On landing at `/`, the frontend detects the cookie session via `POST /api/collections/users/auth-refresh` and shows the logged-in state.

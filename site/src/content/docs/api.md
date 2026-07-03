@@ -534,13 +534,13 @@ Auth endpoints target an auth-type collection (`:col`).
 | POST | `/api/collections/:col/auth-with-password` | Log in with identity + password. |
 | POST | `/api/collections/:col/auth-refresh` | Issue a fresh token for the current session. |
 | POST | `/api/collections/:col/auth-logout` | Clear the auth cookies. |
-| POST | `/api/collections/:col/request-verification` | Request an email-verification token. |
-| POST | `/api/collections/:col/confirm-verification` | Confirm verification with a token. |
-| POST | `/api/collections/:col/request-password-reset` | Request a password-reset token. |
-| POST | `/api/collections/:col/confirm-password-reset` | Confirm a reset with a token. |
+| POST | `/api/collections/:col/request-verification` | Request an email-verification token. `204` (no body). |
+| POST | `/api/collections/:col/confirm-verification` | Confirm verification with a token. `204` (no body) on success. |
+| POST | `/api/collections/:col/request-password-reset` | Request a password-reset token. `204` (no body). |
+| POST | `/api/collections/:col/confirm-password-reset` | Confirm a reset with a token. `204` (no body) on success. |
 | GET | `/api/collections/:col/auth/sessions` | List the caller's active sessions. `.session_store = .table` only — `404` in `.epoch` mode. |
-| DELETE | `/api/collections/:col/auth/sessions/:sid` | "Log out THIS device". `.session_store = .table` only — `404` in `.epoch` mode. |
-| DELETE | `/api/collections/:col/auth/sessions` | "Log out everywhere" — works in both session-store modes. |
+| DELETE | `/api/collections/:col/auth/sessions/:sid` | "Log out THIS device". `204` (no body). `.session_store = .table` only — `404` in `.epoch` mode. |
+| DELETE | `/api/collections/:col/auth/sessions` | "Log out everywhere" — works in both session-store modes. `204` (no body). |
 
 ### auth-with-password
 
@@ -622,7 +622,8 @@ create rule** (`"@public"`) for open signup, and the password must be at least `
 
 The `request-verification` and `request-password-reset` endpoints mint a token and deliver
 it via the configured mailer, then return `204` (they never reveal whether the email
-exists). The matching `confirm-*` endpoint takes that `token` in its body.
+exists). The matching `confirm-*` endpoint takes that `token` in its body and also
+returns `204` (no body) on success.
 
 - **With SMTP configured** (`ZIGBASE_SMTP_HOST` + friends — see the
   [Configuration table](./configuration#environment-variables)), the token is **emailed**
@@ -661,7 +662,7 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 | Method | Path | Description |
 |---|---|---|
 | POST | `/api/collections/:col/auth/webauthn/register/begin` | Returns WebAuthn creation options (challenge, rpId, rpName). |
-| POST | `/api/collections/:col/auth/webauthn/register/finish` | Stores the new passkey bound to the authenticated user. |
+| POST | `/api/collections/:col/auth/webauthn/register/finish` | Stores the new passkey bound to the authenticated user. `204` (no body) on success. |
 
 **magic_link initiate:**
 
@@ -682,9 +683,15 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 
 **magic_link consume + redirect (the classic email-link UX):**
 
+> Renamed from `magic_link` to dash-case in 0.10: `GET .../auth/magic-link/consume` (was
+> `auth/magic_link/consume`). Hard cutover — no redirect shim — so links emailed by a
+> pre-upgrade server 404 after the upgrade; tokens are short-lived, so this is a narrow
+> window. The method **slug** (`magic_link`, used by `initiate`/`complete` above and in
+> `onAuth`) is unchanged — only this bespoke consume path uses the dash.
+
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/collections/:col/auth/magic_link/consume?token=...&redirect=/app` | Verify + consume the token, set `zb_auth`/`zb_csrf` cookies, and `302` to the redirect target. For browser email links: the user clicks a plain GET URL and lands logged-in. Fires `onAuth(.magic_link)` and honors `require_verified` (403) exactly like `complete`. |
+| GET | `/api/collections/:col/auth/magic-link/consume?token=...&redirect=/app` | Verify + consume the token, set `zb_auth`/`zb_csrf` cookies, and `302` to the redirect target. For browser email links: the user clicks a plain GET URL and lands logged-in. Fires `onAuth(.magic_link)` and honors `require_verified` (403) exactly like `complete`. |
 
 The token is single-use (replay returns `400 Link already used.`); a missing token returns `400`, and the route `404`s unless `magic_link` is enabled on the collection.
 

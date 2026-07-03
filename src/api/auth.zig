@@ -989,7 +989,7 @@ pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
     defer st.finalize();
     try st.bindText(1, claims.id);
     _ = try st.step();
-    return .{ .status = 200, .body = "{\"verified\":true}" };
+    return .{ .status = 204, .body = "" };
 }
 
 pub fn requestPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -1075,7 +1075,7 @@ pub fn confirmPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
         return e;
     };
     emitAuthLifecycle(ctx, w, col.name, claims.id, .after_password_change, rec_ptr, rec_opt);
-    return .{ .status = 200, .body = "{\"success\":true}" };
+    return .{ .status = 204, .body = "" };
 }
 
 // ----------------------------------------------------------------------------
@@ -1276,7 +1276,7 @@ test "auth-with-password then authenticate round-trips the issued token (bearer)
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
 }
 
-test "verification: request always 204; confirm sets verified=true" {
+test "verification: request always 204; confirm returns 204 and sets verified=true" {
     var env = try TestEnv.initAuth("users");
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1293,7 +1293,7 @@ test "verification: request always 204; confirm sets verified=true" {
     const token = try env.mintTyped(a, "users", "v@x.io", .verification);
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
     var conf = env.ctx(a, .POST, body, &p);
-    try std.testing.expectEqual(@as(u16, 200), (try confirmVerification(&conf)).status);
+    try std.testing.expectEqual(@as(u16, 204), (try confirmVerification(&conf)).status);
     try std.testing.expect(env.recordVerified(a, "users", "v@x.io"));
 }
 
@@ -1308,7 +1308,7 @@ test "password reset: confirm changes the password and rotates the token" {
     const token = try env.mintTyped(a, "users", "r@x.io", .password_reset);
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var conf = env.ctx(a, .POST, body, &p);
-    try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&conf)).status);
+    try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&conf)).status);
     var conf2 = env.ctx(a, .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 400), (try confirmPasswordReset(&conf2)).status);
 }
@@ -1350,7 +1350,7 @@ test "F7: a verification token cannot be redeemed twice (single-use)" {
     // First redemption succeeds. Verification does NOT rotate tokenKey, so without the
     // single-use ledger this token would remain replayable for its full TTL.
     var c1 = env.ctx(a, .POST, body, &p);
-    try std.testing.expectEqual(@as(u16, 200), (try confirmVerification(&c1)).status);
+    try std.testing.expectEqual(@as(u16, 204), (try confirmVerification(&c1)).status);
     try std.testing.expect(env.recordVerified(a, "users", "v2@x.io"));
     // Second redemption of the very same (still-unexpired) token must fail.
     var c2 = env.ctx(a, .POST, body, &p);
@@ -1368,7 +1368,7 @@ test "F7: a password-reset token cannot be redeemed twice (single-use)" {
     const token = try env.mintTyped(a, "users", "r2@x.io", .password_reset);
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var c1 = env.ctx(a, .POST, body, &p);
-    try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&c1)).status);
+    try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&c1)).status);
     // Replay rejected even though we re-send the identical valid-window token.
     var c2 = env.ctx(a, .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 400), (try confirmPasswordReset(&c2)).status);
@@ -1389,7 +1389,7 @@ test "F7: a too-short password does not consume the reset token" {
     // The token survives the failed attempt and still works once.
     const ok = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var good = env.ctx(a, .POST, ok, &p);
-    try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&good)).status);
+    try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&good)).status);
 }
 
 test "require_verified gates password login: unverified 403, verified 200" {
@@ -2227,7 +2227,7 @@ test "#98 password-change: before/after hooks fire on confirm-password-reset" {
     const p = [_]http.Param{.{ .key = "col", .value = "pcu" }};
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var conf = env.ctx(a, .POST, body, &p);
-    try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&conf)).status);
+    try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&conf)).status);
     try std.testing.expectEqual(@as(usize, 1), Hook.before_seen);
     try std.testing.expectEqual(@as(usize, 1), Hook.after_seen);
     try std.testing.expect(Hook.rid_seen.len > 0);
@@ -2263,7 +2263,7 @@ test "#98 password-change: aborting beforePasswordChange leaves password + reset
 
     // Reset token un-consumed: with the hook removed, the SAME token now succeeds.
     var conf2 = env.ctx(a, .POST, body, &p);
-    try std.testing.expectEqual(@as(u16, 200), (try confirmPasswordReset(&conf2)).status);
+    try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&conf2)).status);
     // And the new password now works.
     const new_token = loginToken(env, a, "pcb", "pc@x.io", "newpassword") catch "";
     try std.testing.expect(new_token.len > 0);
