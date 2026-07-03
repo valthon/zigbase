@@ -38,9 +38,9 @@ ENV ZIGBASE_HTTP_HOST=0.0.0.0 \
 # must contain a matching ${TARGETARCH}/zigbase subpath for each platform built.
 ARG TARGETARCH
 COPY --chown=65532:65532 ${TARGETARCH}/zigbase /zigbase
-VOLUME ["/data"]
 WORKDIR /data
 USER 65532:65532
+VOLUME ["/data"]
 
 EXPOSE 8090
 

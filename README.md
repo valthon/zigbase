@@ -121,6 +121,7 @@ zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static 
               [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
 zigbase migrate [--data-dir PATH]
 zigbase superuser create --email E --password P [--data-dir PATH]
+zigbase version
 zigbase help
 ```
 
