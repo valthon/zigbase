@@ -3324,6 +3324,19 @@ You can also force the prod-safe behavior explicitly: `zig build -Ddev-clock=fal
 
 CI runs both passes: the default `Debug` pass (dev features on, prod-gate assertions skipped) and a `-Ddev-clock=false` prod-gate pass (dev features off, prod-gate assertions executed) to verify the compiled-out guarantee.
 
+## Compile-time build flags
+
+`zig build`/`zig build -Dname=value` accepts these consumer-facing flags. Each folds its gated
+code to comptime-dead when off, so a build that doesn't need a feature doesn't pay for it:
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `-Dfts5` | **on** | SQLite full-text search (FTS5). `-Dfts5=false` drops `-DSQLITE_ENABLE_FTS5` from the SQLite build (~250-400 KB smaller) for lean binaries with no `.searchable` field; `?search=` then 400s and the server refuses to start over a `.searchable` SQLite schema. Postgres full-text search is unaffected. → [docs/search](./search#build-requirement--dfts5-default-on) |
+| `-Dvector` | off | Opt-in nearest-neighbor `?vector=` KNN search — sqlite-vec on SQLite, pgvector on Postgres. → [docs/search](./search#vector-search-opt-in) |
+| `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres](./postgres) |
+| `-Ddev-clock` | on in `Debug`, off in release | The `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` dev-only test seams (§14 above); the release script forces it off for shipped binaries. |
+| `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
+
 ## Exported names reference
 
 The public surface (from `src/root.zig`):

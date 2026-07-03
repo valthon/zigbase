@@ -120,6 +120,14 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build test --summary all
       - name: "Unit tests (prod gate: -Ddev-clock=false)"
         run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-clock=false
+      # Lean-build gate (R2-6): -Dfts5=false must still COMPILE — the whole point is that FTS5 (and
+      # SQLite's -DSQLITE_ENABLE_FTS5) folds out of a build that never declares a `.searchable`
+      # field. Build-only, not a full test run: a handful of pre-existing fixtures (policy.zig,
+      # rewrap.zig, codegen/typegen_cli.zig) construct a searchable collection unconditionally and
+      # would need their own -Dfts5-awareness to pass here — the comptime-dead-code guarantee and
+      # fts.zig's own "enabled reflects build_options" test are what this flag actually needs proven.
+      - name: "Build check: -Dfts5=false (lean build without SQLite FTS5)"
+        run: mise exec zig@0.16.0 -- zig build -Dfts5=false
 
   # Opt-in PostgreSQL backend (#159). Runs the full suite WITH -Dpostgres=true against a
   # real postgres service container, exercising the pure-Zig wire driver's SCRAM-SHA-256

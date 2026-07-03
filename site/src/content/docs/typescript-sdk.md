@@ -361,6 +361,7 @@ server gates identifiers, not the client.
 > advance — it does not try to validate them. You'll see the server's 400s verbatim as
 > `ZigbaseError{status: 400}`:
 > - `"This collection has no searchable fields; \`search\` is not supported here."`
+> - `"Full-text search is not enabled in this build."` (SQLite server built with `-Dfts5=false`; Postgres FTS is unaffected)
 > - `"Vector search is not enabled in this build."` (server not built with `-Dvector`)
 > - `"Vector search does not support cursor pagination; use offset paging."`
 > - `"Invalid vector search query: the query embedding's dimension may not match the stored

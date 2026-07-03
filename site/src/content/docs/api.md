@@ -440,6 +440,12 @@ reduce to nothing (e.g. operator-only, `?search=AND`) matches **no rows** rather
 whole collection. A `search` on a collection with no `searchable` field returns **400**. The
 `_fts` collection-name suffix is reserved (it backs the per-collection shadow tables).
 
+**SQLite FTS5 is compiled in by default — opt out with `-Dfts5=false`.** A lean custom build
+that never declares a `.searchable` field can drop FTS5 (`~250-400 KB` smaller); a `?search=`
+then answers a clean **400**, and the server **refuses to start** over a `.searchable` SQLite
+schema. Postgres full-text search (below) is unaffected by the flag. See
+[docs/search](./search#build-requirement--dfts5-default-on).
+
 **Full-text on Postgres.** On a Postgres backend the SAME `.searchable` schema flag
 and `?search=` API are backed by PostgreSQL's native full-text search instead of FTS5: each
 searchable collection gets a `STORED` `tsvector` **generated column** (`to_tsvector('simple', …)`

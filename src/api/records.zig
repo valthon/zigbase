@@ -720,6 +720,8 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
             return ApiError.badRequest("Cannot filter or sort by an encrypted field.").toResponse(ctx.allocator),
         error.NotSearchable =>
             return ApiError.badRequest("This collection has no searchable fields; `search` is not supported here.").toResponse(ctx.allocator),
+        error.SearchDisabled =>
+            return ApiError.badRequest("Full-text search is not enabled in this build.").toResponse(ctx.allocator),
         error.VectorDisabled =>
             return ApiError.badRequest("Vector search is not enabled in this build.").toResponse(ctx.allocator),
         error.VectorCursorUnsupported =>

@@ -26,9 +26,15 @@
 //! searchable column) is gated through `schema.isValidIdentifier` before interpolation.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const schema = @import("../schema.zig");
 const db = @import("../db.zig");
 const compiler = @import("../query/compiler.zig");
+
+/// Comptime gate: SQLite FTS5 is compiled in (`-Dfts5`, default ON). When false, the SQLite
+/// MATCH/`ensureIndex` paths are comptime-dead and `?search=` fails closed with a clean 400.
+/// Postgres full-text search (`buildPostgres`/`ensureIndexPg`) is NOT behind this flag.
+pub const enabled = build_options.fts5;
 
 /// Suffix appended to a collection name to form its FTS5 shadow table. Canonical in `schema.zig`
 /// (where `schema.validate` reserves it on collection names) — aliased here for the table builder.
@@ -113,10 +119,19 @@ pub const Search = struct {
     order_param: ?compiler.Param = null,
 };
 
+/// `build`'s error set is EXPLICIT (not inferred) so `error.SearchDisabled` is a member
+/// regardless of the `-Dfts5` flag's value: when the default (ON) build's `buildSqlite` branch
+/// comptime-prunes the guard away, an inferred `!?Search` would silently DROP `SearchDisabled`
+/// from the type, breaking every well-typed `error.SearchDisabled => …` handler in a default
+/// build. Mirrors `vector.zig`'s `VectorError` for the same reason (opposite default).
+pub const SearchError = error{SearchDisabled} ||
+    @typeInfo(@typeInfo(@TypeOf(buildSqliteImpl)).@"fn".return_type.?).error_union.error_set ||
+    @typeInfo(@typeInfo(@TypeOf(buildPostgres)).@"fn".return_type.?).error_union.error_set;
+
 /// Build the full-text search clause for `raw_term` on `col` under `dialect`, or null when the
 /// collection is not searchable OR the term carries no searchable token. Allocations are on
 /// `alloc`. The bound `param`/`order_param` are never interpolated.
-pub fn build(alloc: std.mem.Allocator, dialect: db.Dialect, col: schema.Collection, raw_term: []const u8) !?Search {
+pub fn build(alloc: std.mem.Allocator, dialect: db.Dialect, col: schema.Collection, raw_term: []const u8) SearchError!?Search {
     if (!isSearchable(col)) return null;
     return switch (dialect.kind) {
         .sqlite => buildSqlite(alloc, col, raw_term),
@@ -124,9 +139,15 @@ pub fn build(alloc: std.mem.Allocator, dialect: db.Dialect, col: schema.Collecti
     };
 }
 
-/// SQLite lowering: a JOIN onto the FTS5 shadow table + a bound `MATCH` predicate + bm25 `rank`
-/// ordering. `param.text` is the SANITIZED, guaranteed-valid FTS5 query (see `sanitize`).
-fn buildSqlite(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []const u8) !?Search {
+/// SQLite lowering: `error.SearchDisabled` when `-Dfts5=false` (this branch folds to comptime-dead
+/// there — see `enabled`); otherwise a JOIN onto the FTS5 shadow table + a bound `MATCH` predicate
+/// + bm25 `rank` ordering. `param.text` is the SANITIZED, guaranteed-valid FTS5 query (`sanitize`).
+fn buildSqlite(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []const u8) SearchError!?Search {
+    if (comptime !enabled) return error.SearchDisabled;
+    return buildSqliteImpl(alloc, col, raw_term);
+}
+
+fn buildSqliteImpl(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []const u8) !?Search {
     const q = (try sanitize(alloc, raw_term)) orelse return null;
     const ft = try tableName(alloc, col.name);
     return .{
@@ -212,17 +233,36 @@ pub fn sanitize(alloc: std.mem.Allocator, raw: []const u8) !?[]const u8 {
 
 // ---- Provisioning ----------------------------------------------------------
 
+/// `ensureIndex`'s error set is EXPLICIT for the same reason as `SearchError` above: the default
+/// (`-Dfts5` ON) build comptime-prunes the `SearchDisabled` guard, so an inferred `!void` would
+/// silently drop it from the type and break `provision.zig`'s `catch |err| switch (err) { … }`.
+pub const EnsureIndexError = error{SearchDisabled} ||
+    @typeInfo(@typeInfo(@TypeOf(ensureIndexSqliteImpl)).@"fn".return_type.?).error_union.error_set ||
+    @typeInfo(@typeInfo(@TypeOf(ensureIndexPg)).@"fn".return_type.?).error_union.error_set;
+
 /// Provision (idempotently) the FTS5 external-content index + sync triggers for `col`, repopulating
 /// it on first build. A no-op when `col` has no searchable fields (any stale index from a previous
 /// schema is dropped). Re-creates the index when its column set drifts OR its sync triggers are
 /// missing (e.g. after an additive table rebuild dropped them). Called from `provision.ensureCollection`
 /// at startup — NOT a numbered migration. Identifiers are gated through `schema.isValidIdentifier`.
-pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !void {
+pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EnsureIndexError!void {
     // Backend split: the FTS5 external-content vtable + sync triggers + sqlite_master probes below
     // are SQLite-only. Postgres provisions a STORED `tsvector` generated column + GIN index instead
     // (same `?search=` read surface, lowered by `buildPostgres`). Both are idempotent and called
     // from `provision.ensureCollection` at startup — NOT numbered migrations.
     if (db.dbDialect(w).kind == .postgres) return ensureIndexPg(alloc, w, col);
+    if (comptime !enabled) {
+        // fts5 compiled out (-Dfts5=false): a searchable SQLite schema can't be served — fail
+        // LOUDLY here so the caller (provision.zig) can refuse to start, rather than silently
+        // skipping the index and letting `?search=` surface as a runtime 500 later. A collection
+        // with no searchable fields is unaffected — nothing to provision either way.
+        if (isSearchable(col)) return error.SearchDisabled;
+        return;
+    }
+    return ensureIndexSqliteImpl(alloc, w, col);
+}
+
+fn ensureIndexSqliteImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !void {
     if (!schema.isValidIdentifier(col.name)) return;
     const ft = try tableName(alloc, col.name);
     const cols = try searchableColumns(alloc, col);
@@ -551,7 +591,12 @@ test "sanitize quotes tokens, preserves operators, drops dangling ones" {
     try std.testing.expect((try sanitize(a, "AND OR")) == null);
 }
 
+test "fts5 flag: enabled reflects build_options (default true in the test build)" {
+    try std.testing.expect(enabled == build_options.fts5);
+}
+
 test "ensureIndex provisions FTS5, triggers keep it in sync, MATCH search returns rows" {
+    if (comptime !enabled) return error.SkipZigTest; // requires SQLite compiled with FTS5
     var d = try db.Db.openMemory();
     defer d.close();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

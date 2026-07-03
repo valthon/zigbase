@@ -31,6 +31,18 @@ it's a `STORED` `tsvector` **generated column** (`to_tsvector('simple', …)` ov
 columns) plus a **GIN index**. `searchable` is mutually exclusive with `encrypted` — ciphertext
 is not searchable.
 
+## Build requirement (`-Dfts5`, default on)
+
+SQLite FTS5 is compiled in **by default** — it's a core feature, not an experiment. Lean custom
+builds that never declare a `.searchable` field can drop it with `-Dfts5=false` (~250-400 KB
+smaller binary); every FTS5 code path in `src/search/fts.zig` folds to comptime-dead. With
+`-Dfts5=false`, a `?search=` request answers a clean **400** (`"Full-text search is not enabled
+in this build."`), and — more importantly — **the server refuses to start** if the comptime
+schema declares any `.searchable` field on the SQLite backend, with an actionable startup error,
+rather than silently skipping the index and surfacing a 500 on the first search. Postgres
+full-text search (the `tsvector`/GIN path above) is a server-native feature and is **not** gated
+by this flag.
+
 ## Query it
 
 Query with `search` (or its alias `q`):
