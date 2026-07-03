@@ -30,9 +30,9 @@ def test_configure_oauth_provider_and_secret_redacted(page):
     r = api_request(page, "GET", "/api/collections/members/auth/oauth2/providers")
     assert r.status == 200
     body = r.json()
-    assert "providers" in body
-    assert len(body["providers"]) == 1
-    prov = body["providers"][0]
+    assert "items" in body
+    assert len(body["items"]) == 1
+    prov = body["items"][0]
     assert prov["clientId"] == "my-client-id"
     assert "clientSecret" not in prov
     assert "authURL" in prov

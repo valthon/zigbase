@@ -107,7 +107,7 @@ const off = zb.authStore.onChange((token, record) => {
 import { createPkceChallenge, randomState } from "@zigbase/client";
 
 // Discover configured providers (name, authURL, clientId, scopes):
-const { providers } = await zb.collection("users").listAuthProviders();
+const { items: providers } = await zb.collection("users").listAuthProviders();
 
 const { verifier, challenge } = await createPkceChallenge();
 const state = randomState();
@@ -449,15 +449,17 @@ record exists and you lack access, or it simply doesn't exist.
 
 ## Analytics
 
-*Requires ZigBase >= 0.9.0.*
+*Requires ZigBase >= 0.9.0 (cursor pagination on `events` requires >= 0.10.0).*
 
 `client.analytics` exposes two read APIs over the tenant-scoped `_events` activity feed and any
 declared rollups:
 
 ```ts
-// GET /api/analytics/events — the active account's activity feed.
+// GET /api/analytics/events — the active account's activity feed. Paginates with the house
+// cursor: feed.nextCursor/feed.hasNext, forwarded back as opts.cursor for the next page.
 const feed = await zb.analytics.events({ name: "signup", since: new Date("2026-01-01"), limit: 50 });
 feed.items[0]?.payload; // unknown (JSON value; null when unparseable/empty)
+if (feed.hasNext) await zb.analytics.events({ cursor: feed.nextCursor! });
 
 // GET /api/analytics/rollups/:name — a declared rollup's summary rows.
 const rollup = await zb.analytics.rollup("daily_signups", { from: weekAgo, to: new Date() });

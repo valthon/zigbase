@@ -62,7 +62,9 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const entries = try d.kvList();
     var arr: std.json.Array = std.json.Array.init(ctx.allocator);
     for (entries) |e| try arr.append(try entryJson(ctx.allocator, e));
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .array = arr }, .{});
+    var root: std.json.ObjectMap = .empty;
+    try root.put(ctx.allocator, "items", .{ .array = arr });
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{});
     return .{ .status = 200, .body = body };
 }
 
@@ -213,6 +215,7 @@ test "settings API put/get/list/delete round-trips for a superuser" {
     l.authorization = auth_hdr;
     const lres = try list(&l);
     try std.testing.expectEqual(@as(u16, 200), lres.status);
+    try std.testing.expect(std.mem.startsWith(u8, lres.body, "{\"items\":["));
     try std.testing.expect(std.mem.indexOf(u8, lres.body, "\"beta\"") != null);
 
     // Bad body -> 400.

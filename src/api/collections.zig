@@ -76,7 +76,9 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         const cj = try schema.collectionToJson(ctx.allocator, c);
         try arr.append((try std.json.parseFromSlice(std.json.Value, ctx.allocator, cj, .{})).value);
     }
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .array = arr }, .{});
+    var root: std.json.ObjectMap = .empty;
+    try root.put(ctx.allocator, "items", .{ .array = arr });
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{});
     return .{ .status = 200, .body = body };
 }
 
@@ -220,6 +222,7 @@ test "create then get then list a collection over handlers" {
     lctx.authorization = auth_hdr;
     const lres = try list(&lctx);
     try std.testing.expectEqual(@as(u16, 200), lres.status);
+    try std.testing.expect(std.mem.startsWith(u8, lres.body, "{\"items\":["));
     try std.testing.expect(std.mem.indexOf(u8, lres.body, "\"posts\"") != null);
 }
 

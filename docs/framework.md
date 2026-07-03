@@ -1427,7 +1427,7 @@ the KV store (every endpoint requires a valid superuser token):
 
 | Method & path | Effect |
 |---|---|
-| `GET /api/settings` | List all settings (`[{key,value,created,updated}, …]`). |
+| `GET /api/settings` | List all settings (`{"items":[{key,value,created,updated}, …]}`). |
 | `GET /api/settings/:key` | Fetch one (`{key,value}`); 404 if absent. |
 | `PUT /api/settings/:key` | Upsert; body `{"value":"…"}`. |
 | `DELETE /api/settings/:key` | Remove; 204, or 404 if absent. |
@@ -1887,7 +1887,7 @@ OAuth2 (Google, GitHub, etc.) is the **fifth built-in `AuthMethod`** (slug `oaut
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/collections/:col/auth/oauth2/providers` | Discovery — list enabled providers (name, authURL, clientId, scopes). Secrets never returned. |
+| GET | `/api/collections/:col/auth/oauth2/providers` | Discovery — list enabled providers (name, authURL, clientId, scopes) as `{"items":[…]}`. Secrets never returned. |
 | POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata so the client can drive the authorization redirect. |
 | POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session. |
 
@@ -2672,7 +2672,8 @@ a `@compileError`.
 **Read API (tenant-scoped, fail-closed).** Both endpoints are authenticated and never leak across
 accounts:
 
-- `GET /api/analytics/events?name=&actor=&since=&limit=` — the raw activity feed.
+- `GET /api/analytics/events?name=&actor=&since=&limit=&cursor=` — the raw activity feed; paginates
+  with the house cursor (`nextCursor`/`hasNext` in the response).
 - `GET /api/analytics/rollups/:name?from=&to=` — a rollup's summary rows (for charts).
 
 A **superuser** sees everything; a **member** sees only their active account's data (resolved from a

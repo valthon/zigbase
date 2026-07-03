@@ -1,9 +1,9 @@
 const std = @import("std");
 const schema = @import("../schema.zig");
 
-/// Source-agnostic representation of one `_collections` row / one
-/// `GET /api/collections` array element. Both acquisition adapters populate
-/// this and call buildCollection, so the paths converge on identical values.
+/// Source-agnostic representation of one `_collections` row / one element of
+/// `GET /api/collections`'s `{"items":[…]}` envelope. Both acquisition adapters
+/// populate this and call buildCollection, so the paths converge on identical values.
 pub const RawRow = struct {
     name: []const u8,
     type_str: []const u8, // "base" | "auth" | "view"

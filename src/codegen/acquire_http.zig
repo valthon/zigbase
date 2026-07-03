@@ -2,21 +2,23 @@ const std = @import("std");
 const schema = @import("../schema.zig");
 const acquire_core = @import("acquire.zig");
 
-/// Parse a `GET /api/collections` JSON array into user collections. The
+/// Parse a `GET /api/collections` `{"items":[…]}` envelope into user collections. The
 /// endpoint serializes fields under the "schema" key (collectionToJson shape);
 /// nested arrays/objects are re-stringified to feed acquire.buildCollection,
 /// which uses the same parsers as the data-dir path — so both converge.
 pub fn parseCollections(alloc: std.mem.Allocator, json_bytes: []const u8) ![]schema.Collection {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_bytes, .{});
     defer parsed.deinit();
-    if (parsed.value != .array) return error.InvalidSchema;
+    if (parsed.value != .object) return error.InvalidSchema;
+    const items_v = parsed.value.object.get("items") orelse return error.InvalidSchema;
+    if (items_v != .array) return error.InvalidSchema;
 
     // Build id→name map across ALL elements (including system collections,
     // since a relation could target one) so UUID targetCollectionIds can be
     // resolved back to names before the system-collection filter runs.
     var id_to_name = std.StringHashMap([]const u8).init(alloc);
     defer id_to_name.deinit();
-    for (parsed.value.array.items) |item| {
+    for (items_v.array.items) |item| {
         if (item != .object) continue;
         const obj = item.object;
         const id = objStr(obj, "id") orelse continue;
@@ -25,7 +27,7 @@ pub fn parseCollections(alloc: std.mem.Allocator, json_bytes: []const u8) ![]sch
     }
 
     var list: std.ArrayList(schema.Collection) = .empty;
-    for (parsed.value.array.items) |item| {
+    for (items_v.array.items) |item| {
         if (item != .object) return error.InvalidSchema;
         const obj = item.object;
         // Skip system collections (e.g. _superusers) to match the comptime surface.
@@ -130,7 +132,7 @@ test "parseCollections: parses /api/collections array, strips auth fields, sorts
     const a = arena.allocator();
     // Shape mirrors collectionToJson output: fields under "schema", visible-only.
     const body =
-        \\[
+        \\{"items":[
         \\ {"id":"c2","name":"posts","type":"base","system":false,
         \\  "schema":[{"id":"f1","name":"title","type":"text","options":{}}],
         \\  "indexes":[],"options":{}},
@@ -138,7 +140,7 @@ test "parseCollections: parses /api/collections array, strips auth fields, sorts
         \\  "schema":[{"id":"_email","name":"email","type":"email","options":{}},
         \\            {"id":"u1","name":"displayName","type":"text","options":{}}],
         \\  "indexes":[],"options":{}}
-        \\]
+        \\]}
     ;
     const cols = try parseCollections(a, body);
     try std.testing.expectEqual(@as(usize, 2), cols.len);
@@ -157,7 +159,7 @@ test "parseCollections: resolves UUID targetCollectionId to collection name" {
     // The map is built from ALL elements (including system collections) before
     // the system-collection filter runs.
     const body =
-        \\[
+        \\{"items":[
         \\ {"id":"col_users_uuid","name":"users","type":"auth","system":false,
         \\  "schema":[{"id":"u1","name":"displayName","type":"text","options":{}}],
         \\  "indexes":[],"options":{}},
@@ -168,7 +170,7 @@ test "parseCollections: resolves UUID targetCollectionId to collection name" {
         \\     "options":{"targetCollectionId":"col_users_uuid","maxSelect":1}}
         \\  ],
         \\  "indexes":[],"options":{}}
-        \\]
+        \\]}
     ;
     const cols = try parseCollections(a, body);
     try std.testing.expectEqual(@as(usize, 2), cols.len);

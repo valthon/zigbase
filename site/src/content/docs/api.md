@@ -20,6 +20,9 @@ implements.
 - **Base path:** all REST endpoints live under `/api`.
 - **Encoding:** requests and responses are JSON (`Content-Type: application/json`), except
   file uploads (`multipart/form-data`, see [Files](#files)) and file downloads.
+- **List envelope:** every list endpoint returns `{"items":[…]}`, never a bare array. Endpoints
+  that paginate additionally use the records cursor vocabulary (`?cursor=`/`?limit=` request
+  params; `nextCursor`/`hasNext` response keys — see [Cursor (keyset) pagination](#cursor-keyset-pagination)).
 - **Error envelope:** every error response is a JSON object of the shape:
 
   ```json
@@ -94,7 +97,7 @@ Collection management endpoints are **superuser-only**.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/collections` | List all collections. |
+| GET | `/api/collections` | List all collections: `{"items":[…]}` (changed: was a bare array). |
 | POST | `/api/collections` | Create a collection. |
 | GET | `/api/collections/:idOrName` | Get one collection by id or name. |
 | PATCH | `/api/collections/:idOrName` | Update a collection. |
@@ -816,7 +819,7 @@ through the standard auth-method contract endpoints:
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/collections/:col/auth/oauth2/providers` | List enabled providers (`name`, `authURL`, `clientId`, `scopes`). Secrets are never returned. Gated on `.auth.oauth2.enabled`. |
+| GET | `/api/collections/:col/auth/oauth2/providers` | List enabled providers (`name`, `authURL`, `clientId`, `scopes`) as `{"items":[…]}` (changed: was `{"providers":[…]}`). Secrets are never returned. Gated on `.auth.oauth2.enabled`. |
 | POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata so the client can drive the authorization redirect. |
 | POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session. |
 | DELETE | `/api/collections/:col/records/:id/external-auths/:provider` | Unlink a provider from a record. |
@@ -825,7 +828,7 @@ through the standard auth-method contract endpoints:
 
 ```json
 {
-  "providers": [
+  "items": [
     { "name": "google", "authURL": "https://accounts.google.com/o/oauth2/v2/auth?...", "clientId": "my-client-id.apps.googleusercontent.com", "scopes": ["openid", "email", "profile"] }
   ]
 }
@@ -899,7 +902,7 @@ server-managed and never public by default.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/settings` | List every setting: `[{ key, value, created, updated }, …]`. |
+| GET | `/api/settings` | List every setting: `{"items":[{ key, value, created, updated }, …]}` (changed: was a bare array). |
 | GET | `/api/settings/:key` | Fetch one: `{ key, value }`; `404` if absent. |
 | PUT | `/api/settings/:key` | Upsert. Body `{ "value": "..." }`; returns `{ key, value }`. A malformed body is `400`. |
 | DELETE | `/api/settings/:key` | Remove; `204`, or `404` if absent. |
@@ -1014,11 +1017,12 @@ TypeScript SDK exposes this as `zb.flags.resolveAll(subject)` — see
 Read the built-in product-analytics data: the raw event feed and the declarative rollups
 (see [framework → Product analytics](./framework#product-analytics-analytics--ctxtrack)).
 Events are emitted server-side with `ctx.track(name, payload)`; the rollups aggregate them on
-a schedule into per-rollup summary tables.
+a schedule into per-rollup summary tables. Present only when `.analytics` is configured —
+without it these routes are absent from your binary (not merely 404 at runtime).
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/analytics/events?name=&actor=&since=&limit=` | The raw activity feed (newest first). |
+| GET | `/api/analytics/events?name=&actor=&since=&limit=&cursor=` | The raw activity feed (newest first). |
 | GET | `/api/analytics/rollups/:name?from=&to=` | A rollup's summary rows. |
 
 Both endpoints are **authenticated and fail closed**. A **superuser** sees all data; a **member**
@@ -1036,6 +1040,10 @@ payloads) and all of its rollup buckets. The trust boundary is the tenant, not t
 lower bound on `occurred_at`), `limit` (default 50, max 200). The `actor` / `account` / `occurred_at`
 fields are stamped server-side at capture time and cannot be forged by a client.
 
+Events paginate with the house cursor vocabulary: pass the previous page's `nextCursor` back as
+`?cursor=` to fetch the next page. `nextCursor`/`hasNext` are always present, even on the last page
+(`nextCursor: null`, `hasNext: false`). A malformed `cursor` is `400 "Invalid cursor."`.
+
 ```json
 // GET /api/analytics/events?name=user.signup&limit=2   (Authorization + X-Account-Id)
 {
@@ -1043,7 +1051,9 @@ fields are stamped server-side at capture time and cannot be forged by a client.
     { "id": "…", "created": "2026-06-29T12:00:05Z", "name": "user.signup",
       "payload": { "plan": "pro" }, "actor_collection": "users", "actor": "u_123",
       "account": "acc_abc", "occurred_at": "2026-06-29T12:00:05Z" }
-  ]
+  ],
+  "nextCursor": "2026-06-29T12:00:05Z|e_122",
+  "hasNext": true
 }
 ```
 

@@ -113,7 +113,8 @@ export class CollectionService {
     }
   }
 
-  listAuthProviders(): Promise<{ providers: OAuth2Provider[] }> {
+  /** Changed in server 0.10: was `{providers}`, now the house `{items}` list envelope. */
+  listAuthProviders(): Promise<{ items: OAuth2Provider[] }> {
     return this.transport.send(`${this.base()}/auth/oauth2/providers`, { method: "GET" });
   }
 
