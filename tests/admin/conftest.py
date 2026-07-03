@@ -33,14 +33,28 @@ def server(binary, request):
     finally:
         proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
 
-@pytest.fixture()
-def page(server):
+# Launching Chromium (~0.5s) once per test dominated the wall time of the (now
+# parallel) suite. Reuse ONE browser process per test session — under pytest-xdist
+# each worker is a separate process, so this is one Chromium per worker. Each test
+# still gets a fresh, isolated browser context (cookies/storage) + page, which is
+# cheap (~ms) to create.
+@pytest.fixture(scope="session")
+def _playwright():
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        ctx = browser.new_context(base_url=server)
-        pg = ctx.new_page()
-        yield pg
-        ctx.close(); browser.close()
+        yield pw
+
+@pytest.fixture(scope="session")
+def _browser(_playwright):
+    browser = _playwright.chromium.launch()
+    yield browser
+    browser.close()
+
+@pytest.fixture()
+def page(_browser, server):
+    ctx = _browser.new_context(base_url=server)
+    pg = ctx.new_page()
+    yield pg
+    ctx.close()
 
 
 # ---------------------------------------------------------------------------
@@ -107,13 +121,11 @@ def auth2_server(auth2_binary):
         proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
 
 @pytest.fixture()
-def auth2_page(auth2_server):
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        ctx = browser.new_context(base_url=auth2_server)
-        pg = ctx.new_page()
-        yield pg
-        ctx.close(); browser.close()
+def auth2_page(_browser, auth2_server):
+    ctx = _browser.new_context(base_url=auth2_server)
+    pg = ctx.new_page()
+    yield pg
+    ctx.close()
 
 
 def login(page):
