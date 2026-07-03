@@ -55,7 +55,7 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_HTTP_HOST` | `--http-host` | `127.0.0.1` | bind address (loopback by default; set `0.0.0.0` for all interfaces) |
 | `ZIGBASE_HTTP_PORT` | `--http-port` | `8090` | listen port |
 | `ZIGBASE_DATA_DIR` | `--data-dir` | `./zb_data` | data directory (holds `data.db` and `storage/`) |
-| `ZIGBASE_DB_URL` | — | `""` (SQLite) | **Experimental, opt-in.** A `postgres://…` URL selects the PostgreSQL backend instead of SQLite. Only honored in a binary built with `-Dpostgres=true` (see below); ignored otherwise |
+| `ZIGBASE_DB_URL` | — | `""` (SQLite) | **Opt-in.** A `postgres://…` URL selects the PostgreSQL backend instead of SQLite. TLS defaults to `sslmode=verify-full` (certificate chain + hostname verified; `sslrootcert=<pem-path>` for private CAs) — append `?sslmode=require` or `?sslmode=disable` to opt down (logged at startup). Only honored in a binary built with `-Dpostgres=true` (see below); ignored otherwise |
 | — | `--serve-static` | `""` (off) | serve static files from DIR at the root path (default mode only) |
 | `ZIGBASE_JWT_SECRET` | — | _auto-generated_ | token signing secret (≥32 bytes). Unset → a random secret is generated + persisted at `<data-dir>/.jwt_secret` (0600); a shorter provided value is refused |
 | `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
@@ -99,10 +99,11 @@ This is a **fully supported deployment target** with **full feature parity**: re
 typed filter/sort/expand/search query engine, the access-rule + abilities + tenancy
 authorization stack, analytics rollups, the KV/TTL/rate-limit/feature-flag stores, field
 encryption + key rotation, the deterministic test-clock, and typed-client codegen all work
-identically on Postgres — verified against a live server in CI. Transport is also **not yet
-authenticated** — `sslmode=require` encrypts but does not verify the server certificate/hostname
-(libpq `require` parity), and `verify-ca`/`verify-full` are rejected — so use it only on a
-trusted network path for now. See [PostgreSQL backend](./postgres) for the full guide.
+identically on Postgres — verified against a live server in CI. Transport is **verified by
+default** since 0.10.0 — an unqualified URL gets `sslmode=verify-full` (chain + hostname
+verification, `sslrootcert=` for private CAs), a server that refuses TLS fails at startup with
+the exact opt-down instruction, and any explicit mode below `verify-full` logs a startup
+warning. See [PostgreSQL backend](./postgres) for the full guide.
 
 ## Email delivery
 

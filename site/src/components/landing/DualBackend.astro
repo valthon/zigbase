@@ -73,9 +73,9 @@ const proofs = [
     </p>
 
     <p class="dual__caveat">
-      Postgres support is opt-in and new in 0.9.0: transport is TLS-encrypted but
-      server certificates are not yet verified (verify-full is a tracked follow-up) —
-      run it over a trusted network path. Details in the
+      Postgres support is opt-in (build from source with -Dpostgres). Connections are
+      TLS-verified by default since 0.10.0 — sslmode=verify-full checks the certificate
+      chain and hostname. Details in the
       <a href={`${base}docs/postgres`}>PostgreSQL guide</a>.
     </p>
   </div>

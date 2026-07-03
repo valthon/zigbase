@@ -105,8 +105,8 @@ It is an **early release** (Apache-2.0). Read the
 [known limitations](./known-limitations) before deploying — notably that SMTP must be
 configured for email delivery in production, rate limiting ignores proxy-supplied client
 IPs unless `--trust-proxy` is set, comptime auto-migration is additive-only, and the
-scheduler is single-process, and the PostgreSQL backend is new in 0.9.0 (TLS is encrypted
-but not yet certificate-verified).
+scheduler is single-process, and the PostgreSQL backend is opt-in (build from source with
+-Dpostgres).
 
 ## Where to go next
 
