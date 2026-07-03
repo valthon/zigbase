@@ -67,15 +67,23 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
 /// Returns a copy of `col` where each relation field's targetCollectionId is replaced by the
 /// referenced collection's table NAME (so the FK clause references a real table). Returns
 /// error.Validation if a referenced collection does not exist.
+///
+/// A self-relation (a field targeting `col` itself, e.g. a tree's `parent`) is resolved WITHOUT a
+/// DB lookup: `col.id`/`col.name` are already assigned by `create()` before this runs, but the row
+/// does not exist yet, so `get()` would spuriously miss it and reject an otherwise-legal schema.
 fn resolveRelations(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EngineError!schema.Collection {
     const fields = try alloc.alloc(schema.Field, col.fields.len);
     for (col.fields, 0..) |f, i| {
         fields[i] = f;
         switch (f.options) {
             .relation => |r| {
-                const target = (try get(alloc, w, r.targetCollectionId)) orelse return error.Validation;
                 var nr = r;
-                nr.targetCollectionId = target.name;
+                if (std.mem.eql(u8, r.targetCollectionId, col.id) or std.mem.eql(u8, r.targetCollectionId, col.name)) {
+                    nr.targetCollectionId = col.name;
+                } else {
+                    const target = (try get(alloc, w, r.targetCollectionId)) orelse return error.Validation;
+                    nr.targetCollectionId = target.name;
+                }
                 fields[i].options = .{ .relation = nr };
             },
             else => {},
@@ -467,7 +475,9 @@ test "auth collection enforces identity uniqueness via partial unique index, all
     defer arena.deinit();
     const a = arena.allocator();
     _ = try create(a, std.testing.io, &d, .{
-        .id = "", .name = "members", .type = .auth,
+        .id = "",
+        .name = "members",
+        .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
     });
     // two distinct emails ok
