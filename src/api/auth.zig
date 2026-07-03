@@ -1428,7 +1428,7 @@ test "require_verified gates password login: unverified 403, verified 200" {
     try std.testing.expectEqual(@as(u16, 200), (try authWithPassword(&login2)).status);
 }
 
-test "RouteEvent.issueSession mints a session and fires onAuth(custom)" {
+test "auth_helpers.issueSession mints a session and fires onAuth(custom)" {
     var env = try TestEnv.initAuth("members");
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1448,8 +1448,9 @@ test "RouteEvent.issueSession mints a session and fires onAuth(custom)" {
     env.app.dispatch = &disp;
 
     var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
-    var rctx = events.RouteEvent{ .app = &env.app, .ctx = &hctx, .rctx = .{} };
-    const issued = try rctx.issueSession("members", rid);
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const issued = try @import("../auth_helpers.zig").issueSession(&hctx, w, "members", rid);
     try std.testing.expectEqual(@as(usize, 2), issued.cookies.len);
     try std.testing.expectEqual(@as(usize, 1), Counter.seen);
     try std.testing.expectEqual(events.AuthMethod.custom, Counter.m);

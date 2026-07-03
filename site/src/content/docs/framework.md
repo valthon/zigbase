@@ -211,13 +211,16 @@ when a hook doesn't use it.
 
 `zigbase.RecordEvent` fields:
 
-- `app: *Runtime` — the runtime app context.
-- `ctx` — the request context; `ev.ctx.auth` is the authenticated record (if any).
+- `rctx` — the request context; `ev.rctx.auth` is the authenticated record (if any). Named
+  `rctx` (not `ctx`) — `ctx` always means the `*zigbase.Ctx` parameter in a hook signature.
 - `arena: std.mem.Allocator` — the **request-scoped** allocator that owns `record`'s JSON
   storage.
 - `collection: []const u8` — the collection name.
 - `record: *std.json.Value` — mutable in `before_*`; the persisted record in `after_*`.
 - `phase: RecordPhase`.
+
+Need the app itself (e.g. `app.allocator`, `app.io`)? Use the hook's `ctx.app` —
+`RecordEvent` has no `app` field of its own.
 
 ### Semantics
 
@@ -226,11 +229,11 @@ when a hook doesn't use it.
 - **`after*` hooks** are post-commit. An error returned from an after-hook is swallowed and
   routed to the error backstop (it does not undo the committed write).
 
-### CRITICAL: use `ev.arena`, not `ev.app.allocator`
+### Always allocate record data with `ev.arena`
 
 Any allocation that becomes part of `ev.record` MUST use `ev.arena` (the request allocator
-that owns the record's JSON map), **not** `ev.app.allocator` (the long-lived gpa). Mixing
-allocators on the arena-backed JSON map is undefined behavior.
+that owns the record's JSON map). Mixing allocators on the arena-backed JSON map is
+undefined behavior.
 
 From the worked example's `slugify` (`before_create` on `posts`):
 
@@ -244,7 +247,7 @@ fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
         else => return,
     } else return;
 
-    const buf = try ev.arena.alloc(u8, title.len); // <-- ev.arena, NOT ev.app.allocator
+    const buf = try ev.arena.alloc(u8, title.len); // <-- ev.arena
     var len: usize = 0;
     // ... build the slug into buf ...
     try ev.record.object.put(ev.arena, "slug", .{ .string = buf[0..len] }); // <-- ev.arena

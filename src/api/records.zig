@@ -45,8 +45,7 @@ pub fn emitRecord(
     // `ev.record.object` access can't panic. records.* will reject non-objects with NotObject (400).
     if (is_before and value.* != .object) return;
     var ev = events.RecordEvent{
-        .app = app,
-        .ctx = rctx,
+        .rctx = rctx,
         .arena = arena,
         .collection = col_name,
         .record = value,

@@ -57,7 +57,7 @@ fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     } else return;
 
     // Record mutations MUST allocate with `ev.arena` (the request-scoped
-    // allocator that owns `ev.record`), NOT `ev.app.allocator`.
+    // allocator that owns `ev.record`).
     const buf = try ev.arena.alloc(u8, title.len);
     var len: usize = 0;
     var in_run = false;

@@ -70,15 +70,15 @@ fn postsBeforeCreate(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void 
 ```
 
 **Allocator discipline**: hook mutations MUST use `ev.arena` (the
-request-scoped allocator that owns `ev.record`). Using `ev.app.allocator` (the
-long-lived GPA) produces undefined behavior.
+request-scoped allocator that owns `ev.record`). Need the app itself? Use
+`ctx.app`.
 
 ### `slugify` (beforeCreate)
 Derives a URL slug from the post title when one isn't supplied.
 `"Hello, World!"` → `"hello-world"`.
 
 ### `setAuthor` (beforeCreate)
-Stamps the `author` field with the authenticated user's id from `ev.ctx.auth`.
+Stamps the `author` field with the authenticated user's id from `ev.rctx.auth`.
 Creates the ownership link that the access rules rely on.
 
 ### `computeReadingTime` (beforeCreate + beforeUpdate)
