@@ -147,8 +147,12 @@ pub const Pool = struct {
         self.unlockPool();
         for (self.workers[0..n]) |t| t.join();
         if (self.app.memory_pool == @as(?*anyopaque, @ptrCast(self))) {
-            self.app.memory_pool = null;
+            // Clear order matters (mirrors install()'s safe write order): submit_fn gates
+            // the `self.memory_pool.?` deref in App.submit, so it must go null FIRST — else
+            // a concurrent submit() could observe submit_fn still set but memory_pool
+            // already null and deref `.?` on null (panic/UB).
             self.app.submit_fn = null;
+            self.app.memory_pool = null;
         }
         // Final safety drain — NOT for a failed spawn (a spawn that returns 0 workers never
         // reaches `started = true`, so nothing is pushed against it). The real race this
