@@ -1026,6 +1026,24 @@ bmp/ico, plus pdf). Everything else is served as a download:
 `Content-Disposition: attachment` with `X-Content-Type-Options: nosniff` (this
 neutralizes HTML/SVG/JS XSS). Appending `?download` forces a download for any type.
 
+### Range and conditional requests
+
+File downloads support HTTP range and conditional requests (0.10.0):
+
+- `Accept-Ranges: bytes` on every 200/206. A single `Range: bytes=a-b`, `bytes=a-`,
+  or `bytes=-n` answers `206 Partial Content` with `Content-Range`; a syntactically
+  multi-range request is served as a full `200` (RFC-permitted). An unsatisfiable
+  range answers `416` with `Content-Range: bytes */<size>`.
+- Every response carries a strong `ETag` derived from the stored file's identity
+  (stored names are content-immutable — an update mints a new name), so
+  `If-None-Match` revalidation answers `304`. `If-Range` requires an exact strong
+  match, otherwise the range is ignored.
+- `HEAD` mirrors `GET` (status, headers, `Content-Length`) with no body.
+- `?download` and `?token=` compose with `Range` unchanged.
+- **File tokens vs. seeking:** `ZIGBASE_FILE_TOKEN_TTL` defaults to 120 s; a video
+  player seeking via `?token=` URLs gets 404s once the token expires mid-playback.
+  Use cookie/bearer auth for long media, or re-mint tokens per seek.
+
 ---
 
 ## Static files
@@ -1043,25 +1061,51 @@ not apply to the static root, so never place secrets there. For access-controlle
 file delivery, use [file storage](#files) instead.
 
 - `/` and directory paths resolve to that directory's `index.html`.
-- **Caching:** in **embedded** mode, each asset has a precomputed CRC32 content
+- **Range requests:** a single `Range: bytes=a-b`, `bytes=a-` (open-ended, e.g.
+  video seeking), or `bytes=-n` (suffix) answers `206 Partial Content` with
+  `Content-Range`; a range past the end of the file answers `416 Range Not
+  Satisfiable` with `Content-Range: bytes */<size>`. A syntactically malformed or
+  multi-range `Range` header is ignored (plain `200`). This applies to both **dir**
+  mode (the request is normalized into the canonical closed form so facil.io's own
+  transport assembles the `206`) and **embedded** mode (a single-range `206` sliced
+  out of the compiled-in asset bytes).
+- **Caching:** every response — embedded or dir — now emits a `Cache-Control`
+  header. The value defaults to `max-age=3600` and is tunable process-wide via the
+  `--static-cache-control <value>` flag, the `ZIGBASE_STATIC_CACHE_CONTROL` env var,
+  or the comptime `App(.{ .static_cache_control = "…" })` key (flag > env >
+  comptime; unset keeps the stock default). See
+  [framework.md → Static files](framework.md) for the full precedence and scope
+  notes. In **embedded** mode each asset also has a precomputed CRC32 content
   `ETag`; a request with a matching `If-None-Match` gets `304 Not Modified` from
-  zigbase itself. In **dir** mode (comptime-hardcoded `.dir` or `--serve-static`),
-  caching is delegated to facil.io's `sendFile`, which emits its own `ETag`,
-  `Last-Modified`, `Cache-Control: max-age=3600`, and handles `If-None-Match`/`304`.
+  zigbase itself. In **dir** mode, `ETag`/`Last-Modified`/`If-None-Match`/`If-Range`
+  handling is delegated to facil.io's `sendFile`, which uses its own exact-match
+  `ETag` semantics (an unquoted base64 size^mtime tag) rather than RFC 7232
+  list/weak comparison — self-consistent, and intentionally left as-is
+  (facil.io-first).
+- **`.gz` sidecar negotiation (dir mode):** if the request sends `Accept-Encoding`
+  containing `gzip` and a `<file>.gz` sibling exists next to the matched `<file>`,
+  the sidecar's bytes are served instead with `Content-Encoding: gzip` (facil.io's
+  existing behavior, unchanged) and — new — `Vary: Accept-Encoding`, so a shared
+  cache in front of dir-mode static serving doesn't conflate the plain and
+  gzip-encoded responses for the same URL.
 - Every response includes `X-Content-Type-Options: nosniff`; content types are
   derived from the file extension (html, css, js, mjs, json, map, svg, png, jpg/jpeg,
   gif, webp, avif, ico, woff/woff2, ttf, wasm, txt, xml, pdf, mp4, webm; unknown →
   `application/octet-stream`).
 - Paths containing `..`, backslashes, or NUL bytes are rejected (404). There are no
-  directory listings and no `Range`/partial-content support.
+  directory listings.
 - **SPA fallback:** a directory containing a file named `.spa` is an SPA root —
   GET/HEAD misses at or below it serve that directory's `index.html` with 200
-  (real files always win; the `.spa` file itself is never served). In **embedded**
-  mode the marker set is derived once at startup (the manifest can't change at
-  runtime); in **dir** mode it's resolved **live** against the filesystem on every
-  miss, so adding/removing a marker needs no restart (startup only fails fast if a
-  `.spa` has no `index.html`). Custom builds can also declare comptime
-  `static_routes` rewrites, consulted before the marker. See
+  (real files always win; the `.spa` file itself is never served). The fallback
+  shell response is always `Cache-Control: no-cache` with a revalidation `ETag`
+  (a redeploy can't strand a deep link on a stale cached shell), regardless of the
+  Cache-Control knob above; a **direct** hit on that same `index.html` file (not via
+  the fallback) keeps the knob's normal value. In **embedded** mode the marker set
+  is derived once at startup (the manifest can't change at runtime); in **dir** mode
+  it's resolved **live** against the filesystem on every miss, so adding/removing a
+  marker needs no restart (startup only fails fast if a `.spa` has no
+  `index.html`). Custom builds can also declare comptime `static_routes` rewrites,
+  consulted before the marker. See
   [framework.md → Static files](framework.md) for details. <a id="spa-fallback"></a>
 
 ---

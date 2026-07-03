@@ -38,6 +38,9 @@ pub const RateLimitKeyFn = events.RateLimitKeyFn;
 // Storage plugin: a custom storage plugin's `interface()` returns this vtable.
 pub const Storage = @import("files/storage.zig").Storage;
 pub const LocalStorage = @import("files/storage.zig").LocalStorage;
+/// Opt-in S3-compatible storage backend (`-Ds3`; §D). A stub type in a default build —
+/// naming it compiles, constructing it requires `-Ds3=true` (the PG-gated pattern).
+pub const S3Storage = if (@import("build_options").s3) @import("files/s3.zig").S3Storage else struct {};
 
 // Mailer plugin: a custom mailer plugin's `interface()` returns `Mailer`, whose
 // `send` is handed an `Email`. `SmtpTls` lets a consumer pick a TLS mode in code.
@@ -265,6 +268,7 @@ test {
     _ = @import("files/storage.zig");
     _ = @import("files/plan.zig");
     _ = @import("files/multipart.zig");
+    _ = @import("files/serve_file.zig");
     _ = @import("data.zig");
     _ = @import("events.zig");
     _ = @import("sentry.zig");
@@ -278,7 +282,7 @@ test {
     _ = @import("mail/send.zig");
     _ = @import("mail/template.zig");
     _ = @import("mail/addr.zig");
-    _ = @import("mail/sigv4.zig");
+    _ = @import("aws/sigv4.zig");
     _ = @import("mail/ses.zig");
     _ = @import("mail/postmark.zig");
     _ = @import("mail/capture.zig");
@@ -348,5 +352,9 @@ test {
         _ = @import("backend/postgres/schema_pg_test.zig");
         // Wave B: live-PG auth / oauth / analytics / challenge / session end-to-end. Skips if no PG.
         _ = @import("backend/postgres/auth_pg_test.zig");
+    }
+    // Opt-in S3 backend (§D): compiled/tested only under -Ds3 (the postgres pattern above).
+    if (@import("build_options").s3) {
+        _ = @import("files/s3.zig");
     }
 }

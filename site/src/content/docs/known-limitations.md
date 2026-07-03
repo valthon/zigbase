@@ -118,8 +118,6 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 - Static files are served without authentication — collection access rules do not apply
   to the static root; use file storage for access-controlled delivery.
-- No `Range`/partial-content requests (no video seeking on large files served from the
-  static root).
 - No directory listings; directories resolve to `index.html` or 404.
 - Path safety is lexical (`..`, backslashes, and NUL bytes are rejected) **and**
   symlink-aware: a served file is canonicalized and refused if its real path escapes the
@@ -130,9 +128,9 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   servable (404). Encoded traversal (`%2e%2e`) stays a literal — and harmless — path
   segment for the same reason.
 - No on-the-fly compression; pre-compress at the CDN or reverse proxy if needed.
-- In **dir** mode (`--serve-static` or comptime `.dir`), caching is controlled by
-  facil.io's `sendFile` (fixed `Cache-Control: max-age=3600`) — this value is not
-  configurable yet.
+- In **dir** mode, conditional requests (`If-None-Match`/`If-Range`) use facil.io's
+  exact-match ETag semantics (an unquoted base64 size^mtime tag), not RFC 7232
+  list/weak comparison — self-consistent, and kept as-is by design (facil.io-first).
 
 ## Platform & UI
 
@@ -158,12 +156,28 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   target provisions cycle-edge FKs as deferrable and defers them to COMMIT — correct
   for cyclic and self-referential graphs, verified against live Postgres in CI.
 
+## S3 storage (`-Ds3`)
+
+- **`PutObject` runs inside the global write transaction.** A file upload's S3 `PUT`
+  happens synchronously while the writer lock is held — deliberate: a storage failure
+  rolls the record write back instead of leaving an orphaned DB row pointing at a
+  never-uploaded object.
+- **Deletes are best-effort.** Exactly like local storage, a delete that fails partway
+  can leave an orphaned object behind; there is no reconciliation job. Configure an S3
+  lifecycle rule on the bucket/prefix as the mitigation.
+- **Proxy-only serving.** Downloads always flow through the server's spool cache — there
+  is no presigned-URL redirect mode yet.
+- **Single-`PUT` uploads only, capped at 5 GiB.** There is no S3 multipart upload;
+  `ZIGBASE_MAX_UPLOAD_SIZE` above the 5 GiB single-`PUT` limit is refused at startup.
+- **Spool cache eviction is create-time, not true LRU.** Eviction sorts by file mtime,
+  which is only set on a cache miss (the download that fills the entry) — a cache hit
+  does not bump it, so a frequently-read file fetched once long ago can be evicted
+  before a rarely-read file fetched more recently.
+
 ## Other deferred work
 
-- Image thumbnails / transforms; an S3 (or other remote) storage backend — a pluggable
-  `.storage` slot exists, but only the local-disk backend ships; `fields=` response
-  projection; resumable/chunked uploads; realtime backfill/replay and per-event-guard
-  load-tuning.
+- Image thumbnails / transforms; `fields=` response projection; resumable/chunked
+  uploads; realtime backfill/replay and per-event-guard load-tuning.
 
 ---
 

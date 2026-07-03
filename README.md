@@ -57,7 +57,7 @@ See [docs/docker.md](docs/docker.md) for the data-volume/non-root/healthcheck de
 - **KV store & feature flags** — lightweight typed key-value store with a built-in flag layer; manageable from the admin Settings UI. → [docs/framework.md](docs/framework.md)
 - **Rate limiting** — global sensitive-auth limiter plus per-method custom limits; configurable window and count. → [docs/api.md](docs/api.md)
 - **Realtime** — subscribe to record changes over WebSocket. → [docs/api.md](docs/api.md)
-- **Files** — local file storage with serving and short-lived file-access tokens. → [docs/api.md](docs/api.md)
+- **Files** — local file storage with serving and short-lived file-access tokens; opt-in S3-compatible storage (`-Ds3` build flag — AWS S3, MinIO, Cloudflare R2) selected by `ZIGBASE_S3_*` config alone, served through the same Range/ETag/tenancy-identical download path via a local spool cache. → [docs/api.md](docs/api.md)
 - **TypeScript SDK** — published official client (`@zigbase/client`): auth, records,
   offset + cursor pagination, files, realtime + live store — plus a fully-typed client
   generated from your schema (`zig build gen-client`) or from any running instance

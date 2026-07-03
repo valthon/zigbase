@@ -231,6 +231,63 @@ jobs:
         if: always()
         run: docker rm -f pgtls || true
 
+  # Opt-in S3 storage backend (§D). Builds and tests with -Ds3=true against a real
+  # MinIO started via `docker run` (the services: block can't pass the `server /data`
+  # command — same reason postgres-tls uses docker run). The default jobs above keep
+  # the stock flags, so both configurations compile on every PR (the postgres two-
+  # config precedent).
+  s3:
+    runs-on: ubuntu-latest
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
+      ZIGBASE_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+      ZIGBASE_S3_TEST_BUCKET: zbtest
+      ZIGBASE_S3_TEST_KEY: minioadmin
+      ZIGBASE_S3_TEST_SECRET: minioadmin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: Cache zig global cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+      - name: Cache zig local cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-local
+          key: zig-local-s3-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          restore-keys: |
+            zig-local-s3-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
+            zig-local-s3-${{ runner.os }}-zig0.16.0-
+      - name: Start MinIO + create bucket
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/minio/health/ready >/dev/null 2>&1; then
+              echo "minio ready"; break
+            fi
+            sleep 2
+          done
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c \
+            "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && mc mb local/zbtest"
+      - name: Unit + live S3 tests (-Ds3=true)
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Ds3=true
+      - name: Build zigbase (-Ds3=true) for the raw-HTTP e2e
+        run: mise exec zig@0.16.0 -- zig build -Ds3=true -Dcpu=baseline
+      - name: S3 end-to-end (upload -> Range/304/416 -> delete)
+        run: |
+          mise exec python@3.13 -- python -m pip install --quiet pytest
+          ZIGBASE_TEST_BINARY="$PWD/zig-out/bin/zigbase" \
+            mise exec python@3.13 -- python -m pytest tests/s3 -q
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true
+
   browser:
     runs-on: ubuntu-latest
     needs: build

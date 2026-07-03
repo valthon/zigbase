@@ -41,6 +41,12 @@ pub const RequestCtx = struct {
     raw_header_ctx: ?*anyopaque = null,
     /// Live header lookup-by-name (lowercase), wired by `server.zig` from the HTTP request.
     raw_header_fn: ?*const fn (*anyopaque, []const u8) ?[]const u8 = null,
+    /// Live request-header SETTER (lowercase name), wired by server.zig onto facil.io's
+    /// request-header hash (replace semantics — fiobj_hash_set frees the old value).
+    /// Used by the static Range-normalization shim (§A.2) to rewrite the request's
+    /// Range header into the one form the vendored facil.io parses correctly, BEFORE
+    /// delegating to facil.io's sendFile. No-op when unwired (unit tests stub it).
+    raw_header_set_fn: ?*const fn (*anyopaque, name: []const u8, value: []const u8) void = null,
 
     pub fn param(self: *const RequestCtx, name: []const u8) ?[]const u8 {
         for (self.params) |p| {
@@ -62,12 +68,21 @@ pub const RequestCtx = struct {
     /// Used by the `path_secret` route guard's `.header` source.
     pub fn header(self: *const RequestCtx, name: []const u8) ?[]const u8 {
         if (self.raw_header_fn) |f| {
-            if (f(self.raw_header_ctx.?, name)) |v| return v;
+            if (self.raw_header_ctx) |ctx| {
+                if (f(ctx, name)) |v| return v;
+            }
         }
         for (self.headers) |h| {
             if (std.ascii.eqlIgnoreCase(h.key, name)) return h.value;
         }
         return null;
+    }
+
+    /// Replace a request header on the live request (see raw_header_set_fn). No-op
+    /// when no live request is wired.
+    pub fn setRequestHeader(self: *const RequestCtx, name: []const u8, value: []const u8) void {
+        const ctx = self.raw_header_ctx orelse return;
+        if (self.raw_header_set_fn) |f| f(ctx, name, value);
     }
 
     /// The value of cookie `name` from the Cookie header, or null. Trims surrounding spaces.
@@ -109,13 +124,28 @@ pub const UploadedFile = struct {
     bytes: []const u8,
 };
 
+/// A filesystem file reference for `Response.file`: a full file or a byte window of one.
+pub const FileRef = struct {
+    path: []const u8,
+    offset: u64 = 0,
+    len: ?u64 = null,
+};
+
 pub const Response = struct {
     status: u16,
     content_type: []const u8 = "application/json",
     body: []const u8, // allocated in the request arena
     cookies: []const Cookie = &.{},
-    /// When set, server.zig streams this filesystem path via sendFile instead of `body`.
-    file_path: ?[]const u8 = null,
+    /// A filesystem file (or a byte window of one) to stream instead of `body`.
+    /// `len == null` => server.zig DELEGATES wholesale to facil.io's sendFile
+    /// (http_sendfile2: stat, mime, ETag, 304, `.gz` sidecar, Range — dir-mode
+    /// static rides this). `len != null` => the ZigBase-OWNED path (§B): the
+    /// handler has already planned status + headers; server.zig opens the path
+    /// and transmits `[offset, offset+len)` through facil.io's public
+    /// `http_sendfile(h, fd, len, offset)` fd primitive — the same call
+    /// http_sendfile2 itself finishes through. 0.10.0, Breaking: replaces
+    /// `Response.file_path` (migrate `.file_path = p` -> `.file = .{ .path = p }`).
+    file: ?FileRef = null,
     extra_headers: []const Header = &.{},
 };
 
@@ -146,9 +176,12 @@ test "cookie parses a named value out of the Cookie header" {
     try std.testing.expect(empty.cookie("zb_auth") == null);
 }
 
-test "Response file_path and UploadedFile default/usage" {
-    const r = Response{ .status = 200, .body = "", .file_path = "/x/y.png" };
-    try std.testing.expectEqualStrings("/x/y.png", r.file_path.?);
+test "Response file ref and UploadedFile default/usage" {
+    const r = Response{ .status = 200, .body = "", .file = .{ .path = "/x/y.png" } };
+    try std.testing.expectEqualStrings("/x/y.png", r.file.?.path);
+    try std.testing.expect(r.file.?.len == null); // default: wholesale facil.io delegation
+    const ranged = Response{ .status = 206, .body = "", .file = .{ .path = "/x/y.png", .offset = 10, .len = 5 } };
+    try std.testing.expectEqual(@as(u64, 10), ranged.file.?.offset);
     const u = UploadedFile{ .field = "cover", .filename = "a.png", .mimetype = "image/png", .bytes = "x" };
     try std.testing.expectEqualStrings("cover", u.field);
     const ctx = RequestCtx{ .method = .POST, .path = "/", .allocator = std.testing.allocator };

@@ -2696,11 +2696,46 @@ zigbase.App(.{ .mailer = AuditMailer }).runCli(init);
 
 A custom storage plugin follows the same shape, returning a `zigbase.Storage` view from
 `interface()`. The `zigbase.Storage` vtable backs file storage (the default
-`zigbase.DefaultStoragePlugin` wraps `zigbase.LocalStorage`); the `zigbase.Mailer` vtable —
-a single `send(io, alloc, zigbase.Email)` — backs mail (the default
-`zigbase.DefaultMailerPlugin` selects `zigbase.LogMailer` or `zigbase.SmtpMailer` from
-config). See the [plugins example](../examples/plugins) for the full, compiling
-custom-mailer plugin.
+`zigbase.DefaultStoragePlugin` wraps `zigbase.LocalStorage`) with **four** methods —
+`put` / `fetch` / `delete` / `deleteRecord`. `fetch(ctx, io, alloc, col, record_id,
+filename)` returns a local filesystem path whose contents ARE the file, materializing it
+locally first if necessary (a remote backend spools to a local cache); `null` means the
+backend has no such object. *(0.10.0: `localPath(ctx, alloc, …)` → `fetch(ctx, io, alloc,
+…)` — rename + one new parameter; return a local path, materializing the file locally if
+necessary; `null` = object missing.)* The `zigbase.Mailer` vtable — a single `send(io,
+alloc, zigbase.Email)` — backs mail (the default `zigbase.DefaultMailerPlugin` selects
+`zigbase.LogMailer` or `zigbase.SmtpMailer` from config). See the [plugins
+example](../examples/plugins) for the full, compiling custom-mailer plugin.
+
+### S3-compatible storage (`-Ds3`)
+
+`DefaultStoragePlugin` also backs an opt-in **S3-compatible** backend (AWS S3, MinIO,
+Cloudflare R2, ...), selected by config alone once built with **`-Ds3=true`** (off by
+default; a stock binary compiles no S3 code at all): setting `ZIGBASE_S3_BUCKET` on an
+`-Ds3` binary switches `DefaultStoragePlugin` to `S3Storage`, the same "switch via
+configuration alone" contract as `ZIGBASE_DB_URL` (postgres) — a stock binary handed
+`ZIGBASE_S3_BUCKET` warns loudly and falls back to local storage instead of silently
+ignoring it.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `ZIGBASE_S3_BUCKET` | `""` (off) | non-empty enables S3 storage (on an `-Ds3` binary) |
+| `ZIGBASE_S3_REGION` | `"us-east-1"` | AWS region (SigV4 signing + default endpoint) |
+| `ZIGBASE_S3_ENDPOINT` | `""` | `""` → `https://s3.<region>.amazonaws.com`; set for MinIO/R2/other endpoints |
+| `ZIGBASE_S3_ACCESS_KEY_ID` | `""` | SigV4 access key id (required) |
+| `ZIGBASE_S3_SECRET_ACCESS_KEY` | `""` | SigV4 secret access key (required) |
+| `ZIGBASE_S3_FORCE_PATH_STYLE` | _auto_ | `true`/`1` forces path-style; unset auto-selects path-style when `ZIGBASE_S3_ENDPOINT` is set |
+| `ZIGBASE_S3_KEY_PREFIX` | `""` | prefix prepended to every object key — namespace multiple apps in one bucket |
+| `ZIGBASE_S3_CACHE_DIR` | `""` | `""` → `<data_dir>/storage_cache`; the local spool cache directory |
+| `ZIGBASE_S3_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | spool cache size cap; eviction reclaims to a 3/4 low-water mark |
+
+Downloads are never proxied straight from S3: `fetch` spools an object to a local cache
+file on first read and every later read is served from that file, so Range/conditional/
+`ETag`/cacheability behavior is identical to local storage. Startup runs a fail-fast
+`HeadObject` probe so a bad config is caught at boot, not on first upload. See [Known
+limitations](../known-limitations) for the write-lock, best-effort-delete,
+proxy-only-serving, and 5 GiB single-`PUT` caveats. `zigbase.S3Storage` is exported
+alongside `zigbase.LocalStorage` so a custom plugin can wrap it.
 
 ## 10. Footprint levers (`.pools`)
 
@@ -2798,12 +2833,15 @@ pub fn main(init: std.process.Init) !void {
 
 Anything that misses `/_/`, the built-in API, and your custom routes falls through to the
 static-file server (GET/HEAD only; `/api/*` misses keep the JSON 404 envelope; static
-misses return a plain-text 404). `/` and directory paths resolve to `index.html`. In
-**embedded** mode, each asset carries a precomputed CRC32 content `ETag` and zigbase
-handles `If-None-Match`/304 itself. In **dir** mode (`--serve-static` or comptime `.dir`),
-caching is delegated to facil.io's `sendFile`, which emits its own `ETag`, `Last-Modified`,
-`Cache-Control: max-age=3600`, and handles `If-None-Match`/304. All modes add
-`X-Content-Type-Options: nosniff`.
+misses return a plain-text 404). `/` and directory paths resolve to `index.html`. Both
+sources honor a single `Range: bytes=a-b` / `bytes=a-` / `bytes=-n` with a `206` (`416`
+past EOF); a malformed or multi-range header is ignored (plain `200`). In **embedded**
+mode, each asset carries a precomputed CRC32 content `ETag` and zigbase handles
+`If-None-Match`/304 itself. In **dir** mode (`--serve-static` or comptime `.dir`),
+`ETag`/`Last-Modified` and conditional-request handling (`If-None-Match`/`If-Range`) are
+delegated to facil.io's `sendFile` — using its own exact-match `ETag` semantics (an
+unquoted base64 size^mtime tag), not RFC 7232 list/weak comparison. All modes add
+`X-Content-Type-Options: nosniff` and emit `Cache-Control` (see the knob below).
 
 Pick a mode at comptime with `.static_files`:
 
@@ -2831,6 +2869,29 @@ The build fails with a clear error when `frontend/dist` is missing — build the
 first (e.g. `npm run build`). A hardcoded or `--serve-static` directory that is missing or
 unreadable at startup is a **fatal startup error** naming the path.
 
+### Cache-Control: the `--static-cache-control` knob
+
+Every static response — embedded or dir — carries a `Cache-Control` header. The
+default is the stock `max-age=3600` (byte-identical to pre-knob behavior); override
+it process-wide with, in precedence order:
+
+1. `--static-cache-control <value>` (runtime flag; rejected as unknown when static
+   serving is `.disabled`);
+2. `ZIGBASE_STATIC_CACHE_CONTROL` (env, same validation as the flag);
+3. comptime `App(.{ .static_cache_control = "…" })` (validated at compile time:
+   non-empty, ≤ 256 bytes, no CR/LF — a violation is a `@compileError`).
+
+The flag wins over the env var, which wins over the comptime default; leaving all
+three unset keeps the facil.io stock value. The knob is **process-wide, not
+per-route**: in **dir** mode it's applied via a one-time facil.io FIOBJ swap at
+startup (so every `sendFile`-transported response inherits it), which also means **a
+consumer route calling `r.sendFile` directly inherits the knob — that IS the knob**,
+there is no separate per-call override. In **embedded** mode the same resolved value
+is threaded into every asset response directly.
+
+The one exception is the SPA fallback shell (below), which always overrides the
+knob with `Cache-Control: no-cache`.
+
 ### SPA fallback: the `.spa` marker
 
 Client-routed apps (History-API SPAs) break on deep links: `/app/orders/42` is a
@@ -2857,8 +2918,15 @@ case-insensitive filesystems too — see below).
   fallback (checked on the normalized path too, so no raw-vs-normalized-path
   disagreement — e.g. a doubled leading slash — can route an api-looking miss to a
   fallback document); non-GET/HEAD methods never reach it.
-- Fallback responses ride the normal static pipeline: ETag/304 (embedded),
-  facil.io caching (dir), `nosniff`, and HEAD-mirrors-GET all apply.
+- Fallback responses ride the normal static pipeline for `nosniff` and
+  HEAD-mirrors-GET, but **caching is special**: the shell is always served
+  `Cache-Control: no-cache` with a revalidation `ETag` (304 on `If-None-Match`),
+  overriding the `--static-cache-control` knob — a stale cached shell after a
+  redeploy would otherwise reference hashed assets that no longer exist. A
+  **direct** hit on that same `index.html` (not via the fallback) is unaffected and
+  keeps the knob's normal value. In **dir** mode this one response is read and sent
+  OWNED (not via facil.io's delegated `sendFile`), because `sendFile` cannot emit a
+  per-response `Cache-Control` different from the process-wide knob.
 
 **Embedded mode: markers are resolved once, at startup.** The manifest is
 comptime-static (baked into the binary), so the marker root set is derived once and

@@ -64,6 +64,10 @@ const routes = [_]router.Route{
     .{ .method = .GET, .pattern = "/api/collections/:col/auth/oauth2/providers", .handler = oauth_api.oauth2Providers },
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
     .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
+    // HEAD mirrors GET (status/headers/Content-Length, no body) — `serve` itself branches
+    // on `ctx.method == .HEAD`; without this route entry a HEAD request never reaches it
+    // (router.tryDispatch requires an exact method match) and 404s before the handler runs.
+    .{ .method = .HEAD, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
     .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
     // Multi-tenancy (#156): activate an account scope for browser apps (sets the signed
     // `zb_account` cookie). 404s when tenancy is disabled; 403 without an active membership.
@@ -91,6 +95,37 @@ const routes = [_]router.Route{
     .{ .method = .GET, .pattern = "/api/analytics/rollups/:name", .handler = analytics_api.rollups },
 };
 
+// ── §C.1: tunable static Cache-Control via facil.io's OWN state-callback API ────────
+// There is no facil.io settings field and no compile-time define for the static
+// max-age; the value is a runtime FIOBJ created by http_lib_init at
+// FIO_CALL_ON_INITIALIZE (vendored http_internal.c:223) and held in a NON-static C
+// global (http_internal.h:81). We link the same compiled facil.io, so declare the
+// global + the callback API and swap the FIOBJ exactly once at FIO_CALL_PRE_START —
+// which fio_start forces strictly AFTER ON_INITIALIZE (fio.c:3925), so the object
+// exists and our replacement is never clobbered. facil.io's header-emission path is
+// untouched: http_sendfile2 keeps fiobj_dup-ing this global (http.c:484); it just
+// dups our value. Scope (documented): the global affects EVERY http_sendfile2
+// response process-wide — in ZigBase that is exactly dir-mode static (record files
+// left this path in §B), but a consumer route calling r.sendFile directly inherits
+// it too; that IS the knob. Single process; PRE_START runs in the master before any
+// worker forks, so the swap is fork-safe.
+extern var HTTP_HVALUE_MAX_AGE: zap.fio.FIOBJ;
+extern fn fio_state_callback_add(
+    event: c_int,
+    func: ?*const fn (?*anyopaque) callconv(.c) void,
+    arg: ?*anyopaque,
+) void;
+/// callback_type_e ordinal (vendored fio.h:1578-1608): ON_INITIALIZE=0, PRE_START=1.
+const FIO_CALL_PRE_START: c_int = 1;
+/// The knob value; static lifetime (points into env/argv/comptime memory that
+/// outlives the server — set once in listen(), read once in the callback).
+var static_cache_control_value: []const u8 = "";
+
+fn replaceStaticMaxAge(_: ?*anyopaque) callconv(.c) void {
+    zap.fio.fiobj_free_wrapped(HTTP_HVALUE_MAX_AGE);
+    HTTP_HVALUE_MAX_AGE = zap.fio.fiobj_str_new(static_cache_control_value.ptr, static_cache_control_value.len);
+}
+
 pub const Server = struct {
     app: *app_mod.App,
     host: [:0]const u8,
@@ -101,6 +136,10 @@ pub const Server = struct {
     pub fn listen(self: *Server) !void {
         instance = self;
         var listener = zap.HttpListener.init(.{ .port = self.port, .on_request = onRequest, .on_upgrade = realtime_ws.handleUpgrade, .log = false, .max_body_size = @intCast(self.app.max_upload_size) });
+        if (self.app.static_cache_control) |v| {
+            static_cache_control_value = v;
+            fio_state_callback_add(FIO_CALL_PRE_START, replaceStaticMaxAge, null);
+        }
         try listener.listen();
         std.log.info("zigbase listening on http://{s}:{d}", .{ self.host, self.port });
         realtime_ws.active = true; // reactor about to run; allow broadcast to publish
@@ -175,6 +214,17 @@ fn zapHeaderLookup(p: *anyopaque, name: []const u8) ?[]const u8 {
         return req.getHeader(lower);
     }
     return req.getHeader(name);
+}
+
+/// §A.2 write-back: replace a REQUEST header in facil.io's header hash.
+/// fiobj_hash_set (zap fio.zig:137) dups key+value on insert and frees any replaced
+/// value; it consumes our value reference, and we free our key reference ourselves.
+fn zapHeaderSet(ctx: *anyopaque, name: []const u8, value: []const u8) void {
+    const rp: *zap.Request = @ptrCast(@alignCast(ctx));
+    const key = zap.fio.fiobj_str_new(name.ptr, name.len);
+    const val = zap.fio.fiobj_str_new(value.ptr, value.len);
+    _ = zap.fio.fiobj_hash_set(rp.h.*.headers, key, val);
+    zap.fio.fiobj_free_wrapped(key);
 }
 
 /// Map an HTTP status code to zap's `StatusCode` enum.
@@ -805,6 +855,20 @@ test "guard chain: path_secret AND rate_limit composed on one route" {
     try std.testing.expectEqual(@as(u16, 429), (try dispatchIp(a, &app, "/api/both/open", "5.5.5.5")).status);
 }
 
+/// §B transport: transmit `[offset, offset+len)` of `path` through facil.io's PUBLIC
+/// `http_sendfile(h, fd, length, offset)` extern (zap src/fio.zig:426) — the same fd
+/// primitive `http_sendfile2` itself finishes through, so ZigBase reimplements no
+/// socket/streaming code. facil.io takes ownership of the fd (closes it on every path,
+/// http.c:367-377) and adds Content-Length / Content-Type / Date ONLY-IF-MISSING, so
+/// every header the handler set goes on the wire exactly once (the §B.1 double-header
+/// analysis). The zap handle is consumed on success — mark the request finished so
+/// zap's implicit-response machinery stays quiet.
+fn sendFileRange(r: zap.Request, io: std.Io, path: []const u8, offset: u64, len: u64) !void {
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    if (zap.fio.http_sendfile(r.h, f.handle, len, offset) != 0) return error.SendFile;
+    r.markAsFinished(true);
+}
+
 /// Last-resort raw error envelope, used only when even building the normal ApiError
 /// response fails (allocation failure). Sends a fixed JSON body bypassing the arena.
 fn sendRawEnvelope(r: zap.Request, status: u16, body: []const u8) void {
@@ -840,6 +904,7 @@ fn onRequest(r: zap.Request) !void {
     var zap_req = r;
     ctx.raw_header_ctx = &zap_req;
     ctx.raw_header_fn = zapHeaderLookup;
+    ctx.raw_header_set_fn = zapHeaderSet;
     const multipart_err = try applyMultipart(&ctx);
     const resp = blk: {
         if (multipart_err) |er| break :blk er;
@@ -880,6 +945,7 @@ fn onRequest(r: zap.Request) !void {
                 .routes = self.app.static_routes,
                 .spa_roots = self.app.spa_roots,
                 .spa_marker_enabled = self.app.spa_marker_enabled,
+                .cache_control = self.app.static_cache_control,
             }) catch null) |hit| break :blk hit;
             // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.
             break :blk http.Response{ .status = 404, .body = "not found", .content_type = "text/plain; charset=utf-8" };
@@ -908,10 +974,23 @@ fn onRequest(r: zap.Request) !void {
         }) catch {};
     }
     for (resp.extra_headers) |h| r.setHeader(h.name, h.value) catch {};
-    if (resp.file_path) |path| {
-        r.sendFile(path) catch {
-            sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
-        };
+    if (resp.file) |f| {
+        if (f.len) |len| {
+            // ZigBase-owned plan (record files, §B): status + headers were set above;
+            // Content-Type comes from the handler's Response (facil.io's
+            // add_content_type is set-if-missing, so this value wins, exactly once).
+            r.setHeader("content-type", resp.content_type) catch {};
+            sendFileRange(r, self.app.io, f.path, f.offset, len) catch {
+                // Open failure => the existing 404 raw envelope (unchanged semantics).
+                sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
+            };
+        } else {
+            // Wholesale facil.io delegation (dir-mode static): mime, ETag, 304,
+            // `.gz` sidecar, Range are ALL facil.io's (§A.3) — byte-identical to today.
+            r.sendFile(f.path) catch {
+                sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
+            };
+        }
         return;
     }
     r.setHeader("content-type", resp.content_type) catch {};

@@ -40,6 +40,10 @@ const abilities_mod = @import("authz/abilities.zig");
 const analytics = @import("analytics/analytics.zig");
 const analytics_config = @import("analytics/config.zig");
 const colcache = @import("colcache.zig");
+// Opt-in S3-compatible storage backend (`-Ds3`; §D). A stub type when off — the
+// db.zig:27 postgres pattern — so `DefaultStoragePlugin` below always compiles, and
+// only `-Ds3=true` makes `s3mod.S3Storage` a real, constructible type.
+const s3mod = if (build_options.s3) @import("files/s3.zig") else struct {};
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -84,27 +88,65 @@ fn liveEncryptedCollection(arena: std.mem.Allocator, w: *db.Db) !?[]const u8 {
 // either by supplying their own comptime type implementing the same contract.
 // ============================================================================
 
-/// Default storage plugin: wraps `LocalStorage` rooted at `<data_dir>/storage`,
-/// reproducing the pre-plugin file wiring. Owns the heap-allocated root string.
+/// Default storage plugin, config-driven with no code change to switch backends
+/// (the DefaultMailerPlugin precedent):
+///   1. `cfg.s3_bucket` non-empty AND the binary was built with -Ds3 → `S3Storage`.
+///   2. else → `LocalStorage` rooted at `<data_dir>/storage` (unchanged default).
+/// A stock (no -Ds3) binary with ZIGBASE_S3_BUCKET set warns LOUDLY and falls back
+/// to local — never silent, never fatal (the ZIGBASE_DB_URL postgres:// contract).
 pub const DefaultStoragePlugin = struct {
     gpa: std.mem.Allocator,
     root: []const u8,
-    backend: files_storage.LocalStorage,
+    backend: Backend,
+
+    const Backend = if (build_options.s3) union(enum) {
+        local: files_storage.LocalStorage,
+        s3: s3mod.S3Storage,
+    } else union(enum) {
+        local: files_storage.LocalStorage,
+    };
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !DefaultStoragePlugin {
-        _ = io;
         const root = try std.fmt.allocPrint(gpa, "{s}/storage", .{cfg.data_dir});
-        return .{ .gpa = gpa, .root = root, .backend = files_storage.LocalStorage.init(root) };
+        errdefer gpa.free(root);
+        if (cfg.s3_bucket.len > 0) {
+            if (comptime build_options.s3) {
+                return .{ .gpa = gpa, .root = root, .backend = .{ .s3 = try s3mod.S3Storage.create(gpa, io, cfg) } };
+            } else {
+                std.log.warn(
+                    "ZIGBASE_S3_BUCKET is set but this binary was built without -Ds3; " ++
+                        "falling back to local storage at {s}/storage (build with -Ds3=true to use S3)",
+                    .{cfg.data_dir},
+                );
+            }
+        }
+        return .{ .gpa = gpa, .root = root, .backend = .{ .local = files_storage.LocalStorage.init(root) } };
     }
 
     pub fn interface(self: *DefaultStoragePlugin) files_storage.Storage {
-        return self.backend.storage();
+        switch (self.backend) {
+            inline else => |*b| return b.storage(),
+        }
     }
 
     pub fn deinit(self: *DefaultStoragePlugin) void {
+        if (comptime build_options.s3) {
+            switch (self.backend) {
+                .s3 => |*s| s.deinit(),
+                else => {},
+            }
+        }
         self.gpa.free(self.root);
     }
 };
+
+test "DefaultStoragePlugin: ZIGBASE_S3_BUCKET without -Ds3 warns and falls back to LocalStorage" {
+    if (comptime build_options.s3) return error.SkipZigTest; // this test pins the STOCK binary
+    const a = std.testing.allocator;
+    var p = try DefaultStoragePlugin.create(a, std.testing.io, .{ .data_dir = "/tmp/zb-s3-fallback", .s3_bucket = "prod-bucket" });
+    defer p.deinit();
+    try std.testing.expect(p.backend == .local); // fail-loud (warn), not fatal, not S3
+}
 
 /// Default mailer plugin, config-driven with a fixed precedence and no code
 /// change to switch between backends:
@@ -181,6 +223,15 @@ fn migrationsCoerce(comptime M: type) bool {
         return child == .array and child.array.child == provision.Migration;
     }
     return false;
+}
+
+/// §C.2: one rule for the comptime default AND the runtime override — non-empty,
+/// <= 256 bytes, CR/LF-free (header-injection guard; the value goes on the wire
+/// verbatim as the Cache-Control header value).
+fn validCacheControl(v: []const u8) bool {
+    if (v.len == 0 or v.len > 256) return false;
+    for (v) |c| if (c == '\r' or c == '\n') return false;
+    return true;
 }
 
 /// Comptime grammar check for one `.static_routes` match pattern (issue #183):
@@ -276,7 +327,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -636,6 +687,15 @@ pub fn App(comptime cfg: anytype) type {
                 break :blk .{ .embedded = &final };
             }
             @compileError("static_files: expected .disabled, .{ .dir = \"<path>\" }, or .{ .embedded = &<manifest>.files }");
+        };
+
+        /// §C.2 comptime DEFAULT for the static Cache-Control knob (null = not configured).
+        pub const static_cache_control: ?[]const u8 = blk: {
+            if (!@hasField(@TypeOf(cfg), "static_cache_control")) break :blk null;
+            const v: []const u8 = cfg.static_cache_control;
+            if (!validCacheControl(v))
+                @compileError(".static_cache_control must be a non-empty, CR/LF-free Cache-Control value of at most 256 bytes");
+            break :blk v;
         };
 
         /// Tier-2 comptime static rewrites (issue #183): `.static_routes` lowered into a
@@ -1006,6 +1066,7 @@ pub fn App(comptime cfg: anytype) type {
             .tenancy = tenancy_config,
             .role_ranking = role_ranking,
             .mail = mail_config,
+            .static_cache_control = static_cache_control,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -1167,6 +1228,8 @@ pub const ServeOpts = struct {
     /// Email-subsystem knobs (#154), threaded into `app.mail`. Default `.{}` is fully off
     /// (no verified-sender/suppression enforcement, webhook route disabled).
     mail: mail_cfg.Runtime = .{},
+    /// §C.2: comptime default for the static Cache-Control knob; runtime flag/env override it.
+    static_cache_control: ?[]const u8 = null,
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -1180,16 +1243,19 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     const args = try arena.alloc([]const u8, argv.len);
     for (argv, 0..) |a, i| args[i] = a;
 
-    const cmd = cli.parse(args[1..], .{ .serve_static = std.meta.activeTag(opts.static_mode) == .default }) catch |err| {
+    const cmd = cli.parse(args[1..], .{
+        .serve_static = std.meta.activeTag(opts.static_mode) == .default,
+        .static_cache_control = std.meta.activeTag(opts.static_mode) != .disabled,
+    }) catch |err| {
         std.log.err("argument error: {s}", .{@errorName(err)});
-        printUsage(init.io, std.Io.File.stderr(), std.meta.activeTag(opts.static_mode) == .default);
+        printUsage(init.io, std.Io.File.stderr(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled);
         return;
     };
 
     switch (cmd) {
         .help => |topic| switch (topic) {
-            .top => printUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default),
-            .serve => printServeUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default),
+            .top => printUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled),
+            .serve => printServeUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled),
             .migrate => printMigrateUsage(init.io, std.Io.File.stdout()),
             .rewrap => printRewrapUsage(init.io, std.Io.File.stdout()),
             .superuser_create => printSuperuserUsage(init.io, std.Io.File.stdout()),
@@ -1249,7 +1315,9 @@ fn emit(io: std.Io, file: std.Io.File, comptime fmt: []const u8, args: anytype) 
 /// prefixes, which keeps a multi-section help screen readable.
 /// `show_serve_static` mirrors the parser gate: --serve-static is only listed in
 /// the default comptime mode (in .disabled/.dir/.embedded it's an unknown flag).
-fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool) void {
+/// `show_static_cache_control` mirrors the broader --static-cache-control gate:
+/// available in every mode except `.disabled`.
+fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_static_cache_control: bool) void {
     emit(io, file,
         \\zigbase — a single-binary backend (REST + WebSocket + admin UI)
         \\Docs & source: https://github.com/valthon/zigbase
@@ -1285,6 +1353,10 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool) void {
     if (show_serve_static) emit(io, file,
         \\  --serve-static DIR  Serve static files from DIR at the root path (serve only;
         \\                      available unless the app hardcodes static files at comptime).
+        \\
+    , .{});
+    if (show_static_cache_control) emit(io, file,
+        \\  --static-cache-control V  Cache-Control value for static responses (also ZIGBASE_STATIC_CACHE_CONTROL). [default max-age=3600]
         \\
     , .{});
     emit(io, file,
@@ -1359,7 +1431,7 @@ fn printVersion(io: std.Io, file: std.Io.File) void {
     });
 }
 
-fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool) void {
+fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_static_cache_control: bool) void {
     emit(io, file,
         \\zigbase serve — start the HTTP server (REST API + WebSocket + admin UI at /_/).
         \\
@@ -1380,6 +1452,10 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool) void 
     if (show_serve_static) emit(io, file,
         \\  --serve-static DIR  Serve static files from DIR at the root path (anything
         \\                      not matching /api/, /_/, or custom routes). [default: off]
+        \\
+    , .{});
+    if (show_static_cache_control) emit(io, file,
+        \\  --static-cache-control V  Cache-Control value for static responses (also ZIGBASE_STATIC_CACHE_CONTROL). [default max-age=3600]
         \\
     , .{});
     emit(io, file,
@@ -1479,6 +1555,7 @@ fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.C
     if (sa.http_port) |v| cfg.http_port = v;
     if (sa.data_dir) |v| cfg.data_dir = v;
     if (sa.serve_static) |v| cfg.static_dir = v;
+    if (sa.static_cache_control) |v| cfg.static_cache_control = v;
     // Secure-by-default opt-outs/opt-ins (flags override toward the explicit choice).
     if (sa.insecure_cookies) cfg.cookie_secure = false;
     if (sa.trust_proxy) cfg.trust_proxy = true;
@@ -1865,6 +1942,20 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         else => {},
     }
 
+    // §C.2: flag/env (cfg) wins over the comptime default; unset everywhere = null,
+    // and the PRE_START callback is then never registered — facil.io's stock
+    // max-age=3600 stays byte-identical to today.
+    const static_cc: ?[]const u8 = if (cfg.static_cache_control.len > 0)
+        cfg.static_cache_control
+    else
+        opts.static_cache_control;
+    if (static_cc) |v| {
+        if (!validCacheControl(v)) {
+            std.log.err("refusing to start: ZIGBASE_STATIC_CACHE_CONTROL / --static-cache-control is invalid (empty, longer than 256 bytes, or contains CR/LF)", .{});
+            return error.InvalidStaticCacheControl;
+        }
+    }
+
     // Tier-2 startup validation (issue #183): embedded serve targets were proven at
     // comptime; dir targets are statted here (missing = fatal, like a missing static
     // dir). Routes with NO active source could never serve anything — also fatal.
@@ -1944,6 +2035,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .sentry_dsn = cfg.sentry_dsn,
         .static_source = static_source,
         .static_routes = opts.static_routes,
+        .static_cache_control = static_cc,
         .spa_roots = spa_roots,
         .spa_marker_enabled = opts.enable_spa_marker,
         .pagination = .{

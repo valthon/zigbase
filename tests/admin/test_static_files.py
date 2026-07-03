@@ -312,3 +312,193 @@ def test_spa_marker_root():
             assert st == 200 and "text/html" in _hdr(hdr, "content-type")
         finally:
             proc.terminate(); proc.wait(timeout=10)
+
+
+def test_dir_static_range_seek_forms():
+    """§A.2 pin: bytes=X- and bytes=-n now produce correct 206 BYTES through
+    facil.io (the shim rewrites the request header; facil.io assembles the 206)."""
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
+    with tempfile.TemporaryDirectory() as static, tempfile.TemporaryDirectory() as data:
+        blob = bytes(range(256)) * 4  # 1024 recognizable bytes
+        (pathlib.Path(static) / "clip.bin").write_bytes(blob)
+        port = _free_port()
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--http-port", str(port), "--data-dir", data,
+             "--serve-static", static],
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            _wait_up(f"{base}/api/health")
+            url = f"{base}/clip.bin"
+
+            st, hdr, body = _get(url, {"Range": "bytes=200-"})  # open-ended seek
+            assert st == 206 and body == blob[200:]
+            assert _hdr(hdr, "Content-Range") == "bytes 200-1023/1024"
+            st, _, body = _get(url, {"Range": "bytes=-100"})  # suffix
+            assert st == 206 and body == blob[-100:]
+            st, _, body = _get(url, {"Range": "bytes=100-199"})  # already canonical
+            assert st == 206 and body == blob[100:200]
+            st, hdr, _ = _get(url, {"Range": "bytes=5000-"})  # owned 416
+            assert st == 416 and _hdr(hdr, "Content-Range") == "bytes */1024"
+            st, hdr, body = _get(url)  # plain 200: Vary present, single stock Cache-Control
+            assert st == 200 and body == blob
+            assert _hdr(hdr, "Vary") == "Accept-Encoding"
+            assert (hdr.get_all("Cache-Control") or []) == ["max-age=3600"]
+        finally:
+            proc.terminate(); proc.wait(timeout=5)
+
+
+def test_static_cache_control_knob_flag_env_and_default():
+    """§C.2 pin: --static-cache-control / ZIGBASE_STATIC_CACHE_CONTROL / their
+    precedence (flag > env > the stock facil.io default), single header on the wire."""
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
+
+    def _spin(extra_args, extra_env):
+        static_dir = tempfile.mkdtemp()
+        data_dir = tempfile.mkdtemp()
+        try:
+            (pathlib.Path(static_dir) / "asset.txt").write_text("hello knob")
+            port = _free_port()
+            proc = subprocess.Popen(
+                [str(binary), "serve", "--http-port", str(port), "--data-dir", data_dir,
+                 "--serve-static", static_dir, *extra_args],
+                env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef", **extra_env},
+            )
+            try:
+                base = f"http://127.0.0.1:{port}"
+                _wait_up(f"{base}/api/health")
+                st, hdr, body = _get(f"{base}/asset.txt")
+                assert st == 200 and body == b"hello knob"
+                return hdr.get_all("Cache-Control") or []
+            finally:
+                proc.terminate(); proc.wait(timeout=10)
+        finally:
+            shutil.rmtree(static_dir, ignore_errors=True)
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+    # server A: no knob -> stock facil.io default, single header
+    assert _spin([], {}) == ["max-age=3600"]
+    # server B: --static-cache-control -> exact value, single header
+    assert _spin(["--static-cache-control", "public, max-age=86400, immutable"], {}) == \
+        ["public, max-age=86400, immutable"]
+    # server C: env only (no flag) -> env value on the wire
+    assert _spin([], {"ZIGBASE_STATIC_CACHE_CONTROL": "public, max-age=120"}) == \
+        ["public, max-age=120"]
+    # server D: both -> the FLAG value wins
+    assert _spin(
+        ["--static-cache-control", "public, max-age=999"],
+        {"ZIGBASE_STATIC_CACHE_CONTROL": "public, max-age=1"},
+    ) == ["public, max-age=999"]
+
+
+def test_embedded_static_emits_cache_control_and_range():
+    """§C.2/§B embedded pin: plugins example binary (embedded frontend) — GET an
+    embedded asset emits Cache-Control (max-age=3600 default) + Accept-Ranges: bytes;
+    Range: bytes=0-9 answers 206 with the first 10 bytes; the CRC32 ETag format
+    (quoted 8-hex) is unchanged."""
+    binary = resolve_plugins_binary()
+    if binary is None:
+        pytest.skip("npm not available and no prebuilt plugins binary; cannot build the plugins frontend")
+    with tempfile.TemporaryDirectory() as data:
+        port = _free_port()
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--http-port", str(port), "--data-dir", data],
+            env={
+                **os.environ,
+                "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
+                "ZIGBASE_FIELD_KEY": "plugins-static-test-field-key",
+            },
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            _wait_up(f"{base}/api/health")
+
+            st, hdr, body = _get(f"{base}/")
+            assert st == 200
+            assert (hdr.get_all("Cache-Control") or []) == ["max-age=3600"]
+            assert _hdr(hdr, "Accept-Ranges") == "bytes"
+            etag = _hdr(hdr, "ETag")
+            assert etag and etag.startswith('"') and etag.endswith('"')
+            assert len(etag) == 10  # `"` + 8 hex + `"`
+
+            st, hdr, part = _get(f"{base}/", {"Range": "bytes=0-9"})
+            assert st == 206 and part == body[:10]
+            assert _hdr(hdr, "Content-Range") == f"bytes 0-9/{len(body)}"
+
+            st, _, _ = _get(f"{base}/", {"If-None-Match": etag})
+            assert st == 304
+        finally:
+            proc.terminate(); proc.wait(timeout=10)
+
+
+def test_spa_fallback_shell_no_cache_and_etag():
+    """§C.3 pin: dir server with a '.spa' marker — a deep-link miss gets the shell
+    with Cache-Control: no-cache + a quoted revalidation ETag (304 on repeat); a
+    direct hit on the shell itself (real file, not the fallback) is NOT no-cache."""
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
+    with tempfile.TemporaryDirectory() as static, tempfile.TemporaryDirectory() as data:
+        pub = pathlib.Path(static)
+        (pub / "index.html").write_text("<h1>spa root shell</h1>")
+        (pub / ".spa").write_text("")
+        port = _free_port()
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--http-port", str(port), "--data-dir", data,
+             "--serve-static", static],
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            _wait_up(f"{base}/api/health")
+
+            st, hdr, body = _get(f"{base}/some/deep/client/route")
+            assert st == 200 and b"spa root shell" in body
+            assert _hdr(hdr, "Cache-Control") == "no-cache"
+            etag = _hdr(hdr, "ETag")
+            assert etag and etag.startswith('"') and etag.endswith('"')
+
+            st, _, _ = _get(f"{base}/some/deep/client/route", {"If-None-Match": etag})
+            assert st == 304
+
+            # direct hit on the real file: delegated facil.io path, NOT no-cache
+            st, hdr, _ = _get(f"{base}/index.html")
+            assert st == 200
+            assert _hdr(hdr, "Cache-Control") != "no-cache"
+        finally:
+            proc.terminate(); proc.wait(timeout=10)
+
+
+def test_gz_sidecar_still_served_with_vary():
+    """§A.3 pin: a '<file>.gz' sidecar next to '<file>' is still served verbatim by
+    facil.io on Accept-Encoding: gzip (Content-Encoding: gzip unchanged), and now
+    also carries Vary: Accept-Encoding (shared-cache correctness, added by the
+    Range-normalization shim's size probe)."""
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
+    with tempfile.TemporaryDirectory() as static, tempfile.TemporaryDirectory() as data:
+        pub = pathlib.Path(static)
+        (pub / "big.txt").write_text("plain " * 100)
+        (pub / "big.txt.gz").write_bytes(b"\x1f\x8b" + b"z" * 50)  # sidecar bytes, content irrelevant
+        port = _free_port()
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--http-port", str(port), "--data-dir", data,
+             "--serve-static", static],
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            _wait_up(f"{base}/api/health")
+            url = f"{base}/big.txt"
+
+            st, hdr, body = _get(url, {"Accept-Encoding": "gzip"})
+            assert st == 200
+            assert _hdr(hdr, "Content-Encoding") == "gzip"
+            assert _hdr(hdr, "Vary") == "Accept-Encoding"
+            assert body == b"\x1f\x8b" + b"z" * 50
+
+            # no Accept-Encoding: the base file, no Content-Encoding
+            st, hdr, body = _get(url)
+            assert st == 200
+            assert _hdr(hdr, "Content-Encoding") == ""
+            assert body == (b"plain " * 100)
+        finally:
+            proc.terminate(); proc.wait(timeout=10)

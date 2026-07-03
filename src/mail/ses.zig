@@ -2,15 +2,15 @@
 //! drop-in backend behind `ctx.mail()` like SMTP/Postmark.
 //!
 //! Delivery: POST https://email.<region>.amazonaws.com/v2/email/outbound-emails with a SESv2
-//! `SendEmail` JSON body, signed with AWS SigV4 (see `sigv4.zig`). A 2xx is success; any other
-//! status is an error so retry/terminal policy applies.
+//! `SendEmail` JSON body, signed with AWS SigV4 (see `../aws/sigv4.zig`). A 2xx is success; any
+//! other status is an error so retry/terminal policy applies.
 //!
 //! SECURITY: from/to/subject/reply_to are CRLF/control-char checked before they enter the JSON
 //! body; the request is SigV4-signed over the exact payload bytes, so a tampered body fails at AWS.
 
 const std = @import("std");
 const mailer_mod = @import("mailer.zig");
-const sigv4 = @import("sigv4.zig");
+const sigv4 = @import("../aws/sigv4.zig");
 const http_client = @import("../http_client.zig");
 const clock = @import("../clock.zig");
 
@@ -45,17 +45,21 @@ pub const SesMailer = struct {
         defer alloc.free(body);
 
         const amz_date = amzDate(clock.nowUnix(io));
-        const signed = try sigv4.sign(alloc, .{
+        const payload_hash = try sigv4.sha256Hex(alloc, body);
+        defer alloc.free(payload_hash);
+        const authorization = try sigv4.signRequest(alloc, .{
             .access_key = self.access_key,
             .secret_key = self.secret_key,
             .region = self.region,
+            .service = "ses",
+            .method = "POST",
             .host = host,
             .path = path,
-            .body = body,
+            .headers = &.{.{ .name = "content-type", .value = "application/json" }},
+            .payload_sha256 = payload_hash,
             .amz_date = &amz_date,
         });
-        defer alloc.free(signed.authorization);
-        defer alloc.free(signed.payload_sha256);
+        defer alloc.free(authorization);
 
         var client = http_client.HttpClient{ .alloc = alloc, .io = io };
         const res = try client.request(.{
@@ -64,8 +68,8 @@ pub const SesMailer = struct {
             .headers = &.{
                 .{ .name = "Content-Type", .value = "application/json" },
                 .{ .name = "X-Amz-Date", .value = &amz_date },
-                .{ .name = "X-Amz-Content-Sha256", .value = signed.payload_sha256 },
-                .{ .name = "Authorization", .value = signed.authorization },
+                .{ .name = "X-Amz-Content-Sha256", .value = payload_hash },
+                .{ .name = "Authorization", .value = authorization },
             },
             .body = body,
         });

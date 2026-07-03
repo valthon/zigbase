@@ -21,7 +21,7 @@ configures in code:
    `interface()` (where `self` is stable), then builds a static
    `zigbase.Storage.VTable` with all four methods:
    - `put(ctx, io, col, record_id, filename, bytes)`
-   - `localPath(ctx, alloc, col, record_id, filename) ?[]const u8`
+   - `fetch(ctx, io, alloc, col, record_id, filename) ?[]const u8`
    - `delete(ctx, io, col, record_id, filename)`
    - `deleteRecord(ctx, io, col, record_id)`
 

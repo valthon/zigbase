@@ -78,7 +78,7 @@ const zigbase = @import("zigbase");
 //
 //    The `zigbase.Storage.VTable` has exactly four function pointers:
 //      put(ctx, io, col, record_id, filename, bytes) anyerror!void
-//      localPath(ctx, alloc, col, record_id, filename) anyerror!?[]const u8
+//      fetch(ctx, io, alloc, col, record_id, filename) anyerror!?[]const u8
 //      delete(ctx, io, col, record_id, filename) anyerror!void
 //      deleteRecord(ctx, io, col, record_id) anyerror!void
 // ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ const AuditStorage = struct {
     puts: usize = 0,
     deletes: usize = 0,
     delete_records: usize = 0,
-    local_paths: usize = 0,
+    fetches: usize = 0,
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !AuditStorage {
         _ = io;
@@ -114,7 +114,7 @@ const AuditStorage = struct {
 
     const vtable = zigbase.Storage.VTable{
         .put = auditPut,
-        .localPath = auditLocalPath,
+        .fetch = auditFetch,
         .delete = auditDelete,
         .deleteRecord = auditDeleteRecord,
     };
@@ -135,19 +135,18 @@ const AuditStorage = struct {
         return self.inner.vtable.put(self.inner.ctx, io, col, record_id, filename, bytes);
     }
 
-    fn auditLocalPath(
+    fn auditFetch(
         ctx: *anyopaque,
+        io: std.Io,
         alloc: std.mem.Allocator,
         col: []const u8,
         record_id: []const u8,
         filename: []const u8,
     ) anyerror!?[]const u8 {
         const self: *AuditStorage = @ptrCast(@alignCast(ctx));
-        self.local_paths += 1;
-        std.log.debug("[audit-storage] localPath col={s} id={s} file={s}", .{
-            col, record_id, filename,
-        });
-        return self.inner.vtable.localPath(self.inner.ctx, alloc, col, record_id, filename);
+        self.fetches += 1;
+        std.log.debug("[audit-storage] fetch col={s} id={s} file={s}", .{ col, record_id, filename });
+        return self.inner.vtable.fetch(self.inner.ctx, io, alloc, col, record_id, filename);
     }
 
     fn auditDelete(
