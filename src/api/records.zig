@@ -4,6 +4,7 @@ const app_mod = @import("../app.zig");
 const db = @import("../db.zig");
 const migrations = @import("../migrations.zig");
 const collections = @import("../collections.zig");
+const colcache = @import("../colcache.zig");
 const schema = @import("../schema.zig");
 const records = @import("../records.zig");
 const ApiError = @import("error.zig").ApiError;
@@ -81,9 +82,14 @@ fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     return ApiError.validation(fes).toResponse(ctx.allocator);
 }
 
-fn resolveCollection(ctx: *http.RequestCtx, conn: *db.Db) !?schema.Collection {
-    const name = ctx.param("col") orelse return null;
-    return collections.get(ctx.allocator, conn, name);
+/// Resolve the `:col` route param to its parsed collection via the app's metadata cache
+/// (colcache) — direct DB load when no cache is installed. The returned Lease's `col`
+/// memory is CACHE-OWNED and read-only; callers MUST `defer lease.release()` and must not
+/// retain `col` past the request.
+fn resolveCollection(ctx: *http.RequestCtx, conn: *db.Db) !colcache.Lease {
+    const name = ctx.param("col") orelse return colcache.Lease{ .col = null };
+    const cache = if (ctx.app) |a| a.col_cache else null;
+    return colcache.lease(cache, conn, ctx.allocator, name);
 }
 
 fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value) !http.Response {
@@ -157,7 +163,9 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
-    const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    var col_lease = try resolveCollection(ctx, &r);
+    defer col_lease.release();
+    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rctx = buildContext(ctx, &r, null);
     switch (policy.decide(col, .view, &rctx)) {
@@ -180,7 +188,9 @@ pub fn abilities(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
-    const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    var col_lease = try resolveCollection(ctx, &r);
+    defer col_lease.release();
+    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rctx = buildContext(ctx, &r, null);
     // The record must exist AND be viewable; otherwise 404 (never leak existence).
@@ -223,13 +233,19 @@ fn prepareRecordData(ctx: *http.RequestCtx, col: schema.Collection, existing: ?s
 
 pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
+    // The collection lease must OUTLIVE the reader block below: `col` is borrowed from the
+    // cache entry's arena and used through the whole handler, so it is released only on
+    // return (function-scope defer), never at block exit.
+    var col_lease: colcache.Lease = .{ .col = null };
+    defer col_lease.release();
     // Resolve, plan files, and (for auth collections) hash the password BEFORE acquiring the
     // writer, so the expensive argon2 hash in prepAuthData does NOT run under the global writer
     // lock. The reader is closed before the writer is taken. M2 fix.
     const col, const all, const data2 = blk: {
         var r = try app.pool.acquireReader();
         defer app.pool.releaseReader(&r);
-        const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+        col_lease = try resolveCollection(ctx, &r);
+        const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
         const all = switch (try prepareRecordData(ctx, col, null)) {
             .plan => |p| p,
             .resp => |resp| return resp,
@@ -337,7 +353,9 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    var col_lease = try resolveCollection(ctx, w);
+    defer col_lease.release();
+    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const existing = (try records.get(ctx.allocator, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
 
@@ -445,7 +463,9 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const col = (try resolveCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    var col_lease = try resolveCollection(ctx, w);
+    defer col_lease.release();
+    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const existing = (try records.get(ctx.allocator, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rctx = buildContext(ctx, w, null);
@@ -502,7 +522,9 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
-    const col = (try resolveCollection(ctx, &r)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    var col_lease = try resolveCollection(ctx, &r);
+    defer col_lease.release();
+    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
     const rctx = buildContext(ctx, &r, null);
     var rule_expr: ?[]const u8 = null;
     switch (policy.decide(col, .list, &rctx)) {

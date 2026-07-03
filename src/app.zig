@@ -130,6 +130,11 @@ pub const App = struct {
     memory_pool: ?*anyopaque = null,
     /// Submit an ad-hoc job task for async execution; set by `queue/memory.zig` Pool.install.
     submit_fn: ?*const fn (ctx: *anyopaque, name: []const u8, task: @import("events.zig").JobTask) anyerror!void = null,
+    /// The collection-metadata cache (colcache.zig), installed by serveImpl for the
+    /// SQLite backend only (single-process ⇒ the in-process invalidation contract holds;
+    /// on Postgres another instance could run DDL unseen, so reads stay direct). null =
+    /// uncached (tests/CLI/Postgres) — colcache.lease falls back to a direct load.
+    col_cache: ?*@import("colcache.zig").Cache = null,
 
     /// Submit an ad-hoc job task for async execution on the bounded background pool
     /// (queue/memory.zig Pool — shared with memory-queue jobs). Set by Pool.install in

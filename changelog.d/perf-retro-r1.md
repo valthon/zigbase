@@ -18,6 +18,11 @@
   creates only the tables it needs (2 statements) instead of running the full ~28-table
   migration suite once per subscriber per delete — removing the worst per-event fan-out
   cost on the shared HTTP threads.
+- Collection metadata (the parsed schema consulted by every record API request and every
+  realtime delivery) is now served from a versioned in-process cache invalidated on
+  collection create/update/delete (SQLite backend; Postgres deployments keep direct reads
+  so multi-instance DDL stays coherent) — removing a `_collections` SELECT plus a full
+  schema-JSON parse per request and per realtime fan-out delivery.
 
 ### Internal
 

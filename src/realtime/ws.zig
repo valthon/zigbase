@@ -5,6 +5,7 @@ const App = @import("../app.zig").App;
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
+const colcache = @import("../colcache.zig");
 const records = @import("../records.zig");
 const policy = @import("../policy.zig");
 const pg_bridge = @import("pg_bridge.zig");
@@ -372,7 +373,13 @@ fn onChannelMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, channe
     // was already authorized at subscribe time via `canSubscribe`. This mirrors the
     // `__features` precedent and is strictly scoped to topics that are NOT collections, so a
     // custom-topic delivery can never leak a collection's records.
-    const col = (collections.get(a, &r, t.collection) catch return) orelse {
+    // R1-4: cached metadata — this runs once per SUBSCRIBER per event; the cache removes
+    // the per-delivery `_collections` SELECT + schema-JSON parse (and caches the NEGATIVE
+    // result for custom non-collection topics). Falls back to a direct load when no cache
+    // is installed (tests / Postgres backend).
+    var col_lease = colcache.lease(lc.app.col_cache, &r, a, t.collection) catch return;
+    defer col_lease.release();
+    const col = col_lease.col orelse {
         WS.write(handle, message, true) catch {};
         return;
     };
@@ -502,6 +509,7 @@ fn onRemoteEvent(app: *App, ev: pg_bridge.Event) void {
         return;
     };
     defer app.pool.releaseReader(&r);
+    // per-EVENT (not per-subscriber); left uncached deliberately — see onChannelMessage for the hot path.
     const col = (collections.get(a, &r, ev.collection) catch |e| {
         std.log.err("realtime: remote event dropped (collection lookup failed for {s}): {s}", .{ ev.collection, @errorName(e) });
         return;

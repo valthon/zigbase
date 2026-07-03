@@ -39,6 +39,7 @@ const roles = @import("tenancy/roles.zig");
 const abilities_mod = @import("authz/abilities.zig");
 const analytics = @import("analytics/analytics.zig");
 const analytics_config = @import("analytics/config.zig");
+const colcache = @import("colcache.zig");
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -1970,6 +1971,17 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         // the global default. (null only in tests/CLI that construct App directly.)
         .rate_limiter = &rate_limiter,
     };
+    // Collection-metadata cache (R1-4): SQLite only — single-process, so the in-process
+    // invalidation on the admin DDL endpoints is complete. Postgres multi-instance
+    // deployments skip it (another instance's DDL would be unseen, so reads stay direct).
+    // Declared here (before mem_pool/scheduler) so LIFO tears it down LAST — realtime and
+    // record handlers borrow leases from it until zap stops.
+    var col_cache_inst: ?colcache.Cache = if (db.poolDialect(&pool).kind == .sqlite)
+        colcache.Cache.init(allocator)
+    else
+        null;
+    defer if (col_cache_inst) |*c| c.deinit();
+    if (col_cache_inst) |*c| app.col_cache = c;
     // Loud startup warning for the captcha dev-bypass: a configured provider with an empty
     // secret silently passes EVERY verifyCaptcha (the dev-bypass), a prod footgun. Mirrors
     // the `@public`-rule startup warning so operators catch it before deploying.
