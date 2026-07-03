@@ -14,6 +14,10 @@
   enqueued job: jobs run on a small fixed worker pool with a bounded ring. Overflow
   returns `error.QueueFull` instead of unbounded thread creation, so enqueue bursts can
   no longer exhaust threads or address space.
+- Realtime delete fan-out: the per-subscriber authorization sandbox for delete events now
+  creates only the tables it needs (2 statements) instead of running the full ~28-table
+  migration suite once per subscriber per delete — removing the worst per-event fan-out
+  cost on the shared HTTP threads.
 
 ### Internal
 

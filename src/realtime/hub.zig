@@ -95,7 +95,8 @@ pub fn shouldDeliver(
 }
 
 /// Evaluate `rule` against a single deleted-record `snapshot` (F4). Builds a throwaway in-memory
-/// DB, recreates `col`'s table, inserts ONLY the snapshot row (id + its stored columns preserved
+/// DB (a MINIMAL schema: just the _collections registry — R1-3), recreates `col`'s table, inserts
+/// ONLY the snapshot row (id + its stored columns preserved
 /// verbatim), and runs the standard guarded SELECT. Reuses the exact rule machinery without
 /// touching the (now row-less) live DB. Relation-traversing rules resolve against empty target
 /// tables in the temp DB and therefore won't match — a conservative (deny) failure for delete
@@ -129,7 +130,15 @@ fn matchesSnapshot(
     if (snapshot != .object) return false;
     var tmp = try db.Db.openMemory();
     defer tmp.close();
-    try migrations.run(&tmp);
+    // R1-3: the sandbox needs ONLY the `_collections` registry (+ its `options` column) —
+    // collections.create below reads and writes it — plus the one collection table that
+    // create() builds. The full migration suite (~28 CREATE TABLEs) ran here before, ONCE
+    // PER SUBSCRIBER PER DELETE EVENT: the dominant fan-out cost. Semantics are unchanged:
+    // tenancy/ability predicates compile to columns on the target table + bound params,
+    // and relation-traversing rules already resolved against an EMPTY `_collections`
+    // (conservative deny) because user collections were never present in the sandbox.
+    try tmp.exec(migrations.collections_table_sql);
+    try tmp.exec(migrations.collections_options_column_sql);
     // Recreate the collection table (fresh id; we never persist relation FKs, so an isolated
     // schema is enough to evaluate column/macro comparisons).
     var spec = col;
@@ -489,4 +498,17 @@ test "F4: delete frame carries the private authz snapshot (stripped before clien
     try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"owner\":\"u1\"") != null);
     // (onChannelMessage strips delete_snapshot_key and re-serializes an id-only frame before
     // WS.write, so the client never sees the snapshot — covered by the hub authz tests above.)
+}
+
+test "R1-3: delete sandbox schema is minimal — 2 DDLs, not the migration suite" {
+    var tmp = try db.Db.openMemory();
+    defer tmp.close();
+    try tmp.exec(migrations.collections_table_sql);
+    try tmp.exec(migrations.collections_options_column_sql);
+    var st = try tmp.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    // Exactly the _collections registry. This pins the per-subscriber-per-delete cost:
+    // the full suite (migrations.run) creates dozens of tables; the sandbox needs one.
+    try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
 }
