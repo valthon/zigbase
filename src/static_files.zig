@@ -112,7 +112,9 @@ fn opaqueTag(tag: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, tag, "W/")) tag[2..] else tag;
 }
 
-fn etagMatches(if_none_match: []const u8, etag: []const u8) bool {
+/// True when the request's If-None-Match matches this entity tag ("*" or exact; RFC 7232
+/// weak comparison). Also used by the embedded admin SPA (admin.zig).
+pub fn etagMatches(if_none_match: []const u8, etag: []const u8) bool {
     if (if_none_match.len == 0) return false;
     if (std.mem.eql(u8, if_none_match, "*")) return true;
     // RFC 7232 §3.2: If-None-Match MUST use the weak comparison function —
