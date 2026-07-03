@@ -177,6 +177,30 @@ Record endpoints operate on a collection by name (`:col`).
 
 Access to each operation is governed by the collection's [access rules](#access-rules).
 
+### Update: changing a password on an auth collection
+
+A `PATCH` on an **auth** collection's record that includes a `password` field is a
+self-service password change, gated on top of the normal update rule:
+
+- **Non-superusers must also send a verifying `oldPassword`.** A wrong `oldPassword`, a
+  missing `oldPassword`, an unknown record, or a target record with no password set
+  (passwordless — e.g. OAuth2-only) all return the **same** login-identical
+  `400 {"message":"Invalid credentials."}` — the failure modes are indistinguishable by
+  design, so the endpoint can't be used to probe which accounts have a password.
+  Passwordless accounts cannot bootstrap a password via `PATCH`; use the password-reset
+  email flow or a superuser update instead.
+- **Superusers are exempt** from the `oldPassword` check (and from its rate limit — see
+  [Rate limiting](#rate-limiting)).
+- On a successful **self-change** (the caller is the record being updated), the response
+  sets fresh `zb_auth`/`zb_csrf` cookies — the JSON body itself stays the plain updated
+  record.
+- Every other outstanding session for the record is invalidated (the same guarantee as
+  `confirm-password-reset`).
+
+This rides the record `beforeUpdate`/`afterUpdate` hooks plus the `.auth`
+`beforePasswordChange`/`afterPasswordChange` lifecycle hooks — see
+[Framework → Auth lifecycle hooks](./framework#auth-lifecycle-hooks-register--logout--refresh--password-change).
+
 ### List: query parameters
 
 The list endpoint supports two pagination styles: **offset** (`page`/`perPage`) and
@@ -719,9 +743,12 @@ See [Framework §6](./framework#6-auth--file--lifecycle-events) for the
 ### Rate limiting
 
 The sensitive auth endpoints — `auth-with-password` (login), `request-verification`,
-`request-password-reset`, and all `auth/:method/initiate` / `auth/:method/complete`
-endpoints — are rate limited. Over the limit, the endpoint returns **`429
-Too Many Requests`** (`{ "message": "Too many requests. Try again later." }`).
+`request-password-reset`, password change (`PATCH …/records/:id` with a `password`, scope
+`pwchange`), and all `auth/:method/initiate` / `auth/:method/complete` endpoints — are rate
+limited. Over the limit, the endpoint returns **`429 Too Many Requests`**
+(`{ "message": "Too many requests. Try again later." }`). Password change shares the same
+global `ZIGBASE_RATE_LIMIT_MAX`/`ZIGBASE_RATE_LIMIT_WINDOW` budget as `login`/`verify`/`reset`
+(it isn't a `.auth.methods` entry, so it has no per-method override); superusers bypass it.
 
 Per-method rate-limit behavior is configured in `.auth.methods` via the `rate_limit` field (`.default` | `.off` | `.{ .custom = .{ .max, .window_s } }`). See [Framework §6](./framework#6-auth--file--lifecycle-events).
 

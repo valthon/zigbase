@@ -29,10 +29,12 @@ const GenTokenError = @typeInfo(@typeInfo(@TypeOf(crypto.genToken)).@"fn".return
 pub const AuthError = error{ PasswordTooShort, IdentityTaken } || db.DbError || std.mem.Allocator.Error || HashPasswordError || GenTokenError;
 
 /// Fields the server fully controls; they must NEVER be copied from client-supplied data.
-/// `password` is hashed server-side; `passwordHash`/`tokenKey` are set by the server; `verified`
-/// changes only via the confirm-verification endpoint.
+/// `password` is hashed server-side; `oldPassword` is a REQUEST-CONTROL field (verified by
+/// the PATCH handler, never stored); `passwordHash`/`tokenKey` are set by the server;
+/// `verified` changes only via the confirm-verification endpoint.
 fn isServerManagedField(name: []const u8) bool {
-    return std.mem.eql(u8, name, "password") or std.mem.eql(u8, name, "passwordHash") or
+    return std.mem.eql(u8, name, "password") or std.mem.eql(u8, name, "oldPassword") or
+        std.mem.eql(u8, name, "passwordHash") or
         std.mem.eql(u8, name, "tokenKey") or std.mem.eql(u8, name, "verified");
 }
 

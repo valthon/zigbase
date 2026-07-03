@@ -20,6 +20,9 @@ const api_auth = @import("auth.zig");
 const realtime_ws = @import("../realtime/ws.zig");
 const file_plan = @import("../files/plan.zig");
 const events = @import("../events.zig");
+const crypto = @import("../crypto.zig");
+const jwt = @import("../jwt.zig");
+const ratelimit = @import("../ratelimit.zig");
 
 /// Fire a record lifecycle event. `before_*` errors propagate (caller rolls back via the
 /// normal records path); `after_*` errors route to the error backstop and are swallowed.
@@ -140,6 +143,25 @@ fn prepAuthData(ctx: *http.RequestCtx, col: schema.Collection, data: std.json.Va
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.BadPassword, // PasswordTooShort and rare hashing/token failures -> bad request
     };
+}
+
+/// Peek the request body for the auth-collection password-change control fields WITHOUT
+/// running the full prepare pipeline (this runs on a READER, before the writer is taken).
+/// Multipart form fields are verbatim strings; JSON bodies are parsed fresh (the later
+/// prepareRecordData parse is unaffected — double-parsing only happens on auth PATCHes).
+const PwFields = struct { password: ?[]const u8 = null, old: ?[]const u8 = null };
+
+fn peekPasswordFields(ctx: *http.RequestCtx) ?PwFields {
+    const raw = if (ctx.form_fields) |ff| ff else (std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch return null).value;
+    if (raw != .object) return .{};
+    var out = PwFields{};
+    if (raw.object.get("password")) |v| if (v == .string) {
+        out.password = v.string;
+    };
+    if (raw.object.get("oldPassword")) |v| if (v == .string and v.string.len > 0) {
+        out.old = v.string;
+    };
+    return out;
 }
 
 /// Write the planned uploads for `record_id` via Storage, then delete replaced/removed files.
@@ -351,6 +373,54 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
 
 pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
+    // F1 password-change gate (spec §F1). When an AUTH-collection PATCH carries a
+    // `password`, authorize the change BEFORE the writer is acquired:
+    //   1. deny_locked updateRule → 403 first (the normal rule gate, spec ladder step 1);
+    //   2. rate-limit scope "pwchange" (global limiter budget, per client IP falling back
+    //      to the target identity) BEFORE any argon2 work;
+    //   3. non-superusers must present a verifying `oldPassword` (argon2 on the READER —
+    //      never serialize writes behind argon2). Wrong/missing `oldPassword`, a missing
+    //      target, or a passwordless target (no/empty passwordHash) are all the
+    //      login-identical `400 "Invalid credentials."` with dummyVerify timing padding
+    //      (non-oracle: none of the branches is distinguishable by body or time).
+    // Superusers bypass `oldPassword` AND the pwchange limiter (admin reset).
+    // Consequence (deliberate): only the record owner or a superuser can change a
+    // password, regardless of how permissive updateRule is.
+    var pw_change = false; // this PATCH changes an auth record's password
+    var self_change = false; // ...and the caller IS the target record (keep-this-device)
+    {
+        var gate_r = try app.pool.acquireReader();
+        defer app.pool.releaseReader(&gate_r);
+        var gate_lease = try resolveCollection(ctx, &gate_r);
+        defer gate_lease.release();
+        const gcol = gate_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
+        if (gcol.type == .auth) {
+            const grid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
+            const pf = peekPasswordFields(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+            if (pf.password != null) {
+                pw_change = true;
+                const grctx = buildContext(ctx, &gate_r, null);
+                if (policy.decide(gcol, .update, &grctx) == .deny_locked) return forbidden(ctx);
+                if (grctx.auth) |au| {
+                    const aid = if (au == .object) (if (au.object.get("id")) |v| (if (v == .string) v.string else "") else "") else "";
+                    self_change = std.mem.eql(u8, grctx.collection, gcol.name) and std.mem.eql(u8, aid, grid);
+                }
+                if (!grctx.is_superuser) {
+                    if (try api_auth.rateLimited(ctx, "pwchange", grid)) |resp| return resp;
+                    const phc = try api_auth.passwordHashFor(ctx.allocator, &gate_r, gcol.name, grid);
+                    const opw = pf.old;
+                    if (phc == null or phc.?.len == 0 or opw == null) {
+                        // Missing target / passwordless target / missing oldPassword: run the
+                        // identity-independent argon2 padding so timing can't distinguish them.
+                        crypto.dummyVerify(app.io, ctx.allocator);
+                        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
+                    }
+                    if (!crypto.verifyPassword(app.io, ctx.allocator, phc.?, opw.?))
+                        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
+                }
+            }
+        }
+    }
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     var col_lease = try resolveCollection(ctx, w);
@@ -401,6 +471,18 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         return hookRejected(ctx);
     };
 
+    // #98 on the PATCH path (spec §F1): `beforePasswordChange` fires ONLY when the prepared
+    // data contains a password change, INSIDE the update transaction, with a READ-ONLY
+    // pre-change snapshot. Abort ⇒ rollback ⇒ password unchanged (fail closed), mapped via
+    // the Ctx error model — identical contract to confirm-password-reset.
+    if (col.type == .auth and pw_change) {
+        var snap = existing;
+        if (try api_auth.fireAuthLifecycleBefore(ctx, w, col.name, rid, .before_password_change, &snap, existing)) |resp| {
+            w.rollback() catch {};
+            return resp;
+        }
+    }
+
     // Write new file bytes BEFORE the DB update so a storage failure can't leave dangling refs.
     if (ctx.app.?.storage) |storage| {
         var written: usize = 0;
@@ -446,16 +528,46 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
             return ApiError.notFound().toResponse(ctx.allocator);
         }
     }
+    // Password changed ⇒ applyUpdate rotated `tokenKey` (every outstanding token dies in
+    // BOTH session modes). Table mode additionally purges the target's `_sessions` rows
+    // INSIDE the txn so no zombie rows outlive the rotation until GC.
+    if (col.type == .auth and pw_change and app.session_store == .table)
+        try api_auth.deleteSessionsForPrincipal(w, col.name, rid);
     try w.commit();
 
     // Side effects AFTER commit: drop replaced files, fire file/after-update hooks, broadcast.
     if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch {};
     emitFileUploads(app, &rctx, col.name, rid, all.writes);
+    // Self-service password change: "keep this device, log out everywhere else". The old
+    // token (incl. the caller's) died with the tokenKey rotation; re-issue ONE fresh session
+    // for the authenticated owner under the NEW key (the writer is still held — table mode
+    // inserts the single fresh `_sessions` row). Travels ONLY via Set-Cookie: the JSON body
+    // stays the plain updated record (stable SDK update() return type). NO onAuth — this is
+    // not a login. Bearer-token clients re-authenticate (the SDK helper does so). Admin
+    // change (non-self): no re-issue; every target session stays dead.
+    var pw_cookies: []const http.Cookie = &.{};
+    if (col.type == .auth and pw_change and self_change) {
+        if (api_auth.issueSessionNoEmit(ctx, w, col.name, rid)) |issued| {
+            pw_cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
+        } else |e| {
+            // Degraded, not fatal: the password IS changed; the caller just has to log in again.
+            std.log.warn("password-change re-issue failed ({s}); caller must re-authenticate", .{@errorName(e)});
+        }
+    }
     // Capture id BEFORE the after-hook so a hook that mutates/removes "id" can't panic the broadcast.
     const broadcast_id = ur.object.get("id").?.string;
     var ur_mut = ur;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &ur_mut, .after_update) catch {};
+    // #98: afterPasswordChange AFTER the record after-hooks (notify-only, post-commit).
+    if (col.type == .auth and pw_change) {
+        var snap2 = ur_mut;
+        api_auth.emitAuthLifecycle(ctx, w, col.name, rid, .after_password_change, &snap2, ur_mut);
+    }
     realtime_ws.broadcast(app, col, .update, broadcast_id, ur_mut, null);
+    if (pw_cookies.len > 0) {
+        const body = try std.json.Stringify.valueAlloc(ctx.allocator, ur_mut, .{});
+        return .{ .status = 200, .content_type = "application/json", .body = body, .cookies = pw_cookies };
+    }
     return jsonResponse(ctx, 200, ur_mut);
 }
 
@@ -1503,4 +1615,364 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
         try std.testing.expectEqual(@as(u16, 200), res.status);
         try std.testing.expectEqual(@as(usize, 1), TenantHooks.before_update_calls);
     }
+}
+
+// ---- F1: self-service password change via PATCH /records (spec §F1) -------
+
+/// Minimal fixture for the F1 tests: an auth collection `users` with
+/// `updateRule = "@request.auth.id = id"` (owner-only, matching the brief), one seeded
+/// user, and helpers to mint owner/superuser bearer tokens and read columns back directly.
+const F1Env = struct {
+    tmp: std.testing.TmpDir,
+    pool: db.Pool,
+    app: app_mod.App,
+    arena: std.heap.ArenaAllocator,
+    user_id: []const u8 = "",
+
+    fn init(dispatch: ?*const events.Dispatch) !*F1Env {
+        return F1Env.initWithMinLen(dispatch, 8);
+    }
+
+    /// Same as `init`, but lets a test override the `users` collection's
+    /// `minPasswordLength` (e.g. 0, to exercise the min_len==0 password-change gate).
+    fn initWithMinLen(dispatch: ?*const events.Dispatch, min_len: u8) !*F1Env {
+        const env = try std.testing.allocator.create(F1Env);
+        env.tmp = std.testing.tmpDir(.{});
+        const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(dir);
+        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/f1.db", .{dir}, 0);
+        defer std.testing.allocator.free(path);
+        env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
+        env.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        const a = env.arena.allocator();
+        {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            try migrations.run(w);
+            _ = try collections.create(a, std.testing.io, w, .{
+                .id = "", .name = "users", .type = .auth,
+                .fields = &.{},
+                .listRule = "@public", .viewRule = "@public", .createRule = "@public",
+                .updateRule = "@request.auth.id = id", .deleteRule = "@public",
+                .options = .{ .auth = .{ .minPasswordLength = min_len } },
+            });
+        }
+        env.app = .{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = &env.pool, .dispatch = dispatch };
+        env.user_id = "";
+        return env;
+    }
+
+    fn deinit(env: *F1Env) void {
+        env.arena.deinit();
+        env.pool.deinit();
+        env.tmp.cleanup();
+        std.testing.allocator.destroy(env);
+    }
+
+    /// Create a user (password optional — pass "" for a passwordless target) and stash its id.
+    fn createUser(env: *F1Env, email: []const u8, password: []const u8) ![]const u8 {
+        const a = env.arena.allocator();
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const col = (try collections.get(a, w, "users")).?;
+        var ud: std.json.ObjectMap = .empty;
+        try ud.put(a, "email", .{ .string = email });
+        if (password.len > 0) try ud.put(a, "password", .{ .string = password });
+        const prepared = try auth.applyProvision(std.testing.io, a, .{ .object = ud }, col.options.auth.minPasswordLength);
+        const rec = try records.create(a, std.testing.io, w, col, prepared);
+        const rid = try a.dupe(u8, rec.object.get("id").?.string);
+        env.user_id = rid;
+        return rid;
+    }
+
+    /// Mint an owner (regular `.auth`) bearer for `rid`, reading its current tokenKey.
+    fn mintOwnerBearer(env: *F1Env, rid: []const u8) ![]const u8 {
+        const a = env.arena.allocator();
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const tk = (try api_auth.tokenKeyFor(a, w, "users", rid)).?;
+        var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &env.app };
+        const tok = try api_auth.mintToken(&mintctx, w, "users", rid, tk, .auth, 100000, "");
+        return try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    }
+
+    /// Mint a `_superusers` bearer (raw INSERT + mintToken; no register/login endpoint needed).
+    fn mintSuperuserBearer(env: *F1Env) ![]const u8 {
+        const a = env.arena.allocator();
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("INSERT INTO \"_superusers\" (\"id\",\"created\",\"updated\",\"email\",\"username\",\"passwordHash\",\"tokenKey\",\"verified\") VALUES ('su1','','','admin@x.io','','','sutk',1);");
+        var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &env.app };
+        const tok = try api_auth.mintToken(&mintctx, w, "_superusers", "su1", "sutk", .auth, 100000, "");
+        return try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    }
+
+    fn passwordHash(env: *F1Env, rid: []const u8) ![]const u8 {
+        const a = env.arena.allocator();
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        return (try api_auth.passwordHashFor(a, &r, "users", rid)) orelse "";
+    }
+
+    fn tokenKey(env: *F1Env, rid: []const u8) ![]const u8 {
+        const a = env.arena.allocator();
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        return (try api_auth.tokenKeyFor(a, &r, "users", rid)).?;
+    }
+
+    fn sessionCountFor(env: *F1Env, rid: []const u8) !i64 {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        var st = try r.prepare("SELECT COUNT(*) FROM \"_sessions\" WHERE \"collectionRef\" = 'users' AND \"recordRef\" = ?1;");
+        defer st.finalize();
+        try st.bindText(1, rid);
+        _ = try st.step();
+        return st.columnInt(0);
+    }
+
+    fn sessionIds(env: *F1Env, rid: []const u8) ![][]const u8 {
+        const a = env.arena.allocator();
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        var st = try r.prepare("SELECT \"id\" FROM \"_sessions\" WHERE \"collectionRef\" = 'users' AND \"recordRef\" = ?1;");
+        defer st.finalize();
+        try st.bindText(1, rid);
+        var out: std.ArrayList([]const u8) = .empty;
+        while (try st.step()) try out.append(a, try a.dupe(u8, st.columnText(0)));
+        return out.toOwnedSlice(a);
+    }
+};
+
+fn patchCtx(env: *F1Env, a: std.mem.Allocator, rid: []const u8, bearer: []const u8, body: []const u8) http.RequestCtx {
+    const params = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "id", .value = rid } };
+    const dup_params = a.dupe(http.Param, &params) catch unreachable;
+    return .{ .method = .PATCH, .path = "/", .body = body, .allocator = a, .app = &env.app, .params = dup_params, .authorization = bearer };
+}
+
+test "F1 PATCH+password: owner with correct oldPassword -> 200, hash replaced, tokenKey rotated, fresh cookies" {
+    var env = try F1Env.init(null);
+    defer env.deinit();
+    const a = env.arena.allocator();
+    const rid = try env.createUser("owner@x.io", "oldpassword1");
+    const bearer = try env.mintOwnerBearer(rid);
+    const old_hash = try env.passwordHash(rid);
+    const old_tk = try env.tokenKey(rid);
+
+    var uctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
+    const res = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqual(@as(usize, 2), res.cookies.len);
+    for (res.cookies) |c| try std.testing.expect(c.value.len > 0);
+
+    const new_hash = try env.passwordHash(rid);
+    const new_tk = try env.tokenKey(rid);
+    try std.testing.expect(!std.mem.eql(u8, old_hash, new_hash));
+    try std.testing.expect(!std.mem.eql(u8, old_tk, new_tk));
+
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "passwordHash") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "tokenKey") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "oldPassword") == null);
+
+    // The OLD bearer no longer authenticates: tokenKey rotated invalidates the signature check.
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    const old_tok = uctx.bearerToken().?;
+    try std.testing.expect(auth.verifyToken(a, &env.app, &r, old_tok) == null);
+}
+
+test "F1 PATCH+password: wrong and missing oldPassword -> login-identical 400, nothing changed" {
+    var env = try F1Env.init(null);
+    defer env.deinit();
+    const a = env.arena.allocator();
+    const rid = try env.createUser("owner2@x.io", "oldpassword1");
+    const bearer = try env.mintOwnerBearer(rid);
+    const before_hash = try env.passwordHash(rid);
+
+    var wctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"wrongpassword\"}");
+    const wres = try update(&wctx);
+    try std.testing.expectEqual(@as(u16, 400), wres.status);
+    try std.testing.expect(std.mem.indexOf(u8, wres.body, "Invalid credentials.") != null);
+    try std.testing.expectEqual(@as(usize, 0), wres.cookies.len);
+
+    var mctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\"}");
+    const mres = try update(&mctx);
+    try std.testing.expectEqual(@as(u16, 400), mres.status);
+    try std.testing.expect(std.mem.indexOf(u8, mres.body, "Invalid credentials.") != null);
+    try std.testing.expectEqual(@as(usize, 0), mres.cookies.len);
+
+    try std.testing.expectEqualStrings(before_hash, try env.passwordHash(rid));
+}
+
+test "F1 PATCH+password: superuser bypasses oldPassword; target's sessions all die; NO re-issue cookies" {
+    var env = try F1Env.init(null);
+    defer env.deinit();
+    const a = env.arena.allocator();
+    const rid = try env.createUser("target@x.io", "originalpw1");
+    const su_bearer = try env.mintSuperuserBearer();
+
+    var uctx = patchCtx(env, a, rid, su_bearer, "{\"password\":\"adminreset1\"}");
+    const res = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqual(@as(usize, 0), res.cookies.len);
+
+    // The user's old tokenKey is gone (rotated); a fresh owner bearer minted with the NEW
+    // tokenKey works, proving the new password/hash landed.
+    const new_hash = try env.passwordHash(rid);
+    try std.testing.expect(crypto.verifyPassword(std.testing.io, a, new_hash, "adminreset1"));
+}
+
+test "F1 PATCH+password: passwordless target -> 400 for non-superuser (no password bootstrap via PATCH)" {
+    var env = try F1Env.init(null);
+    defer env.deinit();
+    const a = env.arena.allocator();
+    const rid = try env.createUser("nopass@x.io", ""); // no password field at all
+    // The target has no session/tokenKey-based bearer (never logged in); mint one anyway via the
+    // stored (empty) tokenKey — required only to reach the update() handler as "self".
+    const bearer = try env.mintOwnerBearer(rid);
+
+    var uctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"anything12\"}");
+    const res = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 400), res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "Invalid credentials.") != null);
+}
+
+const PwChangeHooks = struct {
+    var before_calls: usize = 0;
+    fn abortBeforePasswordChange(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
+        _ = ev;
+        before_calls += 1;
+        return ctx.fail(403, "password change blocked by policy");
+    }
+};
+
+test "F1 PATCH+password: aborting beforePasswordChange leaves password + tokenKey unchanged" {
+    PwChangeHooks.before_calls = 0;
+    const dispatch = events.Dispatch{ .auth_lifecycle = events.buildAuthLifecycleDispatcher(.{ .beforePasswordChange = PwChangeHooks.abortBeforePasswordChange }) };
+    var env = try F1Env.init(&dispatch);
+    defer env.deinit();
+    const a = env.arena.allocator();
+    const rid = try env.createUser("abort@x.io", "oldpassword1");
+    const bearer = try env.mintOwnerBearer(rid);
+    const before_hash = try env.passwordHash(rid);
+    const before_tk = try env.tokenKey(rid);
+
+    var uctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
+    const res = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 403), res.status);
+    try std.testing.expectEqual(@as(usize, 1), PwChangeHooks.before_calls);
+
+    try std.testing.expectEqualStrings(before_hash, try env.passwordHash(rid));
+    try std.testing.expectEqualStrings(before_tk, try env.tokenKey(rid));
+
+    // Old bearer is still valid (tokenKey wasn't rotated — the txn rolled back).
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    const old_tok = uctx.bearerToken().?;
+    try std.testing.expect(auth.verifyToken(a, &env.app, &r, old_tok) != null);
+}
+
+test "F1 PATCH+password: .table mode purges old rows in-txn and re-issues exactly one fresh row" {
+    var env = try F1Env.init(null);
+    defer env.deinit();
+    env.app.session_store = .table;
+    const a = env.arena.allocator();
+    const rid = try env.createUser("tablemode@x.io", "oldpassword1");
+
+    // Log in twice (two `_sessions` rows) via issueSession directly (owner tokenKey read fresh
+    // each time — password unchanged between the two logins).
+    var lctx1 = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &env.app };
+    var lctx2 = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &env.app };
+    const issued1 = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try api_auth.issueSessionNoEmit(&lctx1, w, "users", rid);
+    };
+    const issued2 = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try api_auth.issueSessionNoEmit(&lctx2, w, "users", rid);
+    };
+    _ = issued1;
+    try std.testing.expectEqual(@as(i64, 2), try env.sessionCountFor(rid));
+
+    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{issued2.token});
+    var uctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
+    const res = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqual(@as(usize, 2), res.cookies.len);
+
+    try std.testing.expectEqual(@as(i64, 1), try env.sessionCountFor(rid));
+    const ids = try env.sessionIds(rid);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+
+    var new_token: []const u8 = "";
+    for (res.cookies) |c| if (std.mem.eql(u8, c.name, "zb_auth")) {
+        new_token = c.value;
+    };
+    try std.testing.expect(new_token.len > 0);
+    const claims = try jwt.peekClaims(a, new_token);
+    try std.testing.expectEqualStrings(ids[0], claims.sid.?);
+}
+
+test "F1 PATCH+password: 'pwchange' rate limit 429s BEFORE any argon2/verify work" {
+    var env = try F1Env.init(null);
+    defer env.deinit();
+    var rl = ratelimit.RateLimiter.init(std.testing.allocator, 1, 3600);
+    defer rl.deinit();
+    env.app.rate_limiter = &rl;
+    const a = env.arena.allocator();
+    const rid = try env.createUser("limited@x.io", "oldpassword1");
+    const bearer = try env.mintOwnerBearer(rid);
+
+    // First PATCH (wrong oldPassword) consumes the single pwchange budget slot -> 400.
+    var c1 = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"wrongpassword\"}");
+    const r1 = try update(&c1);
+    try std.testing.expectEqual(@as(u16, 400), r1.status);
+
+    // Second PATCH (even with the CORRECT oldPassword) -> 429, proving the limiter fires
+    // before argon2 verification runs (a correct password would otherwise succeed).
+    var c2 = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
+    const r2 = try update(&c2);
+    try std.testing.expectEqual(@as(u16, 429), r2.status);
+    try std.testing.expect(std.mem.indexOf(u8, r2.body, "Too many requests") != null);
+
+    // A non-password PATCH on the same collection/record is NOT limited (scope isolation:
+    // "pwchange" is a distinct bucket from any other scope).
+    var c3 = patchCtx(env, a, rid, bearer, "{\"email\":\"limited2@x.io\"}");
+    const r3 = try update(&c3);
+    try std.testing.expectEqual(@as(u16, 200), r3.status);
+}
+
+// Security fast-follow (Task 2 review, Low): with minPasswordLength == 0, applyUpdate
+// accepts an empty-string password (`0 < 0` is false), so peekPasswordFields must still
+// flag `pw_change` on ANY present string password — including "" — or a {"password":""}
+// PATCH bypasses the whole gate (rate limit, oldPassword verify, hook, session purge)
+// while still resetting the password and rotating tokenKey.
+test "F1 PATCH+password: minPasswordLength=0 still gates an empty-string password change" {
+    var env = try F1Env.initWithMinLen(null, 0);
+    defer env.deinit();
+    const a = env.arena.allocator();
+    const rid = try env.createUser("zerolen@x.io", "oldpassword1");
+    const bearer = try env.mintOwnerBearer(rid);
+    const before_hash = try env.passwordHash(rid);
+    const before_tk = try env.tokenKey(rid);
+
+    // Without oldPassword: the gate must fire (pw_change=true) and reject with the
+    // login-identical 400, leaving the password/tokenKey untouched.
+    var uctx = patchCtx(env, a, rid, bearer, "{\"password\":\"\"}");
+    const res = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 400), res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "Invalid credentials.") != null);
+    try std.testing.expectEqual(@as(usize, 0), res.cookies.len);
+    try std.testing.expectEqualStrings(before_hash, try env.passwordHash(rid));
+    try std.testing.expectEqualStrings(before_tk, try env.tokenKey(rid));
+
+    // With the correct oldPassword, the gate passes and applyUpdate's min_len==0 check
+    // (harmlessly) accepts the empty password.
+    var uctx2 = patchCtx(env, a, rid, bearer, "{\"password\":\"\",\"oldPassword\":\"oldpassword1\"}");
+    const res2 = try update(&uctx2);
+    try std.testing.expectEqual(@as(u16, 200), res2.status);
+    try std.testing.expect(!std.mem.eql(u8, before_hash, try env.passwordHash(rid)));
+    try std.testing.expect(!std.mem.eql(u8, before_tk, try env.tokenKey(rid)));
 }

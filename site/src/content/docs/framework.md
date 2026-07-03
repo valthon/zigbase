@@ -1476,7 +1476,7 @@ and unchanged.
 | `register` | record create for an **auth** collection (`POST /api/collections/:col/records`) | ✅ (mutate the new account) | ✅ (in the create txn) | abort rolls back → **no account created** |
 | `logout` | `POST /api/collections/:col/auth-logout` | ✅ (bound writer) | — (no write txn) | abort → mapped response, **cookies not cleared** |
 | `refresh` | `POST /api/collections/:col/auth-refresh` | ✅ | ✅ | abort rolls back → **no new session** |
-| `password-change` | `POST /api/collections/:col/confirm-password-reset` | ✅ | ✅ | abort rolls back → **password unchanged, reset token un-consumed** |
+| `password-change` | `POST /api/collections/:col/confirm-password-reset` **and** `PATCH …/records/:id` with a `password` (non-superusers must also send a verifying `oldPassword`) | ✅ | ✅ | abort rolls back → **password unchanged** (reset token un-consumed, on the reset-confirm path) |
 
 Semantics, consistent across phases:
 
@@ -1498,6 +1498,9 @@ Semantics, consistent across phases:
   `before_register` exposes a writable record.)
 - `logout` keeps a no-writer fast path: it only resolves the caller and acquires the writer
   when an `.auth` hook is actually registered (an empty `.auth = .{}` installs nothing).
+- On the `PATCH /records/:id` password-change path, `beforePasswordChange` runs **inside**
+  the update transaction, **after** the record's own `beforeUpdate` hooks — so a record hook
+  can still veto the write first, and the auth hook sees the already-validated patch.
 
 ```zig
 // Seed a profile row atomically with the new account.
@@ -1509,11 +1512,12 @@ fn seedProfile(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerr
 }
 ```
 
-**Deferred (designed, not wired):** self-service password change via `PATCH /records`
-(use the record `beforeUpdate`/`afterUpdate` hooks on the auth collection), and firing
-`beforeAuthSuccess` on the legacy `/auth-with-password` / `/auth-refresh` endpoints. (The
-`ctx.auth()` refresh / rotate / revoke session verbs **are** wired — see [§6 Session
-verbs](#ctxauth--session-management).) See the auth-lifecycle-hooks design spec.
+Both formerly-deferred items are now wired (0.10.0): self-service password change rides
+`PATCH /records` (see the lifecycle table above — the `password-change` hooks fire there
+too, and the endpoint enforces `oldPassword` for non-superusers), and `beforeAuthSuccess`
+fires on the legacy `/auth-with-password` / `/auth-refresh` endpoints (tag `.password` /
+`.refresh`). The `ctx.auth()` session verbs also gained a REST surface — see [§6 Session
+verbs](#ctxauth--session-management).
 
 ### Auth methods overview
 

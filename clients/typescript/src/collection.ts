@@ -143,6 +143,26 @@ export class CollectionService {
     });
   }
 
+  /**
+   * Change an auth record's password via `PATCH /records/:id` with `{ password, oldPassword }`
+   * (requires ZigBase >= 0.10.0). The server verifies `oldPassword` against the TARGET record
+   * (superusers are exempt) and rotates its tokenKey — every outstanding session dies. For a
+   * self-change the server re-issues THIS device's session via Set-Cookie (cookie mode needs
+   * nothing else); this helper additionally re-runs `authWithPassword` with the stored identity
+   * and the new password when the store's principal IS the target, so bearer-token clients stay
+   * logged in too (a harmless extra login in cookie mode). Wrong/missing `oldPassword` rejects
+   * with the login-identical 400 "Invalid credentials." (non-oracle). `oldPassword` also passes
+   * through plain `update()` for callers who want the raw record response.
+   */
+  async changePassword(id: string, oldPassword: string, newPassword: string): Promise<void> {
+    await this.update(id, { password: newPassword, oldPassword });
+    const rec = this.authStore.record as Record<string, unknown> | null;
+    const identity = (rec?.["email"] ?? rec?.["username"]) as string | undefined;
+    if (rec?.["id"] === id && identity) {
+      await this.authWithPassword(identity, newPassword);
+    }
+  }
+
   /** `/api/collections/<name>/records` */
   private recordsBase(): string {
     return `${this.base()}/records`;
