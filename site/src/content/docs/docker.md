@@ -11,7 +11,7 @@ ZigBase has no native Windows build (the embedded HTTP server depends on facil.i
 Linux/macOS only). The official Docker image, `ghcr.io/valthon/zigbase`, is the supported
 path for Windows-hardware users and for anyone who prefers a Docker-first self-host
 workflow on Linux/macOS too. It ships the same static-musl binary as the
-[release tarballs](https://github.com/valthon/zigbase#quickstart-run-the-binary) — no in-image compilation, no extra runtime deps.
+[release tarballs](https://valthon.github.io/zigbase/download#binaries) — no in-image compilation, no extra runtime deps.
 
 ## Quick start
 
@@ -109,19 +109,21 @@ is **not** an HTTP readiness check. Prefer an orchestrator-native HTTP probe aga
 - `X.Y.Z` — an exact release, e.g. `ghcr.io/valthon/zigbase:0.13.0`.
 - `X.Y` / `X` — rolling aliases that track the newest patch/minor within that line.
 
-Pin to `X.Y.Z` for reproducible deployments.
+Pin to `X.Y.Z` for reproducible deployments. Images are published to `ghcr.io/valthon/zigbase`
+(GitHub Container Registry) with no separate registration step required — pull them like any
+other public image.
 
 ## What's NOT in the image
 
 No shell, no package manager, no Zig toolchain, no build tools — you cannot `docker exec
 … sh` into it. Use `docker exec … /zigbase <subcommand>` for `superuser create`,
 `migrate`, etc. If you need a debugging shell, `docker cp` files out or run the same
-binary from a [release tarball](https://github.com/valthon/zigbase#quickstart-run-the-binary) locally instead.
+binary from a [release tarball](https://valthon.github.io/zigbase/download#binaries) locally instead.
 
 ## See also
 
 - [Configuration](./configuration) — the full environment-variable reference.
-- The [README's Security section](https://github.com/valthon/zigbase#security) — what's safe to change and what
-  isn't.
+- [Configuration — Security](https://valthon.github.io/zigbase/docs/configuration#security) — what's safe to
+  change and what isn't (mirrors the README's Security section).
 - [Known limitations](./known-limitations) — no native Windows build; Docker is the
   supported path there.

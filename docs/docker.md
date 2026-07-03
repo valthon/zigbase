@@ -104,7 +104,9 @@ is **not** an HTTP readiness check. Prefer an orchestrator-native HTTP probe aga
 - `X.Y.Z` — an exact release, e.g. `ghcr.io/valthon/zigbase:0.13.0`.
 - `X.Y` / `X` — rolling aliases that track the newest patch/minor within that line.
 
-Pin to `X.Y.Z` for reproducible deployments.
+Pin to `X.Y.Z` for reproducible deployments. Images are published to `ghcr.io/valthon/zigbase`
+(GitHub Container Registry) with no separate registration step required — pull them like any
+other public image.
 
 ## What's NOT in the image
 
