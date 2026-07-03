@@ -241,6 +241,14 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   that reference them get validated at compile time.
 - **Risk:** Medium — rule-language surface growth; migration of existing rules. Keep backward compatible.
 - **Depends on / ordering:** After the query/rule placeholder layer is stable. Pairs with A5 scopes.
+- **Status: deferred, by choice.** Equality-composition already works today with zero rule-grammar
+  growth — put a `role` select field on the auth collection and reference it via
+  `@request.auth.role = "editor"` (see [recipes.md → Global roles with a select
+  field](recipes.md#recipe-global-roles-with-a-select-field-no-framework-rbac)). Per-account roles ship an
+  ordered ladder via the tenancy system (`_memberships.role`, `@request.account.role`,
+  `.abilities.min_role`). What's still missing is a **global** ordered comparison (`role >= editor`
+  outside a tenancy scope) — that needs the rule-grammar growth this idea flags as its risk.
+  Revisit post-1.0 if the select-field recipe proves insufficient in practice.
 
 #### A8. More OAuth providers + generic OIDC — **Effort S each / M for generic, Risk Low, Parity**
 - **What:** Apple, GitLab, Twitch, Facebook, etc., plus a **generic OIDC** provider configured by

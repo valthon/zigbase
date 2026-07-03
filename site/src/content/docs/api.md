@@ -709,7 +709,9 @@ registered in your `App(.{ .onAuth = ... })`. This is the single chokepoint for
 cross-cutting session logic (audit logging, account-state checks, etc.). There is no
 path through ZigBase's session-issuance machinery that bypasses it.
 
-`AuthEvent.method` is an enum: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`, or `.custom` for custom plugins.
+`AuthEvent.method` is an enum: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`,
+`.custom` for custom plugins, or `.refresh` for `auth-refresh` (previously mislabeled
+`.password`).
 
 See [Framework §6](./framework#6-auth--file--lifecycle-events) for the
 `zigbase.auth` helper surface and the seam guarantee.

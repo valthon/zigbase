@@ -1398,7 +1398,7 @@ One handler each, registered by the matching config key:
 | `onFeatureExposure` | `fn (ev: *zigbase.ExposureEvent) void` | Notify-only, each time a declared flag/experiment is resolved. Zero-cost when unset. See [Exposure events](#exposure-events-onfeatureexposure). |
 
 `AuthEvent` carries `app`, `ctx`, `collection`, `record: ?std.json.Value`, and `method`
-(`.password` | `.oauth2` | `.magic_link` | `.otp` | `.webauthn` | `.custom`). `FileEvent` carries `app`, `ctx`, `collection`,
+(`.password` | `.oauth2` | `.magic_link` | `.otp` | `.webauthn` | `.custom` | `.refresh`). `FileEvent` carries `app`, `ctx`, `collection`,
 `record_id`, and `filename`. `LifecycleEvent` carries `app`.
 
 ### Auth lifecycle (`beforeAuthSuccess`)
@@ -1434,11 +1434,16 @@ Guarantees:
   reflects the just-authenticated principal.
 
 Where it fires: the unified `POST /api/collections/:col/auth/:method/complete` endpoint
-(password / otp / webauthn / oauth2 / custom) and the magic-link
-`GET …/auth/magic_link/consume` link. The legacy `/auth-with-password` and `/auth-refresh`
-endpoints do not fire `beforeAuthSuccess`. `onAuth` still fires once, after issuance, as
-before. The surrounding lifecycle phases (register / logout / refresh / password-change)
-have their own before/after hooks — see below.
+(password / otp / webauthn / oauth2 / custom), the magic-link `GET …/auth/magic_link/consume`
+link, and — since 0.10.0 — the legacy `POST …/auth-with-password` (tag `.password`) and
+`POST …/auth-refresh` (tag `.refresh`, in the same transaction as `beforeRefresh`, lifecycle
+phase first). **This includes `_superusers`: the admin SPA logs in through
+`_superusers/auth-with-password`, so a hook that errors unconditionally will lock superusers
+out of the admin UI.** That is deliberate fail-closed behavior; recovery is fixing the hook
+and rebuilding (hooks are comptime-compiled — operator == developer). `onAuth` still fires
+once, after issuance; on refresh it now reports `.refresh` (previously mislabeled `.password`).
+The surrounding lifecycle phases (register / logout / refresh / password-change) have their
+own before/after hooks — see below.
 
 ### Auth lifecycle hooks (register / logout / refresh / password-change)
 

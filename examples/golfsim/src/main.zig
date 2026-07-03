@@ -741,7 +741,7 @@ fn isoFromEpoch(alloc: std.mem.Allocator, secs: i64) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Auth lifecycle (#80 + #86)
+// Auth lifecycle (#80 + #86 + auth round 2)
 // ---------------------------------------------------------------------------
 
 /// `beforeAuthSuccess` hook: runs INSIDE the login transaction, AFTER the
@@ -751,6 +751,12 @@ fn isoFromEpoch(alloc: std.mem.Allocator, secs: i64) ![]u8 {
 /// with the session. Returning an error would roll this write back AND block the
 /// login (fail closed): the canonical use is "claim anonymous records on first
 /// login" / "deny a banned account".
+///
+/// Since auth round 2 (0.10.0), this ALSO fires on the legacy `/auth-with-password`
+/// (`ev.method == .password`) and `/auth-refresh` (`ev.method == .refresh`) endpoints —
+/// not just the unified `.../auth/:method/complete` flows — so this one hook now covers
+/// every session-issuing path, including refreshes. We log the method alongside the
+/// counter bump as a lightweight audit trail.
 fn bumpLoginCount(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!void {
     const prev: i64 = if (ev.record.object.get("loginCount")) |v| switch (v) {
         .integer => |i| i,
@@ -760,6 +766,7 @@ fn bumpLoginCount(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyer
     try patch.put(ctx.arena, "loginCount", .{ .integer = prev + 1 });
     // ctx.records() reuses the bound transaction connection (do NOT call ctx.tx here).
     _ = try ctx.records().update(ev.collection, ev.record_id, .{ .object = patch });
+    std.log.info("auth: {s}/{s} via .{s} (login #{d})", .{ ev.collection, ev.record_id, @tagName(ev.method), prev + 1 });
 }
 
 /// `beforeRegister` hook (#98): runs INSIDE the account-create transaction, before the

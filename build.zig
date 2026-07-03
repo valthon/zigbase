@@ -126,6 +126,21 @@ pub fn build(b: *std.Build) void {
     const dating_srv_step = b.step("dating-server", "Build the dating fixture as a runnable server");
     dating_srv_step.dependOn(&b.addInstallArtifact(dating_srv_exe, .{}).step);
 
+    // --- auth2-server: the auth-round-2 e2e fixture as a runnable server ----------
+    // Table-mode sessions + a registered beforeAuthSuccess hook, so the browser suite
+    // can drive the legacy login paths (including _superusers) and per-device session
+    // REST against a real server. Links libc (facil.io C deps).
+    const auth2_srv_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/auth2/schema.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    auth2_srv_mod.addImport("zigbase", zigbase_mod);
+    const auth2_srv_exe = b.addExecutable(.{ .name = "auth2-server", .root_module = auth2_srv_mod });
+    const auth2_srv_step = b.step("auth2-server", "Build the auth-round-2 e2e fixture server (table sessions + beforeAuthSuccess)");
+    auth2_srv_step.dependOn(&b.addInstallArtifact(auth2_srv_exe, .{}).step);
+
     // Unit tests run against the library module (where all internal test{} live).
     const tests = b.addTest(.{ .root_module = zigbase_mod });
     const run_tests = b.addRunArtifact(tests);

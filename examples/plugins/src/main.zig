@@ -363,8 +363,8 @@ fn handleError(ev: *zigbase.ErrorEvent) void {
 //   commenters -> magic_link (emailed link)
 //
 // `ev.method` is a `zigbase.events.AuthMethod` enum (password/oauth2/magic_link/
-// otp/webauthn/custom). `ev.record` is ?std.json.Value -- null only for OAuth2
-// provider-unknown paths. Extract the record id via `.object.get("id")`.
+// otp/webauthn/custom/refresh). `ev.record` is ?std.json.Value -- null only for
+// OAuth2 provider-unknown paths. Extract the record id via `.object.get("id")`.
 // ---------------------------------------------------------------------------
 fn handleAuth(ev: *zigbase.AuthEvent) void {
     const method_name = switch (ev.method) {
@@ -374,6 +374,7 @@ fn handleAuth(ev: *zigbase.AuthEvent) void {
         .otp => "otp",
         .webauthn => "webauthn",
         .custom => "custom",
+        .refresh => "refresh",
     };
     const record_id = if (ev.record) |r|
         if (r.object.get("id")) |v| switch (v) {

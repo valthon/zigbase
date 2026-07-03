@@ -57,6 +57,8 @@ jobs:
         run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
       - name: Build dating-server (e2e fixture binary)
         run: mise exec zig@0.16.0 -- zig build dating-server -Dcpu=baseline
+      - name: Build auth2-server (e2e fixture binary)
+        run: mise exec zig@0.16.0 -- zig build auth2-server -Dcpu=baseline
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
@@ -73,6 +75,7 @@ jobs:
           path: |
             zig-out/bin/zigbase
             zig-out/bin/dating-server
+            zig-out/bin/auth2-server
             examples/blog/zig-out/bin/blog
             examples/golfsim/zig-out/bin/golfsim
             examples/plugins/zig-out/bin/plugins
@@ -302,9 +305,11 @@ jobs:
       - name: Export prebuilt binary paths
         run: |
           chmod +x artifacts/zig-out/bin/zigbase \
+                   artifacts/zig-out/bin/auth2-server \
                    artifacts/examples/blog/zig-out/bin/blog \
                    artifacts/examples/plugins/zig-out/bin/plugins
           echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_AUTH2_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/auth2-server" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_BLOG_BINARY=$GITHUB_WORKSPACE/artifacts/examples/blog/zig-out/bin/blog" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
       - name: Install Python test deps + resolve Playwright version
@@ -344,11 +349,13 @@ jobs:
         run: |
           chmod +x artifacts/zig-out/bin/zigbase \
                    artifacts/zig-out/bin/dating-server \
+                   artifacts/zig-out/bin/auth2-server \
                    artifacts/examples/golfsim/zig-out/bin/golfsim \
                    artifacts/examples/blog/zig-out/bin/blog \
                    artifacts/examples/plugins/zig-out/bin/plugins
           echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_DATING_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/dating-server" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_AUTH2_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/auth2-server" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_GOLFSIM_BINARY=$GITHUB_WORKSPACE/artifacts/examples/golfsim/zig-out/bin/golfsim" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_BLOG_BINARY=$GITHUB_WORKSPACE/artifacts/examples/blog/zig-out/bin/blog" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"

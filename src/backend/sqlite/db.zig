@@ -326,6 +326,9 @@ pub const Pool = struct {
     // at startup (serveImpl) and stamped onto every acquired connection so the records
     // value layer can transparently encrypt/decrypt encrypted fields. See db.Db.field_cipher.
     field_cipher: ?*const anyopaque = null,
+    /// Observability/test counter: total successful writer acquisitions. Lets tests pin
+    /// zero-writer fast paths (e.g. the hook-free epoch login) without deadlock-style probes.
+    writer_acquires: usize = 0,
 
     /// Open a pool with the default warm-reader cap (16) and page-cache budget. Thin
     /// wrapper over `initOpts` kept for the many call sites (tests/CLI) that don't tune.
@@ -410,6 +413,7 @@ pub const Pool = struct {
     /// the writer connection. Caller MUST call releaseWriter() when done.
     pub fn acquireWriter(self: *Pool) *Db {
         self.writer_mutex.lockUncancelable(self.io);
+        self.writer_acquires += 1;
         self.writer.field_cipher = self.field_cipher;
         return &self.writer;
     }

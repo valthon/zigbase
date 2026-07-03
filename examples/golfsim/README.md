@@ -526,9 +526,12 @@ To test locally:
 
 - **`beforeAuthSuccess` / `bumpLoginCount`** — runs *inside* the login transaction, after
   credentials are verified but before the session is issued. It reads the current
-  `loginCount` off `ev.record` and increments it via `ctx.records().update(...)`. The
-  write commits atomically with the session — returning an error here rolls it back AND
-  blocks the login.
+  `loginCount` off `ev.record` and increments it via `ctx.records().update(...)`, then logs
+  the auth method as a lightweight audit trail. The write commits atomically with the
+  session — returning an error here rolls it back AND blocks the login. Since auth round 2
+  (0.10.0) this hook also fires on the legacy `/auth-with-password` and `/auth-refresh`
+  endpoints, so `ev.method` can be `.password`, `.refresh`, or any other enabled method —
+  one hook covers every session-issuing path.
 - **`.auth.beforeRegister` / `seedNewUser`** — runs inside the account-create
   transaction before the row is inserted. Seeds `loginCount = 0` so the field is
   initialized at signup rather than only on the first login. Returning an error aborts
