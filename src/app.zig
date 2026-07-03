@@ -126,9 +126,11 @@ pub const App = struct {
     scheduler: ?*anyopaque = null,
     /// Type-erased pointer to the running memory-queue worker Pool (`queue/memory.zig`),
     /// set by `Pool.install` in serveImpl; null = not serving (tests/CLI). Memory-backend
-    /// `ctx.enqueue` jobs and `app.submit` tasks run on this bounded, shutdown-joined pool.
+    /// `ctx.enqueue` jobs run on this bounded, shutdown-joined pool. `app.submit` does NOT
+    /// yet route through it — see the hazard note on `Pool.install` — that lands in Task 4
+    /// together with the `App.submit` body fix below.
     memory_pool: ?*anyopaque = null,
-    /// Submit an ad-hoc job task for async execution; set by Scheduler.start. Task 5 wires App.submit().
+    /// Submit an ad-hoc job task for async execution; set by Scheduler.start. Task 4 wires App.submit().
     submit_fn: ?*const fn (ctx: *anyopaque, name: []const u8, task: @import("events.zig").JobTask) anyerror!void = null,
 
     /// Offload an ad-hoc background task onto the scheduler (runs off the request thread).

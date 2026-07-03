@@ -3,12 +3,14 @@
 //! with in-process backoff retry. AT-MOST-ONCE across restart — an enqueued memory job
 //! lives only in RAM, so a crash drops it. The ring is bounded: when it is full, enqueue
 //! returns error.QueueFull instead of blocking (a blocking policy could deadlock when a
-//! handler enqueues from a pool worker) or spawning unbounded threads. `app.submit` tasks
-//! ride the same pool (see Pool.submitThunk). A retrying job holds one worker for the
-//! whole backoff — size retry policies accordingly; use a `durable` queue when a job MUST
-//! survive a restart or for sustained high-volume work. Without an installed pool (unit
-//! tests / CLI helpers) enqueue runs the job INLINE, synchronously — deterministic for
-//! tests, and no code path spawns detached threads anymore.
+//! handler enqueues from a pool worker) or spawning unbounded threads. `Pool.submitThunk`
+//! is ready to carry `app.submit` tasks on this same pool, but is not yet wired onto
+//! `app.submit_fn` (Task 4 does that, together with fixing `App.submit`'s body — see the
+//! hazard note on `Pool.install`). A retrying job holds one worker for the whole backoff —
+//! size retry policies accordingly; use a `durable` queue when a job MUST survive a
+//! restart or for sustained high-volume work. Without an installed pool (unit tests / CLI
+//! helpers) enqueue runs the job INLINE, synchronously — deterministic for tests, and no
+//! code path spawns detached threads anymore.
 
 const std = @import("std");
 const queue = @import("queue.zig");
@@ -120,15 +122,28 @@ pub const Pool = struct {
         return .{ .app = app };
     }
 
-    /// Route this app's memory-queue jobs AND `app.submit` through this pool.
-    /// Call once, before serving; pair with `stop()` at shutdown.
+    /// Route this app's memory-queue jobs through this pool. Call once, before serving;
+    /// pair with `stop()` at shutdown.
+    ///
+    /// HAZARD (Task 3/4 sequencing — resolved once Task 4 lands): this deliberately does
+    /// NOT set `app.submit_fn`. `App.submit` (app.zig) still does
+    /// `f(self.scheduler.?, name, task)` — it passes the *Scheduler* pointer, not a *Pool*
+    /// pointer. If `install()` armed `app.submit_fn = &submitThunk` here, any live
+    /// `app.submit(...)` call before Task 4 rewires `App.submit` to pass
+    /// `self.memory_pool.?` would hand `submitThunk` a `*Scheduler` mis-cast as `*Pool` —
+    /// silent memory corruption, not a compile error (both are `?*anyopaque`). Task 4 is
+    /// the ONLY commit that may set `app.submit_fn = &submitThunk` (from `install()` or
+    /// elsewhere) — it lands together with the `App.submit` body fix in the same task, so
+    /// the two can never be observed out of sync. Do not backport that wiring here.
     pub fn install(self: *Pool, app: *App) void {
         app.memory_pool = self;
-        app.submit_fn = &submitThunk;
     }
 
     /// Reject new pushes, let the workers DRAIN the remaining ring, join them, and
-    /// uninstall from the app. Idempotent; safe when no worker was ever spawned.
+    /// uninstall from the app. Idempotent; safe when no worker was ever spawned. After this
+    /// returns, `app.memory_pool` is null again, so any subsequent `enqueue(app, ...)` call
+    /// falls back to running the job INLINE, synchronously (the same path unit tests/CLI use
+    /// when no pool was ever installed) rather than being silently dropped.
     pub fn stop(self: *Pool) void {
         self.shutdown.store(true, .release);
         self.lockPool();
@@ -138,9 +153,15 @@ pub const Pool = struct {
         for (self.workers[0..n]) |t| t.join();
         if (self.app.memory_pool == @as(?*anyopaque, @ptrCast(self))) {
             self.app.memory_pool = null;
-            self.app.submit_fn = null;
         }
-        // Free anything a failed spawn stranded in the ring (drain normally empties it).
+        // Final safety drain — NOT for a failed spawn (a spawn that returns 0 workers never
+        // reaches `started = true`, so nothing is pushed against it). The real race this
+        // guards: `push()` re-checks `shutdown` under the lock, so a caller can win that
+        // lock in the narrow window between our `shutdown.store` becoming visible and our
+        // taking the lock above, observe `shutdown == false`, and push a task AFTER we've
+        // already snapshotted `n`/joined (or are about to join) every worker. No worker is
+        // left polling to dequeue that task, so it would strand in the ring forever. This
+        // second lock+drain after the join catches and frees any such straggler.
         self.lockPool();
         while (self.dequeue()) |t| t.destroy();
         self.unlockPool();
@@ -204,9 +225,11 @@ pub const Pool = struct {
         }
     }
 
-    /// `app.submit` entry point (wired by install() onto app.submit_fn). Copies `name`
-    /// (the caller's slice may be request-arena-backed and dead before the task runs —
-    /// the old detached-thread code captured it unsafely).
+    /// `app.submit` entry point — signature matches `app.submit_fn`, but `install()`
+    /// deliberately does NOT wire it onto `app.submit_fn` yet (see the hazard note on
+    /// `install()`); Task 4 does that wiring together with the `App.submit` body fix.
+    /// Copies `name` (the caller's slice may be request-arena-backed and dead before the
+    /// task runs — the old detached-thread code captured it unsafely).
     pub fn submitThunk(ptr: *anyopaque, name: []const u8, task: events.JobTask) anyerror!void {
         const self: *Pool = @ptrCast(@alignCast(ptr));
         const t = try self.app.allocator.create(Task);
@@ -255,21 +278,27 @@ const sentry = @import("../sentry.zig");
 
 fn noopSink(_: []const u8) void {}
 
-var m_runs: usize = 0;
+// `m_runs` is incremented by `okH`/`flakyH`, which the pool tests below run concurrently
+// from up to `Pool.num_workers` worker threads — a plain `usize` here flaked (non-atomic
+// RMW lost updates) 2/9 local suite runs. Use an atomic counter with `.monotonic`
+// ordering (we only need a correct final count after `pool.stop()` joins every worker,
+// not any inter-thread visibility of intermediate values).
+var m_runs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+// `m_fail_until`/`m_err` are only touched by the single-threaded, non-pool
+// `runWithRetry` tests (no concurrent workers), so plain counters are fine.
 var m_fail_until: usize = 0;
 var m_err: usize = 0;
-var m_last_payload: []const u8 = "";
 
 fn okH(ctx: *Ctx, payload: []const u8) anyerror!void {
     _ = ctx;
-    m_runs += 1;
-    m_last_payload = payload;
+    _ = payload;
+    _ = m_runs.fetchAdd(1, .monotonic);
 }
 fn flakyH(ctx: *Ctx, payload: []const u8) anyerror!void {
     _ = ctx;
     _ = payload;
-    m_runs += 1;
-    if (m_runs <= m_fail_until) return error.Flaky;
+    const n = m_runs.fetchAdd(1, .monotonic) + 1;
+    if (n <= m_fail_until) return error.Flaky;
 }
 fn onErrM(ev: *events.ErrorEvent) void {
     _ = ev;
@@ -281,24 +310,24 @@ fn testApp() App {
 }
 
 test "memory runWithRetry succeeds on first attempt" {
-    m_runs = 0;
+    m_runs.store(0, .monotonic);
     var app = testApp();
     const out = runWithRetry(&app, okH, "{}", .{ .max_attempts = 3, .base_ms = 0, .jitter = false });
     try testing.expectEqual(Outcome.done, out);
-    try testing.expectEqual(@as(usize, 1), m_runs);
+    try testing.expectEqual(@as(usize, 1), m_runs.load(.monotonic));
 }
 
 test "memory runWithRetry retries then succeeds" {
-    m_runs = 0;
+    m_runs.store(0, .monotonic);
     m_fail_until = 2; // first two attempts fail, third succeeds
     var app = testApp();
     const out = runWithRetry(&app, flakyH, "{}", .{ .max_attempts = 5, .base_ms = 0, .jitter = false });
     try testing.expectEqual(Outcome.done, out);
-    try testing.expectEqual(@as(usize, 3), m_runs);
+    try testing.expectEqual(@as(usize, 3), m_runs.load(.monotonic));
 }
 
 test "memory runWithRetry exhausts attempts -> failed + onError" {
-    m_runs = 0;
+    m_runs.store(0, .monotonic);
     m_err = 0;
     m_fail_until = 100; // always fail
     sentry.log_sink = noopSink; // swallow the intentional terminal-failure log
@@ -308,7 +337,7 @@ test "memory runWithRetry exhausts attempts -> failed + onError" {
     app.dispatch = &dispatch;
     const out = runWithRetry(&app, flakyH, "{}", .{ .max_attempts = 3, .base_ms = 0, .jitter = false });
     try testing.expectEqual(Outcome.failed, out);
-    try testing.expectEqual(@as(usize, 3), m_runs);
+    try testing.expectEqual(@as(usize, 3), m_runs.load(.monotonic));
     try testing.expectEqual(@as(usize, 1), m_err);
 }
 
@@ -324,19 +353,19 @@ fn blockingH(ctx: *Ctx, payload: []const u8) anyerror!void {
 }
 
 test "pool runs enqueued jobs and stop() drains the ring + joins the workers" {
-    m_runs = 0;
+    m_runs.store(0, .monotonic);
     var app = testApp();
     var pool = Pool.init(&app);
     pool.install(&app);
     const def = QueueDef{ .name = "default", .backend = .memory, .retry = .{ .base_ms = 0, .jitter = false } };
     for (0..8) |_| try enqueue(&app, def, okH, "{}");
     pool.stop(); // drains + joins => deterministic, no spin-wait needed
-    try testing.expectEqual(@as(usize, 8), m_runs);
+    try testing.expectEqual(@as(usize, 8), m_runs.load(.monotonic));
     try testing.expect(app.memory_pool == null); // uninstalled
 }
 
 test "pool overflow: full ring rejects with error.QueueFull (burst does not spawn threads per job)" {
-    m_runs = 0;
+    m_runs.store(0, .monotonic);
     g_gate.store(false, .monotonic);
     g_blocked.store(0, .monotonic);
     var app = testApp();
@@ -355,7 +384,7 @@ test "pool overflow: full ring rejects with error.QueueFull (burst does not spaw
     try testing.expectError(error.QueueFull, enqueue(&app, def, okH, "{}"));
     g_gate.store(true, .release);
     pool.stop(); // drain: all capacity fillers run
-    try testing.expectEqual(@as(usize, Pool.capacity), m_runs);
+    try testing.expectEqual(@as(usize, Pool.capacity), m_runs.load(.monotonic));
 }
 
 test "submitThunk routes app.submit tasks through the pool (name copied, joined at stop)" {
@@ -381,9 +410,55 @@ test "submitThunk routes app.submit tasks through the pool (name copied, joined 
 }
 
 test "enqueue with no installed pool runs inline (unit-test/CLI fallback)" {
-    m_runs = 0;
+    m_runs.store(0, .monotonic);
     var app = testApp();
     const def = QueueDef{ .name = "default", .backend = .memory, .retry = .{ .base_ms = 0, .jitter = false } };
     try enqueue(&app, def, okH, "{}");
-    try testing.expectEqual(@as(usize, 1), m_runs); // ran synchronously, no thread
+    try testing.expectEqual(@as(usize, 1), m_runs.load(.monotonic)); // ran synchronously, no thread
+}
+
+/// State for the worker-context-enqueue test: a job running ON a pool worker calls
+/// `enqueue` again (into the same pool), records whether it returned `ok`/`error.QueueFull`
+/// via `outer_result`, then signals `outer_done` — the test thread waits on that latch
+/// (no sleep-as-sync) before asserting.
+var outer_done = std.atomic.Value(bool).init(false);
+var outer_result: WorkerEnqueueResult = .not_run;
+const WorkerEnqueueResult = enum { not_run, ok, queue_full, other_error };
+
+fn innerH(ctx: *Ctx, payload: []const u8) anyerror!void {
+    _ = ctx;
+    _ = payload;
+}
+
+/// Runs ON a pool worker: enqueues `innerH` back into the SAME app/pool and records
+/// whether that inner `enqueue` call returned promptly rather than blocking.
+fn outerH(ctx: *Ctx, payload: []const u8) anyerror!void {
+    _ = payload;
+    const def = QueueDef{ .name = "default", .backend = .memory, .retry = .{ .base_ms = 0, .jitter = false } };
+    if (enqueue(ctx.app, def, innerH, "{}")) |_| {
+        outer_result = .ok;
+    } else |e| {
+        outer_result = if (e == error.QueueFull) .queue_full else .other_error;
+    }
+    outer_done.store(true, .release);
+}
+
+test "enqueue from INSIDE a pool worker returns promptly (reject-not-block, no self-deadlock)" {
+    outer_done.store(false, .monotonic);
+    outer_result = .not_run;
+    var app = testApp();
+    var pool = Pool.init(&app);
+    pool.install(&app);
+    const def = QueueDef{ .name = "default", .backend = .memory, .retry = .{ .base_ms = 0, .jitter = false } };
+    try enqueue(&app, def, outerH, "{}");
+    // Wait on the latch outerH sets — deterministic, not a fixed sleep race. A bounded
+    // spin cap guards against hanging the suite if the reject-not-block property regresses
+    // (a self-deadlock would never set outer_done).
+    var spins: usize = 0;
+    while (!outer_done.load(.acquire) and spins < 5000) : (spins += 1) {
+        app.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(outer_done.load(.acquire)); // did not self-deadlock
+    try testing.expect(outer_result == .ok or outer_result == .queue_full); // rejected, not blocked
+    pool.stop();
 }
