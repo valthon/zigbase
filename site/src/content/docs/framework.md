@@ -2210,7 +2210,7 @@ zigbase.App(.{
         .projects = .{
             .fields = .{
                 .{ .name = "title",   .type = .text },
-                .{ .name = "account", .type = .relation, .target = "accounts" }, // owning account
+                .{ .name = "account", .type = .relation, .target = "_accounts" }, // owning account
             },
             .tenant_field = "account",                   // <- makes `projects` tenant-owned
             .rules = .{ .list = "@public", .view = "@public" },
@@ -2291,7 +2291,7 @@ const App = zigbase.App(.{
         .projects = .{
             .fields = .{
                 .{ .name = "title",   .type = .text },
-                .{ .name = "account", .type = .relation, .target = "accounts" }, // owning account
+                .{ .name = "account", .type = .relation, .target = "_accounts" }, // owning account
             },
             .rules = .{ .list = "@public", .view = "@public" },
         },
