@@ -6,6 +6,7 @@
 const std = @import("std");
 const http = @import("http.zig");
 const mime = @import("files/mime.zig");
+const serve_file = @import("files/serve_file.zig");
 
 /// One embedded asset. `etag` includes its surrounding quotes (e.g. "\"a1b2c3d4\"")
 /// so it can be compared to / emitted as an ETag header value verbatim.
@@ -98,25 +99,6 @@ fn notModified(content_type: []const u8, headers: []const http.Header) http.Resp
     return .{ .status = 304, .body = "", .content_type = content_type, .extra_headers = headers };
 }
 
-/// True when the request's If-None-Match matches this entity tag ("*" or exact).
-/// Strip an RFC 7232 weak-validator prefix ("W/") from an entity tag.
-fn opaqueTag(tag: []const u8) []const u8 {
-    return if (std.mem.startsWith(u8, tag, "W/")) tag[2..] else tag;
-}
-
-fn etagMatches(if_none_match: []const u8, etag: []const u8) bool {
-    if (if_none_match.len == 0) return false;
-    if (std.mem.eql(u8, if_none_match, "*")) return true;
-    // RFC 7232 §3.2: If-None-Match MUST use the weak comparison function —
-    // W/ prefixes are ignored on both sides (proxies may weaken our strong tag).
-    const ours = opaqueTag(etag);
-    var it = std.mem.splitScalar(u8, if_none_match, ',');
-    while (it.next()) |raw| {
-        if (std.mem.eql(u8, opaqueTag(std.mem.trim(u8, raw, " \t")), ours)) return true;
-    }
-    return false;
-}
-
 fn findEmbedded(files: []const StaticFile, rel: []const u8) ?*const StaticFile {
     for (files) |*f| {
         if (std.mem.eql(u8, f.path, rel)) return f;
@@ -133,7 +115,7 @@ fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const 
     } orelse return null;
     const content_type = mime.fromExtension(hit.path);
     const headers = try headersWithEtag(ctx.allocator, hit.etag);
-    if (etagMatches(ctx.if_none_match, hit.etag)) return notModified(content_type, headers);
+    if (serve_file.etagMatches(ctx.if_none_match, hit.etag)) return notModified(content_type, headers);
     return .{
         .status = 200,
         .body = hit.bytes,
@@ -628,15 +610,6 @@ test "embedded: If-None-Match yields 304; non-GET/HEAD and .none yield null" {
     try std.testing.expect((try serve(std.testing.io, &post, src, .{})) == null);
     var none = http.RequestCtx{ .method = .GET, .path = "/index.html", .allocator = arena.allocator() };
     try std.testing.expect((try serve(std.testing.io, &none, Source.none, .{})) == null);
-}
-
-test "etagMatches uses RFC 7232 weak comparison (W/ prefix ignored)" {
-    // A proxy (e.g. nginx gzip) may convert our strong ETag to weak; the client
-    // then revalidates with W/"..." and must still get a 304.
-    try std.testing.expect(etagMatches("W/\"22222222\"", "\"22222222\""));
-    try std.testing.expect(etagMatches("\"x\", W/\"22222222\"", "\"22222222\""));
-    try std.testing.expect(etagMatches("\"22222222\"", "W/\"22222222\""));
-    try std.testing.expect(!etagMatches("W/\"junk\"", "\"22222222\""));
 }
 
 test "dir: serves files via file_path; index resolution; miss; traversal" {

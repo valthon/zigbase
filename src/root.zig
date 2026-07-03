@@ -264,6 +264,7 @@ test {
     _ = @import("files/storage.zig");
     _ = @import("files/plan.zig");
     _ = @import("files/multipart.zig");
+    _ = @import("files/serve_file.zig");
     _ = @import("data.zig");
     _ = @import("events.zig");
     _ = @import("sentry.zig");
