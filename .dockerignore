@@ -12,3 +12,11 @@ examples/*/zig-cache
 examples/*/frontend/node_modules
 examples/*/frontend/dist
 *.tar.gz
+
+# Editor / IDE / agent-tooling directories — never needed in the build context
+.claude
+.idea
+.vscode
+.superpowers
+*.swp
+.DS_Store
