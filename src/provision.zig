@@ -21,6 +21,8 @@ const rules = @import("rules.zig");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
 const secrets = @import("oauth/secrets.zig");
+const discovery = @import("oauth/discovery.zig");
+const oauth_client = @import("oauth/client.zig");
 const fts = @import("search/fts.zig");
 const vector = @import("search/vector.zig");
 const Migrator = @import("migrator.zig").Migrator;
@@ -611,11 +613,18 @@ fn customSlugsToSlice(comptime t: anytype) []const []const u8 {
         for (tf, 0..) |tff, i| {
             const elem = @field(tup, tff.name);
             switch (@typeInfo(@TypeOf(elem))) {
-                .pointer => out[i] = elem, // bare slug string
+                .pointer => {
+                    const slug: []const u8 = elem;
+                    if (std.mem.eql(u8, slug, "sessions"))
+                        @compileError("auth method slug 'sessions' is reserved: GET/DELETE /api/collections/:col/auth/sessions are the per-device session routes");
+                    out[i] = elem; // bare slug string
+                },
                 .@"struct" => {
                     if (!@hasField(@TypeOf(elem), "slug"))
                         @compileError(".auth.methods.custom struct entry must have a .slug field");
                     const slug: []const u8 = elem.slug;
+                    if (std.mem.eql(u8, slug, "sessions"))
+                        @compileError("auth method slug 'sessions' is reserved: GET/DELETE /api/collections/:col/auth/sessions are the per-device session routes");
                     out[i] = slug;
                 },
                 else => @compileError(".auth.methods.custom entry must be a slug string or a struct with a .slug field"),
@@ -800,6 +809,55 @@ pub fn injectOAuthSecrets(
             if (np[i].clientSecret.len > 0 and !secrets.isEncrypted(np[i].clientSecret)) {
                 np[i].clientSecret = try secrets.encryptSecret(io, alloc, app_secret, np[i].clientSecret);
             }
+        }
+        out[ci].options.auth.oauth2.providers = np;
+    }
+    return out;
+}
+
+/// Resolve every `discoveryURL` provider's endpoints via OIDC discovery (spec §F4). Runs at
+/// startup, after env-secret injection, BEFORE applySpecs persists the collection options —
+/// so the resolved endpoints are stored exactly like literal generic endpoints. The fetch
+/// happens on every startup for deterministic fail-fast (a broken IdP config can never boot
+/// a server with dead login); persistence still follows the normal provisioning caveat
+/// (existing collections are not rewritten — re-resolution needs a migration/admin PATCH).
+/// ANY failure propagates — the caller aborts startup loudly.
+pub fn resolveDiscoveryProviders(
+    alloc: std.mem.Allocator,
+    transport: oauth_client.Transport,
+    specs: []const schema.Collection,
+) ![]const schema.Collection {
+    var any = false;
+    for (specs) |c| {
+        if (c.type != .auth) continue;
+        for (c.options.auth.oauth2.providers) |p| if (p.discoveryURL != null) {
+            any = true;
+        };
+    }
+    if (!any) return specs; // zero-cost when no discovery provider is configured
+
+    const out = try alloc.alloc(schema.Collection, specs.len);
+    for (specs, 0..) |c, ci| {
+        out[ci] = c;
+        if (c.type != .auth or c.options.auth.oauth2.providers.len == 0) continue;
+        const src = c.options.auth.oauth2.providers;
+        const np = try alloc.alloc(schema.OAuth2Provider, src.len);
+        for (src, 0..) |p, i| {
+            np[i] = p;
+            const durl = p.discoveryURL orelse continue;
+            const eps = discovery.resolve(transport, alloc, durl) catch |e| {
+                // .warn, not .err: the real startup failure is logged (at .err) by the
+                // framework.zig caller, which is not itself hit by these unit tests — an
+                // .err-level log call here would trip the test runner's "logged N errors"
+                // failure on this function's own expected-failure test coverage below
+                // (see static_files.zig's validateRouteTargetsDir for the same precedent).
+                std.log.warn("OIDC discovery for provider '{s}' failed ({s}) fetching {s}", .{ p.name, @errorName(e), durl });
+                return e;
+            };
+            np[i].authURL = eps.authURL;
+            np[i].tokenURL = eps.tokenURL;
+            np[i].userinfoURL = eps.userinfoURL;
+            std.log.info("oauth provider '{s}': endpoints resolved via OIDC discovery", .{p.name});
         }
         out[ci].options.auth.oauth2.providers = np;
     }
@@ -1748,4 +1806,75 @@ test "injectOAuthSecrets passes non-oauth collections through" {
     const out = try injectOAuthSecrets(a, std.testing.io, "app-secret", Getter{}, &cols);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expectEqualStrings("posts", out[0].name);
+}
+
+// Stub transport for resolveDiscoveryProviders tests: returns a canned discovery document
+// (or a failing status) regardless of URL, mirroring oauth/client.zig's StubTransport pattern.
+const DiscoveryStubTransport = struct {
+    status: u16 = 200,
+    body: []const u8 =
+        \\{
+        \\  "issuer": "https://acme.okta.com",
+        \\  "authorization_endpoint": "https://acme.okta.com/oauth2/v1/authorize",
+        \\  "token_endpoint": "https://acme.okta.com/oauth2/v1/token",
+        \\  "userinfo_endpoint": "https://acme.okta.com/oauth2/v1/userinfo"
+        \\}
+    ,
+
+    fn call(ctx: *anyopaque, alloc: std.mem.Allocator, method: oauth_client.Method, url: []const u8, headers: []const oauth_client.Header, req_body: ?[]const u8) oauth_client.TransportError!oauth_client.Response {
+        _ = method;
+        _ = url;
+        _ = headers;
+        _ = req_body;
+        const self: *DiscoveryStubTransport = @ptrCast(@alignCast(ctx));
+        return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
+    }
+
+    fn transport(self: *DiscoveryStubTransport) oauth_client.Transport {
+        return .{ .ctx = self, .call = call };
+    }
+};
+
+test "resolveDiscoveryProviders fills endpoints for a discovery provider" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var stub = DiscoveryStubTransport{};
+    const provs = [_]schema.OAuth2Provider{.{ .name = "okta", .discoveryURL = "https://acme.okta.com/.well-known/openid-configuration" }};
+    const cols = [_]schema.Collection{.{
+        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
+    }};
+    const out = try resolveDiscoveryProviders(a, stub.transport(), &cols);
+    const p = out[0].options.auth.oauth2.providers[0];
+    try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/authorize", p.authURL.?);
+    try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/token", p.tokenURL.?);
+    try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/userinfo", p.userinfoURL.?);
+}
+
+test "resolveDiscoveryProviders propagates a discovery failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var stub = DiscoveryStubTransport{ .status = 500, .body = "boom" };
+    const provs = [_]schema.OAuth2Provider{.{ .name = "okta", .discoveryURL = "https://acme.okta.com/.well-known/openid-configuration" }};
+    const cols = [_]schema.Collection{.{
+        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
+    }};
+    try std.testing.expectError(error.DiscoveryFetchFailed, resolveDiscoveryProviders(a, stub.transport(), &cols));
+}
+
+test "resolveDiscoveryProviders returns the same slice when no provider uses discovery" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var stub = DiscoveryStubTransport{};
+    const provs = [_]schema.OAuth2Provider{.{ .name = "google" }};
+    const cols = [_]schema.Collection{.{
+        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
+    }};
+    const out = try resolveDiscoveryProviders(a, stub.transport(), &cols);
+    try std.testing.expectEqual(@as(usize, @intFromPtr(&cols)), @as(usize, @intFromPtr(out.ptr)));
 }

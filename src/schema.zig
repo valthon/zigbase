@@ -113,6 +113,12 @@ pub const OAuth2Provider = struct {
     tokenURL: ?[]const u8 = null,
     userinfoURL: ?[]const u8 = null,
     scopes: ?[]const []const u8 = null,
+    /// OIDC discovery (spec §F4): the provider's `/.well-known/openid-configuration` URL.
+    /// Mutually exclusive with explicit authURL/tokenURL/userinfoURL (comptime-enforced).
+    /// Resolved ONCE at startup into the three endpoint URLs, which are then persisted
+    /// exactly like literal generic endpoints (re-resolution = a migration or admin PATCH).
+    /// camelCase matches this struct's documented provider-field style.
+    discoveryURL: ?[]const u8 = null,
 };
 
 pub const OAuth2Options = struct {
@@ -289,6 +295,7 @@ pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u
         if (p.authURL) |u| try po.put(alloc, "authURL", .{ .string = u });
         if (p.tokenURL) |u| try po.put(alloc, "tokenURL", .{ .string = u });
         if (p.userinfoURL) |u| try po.put(alloc, "userinfoURL", .{ .string = u });
+        if (p.discoveryURL) |u| try po.put(alloc, "discoveryURL", .{ .string = u });
         if (p.scopes) |sc| {
             var sa = std.json.Array.init(alloc);
             for (sc) |s| try sa.append(.{ .string = s });
@@ -469,6 +476,7 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
                 if (o.get("authURL")) |x| if (x == .string) { p.authURL = try alloc.dupe(u8, x.string); };
                 if (o.get("tokenURL")) |x| if (x == .string) { p.tokenURL = try alloc.dupe(u8, x.string); };
                 if (o.get("userinfoURL")) |x| if (x == .string) { p.userinfoURL = try alloc.dupe(u8, x.string); };
+                if (o.get("discoveryURL")) |x| if (x == .string) { p.discoveryURL = try alloc.dupe(u8, x.string); };
                 if (o.get("scopes")) |x| if (x == .array) {
                     var sl: std.ArrayList([]const u8) = .empty;
                     for (x.array.items) |sc| if (sc == .string) try sl.append(alloc, try alloc.dupe(u8, sc.string));

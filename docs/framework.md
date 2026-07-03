@@ -1766,7 +1766,34 @@ A generic provider requires `authURL`, `tokenURL`, and `userinfoURL` (all must b
 | `authURL` | `null` | Generic provider only. |
 | `tokenURL` | `null` | Generic provider only. |
 | `userinfoURL` | `null` | Generic provider only. |
-| `scopes` | `null` | Override default scopes for a preset, or supply scopes for a generic provider. |
+| `discoveryURL` | `null` | Generic provider only; alternative to `authURL`/`tokenURL`/`userinfoURL`. See below. |
+| `scopes` | `null` | Override default scopes for a preset, or supply scopes for a generic provider (default `openid email profile` when using `discoveryURL`). |
+
+**Generic OIDC discovery (`discoveryURL`).** Any OIDC-compliant IdP (Auth0, Okta, Keycloak,
+Entra custom tenants, Zitadel, …) is one line — point at its discovery document instead of
+hand-copying three endpoint URLs:
+
+```zig
+.providers = .{
+    .{ .name = "okta",
+       .discoveryURL = "https://acme.okta.com/.well-known/openid-configuration",
+       .redirectUrls = .{"https://app.acme.com/oauth/callback"} },
+},
+```
+
+`discoveryURL` is mutually exclusive with explicit `authURL`/`tokenURL`/`userinfoURL`
+(compile error), https-only, and rejected for the built-in preset names. Resolution happens
+**once, at startup**: the framework fetches the document over the same TLS transport every
+OAuth call uses, requires all three of `authorization_endpoint`/`token_endpoint`/
+`userinfo_endpoint` (https-only) plus an `issuer` that prefixes the discovery URL, and
+**refuses to start** on any failure (a half-configured IdP must never silently disable
+login). The resolved endpoints are persisted exactly like literal generic endpoints, so the
+usual provisioning caveat applies (re-resolution needs a migration or an admin-API PATCH —
+there is no per-request discovery dependency). Scopes default to `openid email profile`
+(override with `.scopes`); the claim mapping is the fixed OIDC standard set; PKCE is already
+unconditional. `id_token`/JWKS validation remains out of scope — identity is verified via
+the `userinfo` endpoint over TLS, as for every provider. (Provider fields keep their
+documented camelCase style — `discoveryURL` matches `authURL`/`tokenURL`.)
 
 #### Runtime secrets via environment variables
 

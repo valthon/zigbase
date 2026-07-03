@@ -255,6 +255,7 @@ test {
     _ = @import("oauth/secrets.zig");
     _ = @import("oauth/providers.zig");
     _ = @import("oauth/client.zig");
+    _ = @import("oauth/discovery.zig");
     _ = @import("query/params.zig");
     _ = @import("query/lexer.zig");
     _ = @import("query/parser.zig");

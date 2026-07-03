@@ -267,6 +267,11 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   standard claims (`sub`/`email`/`name`/`picture`).
 - **Risk:** Low (table-driven). Apple is the fiddly one (client-secret-as-JWT, form_post).
 - **Depends on / ordering:** Independent; pick off opportunistically.
+- **Status (0.10.0): generic OIDC shipped** (`.discoveryURL`, resolved once at startup,
+  fail-closed) — see [framework.md → Generic OIDC
+  discovery](framework.md#oauth2-providers-authoauth2). Named presets beyond the existing
+  `google`/`github`/`microsoft`/`discord` table (Apple, GitLab, Twitch, Facebook, …) remain
+  opportunistic — pick off as requested.
 
 ---
 
@@ -673,8 +678,9 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   *uniquely* good (comptime, single-binary, embeddable). F4 lands early in the increment because
   reliable webhooks and scheduled backups both want a durable queue.
 
-**Deferred / opportunistic:** A6 sessions, A7 RBAC, A8 (more OAuth/OIDC — pick off as requested),
-B2/B6/B7/B8/B9 (data depth, as usage demands), D4 admin logs/settings UI, E3/E4/E5/E6 (ops maturity),
+**Deferred / opportunistic:** A6 (`.table` session mode as the default — awaits perf data), A7 RBAC
+(deferred by choice — see recipe), A8 (named OAuth presets beyond the current table — pick off as
+requested), B2/B6/B7/B8/B9 (data depth, as usage demands), D4 admin logs/settings UI, E3/E4/E5/E6 (ops maturity),
 F2 (presence), G1/G3 (multi-node — only when single-node limits are *measured*), D5 (WASM — only if
 recompilation proves a barrier).
 
@@ -687,11 +693,12 @@ recompilation proves a barrier).
   `app.submit`); a pluggable `Mailer` vtable with `LogMailer` + `SmtpMailer` wired into auth;
   comptime storage/mailer plugins; comptime pool levers (`.pools.readers`/`.pools.jobs`); a
   reader-connection pool; the `Storage` vtable (S3-ready); FTS5 compiled in; schema migrations +
-  `ddl.zig` rebuild plans; OAuth2 PKCE; rule-filtered realtime; Sentry error reporting.
-- **PocketBase-parity gaps still to close:** rate limiting, SMTP TLS, S3 *implementation*, image
-  transforms, MFA, API keys, session management, more OAuth/OIDC, FTS *wiring*, aggregations,
-  soft-delete, `fields=`, ETags, webhooks, metrics/logs UI, backups, dynamic-collection migrations,
-  generated SDK.
+  `ddl.zig` rebuild plans; OAuth2 PKCE; rule-filtered realtime; Sentry error reporting; rate
+  limiting; SMTP TLS; per-device session management (opt-in `.table` mode) + REST/SDK surface;
+  generic OIDC discovery.
+- **PocketBase-parity gaps still to close:** S3 *implementation*, image transforms, MFA, API keys,
+  named OAuth presets beyond the current table, FTS *wiring*, aggregations, soft-delete, `fields=`,
+  ETags, webhooks, metrics/logs UI, backups, dynamic-collection migrations, generated SDK.
 - **Differentiators (the Zig/comptime/single-binary/embeddable angle):** comptime-typed record
   structs (D1), compile-time-validated schema+rules+roles (A7+D1), atomic batch endpoint on the
   single serialized writer (B3), DB-per-tenant via single-file SQLite (E6), trivially-reliable
