@@ -52,7 +52,7 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     const d = db.dbDialect(w);
     try w.begin();
     errdefer w.rollback() catch {};
-    try w.exec(try alloc.dupeZ(u8, try ddl.createTableSql(alloc, ddl_col, null, d)));
+    try w.exec(try alloc.dupeZ(u8, try ddl.createTableSql(alloc, ddl_col, null, d, &.{})));
     for (col.indexes) |idx| try w.exec(try alloc.dupeZ(u8, try ddl.createIndexSql(alloc, col.name, idx, d)));
     if (col.type == .auth) {
         for (col.options.auth.identityFields) |idf| {

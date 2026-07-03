@@ -152,9 +152,13 @@ fn resetRollupWatermarks(target: *db.Db) Error!void {
 // Target provisioning
 // ===========================================================================
 
-/// Create, on `target`, the physical record table for every source collection whose table does
-/// not yet exist (system collections' tables are created by the migrations). Tables are created
-/// in relation-dependency order so a FK's referenced table exists first. Returns the count created.
+/// Create, on `target`, the physical record table for every source collection whose table
+/// does not yet exist (system collections' tables come from the migrations), in
+/// dependency order. On a POSTGRES target, relation-cycle FK edges are OMITTED from
+/// CREATE TABLE (cyclic inline REFERENCES cannot be created in any order there) and added
+/// back afterwards as `DEFERRABLE INITIALLY IMMEDIATE` constraints — identical to a plain
+/// FK outside explicit SET CONSTRAINTS, deferrable by the load transaction. SQLite permits
+/// forward/cyclic inline FK DDL natively, so its DDL is unchanged. Returns the count created.
 fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const schema.Collection) Error!usize {
     const d = db.dbDialect(target);
     // id -> table name, so a relation field's stored targetCollectionId (an id) resolves to the
@@ -163,6 +167,10 @@ fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const
     for (src_cols) |c| try id_to_name.put(c.id, c.name);
 
     const plan = try planCreateOrder(a, src_cols);
+    const defer_cycle_fks = db.dbBackend(target) == .postgres;
+    const created_flags = try a.alloc(bool, src_cols.len);
+    @memset(created_flags, false);
+
     var created: usize = 0;
     for (plan.order) |idx| {
         const col = src_cols[idx];
@@ -171,7 +179,8 @@ fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const
         // exactly as `collections.create` does, so the physical table matches.
         const full = try schema.injectAuthFields(a, col);
         const ddl_col = try resolveRelationTargets(a, full, id_to_name);
-        try target.exec(try a.dupeZ(u8, try ddl.createTableSql(a, ddl_col, null, d)));
+        const skip: []const []const u8 = if (defer_cycle_fks) try cycleFieldNames(a, plan.cycle_edges, src_cols, idx) else &.{};
+        try target.exec(try a.dupeZ(u8, try ddl.createTableSql(a, ddl_col, null, d, skip)));
         for (col.indexes) |ix| target.exec(try a.dupeZ(u8, try ddl.createIndexSql(a, col.name, ix, d))) catch |e| {
             std.log.warn("migrate-db: index '{s}' on '{s}' skipped ({s})", .{ ix.name, col.name, @errorName(e) });
         };
@@ -179,9 +188,39 @@ fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const
             for (col.options.auth.identityFields) |idf|
                 try target.exec(try a.dupeZ(u8, try ddl.authIdentityIndexSql(a, col.name, idf)));
         }
+        created_flags[idx] = true;
         created += 1;
     }
+
+    // Add the omitted cycle-edge FKs back, deferrable, now that every table exists.
+    // Only for tables created THIS run — a pre-existing table keeps its constraints.
+    if (defer_cycle_fks) {
+        for (plan.cycle_edges) |e| {
+            if (!created_flags[e.col_idx]) continue;
+            const col = src_cols[e.col_idx];
+            const f = col.fields[e.field_idx];
+            const r = f.options.relation;
+            const tgt = id_to_name.get(r.targetCollectionId) orelse r.targetCollectionId;
+            const sql = try ddl.addDeferrableFkSql(a, col.name, f.name, tgt, r.cascadeDelete);
+            target.exec(try a.dupeZ(u8, sql)) catch |err| {
+                std.log.err(
+                    "migrate-db: could not add deferrable FK \"fk_{s}_{s}\" on \"{s}\"(\"{s}\") -> \"{s}\"(\"id\"): {s}. Fix the target schema (or use a superuser target role) and re-run.",
+                    .{ col.name, f.name, col.name, f.name, tgt, @errorName(err) },
+                );
+                return err;
+            };
+        }
+    }
     return created;
+}
+
+/// Field names of `col_idx`'s cycle edges — the FK clauses `createTableSql` must omit.
+fn cycleFieldNames(a: std.mem.Allocator, edges: []const CycleEdge, cols: []const schema.Collection, col_idx: usize) Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (edges) |e| {
+        if (e.col_idx == col_idx) try out.append(a, cols[col_idx].fields[e.field_idx].name);
+    }
+    return out.toOwnedSlice(a);
 }
 
 /// A copy of `col` with each single-relation field's `targetCollectionId` rewritten from the
