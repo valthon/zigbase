@@ -58,6 +58,14 @@ pub const Config = struct {
     // "" = no static serving. Comptime modes (.dir/.embedded/.disabled) ignore it.
     static_dir: []const u8 = "",
 
+    // Cache-Control VALUE for static responses (§C). "" = unset: the comptime
+    // `.static_cache_control` default applies if configured, else facil.io's stock
+    // `max-age=3600` for dir mode / the same default for embedded assets. Applies to
+    // STATIC serving only — record-file downloads keep their authorization-derived
+    // Cache-Control (the tenancy invariant in api/files.zig, NEVER knob-controlled).
+    // Env: ZIGBASE_STATIC_CACHE_CONTROL. Validated at startup (CR/LF, length <= 256).
+    static_cache_control: []const u8 = "",
+
     // In-memory rate limiting for sensitive auth endpoints (login / password-reset /
     // email-verification). Fixed window: at most `rate_limit_max` requests per client
     // key per `rate_limit_window_s` seconds. `rate_limit_max = 0` disables it entirely.
@@ -138,6 +146,7 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
         if (getter.get("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter.get("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
+        if (getter.get("ZIGBASE_STATIC_CACHE_CONTROL")) |v| cfg.static_cache_control = v;
         if (getter.get("ZIGBASE_RATE_LIMIT_MAX")) |v| cfg.rate_limit_max = try std.fmt.parseInt(u32, v, 10);
         if (getter.get("ZIGBASE_RATE_LIMIT_WINDOW")) |v| cfg.rate_limit_window_s = try std.fmt.parseInt(i64, v, 10);
         if (getter.get("ZIGBASE_OAUTH_STATE_SERVER")) |v| cfg.oauth_state_server = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
@@ -148,11 +157,7 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_SMTP_PASSWORD")) |v| cfg.smtp_password = v;
         if (getter.get("ZIGBASE_SMTP_FROM")) |v| cfg.smtp_from = v;
         if (getter.get("ZIGBASE_SMTP_TLS")) |v| {
-            if (std.mem.eql(u8, v, "none")) cfg.smtp_tls = .none
-            else if (std.mem.eql(u8, v, "starttls")) cfg.smtp_tls = .starttls
-            else if (std.mem.eql(u8, v, "implicit")) cfg.smtp_tls = .implicit
-            else if (std.mem.eql(u8, v, "auto")) cfg.smtp_tls = .auto
-            else return error.InvalidSmtpTls;
+            if (std.mem.eql(u8, v, "none")) cfg.smtp_tls = .none else if (std.mem.eql(u8, v, "starttls")) cfg.smtp_tls = .starttls else if (std.mem.eql(u8, v, "implicit")) cfg.smtp_tls = .implicit else if (std.mem.eql(u8, v, "auto")) cfg.smtp_tls = .auto else return error.InvalidSmtpTls;
         }
         if (getter.get("ZIGBASE_SMTP_INSECURE")) |v|
             cfg.smtp_insecure_skip_verify = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
@@ -207,7 +212,9 @@ test "env overrides are applied and parsed" {
 
 test "auth defaults and overrides" {
     const G0 = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     const d = try Config.load(G0{});
     try std.testing.expectEqual(true, d.cookie_secure); // secure-by-default
@@ -227,7 +234,9 @@ test "auth defaults and overrides" {
 
 test "trust_proxy defaults off, opt-in via env" {
     const G0 = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     try std.testing.expectEqual(false, (try Config.load(G0{})).trust_proxy);
     const G1 = struct {
@@ -265,7 +274,9 @@ test "smtp tls env overrides" {
 
     // Default: auto + verify on.
     const G0 = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     const d = try Config.load(G0{});
     try std.testing.expectEqual(SmtpTls.auto, d.smtp_tls);
@@ -274,7 +285,9 @@ test "smtp tls env overrides" {
 
 test "rate limit defaults and overrides" {
     const G0 = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     const d = try Config.load(G0{});
     try std.testing.expectEqual(@as(u32, 10), d.rate_limit_max);
@@ -294,7 +307,9 @@ test "rate limit defaults and overrides" {
 
 test "oauth_state_server defaults ON, opt-out via env" {
     const G0 = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     // Secure-by-default: server-side OAuth CSRF state is ON unless explicitly disabled.
     try std.testing.expectEqual(true, (try Config.load(G0{})).oauth_state_server);
@@ -309,7 +324,9 @@ test "oauth_state_server defaults ON, opt-out via env" {
 
 test "field_key_generation defaults to 1, overridable via env" {
     const G0 = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     try std.testing.expectEqual(@as(u16, 1), (try Config.load(G0{})).field_key_generation);
     const G1 = struct {
@@ -323,7 +340,9 @@ test "field_key_generation defaults to 1, overridable via env" {
 
 test "realtime origins default empty, overridable" {
     const G0 = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     try std.testing.expectEqualStrings("", (try Config.load(G0{})).realtime_allowed_origins);
     const G1 = struct {
@@ -333,4 +352,20 @@ test "realtime origins default empty, overridable" {
         }
     };
     try std.testing.expectEqualStrings("https://app.example", (try Config.load(G1{})).realtime_allowed_origins);
+}
+
+test "static_cache_control defaults empty, overridable via env" {
+    const G0 = struct {
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    try std.testing.expectEqualStrings("", (try Config.load(G0{})).static_cache_control);
+    const G1 = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_STATIC_CACHE_CONTROL")) return "public, max-age=86400, immutable";
+            return null;
+        }
+    };
+    try std.testing.expectEqualStrings("public, max-age=86400, immutable", (try Config.load(G1{})).static_cache_control);
 }

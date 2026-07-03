@@ -1,6 +1,6 @@
 const std = @import("std");
 const http = @import("http.zig");
-const static_files = @import("static_files.zig");
+const serve_file = @import("files/serve_file.zig");
 
 const index_html = @embedFile("admin/index.html");
 const app_js = @embedFile("admin/app.js");
@@ -24,7 +24,7 @@ fn asset(ctx: *http.RequestCtx, comptime bytes: []const u8, comptime content_typ
         .{ .name = "ETag", .value = crcEtag(bytes) },
         .{ .name = "X-Content-Type-Options", .value = "nosniff" },
     };
-    if (static_files.etagMatches(ctx.if_none_match, headers[0].value))
+    if (serve_file.etagMatches(ctx.if_none_match, headers[0].value))
         return .{ .status = 304, .body = "", .content_type = content_type, .extra_headers = &headers };
     return .{ .status = 200, .body = bytes, .content_type = content_type, .extra_headers = &headers };
 }

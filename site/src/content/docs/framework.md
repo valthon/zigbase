@@ -2696,11 +2696,16 @@ zigbase.App(.{ .mailer = AuditMailer }).runCli(init);
 
 A custom storage plugin follows the same shape, returning a `zigbase.Storage` view from
 `interface()`. The `zigbase.Storage` vtable backs file storage (the default
-`zigbase.DefaultStoragePlugin` wraps `zigbase.LocalStorage`); the `zigbase.Mailer` vtable —
-a single `send(io, alloc, zigbase.Email)` — backs mail (the default
-`zigbase.DefaultMailerPlugin` selects `zigbase.LogMailer` or `zigbase.SmtpMailer` from
-config). See the [plugins example](../examples/plugins) for the full, compiling
-custom-mailer plugin.
+`zigbase.DefaultStoragePlugin` wraps `zigbase.LocalStorage`) with **four** methods —
+`put` / `fetch` / `delete` / `deleteRecord`. `fetch(ctx, io, alloc, col, record_id,
+filename)` returns a local filesystem path whose contents ARE the file, materializing it
+locally first if necessary (a remote backend spools to a local cache); `null` means the
+backend has no such object. *(0.10.0: `localPath(ctx, alloc, …)` → `fetch(ctx, io, alloc,
+…)` — rename + one new parameter; return a local path, materializing the file locally if
+necessary; `null` = object missing.)* The `zigbase.Mailer` vtable — a single `send(io,
+alloc, zigbase.Email)` — backs mail (the default `zigbase.DefaultMailerPlugin` selects
+`zigbase.LogMailer` or `zigbase.SmtpMailer` from config). See the [plugins
+example](../examples/plugins) for the full, compiling custom-mailer plugin.
 
 ## 10. Footprint levers (`.pools`)
 
@@ -2798,12 +2803,15 @@ pub fn main(init: std.process.Init) !void {
 
 Anything that misses `/_/`, the built-in API, and your custom routes falls through to the
 static-file server (GET/HEAD only; `/api/*` misses keep the JSON 404 envelope; static
-misses return a plain-text 404). `/` and directory paths resolve to `index.html`. In
-**embedded** mode, each asset carries a precomputed CRC32 content `ETag` and zigbase
-handles `If-None-Match`/304 itself. In **dir** mode (`--serve-static` or comptime `.dir`),
-caching is delegated to facil.io's `sendFile`, which emits its own `ETag`, `Last-Modified`,
-`Cache-Control: max-age=3600`, and handles `If-None-Match`/304. All modes add
-`X-Content-Type-Options: nosniff`.
+misses return a plain-text 404). `/` and directory paths resolve to `index.html`. Both
+sources honor a single `Range: bytes=a-b` / `bytes=a-` / `bytes=-n` with a `206` (`416`
+past EOF); a malformed or multi-range header is ignored (plain `200`). In **embedded**
+mode, each asset carries a precomputed CRC32 content `ETag` and zigbase handles
+`If-None-Match`/304 itself. In **dir** mode (`--serve-static` or comptime `.dir`),
+`ETag`/`Last-Modified` and conditional-request handling (`If-None-Match`/`If-Range`) are
+delegated to facil.io's `sendFile` — using its own exact-match `ETag` semantics (an
+unquoted base64 size^mtime tag), not RFC 7232 list/weak comparison. All modes add
+`X-Content-Type-Options: nosniff` and emit `Cache-Control` (see the knob below).
 
 Pick a mode at comptime with `.static_files`:
 
@@ -2831,6 +2839,29 @@ The build fails with a clear error when `frontend/dist` is missing — build the
 first (e.g. `npm run build`). A hardcoded or `--serve-static` directory that is missing or
 unreadable at startup is a **fatal startup error** naming the path.
 
+### Cache-Control: the `--static-cache-control` knob
+
+Every static response — embedded or dir — carries a `Cache-Control` header. The
+default is the stock `max-age=3600` (byte-identical to pre-knob behavior); override
+it process-wide with, in precedence order:
+
+1. `--static-cache-control <value>` (runtime flag; rejected as unknown when static
+   serving is `.disabled`);
+2. `ZIGBASE_STATIC_CACHE_CONTROL` (env, same validation as the flag);
+3. comptime `App(.{ .static_cache_control = "…" })` (validated at compile time:
+   non-empty, ≤ 256 bytes, no CR/LF — a violation is a `@compileError`).
+
+The flag wins over the env var, which wins over the comptime default; leaving all
+three unset keeps the facil.io stock value. The knob is **process-wide, not
+per-route**: in **dir** mode it's applied via a one-time facil.io FIOBJ swap at
+startup (so every `sendFile`-transported response inherits it), which also means **a
+consumer route calling `r.sendFile` directly inherits the knob — that IS the knob**,
+there is no separate per-call override. In **embedded** mode the same resolved value
+is threaded into every asset response directly.
+
+The one exception is the SPA fallback shell (below), which always overrides the
+knob with `Cache-Control: no-cache`.
+
 ### SPA fallback: the `.spa` marker
 
 Client-routed apps (History-API SPAs) break on deep links: `/app/orders/42` is a
@@ -2857,8 +2888,15 @@ case-insensitive filesystems too — see below).
   fallback (checked on the normalized path too, so no raw-vs-normalized-path
   disagreement — e.g. a doubled leading slash — can route an api-looking miss to a
   fallback document); non-GET/HEAD methods never reach it.
-- Fallback responses ride the normal static pipeline: ETag/304 (embedded),
-  facil.io caching (dir), `nosniff`, and HEAD-mirrors-GET all apply.
+- Fallback responses ride the normal static pipeline for `nosniff` and
+  HEAD-mirrors-GET, but **caching is special**: the shell is always served
+  `Cache-Control: no-cache` with a revalidation `ETag` (304 on `If-None-Match`),
+  overriding the `--static-cache-control` knob — a stale cached shell after a
+  redeploy would otherwise reference hashed assets that no longer exist. A
+  **direct** hit on that same `index.html` (not via the fallback) is unaffected and
+  keeps the knob's normal value. In **dir** mode this one response is read and sent
+  OWNED (not via facil.io's delegated `sendFile`), because `sendFile` cannot emit a
+  per-response `Cache-Control` different from the process-wide knob.
 
 **Embedded mode: markers are resolved once, at startup.** The manifest is
 comptime-static (baked into the binary), so the marker root set is derived once and

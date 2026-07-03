@@ -1,11 +1,12 @@
 //! Static file serving — the root-path fallback (spec:
 //! docs/superpowers/specs/2026-06-10-static-files-design.md).
 //! GET/HEAD requests that miss admin, built-in, and custom routes fall through
-//! here (server.zig). Sources: a filesystem dir (streamed via Response.file_path
+//! here (server.zig). Sources: a filesystem dir (streamed via Response.file
 //! -> zap sendFile) or a build-generated embedded manifest (comptime bytes).
 const std = @import("std");
 const http = @import("http.zig");
 const mime = @import("files/mime.zig");
+const serve_file = @import("files/serve_file.zig");
 
 /// One embedded asset. `etag` includes its surrounding quotes (e.g. "\"a1b2c3d4\"")
 /// so it can be compared to / emitted as an ETag header value verbatim.
@@ -57,9 +58,40 @@ pub const Fallback = struct {
     routes: []const StaticRoute = &.{},
     spa_roots: []const []const u8 = &.{},
     spa_marker_enabled: bool = false,
+    /// §C.2: the resolved static Cache-Control knob (app.static_cache_control).
+    /// null = unset. Embedded assets emit `orelse "max-age=3600"`; dir-mode direct
+    /// hits get the value via the facil.io global swap instead (server.zig §C.1).
+    cache_control: ?[]const u8 = null,
 };
 
 const nosniff = http.Header{ .name = "X-Content-Type-Options", .value = "nosniff" };
+
+pub const RangeNorm = union(enum) { rewrite: []const u8, unsatisfiable };
+
+/// §A.2: rewrite the REQUEST's Range header value into the canonical, closed,
+/// in-bounds `bytes=a-b` form — the ONLY form the vendored facil.io parses correctly
+/// (http.c ~511-560: `bytes=X-` falls through to a 200, `bytes=-n` computes an offset
+/// past EOF and prints a negative into Content-Range, an overlong `a-b` produces a
+/// bogus length, `a >= size` yields 200 instead of 416). Returns:
+///   .rewrite       — write this back over the request's Range header, then delegate;
+///                    facil.io's own machinery then produces the 206/Content-Range.
+///   .unsatisfiable — a >= size or "-0": the CALLER answers 416 (facil.io's
+///                    alternative is a WRONG 200 — the one status it can't emit).
+///   null           — leave untouched (already the canonical in-bounds form,
+///                    malformed, multi-range, non-bytes): facil.io ignores -> 200,
+///                    RFC-permitted. A fixed upstream parser makes rewrites no-ops.
+pub fn normalizeRange(alloc: std.mem.Allocator, raw: []const u8, size: u64) !?RangeNorm {
+    return switch (serve_file.parseRange(raw, size)) {
+        .none => null,
+        .unsatisfiable => .unsatisfiable,
+        .slice => |s| blk: {
+            const canonical = try std.fmt.allocPrint(alloc, "bytes={d}-{d}", .{ s.offset, s.offset + s.len - 1 });
+            // Already exactly what facil.io handles? Don't touch the request.
+            if (std.mem.eql(u8, std.mem.trim(u8, raw, " \t"), canonical)) break :blk null;
+            break :blk .{ .rewrite = canonical };
+        },
+    };
+}
 
 /// Normalize a request path into a root-relative, '/'-separated file path.
 /// Returns null for unsafe paths (no leading '/', NUL, backslash, "..").
@@ -92,39 +124,10 @@ pub fn sanitize(alloc: std.mem.Allocator, path: []const u8) !?[]const u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-/// Build the (ETag, nosniff) header pair in the request arena.
-fn headersWithEtag(alloc: std.mem.Allocator, etag: []const u8) ![]http.Header {
-    const hs = try alloc.alloc(http.Header, 2);
-    hs[0] = .{ .name = "ETag", .value = etag };
-    hs[1] = nosniff;
-    return hs;
-}
-
 /// RFC 7232: a 304 carries the headers the 200 would have sent, so it reports
 /// the file's real content type rather than a placeholder.
 fn notModified(content_type: []const u8, headers: []const http.Header) http.Response {
     return .{ .status = 304, .body = "", .content_type = content_type, .extra_headers = headers };
-}
-
-/// True when the request's If-None-Match matches this entity tag ("*" or exact).
-/// Strip an RFC 7232 weak-validator prefix ("W/") from an entity tag.
-fn opaqueTag(tag: []const u8) []const u8 {
-    return if (std.mem.startsWith(u8, tag, "W/")) tag[2..] else tag;
-}
-
-/// True when the request's If-None-Match matches this entity tag ("*" or exact; RFC 7232
-/// weak comparison). Also used by the embedded admin SPA (admin.zig).
-pub fn etagMatches(if_none_match: []const u8, etag: []const u8) bool {
-    if (if_none_match.len == 0) return false;
-    if (std.mem.eql(u8, if_none_match, "*")) return true;
-    // RFC 7232 §3.2: If-None-Match MUST use the weak comparison function —
-    // W/ prefixes are ignored on both sides (proxies may weaken our strong tag).
-    const ours = opaqueTag(etag);
-    var it = std.mem.splitScalar(u8, if_none_match, ',');
-    while (it.next()) |raw| {
-        if (std.mem.eql(u8, opaqueTag(std.mem.trim(u8, raw, " \t")), ours)) return true;
-    }
-    return false;
 }
 
 fn findEmbedded(files: []const StaticFile, rel: []const u8) ?*const StaticFile {
@@ -134,7 +137,7 @@ fn findEmbedded(files: []const StaticFile, rel: []const u8) ?*const StaticFile {
     return null;
 }
 
-fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const u8) !?http.Response {
+fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const u8, cache_control: []const u8) !?http.Response {
     const hit = blk: {
         if (rel.len == 0) break :blk findEmbedded(files, "index.html");
         if (findEmbedded(files, rel)) |f| break :blk f;
@@ -142,13 +145,31 @@ fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const 
         break :blk findEmbedded(files, idx);
     } orelse return null;
     const content_type = mime.fromExtension(hit.path);
-    const headers = try headersWithEtag(ctx.allocator, hit.etag);
-    if (etagMatches(ctx.if_none_match, hit.etag)) return notModified(content_type, headers);
+    // §A.4: reuse the §B planner over the embedded bytes. ETag format unchanged
+    // (build-time CRC32, quoted) — revalidation and the Playwright assertions hold.
+    const p = try serve_file.plan(ctx.allocator, .{
+        .size = hit.bytes.len,
+        .etag = hit.etag,
+        .range = ctx.header("range") orelse "",
+        .if_none_match = ctx.if_none_match,
+        .if_range = ctx.header("if-range") orelse "",
+        .head = ctx.method == .HEAD,
+    });
+    var hs: std.ArrayList(http.Header) = .empty;
+    try hs.appendSlice(ctx.allocator, &.{
+        .{ .name = "ETag", .value = hit.etag },
+        nosniff,
+        .{ .name = "Cache-Control", .value = cache_control },
+    });
+    if (p.status == 304) return notModified(content_type, try hs.toOwnedSlice(ctx.allocator));
+    try hs.append(ctx.allocator, .{ .name = "Accept-Ranges", .value = "bytes" });
+    if (p.content_range) |cr| try hs.append(ctx.allocator, .{ .name = "Content-Range", .value = cr });
+    if (p.status == 416) return .{ .status = 416, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator) };
     return .{
-        .status = 200,
-        .body = hit.bytes,
+        .status = p.status,
+        .body = hit.bytes[@intCast(p.offset)..@intCast(p.offset + p.len)],
         .content_type = content_type,
-        .extra_headers = headers,
+        .extra_headers = try hs.toOwnedSlice(ctx.allocator),
     };
 }
 
@@ -456,35 +477,102 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
     const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, ctx.allocator) catch return null;
     const real_full = std.Io.Dir.cwd().realPathFileAlloc(io, full, ctx.allocator) catch return null;
     if (!withinRoot(real_root, real_full)) return null;
+    // §A.2 shim: normalize the Range header against the size of the file facil.io
+    // WILL serve — mirroring its .gz sidecar probe (http.c:449-470: Accept-Encoding
+    // contains "gzip" -> stat "<path>.gz") — then keep delegating. If-Range ORDERING
+    // is preserved: the shim only edits the header VALUE — facil.io still compares
+    // If-Range against ITS OWN etag itself. NOTE (corrected, deferred from Task 4):
+    // the vendored facil.io deletes the Range header on an If-Range MATCH (http.c
+    // ~511-517) — itself non-RFC (RFC 9110 says honor Range on a match, ignore it on
+    // a mismatch) — not on a mismatch. Either way a REWRITE is always safe: on a match
+    // the Range header is dropped so our rewritten value never reaches facil.io's
+    // parser at all; on a mismatch (or when If-Range is absent) facil.io processes the
+    // Range value as usual, and that's the rewritten canonical form. Only the OWNED
+    // 416 is gated on If-Range being ABSENT: with one present we cannot know whether
+    // facil.io is about to drop the Range entirely (a match), so an unsatisfiable form
+    // then passes through untouched (facil.io's 200 — today's behavior for that corner).
+    const raw_range = ctx.header("range") orelse "";
+    if (raw_range.len > 0) {
+        var size = st.size;
+        if (ctx.header("accept-encoding")) |ae| {
+            if (std.mem.indexOf(u8, ae, "gzip") != null and !std.mem.endsWith(u8, full, ".gz")) {
+                const gz = try std.fmt.allocPrint(ctx.allocator, "{s}.gz", .{full});
+                if (std.Io.Dir.cwd().statFile(io, gz, .{})) |gst| {
+                    if (gst.kind == .file) size = gst.size; // one extra stat, worst case
+                } else |_| {}
+            }
+        }
+        if (try normalizeRange(ctx.allocator, raw_range, size)) |norm| switch (norm) {
+            .rewrite => |v| ctx.setRequestHeader("range", v),
+            .unsatisfiable => if (ctx.header("if-range") == null) {
+                // Tiny owned response — the one static status facil.io cannot emit.
+                const hs416 = try ctx.allocator.dupe(http.Header, &.{
+                    .{ .name = "Content-Range", .value = try std.fmt.allocPrint(ctx.allocator, "bytes */{d}", .{size}) },
+                    nosniff,
+                });
+                return .{ .status = 416, .body = "", .content_type = mime.fromExtension(full), .extra_headers = hs416 };
+            },
+        };
+    }
     // Dir mode delegates ETag/Last-Modified/Cache-Control(max-age=3600)/If-None-Match/304
     // handling to facil.io's sendFile (http_sendfile2), which always emits its own etag
     // and answers conditional requests itself — adding ours would put two ETag headers
     // on the wire. Embedded mode keeps zigbase's CRC32 ETag because plain body responses
-    // get no transport etag.
-    const hs = try ctx.allocator.alloc(http.Header, 1);
+    // get no transport etag. The Vary is needed alongside the .gz sidecar probe above:
+    // facil.io never sets Vary itself, so a shared cache in front of dir mode must be
+    // told the body (and this shim's own size-driven Range math) depends on
+    // Accept-Encoding — no duplicate header is possible.
+    const hs = try ctx.allocator.alloc(http.Header, 2);
     hs[0] = nosniff;
+    hs[1] = .{ .name = "Vary", .value = "Accept-Encoding" };
     return .{
         .status = 200,
         .body = "",
         .content_type = mime.fromExtension(full),
-        .file_path = full,
+        .file = .{ .path = full },
         .extra_headers = hs,
     };
 }
 
+/// §C.3 (dir source, Tier-1 fallback only): serve the SPA shell OWNED — read the file
+/// and sendBody with `Cache-Control: no-cache` + a stat-derived strong ETag
+/// ("<hex size>-<hex mtime-seconds>") so revalidation is one cheap 304. Per-response
+/// Cache-Control is impossible through http_sendfile2 (§B.1 items 1-2), and the
+/// alternative (knob value on the fallback shell) breaks deployments — this is a
+/// deliberate, tiny widening of the owned surface, confined to one small HTML file.
+/// F10 still applies: the canonicalized shell must live under the canonicalized root.
+fn serveShellOwned(io: std.Io, ctx: *http.RequestCtx, root: []const u8, shell_rel: []const u8) !?http.Response {
+    const full = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ root, shell_rel });
+    const st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
+    if (st.kind != .file) return null;
+    const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, ctx.allocator) catch return null;
+    const real_full = std.Io.Dir.cwd().realPathFileAlloc(io, full, ctx.allocator) catch return null;
+    if (!withinRoot(real_root, real_full)) return null;
+    const mtime_s: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+    const etag = try std.fmt.allocPrint(ctx.allocator, "\"{x}-{x}\"", .{ st.size, @as(u64, @bitCast(mtime_s)) });
+    const hs = try ctx.allocator.dupe(http.Header, &.{
+        .{ .name = "ETag", .value = etag },
+        nosniff,
+        .{ .name = "Cache-Control", .value = "no-cache" },
+    });
+    if (serve_file.etagMatches(ctx.if_none_match, etag)) return notModified("text/html; charset=utf-8", hs);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, full, ctx.allocator, .limited(16 << 20)) catch return null;
+    return .{ .status = 200, .body = bytes, .content_type = "text/html; charset=utf-8", .extra_headers = hs };
+}
+
 /// Resolve `source` to serve one relative path (shared by the direct lookup and both
 /// fallback tiers, so fallback documents inherit ETag/304/HEAD/nosniff/F10 for free).
-fn serveRel(io: std.Io, ctx: *http.RequestCtx, source: Source, rel: []const u8) !?http.Response {
+fn serveRel(io: std.Io, ctx: *http.RequestCtx, source: Source, rel: []const u8, cache_control: []const u8) !?http.Response {
     return switch (source) {
         .none => unreachable, // gated in serve()
-        .embedded => |files| serveEmbedded(ctx, files, rel),
-        .dir => |root| serveDir(io, ctx, root, rel),
+        .embedded => |files| serveEmbedded(ctx, files, rel, cache_control),
+        .dir => |root| serveDir(io, ctx, root, rel), // dir-mode CC = the facil.io global (§C.1)
     };
 }
 
 /// Serve `ctx.path` from `source`. Returns null when nothing matches (the caller
 /// emits its 404), including for non-GET/HEAD methods and `.none` sources.
-/// HEAD gets the same response as GET (status + headers + body/file_path);
+/// HEAD gets the same response as GET (status + headers + body/file);
 /// stripping the body for HEAD is the transport layer's (zap/facil.io) job.
 ///
 /// Miss resolution (issue #183, owner revision — dir-mode markers are LIVE), in order:
@@ -513,12 +601,13 @@ pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback) !?
     // (non-normalized) case this is a no-op: `/api/*` never reaches this function at
     // all, since server.zig's raw-path gate already routes it to the API's JSON 404.
     if (std.mem.eql(u8, rel, "api") or std.mem.startsWith(u8, rel, "api/")) return null;
+    const cc_default: []const u8 = fb.cache_control orelse "max-age=3600";
     if (!isSpaMarkerPath(rel)) {
-        if (try serveRel(io, ctx, source, rel)) |hit| return hit;
+        if (try serveRel(io, ctx, source, rel, cc_default)) |hit| return hit;
     }
     for (fb.routes) |rt| {
         if (matchRoute(rt.match, rel))
-            return serveRel(io, ctx, source, std.mem.trimStart(u8, rt.serve, "/"));
+            return serveRel(io, ctx, source, std.mem.trimStart(u8, rt.serve, "/"), cc_default);
     }
     if (!fb.spa_marker_enabled) return null;
     switch (source) {
@@ -528,13 +617,16 @@ pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback) !?
                     "index.html"
                 else
                     try std.fmt.allocPrint(ctx.allocator, "{s}/index.html", .{root});
-                return serveRel(io, ctx, source, shell);
+                // §C.3: a FALLBACK-served shell is always no-cache — a cached stale shell
+                // after a redeploy references hashed assets that no longer exist, breaking
+                // deep links. Direct hits on the same file still get the knob value.
+                return serveRel(io, ctx, source, shell, "no-cache");
             }
             return null;
         },
         .dir => |root| {
             const shell = (try resolveSpaMarkerDirLive(io, ctx.allocator, root, rel)) orelse return null;
-            return serveRel(io, ctx, source, shell);
+            return serveShellOwned(io, ctx, root, shell);
         },
         .none => unreachable, // gated above
     }
@@ -600,7 +692,8 @@ test "embedded: exact file, root index, directory index, miss" {
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expectEqualStrings("console.log(1)", r.body);
     try std.testing.expectEqualStrings("application/javascript", r.content_type);
-    try std.testing.expectEqual(@as(usize, 2), r.extra_headers.len);
+    // 200s now carry [ETag, nosniff, Cache-Control, Accept-Ranges] (§A.4/§C.2).
+    try std.testing.expectEqual(@as(usize, 4), r.extra_headers.len);
     try std.testing.expectEqualStrings("ETag", r.extra_headers[0].name);
     try std.testing.expectEqualStrings("\"22222222\"", r.extra_headers[0].value);
 
@@ -620,7 +713,7 @@ test "embedded: exact file, root index, directory index, miss" {
     const hr = (try serve(std.testing.io, &head, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), hr.status);
     try std.testing.expectEqualStrings("application/javascript", hr.content_type);
-    try std.testing.expectEqual(@as(usize, 2), hr.extra_headers.len);
+    try std.testing.expectEqual(@as(usize, 4), hr.extra_headers.len);
     try std.testing.expectEqualStrings("\"22222222\"", hr.extra_headers[0].value);
 }
 
@@ -640,16 +733,40 @@ test "embedded: If-None-Match yields 304; non-GET/HEAD and .none yield null" {
     try std.testing.expect((try serve(std.testing.io, &none, Source.none, .{})) == null);
 }
 
-test "etagMatches uses RFC 7232 weak comparison (W/ prefix ignored)" {
-    // A proxy (e.g. nginx gzip) may convert our strong ETag to weak; the client
-    // then revalidates with W/"..." and must still get a 304.
-    try std.testing.expect(etagMatches("W/\"22222222\"", "\"22222222\""));
-    try std.testing.expect(etagMatches("\"x\", W/\"22222222\"", "\"22222222\""));
-    try std.testing.expect(etagMatches("\"22222222\"", "W/\"22222222\""));
-    try std.testing.expect(!etagMatches("W/\"junk\"", "\"22222222\""));
+test "embedded: Range 206 subslice + 416 + Cache-Control default and knob (§A.4/§C.2)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = Source{ .embedded = &fixture };
+    // knob unset: embedded now sends the max-age=3600 default (was: NO Cache-Control)
+    var plain = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = a };
+    const rp = (try serve(std.testing.io, &plain, src, .{})).?;
+    try std.testing.expectEqualStrings("Cache-Control", rp.extra_headers[2].name);
+    try std.testing.expectEqualStrings("max-age=3600", rp.extra_headers[2].value);
+    try std.testing.expectEqualStrings("Accept-Ranges", rp.extra_headers[3].name);
+    // knob set: the configured value rides through Fallback.cache_control
+    var knob = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = a };
+    const rk = (try serve(std.testing.io, &knob, src, .{ .cache_control = "public, max-age=86400" })).?;
+    try std.testing.expectEqualStrings("public, max-age=86400", rk.extra_headers[2].value);
+    // 206 subslice ("console.log(1)" is 14 bytes)
+    const rh = [_]http.Param{.{ .key = "range", .value = "bytes=8-" }};
+    var ranged = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = a, .headers = &rh };
+    const r206 = (try serve(std.testing.io, &ranged, src, .{})).?;
+    try std.testing.expectEqual(@as(u16, 206), r206.status);
+    try std.testing.expectEqualStrings("log(1)", r206.body);
+    var got_cr = false;
+    for (r206.extra_headers) |h| if (std.mem.eql(u8, h.name, "Content-Range")) {
+        try std.testing.expectEqualStrings("bytes 8-13/14", h.value);
+        got_cr = true;
+    };
+    try std.testing.expect(got_cr);
+    // 416
+    const rb = [_]http.Param{.{ .key = "range", .value = "bytes=99-" }};
+    var bad = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = a, .headers = &rb };
+    try std.testing.expectEqual(@as(u16, 416), (try serve(std.testing.io, &bad, src, .{})).?.status);
 }
 
-test "dir: serves files via file_path; index resolution; miss; traversal" {
+test "dir: serves files via file; index resolution; miss; traversal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
@@ -664,15 +781,17 @@ test "dir: serves files via file_path; index resolution; miss; traversal" {
     var ctx = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = arena.allocator() };
     const r = (try serve(std.testing.io, &ctx, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
-    try std.testing.expect(r.file_path != null);
-    try std.testing.expect(std.mem.endsWith(u8, r.file_path.?, "assets/app.js"));
-    // Dir mode emits ONLY nosniff; ETag/304 are facil.io sendFile's job.
-    try std.testing.expectEqual(@as(usize, 1), r.extra_headers.len);
+    try std.testing.expect(r.file != null);
+    try std.testing.expect(std.mem.endsWith(u8, r.file.?.path, "assets/app.js"));
+    // Dir mode emits nosniff + Vary; ETag/304 are facil.io sendFile's job.
+    try std.testing.expectEqual(@as(usize, 2), r.extra_headers.len);
     try std.testing.expectEqualStrings("X-Content-Type-Options", r.extra_headers[0].name);
+    try std.testing.expectEqualStrings("Vary", r.extra_headers[1].name);
+    try std.testing.expectEqualStrings("Accept-Encoding", r.extra_headers[1].value);
 
     var root_req = http.RequestCtx{ .method = .GET, .path = "/", .allocator = arena.allocator() };
     const ri = (try serve(std.testing.io, &root_req, src, .{})).?;
-    try std.testing.expect(std.mem.endsWith(u8, ri.file_path.?, "index.html"));
+    try std.testing.expect(std.mem.endsWith(u8, ri.file.?.path, "index.html"));
 
     var dir_req = http.RequestCtx{ .method = .GET, .path = "/assets", .allocator = arena.allocator() };
     try std.testing.expect((try serve(std.testing.io, &dir_req, src, .{})) == null);
@@ -725,7 +844,94 @@ test "dir: a symlink inside the root pointing OUTSIDE it is refused (F10)" {
     var ok = http.RequestCtx{ .method = .GET, .path = "/ok.txt", .allocator = a };
     const r = (try serve(std.testing.io, &ok, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
-    try std.testing.expect(r.file_path != null);
+    try std.testing.expect(r.file != null);
+}
+
+test "normalizeRange matrix (§A.2): open/suffix/overlong rewritten; in-bounds/malformed/multi passthrough; 416 forms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // rewrites into the canonical closed form
+    try std.testing.expectEqualStrings("bytes=200-999", (try normalizeRange(a, "bytes=200-", 1000)).?.rewrite);
+    try std.testing.expectEqualStrings("bytes=900-999", (try normalizeRange(a, "bytes=-100", 1000)).?.rewrite);
+    try std.testing.expectEqualStrings("bytes=0-999", (try normalizeRange(a, "bytes=-5000", 1000)).?.rewrite); // n >= size
+    try std.testing.expectEqualStrings("bytes=900-999", (try normalizeRange(a, "bytes=900-5000", 1000)).?.rewrite); // clamp
+    // unsatisfiable -> caller's 416
+    try std.testing.expect((try normalizeRange(a, "bytes=1000-", 1000)).? == .unsatisfiable);
+    try std.testing.expect((try normalizeRange(a, "bytes=-0", 1000)).? == .unsatisfiable);
+    // passthrough (null): facil.io already correct, or RFC-permitted ignore
+    try std.testing.expect((try normalizeRange(a, "bytes=0-99", 1000)) == null); // in-bounds a-b
+    try std.testing.expect((try normalizeRange(a, "bytes=0-99,200-", 1000)) == null); // multi
+    try std.testing.expect((try normalizeRange(a, "garbage", 1000)) == null);
+    try std.testing.expect((try normalizeRange(a, "items=0-5", 1000)) == null);
+}
+
+test "dir shim: open-ended Range is rewritten via setRequestHeader; unsatisfiable answers owned 416; gz sidecar drives the size" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.bin", .data = "x" ** 1000 });
+    // sidecar SMALLER than the base file, so a sidecar-selected rewrite is observable
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.bin.gz", .data = "z" ** 100 });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const src = Source{ .dir = root };
+
+    const Capture = struct {
+        var name_buf: [64]u8 = undefined;
+        var value_buf: [64]u8 = undefined;
+        var name: []const u8 = "";
+        var value: []const u8 = "";
+        fn set(_: *anyopaque, n: []const u8, v: []const u8) void {
+            name = name_buf[0..n.len];
+            @memcpy(name_buf[0..n.len], n);
+            value = value_buf[0..v.len];
+            @memcpy(value_buf[0..v.len], v);
+        }
+    };
+    var dummy: u8 = 0;
+
+    // Open-ended seek on the base file: rewritten to the closed in-bounds form.
+    const rh = [_]http.Param{.{ .key = "range", .value = "bytes=200-" }};
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
+    const r = (try serve(std.testing.io, &ctx, src, .{})).?;
+    try std.testing.expectEqual(@as(u16, 200), r.status); // still DELEGATED (facil.io does the 206)
+    try std.testing.expect(r.file != null);
+    try std.testing.expectEqualStrings("range", Capture.name);
+    try std.testing.expectEqualStrings("bytes=200-999", Capture.value);
+
+    // Accept-Encoding gzip: the SIDECAR's size (100) drives the rewrite.
+    Capture.name = "";
+    const rh_gz = [_]http.Param{ .{ .key = "range", .value = "bytes=50-" }, .{ .key = "accept-encoding", .value = "gzip, br" } };
+    var ctx_gz = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh_gz, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
+    _ = (try serve(std.testing.io, &ctx_gz, src, .{})).?;
+    try std.testing.expectEqualStrings("bytes=50-99", Capture.value);
+
+    // Unsatisfiable: the shim's OWNED 416 with Content-Range: bytes */N.
+    const rh_bad = [_]http.Param{.{ .key = "range", .value = "bytes=5000-" }};
+    var ctx_bad = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh_bad, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
+    const r416 = (try serve(std.testing.io, &ctx_bad, src, .{})).?;
+    try std.testing.expectEqual(@as(u16, 416), r416.status);
+    try std.testing.expectEqualStrings("Content-Range", r416.extra_headers[0].name);
+    try std.testing.expectEqualStrings("bytes */1000", r416.extra_headers[0].value);
+
+    // If-Range present but MISMATCHED ("whatever" is not this file's etag): the
+    // REWRITE still happens — facil.io only deletes the Range header on an If-Range
+    // MATCH (see the shim's doc comment above), so on a mismatch it falls through to
+    // parsing Range as usual, and that's the rewritten canonical form...
+    Capture.name = "";
+    Capture.value = "";
+    const rh_ifr = [_]http.Param{ .{ .key = "range", .value = "bytes=200-" }, .{ .key = "if-range", .value = "\"whatever\"" } };
+    var ctx_ifr = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh_ifr, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
+    _ = (try serve(std.testing.io, &ctx_ifr, src, .{})).?;
+    try std.testing.expectEqualStrings("bytes=200-999", Capture.value);
+    // ...but an UNSATISFIABLE range with If-Range present is passed through untouched
+    // (no owned 416 — facil.io may be about to ignore the Range entirely).
+    const rh_ifr_bad = [_]http.Param{ .{ .key = "range", .value = "bytes=5000-" }, .{ .key = "if-range", .value = "\"whatever\"" } };
+    var ctx_ifr_bad = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh_ifr_bad, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
+    const r_ifr_bad = (try serve(std.testing.io, &ctx_ifr_bad, src, .{})).?;
+    try std.testing.expectEqual(@as(u16, 200), r_ifr_bad.status); // delegated, not 416
 }
 
 // ── Tier-1 SPA marker fixtures + tests (issue #183) ─────────────────────────
@@ -1015,8 +1221,9 @@ test "spa fallback: '.spa' itself is never served (embedded + dir, incl. dir liv
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     var m3 = http.RequestCtx{ .method = .GET, .path = "/.spa", .allocator = a };
     const r3 = (try serve(std.testing.io, &m3, Source{ .dir = root }, .{ .spa_marker_enabled = true })).?;
-    try std.testing.expect(r3.file_path != null);
-    try std.testing.expect(std.mem.endsWith(u8, r3.file_path.?, "index.html"));
+    // The dir-mode Tier-1 shell is now served OWNED (§C.3), not via file delegation.
+    try std.testing.expect(r3.file == null);
+    try std.testing.expectEqualStrings("<h1>root</h1>", r3.body);
 }
 
 test "spa fallback: If-None-Match on the embedded fallback yields 304; HEAD mirrors GET" {
@@ -1032,7 +1239,23 @@ test "spa fallback: If-None-Match on the embedded fallback yields 304; HEAD mirr
     try std.testing.expectEqualStrings("text/html; charset=utf-8", hr.content_type);
 }
 
-test "spa fallback: dir-mode fallback streams via file_path (facil.io owns caching)" {
+test "embedded spa fallback shell is no-cache even with the knob set (§C.3)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = Source{ .embedded = &spa_fixture };
+    const fb = Fallback{ .spa_roots = &.{"app"}, .spa_marker_enabled = true, .cache_control = "public, max-age=86400" };
+    // fallback-resolved miss: no-cache wins over the knob
+    var miss = http.RequestCtx{ .method = .GET, .path = "/app/deep/link", .allocator = a };
+    const rm = (try serve(std.testing.io, &miss, src, fb)).?;
+    try std.testing.expectEqualStrings("no-cache", rm.extra_headers[2].value);
+    // a DIRECT hit on the same shell file keeps the knob value (deploy-owner's choice)
+    var direct = http.RequestCtx{ .method = .GET, .path = "/app/index.html", .allocator = a };
+    const rd = (try serve(std.testing.io, &direct, src, fb)).?;
+    try std.testing.expectEqualStrings("public, max-age=86400", rd.extra_headers[2].value);
+}
+
+test "spa fallback (dir): shell is served OWNED — no-cache, stat ETag, 304 revalidation (§C.3)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "app");
@@ -1044,11 +1267,14 @@ test "spa fallback: dir-mode fallback streams via file_path (facil.io owns cachi
     var deep = http.RequestCtx{ .method = .GET, .path = "/app/orders/1234", .allocator = arena.allocator() };
     const r = (try serve(std.testing.io, &deep, Source{ .dir = root }, .{ .spa_marker_enabled = true })).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
-    try std.testing.expect(r.file_path != null);
-    try std.testing.expect(std.mem.endsWith(u8, r.file_path.?, "app/index.html"));
-    // Dir mode emits ONLY nosniff; ETag/304 belong to facil.io sendFile.
-    try std.testing.expectEqual(@as(usize, 1), r.extra_headers.len);
-    try std.testing.expectEqualStrings("X-Content-Type-Options", r.extra_headers[0].name);
+    try std.testing.expect(r.file == null); // OWNED body, not a sendFile delegation
+    try std.testing.expectEqualStrings("<h1>dir shell</h1>", r.body);
+    try std.testing.expectEqualStrings("ETag", r.extra_headers[0].name);
+    try std.testing.expectEqualStrings("Cache-Control", r.extra_headers[2].name);
+    try std.testing.expectEqualStrings("no-cache", r.extra_headers[2].value);
+    // revalidation: 304 on the stat ETag
+    var cond = http.RequestCtx{ .method = .GET, .path = "/app/orders/1234", .allocator = arena.allocator(), .if_none_match = r.extra_headers[0].value };
+    try std.testing.expectEqual(@as(u16, 304), (try serve(std.testing.io, &cond, Source{ .dir = root }, .{ .spa_marker_enabled = true })).?.status);
 }
 
 // ── Dir-mode LIVE marker resolution (owner revision, 2026-07-02) ────────────
@@ -1082,8 +1308,8 @@ test "spa live (dir): a marker created AFTER boot is picked up on the very next 
     // The very next miss under "app/" now gets the shell.
     var after = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
     const r = (try serve(std.testing.io, &after, src, fb)).?;
-    try std.testing.expect(r.file_path != null);
-    try std.testing.expect(std.mem.endsWith(u8, r.file_path.?, "app/index.html"));
+    try std.testing.expect(r.file == null); // OWNED shell (§C.3), not a sendFile delegation
+    try std.testing.expectEqualStrings("<h1>app shell</h1>", r.body);
 }
 
 test "spa live (dir): removing a marker post-boot stops the fallback on the next miss" {
@@ -1126,15 +1352,22 @@ test "spa live (dir): deepest marker wins; vanished index.html on the deepest ma
     const src = Source{ .dir = root };
     const fb = Fallback{ .spa_marker_enabled = true };
 
-    // Deepest ("app/admin") wins over "app" and the root.
+    // Deepest ("app/admin") wins over "app" and the root. Shells are OWNED (§C.3),
+    // so assert body content rather than a delegated file path.
     var deep = http.RequestCtx{ .method = .GET, .path = "/app/admin/orders/1", .allocator = arena.allocator() };
-    try std.testing.expect(std.mem.endsWith(u8, (try serve(std.testing.io, &deep, src, fb)).?.file_path.?, "app/admin/index.html"));
+    const rd = (try serve(std.testing.io, &deep, src, fb)).?;
+    try std.testing.expect(rd.file == null);
+    try std.testing.expectEqualStrings("<h1>admin shell</h1>", rd.body);
     // A miss under "app/" (but not "app/admin/") gets the "app" shell.
     var mid = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
-    try std.testing.expect(std.mem.endsWith(u8, (try serve(std.testing.io, &mid, src, fb)).?.file_path.?, "app/index.html"));
+    const rm = (try serve(std.testing.io, &mid, src, fb)).?;
+    try std.testing.expect(rm.file == null);
+    try std.testing.expectEqualStrings("<h1>app shell</h1>", rm.body);
     // A miss elsewhere gets the root shell.
     var out = http.RequestCtx{ .method = .GET, .path = "/pricing", .allocator = arena.allocator() };
-    try std.testing.expect(std.mem.endsWith(u8, (try serve(std.testing.io, &out, src, fb)).?.file_path.?, "index.html"));
+    const ro = (try serve(std.testing.io, &out, src, fb)).?;
+    try std.testing.expect(ro.file == null);
+    try std.testing.expectEqualStrings("<h1>root</h1>", ro.body);
 
     // Now delete the DEEPEST marker's index.html (post-boot, live): a miss under
     // "app/admin/" must resolve to null — NOT fall through to the "app" marker. This
@@ -1145,7 +1378,9 @@ test "spa live (dir): deepest marker wins; vanished index.html on the deepest ma
     try std.testing.expect((try serve(std.testing.io, &vanished, src, fb)) == null);
     // A sibling still under "app/" (not "app/admin/") is unaffected.
     var sibling = http.RequestCtx{ .method = .GET, .path = "/app/orders/2", .allocator = arena.allocator() };
-    try std.testing.expect(std.mem.endsWith(u8, (try serve(std.testing.io, &sibling, src, fb)).?.file_path.?, "app/index.html"));
+    const rs = (try serve(std.testing.io, &sibling, src, fb)).?;
+    try std.testing.expect(rs.file == null);
+    try std.testing.expectEqualStrings("<h1>app shell</h1>", rs.body);
 }
 
 test "spa live (dir): a request path deeper than the ancestor-walk cap still resolves the root marker" {
@@ -1175,8 +1410,8 @@ test "spa live (dir): a request path deeper than the ancestor-walk cap still res
 
     var deep = http.RequestCtx{ .method = .GET, .path = path, .allocator = arena.allocator() };
     const r = (try serve(std.testing.io, &deep, src, fb)).?;
-    try std.testing.expect(r.file_path != null);
-    try std.testing.expect(std.mem.endsWith(u8, r.file_path.?, "index.html"));
+    try std.testing.expect(r.file == null); // OWNED shell (§C.3)
+    try std.testing.expectEqualStrings("<h1>root</h1>", r.body);
 }
 
 test "spa live (dir): a marker just past the ancestor-walk cap depth is NOT found (documents the bound)" {

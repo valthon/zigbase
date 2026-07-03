@@ -118,8 +118,6 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 - Static files are served without authentication — collection access rules do not apply
   to the static root; use file storage for access-controlled delivery.
-- No `Range`/partial-content requests (no video seeking on large files served from the
-  static root).
 - No directory listings; directories resolve to `index.html` or 404.
 - Path safety is lexical (`..`, backslashes, and NUL bytes are rejected) **and**
   symlink-aware: a served file is canonicalized and refused if its real path escapes the
@@ -130,9 +128,9 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   servable (404). Encoded traversal (`%2e%2e`) stays a literal — and harmless — path
   segment for the same reason.
 - No on-the-fly compression; pre-compress at the CDN or reverse proxy if needed.
-- In **dir** mode (`--serve-static` or comptime `.dir`), caching is controlled by
-  facil.io's `sendFile` (fixed `Cache-Control: max-age=3600`) — this value is not
-  configurable yet.
+- In **dir** mode, conditional requests (`If-None-Match`/`If-Range`) use facil.io's
+  exact-match ETag semantics (an unquoted base64 size^mtime tag), not RFC 7232
+  list/weak comparison — self-consistent, and kept as-is by design (facil.io-first).
 
 ## Platform & UI
 

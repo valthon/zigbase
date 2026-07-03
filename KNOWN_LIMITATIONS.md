@@ -33,8 +33,6 @@ ZigBase v0.9.0 is an early release. The gaps below are known and tracked for fut
 
 - Static files are served without authentication — collection access rules do not
   apply to the static root; use file storage for access-controlled delivery.
-- No `Range`/partial-content requests (no video seeking on large files served from
-  the static root).
 - No directory listings; directories resolve to `index.html` or 404.
 - Path safety is lexical (`..`, backslashes, and NUL bytes are rejected) **and**
   symlink-aware: a served file is canonicalized and refused if its real path escapes
@@ -45,9 +43,9 @@ ZigBase v0.9.0 is an early release. The gaps below are known and tracked for fut
   servable (404). Encoded traversal (`%2e%2e`) stays a literal — and harmless — path
   segment for the same reason.
 - No on-the-fly compression; pre-compress at the CDN or reverse proxy if needed.
-- In **dir** mode (`--serve-static` or comptime `.dir`), caching is controlled by
-  facil.io's `sendFile` (fixed `Cache-Control: max-age=3600`) — this value is not
-  configurable yet.
+- In **dir** mode, conditional requests (`If-None-Match`/`If-Range`) use facil.io's
+  exact-match ETag semantics (an unquoted base64 size^mtime tag), not RFC 7232
+  list/weak comparison — self-consistent, and kept as-is by design (facil.io-first).
 
 ## Postgres backend
 - **`verify-full` hostname checks match DNS names only.** Dialing an IP literal under the default `sslmode=verify-full` generally fails hostname verification even when the certificate carries an iPAddress SAN — connect by DNS name, or use `sslmode=verify-ca` on an otherwise-trusted path. Client certificates (mTLS), CRL/OCSP, and SCRAM channel binding (`SCRAM-SHA-256-PLUS`) are not supported.

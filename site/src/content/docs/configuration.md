@@ -58,6 +58,7 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_DATA_DIR` | `--data-dir` | `./zb_data` | data directory (holds `data.db` and `storage/`) |
 | `ZIGBASE_DB_URL` | — | `""` (SQLite) | **Opt-in.** A `postgres://…` URL selects the PostgreSQL backend instead of SQLite. TLS defaults to `sslmode=verify-full` (certificate chain + hostname verified; `sslrootcert=<pem-path>` for private CAs) — append `?sslmode=require` or `?sslmode=disable` to opt down (logged at startup). Only honored in a binary built with `-Dpostgres=true` (see below); ignored otherwise |
 | — | `--serve-static` | `""` (off) | serve static files from DIR at the root path (default mode only) |
+| `ZIGBASE_STATIC_CACHE_CONTROL` | `--static-cache-control` | `"max-age=3600"` (facil.io stock) | `Cache-Control` value for static responses (embedded + dir); flag wins over env, both win over the comptime `.static_cache_control` default. See [Framework → Static files](./framework#13-serve-a-frontend-static-files) |
 | `ZIGBASE_JWT_SECRET` | — | _auto-generated_ | token signing secret (≥32 bytes). Unset → a random secret is generated + persisted at `<data-dir>/.jwt_secret` (0600); a shorter provided value is refused |
 | `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
 | `ZIGBASE_TRUST_PROXY` | `--trust-proxy` (sets `true`) | `false` | trust `X-Forwarded-For`/`X-Real-IP` for client-IP / rate-limit keying (set only behind a trusted reverse proxy) |

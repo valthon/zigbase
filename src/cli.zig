@@ -5,6 +5,7 @@ pub const ServeArgs = struct {
     http_port: ?u16 = null,
     data_dir: ?[]const u8 = null,
     serve_static: ?[]const u8 = null,
+    static_cache_control: ?[]const u8 = null,
     // Secure-by-default opt-outs / opt-ins (F8/F12). null = leave the config default.
     insecure_cookies: bool = false, // --insecure-cookies => cookie_secure=false (plain-HTTP local dev)
     trust_proxy: bool = false, // --trust-proxy => honor X-Forwarded-For/X-Real-IP
@@ -71,6 +72,11 @@ pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValu
 /// static-files mode — in .disabled/.dir/.embedded the flag is rejected as unknown.
 pub const ParseOpts = struct {
     serve_static: bool = true,
+    /// --static-cache-control is rejected as unknown when static serving is disabled
+    /// at comptime (`.static_files = .disabled`), mirroring the --serve-static gate.
+    /// Unlike serve_static it stays available in .dir/.embedded modes (the knob
+    /// applies to comptime-configured sources too).
+    static_cache_control: bool = true,
 };
 
 /// Parse argv (excluding the program name).
@@ -225,6 +231,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
             sa.serve_static = args[i];
+        } else if (popts.static_cache_control and std.mem.eql(u8, a, "--static-cache-control")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            sa.static_cache_control = args[i];
         } else if (std.mem.eql(u8, a, "--insecure-cookies")) {
             sa.insecure_cookies = true;
         } else if (std.mem.eql(u8, a, "--trust-proxy")) {
@@ -339,6 +349,16 @@ test "--serve-static is an unknown flag when disabled at comptime" {
 
 test "--serve-static without a value errors" {
     try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--serve-static" }, .{}));
+}
+
+test "--static-cache-control parses, requires a value, and is gated by ParseOpts" {
+    const c = try parse(&.{ "serve", "--static-cache-control", "public, max-age=86400" }, .{});
+    try std.testing.expectEqualStrings("public, max-age=86400", c.serve.static_cache_control.?);
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--static-cache-control" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(
+        &.{ "serve", "--static-cache-control", "x" },
+        .{ .static_cache_control = false },
+    ));
 }
 
 test "parse typegen: data-dir + out + flags" {

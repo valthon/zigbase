@@ -1,14 +1,17 @@
 const std = @import("std");
 
-/// Backend-agnostic blob storage for record files. `localPath` returns a filesystem path for
-/// backends that have one (so server.zig can sendFile); non-local backends return null.
+/// Backend-agnostic blob storage for record files. `fetch` returns a local filesystem
+/// path whose contents ARE the file — materializing it locally first if necessary
+/// (remote backends spool to a local cache); `null` = the backend has no such object.
+/// (0.10.0, Breaking: was `localPath(ctx, alloc, …)` — the rename is forced anyway,
+/// since a remote backend needs the `io` for network/disk I/O.)
 pub const Storage = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         put: *const fn (ctx: *anyopaque, io: std.Io, col: []const u8, record_id: []const u8, filename: []const u8, bytes: []const u8) anyerror!void,
-        localPath: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!?[]const u8,
+        fetch: *const fn (ctx: *anyopaque, io: std.Io, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!?[]const u8,
         delete: *const fn (ctx: *anyopaque, io: std.Io, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!void,
         deleteRecord: *const fn (ctx: *anyopaque, io: std.Io, col: []const u8, record_id: []const u8) anyerror!void,
     };
@@ -16,8 +19,8 @@ pub const Storage = struct {
     pub fn put(self: Storage, io: std.Io, col: []const u8, record_id: []const u8, filename: []const u8, bytes: []const u8) anyerror!void {
         return self.vtable.put(self.ctx, io, col, record_id, filename, bytes);
     }
-    pub fn localPath(self: Storage, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!?[]const u8 {
-        return self.vtable.localPath(self.ctx, alloc, col, record_id, filename);
+    pub fn fetch(self: Storage, io: std.Io, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!?[]const u8 {
+        return self.vtable.fetch(self.ctx, io, alloc, col, record_id, filename);
     }
     pub fn delete(self: Storage, io: std.Io, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!void {
         return self.vtable.delete(self.ctx, io, col, record_id, filename);
@@ -41,7 +44,7 @@ pub const LocalStorage = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    const vtable = Storage.VTable{ .put = put, .localPath = localPath, .delete = delete, .deleteRecord = deleteRecord };
+    const vtable = Storage.VTable{ .put = put, .fetch = fetch, .delete = delete, .deleteRecord = deleteRecord };
 
     fn dirPath(alloc: std.mem.Allocator, root: []const u8, col: []const u8, record_id: []const u8) ![]u8 {
         return std.fs.path.join(alloc, &.{ root, col, record_id });
@@ -59,7 +62,8 @@ pub const LocalStorage = struct {
         try cwd.writeFile(io, .{ .sub_path = path, .data = bytes });
     }
 
-    fn localPath(ctx: *anyopaque, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!?[]const u8 {
+    fn fetch(ctx: *anyopaque, io: std.Io, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!?[]const u8 {
+        _ = io;
         const self: *LocalStorage = @ptrCast(@alignCast(ctx));
         return try std.fs.path.join(alloc, &.{ self.root, col, record_id, filename });
     }
@@ -87,7 +91,7 @@ pub const LocalStorage = struct {
     }
 };
 
-test "LocalStorage put/localPath/read/delete/deleteRecord round-trip" {
+test "LocalStorage put/fetch/read/delete/deleteRecord round-trip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -99,7 +103,7 @@ test "LocalStorage put/localPath/read/delete/deleteRecord round-trip" {
     const st = local.storage();
 
     try st.put(std.testing.io, "posts", "rec1", "cover_ab12.png", "PNGDATA");
-    const p = (try st.localPath(a, "posts", "rec1", "cover_ab12.png")).?;
+    const p = (try st.fetch(std.testing.io, a, "posts", "rec1", "cover_ab12.png")).?;
     const back = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, p, a, .limited(1 << 20));
     try std.testing.expectEqualStrings("PNGDATA", back);
 
@@ -109,7 +113,7 @@ test "LocalStorage put/localPath/read/delete/deleteRecord round-trip" {
     try st.put(std.testing.io, "posts", "rec2", "a.txt", "A");
     try st.put(std.testing.io, "posts", "rec2", "b.txt", "B");
     try st.deleteRecord(std.testing.io, "posts", "rec2");
-    const dir2 = (try st.localPath(a, "posts", "rec2", "a.txt")).?;
+    const dir2 = (try st.fetch(std.testing.io, a, "posts", "rec2", "a.txt")).?;
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, dir2, a, .limited(16)));
 
     try st.delete(std.testing.io, "posts", "ghost", "none.txt"); // missing -> no-op
