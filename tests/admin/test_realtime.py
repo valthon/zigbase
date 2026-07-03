@@ -24,6 +24,54 @@ def _raw_exchange(host, port, raw: bytes, timeout=3.0) -> bytes:
         return b"".join(chunks)
 
 
+def test_malformed_ws_upgrade_does_not_crash_server(server):
+    """SECURITY REGRESSION — unauthenticated remote double-free on the WS upgrade path.
+
+    A WebSocket upgrade carrying an INVALID `Sec-WebSocket-Version` drives facil.io's
+    `http1_http2websocket_server` down its `bad_request` branch, which sends a terminal 400
+    AND invokes the connection's `on_close` (our teardown) ITSELF before returning -1.
+    Pre-fix, `ws.handleUpgrade`'s `WS.upgrade catch { ... }` block then freed the `LiveConn`
+    and released the shared connection slot a SECOND time -> heap double-free + double
+    slot-release. No auth is required to reach this path, so it is a trivial remote DoS.
+
+    Oracle: fire many malformed upgrades and assert the server is STILL serving afterwards.
+    Under the debug-safety allocator the very first double-free aborts the process, so pre-fix
+    the loop (or the final health probe) fails to connect; post-fix every request succeeds."""
+    u = urlparse(server)
+    host, port = u.hostname, u.port
+    health = b"GET /api/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+
+    # Baseline: the server is up and answering before we start.
+    assert b"200" in _raw_exchange(host, port, health), "server not healthy at start"
+
+    malformed = (
+        "GET /api/realtime HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        "Connection: Upgrade\r\n"
+        "Upgrade: websocket\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 999\r\n"  # invalid (must be 13) -> facil.io bad_request path
+        "\r\n"
+    ).encode()
+
+    # Repeat well past 1: the double-free is deterministic per hit, but iterating hardens the
+    # oracle against any allocator that only trips on repeated corruption.
+    for i in range(30):
+        try:
+            resp = _raw_exchange(host, port, malformed)
+        except OSError as e:
+            raise AssertionError(f"server unreachable on malformed upgrade #{i} (crashed?): {e}")
+        assert b"400" in resp, f"iteration {i}: expected a 400 to the malformed upgrade, got {resp!r}"
+
+    # The real assertion: after all those failure-path upgrades the server is alive and serving.
+    # A double-free would have aborted the process, and this probe would raise instead.
+    try:
+        final = _raw_exchange(host, port, health)
+    except OSError as e:
+        raise AssertionError(f"server crashed after malformed upgrades (double-free?): {e}")
+    assert b"200" in final, f"server not healthy after malformed upgrades: {final!r}"
+
+
 def _recv_until(sock, needle: bytes, timeout=8.0) -> bytes:
     """Read from an already-open socket until `needle` appears or the peer closes/times out."""
     sock.settimeout(timeout)

@@ -165,10 +165,18 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
         .context = lc,
     };
     WS.upgrade(r.h, &lc.settings) catch {
-        lc.durable.deinit();
-        lc.frame.deinit();
-        app.allocator.destroy(lc);
-        connection.releaseConnectionSlot(); // release the reserved slot
+        // DO NOT tear down here. facil.io's upgrade-FAILURE paths invoke the connection's
+        // on_close (== our `onClose`, via zap's `internal_on_close`) THEMSELVES and then return
+        // -1 — so by the time this catch runs, `lc` has ALREADY been fully destroyed and the
+        // slot released. Both -1 paths do this:
+        //   • http_upgrade2ws invalid-handle           (http.c:718-720:  args.on_close(-1, udata))
+        //   • http1_http2websocket_server bad_request  (http1.c:365-368: http_send_error(400) then
+        //                                                args->on_close(0, udata))
+        // The bad_request path is unauthenticated + trivially remote-triggerable with a malformed
+        // `Sec-WebSocket-Version` header; repeating the teardown here was a heap double-free +
+        // double connection-slot release (release-build DoS). facil has also already sent the
+        // terminal response (http_send_error), so the caller must do NOTHING but stop — symmetric
+        // with the success path, which likewise returns without finishing the request.
         return;
     };
 }
@@ -445,6 +453,29 @@ test "originAllowed: empty allowlist denies cross-origin browser upgrades (F12);
     // Explicit allowlist matches exactly (cross-origin, host differs).
     try std.testing.expect(originAllowed("https://a.com, https://b.com", "https://b.com", "api.myhost"));
     try std.testing.expect(!originAllowed("https://a.com", "https://evil.com", "api.myhost"));
+}
+
+test "WS upgrade-failure teardown: facil's on_close frees the LiveConn + releases the slot exactly once (no leak)" {
+    // Proves the fix does not LEAK. On the upgrade-failure path facil.io calls the connection's
+    // on_close (== this onClose, via zap's internal_on_close) and the caller's catch block now does
+    // NOTHING — so onClose must be the SOLE, COMPLETE teardown: both arenas deinit'd, `lc` destroyed
+    // exactly once, and the shared connection slot released exactly once. We build the LiveConn +
+    // reserve the slot exactly as handleUpgrade does (the state at the moment WS.upgrade fails), then
+    // invoke onClose once — the same call facil makes on the failure path.
+    const base = connection.connectionCount();
+    var app: App = .{ .allocator = std.testing.allocator, .io = undefined, .pool = undefined };
+    const lc = try app.allocator.create(LiveConn);
+    lc.* = .{
+        .app = &app,
+        .durable = std.heap.ArenaAllocator.init(app.allocator),
+        .frame = std.heap.ArenaAllocator.init(app.allocator),
+    };
+    _ = connection.reserveConnectionSlot(); // handleUpgrade reserved the slot before WS.upgrade
+    try std.testing.expectEqual(base + 1, connection.connectionCount());
+    try onClose(lc, -1); // == facil.io's on_close on the -1 failure path: frees lc + releases slot
+    // Slot released exactly once (back to baseline). std.testing.allocator fails the test on a
+    // leak OR a double-free — that IS the exactly-once assertion for the LiveConn + its arenas.
+    try std.testing.expectEqual(base, connection.connectionCount());
 }
 
 test "broadcast is a no-op when inactive" {
