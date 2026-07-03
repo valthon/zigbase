@@ -29,7 +29,7 @@ CLI subcommands: `serve`, `migrate`, `superuser create --email … --password �
    ```sh
    mise exec python@3.13 -- python -m pytest tests/admin/test_schema.py::test_edit_rules_lock_toggle -q
    ```
-   `tests/admin/conftest.py` is the harness (it builds + launches the server with `--insecure-cookies`). **Unit tests passing does NOT mean the browser suite passes** — behavior that only manifests end-to-end (admin UI, secure defaults, realtime, access rules) is caught only here. Run the relevant `tests/admin/` test locally after any change touching those areas; a green `zig build test` has repeatedly hidden real regressions that the `browser` CI job then failed on.
+   Run the whole suite in parallel with `-n auto` (pytest-xdist) — the harness is parallel-safe (each server binds its own free port + tempdir): `mise exec python@3.13 -- python -m pytest tests/admin -q -n auto`. `tests/smtp` stays serial (it binds a fixed TLS port). `tests/admin/conftest.py` is the harness (it builds + launches the server with `--insecure-cookies`). **Unit tests passing does NOT mean the browser suite passes** — behavior that only manifests end-to-end (admin UI, secure defaults, realtime, access rules) is caught only here. Run the relevant `tests/admin/` test locally after any change touching those areas; a green `zig build test` has repeatedly hidden real regressions that the `browser` CI job then failed on.
 
 The example apps are also built in CI (the `examples/plugins` frontend must be `npm run build`-ed before its Zig build, since it embeds `frontend/dist`).
 

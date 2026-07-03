@@ -315,7 +315,7 @@ jobs:
       - name: Install Python test deps + resolve Playwright version
         id: pw
         run: |
-          mise exec python@3.13 -- python -m pip install --quiet pytest playwright aiosmtpd
+          mise exec python@3.13 -- python -m pip install --quiet pytest pytest-xdist playwright aiosmtpd
           echo "version=$(mise exec python@3.13 -- python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
       - name: Cache Playwright browser (chromium headless shell)
         id: pw-cache
@@ -330,7 +330,10 @@ jobs:
         if: steps.pw-cache.outputs.cache-hit == 'true'
         run: mise exec python@3.13 -- python -m playwright install-deps chromium
       - name: Headless browser tests
-        run: mise exec python@3.13 -- python -m pytest tests/admin -q
+        # -n auto parallelizes across the runner's vCPUs (each test binds its own
+        # free port + tempdir, so the harness is parallel-safe). Keep tests/smtp
+        # serial below — it binds a real fixed TLS port.
+        run: mise exec python@3.13 -- python -m pytest tests/admin -q -n auto
       - name: Live SMTP-over-TLS (STARTTLS) delivery test
         run: mise exec python@3.13 -- python -m pytest tests/smtp -q
 
