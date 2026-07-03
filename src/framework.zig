@@ -1449,6 +1449,8 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                           on all interfaces.              [default 127.0.0.1]
         \\  ZIGBASE_HTTP_PORT         Listen port.                   [default 8090]
         \\  ZIGBASE_DATA_DIR          Data directory (db + storage). [default ./zb_data]
+        \\  ZIGBASE_DB_URL           postgres://… routes storage to Postgres (-Dpostgres builds);
+        \\                           unset = embedded SQLite in the data dir.
         \\  ZIGBASE_COOKIE_SECURE     Secure flag on auth cookies (true/1). Secure by default; set
         \\                           false only for plain-HTTP local dev. [default true]
         \\  ZIGBASE_TRUST_PROXY       Trust X-Forwarded-For/X-Real-IP (true/1). Set ONLY behind a
@@ -1457,16 +1459,47 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                           [default empty]
         \\  ZIGBASE_REALTIME_ORIGINS  CSV of allowed WebSocket Origins. Empty DENIES cross-origin
         \\                           browser upgrades.               [default empty]
+        \\  ZIGBASE_SSE_HEARTBEAT_SECONDS  SSE keep-alive comment interval, 0 or 1..=255; 0 inherits
+        \\                           the 40s listener timeout.       [default 0]
         \\  ZIGBASE_MAX_UPLOAD_SIZE   Max request body for uploads, in bytes. [default 52428800 = 50 MiB]
         \\  ZIGBASE_AUTH_TOKEN_TTL    Auth token lifetime, seconds.  [default 1209600 = 14 days]
         \\  ZIGBASE_VERIFICATION_TTL  Email-verification token TTL, seconds. [default 604800 = 7 days]
         \\  ZIGBASE_PASSWORD_RESET_TTL Password-reset token TTL, seconds.    [default 3600 = 1 hour]
         \\  ZIGBASE_FILE_TOKEN_TTL    Short-lived file-access token TTL, seconds. [default 120 = 2 min]
+        \\  ZIGBASE_STATIC_CACHE_CONTROL  Cache-Control for static responses (embedded + dir). Flag
+        \\                           --static-cache-control wins over env. [default max-age=3600]
         \\  ZIGBASE_FIELD_KEY         Key for at-rest field encryption (.encrypted fields). Never
         \\                           auto-generated/persisted/logged. Required if any field is encrypted.
         \\  ZIGBASE_FIELD_KEY_GENERATION  Generation of the primary key = envelope version written
         \\                           (v<N>:). Bump to rotate; then run `zigbase rewrap`. [default 1]
         \\  ZIGBASE_FIELD_KEY_V<n>    Older read-only key for generation <n> (decrypts existing v<n>: data).
+        \\  ZIGBASE_PUBLIC_URL       Public base URL for user-facing links (magic-link emails).
+        \\  ZIGBASE_UNSUBSCRIBE_BASE_URL Public base URL for the RFC 8058 one-click unsubscribe
+        \\                           endpoint. Empty disables the feature. [default: off]
+        \\  ZIGBASE_RATE_LIMIT_MAX    Max sensitive-auth attempts per window per client; 0 disables.
+        \\                           [default 10]
+        \\  ZIGBASE_RATE_LIMIT_WINDOW Rate-limit window length, seconds. [default 60]
+        \\  ZIGBASE_OAUTH_STATE_SERVER Server-side OAuth state (CSRF) store (true/1). [default true]
+        \\  ZIGBASE_OAUTH_STATE_TTL  Server-side OAuth state lifetime, seconds. [default 600 = 10 min]
+        \\  ZIGBASE_SMTP_HOST        SMTP server host; unset logs mail instead of sending. [default: log]
+        \\  ZIGBASE_SMTP_PORT        SMTP server port.             [default 25]
+        \\  ZIGBASE_SMTP_USERNAME    SMTP username; non-empty enables AUTH LOGIN.
+        \\  ZIGBASE_SMTP_PASSWORD    SMTP password.
+        \\  ZIGBASE_SMTP_FROM        Envelope + From: address.     [default noreply@zigbase.dev]
+        \\  ZIGBASE_SMTP_TLS         Transport security: none/starttls/implicit/auto. [default auto]
+        \\  ZIGBASE_SMTP_INSECURE    Skip TLS cert verification (self-signed relays only). [default false]
+        \\  ZIGBASE_SENDMAIL_COMMAND Pipe outbound mail to this command instead of SMTP; takes
+        \\                           precedence over ZIGBASE_SMTP_HOST.
+        \\  ZIGBASE_S3_BUCKET        Opt-in S3-compatible storage (needs -Ds3=true build); non-empty
+        \\                           selects S3 instead of local disk. [default: off]
+        \\  ZIGBASE_S3_REGION        AWS region (SigV4 + default endpoint). [default us-east-1]
+        \\  ZIGBASE_S3_ENDPOINT      Custom endpoint (MinIO/R2/…); empty → s3.<region>.amazonaws.com.
+        \\  ZIGBASE_S3_ACCESS_KEY_ID     SigV4 access key id (required with ZIGBASE_S3_BUCKET).
+        \\  ZIGBASE_S3_SECRET_ACCESS_KEY SigV4 secret access key (required with ZIGBASE_S3_BUCKET).
+        \\  ZIGBASE_S3_FORCE_PATH_STYLE  Force path-style addressing (true/1); unset auto-selects.
+        \\  ZIGBASE_S3_KEY_PREFIX    Prefix prepended to every object key (namespace one bucket).
+        \\  ZIGBASE_S3_CACHE_DIR     Local spool-cache dir; empty → <data-dir>/storage_cache.
+        \\  ZIGBASE_S3_CACHE_MAX_BYTES   Spool-cache size cap, bytes. [default 1073741824 = 1 GiB]
         \\
         \\EXAMPLES:
         \\  # Create the first superuser (admin) account:

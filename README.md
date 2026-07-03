@@ -47,6 +47,7 @@ See [docs/docker.md](docs/docker.md) for the data-volume/non-root/healthcheck de
 
 - **Collections & schema** — define collections with typed fields; schema migrations run on startup.
 - **Records & query API** — typed CRUD with `filter`, `sort`, and `expand` on relations. → [docs/api.md](docs/api.md)
+- **Search** — ranked full-text search (`?search=`) over `.searchable` fields, composed into the same scoped query as every other list request. SQLite FTS5 is compiled in by default (`-Dfts5=false` drops it, ~250-400 KB, for lean builds with no `.searchable` fields); Postgres full-text search is unaffected. Opt-in `-Dvector` build adds nearest-neighbor `?vector=` KNN search on both backends. → [docs/search.md](docs/search.md)
 - **Access rules** — per-collection list / view / create / update / delete rules. → [docs/api.md](docs/api.md)
 - **Auth** — argon2id password, magic-link, OTP, and WebAuthn passkey auth; JWT tokens; verification and password-reset flows. → [docs/api.md](docs/api.md)
 - **Session management** — stateless epoch-based revocation (`revokeAllSessions` / `refresh` / `rotate`); opt-in per-device table store (`listActiveSessions` / `revoke(sessionId)`). → [docs/framework.md](docs/framework.md)
@@ -137,7 +138,11 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_HTTP_HOST` | `--http-host` | `127.0.0.1` | bind address (loopback by default; set `0.0.0.0` for all interfaces) |
 | `ZIGBASE_HTTP_PORT` | `--http-port` | `8090` | listen port |
 | `ZIGBASE_DATA_DIR` | `--data-dir` | `./zb_data` | data directory (holds `data.db`, `storage/`, and `.jwt_secret`) |
+| `ZIGBASE_DB_URL` | — | `""` (embedded SQLite) | database backend selector: a `postgres://…` URL routes storage to Postgres (requires a `-Dpostgres` build); unset/empty = SQLite in the data dir |
 | `ZIGBASE_JWT_SECRET` | — | _auto-generated_ | token signing secret (≥32 bytes). Unset → a random secret is generated + persisted at `<data-dir>/.jwt_secret` (0600); a shorter provided value is refused |
+| `ZIGBASE_FIELD_KEY` | — | `""` (unset) | key for at-rest field encryption (`.encrypted` fields). Never auto-generated/persisted/logged; the server **refuses to start** if any collection declares an encrypted field while this is empty. See [docs/fields.md](docs/fields.md) |
+| `ZIGBASE_FIELD_KEY_GENERATION` | — | `1` | generation of the primary (write) field-encryption key — the envelope version stamped on writes (`v<N>:`). Bump to rotate, then run `zigbase rewrap` |
+| `ZIGBASE_FIELD_KEY_V<n>` | — | _unset_ | older read-only key for generation `<n>`, needed to decrypt existing `v<n>:` data after a key rotation |
 | `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
 | `ZIGBASE_TRUST_PROXY` | `--trust-proxy` (sets `true`) | `false` | trust `X-Forwarded-For`/`X-Real-IP` for client-IP / rate-limit keying (set only behind a trusted reverse proxy) |
 | `ZIGBASE_AUTH_TOKEN_TTL` | — | `1209600` (14 days) | auth token lifetime, seconds |
@@ -147,11 +152,14 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_SSE_HEARTBEAT_SECONDS` | `--sse-heartbeat-seconds` | `0` (inherit 40s listener timeout) | SSE heartbeat (`: ping`) interval, 1–255 seconds |
 | `ZIGBASE_MAX_UPLOAD_SIZE` | — | `52428800` (50 MiB) | max request body size, bytes |
 | `ZIGBASE_FILE_TOKEN_TTL` | — | `120` (2 min) | file-access token lifetime, seconds |
+| `ZIGBASE_STATIC_CACHE_CONTROL` | `--static-cache-control` | `max-age=3600` (facil.io stock) | `Cache-Control` value for static responses (embedded + dir); flag wins over env, both win over the comptime `.static_cache_control` default |
 | `ZIGBASE_SENTRY_DSN` | — | `""` (log to stderr) | set to enable Sentry error reporting |
 | `ZIGBASE_RATE_LIMIT_MAX` | — | `10` | max sensitive-auth attempts per window per client; `0` disables rate limiting |
 | `ZIGBASE_RATE_LIMIT_WINDOW` | — | `60` | rate-limit window length, seconds |
-| `ZIGBASE_OAUTH_STATE_SERVER` | — | `false` | enable server-side OAuth `state` (CSRF) store; clients must call `oauth2-init` and echo `state` on callback (PKCE still required) |
+| `ZIGBASE_OAUTH_STATE_SERVER` | — | `true` | server-side OAuth `state` (CSRF) store is **on by default**; set `false` to opt out (client-driven state only — PKCE still required) |
 | `ZIGBASE_OAUTH_STATE_TTL` | — | `600` (10 min) | server-side OAuth `state` lifetime, seconds |
+| `ZIGBASE_PUBLIC_URL` | — | `""` | public base URL used to build user-facing links (magic-link sign-in emails). Unset → magic-link emails contain the raw token instead of a clickable URL |
+| `ZIGBASE_UNSUBSCRIBE_BASE_URL` | — | `""` (off) | public base URL for the RFC 8058 one-click unsubscribe endpoint. Empty disables the feature (routes 404 and no `List-Unsubscribe` header is added); overrides the comptime `.mail` key |
 | `ZIGBASE_SMTP_HOST` | — | `""` (use LogMailer) | SMTP server host; set to deliver verify/reset email instead of logging |
 | `ZIGBASE_SMTP_PORT` | — | `25` | SMTP server port |
 | `ZIGBASE_SMTP_USERNAME` | — | `""` | SMTP username; non-empty enables `AUTH LOGIN` |
@@ -159,6 +167,16 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_SMTP_FROM` | — | `noreply@zigbase.dev` | envelope + `From:` address |
 | `ZIGBASE_SMTP_TLS` | — | `auto` | transport security: `none` / `starttls` / `implicit` / `auto` (auto: 465→implicit, 587→starttls, else→none) |
 | `ZIGBASE_SMTP_INSECURE` | — | `false` | skip TLS cert verification (self-signed relays only) |
+| `ZIGBASE_SENDMAIL_COMMAND` | — | `""` | deliver mail by piping RFC-822 to this command (e.g. `sendmail -t`) instead of SMTP; takes precedence over `ZIGBASE_SMTP_HOST` |
+| `ZIGBASE_S3_BUCKET` | — | `""` (off) | **Opt-in.** Non-empty selects the S3-compatible storage backend instead of local disk. Only honored in a binary built with `-Ds3=true`; ignored otherwise |
+| `ZIGBASE_S3_REGION` | — | `us-east-1` | AWS region (SigV4 signing + default endpoint) |
+| `ZIGBASE_S3_ENDPOINT` | — | `""` | `""` → `https://s3.<region>.amazonaws.com`; set for MinIO/R2/other S3-compatible endpoints |
+| `ZIGBASE_S3_ACCESS_KEY_ID` | — | `""` | SigV4 access key id (required with `ZIGBASE_S3_BUCKET`) |
+| `ZIGBASE_S3_SECRET_ACCESS_KEY` | — | `""` | SigV4 secret access key (required with `ZIGBASE_S3_BUCKET`) |
+| `ZIGBASE_S3_FORCE_PATH_STYLE` | — | _auto_ | `true`/`1` forces path-style addressing; unset auto-selects path-style when `ZIGBASE_S3_ENDPOINT` is set, virtual-hosted otherwise |
+| `ZIGBASE_S3_KEY_PREFIX` | — | `""` | prefix prepended to every object key — namespace multiple apps in one bucket |
+| `ZIGBASE_S3_CACHE_DIR` | — | `""` | `""` → `<data-dir>/storage_cache`; local spool-cache directory downloads materialize through |
+| `ZIGBASE_S3_CACHE_MAX_BYTES` | — | `1073741824` (1 GiB) | spool-cache size cap; eviction reclaims down to a 3/4 low-water mark |
 
 > Email delivery: with `ZIGBASE_SMTP_HOST` set, verification and password-reset tokens
 > are **emailed** over the configured SMTP transport. Without it (the default), they are
