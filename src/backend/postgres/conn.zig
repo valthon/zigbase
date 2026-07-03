@@ -157,7 +157,13 @@ pub const Conn = struct {
             self.last_error.deinit(self.gpa);
         }
 
-        std.debug.assert((trust != null) == cfg.sslmode.verifiesCertificate());
+        // Fail CLOSED on the trust/sslmode invariant rather than asserting it: a bare
+        // `std.debug.assert` is compiled out under ReleaseFast/ReleaseSmall, so a null `trust`
+        // on a verifying sslmode would slip through and `startTlsHandshake` would silently pick
+        // `.ca = .no_verification` — a total cert-verification bypass. The Db/Pool layers uphold
+        // this by construction; this runtime check is the last-line guard that holds in every
+        // build mode. (gemini security-critical.)
+        if ((trust != null) != cfg.sslmode.verifiesCertificate()) return ConnError.ConnectFailed;
         try self.maybeStartTls(cfg, trust);
         try self.startup(cfg);
         try self.authenticate(cfg);

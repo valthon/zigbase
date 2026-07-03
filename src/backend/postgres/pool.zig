@@ -58,7 +58,9 @@ pub const Pool = struct {
         // Parse once at startup for TLS policy: the opted-down warnings + the shared trust
         // store. (Db.openTrusted re-parses per connection — cheap, and keeps Db.open's
         // standalone contract intact.)
-        var cfg = connstr.parse(allocator, owned) catch return DbError.OpenFailed;
+        var cfg = connstr.parse(allocator, owned) catch |err| {
+            return if (err == error.OutOfMemory) error.OutOfMemory else DbError.OpenFailed;
+        };
         defer cfg.deinit();
         logStartupWarnings(&cfg);
 

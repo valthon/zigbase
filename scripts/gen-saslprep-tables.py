@@ -54,7 +54,7 @@ def parse_rfc_table(text: str, name: str) -> list[tuple[int, int]]:
 def parse_ucd_ranges(path: Path, value_filter=None) -> list[tuple[int, int, str]]:
     """Parse `XXXX[..YYYY] ; value ...` UCD lines -> (lo, hi, value)."""
     out: list[tuple[int, int, str]] = []
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
@@ -93,7 +93,7 @@ def emit_range_table(name: str, doc: str, ranges: list[tuple[int, int]]) -> str:
 
 
 def main() -> None:
-    rfc = (VENDOR / "rfc3454.txt").read_text()
+    rfc = (VENDOR / "rfc3454.txt").read_text(encoding="utf-8")
 
     b1 = coalesce(parse_rfc_table(rfc, "B.1"))
     c12 = coalesce(parse_rfc_table(rfc, "C.1.2"))
@@ -119,7 +119,7 @@ def main() -> None:
     # ordering half of the quick check). The ccc is field 1 of this file, so it gets its
     # own parse loop; adjacent ranges are coalesced only when their ccc is equal.
     ccc_entries: list[tuple[int, int, int]] = []
-    for line in (VENDOR / "combining-class.txt").read_text().splitlines():
+    for line in (VENDOR / "combining-class.txt").read_text(encoding="utf-8").splitlines():
         body = line.split("#", 1)[0].strip()
         if not body:
             continue
