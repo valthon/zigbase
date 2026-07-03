@@ -13,6 +13,8 @@ const std = @import("std");
 const db_mod = @import("db.zig");
 const Db = db_mod.Db;
 const DbError = db_mod.DbError;
+const connstr = @import("connstr.zig");
+const tls_trust = @import("tls_trust.zig");
 
 const reader_pool_size = 16;
 
@@ -36,6 +38,11 @@ pub const Pool = struct {
     /// Type-erased field-encryption cipher pointer; stamped onto every acquired connection.
     field_cipher: ?*const anyopaque = null,
 
+    /// Shared CA trust for verify-ca/verify-full (heap-pinned: the TLS handshake takes
+    /// pointers into it, and `Pool` itself moves by value). Built once in `initOpts`,
+    /// reused by every reader refill, destroyed in `deinit`. Null for other modes.
+    trust: ?*tls_trust.TlsTrust = null,
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, uri: []const u8) (DbError || std.mem.Allocator.Error)!Pool {
         return initOpts(allocator, io, uri, .{});
     }
@@ -47,14 +54,57 @@ pub const Pool = struct {
     pub fn initOpts(allocator: std.mem.Allocator, io: std.Io, uri: []const u8, options: PoolOptions) (DbError || std.mem.Allocator.Error)!Pool {
         const owned = try allocator.dupe(u8, uri);
         errdefer allocator.free(owned);
-        const writer = try Db.open(allocator, io, owned);
+
+        // Parse once at startup for TLS policy: the opted-down warnings + the shared trust
+        // store. (Db.openTrusted re-parses per connection — cheap, and keeps Db.open's
+        // standalone contract intact.)
+        var cfg = connstr.parse(allocator, owned) catch return DbError.OpenFailed;
+        defer cfg.deinit();
+        logStartupWarnings(&cfg);
+
+        var trust: ?*tls_trust.TlsTrust = null;
+        errdefer if (trust) |t| {
+            t.deinit();
+            allocator.destroy(t);
+        };
+        if (cfg.sslmode.verifiesCertificate()) {
+            const t = try allocator.create(tls_trust.TlsTrust);
+            t.* = tls_trust.TlsTrust.init(allocator, io, &cfg) catch |e| {
+                allocator.destroy(t);
+                return if (e == error.OutOfMemory) error.OutOfMemory else DbError.OpenFailed;
+            };
+            trust = t;
+        }
+
+        const writer = try Db.openTrusted(allocator, io, owned, trust);
         return .{
             .allocator = allocator,
             .io = io,
             .uri = owned,
             .writer = writer,
             .reader_cap = @min(options.reader_cap, reader_pool_size),
+            .trust = trust,
         };
+    }
+
+    /// One warning per opted-down startup (mirrors the `@public` access-rule warnings): an
+    /// EXPLICIT sslmode below verify-full, and an sslrootcert the mode ignores. The DEFAULT
+    /// (verify-full) and the explicit verify modes are silent. Logged once, at pool init —
+    /// NOT in Db.open, so lazy reader refills never re-warn.
+    fn logStartupWarnings(cfg: *const connstr.Config) void {
+        const w = tls_trust.startupWarnings(cfg);
+        if (w.unverified_sslmode) {
+            const clause: []const u8 = switch (cfg.sslmode) {
+                .disable => "connection is PLAINTEXT",
+                .prefer => "an active MITM can strip TLS to plaintext",
+                .require => "connection is encrypted but the server is NOT authenticated",
+                .verify_ca, .verify_full => unreachable,
+            };
+            std.log.warn("postgres: sslmode={s} — {s}; use verify-full in production", .{ cfg.sslmode.label(), clause });
+        }
+        if (w.sslrootcert_ignored) {
+            std.log.warn("postgres: sslrootcert is ignored under sslmode={s} (it applies only to verify-ca/verify-full)", .{cfg.sslmode.label()});
+        }
     }
 
     pub fn deinit(self: *Pool) void {
@@ -64,6 +114,10 @@ pub const Pool = struct {
         self.reader_count = 0;
         self.reader_mutex.unlock();
         self.writer.close();
+        if (self.trust) |t| {
+            t.deinit();
+            self.allocator.destroy(t);
+        }
         self.allocator.free(self.uri);
     }
 
@@ -81,7 +135,7 @@ pub const Pool = struct {
 
     /// Opens a fresh connection. Caller owns it and must `close()` (or hand to releaseReader).
     pub fn openReader(self: *Pool) DbError!Db {
-        var db = try Db.open(self.allocator, self.io, self.uri);
+        var db = try Db.openTrusted(self.allocator, self.io, self.uri, self.trust);
         db.field_cipher = self.field_cipher;
         return db;
     }

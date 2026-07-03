@@ -13,6 +13,7 @@ const tls = std.crypto.tls;
 const proto = @import("protocol.zig");
 const scram = @import("scram.zig");
 const connstr = @import("connstr.zig");
+const tls_trust = @import("tls_trust.zig");
 
 pub const ConnError = error{
     ConnectFailed,
@@ -27,6 +28,13 @@ pub const ConnError = error{
     /// An identifier that must be interpolated (e.g. a LISTEN channel — not parameterizable)
     /// contained a quote or NUL and was rejected before interpolation.
     InvalidIdentifier,
+    /// verify-ca/verify-full: the server certificate chain did not verify against the CA
+    /// bundle. The log names the CA source and suggests sslrootcert= for private CAs.
+    CertUntrusted,
+    /// verify-full: the server certificate does not match the URL host.
+    CertHostnameMismatch,
+    CertExpired,
+    CertNotYetValid,
 };
 
 /// Reject an identifier that cannot be safely interpolated into a double-quoted SQL
@@ -94,8 +102,10 @@ pub const Conn = struct {
     notifications: std.ArrayList(Notification) = .empty,
 
     /// Connect, negotiate TLS per `cfg.sslmode`, and complete startup + authentication.
+    /// `trust` is the CA bundle for the verified modes and MUST be non-null exactly when
+    /// `cfg.sslmode.verifiesCertificate()` (the Db/Pool layers uphold this).
     /// Returns a pinned, ready-to-query connection; caller owns it and must call `deinit`.
-    pub fn connect(gpa: std.mem.Allocator, io: std.Io, cfg: connstr.Config) ConnError!*Conn {
+    pub fn connect(gpa: std.mem.Allocator, io: std.Io, cfg: connstr.Config, trust: ?*tls_trust.TlsTrust) ConnError!*Conn {
         const self = gpa.create(Conn) catch return ConnError.OutOfMemory;
         errdefer gpa.destroy(self);
 
@@ -125,7 +135,8 @@ pub const Conn = struct {
             self.last_error.deinit(self.gpa);
         }
 
-        try self.maybeStartTls(cfg.sslmode);
+        std.debug.assert((trust != null) == cfg.sslmode.verifiesCertificate());
+        try self.maybeStartTls(cfg, trust);
         try self.startup(cfg);
         try self.authenticate(cfg);
         try self.readUntilReady();
@@ -175,8 +186,8 @@ pub const Conn = struct {
 
     // --- TLS negotiation --------------------------------------------------------
 
-    fn maybeStartTls(self: *Conn, sslmode: connstr.SslMode) ConnError!void {
-        if (sslmode == .disable) return;
+    fn maybeStartTls(self: *Conn, cfg: connstr.Config, trust: ?*tls_trust.TlsTrust) ConnError!void {
+        if (cfg.sslmode == .disable) return;
 
         // SSLRequest: int32 length(8), int32 magic(80877103). No type tag.
         self.out.writeInt(i32, 8, .big) catch return ConnError.ConnectFailed;
@@ -185,13 +196,22 @@ pub const Conn = struct {
 
         const reply = self.in.takeByte() catch return ConnError.ConnectFailed;
         switch (reply) {
-            'S' => try self.startTlsHandshake(),
-            'N' => if (sslmode == .require) return ConnError.TlsRequiredButRefused,
+            'S' => try self.startTlsHandshake(cfg, trust),
+            'N' => switch (cfg.sslmode) {
+                .require, .verify_ca, .verify_full => {
+                    std.log.err(
+                        "postgres: server {s}:{d} refused TLS but sslmode={s} requires it; for a trusted-network/dev setup append ?sslmode=disable (plaintext) or ?sslmode=require (encrypted, unverified) to ZIGBASE_DB_URL.",
+                        .{ cfg.host, cfg.port, cfg.sslmode.label() },
+                    );
+                    return ConnError.TlsRequiredButRefused;
+                },
+                .prefer, .disable => {}, // opportunistic modes: plaintext fallback
+            },
             else => return ConnError.Protocol,
         }
     }
 
-    fn startTlsHandshake(self: *Conn) ConnError!void {
+    fn startTlsHandshake(self: *Conn, cfg: connstr.Config, trust: ?*tls_trust.TlsTrust) ConnError!void {
         self.tls_read_buf = self.gpa.alloc(u8, sock_buf_len) catch return ConnError.OutOfMemory;
         self.tls_write_buf = self.gpa.alloc(u8, sock_buf_len) catch return ConnError.OutOfMemory;
         const client = self.gpa.create(tls.Client) catch return ConnError.OutOfMemory;
@@ -201,23 +221,77 @@ pub const Conn = struct {
         self.io.random(&entropy);
 
         client.* = tls.Client.init(self.in, self.out, .{
-            // The driver does not (yet) verify the server certificate chain or hostname —
-            // it uses TLS purely for transport encryption (parity with libpq sslmode=require,
-            // which also does not authenticate the server). connstr.parse REJECTS
-            // verify-ca/verify-full (ParseError.UnsupportedSslMode) rather than silently
-            // accepting them here; real cert+host verification is a documented follow-up.
-            .host = .no_verification,
-            .ca = .no_verification,
+            // verify_full: verify the certificate matches the URL host (SAN/CN).
+            // Everything below verify_full: encryption without server authentication —
+            // libpq parity for require/prefer; the verified modes are the safe default.
+            .host = if (cfg.sslmode == .verify_full) .{ .explicit = cfg.host } else .no_verification,
+            // verify_ca/verify_full: chain verification against the startup-built bundle
+            // (shared across the pool; the std API takes the lock + bundle by pointer).
+            .ca = if (trust) |t| .{ .bundle = .{
+                .gpa = self.gpa,
+                .io = self.io,
+                .lock = &t.lock,
+                .bundle = &t.bundle,
+            } } else .no_verification,
             .write_buffer = self.tls_write_buf,
             .read_buffer = self.tls_read_buf,
             .entropy = &entropy,
-            .realtime_now = .zero,
-        }) catch return ConnError.TlsHandshakeFailed;
+            // Real wall time UNCONDITIONALLY: the verified modes need it for
+            // NotBefore/NotAfter (`.zero` would make every cert "not yet valid");
+            // harmless under .no_verification.
+            .realtime_now = std.Io.Timestamp.now(self.io, .real),
+        }) catch |e| return self.mapTlsInitError(e, cfg);
 
         self.tls_client = client;
         self.in = &client.reader;
         self.out = &client.writer;
         self.using_tls = true;
+    }
+
+    /// Map a TLS-handshake failure into an actionable ConnError, logging the operator-facing
+    /// message HERE (the Db/Pool layers flatten everything to OpenFailed, so this is the only
+    /// place the distinction exists). NEVER logs the URL — host:port, sslmode label, and the
+    /// CA source only.
+    fn mapTlsInitError(self: *Conn, e: anyerror, cfg: connstr.Config) ConnError {
+        self.broken = true;
+        const ca_src: []const u8 = cfg.sslrootcert orelse "the system root store";
+        switch (e) {
+            error.CertificateHostMismatch => {
+                std.log.err(
+                    "postgres TLS: the server certificate does not match host '{s}' (sslmode=verify-full). Connect by the name in the certificate, or use sslmode=verify-ca if you cannot.",
+                    .{cfg.host},
+                );
+                return ConnError.CertHostnameMismatch;
+            },
+            error.CertificateExpired => {
+                std.log.err(
+                    "postgres TLS: the server certificate for {s}:{d} is EXPIRED. Renew the server certificate (and check this host's system clock).",
+                    .{ cfg.host, cfg.port },
+                );
+                return ConnError.CertExpired;
+            },
+            error.CertificateNotYetValid => {
+                std.log.err(
+                    "postgres TLS: the server certificate for {s}:{d} is not yet valid. Check the server certificate and this host's system clock.",
+                    .{ cfg.host, cfg.port },
+                );
+                return ConnError.CertNotYetValid;
+            },
+            error.TlsCertificateNotVerified,
+            error.CertificateIssuerMismatch,
+            error.CertificateSignatureInvalid,
+            => {
+                std.log.err(
+                    "postgres TLS: the certificate chain for {s}:{d} could not be verified against {s} (sslmode={s}). For a private CA, pass sslrootcert=<pem-path> in ZIGBASE_DB_URL.",
+                    .{ cfg.host, cfg.port, ca_src, cfg.sslmode.label() },
+                );
+                return ConnError.CertUntrusted;
+            },
+            else => {
+                std.log.err("postgres TLS: handshake with {s}:{d} failed ({s}).", .{ cfg.host, cfg.port, @errorName(e) });
+                return ConnError.TlsHandshakeFailed;
+            },
+        }
     }
 
     // --- startup + auth ---------------------------------------------------------
@@ -434,7 +508,10 @@ pub const Conn = struct {
         mb.start(proto.Frontend.query) catch return ConnError.OutOfMemory;
         mb.cstr(sql) catch return ConnError.OutOfMemory;
         mb.finish(self.out) catch return ConnError.QueryFailed;
-        self.flushOut() catch { self.broken = true; return ConnError.QueryFailed; };
+        self.flushOut() catch {
+            self.broken = true;
+            return ConnError.QueryFailed;
+        };
 
         var failed = false;
         while (true) {
@@ -504,7 +581,10 @@ pub const Conn = struct {
         // Sync.
         mb.start(proto.Frontend.sync) catch return ConnError.OutOfMemory;
         mb.finish(self.out) catch return ConnError.QueryFailed;
-        self.flushOut() catch { self.broken = true; return ConnError.QueryFailed; };
+        self.flushOut() catch {
+            self.broken = true;
+            return ConnError.QueryFailed;
+        };
 
         var result = QueryResult{};
         var rows: std.ArrayList([]?[]const u8) = .empty;

@@ -9,6 +9,7 @@ const conn_mod = @import("conn.zig");
 const connstr = @import("connstr.zig");
 const stmt_mod = @import("stmt.zig");
 const frozen_clock = @import("clock.zig");
+const tls_trust = @import("tls_trust.zig");
 
 pub const Conn = conn_mod.Conn;
 pub const Stmt = stmt_mod.Stmt;
@@ -32,15 +33,41 @@ pub const Db = struct {
     field_cipher: ?*const anyopaque = null,
 
     /// Connect to `uri` (`postgres://user:pass@host:port/dbname?sslmode=...`) and complete
-    /// startup + authentication. Caller owns the connection and must call `close`.
+    /// startup + authentication. For the verified sslmodes (verify-ca / verify-full — the
+    /// DEFAULT) this builds an ephemeral CA trust store for the single handshake; pooled
+    /// connections share one instead via `openTrusted`. Caller owns the connection and
+    /// must call `close`.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, uri: []const u8) DbError!Db {
-        var cfg = connstr.parse(gpa, uri) catch return DbError.OpenFailed;
+        var cfg = connstr.parse(gpa, uri) catch |e| {
+            std.log.err("postgres: invalid connection URL ({s})", .{@errorName(e)});
+            return DbError.OpenFailed;
+        };
         defer cfg.deinit();
-        const conn = conn_mod.Conn.connect(gpa, io, cfg) catch return DbError.OpenFailed;
-        // Dev-only: install the frozen test clock (`ZIGBASE_FAKE_NOW`) on every connection — the
-        // Postgres analog of the SQLite `clock_sql`/`clock_vfs` shims. comptime no-op + does
-        // nothing unless a freeze is active (see backend/postgres/clock.zig). The pool opens
-        // BOTH the writer and every reader through `open`, so this covers all connections.
+        if (cfg.sslmode.verifiesCertificate()) {
+            // Ephemeral trust: the tls handshake completes fully inside Client.init, so the
+            // bundle is not referenced after connect returns and can be freed immediately.
+            var trust = tls_trust.TlsTrust.init(gpa, io, &cfg) catch return DbError.OpenFailed;
+            defer trust.deinit();
+            return openParsed(gpa, io, cfg, &trust);
+        }
+        return openParsed(gpa, io, cfg, null);
+    }
+
+    /// Pool path: connect using an already-built, shared trust store (or null for the
+    /// non-verifying modes). `trust` must be non-null iff the URI's sslmode verifies.
+    pub fn openTrusted(gpa: std.mem.Allocator, io: std.Io, uri: []const u8, trust: ?*tls_trust.TlsTrust) DbError!Db {
+        var cfg = connstr.parse(gpa, uri) catch |e| {
+            std.log.err("postgres: invalid connection URL ({s})", .{@errorName(e)});
+            return DbError.OpenFailed;
+        };
+        defer cfg.deinit();
+        return openParsed(gpa, io, cfg, trust);
+    }
+
+    fn openParsed(gpa: std.mem.Allocator, io: std.Io, cfg: connstr.Config, trust: ?*tls_trust.TlsTrust) DbError!Db {
+        const conn = conn_mod.Conn.connect(gpa, io, cfg, trust) catch return DbError.OpenFailed;
+        // Dev-only frozen test clock (`ZIGBASE_FAKE_NOW`) on every connection — comptime
+        // no-op unless a freeze is active. Both pool writer and readers route through here.
         frozen_clock.install(conn);
         return .{ .conn = conn, .gpa = gpa };
     }
