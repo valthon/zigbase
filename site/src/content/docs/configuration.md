@@ -81,6 +81,15 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_SENDMAIL_COMMAND` | — | `""` (off) | local-MTA command to pipe mail to (e.g. `sendmail -t -i` or `msmtp -t`); when set, **overrides** SMTP. App holds no SMTP creds |
 | `ZIGBASE_FAKE_NOW` | — | _unset_ | **DEV-ONLY test clock.** Freeze "now" to an ISO-8601 UTC instant (e.g. `2029-03-07T16:00:00Z`) for deterministic time-boundary e2e tests. Freezes both the framework's own timestamps and a consumer's raw SQL `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')` (and `date`/`time`/`julianday`), plus the `CURRENT_TIMESTAMP` / `CURRENT_TIME` / `CURRENT_DATE` keywords and column `DEFAULT CURRENT_TIMESTAMP` (via a wrapping VFS). **Ignored entirely on a production build** (compiled out unless built with `-Ddev-clock=true`; off in any release build). See [Known limitations → Testing](./known-limitations) for scope |
 | `ZIGBASE_FAKE_SEED` | — | _unset_ | **DEV-ONLY seeded entropy.** Set to a decimal `u64` (e.g. `12345`) to make record/field ID and token generation deterministic: two runs with the same seed produce identical IDs and tokens. Useful for snapshot tests. **Ignored entirely on a production build** (compiled out unless built with `-Ddev-clock=true`; off in any release build). See [Framework → Test/dev-mode seams](./framework#14-test--dev-mode-determinism-seams) |
+| `ZIGBASE_S3_BUCKET` | — | `""` (off) | **Opt-in.** Non-empty selects the S3-compatible storage backend instead of local disk. Only honored in a binary built with `-Ds3=true` (see below); ignored otherwise |
+| `ZIGBASE_S3_REGION` | — | `"us-east-1"` | AWS region (SigV4 signing + default endpoint) |
+| `ZIGBASE_S3_ENDPOINT` | — | `""` | `""` → `https://s3.<region>.amazonaws.com`; set for MinIO/R2/other S3-compatible endpoints |
+| `ZIGBASE_S3_ACCESS_KEY_ID` | — | `""` | SigV4 access key id (required with `ZIGBASE_S3_BUCKET`) |
+| `ZIGBASE_S3_SECRET_ACCESS_KEY` | — | `""` | SigV4 secret access key (required with `ZIGBASE_S3_BUCKET`) |
+| `ZIGBASE_S3_FORCE_PATH_STYLE` | — | _auto_ | `true`/`1` forces path-style addressing; unset auto-selects path-style when `ZIGBASE_S3_ENDPOINT` is set, virtual-hosted otherwise |
+| `ZIGBASE_S3_KEY_PREFIX` | — | `""` | prefix prepended to every object key — namespace multiple apps in one bucket |
+| `ZIGBASE_S3_CACHE_DIR` | — | `""` | `""` → `<data-dir>/storage_cache`; the local spool cache directory downloads materialize through |
+| `ZIGBASE_S3_CACHE_MAX_BYTES` | — | `1073741824` (1 GiB) | spool cache size cap; eviction reclaims down to a 3/4 low-water mark |
 
 ## Database backend (experimental)
 
@@ -106,6 +115,28 @@ default** since 0.10.0 — an unqualified URL gets `sslmode=verify-full` (chain 
 verification, `sslrootcert=` for private CAs), a server that refuses TLS fails at startup with
 the exact opt-down instruction, and any explicit mode below `verify-full` logs a startup
 warning. See [PostgreSQL backend](./postgres) for the full guide.
+
+## S3 storage backend (experimental)
+
+ZigBase defaults to local-disk file storage (`<data-dir>/storage`). An opt-in
+**S3-compatible** object storage backend (AWS S3, MinIO, Cloudflare R2, and similar) is
+available behind the **`-Ds3`** build flag — off by default, alongside `-Dpostgres` and
+`-Dvector` in the same "compiled in only when asked for" family of opt-in build flags.
+
+When compiled in (`zig build -Ds3=true`), setting `ZIGBASE_S3_BUCKET` (plus credentials —
+see the env table above) selects S3 storage at startup instead of local disk; leaving it
+unset keeps local disk. The backend is chosen once, by configuration — the same "switch
+via configuration alone" contract as `ZIGBASE_DB_URL`. A **stock (`-Ds3=false`) binary**
+handed `ZIGBASE_S3_BUCKET` does **not** silently keep writing to local disk unnoticed — it
+logs a loud warning and falls back to local storage.
+
+Downloads are never proxied straight from S3: the server spools an object to a local
+cache file on first read (`ZIGBASE_S3_CACHE_DIR`) and serves every subsequent read from
+that file, so Range requests, conditional requests, `ETag`, and per-collection
+cacheability behave identically to local storage. Startup runs a fail-fast `HeadObject`
+probe so a bad config is caught at boot, not on first upload. See [Known
+limitations](./known-limitations) for the write-lock, best-effort-delete,
+proxy-only-serving, and 5 GiB single-`PUT` caveats.
 
 ## Email delivery
 

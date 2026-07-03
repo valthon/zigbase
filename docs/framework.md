@@ -2777,6 +2777,50 @@ custom **mailer** (`AuditMailer`) *and* custom **storage** (`AuditStorage`, whic
 wraps `zigbase.LocalStorage` and logs each of the four vtable calls before
 delegating).
 
+### S3-compatible storage (`-Ds3`)
+
+`DefaultStoragePlugin` also backs an opt-in **S3-compatible** object storage
+backend (AWS S3, MinIO, Cloudflare R2, and similar) — selected by
+**configuration alone**, no code change:
+
+1. Build with **`-Ds3=true`**. Off by default; a stock binary has no S3 code
+   compiled in at all.
+2. On an `-Ds3` binary, set **`ZIGBASE_S3_BUCKET`** (and credentials) to switch
+   `DefaultStoragePlugin` from `LocalStorage` to `S3Storage` at startup — the
+   same "switch via configuration alone" contract as `ZIGBASE_DB_URL`
+   (postgres). A **stock (`-Ds3=false`)** binary handed `ZIGBASE_S3_BUCKET`
+   does **not** silently keep writing to local disk unnoticed — it logs a
+   loud warning and falls back to local storage.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `ZIGBASE_S3_BUCKET` | `""` (off) | non-empty enables S3 storage (on an `-Ds3` binary) |
+| `ZIGBASE_S3_REGION` | `"us-east-1"` | AWS region (used for SigV4 signing and the default endpoint) |
+| `ZIGBASE_S3_ENDPOINT` | `""` | `""` → `https://s3.<region>.amazonaws.com`; set for MinIO/R2/other S3-compatible endpoints |
+| `ZIGBASE_S3_ACCESS_KEY_ID` | `""` | SigV4 access key id (required) |
+| `ZIGBASE_S3_SECRET_ACCESS_KEY` | `""` | SigV4 secret access key (required) |
+| `ZIGBASE_S3_FORCE_PATH_STYLE` | _auto_ | `true`/`1` forces path-style addressing; unset auto-selects path-style when `ZIGBASE_S3_ENDPOINT` is set, virtual-hosted otherwise |
+| `ZIGBASE_S3_KEY_PREFIX` | `""` | prefix prepended to every object key (`<prefix><col>/<rid>/<name>`) — namespace multiple apps in one bucket |
+| `ZIGBASE_S3_CACHE_DIR` | `""` | `""` → `<data_dir>/storage_cache`; the local spool cache directory (see below) |
+| `ZIGBASE_S3_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | spool cache size cap; eviction reclaims down to a 3/4 low-water mark |
+
+Downloads are never proxied straight from S3: `fetch` spools an object to a
+local cache file on first read (an atomic download-then-rename, safe under
+concurrent misses) and every subsequent read is served from that local file —
+so `GET /api/files/:col/:rec/:name` gets **Range requests, conditional
+requests, `ETag`, and per-collection cacheability exactly as with local
+storage** (§9's `fetch` contract). Startup runs a fail-fast `HeadObject` probe
+(200 or 404 both prove DNS/TLS/SigV4/bucket/permissions end-to-end; anything
+else refuses to start) so a bad S3 config is caught at boot, not on first
+upload. See [Known limitations](../KNOWN_LIMITATIONS.md) for the write-lock,
+best-effort-delete, proxy-only-serving, and 5 GiB single-`PUT` caveats.
+
+`zigbase.S3Storage` is exported alongside `zigbase.LocalStorage` (an empty
+placeholder type on a stock, non-`-Ds3` build — its `create`/`interface`
+methods only exist when compiled in), so a custom storage plugin built on an
+`-Ds3` binary can wrap or delegate to it the same way the example above wraps
+`LocalStorage`.
+
 ## 10. Footprint levers (`.pools`)
 
 `.pools` tunes ZigBase's memory/connection footprint at comptime. All fields are

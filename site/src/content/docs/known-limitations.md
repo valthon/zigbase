@@ -156,12 +156,28 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   target provisions cycle-edge FKs as deferrable and defers them to COMMIT — correct
   for cyclic and self-referential graphs, verified against live Postgres in CI.
 
+## S3 storage (`-Ds3`)
+
+- **`PutObject` runs inside the global write transaction.** A file upload's S3 `PUT`
+  happens synchronously while the writer lock is held — deliberate: a storage failure
+  rolls the record write back instead of leaving an orphaned DB row pointing at a
+  never-uploaded object.
+- **Deletes are best-effort.** Exactly like local storage, a delete that fails partway
+  can leave an orphaned object behind; there is no reconciliation job. Configure an S3
+  lifecycle rule on the bucket/prefix as the mitigation.
+- **Proxy-only serving.** Downloads always flow through the server's spool cache — there
+  is no presigned-URL redirect mode yet.
+- **Single-`PUT` uploads only, capped at 5 GiB.** There is no S3 multipart upload;
+  `ZIGBASE_MAX_UPLOAD_SIZE` above the 5 GiB single-`PUT` limit is refused at startup.
+- **Spool cache eviction is create-time, not true LRU.** Eviction sorts by file mtime,
+  which is only set on a cache miss (the download that fills the entry) — a cache hit
+  does not bump it, so a frequently-read file fetched once long ago can be evicted
+  before a rarely-read file fetched more recently.
+
 ## Other deferred work
 
-- Image thumbnails / transforms; an S3 (or other remote) storage backend — a pluggable
-  `.storage` slot exists, but only the local-disk backend ships; `fields=` response
-  projection; resumable/chunked uploads; realtime backfill/replay and per-event-guard
-  load-tuning.
+- Image thumbnails / transforms; `fields=` response projection; resumable/chunked
+  uploads; realtime backfill/replay and per-event-guard load-tuning.
 
 ---
 

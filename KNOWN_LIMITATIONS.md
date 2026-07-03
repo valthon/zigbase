@@ -52,8 +52,15 @@ ZigBase v0.9.0 is an early release. The gaps below are known and tracked for fut
 - **SCRAM passwords that require NFKC normalization are rejected.** The driver implements RFC 4013 SASLprep except full NFKC normalization: a password whose SASLprep output would need NFKC fails at connect with an actionable error — supply it pre-normalized to NFKC, or use an ASCII password. (Everything else is correctly prepped or intentionally matches PostgreSQL's own use-verbatim behavior.)
 - **`migrate-db`: the superuser fast path is faster; the non-superuser path is fully supported.** A superuser target suspends FK enforcement wholesale; a non-superuser target provisions cycle-edge FKs as deferrable and defers them to COMMIT — correct for cyclic and self-referential graphs, verified against live Postgres in CI.
 
+## S3 storage (`-Ds3`)
+- **`PutObject` runs inside the global write transaction.** A file upload's S3 `PUT` happens synchronously while the writer lock is held, so a slow upload holds up every other write for its duration — deliberate: a storage failure rolls the record write back instead of leaving an orphaned DB row pointing at a never-uploaded object.
+- **Deletes are best-effort.** Exactly like local storage, a delete that fails partway (network blip, permission change) can leave an orphaned object behind; there is no reconciliation job. Configure an S3 lifecycle rule on the bucket/prefix as the mitigation.
+- **Proxy-only serving.** Downloads always flow through the server's spool cache (§D.6) — there is no presigned-URL redirect mode yet, so every download consumes server bandwidth/CPU even though the bytes ultimately come from S3.
+- **Single-`PUT` uploads only, capped at 5 GiB.** There is no S3 multipart upload; `ZIGBASE_MAX_UPLOAD_SIZE` above the 5 GiB single-`PUT` limit is refused at startup.
+- **Spool cache disk usage + eviction is create-time, not true LRU.** The local spool cache (`ZIGBASE_S3_CACHE_DIR`, default `<data-dir>/storage_cache`) needs its own disk budget on top of the database; size it via `ZIGBASE_S3_CACHE_MAX_BYTES`. Eviction sorts by file **mtime**, which is only set on a cache **miss** (the download that fills the entry) — a cache **hit** does not bump it. A frequently-read file that was fetched once long ago can be evicted before a rarely-read file that happened to be fetched recently; this is deliberately simple (no access-time bookkeeping), not a strict LRU.
+
 ## Other deferred work
-- Image thumbnails / transforms; an S3 (or other remote) storage backend — a pluggable `.storage` slot exists, but only the local-disk backend ships; `fields=` response projection; resumable/chunked uploads; realtime backfill/replay and per-event-guard load-tuning.
+- Image thumbnails / transforms; `fields=` response projection; resumable/chunked uploads; realtime backfill/replay and per-event-guard load-tuning.
 
 ---
 These are tracked for upcoming releases. Contributions welcome.

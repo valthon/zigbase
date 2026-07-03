@@ -2707,6 +2707,36 @@ alloc, zigbase.Email)` — backs mail (the default `zigbase.DefaultMailerPlugin`
 `zigbase.LogMailer` or `zigbase.SmtpMailer` from config). See the [plugins
 example](../examples/plugins) for the full, compiling custom-mailer plugin.
 
+### S3-compatible storage (`-Ds3`)
+
+`DefaultStoragePlugin` also backs an opt-in **S3-compatible** backend (AWS S3, MinIO,
+Cloudflare R2, ...), selected by config alone once built with **`-Ds3=true`** (off by
+default; a stock binary compiles no S3 code at all): setting `ZIGBASE_S3_BUCKET` on an
+`-Ds3` binary switches `DefaultStoragePlugin` to `S3Storage`, the same "switch via
+configuration alone" contract as `ZIGBASE_DB_URL` (postgres) — a stock binary handed
+`ZIGBASE_S3_BUCKET` warns loudly and falls back to local storage instead of silently
+ignoring it.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `ZIGBASE_S3_BUCKET` | `""` (off) | non-empty enables S3 storage (on an `-Ds3` binary) |
+| `ZIGBASE_S3_REGION` | `"us-east-1"` | AWS region (SigV4 signing + default endpoint) |
+| `ZIGBASE_S3_ENDPOINT` | `""` | `""` → `https://s3.<region>.amazonaws.com`; set for MinIO/R2/other endpoints |
+| `ZIGBASE_S3_ACCESS_KEY_ID` | `""` | SigV4 access key id (required) |
+| `ZIGBASE_S3_SECRET_ACCESS_KEY` | `""` | SigV4 secret access key (required) |
+| `ZIGBASE_S3_FORCE_PATH_STYLE` | _auto_ | `true`/`1` forces path-style; unset auto-selects path-style when `ZIGBASE_S3_ENDPOINT` is set |
+| `ZIGBASE_S3_KEY_PREFIX` | `""` | prefix prepended to every object key — namespace multiple apps in one bucket |
+| `ZIGBASE_S3_CACHE_DIR` | `""` | `""` → `<data_dir>/storage_cache`; the local spool cache directory |
+| `ZIGBASE_S3_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | spool cache size cap; eviction reclaims to a 3/4 low-water mark |
+
+Downloads are never proxied straight from S3: `fetch` spools an object to a local cache
+file on first read and every later read is served from that file, so Range/conditional/
+`ETag`/cacheability behavior is identical to local storage. Startup runs a fail-fast
+`HeadObject` probe so a bad config is caught at boot, not on first upload. See [Known
+limitations](../known-limitations) for the write-lock, best-effort-delete,
+proxy-only-serving, and 5 GiB single-`PUT` caveats. `zigbase.S3Storage` is exported
+alongside `zigbase.LocalStorage` so a custom plugin can wrap it.
+
 ## 10. Footprint levers (`.pools`)
 
 `.pools` tunes ZigBase's memory/connection footprint at comptime. All fields are optional;

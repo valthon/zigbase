@@ -186,7 +186,11 @@ pub const MockResponse = struct {
 
 const Mock = struct {
     url_substring: []const u8,
-    resp: MockResponse,
+    /// Ordered responses for successive matching calls; once exhausted, the last entry
+    /// repeats for any further match (sticky-last). `mock()` registers a single-entry
+    /// sequence, so its existing "always this response" behavior is unchanged.
+    responses: []MockResponse,
+    next: usize = 0,
 };
 
 /// Result of consulting the HTTP capture before a real request.
@@ -263,17 +267,27 @@ pub const http = struct {
     /// Later registrations win on overlap (matched newest-first). The response is copied into
     /// the capture arena, so callers may pass transient buffers.
     pub fn mock(url_substring: []const u8, resp: MockResponse) void {
-        if (!enabled) return;
+        mockSequence(url_substring, &.{resp});
+    }
+
+    /// Like `mock`, but registers an ORDERED sequence of responses: the 1st matching call
+    /// gets `responses[0]`, the 2nd gets `responses[1]`, etc.; once exhausted, the last
+    /// entry repeats for any further match. Lets a test exercise a retry-then-succeed
+    /// call within a single client op (e.g. a 5xx followed by a 200).
+    pub fn mockSequence(url_substring: []const u8, responses: []const MockResponse) void {
+        if (!enabled or responses.len == 0) return;
         lockMutex(&g_http.mutex);
         defer g_http.mutex.unlock();
         const a = g_http.alloc();
+        const dup_responses = a.alloc(MockResponse, responses.len) catch return;
+        for (responses, 0..) |r, i| dup_responses[i] = .{
+            .status = r.status,
+            .headers = dupeHeaders(a, r.headers) catch return,
+            .body = a.dupe(u8, r.body) catch return,
+        };
         const m = Mock{
             .url_substring = a.dupe(u8, url_substring) catch return,
-            .resp = .{
-                .status = resp.status,
-                .headers = dupeHeaders(a, resp.headers) catch return,
-                .body = a.dupe(u8, resp.body) catch return,
-            },
+            .responses = dup_responses,
         };
         g_http.mocks.append(a, m) catch {};
     }
@@ -322,16 +336,21 @@ pub const http = struct {
         };
         g_http.requests.append(ca, rec) catch {};
 
-        // Match a mock (newest-first so later registrations win on overlap).
+        // Match a mock (newest-first so later registrations win on overlap). Each match
+        // advances that mock's own sequence position (sticky on the last entry once
+        // exhausted), independent of the other mocks.
         var idx = g_http.mocks.items.len;
         while (idx > 0) {
             idx -= 1;
-            const m = g_http.mocks.items[idx];
+            const m = &g_http.mocks.items[idx];
             if (std.mem.indexOf(u8, opts.url, m.url_substring) != null) {
+                const i = @min(m.next, m.responses.len - 1);
+                const resp = m.responses[i];
+                if (m.next < m.responses.len - 1) m.next += 1;
                 return .{ .response = .{
-                    .status = m.resp.status,
-                    .headers = try dupeHeaders(caller_alloc, m.resp.headers),
-                    .body = try caller_alloc.dupe(u8, m.resp.body),
+                    .status = resp.status,
+                    .headers = try dupeHeaders(caller_alloc, resp.headers),
+                    .body = try caller_alloc.dupe(u8, resp.body),
                 } };
             }
         }

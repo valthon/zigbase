@@ -66,6 +66,19 @@ pub const Config = struct {
     // Env: ZIGBASE_STATIC_CACHE_CONTROL. Validated at startup (CR/LF, length <= 256).
     static_cache_control: []const u8 = "",
 
+    // S3-compatible remote storage (§D). Parsed in EVERY build — a stock (no -Ds3)
+    // binary needs them to detect-and-warn (the postgres_url_without_build precedent);
+    // the backend itself is compiled only under -Ds3. Secrets are never logged.
+    s3_bucket: []const u8 = "", // non-empty enables S3 (in an -Ds3 build)
+    s3_region: []const u8 = "us-east-1",
+    s3_endpoint: []const u8 = "", // "" = https://s3.<region>.amazonaws.com; MinIO/R2 set this
+    s3_access_key_id: []const u8 = "",
+    s3_secret_access_key: []const u8 = "",
+    s3_force_path_style: ?bool = null, // null = auto: true when an endpoint is set
+    s3_key_prefix: []const u8 = "",
+    s3_cache_dir: []const u8 = "", // "" = <data_dir>/storage_cache
+    s3_cache_max_bytes: u64 = 1 << 30, // 1 GiB spool cap
+
     // In-memory rate limiting for sensitive auth endpoints (login / password-reset /
     // email-verification). Fixed window: at most `rate_limit_max` requests per client
     // key per `rate_limit_window_s` seconds. `rate_limit_max = 0` disables it entirely.
@@ -147,6 +160,15 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter.get("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
         if (getter.get("ZIGBASE_STATIC_CACHE_CONTROL")) |v| cfg.static_cache_control = v;
+        if (getter.get("ZIGBASE_S3_BUCKET")) |v| cfg.s3_bucket = v;
+        if (getter.get("ZIGBASE_S3_REGION")) |v| cfg.s3_region = v;
+        if (getter.get("ZIGBASE_S3_ENDPOINT")) |v| cfg.s3_endpoint = v;
+        if (getter.get("ZIGBASE_S3_ACCESS_KEY_ID")) |v| cfg.s3_access_key_id = v;
+        if (getter.get("ZIGBASE_S3_SECRET_ACCESS_KEY")) |v| cfg.s3_secret_access_key = v;
+        if (getter.get("ZIGBASE_S3_FORCE_PATH_STYLE")) |v| cfg.s3_force_path_style = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        if (getter.get("ZIGBASE_S3_KEY_PREFIX")) |v| cfg.s3_key_prefix = v;
+        if (getter.get("ZIGBASE_S3_CACHE_DIR")) |v| cfg.s3_cache_dir = v;
+        if (getter.get("ZIGBASE_S3_CACHE_MAX_BYTES")) |v| cfg.s3_cache_max_bytes = try std.fmt.parseInt(u64, v, 10);
         if (getter.get("ZIGBASE_RATE_LIMIT_MAX")) |v| cfg.rate_limit_max = try std.fmt.parseInt(u32, v, 10);
         if (getter.get("ZIGBASE_RATE_LIMIT_WINDOW")) |v| cfg.rate_limit_window_s = try std.fmt.parseInt(i64, v, 10);
         if (getter.get("ZIGBASE_OAUTH_STATE_SERVER")) |v| cfg.oauth_state_server = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
@@ -368,4 +390,47 @@ test "static_cache_control defaults empty, overridable via env" {
         }
     };
     try std.testing.expectEqualStrings("public, max-age=86400, immutable", (try Config.load(G1{})).static_cache_control);
+}
+
+test "s3_* config: defaults empty/us-east-1/null, overridable via env" {
+    const G0 = struct {
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const c0 = try Config.load(G0{});
+    try std.testing.expectEqualStrings("", c0.s3_bucket);
+    try std.testing.expectEqualStrings("us-east-1", c0.s3_region);
+    try std.testing.expectEqualStrings("", c0.s3_endpoint);
+    try std.testing.expectEqualStrings("", c0.s3_access_key_id);
+    try std.testing.expectEqualStrings("", c0.s3_secret_access_key);
+    try std.testing.expectEqual(@as(?bool, null), c0.s3_force_path_style);
+    try std.testing.expectEqualStrings("", c0.s3_key_prefix);
+    try std.testing.expectEqualStrings("", c0.s3_cache_dir);
+    try std.testing.expectEqual(@as(u64, 1 << 30), c0.s3_cache_max_bytes);
+
+    const G1 = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_BUCKET")) return "prod-bucket";
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_REGION")) return "eu-west-1";
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_ENDPOINT")) return "http://localhost:9000";
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_ACCESS_KEY_ID")) return "AKIAEXAMPLE";
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_SECRET_ACCESS_KEY")) return "secret";
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_FORCE_PATH_STYLE")) return "true";
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_KEY_PREFIX")) return "tenant-a/";
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_CACHE_DIR")) return "/var/cache/zigbase";
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_CACHE_MAX_BYTES")) return "2147483648";
+            return null;
+        }
+    };
+    const c1 = try Config.load(G1{});
+    try std.testing.expectEqualStrings("prod-bucket", c1.s3_bucket);
+    try std.testing.expectEqualStrings("eu-west-1", c1.s3_region);
+    try std.testing.expectEqualStrings("http://localhost:9000", c1.s3_endpoint);
+    try std.testing.expectEqualStrings("AKIAEXAMPLE", c1.s3_access_key_id);
+    try std.testing.expectEqualStrings("secret", c1.s3_secret_access_key);
+    try std.testing.expectEqual(@as(?bool, true), c1.s3_force_path_style);
+    try std.testing.expectEqualStrings("tenant-a/", c1.s3_key_prefix);
+    try std.testing.expectEqualStrings("/var/cache/zigbase", c1.s3_cache_dir);
+    try std.testing.expectEqual(@as(u64, 1 << 31), c1.s3_cache_max_bytes);
 }

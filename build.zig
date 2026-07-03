@@ -49,6 +49,13 @@ pub fn build(b: *std.Build) void {
     // C/libpq/OpenSSL to compile, so unlike -Dvector there is no extra C source to add here.
     const postgres = b.option(bool, "postgres", "Compile in the opt-in pure-Zig PostgreSQL wire-protocol backend (default: off)") orelse false;
     build_options.addOption(bool, "postgres", postgres);
+    // Opt-in S3-compatible storage backend (SP3 Theme D §D). OFF by default: when false,
+    // src/files/s3.zig is comptime-unreachable (conditional @import in framework.zig /
+    // root.zig — the db.zig:27 postgres pattern), so the default build compiles zero S3
+    // code. Pure Zig (the shared http_client + the aws/sigv4 signer, both of which the
+    // default build already ships via SES) — no extra C sources.
+    const s3 = b.option(bool, "s3", "Compile in the opt-in S3-compatible storage backend (default: off)") orelse false;
+    build_options.addOption(bool, "s3", s3);
     zigbase_mod.addOptions("build_options", build_options);
 
     zigbase_mod.addIncludePath(b.path("vendor/sqlite"));

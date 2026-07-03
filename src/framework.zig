@@ -40,6 +40,10 @@ const abilities_mod = @import("authz/abilities.zig");
 const analytics = @import("analytics/analytics.zig");
 const analytics_config = @import("analytics/config.zig");
 const colcache = @import("colcache.zig");
+// Opt-in S3-compatible storage backend (`-Ds3`; §D). A stub type when off — the
+// db.zig:27 postgres pattern — so `DefaultStoragePlugin` below always compiles, and
+// only `-Ds3=true` makes `s3mod.S3Storage` a real, constructible type.
+const s3mod = if (build_options.s3) @import("files/s3.zig") else struct {};
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -84,27 +88,65 @@ fn liveEncryptedCollection(arena: std.mem.Allocator, w: *db.Db) !?[]const u8 {
 // either by supplying their own comptime type implementing the same contract.
 // ============================================================================
 
-/// Default storage plugin: wraps `LocalStorage` rooted at `<data_dir>/storage`,
-/// reproducing the pre-plugin file wiring. Owns the heap-allocated root string.
+/// Default storage plugin, config-driven with no code change to switch backends
+/// (the DefaultMailerPlugin precedent):
+///   1. `cfg.s3_bucket` non-empty AND the binary was built with -Ds3 → `S3Storage`.
+///   2. else → `LocalStorage` rooted at `<data_dir>/storage` (unchanged default).
+/// A stock (no -Ds3) binary with ZIGBASE_S3_BUCKET set warns LOUDLY and falls back
+/// to local — never silent, never fatal (the ZIGBASE_DB_URL postgres:// contract).
 pub const DefaultStoragePlugin = struct {
     gpa: std.mem.Allocator,
     root: []const u8,
-    backend: files_storage.LocalStorage,
+    backend: Backend,
+
+    const Backend = if (build_options.s3) union(enum) {
+        local: files_storage.LocalStorage,
+        s3: s3mod.S3Storage,
+    } else union(enum) {
+        local: files_storage.LocalStorage,
+    };
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !DefaultStoragePlugin {
-        _ = io;
         const root = try std.fmt.allocPrint(gpa, "{s}/storage", .{cfg.data_dir});
-        return .{ .gpa = gpa, .root = root, .backend = files_storage.LocalStorage.init(root) };
+        errdefer gpa.free(root);
+        if (cfg.s3_bucket.len > 0) {
+            if (comptime build_options.s3) {
+                return .{ .gpa = gpa, .root = root, .backend = .{ .s3 = try s3mod.S3Storage.create(gpa, io, cfg) } };
+            } else {
+                std.log.warn(
+                    "ZIGBASE_S3_BUCKET is set but this binary was built without -Ds3; " ++
+                        "falling back to local storage at {s}/storage (build with -Ds3=true to use S3)",
+                    .{cfg.data_dir},
+                );
+            }
+        }
+        return .{ .gpa = gpa, .root = root, .backend = .{ .local = files_storage.LocalStorage.init(root) } };
     }
 
     pub fn interface(self: *DefaultStoragePlugin) files_storage.Storage {
-        return self.backend.storage();
+        switch (self.backend) {
+            inline else => |*b| return b.storage(),
+        }
     }
 
     pub fn deinit(self: *DefaultStoragePlugin) void {
+        if (comptime build_options.s3) {
+            switch (self.backend) {
+                .s3 => |*s| s.deinit(),
+                else => {},
+            }
+        }
         self.gpa.free(self.root);
     }
 };
+
+test "DefaultStoragePlugin: ZIGBASE_S3_BUCKET without -Ds3 warns and falls back to LocalStorage" {
+    if (comptime build_options.s3) return error.SkipZigTest; // this test pins the STOCK binary
+    const a = std.testing.allocator;
+    var p = try DefaultStoragePlugin.create(a, std.testing.io, .{ .data_dir = "/tmp/zb-s3-fallback", .s3_bucket = "prod-bucket" });
+    defer p.deinit();
+    try std.testing.expect(p.backend == .local); // fail-loud (warn), not fatal, not S3
+}
 
 /// Default mailer plugin, config-driven with a fixed precedence and no code
 /// change to switch between backends:
