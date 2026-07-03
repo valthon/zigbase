@@ -25,6 +25,13 @@ pub const Email = struct {
     /// verified per-account sender identities ride on (a tenant sends as its own verified
     /// address rather than the app's global From). CRLF-checked like the other fields.
     from: ?[]const u8 = null,
+    /// Optional one-click unsubscribe URL (#154 round 2). When set, the backends emit the
+    /// RFC 8058 pair — `List-Unsubscribe: <URL>` and `List-Unsubscribe-Post:
+    /// List-Unsubscribe=One-Click`. Deliberately ONE vetted field, not a generic headers
+    /// array: it is CRLF/control-char checked like every other header-bound value, so the
+    /// injection surface stays closed. Set automatically by the bulk item handler when
+    /// `unsubscribe_base_url` is configured; transactional `send()` NEVER sets it.
+    list_unsubscribe: ?[]const u8 = null,
 };
 
 /// Pluggable, backend-agnostic mailer. Mirrors the `Storage` vtable pattern in
@@ -504,8 +511,8 @@ pub fn rejectControlChars(s: []const u8) HeaderError!void {
 /// Build the RFC5322 message bytes (headers + blank line + body). `io` is used ONLY to draw a random
 /// MIME boundary for the multipart case (see below); the header/body bytes are otherwise determined
 /// by the inputs. The dot-stuffing terminator (\r\n.\r\n) is appended by the DATA send path, not here.
-/// Returns error.HeaderInjection if `from`/`to`/`subject`/`reply_to` contain a
-/// CR, LF, NUL, or any other ASCII control char.
+/// Returns error.HeaderInjection if `from`/`to`/`subject`/`reply_to`/`list_unsubscribe`
+/// contain a CR, LF, NUL, or any other ASCII control char.
 ///
 /// Body shape:
 ///   - `html_body == null`           → `text/plain` (the original single-part form).
@@ -517,6 +524,7 @@ pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, emai
     try checkHeaderField(email.to);
     try checkHeaderField(email.subject);
     if (email.reply_to) |rt| try checkHeaderField(rt);
+    if (email.list_unsubscribe) |lu| try checkHeaderField(lu);
     const date = rfc5322Date(now_unix);
 
     // Common headers shared by every body shape. `Reply-To` is emitted only when set.
@@ -525,10 +533,16 @@ pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, emai
     else
         "";
     defer if (email.reply_to != null) alloc.free(reply_hdr);
+    // RFC 8058 one-click unsubscribe pair, emitted only when `list_unsubscribe` is set.
+    const unsub_hdr = if (email.list_unsubscribe) |lu|
+        try std.fmt.allocPrint(alloc, "List-Unsubscribe: <{s}>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n", .{lu})
+    else
+        "";
+    defer if (email.list_unsubscribe != null) alloc.free(unsub_hdr);
     const head = try std.fmt.allocPrint(
         alloc,
-        "From: {s}\r\nTo: {s}\r\n{s}Subject: {s}\r\nDate: {s}\r\nMIME-Version: 1.0\r\n",
-        .{ from, email.to, reply_hdr, email.subject, date },
+        "From: {s}\r\nTo: {s}\r\n{s}{s}Subject: {s}\r\nDate: {s}\r\nMIME-Version: 1.0\r\n",
+        .{ from, email.to, reply_hdr, unsub_hdr, email.subject, date },
     );
     defer alloc.free(head);
 
@@ -708,6 +722,28 @@ test "buildMessage rejects CRLF in reply_to" {
         .subject = "Hi",
         .text_body = "body",
         .reply_to = "ok@x.io\r\nBcc: spam@evil.com",
+    }, 0));
+}
+
+test "buildMessage emits BOTH RFC 8058 headers when list_unsubscribe is set, none when null" {
+    const a = std.testing.allocator;
+    const msg = try buildMessage(a, std.testing.io, "n@a.io", .{
+        .to = "u@x.io", .subject = "News", .text_body = "b",
+        .list_unsubscribe = "https://app.example/api/mail/unsubscribe?t=abc.def",
+    }, 0);
+    defer a.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\r\nList-Unsubscribe: <https://app.example/api/mail/unsubscribe?t=abc.def>\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n") != null);
+
+    const plain = try buildMessage(a, std.testing.io, "n@a.io", .{ .to = "u@x.io", .subject = "s", .text_body = "b" }, 0);
+    defer a.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "List-Unsubscribe") == null);
+}
+
+test "buildMessage rejects CRLF in the list_unsubscribe URL (header injection)" {
+    try std.testing.expectError(error.HeaderInjection, buildMessage(std.testing.allocator, std.testing.io, "n@a.io", .{
+        .to = "u@x.io", .subject = "s", .text_body = "b",
+        .list_unsubscribe = "https://x/u?t=1\r\nBcc: spam@evil.com",
     }, 0));
 }
 

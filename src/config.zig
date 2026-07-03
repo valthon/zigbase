@@ -54,6 +54,10 @@ pub const Config = struct {
     max_upload_size: u64 = 50 << 20, // 50 MiB per request body
     file_token_ttl_s: i64 = 120, // short-lived file-access token
     sentry_dsn: []const u8 = "", // "" = log errors to stderr; set to enable Sentry reporting
+    /// Public base URL for the one-click unsubscribe endpoint (#154 round 2). "" = feature off
+    /// (see `mail/config.zig` Runtime.unsubscribe_base_url). Env overrides the comptime `.mail`
+    /// key — this is what lets the stock binary be configured/e2e-tested without a rebuild.
+    unsubscribe_base_url: []const u8 = "",
     // Static-file root for the default (runtime-flag) mode; set by `--serve-static`.
     // "" = no static serving. Comptime modes (.dir/.embedded/.disabled) ignore it.
     static_dir: []const u8 = "",
@@ -169,6 +173,7 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_S3_KEY_PREFIX")) |v| cfg.s3_key_prefix = v;
         if (getter.get("ZIGBASE_S3_CACHE_DIR")) |v| cfg.s3_cache_dir = v;
         if (getter.get("ZIGBASE_S3_CACHE_MAX_BYTES")) |v| cfg.s3_cache_max_bytes = try std.fmt.parseInt(u64, v, 10);
+        if (getter.get("ZIGBASE_UNSUBSCRIBE_BASE_URL")) |v| cfg.unsubscribe_base_url = v;
         if (getter.get("ZIGBASE_RATE_LIMIT_MAX")) |v| cfg.rate_limit_max = try std.fmt.parseInt(u32, v, 10);
         if (getter.get("ZIGBASE_RATE_LIMIT_WINDOW")) |v| cfg.rate_limit_window_s = try std.fmt.parseInt(i64, v, 10);
         if (getter.get("ZIGBASE_OAUTH_STATE_SERVER")) |v| cfg.oauth_state_server = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
@@ -358,6 +363,22 @@ test "field_key_generation defaults to 1, overridable via env" {
         }
     };
     try std.testing.expectEqual(@as(u16, 3), (try Config.load(G1{})).field_key_generation);
+}
+
+test "unsubscribe_base_url defaults empty, overridable via env" {
+    const G0 = struct {
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    try std.testing.expectEqualStrings("", (try Config.load(G0{})).unsubscribe_base_url);
+    const G1 = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_UNSUBSCRIBE_BASE_URL")) return "https://app.example.com";
+            return null;
+        }
+    };
+    try std.testing.expectEqualStrings("https://app.example.com", (try Config.load(G1{})).unsubscribe_base_url);
 }
 
 test "realtime origins default empty, overridable" {

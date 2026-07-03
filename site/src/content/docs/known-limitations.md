@@ -32,6 +32,22 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   trusted proxy the limiter keys on the submitted identity/email (not header-spoofable). The
   limiter also fails open under memory pressure (it never becomes a self-DoS), so it is a
   throttle, not a hard guarantee.
+- **Queue `.rate` throttling is per-process, in-memory.** A durable queue's `.rate = .{
+  .per_second = N }` token bucket lives in the serving process's memory — it is authoritative
+  only because the scheduler is itself single-process (see Scheduler below); coordinating a
+  shared rate ceiling across multiple ZigBase processes is out of scope.
+- **Durable mail delivery is at-least-once: a crash can produce one duplicate send.** Both
+  the built-in `"mail"` job kind and bulk `sendBulk` delivery persist to a durable queue and
+  mark their row `sent`/`done` only after the backend accepts the message; a crash between
+  backend-accept and that row update replays the job on restart, producing one duplicate send
+  to the recipient. Handlers are otherwise idempotent (bulk redelivery of an already-`sent`/
+  `suppressed`/`canceled` recipient row is a no-op) — this window is the one unavoidable
+  exception.
+- **No CSS inliner or `cid:` inline attachments.** ZigBase does not inline `<style>` rules
+  into `style="…"` attributes or support MIME `cid:`-referenced inline images — author inline
+  styles directly (or run a build-time inliner over your template sources) and host images at
+  absolute HTTPS URLs; see "HTML that renders everywhere" in
+  [Framework](./framework#ctxmail--send-application-mail).
 
 ## Framework / hooks
 

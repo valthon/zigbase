@@ -32,6 +32,11 @@ const suppression = @import("suppression.zig");
 
 const Email = mailer.Email;
 
+/// Gmail clips messages around ~102KB and hides the rest behind "[Message clipped]"
+/// — which also hides the RFC 8058 unsubscribe footer if the template renders one.
+/// Warn (never error) above a round 100KB so list templates get fixed at dev time.
+pub const gmail_clip_warn_bytes: usize = 100 * 1024;
+
 /// A consumer-facing outbound message (`ctx.mail().send` / `.enqueue`). Exactly one
 /// of `text`/`html` is required (both may be set for a `multipart/alternative` mail).
 /// `to`/`reply_to` are validated as addresses and all header fields are CRLF-checked
@@ -50,6 +55,10 @@ pub const MailMessage = struct {
     /// sender enforcement). When set, it scopes the verified-sender + suppression checks to that
     /// account. `ctx.mail()` defaults this from the request's active account scope.
     account: ?[]const u8 = null,
+    /// Optional one-click unsubscribe URL (#154 round 2), lowered onto `Email.list_unsubscribe`.
+    /// Set by the framework's bulk item handler (or via `ctx.mail().unsubscribeUrl` for
+    /// hand-rolled list mail). Transactional mail must NOT carry it.
+    list_unsubscribe: ?[]const u8 = null,
 };
 
 pub const MailError = error{
@@ -74,7 +83,7 @@ fn checkHeader(s: []const u8) MailError!void {
 /// non-empty labels. This is a backstop against malformed/spoofed recipients, not a
 /// full RFC5322 parser (display-name forms like `Name <a@b.com>` are intentionally
 /// rejected — pass a bare address). `checkHeader` must pass first (no control chars).
-fn validateAddress(addr: []const u8) MailError!void {
+pub fn validateAddress(addr: []const u8) MailError!void {
     try checkHeader(addr);
     if (addr.len == 0 or addr.len > 254) return error.InvalidAddress;
     const at = std.mem.indexOfScalar(u8, addr, '@') orelse return error.InvalidAddress;
@@ -100,6 +109,7 @@ pub fn validate(msg: MailMessage) MailError!void {
     if (msg.reply_to) |rt| try validateAddress(rt);
     if (msg.from) |fr| try validateAddress(fr);
     if (msg.account) |acct| try checkHeader(acct);
+    if (msg.list_unsubscribe) |lu| try checkHeader(lu);
 }
 
 /// Lower a validated `MailMessage` to a `mail.Email` (the backend wire type).
@@ -111,6 +121,7 @@ fn toEmail(msg: MailMessage) Email {
         .html_body = msg.html,
         .reply_to = msg.reply_to,
         .from = msg.from,
+        .list_unsubscribe = msg.list_unsubscribe,
     };
 }
 
@@ -133,7 +144,7 @@ fn enforce(app: *App, alloc: std.mem.Allocator, conn: *db.Db, msg: MailMessage) 
         }
     }
     if (app.mail.check_suppression) {
-        try suppression.assertNotSuppressed(alloc, conn, msg.account orelse "", msg.to);
+        try suppression.assertNotSuppressed(alloc, conn, msg.account orelse "", msg.to, .transactional);
     }
 }
 
@@ -145,6 +156,12 @@ fn enforce(app: *App, alloc: std.mem.Allocator, conn: *db.Db, msg: MailMessage) 
 /// A real backend failure propagates so it is never silently dropped.
 pub fn send(app: *App, alloc: std.mem.Allocator, msg: MailMessage) !void {
     try validate(msg);
+    if (msg.html) |h| {
+        if (h.len > gmail_clip_warn_bytes) std.log.warn(
+            "mail: html body to {s} is {d} bytes (>100KB); Gmail clips ~102KB — the message may be truncated for recipients",
+            .{ msg.to, h.len },
+        );
+    }
     // Fail-closed enforcement (verified sender + suppression), only when the app opted in. The
     // default path (`enforces()==false`) acquires no reader and is byte-identical to pre-#154.
     if (app.mail.enforces()) {
@@ -200,6 +217,13 @@ test "validate rejects CRLF/control-char header injection in to/subject/reply_to
     try testing.expectError(error.HeaderInjection, validate(.{ .to = "user@example.com", .subject = "s", .text = "b", .reply_to = "ok@x.io\r\nEvil: 1" }));
     // A NUL is rejected too.
     try testing.expectError(error.HeaderInjection, validate(.{ .to = "user@example.com", .subject = "Hi\x00", .text = "b" }));
+    // CRLF in list_unsubscribe (would inject an extra header/field into the provider payload).
+    try testing.expectError(error.HeaderInjection, validate(.{
+        .to = "user@example.com",
+        .subject = "s",
+        .text = "b",
+        .list_unsubscribe = "https://x/u?t=1\r\nBcc: spam@evil.com",
+    }));
 }
 
 test "toEmail maps text/html/reply_to onto the backend Email" {
@@ -217,6 +241,13 @@ test "toEmail maps text/html/reply_to onto the backend Email" {
 test "toEmail carries the per-message From override" {
     const e = toEmail(.{ .to = "u@x.io", .subject = "s", .text = "t", .from = "tenant@acct.com" });
     try testing.expectEqualStrings("tenant@acct.com", e.from.?);
+}
+
+test "toEmail maps list_unsubscribe onto the backend Email" {
+    const e = toEmail(.{ .to = "u@x.io", .subject = "s", .text = "t", .list_unsubscribe = "https://app.example/u?t=1" });
+    try testing.expectEqualStrings("https://app.example/u?t=1", e.list_unsubscribe.?);
+    const e2 = toEmail(.{ .to = "u@x.io", .subject = "s", .text = "t" });
+    try testing.expect(e2.list_unsubscribe == null);
 }
 
 // --- Send-time enforcement (fail-closed) ------------------------------------
@@ -314,4 +345,15 @@ test "send blocks a suppressed recipient when check_suppression is on (fail clos
     }));
     // A different recipient is fine (no mailer wired → log fallback, no error).
     try send(&env.app, std.testing.allocator, .{ .to = "ok@example.com", .subject = "Hi", .text = "body", .account = "acc1" });
+}
+
+test "an oversized html body warns but still sends (never an error)" {
+    const a = std.testing.allocator;
+    const big = try a.alloc(u8, gmail_clip_warn_bytes + 1);
+    defer a.free(big);
+    @memset(big, 'x');
+    var env = try EnforceEnv.init(.{});
+    defer env.deinit();
+    // No mailer wired → log-fallback path; the send must succeed despite the warning.
+    try send(&env.app, a, .{ .to = "u@x.io", .subject = "big", .html = big });
 }

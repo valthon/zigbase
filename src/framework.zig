@@ -31,6 +31,7 @@ const queue_config = @import("queue/config.zig");
 const queue_durable = @import("queue/durable.zig");
 const queue_memory = @import("queue/memory.zig");
 const mail_send = @import("mail/send.zig");
+const mail_bulk = @import("mail/bulk.zig");
 const mail_cfg = @import("mail/config.zig");
 const webhook = @import("webhook.zig");
 const captcha = @import("captcha.zig");
@@ -442,10 +443,12 @@ pub fn App(comptime cfg: anytype) type {
 
         /// Framework-owned built-in job kinds, prepended to the consumer `.jobs` registry
         /// below. `"mail"` (#141) backs `ctx.mail().enqueue` — a `"mail"` job deserializes
-        /// the `MailMessage` payload and delivers it via `mail/send.zig`. Kept as its own
+        /// the `MailMessage` payload and delivers it via `mail/send.zig`. `"mail_batch_item"`
+        /// (#154 round 2) backs `ctx.mail().sendBulk` — see `mail/bulk.zig`. Kept as its own
         /// const so sibling PRs (e.g. webhook, #144) can add their built-ins self-contained.
         const builtin_job_regs: []const queue.JobReg = &.{
             .{ .kind = "mail", .handler = mail_send.jobHandler },
+            .{ .kind = mail_bulk.job_kind, .handler = mail_bulk.jobHandler },
             .{ .kind = webhook.job_kind, .handler = webhook.webhookJobHandler },
         };
 
@@ -1029,13 +1032,24 @@ pub fn App(comptime cfg: anytype) type {
                 @compileError(".mail must be a struct, e.g. '.{ .require_verified_sender = true, .webhook_secret = \"…\" }'");
             for (std.meta.fields(MC)) |f| {
                 const ok = std.mem.eql(u8, f.name, "require_verified_sender") or
-                    std.mem.eql(u8, f.name, "check_suppression") or std.mem.eql(u8, f.name, "webhook_secret");
-                if (!ok) @compileError(".mail: unknown key '." ++ f.name ++ "' (recognized: .require_verified_sender, .check_suppression, .webhook_secret)");
+                    std.mem.eql(u8, f.name, "check_suppression") or std.mem.eql(u8, f.name, "webhook_secret") or
+                    std.mem.eql(u8, f.name, "unsubscribe_base_url");
+                if (!ok) @compileError(".mail: unknown key '." ++ f.name ++ "' (recognized: .require_verified_sender, .check_suppression, .webhook_secret, .unsubscribe_base_url)");
             }
             var rt = mail_cfg.Runtime{};
             if (@hasField(MC, "require_verified_sender")) rt.require_verified_sender = mc.require_verified_sender;
             if (@hasField(MC, "check_suppression")) rt.check_suppression = mc.check_suppression;
             if (@hasField(MC, "webhook_secret")) rt.webhook_secret = mc.webhook_secret;
+            if (@hasField(MC, "unsubscribe_base_url")) {
+                const u = mc.unsubscribe_base_url;
+                if (u.len > 0) {
+                    if (!std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://"))
+                        @compileError(".mail.unsubscribe_base_url must start with http:// or https://");
+                    for (u) |c| if (c <= ' ' or c == 127)
+                        @compileError(".mail.unsubscribe_base_url must not contain whitespace or control characters");
+                }
+                rt.unsubscribe_base_url = u;
+            }
             break :blk rt;
         };
 
@@ -2080,6 +2094,21 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     if (opts.captcha_provider != null and opts.captcha_secret.len == 0) {
         std.log.warn("captcha: provider configured but secret is empty — dev-bypass active, ALL captchas will pass; set the secret before deploying", .{});
     }
+    // One-click unsubscribe (#154 round 2): env overrides the comptime .mail key so the
+    // stock binary is configurable at runtime (and e2e-testable). Validate the EFFECTIVE
+    // value fail-fast — a malformed base URL would mint dead links into outbound mail.
+    if (cfg.unsubscribe_base_url.len > 0) app.mail.unsubscribe_base_url = cfg.unsubscribe_base_url;
+    if (app.mail.unsubscribe_base_url.len > 0) {
+        const u = app.mail.unsubscribe_base_url;
+        var bad = !std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://");
+        for (u) |c| {
+            if (c <= ' ' or c == 127) bad = true;
+        }
+        if (bad) {
+            std.log.err("refusing to start: ZIGBASE_UNSUBSCRIBE_BASE_URL / .mail.unsubscribe_base_url must be an http(s) URL with no whitespace/control chars (got \"{s}\")", .{u});
+            return error.InvalidUnsubscribeBaseUrl;
+        }
+    }
     const Ctx = @import("ctx.zig").Ctx;
     // Each lifecycle hook gets a per-invocation arena owning any ctx.records()
     // results, declared before cx so its deinit runs last (LIFO).
@@ -2223,11 +2252,13 @@ test "App(cfg) lowers .queues/.workers/.jobs and installs durable poller + GC jo
         .jobs = .{ .send = qTestHandler },
     });
     try std.testing.expect(A.has_durable_queue);
-    // job_regs = built-ins "mail" (#141) + "webhook" (#144) ++ consumer kinds; built-ins first.
-    try std.testing.expectEqual(@as(usize, 3), A.job_regs.len);
+    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144)
+    // ++ consumer kinds; built-ins first.
+    try std.testing.expectEqual(@as(usize, 4), A.job_regs.len);
     try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
-    try std.testing.expectEqualStrings("webhook", A.job_regs[1].kind);
-    try std.testing.expectEqualStrings("send", A.job_regs[2].kind);
+    try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[1].kind);
+    try std.testing.expectEqualStrings("webhook", A.job_regs[2].kind);
+    try std.testing.expectEqualStrings("send", A.job_regs[3].kind);
     try std.testing.expectEqualStrings("send", @tagName(@as(A.Job, .send)));
     try std.testing.expectEqualStrings("emails", @tagName(@as(A.Queue, .emails)));
 
@@ -2245,11 +2276,13 @@ test "App(cfg) keeps legacy .jobs.pool_size working alongside the job registry" 
     // `.jobs.pool_size` is the legacy scheduler-pool lever; it must NOT become a job kind.
     const A = App(.{ .jobs = .{ .pool_size = 3, .resize = qTestHandler } });
     try std.testing.expectEqual(@as(usize, 3), A.job_pool_size);
-    // job_regs = built-ins "mail" (#141) + "webhook" (#144) ++ consumer "resize"; pool_size is skipped.
-    try std.testing.expectEqual(@as(usize, 3), A.job_regs.len);
+    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144)
+    // ++ consumer "resize"; pool_size is skipped.
+    try std.testing.expectEqual(@as(usize, 4), A.job_regs.len);
     try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
-    try std.testing.expectEqualStrings("webhook", A.job_regs[1].kind);
-    try std.testing.expectEqualStrings("resize", A.job_regs[2].kind);
+    try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[1].kind);
+    try std.testing.expectEqualStrings("webhook", A.job_regs[2].kind);
+    try std.testing.expectEqualStrings("resize", A.job_regs[3].kind);
     // The compile-checked Job enum still reflects ONLY the consumer kinds (mail is a
     // built-in reached via ctx.mail().enqueue / ctx.enqueueByName, not the typed enum).
     try std.testing.expectEqual(@as(usize, 1), std.meta.fields(A.Job).len);

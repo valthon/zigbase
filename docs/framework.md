@@ -675,9 +675,125 @@ The data model: migration `0016_email` seeds two system collections — `_sender
 email, verified_at, verification_token, status)` (UNIQUE `(account,email)`) and
 `_suppressions(account, email, reason, source)` (UNIQUE `(account,email)`).
 
-**Deferred (planned 0.9.x fast-follows, NOT in this release):** bulk/throttled personalized list
-sends; scheduled/sequenced (drip) sends; CSS-inlining + inline-image hosting; one-click unsubscribe /
-list management. The send job + suppression + verified-sender checks are the seams those build on.
+**Bulk list sends (`sendBulk`).** `ctx.mail().sendBulk(BulkSend)` fans one templated message out to
+many recipients over the durable queue, rendering per-recipient personalization at delivery time.
+`BulkSend` is `{ subject, text?, html?, from?, reply_to?, recipients, list = "", queue = "default",
+at?, account? }` — `recipients` is `[]const BulkRecipient{ to, vars = &.{} }`. Subject/text/html are
+**template sources**, rendered per recipient against `vars` with the same engine as transactional
+mail: `{{ name }}` is HTML-escaped, `{{{ name }}}` is the explicit raw opt-in. A bulk queue **must be
+durable** (`error.BulkRequiresDurable`) — memory jobs can't survive a restart, carry a report, or be
+rate-throttled.
+
+```zig
+const batch_id = try ctx.mail().sendBulk(.{
+    .subject = "Hi {{ name }} — May updates",
+    .html = "<p>Hi {{ name }},</p><p>…</p>",
+    .list = "newsletter",
+    .queue = "ses_mail",
+    .recipients = &.{
+        .{ .to = "a@example.com", .vars = &.{.{ .key = "name", .value = "Ann" }} },
+        .{ .to = "b@example.com", .vars = &.{.{ .key = "name", .value = "Bo" }} },
+    },
+});
+const report = try ctx.mail().batchStatus(batch_id); // {total, pending, sent, suppressed, invalid, failed, canceled}
+```
+
+Under the hood, `sendBulk` writes one `_mail_batches` row (the templates, once) and one
+`_mail_batch_recipients` row per distinct recipient, then enqueues one durable `"mail_batch_item"`
+job per distinct recipient with the tiny payload `{"batch":"…","to":"…"}` — N small jobs rather than
+one driver job, so per-recipient retry/backoff, priority ordering, visibility-timeout crash recovery,
+and queue rate throttling all come from the existing job engine for free. `ctx.mail().batchStatus(id)`
+reads the durable send-report back as a `BatchReport`; a superuser can also browse `_mail_batches` /
+`_mail_batch_recipients` directly over the records API (they're **Locked** system collections —
+superusers only, same as every other `_`-prefixed table). `ctx.mail().cancelBatch(id)` flips every
+still-`pending` recipient row to `canceled` and returns the count; it's idempotent, and a stray
+in-flight `"mail_batch_item"` job for an already-canceled batch drains as a no-op rather than an
+error.
+
+Suppression on list mail is **always enforced**, independent of the `.mail.check_suppression` knob
+(which only gates *transactional* `send`/`enqueue`) — sending past a suppression is a compliance
+issue, not a tuning choice. A suppressed recipient is a **reported outcome** (`status = "suppressed"`
+on its row), not a job failure. Account attribution mirrors `send()`: `b.account` defaults to the
+request's active account scope (explicit `""` is a system send), and when `.require_verified_sender`
+is on and the batch is account-scoped, `b.from` is asserted against `_sender_identities` **once at
+submit** (delivery re-checks anyway). Like every durable job, delivery is **at-least-once**: a crash
+between the backend accepting the message and the recipient row being marked `sent` replays the job,
+producing one duplicate send — identical to the `"mail"` job kind, and the reason durable handlers
+must tolerate replays.
+
+**Scheduled sends + the drip recipe (`deliverAt` / `cancel`).** `EnqueueOpts` gained `at: ?i64` and
+`delay_s: ?u32` (unix-seconds absolute / relative-from-now) — set at most one
+(`error.ConflictingSchedule`), and either requires a **durable** queue (`error.ScheduleRequiresDurable`
+— a memory job can't survive to a future time). `ctx.mail().deliverAt(msg, opts)` schedules a message
+and returns the durable job id; `ctx.mail().cancel(id)` calls a still-pending send off, returning
+`false` when it already ran, is running, or was already canceled. `sendBulk`'s own `.at` schedules
+every recipient job's earliest delivery the same way.
+
+Persisting the id `deliverAt` returns is the whole drip-sequence primitive — there's no separate
+campaign machinery:
+
+```zig
+// On trigger (e.g. signup): schedule each step and remember the ids.
+const step1 = try ctx.mail().deliverAt(welcomeMsg(user), .{ .delay_s = 0 });
+const step2 = try ctx.mail().deliverAt(tipsMsg(user), .{ .delay_s = 3 * 86_400 });
+const step3 = try ctx.mail().deliverAt(nudgeMsg(user), .{ .delay_s = 7 * 86_400 });
+// Persist step1/step2/step3 on your own record, or ctx.kv().
+
+// On conversion: call off whatever hasn't fired yet.
+_ = try ctx.mail().cancel(step2);
+_ = try ctx.mail().cancel(step3);
+```
+
+For sequences whose steps depend on runtime state (branch on a later event, vary count per segment),
+reach for a cron job plus a query instead — `deliverAt`/`cancel` are deliberately a recipe, not a
+scheduling DSL.
+
+**One-click unsubscribe (RFC 8058).** Set `.mail.unsubscribe_base_url` (comptime key or
+`ZIGBASE_UNSUBSCRIBE_BASE_URL`, env wins) to your app's public origin, e.g.
+`"https://app.example.com"`. **Empty (the default) is off**: no `List-Unsubscribe` headers are
+emitted and the endpoint 404s — the same default-off pattern as `webhook_secret`. Once configured,
+every `sendBulk` recipient automatically gets a signed, stateless unsubscribe token — no new secret
+to manage: the token is HMAC-SHA256'd with a **labeled derivation** of the existing JWT secret
+(`"zigbase.mail.unsub.v1"`), so it can never be confused with an auth token. The token **never
+expires** by design: an unsubscribe link must still work from a five-year-old inbox, and the
+worst-case "attack" is unsubscribing an address whose mail the attacker already possesses.
+
+The endpoint is `POST /api/mail/unsubscribe?t=<token>` (mail clients / providers call this on the
+user's behalf) — success is **204**, including on a repeat call (idempotent upsert; no "was this
+address known" oracle), and any invalid token (bad signature, malformed, tampered) is one generic
+**400** (no oracle distinguishing failure reasons). `GET` on the same URL renders a minimal HTML
+confirmation page whose button POSTs back — **it never mutates**, so link-prefetchers and mail-scanner
+bots can't unsubscribe someone by fetching the link. Both verbs are per-IP rate limited. A successful
+one-click unsubscribe records a `reason = "unsubscribe"` suppression that blocks **list mail only**
+for that recipient (transactional mail is unaffected) — it's account-global, with the originating
+list name recorded in `source = "one_click:<list>"` for audit. Per-list preference centers ("resub to
+just the newsletter") are an app-level UX layer you can build on top of that audit trail; the
+framework guarantees the compliance floor — one unconditional opt-out per address.
+
+For hand-rolled list mail that doesn't go through `sendBulk`, `ctx.mail().unsubscribeUrl(account,
+list, recipient)` mints the same signed URL to set on `MailMessage.list_unsubscribe` yourself
+(`error.UnsubscribeNotConfigured` when the base URL is unset). Transactional mail (`ctx.mail().send` /
+`.enqueue`) never carries these headers — only bulk list mail auto-wires them.
+
+```zig
+const App = zigbase.App(.{
+    .mail = .{
+        .unsubscribe_base_url = "https://app.example.com", // "" (default) = feature off
+    },
+});
+```
+
+**HTML that renders everywhere.** ZigBase ships no CSS inliner or `cid:` inline-attachment support —
+author your HTML with inline `style="…"` attributes directly, or run a build-time inliner (MJML,
+juice, premailer, …) over your template *sources* and paste its output into your `mail_template`
+strings; `{{ }}` / `{{{ }}}` interpolation passes through untouched either way. Host images at
+absolute HTTPS URLs — your app's file storage or static assets work well — rather than embedding
+them. Keep a rendered HTML body under roughly 100 KB; `ctx.mail()` warns (never errors) above that,
+since Gmail clips messages around ~102 KB and hides the rest behind "[Message clipped]". CSS inlining
+is left out because a half-baked inliner without a real CSS selector engine is a wrong-styling
+footgun — worse than shipping no inlining at all; `cid:` attachments are left out because they need a
+raw-MIME rewrite on every backend (SMTP and both HTTP APIs) for a problem hosted images solve more
+simply.
 
 ### `ctx.http()` — outbound HTTP client
 
@@ -2021,6 +2137,7 @@ App(.{
             // double-dispatches a still-running job:
             .visibility_timeout_s = 300,       // reclaim a claim older than this (>= 1)
             .done_ttl_s           = 604_800,   // GC done/failed rows older than this (7d)
+            .rate = .{ .per_second = 14 },  // durable only: per-queue send-rate ceiling (e.g. SES default 14/s)
         },
         .reports = .{ .backend = .durable, .priority = .low },
     },
@@ -2097,6 +2214,12 @@ payload and delivers it). It is reached via that helper (or `ctx.enqueueByName(q
   next run is pushed out by the queue's backoff (`fixed` or `exponential`, with optional
   jitter, capped at `max_ms`); exhausting `max_attempts` marks it `failed` and fires your
   `.onError` handler (phase `.job`). Memory jobs retry in-process the same way.
+- **Rate throttling** (`.rate = .{ .per_second = N }`, durable only): a token bucket per
+  rated queue, capacity = one second's worth of tokens (the max burst), enforced at **claim
+  time** — a job that can't claim a token this tick simply waits for the next ~500ms
+  scheduler tick rather than sleeping in the worker. It's in-process and
+  single-process-authoritative (see Caveats below); `.rate` on a `memory` queue is a
+  compile error (memory jobs dispatch inline and can't be throttled).
 
 ### Caveats
 

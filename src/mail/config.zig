@@ -23,6 +23,12 @@ pub const Runtime = struct {
     /// Shared secret for the inbound bounce/complaint webhook signature (HMAC-SHA256, constant-time
     /// compare). EMPTY (default) disables the webhook route (404). Configure it to enable ingestion.
     webhook_secret: []const u8 = "",
+    /// Public base URL for the one-click unsubscribe endpoint (#154 round 2), e.g.
+    /// "https://app.example.com". EMPTY (default) = the feature is OFF: no
+    /// List-Unsubscribe headers are emitted and the endpoint 404s (the same
+    /// default-off pattern as `webhook_secret`). Set the comptime `.mail` key or the
+    /// ZIGBASE_UNSUBSCRIBE_BASE_URL env var (env wins).
+    unsubscribe_base_url: []const u8 = "",
 
     /// True when any send-time enforcement (verified sender or suppression) is active. Lets the send
     /// path skip acquiring a reader entirely when nothing is enabled (zero-cost on the default path).
@@ -36,6 +42,7 @@ test "Runtime defaults are the fully-off back-compat path" {
     try std.testing.expect(!r.require_verified_sender);
     try std.testing.expect(!r.check_suppression);
     try std.testing.expectEqualStrings("", r.webhook_secret);
+    try std.testing.expectEqualStrings("", r.unsubscribe_base_url);
     try std.testing.expect(!r.enforces());
 }
 

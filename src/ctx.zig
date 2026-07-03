@@ -27,6 +27,8 @@ const queue_mod = @import("queue/queue.zig");
 const queue_memory = @import("queue/memory.zig");
 const queue_durable = @import("queue/durable.zig");
 const mail_send = @import("mail/send.zig");
+const mail_bulk = @import("mail/bulk.zig");
+const mail_unsubscribe = @import("mail/unsubscribe.zig");
 const webhook_mod = @import("webhook.zig");
 const analytics = @import("analytics/analytics.zig");
 
@@ -403,11 +405,11 @@ pub const Ctx = struct {
             .durable => {
                 const now = clock.nowUnix(self.app.io);
                 if (self.bound_conn) |c| {
-                    try queue_durable.enqueue(c, self.app.io, q, kind, payload_json, now);
+                    _ = try queue_durable.enqueue(c, self.app.io, q, kind, payload_json, now);
                 } else {
                     const w = self.app.pool.acquireWriter();
                     defer self.app.pool.releaseWriter();
-                    try queue_durable.enqueue(w, self.app.io, q, kind, payload_json, now);
+                    _ = try queue_durable.enqueue(w, self.app.io, q, kind, payload_json, now);
                 }
             },
         }
@@ -997,9 +999,16 @@ pub const MailApi = struct {
     /// re-exported `zigbase.MailMessage`.
     pub const Message = mail_send.MailMessage;
 
-    /// Options for `enqueue`. `queue` is the queue NAME to route the mail job onto
-    /// (defaults to the always-present `"default"` queue).
-    pub const EnqueueOpts = struct { queue: []const u8 = "default" };
+    /// Options for the background-delivery verbs. `queue` routes the "mail" job;
+    /// `at` (unix seconds) / `delay_s` schedule its earliest delivery — mutually
+    /// exclusive (`error.ConflictingSchedule`), and scheduling requires a DURABLE
+    /// queue (`error.ScheduleRequiresDurable` — a memory job cannot survive to a
+    /// future time). Both null = deliver on the next poll (today's behavior).
+    pub const EnqueueOpts = struct {
+        queue: []const u8 = "default",
+        at: ?i64 = null,
+        delay_s: ?u32 = null,
+    };
 
     /// Default `msg.account` from the request's active account scope (#154) when the caller did not
     /// set it explicitly. This is the EXPLICIT engagement point for verified-sender + suppression
@@ -1028,6 +1037,10 @@ pub const MailApi = struct {
     /// enqueue means a malformed message fails fast at the call site, not later in a
     /// worker. Requires a wired queue registry (`error.QueuesUnavailable` otherwise).
     pub fn enqueue(self: MailApi, msg: Message, opts: EnqueueOpts) !void {
+        if (opts.at != null or opts.delay_s != null) {
+            _ = try self.deliverAt(msg, opts);
+            return;
+        }
         const scoped = self.withScope(msg);
         try mail_send.validate(scoped);
         return self.ctx.enqueueByName(opts.queue, "mail", scoped);
@@ -1037,6 +1050,81 @@ pub const MailApi = struct {
     /// async transactional-mail entry point (#154).
     pub fn deliverLater(self: MailApi, msg: Message, opts: EnqueueOpts) !void {
         return self.enqueue(msg, opts);
+    }
+
+    /// Schedule a message for (earliest) delivery at `opts.at` / now+`opts.delay_s`,
+    /// returning the durable JOB ID (arena-owned). Persist that id (your own record,
+    /// `ctx.kv()`, …) and hand it to `cancel` to call the send off — this pair is the
+    /// drip-sequence primitive (see framework.md's recipe; there is no campaign
+    /// machinery). Validates the message up front like `enqueue`.
+    pub fn deliverAt(self: MailApi, msg: Message, opts: EnqueueOpts) ![]const u8 {
+        if (opts.at != null and opts.delay_s != null) return error.ConflictingSchedule;
+        const scoped = self.withScope(msg);
+        try mail_send.validate(scoped);
+        const reg = queue_mod.registryFromApp(self.ctx.app) orelse return error.QueuesUnavailable;
+        const q = reg.queueByName(opts.queue) orelse return error.UnknownQueue;
+        if (q.backend != .durable) return error.ScheduleRequiresDurable;
+        const io = self.ctx.app.io;
+        const now = clock.nowUnix(io);
+        const run_at: i64 = opts.at orelse (now + @as(i64, opts.delay_s orelse 0));
+        const payload = try self.ctx.serializePayload(scoped);
+        const jid = blk: {
+            if (self.ctx.bound_conn) |c| break :blk try queue_durable.enqueue(c, io, q, "mail", payload, run_at);
+            const w = self.ctx.app.pool.acquireWriter();
+            defer self.ctx.app.pool.releaseWriter();
+            break :blk try queue_durable.enqueue(w, io, q, "mail", payload, run_at);
+        };
+        return self.ctx.arena.dupe(u8, &jid);
+    }
+
+    /// Cancel a still-pending scheduled job by the id `deliverAt` returned. True when
+    /// it was called off; false when it already ran / is running / was canceled.
+    pub fn cancel(self: MailApi, job_id: []const u8) !bool {
+        if (self.ctx.bound_conn) |c| return queue_durable.cancelJob(c, job_id);
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return queue_durable.cancelJob(w, job_id);
+    }
+
+    pub const BulkSend = mail_bulk.BulkSend;
+    pub const BulkRecipient = mail_bulk.BulkRecipient;
+    pub const BatchReport = mail_bulk.BatchReport;
+
+    /// Submit a bulk list send (#154 round 2): one templated message fanned out as
+    /// per-recipient durable jobs with a durable send-report. Validates EVERYTHING at
+    /// the call site (a bad recipient anywhere persists nothing). Requires a durable
+    /// queue (`error.BulkRequiresDurable`) and a wired registry. Returns the batch id
+    /// (arena-owned) — hand it to `batchStatus`/`cancelBatch`.
+    pub fn sendBulk(self: MailApi, b: BulkSend) ![]const u8 {
+        const account = b.account orelse self.ctx.rctx.account_id; // withScope parity: explicit wins
+        const reg = queue_mod.registryFromApp(self.ctx.app) orelse return error.QueuesUnavailable;
+        if (self.ctx.bound_conn) |c| return mail_bulk.sendBulk(self.ctx.app, self.ctx.arena, reg, c, false, b, account);
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return mail_bulk.sendBulk(self.ctx.app, self.ctx.arena, reg, w, true, b, account);
+    }
+
+    /// Cancel every still-pending recipient of a batch (idempotent; stray queued item
+    /// jobs drain as no-ops). Returns how many recipients moved pending→canceled.
+    pub fn cancelBatch(self: MailApi, batch_id: []const u8) !usize {
+        if (self.ctx.bound_conn) |c| return mail_bulk.cancelBatch(self.ctx.app, c, false, batch_id);
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return mail_bulk.cancelBatch(self.ctx.app, w, true, batch_id);
+    }
+
+    /// The durable per-recipient send-report, aggregated.
+    pub fn batchStatus(self: MailApi, batch_id: []const u8) !BatchReport {
+        return mail_bulk.batchStatus(self.ctx.app, self.ctx.arena, batch_id);
+    }
+
+    /// Escape hatch for hand-rolled list mail: the signed one-click unsubscribe URL for
+    /// (account, list, recipient) — set it on your MailMessage.list_unsubscribe. Errors
+    /// with `error.UnsubscribeNotConfigured` when `unsubscribe_base_url` is unset.
+    pub fn unsubscribeUrl(self: MailApi, account: []const u8, list: []const u8, recipient: []const u8) ![]const u8 {
+        const base = self.ctx.app.mail.unsubscribe_base_url;
+        if (base.len == 0) return error.UnsubscribeNotConfigured;
+        return mail_unsubscribe.buildUrl(self.ctx.arena, base, self.ctx.app.jwt_secret, account, list, recipient);
     }
 };
 
@@ -2013,6 +2101,26 @@ test "#141 ctx.mail().send rejects a malformed address / header injection up fro
     try std.testing.expectError(error.EmptyBody, ctx.mail().send(.{ .to = "u@x.io", .subject = "s" }));
 }
 
+test "ctx.mail().unsubscribeUrl builds a token that verifies to (account, list, recipient); errors when unconfigured" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    env.app.jwt_secret = "s";
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    try std.testing.expectError(error.UnsubscribeNotConfigured, ctx.mail().unsubscribeUrl("acc1", "news", "u@x.io"));
+
+    env.app.mail.unsubscribe_base_url = "https://app.example";
+    const url = try ctx.mail().unsubscribeUrl("acc1", "news", "u@x.io");
+    try std.testing.expect(std.mem.startsWith(u8, url, "https://app.example/api/mail/unsubscribe?t="));
+    const marker = "?t=";
+    const token = url[std.mem.indexOf(u8, url, marker).? + marker.len ..];
+    const parts = mail_unsubscribe.verify(env.arena.allocator(), "s", token) orelse return error.TestExpectedNonNull;
+    try std.testing.expectEqualStrings("acc1", parts.account);
+    try std.testing.expectEqualStrings("news", parts.list);
+    try std.testing.expectEqualStrings("u@x.io", parts.recipient);
+}
+
 test "#141 ctx.mail().enqueue durable round-trips into a _queue_jobs 'mail' row" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
@@ -2083,6 +2191,95 @@ test "#141 ctx.mail().enqueue memory round-trips: built-in handler delivers + is
     pool.stop(); // drain + join: deterministic
     try std.testing.expectEqual(@as(usize, 1), testcapture.mail.count());
     try std.testing.expectEqualStrings("queued@example.com", testcapture.mail.get(0).?.to);
+}
+
+// ---------------------------------------------------------------------------
+// ctx.mail().deliverAt / .cancel (#154 round 2) — scheduling primitives.
+// ---------------------------------------------------------------------------
+
+test "ctx.mail().deliverAt on a durable queue returns the job id + persists run_at" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{mail_job_reg},
+    };
+    env.app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    const now = clock.nowUnix(env.app.io);
+    const jid = try ctx.mail().deliverAt(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{ .at = now + 3600 });
+    try std.testing.expectEqual(@as(usize, 15), jid.len);
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var st = try w.prepare("SELECT run_at, status FROM \"_queue_jobs\" WHERE \"id\"=?1;");
+    defer st.finalize();
+    try st.bindText(1, jid);
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(now + 3600, st.columnInt(0));
+    try std.testing.expectEqualStrings("pending", st.columnText(1));
+}
+
+test "ctx.mail().deliverAt requires a durable queue and rejects a conflicting schedule" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .memory, .retry = .{ .base_ms = 0, .jitter = false } }},
+        .jobs = &.{mail_job_reg},
+    };
+    env.app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    try std.testing.expectError(error.ScheduleRequiresDurable, ctx.mail().deliverAt(
+        .{ .to = "user@example.com", .subject = "Hi", .text = "body" },
+        .{ .delay_s = 60 },
+    ));
+    try std.testing.expectError(error.ConflictingSchedule, ctx.mail().deliverAt(
+        .{ .to = "user@example.com", .subject = "Hi", .text = "body" },
+        .{ .at = 1, .delay_s = 60 },
+    ));
+}
+
+test "ctx.mail().cancel: pending -> true, then already-canceled -> false" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{mail_job_reg},
+    };
+    env.app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    const now = clock.nowUnix(env.app.io);
+    const jid = try ctx.mail().deliverAt(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{ .at = now + 3600 });
+    try std.testing.expect(try ctx.mail().cancel(jid));
+    try std.testing.expect(!try ctx.mail().cancel(jid));
+}
+
+test "ctx.mail().enqueue with .delay_s schedules a future run_at" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{mail_job_reg},
+    };
+    env.app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    const now = clock.nowUnix(env.app.io);
+    try ctx.mail().enqueue(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{ .delay_s = 60 });
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var st = try w.prepare("SELECT run_at FROM \"_queue_jobs\" WHERE kind='mail';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expect(st.columnInt(0) > now);
 }
 
 // ---------------------------------------------------------------------------
