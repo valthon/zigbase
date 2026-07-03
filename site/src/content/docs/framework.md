@@ -645,9 +645,32 @@ The data model: migration `0016_email` seeds two system collections — `_sender
 email, verified_at, verification_token, status)` (UNIQUE `(account,email)`) and
 `_suppressions(account, email, reason, source)` (UNIQUE `(account,email)`).
 
-**Deferred (planned 0.9.x fast-follows, NOT in this release):** bulk/throttled personalized list
-sends; scheduled/sequenced (drip) sends; CSS-inlining + inline-image hosting; one-click unsubscribe /
-list management. The send job + suppression + verified-sender checks are the seams those build on.
+**Scheduled sends + the drip recipe (`deliverAt` / `cancel`).** `EnqueueOpts` gained `at: ?i64` and
+`delay_s: ?u32` (unix-seconds absolute / relative-from-now) — set at most one
+(`error.ConflictingSchedule`), and either requires a **durable** queue (`error.ScheduleRequiresDurable`
+— a memory job can't survive to a future time). `ctx.mail().deliverAt(msg, opts)` schedules a message
+and returns the durable job id; `ctx.mail().cancel(id)` calls a still-pending send off, returning
+`false` when it already ran, is running, or was already canceled. `sendBulk`'s own `.at` schedules
+every recipient job's earliest delivery the same way.
+
+Persisting the id `deliverAt` returns is the whole drip-sequence primitive — there's no separate
+campaign machinery:
+
+```zig
+// On trigger (e.g. signup): schedule each step and remember the ids.
+const step1 = try ctx.mail().deliverAt(welcomeMsg(user), .{ .delay_s = 0 });
+const step2 = try ctx.mail().deliverAt(tipsMsg(user), .{ .delay_s = 3 * 86_400 });
+const step3 = try ctx.mail().deliverAt(nudgeMsg(user), .{ .delay_s = 7 * 86_400 });
+// Persist step1/step2/step3 on your own record, or ctx.kv().
+
+// On conversion: call off whatever hasn't fired yet.
+_ = try ctx.mail().cancel(step2);
+_ = try ctx.mail().cancel(step3);
+```
+
+For sequences whose steps depend on runtime state (branch on a later event, vary count per segment),
+reach for a cron job plus a query instead — `deliverAt`/`cancel` are deliberately a recipe, not a
+scheduling DSL.
 
 ### `ctx.http()` — outbound HTTP client
 
@@ -1986,6 +2009,7 @@ App(.{
             // double-dispatches a still-running job:
             .visibility_timeout_s = 300,       // reclaim a claim older than this (>= 1)
             .done_ttl_s           = 604_800,   // GC done/failed rows older than this (7d)
+            .rate = .{ .per_second = 14 },  // durable only: per-queue send-rate ceiling (e.g. SES default 14/s)
         },
         .reports = .{ .backend = .durable, .priority = .low },
     },
@@ -2062,6 +2086,12 @@ payload and delivers it). It is reached via that helper (or `ctx.enqueueByName(q
   next run is pushed out by the queue's backoff (`fixed` or `exponential`, with optional
   jitter, capped at `max_ms`); exhausting `max_attempts` marks it `failed` and fires your
   `.onError` handler (phase `.job`). Memory jobs retry in-process the same way.
+- **Rate throttling** (`.rate = .{ .per_second = N }`, durable only): a token bucket per
+  rated queue, capacity = one second's worth of tokens (the max burst), enforced at **claim
+  time** — a job that can't claim a token this tick simply waits for the next ~500ms
+  scheduler tick rather than sleeping in the worker. It's in-process and
+  single-process-authoritative (see Caveats below); `.rate` on a `memory` queue is a
+  compile error (memory jobs dispatch inline and can't be throttled).
 
 ### Caveats
 

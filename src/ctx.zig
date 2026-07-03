@@ -403,11 +403,11 @@ pub const Ctx = struct {
             .durable => {
                 const now = clock.nowUnix(self.app.io);
                 if (self.bound_conn) |c| {
-                    try queue_durable.enqueue(c, self.app.io, q, kind, payload_json, now);
+                    _ = try queue_durable.enqueue(c, self.app.io, q, kind, payload_json, now);
                 } else {
                     const w = self.app.pool.acquireWriter();
                     defer self.app.pool.releaseWriter();
-                    try queue_durable.enqueue(w, self.app.io, q, kind, payload_json, now);
+                    _ = try queue_durable.enqueue(w, self.app.io, q, kind, payload_json, now);
                 }
             },
         }
@@ -997,9 +997,16 @@ pub const MailApi = struct {
     /// re-exported `zigbase.MailMessage`.
     pub const Message = mail_send.MailMessage;
 
-    /// Options for `enqueue`. `queue` is the queue NAME to route the mail job onto
-    /// (defaults to the always-present `"default"` queue).
-    pub const EnqueueOpts = struct { queue: []const u8 = "default" };
+    /// Options for the background-delivery verbs. `queue` routes the "mail" job;
+    /// `at` (unix seconds) / `delay_s` schedule its earliest delivery — mutually
+    /// exclusive (`error.ConflictingSchedule`), and scheduling requires a DURABLE
+    /// queue (`error.ScheduleRequiresDurable` — a memory job cannot survive to a
+    /// future time). Both null = deliver on the next poll (today's behavior).
+    pub const EnqueueOpts = struct {
+        queue: []const u8 = "default",
+        at: ?i64 = null,
+        delay_s: ?u32 = null,
+    };
 
     /// Default `msg.account` from the request's active account scope (#154) when the caller did not
     /// set it explicitly. This is the EXPLICIT engagement point for verified-sender + suppression
@@ -1028,6 +1035,10 @@ pub const MailApi = struct {
     /// enqueue means a malformed message fails fast at the call site, not later in a
     /// worker. Requires a wired queue registry (`error.QueuesUnavailable` otherwise).
     pub fn enqueue(self: MailApi, msg: Message, opts: EnqueueOpts) !void {
+        if (opts.at != null or opts.delay_s != null) {
+            _ = try self.deliverAt(msg, opts);
+            return;
+        }
         const scoped = self.withScope(msg);
         try mail_send.validate(scoped);
         return self.ctx.enqueueByName(opts.queue, "mail", scoped);
@@ -1037,6 +1048,40 @@ pub const MailApi = struct {
     /// async transactional-mail entry point (#154).
     pub fn deliverLater(self: MailApi, msg: Message, opts: EnqueueOpts) !void {
         return self.enqueue(msg, opts);
+    }
+
+    /// Schedule a message for (earliest) delivery at `opts.at` / now+`opts.delay_s`,
+    /// returning the durable JOB ID (arena-owned). Persist that id (your own record,
+    /// `ctx.kv()`, …) and hand it to `cancel` to call the send off — this pair is the
+    /// drip-sequence primitive (see framework.md's recipe; there is no campaign
+    /// machinery). Validates the message up front like `enqueue`.
+    pub fn deliverAt(self: MailApi, msg: Message, opts: EnqueueOpts) ![]const u8 {
+        if (opts.at != null and opts.delay_s != null) return error.ConflictingSchedule;
+        const scoped = self.withScope(msg);
+        try mail_send.validate(scoped);
+        const reg = queue_mod.registryFromApp(self.ctx.app) orelse return error.QueuesUnavailable;
+        const q = reg.queueByName(opts.queue) orelse return error.UnknownQueue;
+        if (q.backend != .durable) return error.ScheduleRequiresDurable;
+        const io = self.ctx.app.io;
+        const now = clock.nowUnix(io);
+        const run_at: i64 = opts.at orelse (now + @as(i64, opts.delay_s orelse 0));
+        const payload = try self.ctx.serializePayload(scoped);
+        const jid = blk: {
+            if (self.ctx.bound_conn) |c| break :blk try queue_durable.enqueue(c, io, q, "mail", payload, run_at);
+            const w = self.ctx.app.pool.acquireWriter();
+            defer self.ctx.app.pool.releaseWriter();
+            break :blk try queue_durable.enqueue(w, io, q, "mail", payload, run_at);
+        };
+        return self.ctx.arena.dupe(u8, &jid);
+    }
+
+    /// Cancel a still-pending scheduled job by the id `deliverAt` returned. True when
+    /// it was called off; false when it already ran / is running / was canceled.
+    pub fn cancel(self: MailApi, job_id: []const u8) !bool {
+        if (self.ctx.bound_conn) |c| return queue_durable.cancelJob(c, job_id);
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return queue_durable.cancelJob(w, job_id);
     }
 };
 
@@ -2083,6 +2128,95 @@ test "#141 ctx.mail().enqueue memory round-trips: built-in handler delivers + is
     pool.stop(); // drain + join: deterministic
     try std.testing.expectEqual(@as(usize, 1), testcapture.mail.count());
     try std.testing.expectEqualStrings("queued@example.com", testcapture.mail.get(0).?.to);
+}
+
+// ---------------------------------------------------------------------------
+// ctx.mail().deliverAt / .cancel (#154 round 2) — scheduling primitives.
+// ---------------------------------------------------------------------------
+
+test "ctx.mail().deliverAt on a durable queue returns the job id + persists run_at" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{mail_job_reg},
+    };
+    env.app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    const now = clock.nowUnix(env.app.io);
+    const jid = try ctx.mail().deliverAt(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{ .at = now + 3600 });
+    try std.testing.expectEqual(@as(usize, 15), jid.len);
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var st = try w.prepare("SELECT run_at, status FROM \"_queue_jobs\" WHERE \"id\"=?1;");
+    defer st.finalize();
+    try st.bindText(1, jid);
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(now + 3600, st.columnInt(0));
+    try std.testing.expectEqualStrings("pending", st.columnText(1));
+}
+
+test "ctx.mail().deliverAt requires a durable queue and rejects a conflicting schedule" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .memory, .retry = .{ .base_ms = 0, .jitter = false } }},
+        .jobs = &.{mail_job_reg},
+    };
+    env.app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    try std.testing.expectError(error.ScheduleRequiresDurable, ctx.mail().deliverAt(
+        .{ .to = "user@example.com", .subject = "Hi", .text = "body" },
+        .{ .delay_s = 60 },
+    ));
+    try std.testing.expectError(error.ConflictingSchedule, ctx.mail().deliverAt(
+        .{ .to = "user@example.com", .subject = "Hi", .text = "body" },
+        .{ .at = 1, .delay_s = 60 },
+    ));
+}
+
+test "ctx.mail().cancel: pending -> true, then already-canceled -> false" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{mail_job_reg},
+    };
+    env.app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    const now = clock.nowUnix(env.app.io);
+    const jid = try ctx.mail().deliverAt(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{ .at = now + 3600 });
+    try std.testing.expect(try ctx.mail().cancel(jid));
+    try std.testing.expect(!try ctx.mail().cancel(jid));
+}
+
+test "ctx.mail().enqueue with .delay_s schedules a future run_at" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const reg = queue_mod.Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{mail_job_reg},
+    };
+    env.app.queues = @ptrCast(&reg);
+
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+    const now = clock.nowUnix(env.app.io);
+    try ctx.mail().enqueue(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{ .delay_s = 60 });
+
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var st = try w.prepare("SELECT run_at FROM \"_queue_jobs\" WHERE kind='mail';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expect(st.columnInt(0) > now);
 }
 
 // ---------------------------------------------------------------------------

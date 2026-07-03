@@ -32,6 +32,10 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   trusted proxy the limiter keys on the submitted identity/email (not header-spoofable). The
   limiter also fails open under memory pressure (it never becomes a self-DoS), so it is a
   throttle, not a hard guarantee.
+- **Queue `.rate` throttling is per-process, in-memory.** A durable queue's `.rate = .{
+  .per_second = N }` token bucket lives in the serving process's memory — it is authoritative
+  only because the scheduler is itself single-process (see Scheduler below); coordinating a
+  shared rate ceiling across multiple ZigBase processes is out of scope.
 
 ## Framework / hooks
 

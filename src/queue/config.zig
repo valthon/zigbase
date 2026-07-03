@@ -47,8 +47,9 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
                     !std.mem.eql(u8, sf.name, "priority") and
                     !std.mem.eql(u8, sf.name, "retry") and
                     !std.mem.eql(u8, sf.name, "visibility_timeout_s") and
-                    !std.mem.eql(u8, sf.name, "done_ttl_s"))
-                    @compileError("queue '" ++ f.name ++ "': unknown key '." ++ sf.name ++ "' (recognized keys: .backend, .priority, .retry, .visibility_timeout_s, .done_ttl_s)");
+                    !std.mem.eql(u8, sf.name, "done_ttl_s") and
+                    !std.mem.eql(u8, sf.name, "rate"))
+                    @compileError("queue '" ++ f.name ++ "': unknown key '." ++ sf.name ++ "' (recognized keys: .backend, .priority, .retry, .visibility_timeout_s, .done_ttl_s, .rate)");
             }
             var def = QueueDef{ .name = f.name };
             if (@hasField(ST, "backend")) {
@@ -72,6 +73,17 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
                     @compileError("queue '" ++ f.name ++ "': .done_ttl_s must be >= 1 (seconds to retain done/failed jobs; omit for the 7-day default)");
                 def.done_ttl_s = spec.done_ttl_s;
             }
+            if (@hasField(ST, "rate")) {
+                const rs = spec.rate;
+                const RST = @TypeOf(rs);
+                if (@typeInfo(RST) != .@"struct" or !@hasField(RST, "per_second"))
+                    @compileError("queue '" ++ f.name ++ "': .rate must be '.{ .per_second = N }'");
+                if (rs.per_second == 0)
+                    @compileError("queue '" ++ f.name ++ "': .rate.per_second must be >= 1");
+                def.rate = .{ .per_second = rs.per_second };
+            }
+            if (def.rate != null and def.backend != .durable)
+                @compileError("queue '" ++ f.name ++ "': .rate requires .backend = .durable (memory jobs dispatch inline and cannot be throttled)");
             list = list ++ &[_]QueueDef{def};
         }
         if (!has_default)
@@ -319,6 +331,15 @@ test "queueMeta lowers backend/priority/retry and keeps an explicit default" {
     try testing.expectEqual(@as(u16, 3), defs[1].retry.max_attempts);
     try testing.expectEqual(@as(u32, 500), defs[1].retry.base_ms);
     try testing.expect(!defs[1].retry.jitter);
+}
+
+test "queueMeta lowers .rate on a durable queue and defaults to null" {
+    const defs = comptime queueMeta(.{
+        .ses_mail = .{ .backend = .durable, .rate = .{ .per_second = 14 } },
+    });
+    try testing.expect(defs[0].rate == null); // synthesized default
+    try testing.expectEqualStrings("ses_mail", defs[1].name);
+    try testing.expectEqual(@as(u16, 14), defs[1].rate.?.per_second);
 }
 
 test "workerMeta default = one implicit worker over all queues" {

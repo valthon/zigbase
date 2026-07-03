@@ -43,6 +43,13 @@ pub const RetryPolicy = struct {
     jitter: bool = true,
 };
 
+/// Sustained per-queue delivery ceiling (durable only). `per_second` is BOTH the
+/// refill rate and the bucket capacity, so the maximum burst is one second's worth
+/// of tokens. The bucket is in-process, per queue name, shared by every worker
+/// draining that queue — authoritative because the scheduler is single-process
+/// (documented). Memory queues cannot be rated (loud @compileError at lowering).
+pub const Rate = struct { per_second: u16 };
+
 /// One declared queue (lowered from a `.queues` entry, or the synthesized `.default`).
 pub const QueueDef = struct {
     name: []const u8,
@@ -58,6 +65,8 @@ pub const QueueDef = struct {
     /// GC threshold (durable only): `done`/`failed` rows older than this many seconds
     /// are deleted by the `_queue_gc` sweep. Default 7 days.
     done_ttl_s: i64 = 7 * 24 * 3600,
+    /// Sustained per-queue claim-rate ceiling (durable only). See `Rate`.
+    rate: ?Rate = null,
 };
 
 /// One declared worker (lowered from a `.workers` entry, or the implicit

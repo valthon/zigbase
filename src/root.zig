@@ -102,6 +102,7 @@ pub const CaptchaResult = @import("captcha.zig").Result;
 pub const QueueDef = @import("queue/queue.zig").QueueDef;
 pub const WorkerDef = @import("queue/queue.zig").WorkerDef;
 pub const RetryPolicy = @import("queue/queue.zig").RetryPolicy;
+pub const Rate = @import("queue/queue.zig").Rate;
 pub const Backend = @import("queue/queue.zig").Backend;
 pub const Priority = @import("queue/queue.zig").Priority;
 pub const Backoff = @import("queue/queue.zig").Backoff;

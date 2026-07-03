@@ -23,9 +23,85 @@ const Registry = queue.Registry;
 /// for one long statement (mirrors `features_resolver.assignment_gc_batch`).
 pub const gc_batch: usize = 1000;
 
-/// Insert a `pending` durable job. `run_at` is the earliest unix-second the job may be
-/// claimed (pass `clock.nowUnix(io)` for immediate). The writer must be held by the caller.
-pub fn enqueue(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: []const u8, run_at: i64) !void {
+// ── Per-queue rate throttling (#154 round 2) ─────────────────────────────
+// Enforced HERE, at claim time: rated queues are claimed per-queue with
+// `limit = min(worker's remaining concurrency, reserved tokens)`. Unclaimed ready
+// jobs simply wait for the next ~500ms scheduler tick — no sleeping in the worker,
+// no per-job pacing. Refill is INTEGER-SECOND on the framework clock (capacity ==
+// per_second, so any new second refills to full): deterministic, ZIGBASE_FAKE_NOW-
+// compatible, and equivalent to continuous refill at the tick granularity. The map
+// is process-global (single-process scheduler ⇒ authoritative) and lazily populated
+// ONLY for queues that set `.rate` — zero cost for unrated queues.
+
+/// Pure token-bucket math (unit-tested directly; production drives it via
+/// reserveTokens/refundTokens under the global mutex).
+pub const TokenBucket = struct {
+    capacity: u32,
+    tokens: u32,
+    last_s: i64,
+
+    pub fn init(per_second: u16, now_s: i64) TokenBucket {
+        return .{ .capacity = per_second, .tokens = per_second, .last_s = now_s };
+    }
+
+    fn refill(self: *TokenBucket, now_s: i64) void {
+        if (now_s <= self.last_s) return; // clock went backwards / same second: no refill
+        self.tokens = self.capacity; // capacity == per_second ⇒ any elapsed second refills to full
+        self.last_s = now_s;
+    }
+
+    /// Reserve up to `want` tokens (decrementing). Returns the grant.
+    pub fn reserve(self: *TokenBucket, now_s: i64, want: usize) usize {
+        self.refill(now_s);
+        const take: u32 = @intCast(@min(want, self.tokens));
+        self.tokens -= take;
+        return take;
+    }
+
+    /// Return unused reserved tokens (claim came up short), capped at capacity.
+    pub fn refund(self: *TokenBucket, n: usize) void {
+        self.tokens = @intCast(@min(@as(usize, self.capacity), self.tokens + n));
+    }
+};
+
+fn lockMutex(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.atomic.spinLoopHint();
+}
+
+var rate_mutex: std.atomic.Mutex = .unlocked;
+// page_allocator: process-lifetime map (a handful of tiny entries keyed by the
+// registry's comptime-static queue names — no key dup, never freed in prod).
+var rate_buckets: std.StringHashMapUnmanaged(TokenBucket) = .empty;
+
+fn reserveTokens(name: []const u8, per_second: u16, now_s: i64, want: usize) usize {
+    lockMutex(&rate_mutex);
+    defer rate_mutex.unlock();
+    const gop = rate_buckets.getOrPut(std.heap.page_allocator, name) catch return 0; // OOM: claim nothing this tick
+    if (!gop.found_existing) gop.value_ptr.* = TokenBucket.init(per_second, now_s);
+    return gop.value_ptr.reserve(now_s, want);
+}
+
+fn refundTokens(name: []const u8, n: usize) void {
+    if (n == 0) return;
+    lockMutex(&rate_mutex);
+    defer rate_mutex.unlock();
+    if (rate_buckets.getPtr(name)) |b| b.refund(n);
+}
+
+/// TEST-ONLY: drop all buckets so each test starts from a full burst.
+pub fn resetRateBucketsForTest() void {
+    if (!@import("builtin").is_test) @compileError("resetRateBucketsForTest is test-only");
+    lockMutex(&rate_mutex);
+    defer rate_mutex.unlock();
+    rate_buckets.deinit(std.heap.page_allocator);
+    rate_buckets = .empty;
+}
+
+/// Insert a `pending` durable job and return its generated id. `run_at` is the earliest
+/// unix-second the job may be claimed (pass `clock.nowUnix(io)` for immediate; a future
+/// value is the SCHEDULING primitive — `claimBatch` only claims `run_at <= now`, indexed).
+/// The writer must be held by the caller.
+pub fn enqueue(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: []const u8, run_at: i64) ![15]u8 {
     const jid = id.collectionId(io);
     var st = try w.prepare(
         \\INSERT INTO "_queue_jobs"
@@ -41,6 +117,7 @@ pub fn enqueue(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: 
     try st.bindInt(6, @intCast(def.retry.max_attempts));
     try st.bindInt(7, run_at);
     _ = try st.step();
+    return jid;
 }
 
 /// A claimed (now in-flight) durable job. All slices are owned by `arena`.
@@ -145,6 +222,23 @@ pub fn markFailed(w: *db.Db, job_id: []const u8, new_attempts: i64, last_error: 
     _ = try st.step();
 }
 
+/// Cancel a still-PENDING durable job. Returns true when the row transitioned
+/// pending→canceled; false when nothing matched (already claimed/done/failed/
+/// canceled, or unknown id — it ran or is running). NO-MATCH IS DETECTED AS
+/// `changes() == 0`, NEVER as "success == 1": sqlite3_changes also counts rows
+/// touched by triggers (e.g. FTS5), so equality-with-1 false-positives on tables
+/// with triggers. `claimBatch` only claims 'pending', so no claim-path change.
+pub fn cancelJob(w: *db.Db, job_id: []const u8) !bool {
+    var st = try w.prepare(
+        \\UPDATE "_queue_jobs" SET "status"='canceled', "claimed_at"=NULL
+        \\ WHERE "id"=?1 AND "status"='pending';
+    );
+    defer st.finalize();
+    try st.bindText(1, job_id);
+    _ = try st.step();
+    return w.changesCount() != 0;
+}
+
 /// Reclaim sweep for ONE queue: any `claimed` row of `queue_name` whose `claimed_at` is
 /// older than `visibility_timeout_s` (relative to `now`) is reset to `pending` so a crashed
 /// worker (or a handler that overran its timeout) doesn't strand it. The threshold is
@@ -164,8 +258,8 @@ pub fn reclaimStale(w: *db.Db, queue_name: []const u8, now: i64, visibility_time
     return n;
 }
 
-/// GC sweep for ONE queue: delete `done`/`failed` rows of `queue_name` whose `created` is
-/// older than `ttl_s` seconds, in bounded batches (mirrors `features_resolver.gcExpiredAssignments`).
+/// GC sweep for ONE queue: delete `done`/`failed`/`canceled` rows of `queue_name` whose `created`
+/// is older than `ttl_s` seconds, in bounded batches (mirrors `features_resolver.gcExpiredAssignments`).
 /// The TTL is per-queue (`QueueDef.done_ttl_s`). Returns rows deleted. Writer held by caller.
 pub fn gcDoneJobs(w: *db.Db, queue_name: []const u8, ttl_s: i64) !usize {
     var buf: [32]u8 = undefined;
@@ -179,7 +273,7 @@ pub fn gcDoneJobs(w: *db.Db, queue_name: []const u8, ttl_s: i64) !usize {
             \\DELETE FROM "_queue_jobs"
             \\ WHERE rowid IN (
             \\   SELECT rowid FROM "_queue_jobs"
-            \\    WHERE "status" IN ('done','failed') AND "queue"=?1
+            \\    WHERE "status" IN ('done','failed','canceled') AND "queue"=?1
             \\      AND "created" <= datetime('now', ?2)
             \\    LIMIT {d}
             \\ )
@@ -209,13 +303,18 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
     defer poll_arena.deinit();
     const pa = poll_arena.allocator();
 
-    var durable_qs: std.ArrayList([]const u8) = .empty;
+    var durable_qs: std.ArrayList([]const u8) = .empty; // unrated
+    var rated_qs: std.ArrayList(QueueDef) = .empty;
     for (worker.queues) |qn| {
-        if (reg.queueByName(qn)) |q| if (q.backend == .durable) try durable_qs.append(pa, qn);
+        if (reg.queueByName(qn)) |q| {
+            if (q.backend != .durable) continue;
+            if (q.rate == null) try durable_qs.append(pa, qn) else try rated_qs.append(pa, q);
+        }
     }
-    if (durable_qs.items.len == 0) return 0;
+    if (durable_qs.items.len == 0 and rated_qs.items.len == 0) return 0;
 
-    const claimed = blk: {
+    var claimed_list: std.ArrayList(Claimed) = .empty;
+    {
         const w = app.pool.acquireWriter();
         defer app.pool.releaseWriter();
         // Reclaim each durable queue with ITS OWN visibility timeout before claiming.
@@ -224,8 +323,29 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
             _ = reclaimStale(w, qn, now, vt) catch |e|
                 std.log.warn("queue '{s}' reclaim sweep failed: {s}", .{ qn, @errorName(e) });
         }
-        break :blk try claimBatch(pa, w, durable_qs.items, worker.name, worker.concurrency, now);
-    };
+        for (rated_qs.items) |q| {
+            _ = reclaimStale(w, q.name, now, q.visibility_timeout_s) catch |e|
+                std.log.warn("queue '{s}' reclaim sweep failed: {s}", .{ q.name, @errorName(e) });
+        }
+        var remaining: usize = worker.concurrency;
+        if (durable_qs.items.len > 0 and remaining > 0) {
+            const c = try claimBatch(pa, w, durable_qs.items, worker.name, remaining, now);
+            try claimed_list.appendSlice(pa, c);
+            remaining -= c.len;
+        }
+        for (rated_qs.items) |q| {
+            if (remaining == 0) break;
+            // Reserve-then-claim-then-refund is race-safe: tokens are decremented up
+            // front, and only the shortfall (grant - actually claimed) is returned.
+            const grant = reserveTokens(q.name, q.rate.?.per_second, now, remaining);
+            if (grant == 0) continue;
+            const c = try claimBatch(pa, w, &.{q.name}, worker.name, grant, now);
+            if (c.len < grant) refundTokens(q.name, grant - c.len);
+            try claimed_list.appendSlice(pa, c);
+            remaining -= c.len;
+        }
+    }
+    const claimed = claimed_list.items;
 
     for (claimed) |job| {
         const reg_job = reg.jobByKind(job.kind);
@@ -300,10 +420,10 @@ test "durable enqueue + claimBatch claims ready pending rows and marks them clai
     const io = testing.io;
 
     const def = QueueDef{ .name = "default", .backend = .durable };
-    try enqueue(&d, io, def, "mail", "{\"a\":1}", clock.nowUnix(io));
-    try enqueue(&d, io, def, "mail", "{\"a\":2}", clock.nowUnix(io));
+    _ = try enqueue(&d, io, def, "mail", "{\"a\":1}", clock.nowUnix(io));
+    _ = try enqueue(&d, io, def, "mail", "{\"a\":2}", clock.nowUnix(io));
     // A future row must NOT be claimed yet.
-    try enqueue(&d, io, def, "mail", "{\"a\":3}", clock.nowUnix(io) + 3600);
+    _ = try enqueue(&d, io, def, "mail", "{\"a\":3}", clock.nowUnix(io) + 3600);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -321,9 +441,9 @@ test "durable claimBatch drains queues in strict priority order" {
     const io = testing.io;
     const now = clock.nowUnix(io);
 
-    try enqueue(&d, io, .{ .name = "low", .backend = .durable, .priority = .low }, "k", "lo", now);
-    try enqueue(&d, io, .{ .name = "norm", .backend = .durable, .priority = .normal }, "k", "no", now);
-    try enqueue(&d, io, .{ .name = "high", .backend = .durable, .priority = .high }, "k", "hi", now);
+    _ = try enqueue(&d, io, .{ .name = "low", .backend = .durable, .priority = .low }, "k", "lo", now);
+    _ = try enqueue(&d, io, .{ .name = "norm", .backend = .durable, .priority = .normal }, "k", "no", now);
+    _ = try enqueue(&d, io, .{ .name = "high", .backend = .durable, .priority = .high }, "k", "hi", now);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -365,7 +485,7 @@ test "durable markRetry / markFailed update attempts + state" {
     defer d.close();
     try migrations.run(&d);
     const io = testing.io;
-    try enqueue(&d, io, .{ .name = "default", .backend = .durable }, "k", "p", clock.nowUnix(io));
+    _ = try enqueue(&d, io, .{ .name = "default", .backend = .durable }, "k", "p", clock.nowUnix(io));
     var idst = try d.prepare("SELECT id FROM \"_queue_jobs\" LIMIT 1;");
     _ = try idst.step();
     const jid = try testing.allocator.dupe(u8, idst.columnText(0));
@@ -405,6 +525,62 @@ test "durable gcDoneJobs reaps old done/failed rows, keeps fresh + pending" {
     defer st.finalize();
     _ = try st.step();
     try testing.expectEqual(@as(i64, 2), st.columnInt(0));
+}
+
+test "enqueue returns the persisted job id; a future run_at is not claimed until due" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const io = testing.io;
+    const def = QueueDef{ .name = "default", .backend = .durable };
+    const jid = try enqueue(&d, io, def, "k", "{}", 2_000_000); // due at t=2M
+    {
+        var st = try d.prepare("SELECT \"status\" FROM \"_queue_jobs\" WHERE \"id\"=?1;");
+        defer st.finalize();
+        try st.bindText(1, &jid);
+        try testing.expect(try st.step());
+        try testing.expectEqualStrings("pending", st.columnText(0));
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Before due: nothing claimable. At/after due: claimed.
+    try testing.expectEqual(@as(usize, 0), (try claimBatch(arena.allocator(), &d, &.{"default"}, "w", 10, 1_999_999)).len);
+    try testing.expectEqual(@as(usize, 1), (try claimBatch(arena.allocator(), &d, &.{"default"}, "w", 10, 2_000_000)).len);
+}
+
+test "cancelJob: pending -> true; claimed/done/second-cancel -> false (changes()==0 no-match rule)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const io = testing.io;
+    const def = QueueDef{ .name = "default", .backend = .durable };
+    const jid = try enqueue(&d, io, def, "k", "{}", clock.nowUnix(io) + 3600);
+    try testing.expect(try cancelJob(&d, &jid)); // pending -> canceled
+    try testing.expect(!try cancelJob(&d, &jid)); // already canceled -> no match
+    try testing.expect(!try cancelJob(&d, "nonexistent-id!")); // unknown -> no match
+    // A canceled job is invisible to the claim query.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 0), (try claimBatch(arena.allocator(), &d, &.{"default"}, "w", 10, clock.nowUnix(io) + 7200)).len);
+}
+
+test "gcDoneJobs reaps old canceled rows" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('c1','q','k',5,'canceled',datetime('now','-400 days'));");
+    try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('c2','q','k',5,'canceled',datetime('now'));");
+    try testing.expectEqual(@as(usize, 1), try gcDoneJobs(&d, "q", 30 * 24 * 3600)); // old canceled reaped, fresh kept
+}
+
+test "TokenBucket: full burst, drain, integer-second refill, refund cap" {
+    var b = TokenBucket.init(3, 100);
+    try testing.expectEqual(@as(usize, 3), b.reserve(100, 10)); // burst = 1s of tokens
+    try testing.expectEqual(@as(usize, 0), b.reserve(100, 1)); // same second: empty
+    try testing.expectEqual(@as(usize, 3), b.reserve(101, 5)); // new second: refilled to capacity
+    b.refund(99);
+    try testing.expectEqual(@as(u32, 3), b.tokens); // refund never exceeds capacity
+    try testing.expectEqual(@as(usize, 2), b.reserve(50, 2)); // clock going BACKWARDS: no refill, but reserve still works
 }
 
 // --- Integration: pollOnce over a real pool ---------------------------------
@@ -480,7 +656,7 @@ test "pollOnce: claim -> dispatch -> done (success)" {
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        try enqueue(w, env.app.io, reg.queues[0], "ok", "{}", clock.nowUnix(env.app.io));
+        _ = try enqueue(w, env.app.io, reg.queues[0], "ok", "{}", clock.nowUnix(env.app.io));
     }
     const worker = WorkerDef{ .name = "w1", .queues = &.{"default"}, .concurrency = 5 };
     const n = try pollOnce(&env.app, &reg, worker);
@@ -545,7 +721,7 @@ test "pollOnce: retry then terminal failure fires .onError" {
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        try enqueue(w, env.app.io, reg.queues[0], "flaky", "{}", clock.nowUnix(env.app.io));
+        _ = try enqueue(w, env.app.io, reg.queues[0], "flaky", "{}", clock.nowUnix(env.app.io));
     }
     const worker = WorkerDef{ .name = "w1", .queues = &.{"default"}, .concurrency = 5 };
 
@@ -567,4 +743,43 @@ test "pollOnce: retry then terminal failure fires .onError" {
     }
     try testing.expectEqual(@as(usize, 2), th_runs);
     try testing.expectEqual(@as(usize, 1), th_err_count);
+}
+
+test "pollOnce claims <= tokens on a rated queue while an unrated queue drains unthrottled" {
+    // Needs `clock.setForTest` to freeze the token-bucket refill second deterministically;
+    // that's a no-op on a `-Ddev-clock=false` build (see clock.zig), so this can't run there.
+    if (!clock.enabled) return error.SkipZigTest;
+    const env = try PollTestEnv.init();
+    defer env.deinit();
+    resetRateBucketsForTest();
+    defer resetRateBucketsForTest();
+    clock.setForTest(1_000_000);
+    defer clock.resetForTest();
+    th_runs = 0;
+    const reg = Registry{
+        .queues = &.{
+            .{ .name = "fast", .backend = .durable },
+            .{ .name = "slow", .backend = .durable, .rate = .{ .per_second = 2 } },
+        },
+        .jobs = &.{.{ .kind = "ok", .handler = okHandler }},
+    };
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var i: usize = 0;
+        while (i < 3) : (i += 1) _ = try enqueue(w, env.app.io, reg.queues[0], "ok", "{}", clock.nowUnix(env.app.io));
+        i = 0;
+        while (i < 5) : (i += 1) _ = try enqueue(w, env.app.io, reg.queues[1], "ok", "{}", clock.nowUnix(env.app.io));
+    }
+    const worker = WorkerDef{ .name = "w1", .queues = &.{ "fast", "slow" }, .concurrency = 10 };
+    // Tick 1: all 3 unrated + only 2 rated (the 1s burst).
+    try testing.expectEqual(@as(usize, 5), try pollOnce(&env.app, &reg, worker));
+    // Tick 2, same frozen second: the bucket is empty — nothing more claimed.
+    try testing.expectEqual(@as(usize, 0), try pollOnce(&env.app, &reg, worker));
+    // Advance one second: 2 more.
+    clock.setForTest(1_000_001);
+    try testing.expectEqual(@as(usize, 2), try pollOnce(&env.app, &reg, worker));
+    clock.setForTest(1_000_002);
+    try testing.expectEqual(@as(usize, 1), try pollOnce(&env.app, &reg, worker));
+    try testing.expectEqual(@as(usize, 8), th_runs);
 }
