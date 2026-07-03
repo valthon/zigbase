@@ -58,23 +58,45 @@ pub const PostmarkMailer = struct {
 
 /// Build the Postmark JSON request body. Pure (no I/O), so it is unit-testable by asserting the
 /// exact bytes. Header-bound fields are CRLF-rejected first; body parts are JSON-escaped.
+///
+/// Builds the nested value tree on a scratch arena (mirrors `ses.buildBody`): the `Headers` array
+/// (RFC 8058 unsubscribe pair) is a nested `ObjectMap`/`Array` structure that a single top-level
+/// `obj.deinit(alloc)` cannot free — only the final serialized bytes are duped onto `alloc`.
 pub fn buildBody(alloc: std.mem.Allocator, from: []const u8, message_stream: []const u8, email: Email) ![]u8 {
     try mailer_mod.rejectControlChars(from);
     try mailer_mod.rejectControlChars(email.to);
     try mailer_mod.rejectControlChars(email.subject);
     if (email.reply_to) |rt| try mailer_mod.rejectControlChars(rt);
+    if (email.list_unsubscribe) |lu| try mailer_mod.rejectControlChars(lu);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
 
     var obj: std.json.ObjectMap = .empty;
-    defer obj.deinit(alloc);
-    try obj.put(alloc, "From", .{ .string = from });
-    try obj.put(alloc, "To", .{ .string = email.to });
-    try obj.put(alloc, "Subject", .{ .string = email.subject });
-    if (email.text_body.len > 0) try obj.put(alloc, "TextBody", .{ .string = email.text_body });
-    if (email.html_body) |h| try obj.put(alloc, "HtmlBody", .{ .string = h });
-    if (email.reply_to) |rt| try obj.put(alloc, "ReplyTo", .{ .string = rt });
-    if (message_stream.len > 0) try obj.put(alloc, "MessageStream", .{ .string = message_stream });
+    try obj.put(a, "From", .{ .string = from });
+    try obj.put(a, "To", .{ .string = email.to });
+    try obj.put(a, "Subject", .{ .string = email.subject });
+    if (email.text_body.len > 0) try obj.put(a, "TextBody", .{ .string = email.text_body });
+    if (email.html_body) |h| try obj.put(a, "HtmlBody", .{ .string = h });
+    if (email.reply_to) |rt| try obj.put(a, "ReplyTo", .{ .string = rt });
+    if (message_stream.len > 0) try obj.put(a, "MessageStream", .{ .string = message_stream });
 
-    return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
+    if (email.list_unsubscribe) |lu| {
+        var h1: std.json.ObjectMap = .empty;
+        try h1.put(a, "Name", .{ .string = "List-Unsubscribe" });
+        try h1.put(a, "Value", .{ .string = try std.fmt.allocPrint(a, "<{s}>", .{lu}) });
+        var h2: std.json.ObjectMap = .empty;
+        try h2.put(a, "Name", .{ .string = "List-Unsubscribe-Post" });
+        try h2.put(a, "Value", .{ .string = "List-Unsubscribe=One-Click" });
+        var hdrs = std.json.Array.init(a);
+        try hdrs.append(.{ .object = h1 });
+        try hdrs.append(.{ .object = h2 });
+        try obj.put(a, "Headers", .{ .array = hdrs });
+    }
+
+    const json = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = obj }, .{});
+    return alloc.dupe(u8, json);
 }
 
 // ---------------------------------------------------------------------------
@@ -116,4 +138,37 @@ test "buildBody rejects CRLF header injection in to/subject/from/reply_to" {
     try testing.expectError(error.HeaderInjection, buildBody(a, "n@a.com", "", .{ .to = "x@y.io", .subject = "S\nX: 1", .text_body = "b" }));
     try testing.expectError(error.HeaderInjection, buildBody(a, "n@a.com\r\nEvil: 1", "", .{ .to = "x@y.io", .subject = "S", .text_body = "b" }));
     try testing.expectError(error.HeaderInjection, buildBody(a, "n@a.com", "", .{ .to = "x@y.io", .subject = "S", .text_body = "b", .reply_to = "r@x.io\r\nE: 1" }));
+}
+
+test "buildBody emits RFC 8058 Headers array when list_unsubscribe is set" {
+    const a = testing.allocator;
+    const body = try buildBody(a, "noreply@app.com", "", .{
+        .to = "user@example.com",
+        .subject = "News",
+        .text_body = "plain",
+        .list_unsubscribe = "https://app.example/api/mail/unsubscribe?t=abc",
+    });
+    defer a.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Headers\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Name\":\"List-Unsubscribe\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Value\":\"<https://app.example/api/mail/unsubscribe?t=abc>\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Name\":\"List-Unsubscribe-Post\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Value\":\"List-Unsubscribe=One-Click\"") != null);
+}
+
+test "buildBody omits Headers when list_unsubscribe is unset" {
+    const a = testing.allocator;
+    const body = try buildBody(a, "n@a.com", "", .{ .to = "x@y.io", .subject = "S", .text_body = "b" });
+    defer a.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Headers\"") == null);
+}
+
+test "buildBody rejects CRLF in list_unsubscribe" {
+    const a = testing.allocator;
+    try testing.expectError(error.HeaderInjection, buildBody(a, "n@a.com", "", .{
+        .to = "x@y.io",
+        .subject = "S",
+        .text_body = "b",
+        .list_unsubscribe = "https://x/u?t=1\r\nBcc: e@v.io",
+    }));
 }

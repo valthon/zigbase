@@ -9,6 +9,7 @@ const records_api = @import("api/records.zig");
 const accounts_api = @import("api/accounts.zig");
 const senders_api = @import("api/senders.zig");
 const mail_inbound = @import("mail/inbound.zig");
+const mail_unsub_api = @import("api/mail_unsubscribe.zig");
 const auth_api = @import("api/auth.zig");
 const auth_methods_api = @import("api/auth_methods.zig");
 const magic_link_consume_api = @import("api/magic_link_consume.zig");
@@ -80,6 +81,10 @@ const routes = [_]router.Route{
     // Email (#154): inbound bounce/complaint webhook (SES/Postmark). 404 unless a webhook_secret is
     // configured; 401 on a bad signature (constant-time compare); upserts suppressions on success.
     .{ .method = .POST, .pattern = "/api/mail/webhooks/:provider", .handler = mail_inbound.webhook_handler },
+    // Email (#154 round 2): PUBLIC one-click unsubscribe (RFC 8058). 404 unless
+    // unsubscribe_base_url is configured; signed-token authorized; GET never mutates.
+    .{ .method = .POST, .pattern = "/api/mail/unsubscribe", .handler = mail_unsub_api.post },
+    .{ .method = .GET, .pattern = "/api/mail/unsubscribe", .handler = mail_unsub_api.get },
     // Public, UNAUTHENTICATED feature-state projection (#130). Mounted at the default
     // "/api/state"; the handler 404s when disabled or remapped (a custom path is
     // dispatched dynamically in onRequest). NEVER exposes the superuser settings verbs.

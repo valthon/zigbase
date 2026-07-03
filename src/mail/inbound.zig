@@ -194,7 +194,7 @@ test "ingest maps an SES permanent bounce into a suppression row" {
     ;
     const n = try ingest(testing.io, a, &d, .ses, "acc1", body, "ses");
     try testing.expectEqual(@as(usize, 1), n);
-    try testing.expect(try suppression.isSuppressed(a, &d, "acc1", "bad@x.io"));
+    try testing.expect(try suppression.isSuppressed(a, &d, "acc1", "bad@x.io", .transactional));
 }
 
 test "webhook_handler rejects an invalid signature (401, fail closed)" {
@@ -264,8 +264,8 @@ test "webhook_handler: signed-account event verifies (200); tampering account �
     {
         var r = try pool.acquireReader();
         defer pool.releaseReader(&r);
-        try testing.expect(try suppression.isSuppressed(a, &r, "acc1", "bad@x.io"));
-        try testing.expect(!try suppression.isSuppressed(a, &r, "acc2", "bad@x.io")); // not cross-tenant
+        try testing.expect(try suppression.isSuppressed(a, &r, "acc1", "bad@x.io", .transactional));
+        try testing.expect(!try suppression.isSuppressed(a, &r, "acc2", "bad@x.io", .transactional)); // not cross-tenant
     }
 
     // (2) Tamper the account header to acc2 WITHOUT re-signing → signature mismatch → 401.

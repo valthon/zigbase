@@ -1029,13 +1029,24 @@ pub fn App(comptime cfg: anytype) type {
                 @compileError(".mail must be a struct, e.g. '.{ .require_verified_sender = true, .webhook_secret = \"…\" }'");
             for (std.meta.fields(MC)) |f| {
                 const ok = std.mem.eql(u8, f.name, "require_verified_sender") or
-                    std.mem.eql(u8, f.name, "check_suppression") or std.mem.eql(u8, f.name, "webhook_secret");
-                if (!ok) @compileError(".mail: unknown key '." ++ f.name ++ "' (recognized: .require_verified_sender, .check_suppression, .webhook_secret)");
+                    std.mem.eql(u8, f.name, "check_suppression") or std.mem.eql(u8, f.name, "webhook_secret") or
+                    std.mem.eql(u8, f.name, "unsubscribe_base_url");
+                if (!ok) @compileError(".mail: unknown key '." ++ f.name ++ "' (recognized: .require_verified_sender, .check_suppression, .webhook_secret, .unsubscribe_base_url)");
             }
             var rt = mail_cfg.Runtime{};
             if (@hasField(MC, "require_verified_sender")) rt.require_verified_sender = mc.require_verified_sender;
             if (@hasField(MC, "check_suppression")) rt.check_suppression = mc.check_suppression;
             if (@hasField(MC, "webhook_secret")) rt.webhook_secret = mc.webhook_secret;
+            if (@hasField(MC, "unsubscribe_base_url")) {
+                const u = mc.unsubscribe_base_url;
+                if (u.len > 0) {
+                    if (!std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://"))
+                        @compileError(".mail.unsubscribe_base_url must start with http:// or https://");
+                    for (u) |c| if (c <= ' ' or c == 127)
+                        @compileError(".mail.unsubscribe_base_url must not contain whitespace or control characters");
+                }
+                rt.unsubscribe_base_url = u;
+            }
             break :blk rt;
         };
 
@@ -2079,6 +2090,21 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     // the `@public`-rule startup warning so operators catch it before deploying.
     if (opts.captcha_provider != null and opts.captcha_secret.len == 0) {
         std.log.warn("captcha: provider configured but secret is empty — dev-bypass active, ALL captchas will pass; set the secret before deploying", .{});
+    }
+    // One-click unsubscribe (#154 round 2): env overrides the comptime .mail key so the
+    // stock binary is configurable at runtime (and e2e-testable). Validate the EFFECTIVE
+    // value fail-fast — a malformed base URL would mint dead links into outbound mail.
+    if (cfg.unsubscribe_base_url.len > 0) app.mail.unsubscribe_base_url = cfg.unsubscribe_base_url;
+    if (app.mail.unsubscribe_base_url.len > 0) {
+        const u = app.mail.unsubscribe_base_url;
+        var bad = !std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://");
+        for (u) |c| {
+            if (c <= ' ' or c == 127) bad = true;
+        }
+        if (bad) {
+            std.log.err("refusing to start: ZIGBASE_UNSUBSCRIBE_BASE_URL / .mail.unsubscribe_base_url must be an http(s) URL with no whitespace/control chars (got \"{s}\")", .{u});
+            return error.InvalidUnsubscribeBaseUrl;
+        }
     }
     const Ctx = @import("ctx.zig").Ctx;
     // Each lifecycle hook gets a per-invocation arena owning any ctx.records()

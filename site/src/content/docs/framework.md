@@ -672,6 +672,53 @@ For sequences whose steps depend on runtime state (branch on a later event, vary
 reach for a cron job plus a query instead — `deliverAt`/`cancel` are deliberately a recipe, not a
 scheduling DSL.
 
+**One-click unsubscribe (RFC 8058).** Set `.mail.unsubscribe_base_url` (comptime key or
+`ZIGBASE_UNSUBSCRIBE_BASE_URL`, env wins) to your app's public origin, e.g.
+`"https://app.example.com"`. **Empty (the default) is off**: no `List-Unsubscribe` headers are
+emitted and the endpoint 404s — the same default-off pattern as `webhook_secret`. Once configured,
+every `sendBulk` recipient automatically gets a signed, stateless unsubscribe token — no new secret
+to manage: the token is HMAC-SHA256'd with a **labeled derivation** of the existing JWT secret
+(`"zigbase.mail.unsub.v1"`), so it can never be confused with an auth token. The token **never
+expires** by design: an unsubscribe link must still work from a five-year-old inbox, and the
+worst-case "attack" is unsubscribing an address whose mail the attacker already possesses.
+
+The endpoint is `POST /api/mail/unsubscribe?t=<token>` (mail clients / providers call this on the
+user's behalf) — success is **204**, including on a repeat call (idempotent upsert; no "was this
+address known" oracle), and any invalid token (bad signature, malformed, tampered) is one generic
+**400** (no oracle distinguishing failure reasons). `GET` on the same URL renders a minimal HTML
+confirmation page whose button POSTs back — **it never mutates**, so link-prefetchers and mail-scanner
+bots can't unsubscribe someone by fetching the link. Both verbs are per-IP rate limited. A successful
+one-click unsubscribe records a `reason = "unsubscribe"` suppression that blocks **list mail only**
+for that recipient (transactional mail is unaffected) — it's account-global, with the originating
+list name recorded in `source = "one_click:<list>"` for audit. Per-list preference centers ("resub to
+just the newsletter") are an app-level UX layer you can build on top of that audit trail; the
+framework guarantees the compliance floor — one unconditional opt-out per address.
+
+For hand-rolled list mail that doesn't go through `sendBulk`, `ctx.mail().unsubscribeUrl(account,
+list, recipient)` mints the same signed URL to set on `MailMessage.list_unsubscribe` yourself
+(`error.UnsubscribeNotConfigured` when the base URL is unset). Transactional mail (`ctx.mail().send` /
+`.enqueue`) never carries these headers — only bulk list mail auto-wires them.
+
+```zig
+const App = zigbase.App(.{
+    .mail = .{
+        .unsubscribe_base_url = "https://app.example.com", // "" (default) = feature off
+    },
+});
+```
+
+**HTML that renders everywhere.** ZigBase ships no CSS inliner or `cid:` inline-attachment support —
+author your HTML with inline `style="…"` attributes directly, or run a build-time inliner (MJML,
+juice, premailer, …) over your template *sources* and paste its output into your `mail_template`
+strings; `{{ }}` / `{{{ }}}` interpolation passes through untouched either way. Host images at
+absolute HTTPS URLs — your app's file storage or static assets work well — rather than embedding
+them. Keep a rendered HTML body under roughly 100 KB; `ctx.mail()` warns (never errors) above that,
+since Gmail clips messages around ~102 KB and hides the rest behind "[Message clipped]". CSS inlining
+is left out because a half-baked inliner without a real CSS selector engine is a wrong-styling
+footgun — worse than shipping no inlining at all; `cid:` attachments are left out because they need a
+raw-MIME rewrite on every backend (SMTP and both HTTP APIs) for a problem hosted images solve more
+simply.
+
 ### `ctx.http()` — outbound HTTP client
 
 Returns an `HttpClient` bound to the Ctx's arena and the app's `io`:

@@ -291,7 +291,9 @@ test {
     _ = @import("mail/senders.zig");
     _ = @import("mail/suppression.zig");
     _ = @import("mail/inbound.zig");
+    _ = @import("mail/unsubscribe.zig");
     _ = @import("api/senders.zig");
+    _ = @import("api/mail_unsubscribe.zig");
     _ = @import("codegen/ts_type.zig");
     _ = @import("codegen/identifiers.zig");
     _ = @import("codegen/guards.zig");

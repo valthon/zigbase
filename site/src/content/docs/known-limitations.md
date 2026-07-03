@@ -36,6 +36,11 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   .per_second = N }` token bucket lives in the serving process's memory — it is authoritative
   only because the scheduler is itself single-process (see Scheduler below); coordinating a
   shared rate ceiling across multiple ZigBase processes is out of scope.
+- **No CSS inliner or `cid:` inline attachments.** ZigBase does not inline `<style>` rules
+  into `style="…"` attributes or support MIME `cid:`-referenced inline images — author inline
+  styles directly (or run a build-time inliner over your template sources) and host images at
+  absolute HTTPS URLs; see "HTML that renders everywhere" in
+  [Framework](./framework#ctxmail--send-application-mail).
 
 ## Framework / hooks
 

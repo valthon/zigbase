@@ -20,6 +20,7 @@ const addr = @import("addr.zig");
 
 pub const reason_hard_bounce = "hard_bounce";
 pub const reason_complaint = "complaint";
+pub const reason_unsubscribe = "unsubscribe";
 
 /// Inbound providers whose bounce/complaint payloads we can normalize.
 pub const Provider = enum { ses, postmark };
@@ -56,22 +57,33 @@ pub fn upsert(io: std.Io, alloc: std.mem.Allocator, w: *db.Db, account: []const 
     _ = try st.step();
 }
 
+/// Which send path is asking (#154 round 2). `transactional` (plain send()/enqueue/
+/// deliverAt) IGNORES `reason='unsubscribe'` rows — a user who opts out of the
+/// newsletter must still get password resets (RFC 8058 one-click is a LIST-mail
+/// mechanism). `list` (the bulk item handler) honors every reason. Bounce/complaint
+/// rows block BOTH kinds, exactly as today.
+pub const Kind = enum { transactional, list };
+
 /// True iff `email` is suppressed for `account` — i.e. a row exists with this email AND an account
 /// of `''` (global) OR `account`. `email` is normalized (I1) so case variations of a suppressed
-/// address are still blocked (no fail-open). Read-only.
-pub fn isSuppressed(alloc: std.mem.Allocator, reader: *db.Db, account: []const u8, email_in: []const u8) (db.DbError || std.mem.Allocator.Error)!bool {
+/// address are still blocked (no fail-open). `kind` controls whether a `reason='unsubscribe'` row
+/// applies (see `Kind`). Read-only.
+pub fn isSuppressed(alloc: std.mem.Allocator, reader: *db.Db, account: []const u8, email_in: []const u8, kind: Kind) (db.DbError || std.mem.Allocator.Error)!bool {
     const email = try addr.normalize(alloc, email_in);
     defer alloc.free(email);
-    var st = try reader.prepare("SELECT 1 FROM \"_suppressions\" WHERE \"email\"=?1 AND (\"account\"='' OR \"account\"=?2) LIMIT 1;");
+    var st = try reader.prepare(
+        "SELECT 1 FROM \"_suppressions\" WHERE \"email\"=?1 AND (\"account\"='' OR \"account\"=?2) AND (?3=1 OR \"reason\"<>'unsubscribe') LIMIT 1;",
+    );
     defer st.finalize();
     try st.bindText(1, email);
     try st.bindText(2, account);
+    try st.bindInt(3, if (kind == .list) 1 else 0);
     return st.step();
 }
 
 /// Fail-closed gate: `error.RecipientSuppressed` when `email` is suppressed for `account`.
-pub fn assertNotSuppressed(alloc: std.mem.Allocator, reader: *db.Db, account: []const u8, email: []const u8) SuppressionError!void {
-    if (try isSuppressed(alloc, reader, account, email)) return error.RecipientSuppressed;
+pub fn assertNotSuppressed(alloc: std.mem.Allocator, reader: *db.Db, account: []const u8, email: []const u8, kind: Kind) SuppressionError!void {
+    if (try isSuppressed(alloc, reader, account, email, kind)) return error.RecipientSuppressed;
 }
 
 /// Parse a provider webhook body into normalized suppression events (allocated on `alloc`). A
@@ -174,15 +186,15 @@ test "upsert + isSuppressed: account-scoped and global" {
     const a = testing.allocator;
     try upsert(testing.io, a, &d, "acc1", "bad@x.io", reason_hard_bounce, "ses");
     // acc1 blocked; acc2 not (per-tenant isolation).
-    try testing.expect(try isSuppressed(a, &d, "acc1", "bad@x.io"));
-    try testing.expect(!try isSuppressed(a, &d, "acc2", "bad@x.io"));
-    try testing.expectError(error.RecipientSuppressed, assertNotSuppressed(a, &d, "acc1", "bad@x.io"));
-    try assertNotSuppressed(a, &d, "acc2", "bad@x.io");
+    try testing.expect(try isSuppressed(a, &d, "acc1", "bad@x.io", .transactional));
+    try testing.expect(!try isSuppressed(a, &d, "acc2", "bad@x.io", .transactional));
+    try testing.expectError(error.RecipientSuppressed, assertNotSuppressed(a, &d, "acc1", "bad@x.io", .transactional));
+    try assertNotSuppressed(a, &d, "acc2", "bad@x.io", .transactional);
 
     // A GLOBAL suppression (empty account) blocks everyone.
     try upsert(testing.io, a, &d, "", "spammer@x.io", reason_complaint, "postmark");
-    try testing.expect(try isSuppressed(a, &d, "acc1", "spammer@x.io"));
-    try testing.expect(try isSuppressed(a, &d, "acc2", "spammer@x.io"));
+    try testing.expect(try isSuppressed(a, &d, "acc1", "spammer@x.io", .transactional));
+    try testing.expect(try isSuppressed(a, &d, "acc2", "spammer@x.io", .transactional));
 }
 
 test "suppression is address-case-insensitive (I1 — no fail-open on case)" {
@@ -191,12 +203,26 @@ test "suppression is address-case-insensitive (I1 — no fail-open on case)" {
     const a = testing.allocator;
     // Suppress a lowercase address; a differently-cased send to the same address is still blocked.
     try upsert(testing.io, a, &d, "acc1", "bad@x.io", reason_hard_bounce, "ses");
-    try testing.expect(try isSuppressed(a, &d, "acc1", "BAD@X.io"));
-    try testing.expect(try isSuppressed(a, &d, "acc1", "Bad@X.IO"));
-    try testing.expectError(error.RecipientSuppressed, assertNotSuppressed(a, &d, "acc1", "BAD@X.IO"));
+    try testing.expect(try isSuppressed(a, &d, "acc1", "BAD@X.io", .transactional));
+    try testing.expect(try isSuppressed(a, &d, "acc1", "Bad@X.IO", .transactional));
+    try testing.expectError(error.RecipientSuppressed, assertNotSuppressed(a, &d, "acc1", "BAD@X.IO", .transactional));
     // And a suppression created from a mixed-case provider event normalizes on the way in.
     try upsert(testing.io, a, &d, "acc1", "MixedCase@Y.io", reason_complaint, "postmark");
-    try testing.expect(try isSuppressed(a, &d, "acc1", "mixedcase@y.io"));
+    try testing.expect(try isSuppressed(a, &d, "acc1", "mixedcase@y.io", .transactional));
+}
+
+test "suppression kinds: unsubscribe blocks .list only; hard_bounce blocks both" {
+    var d = try testDb();
+    defer d.close();
+    const a = testing.allocator;
+    try upsert(testing.io, a, &d, "acc1", "opted-out@x.io", reason_unsubscribe, "one_click:news");
+    try upsert(testing.io, a, &d, "acc1", "bounced@x.io", reason_hard_bounce, "ses");
+    // unsubscribe: list blocked, transactional passes (password resets still deliver).
+    try testing.expect(try isSuppressed(a, &d, "acc1", "opted-out@x.io", .list));
+    try testing.expect(!try isSuppressed(a, &d, "acc1", "opted-out@x.io", .transactional));
+    // hard bounce: both blocked.
+    try testing.expect(try isSuppressed(a, &d, "acc1", "bounced@x.io", .list));
+    try testing.expect(try isSuppressed(a, &d, "acc1", "bounced@x.io", .transactional));
 }
 
 test "upsert is idempotent (no duplicate row, reason updates)" {

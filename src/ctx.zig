@@ -27,6 +27,7 @@ const queue_mod = @import("queue/queue.zig");
 const queue_memory = @import("queue/memory.zig");
 const queue_durable = @import("queue/durable.zig");
 const mail_send = @import("mail/send.zig");
+const mail_unsubscribe = @import("mail/unsubscribe.zig");
 const webhook_mod = @import("webhook.zig");
 const analytics = @import("analytics/analytics.zig");
 
@@ -1083,6 +1084,15 @@ pub const MailApi = struct {
         defer self.ctx.app.pool.releaseWriter();
         return queue_durable.cancelJob(w, job_id);
     }
+
+    /// Escape hatch for hand-rolled list mail: the signed one-click unsubscribe URL for
+    /// (account, list, recipient) — set it on your MailMessage.list_unsubscribe. Errors
+    /// with `error.UnsubscribeNotConfigured` when `unsubscribe_base_url` is unset.
+    pub fn unsubscribeUrl(self: MailApi, account: []const u8, list: []const u8, recipient: []const u8) ![]const u8 {
+        const base = self.ctx.app.mail.unsubscribe_base_url;
+        if (base.len == 0) return error.UnsubscribeNotConfigured;
+        return mail_unsubscribe.buildUrl(self.ctx.arena, base, self.ctx.app.jwt_secret, account, list, recipient);
+    }
 };
 
 /// Consumer realtime publish namespace (`ctx.realtime()`, #143). Both verbs publish on a
@@ -2056,6 +2066,26 @@ test "#141 ctx.mail().send rejects a malformed address / header injection up fro
     try std.testing.expectError(error.InvalidAddress, ctx.mail().send(.{ .to = "not-an-email", .subject = "s", .text = "b" }));
     try std.testing.expectError(error.HeaderInjection, ctx.mail().send(.{ .to = "u@x.io\r\nBcc: e@evil.io", .subject = "s", .text = "b" }));
     try std.testing.expectError(error.EmptyBody, ctx.mail().send(.{ .to = "u@x.io", .subject = "s" }));
+}
+
+test "ctx.mail().unsubscribeUrl builds a token that verifies to (account, list, recipient); errors when unconfigured" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    env.app.jwt_secret = "s";
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    try std.testing.expectError(error.UnsubscribeNotConfigured, ctx.mail().unsubscribeUrl("acc1", "news", "u@x.io"));
+
+    env.app.mail.unsubscribe_base_url = "https://app.example";
+    const url = try ctx.mail().unsubscribeUrl("acc1", "news", "u@x.io");
+    try std.testing.expect(std.mem.startsWith(u8, url, "https://app.example/api/mail/unsubscribe?t="));
+    const marker = "?t=";
+    const token = url[std.mem.indexOf(u8, url, marker).? + marker.len ..];
+    const parts = mail_unsubscribe.verify(env.arena.allocator(), "s", token) orelse return error.TestExpectedNonNull;
+    try std.testing.expectEqualStrings("acc1", parts.account);
+    try std.testing.expectEqualStrings("news", parts.list);
+    try std.testing.expectEqualStrings("u@x.io", parts.recipient);
 }
 
 test "#141 ctx.mail().enqueue durable round-trips into a _queue_jobs 'mail' row" {

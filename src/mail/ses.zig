@@ -105,6 +105,7 @@ pub fn buildBody(alloc: std.mem.Allocator, from: []const u8, email: Email) ![]u8
     try mailer_mod.rejectControlChars(email.to);
     try mailer_mod.rejectControlChars(email.subject);
     if (email.reply_to) |rt| try mailer_mod.rejectControlChars(rt);
+    if (email.list_unsubscribe) |lu| try mailer_mod.rejectControlChars(lu);
 
     // Build the nested value tree in a scratch arena so we never have to hand-free each nested
     // ObjectMap/Array; only the final serialized bytes are duped onto the caller's allocator.
@@ -141,6 +142,23 @@ pub fn buildBody(alloc: std.mem.Allocator, from: []const u8, email: Email) ![]u8
     var simple: std.json.ObjectMap = .empty;
     try simple.put(a, "Subject", .{ .object = subject_obj });
     try simple.put(a, "Body", .{ .object = body_obj });
+
+    if (email.list_unsubscribe) |lu| {
+        // SES v2 supports per-message Headers on the Simple content object (since 2023) —
+        // no switch to Raw MIME. Do NOT use ListManagementOptions (that binds unsubscribe
+        // to SES's own contact lists rather than our endpoint).
+        var h1: std.json.ObjectMap = .empty;
+        try h1.put(a, "Name", .{ .string = "List-Unsubscribe" });
+        try h1.put(a, "Value", .{ .string = try std.fmt.allocPrint(a, "<{s}>", .{lu}) });
+        var h2: std.json.ObjectMap = .empty;
+        try h2.put(a, "Name", .{ .string = "List-Unsubscribe-Post" });
+        try h2.put(a, "Value", .{ .string = "List-Unsubscribe=One-Click" });
+        var hdrs = std.json.Array.init(a);
+        try hdrs.append(.{ .object = h1 });
+        try hdrs.append(.{ .object = h2 });
+        try simple.put(a, "Headers", .{ .array = hdrs });
+    }
+
     var content: std.json.ObjectMap = .empty;
     try content.put(a, "Simple", .{ .object = simple });
     try root.put(a, "Content", .{ .object = content });
@@ -191,4 +209,37 @@ test "buildBody rejects header injection" {
     const a = testing.allocator;
     try testing.expectError(error.HeaderInjection, buildBody(a, "n@a.com", .{ .to = "x@y.io\r\nBcc: e@v.io", .subject = "S", .text_body = "b" }));
     try testing.expectError(error.HeaderInjection, buildBody(a, "n@a.com", .{ .to = "x@y.io", .subject = "S\nX:1", .text_body = "b" }));
+}
+
+test "buildBody emits RFC 8058 Headers on Content.Simple when list_unsubscribe is set" {
+    const a = testing.allocator;
+    const body = try buildBody(a, "noreply@app.com", .{
+        .to = "user@example.com",
+        .subject = "News",
+        .text_body = "plain",
+        .list_unsubscribe = "https://app.example/api/mail/unsubscribe?t=abc",
+    });
+    defer a.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Headers\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Name\":\"List-Unsubscribe\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Value\":\"<https://app.example/api/mail/unsubscribe?t=abc>\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Name\":\"List-Unsubscribe-Post\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Value\":\"List-Unsubscribe=One-Click\"") != null);
+}
+
+test "buildBody omits Headers when list_unsubscribe is unset" {
+    const a = testing.allocator;
+    const body = try buildBody(a, "n@a.com", .{ .to = "x@y.io", .subject = "S", .text_body = "b" });
+    defer a.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Headers\"") == null);
+}
+
+test "buildBody rejects CRLF in list_unsubscribe" {
+    const a = testing.allocator;
+    try testing.expectError(error.HeaderInjection, buildBody(a, "n@a.com", .{
+        .to = "x@y.io",
+        .subject = "S",
+        .text_body = "b",
+        .list_unsubscribe = "https://x/u?t=1\r\nBcc: e@v.io",
+    }));
 }
