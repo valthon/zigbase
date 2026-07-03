@@ -106,12 +106,14 @@ is **not** an HTTP readiness check. Prefer an orchestrator-native HTTP probe aga
 ## Tags
 
 - `latest` — newest tagged release.
-- `X.Y.Z` — an exact release, e.g. `ghcr.io/valthon/zigbase:0.13.0`.
+- `X.Y.Z` — an exact release, e.g. `ghcr.io/valthon/zigbase:0.9.0`.
 - `X.Y` / `X` — rolling aliases that track the newest patch/minor within that line.
 
 Pin to `X.Y.Z` for reproducible deployments. Images are published to `ghcr.io/valthon/zigbase`
-(GitHub Container Registry) with no separate registration step required — pull them like any
-other public image.
+(GitHub Container Registry) on each tagged release. **Maintainer note:** GHCR creates a newly
+pushed package as **private** by default — after the first release push, a repo owner must
+flip its visibility to Public once (package Settings → Change visibility) before `docker pull`
+works for anonymous/public users.
 
 ## What's NOT in the image
 

@@ -13,8 +13,8 @@ services:
       # Remove this (or set back to true) once you're behind TLS.
       ZIGBASE_COOKIE_SECURE: "false"
     healthcheck:
-      # distroless has no shell/curl; compose's healthcheck still needs a
-      # command, so this checks liveness via /proc instead of the HTTP API.
+      # distroless has no shell/curl, so compose's healthcheck runs the binary
+      # itself (/zigbase version) as a liveness check instead of an HTTP probe.
       # For a real HTTP health probe, front this with a reverse proxy (e.g.
       # Traefik/Caddy) that can itself curl GET /api/health, or use your
       # orchestrator's HTTP probe type (e.g. Kubernetes httpGet) directly

@@ -127,6 +127,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }}
             type=semver,pattern={{major}},value=${{ github.ref_name }}
             type=raw,value=latest
+      # NOTE: the first push creates the GHCR package as PRIVATE — a repo owner must
+      # flip it to Public once (Package settings → Change visibility).
       - name: Build + push multi-arch image
         uses: docker/build-push-action@v6
         with:
