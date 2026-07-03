@@ -102,6 +102,7 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     // restore it explicitly before commit). Best-effort: needs a superuser target, otherwise we
     // fall back to topological table order.
     const fk_suspended = suspendForeignKeys(target);
+    if (!fk_suspended) try deferForeignKeys(target);
 
     // The returned report outlives this function's arena, so allocate it with the caller's `gpa`.
     // On the error path (e.g. a rejected row → rollback) free the table names duped so far too.
@@ -132,7 +133,10 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     try resetRollupWatermarks(target);
 
     if (fk_suspended) restoreForeignKeys(target);
-    try target.commit();
+    target.commit() catch |e| {
+        if (!fk_suspended) logDeferredFkCommitFailure(a, src_cols);
+        return e;
+    };
 
     return .{
         .tables = try reports.toOwnedSlice(gpa),
@@ -538,18 +542,61 @@ fn countRows(a: std.mem.Allocator, d: *db.Db, table: []const u8) Error!usize {
 /// Suspend FK enforcement on the target for the duration of the load (Postgres only, best effort).
 /// `SET session_replication_role = replica` disables FK triggers so rows load in any order and
 /// self-references never trip. Returns false if it could not be set (non-superuser target) — the
-/// caller then falls back to topological table ordering.
+/// caller then falls back to `deferForeignKeys`.
+///
+/// The attempt is wrapped in a SAVEPOINT: on Postgres, ANY failed statement poisons the rest of
+/// the enclosing transaction (every later statement errors "current transaction is aborted" until
+/// a ROLLBACK), so a plain failed `SET` here would silently break the load transaction for the
+/// non-superuser fallback path that follows it in `run`. Rolling back to the savepoint undoes just
+/// this one failed statement, leaving the load transaction otherwise usable.
 fn suspendForeignKeys(d: *db.Db) bool {
     if (db.dbBackend(d) != .postgres) return false;
+    d.exec("SAVEPOINT zb_fk_suspend;") catch return false;
     d.exec("SET session_replication_role = replica;") catch {
-        std.log.warn("migrate-db: could not suspend FK enforcement (target role is not superuser); loading in dependency order", .{});
+        d.exec("ROLLBACK TO SAVEPOINT zb_fk_suspend;") catch {};
+        std.log.warn("migrate-db: could not suspend FK enforcement (target role is not superuser); deferring constraints to COMMIT instead", .{});
         return false;
     };
+    d.exec("RELEASE SAVEPOINT zb_fk_suspend;") catch {};
     return true;
 }
 
 fn restoreForeignKeys(d: *db.Db) void {
     d.exec("SET session_replication_role = origin;") catch {};
+}
+
+/// The non-superuser path: instead of suspending FK enforcement, defer constraint
+/// checking to COMMIT inside the (already-open) load transaction. Postgres:
+/// `SET CONSTRAINTS ALL DEFERRED` — no privilege required, affects only DEFERRABLE
+/// constraints, i.e. exactly the cycle-edge FKs provisioned by provisionRecordTables.
+/// SQLite: `PRAGMA defer_foreign_keys=ON` — transaction-scoped, auto-resets at COMMIT
+/// (SQLite's inline FK DDL is already cycle-capable; only row order needs this).
+fn deferForeignKeys(d: *db.Db) Error!void {
+    switch (db.dbBackend(d)) {
+        .postgres => try d.exec("SET CONSTRAINTS ALL DEFERRED;"),
+        .sqlite => try d.exec("PRAGMA defer_foreign_keys=ON;"),
+    }
+}
+
+/// A COMMIT failure on the deferred-constraint path means a dangling reference in the
+/// source data — the ONLY hard error left in the non-superuser design. Name the cycle
+/// members so the operator can find it. (Errors are logged here, then the DbError
+/// propagates; the CLI wrapper prints its usual abort message.)
+fn logDeferredFkCommitFailure(a: std.mem.Allocator, src_cols: []const schema.Collection) void {
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(a);
+    if (planCreateOrder(a, src_cols)) |plan| {
+        for (plan.cycle_edges) |e| {
+            const n = src_cols[e.col_idx].name;
+            if (std.mem.indexOf(u8, names.items, n) != null) continue;
+            if (names.items.len > 0) names.appendSlice(a, ", ") catch break;
+            names.appendSlice(a, n) catch break;
+        }
+    } else |_| {}
+    std.log.err(
+        "migrate-db: foreign-key cycle across collections [{s}] could not be satisfied at commit — a row references a missing target. The target was rolled back; fix the dangling reference in the source (or use a superuser target role) and re-run.",
+        .{names.items},
+    );
 }
 
 /// The order to load tables in. When FK enforcement is suspended, the target's natural (name)
@@ -736,6 +783,49 @@ test "dumpload: per-table report counts equal the real target row counts (M1)" {
     defer n.finalize();
     try std.testing.expect(try n.step());
     try std.testing.expectEqual(@as(i64, 2), n.columnInt(0));
+}
+
+test "dumpload: self-referential relation rows load in any order (defer_foreign_keys)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var source = try db.Db.openMemory();
+    defer source.close();
+    try migrations.run(&source);
+    const col = schema.Collection{ .id = "_", .name = "nodes", .fields = &[_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "parent", .options = .{ .relation = .{ .targetCollectionId = "nodes", .maxSelect = 1 } } },
+    } };
+    _ = try collections.create(al, io, &source, col);
+    // r1 references the LATER row r2: with foreign_keys=ON and no deferral, copying in natural
+    // order would fail at the first INSERT — dumpload's defer_foreign_keys validates at COMMIT
+    // instead. The vendored SQLite is built with SQLITE_DEFAULT_FOREIGN_KEYS=1, so FK enforcement
+    // is ON by default even on a bare test handle — seeding r1 before r2 exists would fail here
+    // too without deferring, mirroring how such a row order can legitimately exist in a real
+    // database (e.g. itself loaded via a deferred-FK bulk import).
+    try source.exec("BEGIN;");
+    try source.exec("PRAGMA defer_foreign_keys=ON;");
+    try source.exec("INSERT INTO \"nodes\" (\"id\",\"created\",\"updated\",\"title\",\"parent\") VALUES ('r1','t','t','child','r2');");
+    try source.exec("INSERT INTO \"nodes\" (\"id\",\"created\",\"updated\",\"title\",\"parent\") VALUES ('r2','t','t','root',NULL);");
+    try source.exec("COMMIT;");
+
+    var target = try db.Db.openMemory();
+    defer target.close();
+    // FK enforcement is already ON by default (SQLITE_DEFAULT_FOREIGN_KEYS=1), matching the
+    // production pool writer (backend/sqlite/db.zig); set it explicitly anyway so the test does
+    // not silently pass if that compile default is ever dropped.
+    try target.exec("PRAGMA foreign_keys=ON;");
+
+    const report = try run(a, &source, &target, .{});
+    defer report.deinit(a);
+
+    var st = try target.prepare("SELECT \"parent\" FROM \"nodes\" WHERE \"id\"='r1';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("r2", st.columnText(0));
 }
 
 // --- planCreateOrder (pure cycle detection) ---------------------------------------
