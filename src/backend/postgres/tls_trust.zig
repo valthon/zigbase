@@ -12,7 +12,17 @@
 //! NEVER logged here — messages name sslmode labels and file paths only.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const connstr = @import("connstr.zig");
+
+/// A startup TLS/CA misconfiguration is a hard `.err` in production, but Zig's test
+/// runner counts every `std.log.err` as a test failure — so the tests that
+/// deliberately exercise these abort-startup paths would fail on the log alone even
+/// though their assertions are correct. Under the test runner we emit the identical
+/// message at `.warn`; production still logs `.err`.
+fn logMisconfig(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.is_test) std.log.warn(fmt, args) else std.log.err(fmt, args);
+}
 
 pub const TrustError = error{
     /// The `sslrootcert` file is missing/unreadable, or a PEM block in it failed to parse
@@ -49,7 +59,7 @@ pub const TlsTrust = struct {
                 bundle.addCertsFromFilePath(gpa, io, now, std.Io.Dir.cwd(), path);
             res catch |e| {
                 if (e == error.OutOfMemory) return TrustError.OutOfMemory;
-                std.log.err(
+                logMisconfig(
                     "postgres TLS: sslmode={s} requires a CA bundle, but sslrootcert '{s}' could not be read ({s}). Fix the path, or omit sslrootcert to use the system root store.",
                     .{ cfg.sslmode.label(), path, @errorName(e) },
                 );
@@ -58,7 +68,7 @@ pub const TlsTrust = struct {
         } else {
             bundle.rescan(gpa, io, now) catch |e| {
                 if (e == error.OutOfMemory) return TrustError.OutOfMemory;
-                std.log.err(
+                logMisconfig(
                     "postgres TLS: sslmode={s} requires CA certificates, but scanning the system root store failed ({s}). Pass sslrootcert=<pem-path> in ZIGBASE_DB_URL instead.",
                     .{ cfg.sslmode.label(), @errorName(e) },
                 );
@@ -67,7 +77,7 @@ pub const TlsTrust = struct {
         }
 
         if (bundle.map.count() == 0) {
-            std.log.err(
+            logMisconfig(
                 "postgres TLS: sslmode={s} requires a CA bundle, but {s}{s} contains no usable CA certificates.",
                 .{
                     cfg.sslmode.label(),

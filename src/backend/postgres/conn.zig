@@ -8,12 +8,22 @@
 //! interfaces are self-referential); `db.zig`/`pool.zig` always hold a `*Conn`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const net = std.Io.net;
 const tls = std.crypto.tls;
 const proto = @import("protocol.zig");
 const scram = @import("scram.zig");
 const connstr = @import("connstr.zig");
 const tls_trust = @import("tls_trust.zig");
+
+/// A TLS/auth misconfiguration is a hard `.err` in production, but Zig's test runner
+/// counts every `std.log.err` as a test failure — so the tests that deliberately
+/// exercise these refuse-to-connect paths would fail on the log alone even though
+/// their assertions (the returned error) are correct. Under the test runner we emit
+/// the identical message at `.warn`; production still logs `.err`.
+fn logMisconfig(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.is_test) std.log.warn(fmt, args) else std.log.err(fmt, args);
+}
 
 pub const ConnError = error{
     ConnectFailed,
@@ -202,7 +212,7 @@ pub const Conn = struct {
             'S' => try self.startTlsHandshake(cfg, trust),
             'N' => switch (cfg.sslmode) {
                 .require, .verify_ca, .verify_full => {
-                    std.log.err(
+                    logMisconfig(
                         "postgres: server {s}:{d} refused TLS but sslmode={s} requires it; for a trusted-network/dev setup append ?sslmode=disable (plaintext) or ?sslmode=require (encrypted, unverified) to ZIGBASE_DB_URL.",
                         .{ cfg.host, cfg.port, cfg.sslmode.label() },
                     );
@@ -397,7 +407,7 @@ pub const Conn = struct {
 
         const client_final = client.clientFinal(cfg.password, server_first) catch |e| switch (e) {
             error.PasswordNeedsNormalization => {
-                std.log.err(
+                logMisconfig(
                     "postgres auth: the password contains Unicode that requires NFKC normalization (RFC 4013 SASLprep), which this driver does not perform. Supply the password pre-normalized to NFKC, or change it to an ASCII password.",
                     .{},
                 );
