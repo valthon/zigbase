@@ -162,9 +162,9 @@ fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const
     var id_to_name = std.StringHashMap([]const u8).init(a);
     for (src_cols) |c| try id_to_name.put(c.id, c.name);
 
-    const order = try collectionCreateOrder(a, src_cols);
+    const plan = try planCreateOrder(a, src_cols);
     var created: usize = 0;
-    for (order) |idx| {
+    for (plan.order) |idx| {
         const col = src_cols[idx];
         if (try tableExists(a, target, col.name)) continue; // system tables already exist
         // For auth collections, materialize the injected system columns (passwordHash/tokenKey/…)
@@ -205,10 +205,24 @@ fn resolveRelationTargets(a: std.mem.Allocator, col: schema.Collection, id_to_na
     return out;
 }
 
-/// Order collection indices so a relation target is created before the collection referencing it.
-/// Falls back to declaration order on a cycle (the FK create then fails loudly — acceptable, a
-/// circular hard-FK schema is not representable as inline FKs on either backend).
-fn collectionCreateOrder(a: std.mem.Allocator, cols: []const schema.Collection) Error![]usize {
+pub const CycleEdge = struct { col_idx: usize, field_idx: usize };
+
+pub const CreatePlan = struct {
+    /// Collection indices in creation order. Every collection appears exactly once;
+    /// cycle members are appended in declaration order after the acyclic prefix.
+    order: []usize,
+    /// Single-relation fields that participate in a dependency cycle — every relation
+    /// edge between two Kahn leftovers (conservative) plus EVERY self-relation (its DDL
+    /// is legal inline, but its rows still need COMMIT-time deferral):
+    /// `cols[e.col_idx].fields[e.field_idx]`. Empty for an acyclic graph.
+    cycle_edges: []CycleEdge,
+};
+
+/// Kahn-style creation plan over the collection relation graph. Pure (arena-allocating,
+/// no I/O) so cycle handling is unit-testable. The nodes Kahn cannot place form the
+/// cyclic core; on Postgres their in-cycle FK edges are provisioned as deferrable
+/// `ALTER TABLE ADD CONSTRAINT`s instead of inline REFERENCES (see provisionRecordTables).
+fn planCreateOrder(a: std.mem.Allocator, cols: []const schema.Collection) Error!CreatePlan {
     const n = cols.len;
     const placed = try a.alloc(bool, n);
     @memset(placed, false);
@@ -225,9 +239,51 @@ fn collectionCreateOrder(a: std.mem.Allocator, cols: []const schema.Collection) 
             }
         }
     }
-    // Append any cycle remainder in declaration order.
-    for (0..n) |i| if (!placed[i]) try order.append(a, i);
-    return order.toOwnedSlice(a);
+
+    // Cycle edges: FK-bearing (single) relations where BOTH endpoints are Kahn leftovers,
+    // plus every self-relation regardless of placement.
+    var cycle_edges: std.ArrayList(CycleEdge) = .empty;
+    for (cols, 0..) |c, i| {
+        for (c.fields, 0..) |f, fi| switch (f.options) {
+            .relation => |r| {
+                if (r.maxSelect != 1) continue; // multi-relations carry no FK
+                const j = findCollection(cols, r.targetCollectionId) orelse continue;
+                if (i == j) {
+                    try cycle_edges.append(a, .{ .col_idx = i, .field_idx = fi });
+                } else if (!placed[i] and !placed[j]) {
+                    try cycle_edges.append(a, .{ .col_idx = i, .field_idx = fi });
+                }
+            },
+            else => {},
+        };
+    }
+
+    // Append the cyclic core in declaration order (its tables are still created — only
+    // the in-cycle FK clauses are handled specially) and log the members once.
+    var had_cycle = false;
+    for (0..n) |i| {
+        if (!placed[i]) {
+            if (!had_cycle) {
+                had_cycle = true;
+                std.log.info("migrate-db: relation cycle detected; deferring its FK edges to COMMIT. Members:", .{});
+            }
+            std.log.info("migrate-db:   cycle member '{s}'", .{cols[i].name});
+            try order.append(a, i);
+        }
+    }
+    return .{
+        .order = try order.toOwnedSlice(a),
+        .cycle_edges = try cycle_edges.toOwnedSlice(a),
+    };
+}
+
+/// Index of the collection whose id OR name equals `target` (relation targets are stored
+/// either way), or null for out-of-set targets (e.g. system `_superusers`).
+fn findCollection(cols: []const schema.Collection, target: []const u8) ?usize {
+    for (cols, 0..) |c, j| {
+        if (std.mem.eql(u8, c.id, target) or std.mem.eql(u8, c.name, target)) return j;
+    }
+    return null;
 }
 
 /// True if every user-collection relation target of `c` is already placed. Targets that are not
@@ -464,7 +520,7 @@ fn restoreForeignKeys(d: *db.Db) void {
 fn tableLoadOrder(a: std.mem.Allocator, tables: []const []const u8, src_cols: []const schema.Collection, fk_suspended: bool) Error![]const []const u8 {
     if (fk_suspended) return tables;
     // Build a name->dependency(name) set from collections, then stable-topo the table list.
-    const order = try collectionCreateOrder(a, src_cols);
+    const order = (try planCreateOrder(a, src_cols)).order;
     var rank = std.StringHashMap(usize).init(a);
     for (order, 0..) |idx, r| try rank.put(src_cols[idx].name, r);
     const out = try a.dupe([]const u8, tables);
@@ -641,4 +697,96 @@ test "dumpload: per-table report counts equal the real target row counts (M1)" {
     defer n.finalize();
     try std.testing.expect(try n.step());
     try std.testing.expectEqual(@as(i64, 2), n.columnInt(0));
+}
+
+// --- planCreateOrder (pure cycle detection) ---------------------------------------
+
+fn relField(comptime id: []const u8, comptime name: []const u8, comptime target: []const u8) schema.Field {
+    return .{ .id = id, .name = name, .options = .{ .relation = .{ .targetCollectionId = target, .maxSelect = 1 } } };
+}
+
+test "dumpload: planCreateOrder — acyclic graph orders dependencies first, zero cycle edges" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const post_fields = [_]schema.Field{relField("f1", "author", "authors")};
+    const cols = [_]schema.Collection{
+        .{ .id = "c_posts", .name = "posts", .fields = &post_fields },
+        .{ .id = "c_auth", .name = "authors", .fields = &.{} },
+    };
+    const plan = try planCreateOrder(al, &cols);
+    try std.testing.expectEqual(@as(usize, 0), plan.cycle_edges.len);
+    try std.testing.expectEqual(@as(usize, 2), plan.order.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.order[0]); // authors first
+    try std.testing.expectEqual(@as(usize, 0), plan.order[1]); // then posts
+}
+
+test "dumpload: planCreateOrder — a self-relation is ALWAYS a cycle edge (but places normally)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const node_fields = [_]schema.Field{relField("f1", "parent", "nodes")};
+    const cols = [_]schema.Collection{
+        .{ .id = "c_nodes", .name = "nodes", .fields = &node_fields },
+    };
+    const plan = try planCreateOrder(al, &cols);
+    try std.testing.expectEqual(@as(usize, 1), plan.order.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.cycle_edges.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.cycle_edges[0].col_idx);
+    try std.testing.expectEqual(@as(usize, 0), plan.cycle_edges[0].field_idx);
+}
+
+test "dumpload: planCreateOrder — 2-cycle and 3-cycle mark every in-cycle edge" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    {
+        const af = [_]schema.Field{relField("f1", "buddy", "beta")};
+        const bf = [_]schema.Field{relField("f2", "buddy", "alpha")};
+        const cols = [_]schema.Collection{
+            .{ .id = "c_a", .name = "alpha", .fields = &af },
+            .{ .id = "c_b", .name = "beta", .fields = &bf },
+        };
+        const plan = try planCreateOrder(al, &cols);
+        try std.testing.expectEqual(@as(usize, 2), plan.order.len); // both still created
+        try std.testing.expectEqual(@as(usize, 2), plan.cycle_edges.len);
+    }
+    {
+        const xf = [_]schema.Field{relField("f1", "next", "y")};
+        const yf = [_]schema.Field{relField("f2", "next", "z")};
+        const zf = [_]schema.Field{relField("f3", "next", "x")};
+        const cols = [_]schema.Collection{
+            .{ .id = "c_x", .name = "x", .fields = &xf },
+            .{ .id = "c_y", .name = "y", .fields = &yf },
+            .{ .id = "c_z", .name = "z", .fields = &zf },
+        };
+        const plan = try planCreateOrder(al, &cols);
+        try std.testing.expectEqual(@as(usize, 3), plan.cycle_edges.len);
+    }
+}
+
+test "dumpload: planCreateOrder — a diamond feeding a cycle only defers the in-cycle edges" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    // base <- x, base <- y (acyclic diamond); a -> {x, b}, b -> {y, a} (a/b cycle).
+    const xf = [_]schema.Field{relField("f1", "root", "base")};
+    const yf = [_]schema.Field{relField("f2", "root", "base")};
+    const af = [_]schema.Field{ relField("f3", "via", "x"), relField("f4", "pair", "b") };
+    const bf = [_]schema.Field{ relField("f5", "via", "y"), relField("f6", "pair", "a") };
+    const cols = [_]schema.Collection{
+        .{ .id = "c_base", .name = "base", .fields = &.{} },
+        .{ .id = "c_x", .name = "x", .fields = &xf },
+        .{ .id = "c_y", .name = "y", .fields = &yf },
+        .{ .id = "c_a", .name = "a", .fields = &af },
+        .{ .id = "c_b", .name = "b", .fields = &bf },
+    };
+    const plan = try planCreateOrder(al, &cols);
+    try std.testing.expectEqual(@as(usize, 5), plan.order.len);
+    // ONLY a.pair and b.pair are cycle edges — a.via/b.via point at placed (acyclic) nodes.
+    try std.testing.expectEqual(@as(usize, 2), plan.cycle_edges.len);
+    for (plan.cycle_edges) |e| {
+        const f = cols[e.col_idx].fields[e.field_idx];
+        try std.testing.expectEqualStrings("pair", f.name);
+    }
 }
