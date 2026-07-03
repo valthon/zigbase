@@ -4,6 +4,16 @@
   was materialized as a ~3 MB all-zero `.rodata` template copied at runtime on every
   `compile`) — the default ReleaseSafe binary shrinks ~40%, from ~7.6 MB to ~4.6 MB,
   with identical behavior.
+- `app.submit` tasks and memory-queue jobs are now drained and joined at shutdown (a task
+  submitted before shutdown completes instead of being cut off), and `app.submit` works
+  whenever the server is running — a configured scheduler is no longer required.
+
+### Performance
+
+- Memory-backend queues no longer spawn one detached OS thread (with a 1 MiB stack) per
+  enqueued job: jobs run on a small fixed worker pool with a bounded ring. Overflow
+  returns `error.QueueFull` instead of unbounded thread creation, so enqueue bursts can
+  no longer exhaust threads or address space.
 
 ### Internal
 

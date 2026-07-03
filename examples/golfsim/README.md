@@ -307,8 +307,9 @@ fn webhookJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
 
 The job **never propagates an error that matters** — a webhook is a notification, not part
 of the transaction, so an unreachable endpoint can't break a confirmation. (Submitted
-ad-hoc tasks run on a detached thread; see `App.submit`'s doc comment for the shutdown
-caveat.) The target URL is read from the KV store (`booking_webhook_url`), seeded at
+ad-hoc tasks run on the bounded background worker pool; see `App.submit`'s doc comment
+for the shutdown semantics.) The target URL is read from the KV store
+(`booking_webhook_url`), seeded at
 startup by the `onBootstrap` handler from the `GOLFSIM_BOOKING_WEBHOOK_URL` env var:
 
 ```zig

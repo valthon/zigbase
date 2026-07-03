@@ -29,6 +29,7 @@ const ctx_mod = @import("ctx.zig");
 const queue = @import("queue/queue.zig");
 const queue_config = @import("queue/config.zig");
 const queue_durable = @import("queue/durable.zig");
+const queue_memory = @import("queue/memory.zig");
 const mail_send = @import("mail/send.zig");
 const mail_cfg = @import("mail/config.zig");
 const webhook = @import("webhook.zig");
@@ -2006,6 +2007,13 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
     var srv = server.Server{ .app = &app, .host = host_z, .port = cfg.http_port };
+    // Bounded background pool for memory-queue jobs + app.submit (R1-2). Worker threads
+    // spawn lazily on first use (zero overhead when unused) and stop() drains + joins.
+    // Its defer is registered BEFORE the scheduler's, so (LIFO) the scheduler stops FIRST
+    // — a cron handler may still enqueue/submit during its final run.
+    var mem_pool = queue_memory.Pool.init(&app);
+    mem_pool.install(&app);
+    defer mem_pool.stop();
     // Start the scheduler only when jobs are configured. Registered LAST among the teardown
     // defers, so (LIFO) its stop()+deinit() runs FIRST on return — joining worker threads
     // before pool.deinit()/storage_inst go out of scope, since workers touch app.pool/storage.

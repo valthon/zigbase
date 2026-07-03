@@ -126,22 +126,21 @@ pub const App = struct {
     scheduler: ?*anyopaque = null,
     /// Type-erased pointer to the running memory-queue worker Pool (`queue/memory.zig`),
     /// set by `Pool.install` in serveImpl; null = not serving (tests/CLI). Memory-backend
-    /// `ctx.enqueue` jobs run on this bounded, shutdown-joined pool. `app.submit` does NOT
-    /// yet route through it — see the hazard note on `Pool.install` — that lands in Task 4
-    /// together with the `App.submit` body fix below.
+    /// `ctx.enqueue` jobs AND `app.submit` tasks run on this bounded, shutdown-joined pool.
     memory_pool: ?*anyopaque = null,
-    /// Submit an ad-hoc job task for async execution; set by Scheduler.start. Task 4 wires App.submit().
+    /// Submit an ad-hoc job task for async execution; set by `queue/memory.zig` Pool.install.
     submit_fn: ?*const fn (ctx: *anyopaque, name: []const u8, task: @import("events.zig").JobTask) anyerror!void = null,
 
-    /// Offload an ad-hoc background task onto the scheduler (runs off the request thread).
-    /// Returns error.SchedulerUnavailable if no scheduler is running (CLI/tests/no jobs configured).
-    ///
-    /// LIMITATION (v0.1): ad-hoc submitted tasks currently run on a DETACHED thread that is
-    /// NOT joined at shutdown. A task submitted near shutdown may outlive the Scheduler's
-    /// stop()/deinit() and must not assume `app` (or its pool/storage) outlives it
-    /// indefinitely. Cron/interval jobs, by contrast, use the bounded, cleanly-joined worker pool.
+    /// Submit an ad-hoc job task for async execution on the bounded background pool
+    /// (queue/memory.zig Pool — shared with memory-queue jobs). Set by Pool.install in
+    /// serveImpl, so it is available whenever the server is running (0.10.0: previously it
+    /// required a configured scheduler). Tasks queued before shutdown are DRAINED and the
+    /// workers JOINED — a task submitted near shutdown completes (at-most-once across a
+    /// crash). Returns error.SchedulerUnavailable when no pool is installed (unit tests /
+    /// CLI — the historical error name is kept for compatibility) and error.QueueFull when
+    /// the bounded ring is full (reject-not-block; see queue/memory.zig for the policy).
     pub fn submit(self: *App, name: []const u8, task: @import("events.zig").JobTask) !void {
         const f = self.submit_fn orelse return error.SchedulerUnavailable;
-        return f(self.scheduler.?, name, task);
+        return f(self.memory_pool.?, name, task);
     }
 };

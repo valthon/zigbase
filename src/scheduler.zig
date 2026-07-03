@@ -152,14 +152,14 @@ pub fn completeJobError(s: *JobState, now: i64) void {
 
 const Thread = std.Thread;
 
-/// Per-thread stack size (bytes) for the scheduler's spawned threads (the tick thread,
-/// each job-pool worker, and detached `app.submit` task threads). `std.Thread`'s default
-/// is 16 MiB EACH, so the default pool reserves ~48 MiB of address space for stacks that
-/// the scheduler/job handlers never come close to using. 1 MiB is generous for cron/job
-/// handlers (they heap-allocate; argon2/DB work lives off-stack) while cutting the reserved
-/// footprint by ~15x per thread. Overridable per-deploy via the `.pools.stack_size` comptime
-/// lever (threaded through `Scheduler.init`), which RAISES the stack for unusually deep
-/// handlers — the default already minimizes the footprint.
+/// Per-thread stack size (bytes) for the scheduler's spawned threads (the tick thread and
+/// each job-pool worker). `std.Thread`'s default is 16 MiB EACH, so the default pool
+/// reserves ~48 MiB of address space for stacks that the scheduler/job handlers never come
+/// close to using. 1 MiB is generous for cron/job handlers (they heap-allocate; argon2/DB
+/// work lives off-stack) while cutting the reserved footprint by ~15x per thread.
+/// Overridable per-deploy via the `.pools.stack_size` comptime lever (threaded through
+/// `Scheduler.init`), which RAISES the stack for unusually deep handlers — the default
+/// already minimizes the footprint.
 pub const default_job_stack_size: usize = 1 << 20; // 1 MiB
 
 /// Hard floor the `.pools.stack_size` lever is clamped up to. The OS's effective minimum
@@ -247,7 +247,6 @@ pub const Scheduler = struct {
 
     pub fn start(self: *Scheduler) !void {
         self.app.scheduler = self;
-        self.app.submit_fn = &submitThunk;
         self.workers = try self.allocator.alloc(Thread, self.pool_size);
         var spawned: usize = 0;
         errdefer {
@@ -267,7 +266,6 @@ pub const Scheduler = struct {
         self.sched_thread = null;
         for (self.workers) |t| t.join();
         self.app.scheduler = null;
-        self.app.submit_fn = null;
     }
 
     fn schedulerLoop(self: *Scheduler) void {
@@ -321,30 +319,6 @@ pub const Scheduler = struct {
                 self.unlock();
             }
         }
-    }
-
-    fn submitThunk(ctx: *anyopaque, name: []const u8, task: events.JobTask) anyerror!void {
-        const self: *Scheduler = @ptrCast(@alignCast(ctx));
-        const Holder = struct {
-            fn go(a: *App, n: []const u8, t: events.JobTask) void {
-                var ev = events.JobEvent{ .app = a, .name = n };
-                // The Ctx (and its per-invocation arena) is built INSIDE the detached
-                // thread so its lifetime is the task's, not the submitting thread's —
-                // and never shared across threads. The arena owns ctx.records()
-                // results; declared before cx so its deinit runs last (frees results
-                // after cx.deinit releases the pooled reader).
-                var arena = std.heap.ArenaAllocator.init(a.allocator);
-                defer arena.deinit();
-                var cx = Ctx{ .app = a, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
-                defer cx.deinit();
-                t(&cx, &ev) catch |e| {
-                    var err_ev = events.ErrorEvent{ .app = a, .ctx = null, .err = e, .phase = .job, .message = @errorName(e) };
-                    events.dispatchError(a, a.dispatch, &err_ev);
-                };
-            }
-        };
-        const th = try Thread.spawn(.{ .stack_size = self.stack_size }, Holder.go, .{ self.app, name, task });
-        th.detach();
     }
 };
 

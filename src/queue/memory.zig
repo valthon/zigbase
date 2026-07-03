@@ -4,13 +4,13 @@
 //! lives only in RAM, so a crash drops it. The ring is bounded: when it is full, enqueue
 //! returns error.QueueFull instead of blocking (a blocking policy could deadlock when a
 //! handler enqueues from a pool worker) or spawning unbounded threads. `Pool.submitThunk`
-//! is ready to carry `app.submit` tasks on this same pool, but is not yet wired onto
-//! `app.submit_fn` (Task 4 does that, together with fixing `App.submit`'s body — see the
-//! hazard note on `Pool.install`). A retrying job holds one worker for the whole backoff —
-//! size retry policies accordingly; use a `durable` queue when a job MUST survive a
-//! restart or for sustained high-volume work. Without an installed pool (unit tests / CLI
-//! helpers) enqueue runs the job INLINE, synchronously — deterministic for tests, and no
-//! code path spawns detached threads anymore.
+//! also carries `app.submit` tasks on this same pool — `install()` wires it onto
+//! `app.submit_fn`, and `App.submit` passes `self.memory_pool.?` (both landed together in
+//! Task 4 so they can never be observed out of sync). A retrying job holds one worker for
+//! the whole backoff — size retry policies accordingly; use a `durable` queue when a job
+//! MUST survive a restart or for sustained high-volume work. Without an installed pool
+//! (unit tests / CLI helpers) enqueue runs the job INLINE, synchronously — deterministic
+//! for tests, and no code path spawns detached threads anymore.
 
 const std = @import("std");
 const queue = @import("queue.zig");
@@ -122,28 +122,23 @@ pub const Pool = struct {
         return .{ .app = app };
     }
 
-    /// Route this app's memory-queue jobs through this pool. Call once, before serving;
-    /// pair with `stop()` at shutdown.
-    ///
-    /// HAZARD (Task 3/4 sequencing — resolved once Task 4 lands): this deliberately does
-    /// NOT set `app.submit_fn`. `App.submit` (app.zig) still does
-    /// `f(self.scheduler.?, name, task)` — it passes the *Scheduler* pointer, not a *Pool*
-    /// pointer. If `install()` armed `app.submit_fn = &submitThunk` here, any live
-    /// `app.submit(...)` call before Task 4 rewires `App.submit` to pass
-    /// `self.memory_pool.?` would hand `submitThunk` a `*Scheduler` mis-cast as `*Pool` —
-    /// silent memory corruption, not a compile error (both are `?*anyopaque`). Task 4 is
-    /// the ONLY commit that may set `app.submit_fn = &submitThunk` (from `install()` or
-    /// elsewhere) — it lands together with the `App.submit` body fix in the same task, so
-    /// the two can never be observed out of sync. Do not backport that wiring here.
+    /// Route this app's memory-queue jobs AND `app.submit` tasks through this pool. Call
+    /// once, before serving; pair with `stop()` at shutdown. Sets both `app.memory_pool`
+    /// (what `App.submit` dereferences as `self.memory_pool.?`) and `app.submit_fn`
+    /// (`&submitThunk`) together, atomically from the caller's perspective — there is no
+    /// window where one is set without the other, so `App.submit` never hands `submitThunk`
+    /// a stale or mismatched pointer.
     pub fn install(self: *Pool, app: *App) void {
         app.memory_pool = self;
+        app.submit_fn = &submitThunk;
     }
 
     /// Reject new pushes, let the workers DRAIN the remaining ring, join them, and
     /// uninstall from the app. Idempotent; safe when no worker was ever spawned. After this
-    /// returns, `app.memory_pool` is null again, so any subsequent `enqueue(app, ...)` call
-    /// falls back to running the job INLINE, synchronously (the same path unit tests/CLI use
-    /// when no pool was ever installed) rather than being silently dropped.
+    /// returns, `app.memory_pool` and `app.submit_fn` are null again, so any subsequent
+    /// `enqueue(app, ...)` call falls back to running the job INLINE, synchronously (the
+    /// same path unit tests/CLI use when no pool was ever installed) rather than being
+    /// silently dropped, and `app.submit(...)` returns `error.SchedulerUnavailable`.
     pub fn stop(self: *Pool) void {
         self.shutdown.store(true, .release);
         self.lockPool();
@@ -153,6 +148,7 @@ pub const Pool = struct {
         for (self.workers[0..n]) |t| t.join();
         if (self.app.memory_pool == @as(?*anyopaque, @ptrCast(self))) {
             self.app.memory_pool = null;
+            self.app.submit_fn = null;
         }
         // Final safety drain — NOT for a failed spawn (a spawn that returns 0 workers never
         // reaches `started = true`, so nothing is pushed against it). The real race this
@@ -225,11 +221,9 @@ pub const Pool = struct {
         }
     }
 
-    /// `app.submit` entry point — signature matches `app.submit_fn`, but `install()`
-    /// deliberately does NOT wire it onto `app.submit_fn` yet (see the hazard note on
-    /// `install()`); Task 4 does that wiring together with the `App.submit` body fix.
-    /// Copies `name` (the caller's slice may be request-arena-backed and dead before the
-    /// task runs — the old detached-thread code captured it unsafely).
+    /// `app.submit` entry point — matches `app.submit_fn`'s signature; `install()` wires it
+    /// on. Copies `name` (the caller's slice may be request-arena-backed and dead before
+    /// the task runs — the old detached-thread code captured it unsafely).
     pub fn submitThunk(ptr: *anyopaque, name: []const u8, task: events.JobTask) anyerror!void {
         const self: *Pool = @ptrCast(@alignCast(ptr));
         const t = try self.app.allocator.create(Task);
