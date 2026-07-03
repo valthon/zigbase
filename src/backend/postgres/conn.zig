@@ -122,8 +122,17 @@ pub const Conn = struct {
         const self = gpa.create(Conn) catch return ConnError.OutOfMemory;
         errdefer gpa.destroy(self);
 
-        const addr = net.IpAddress.resolve(io, cfg.host, cfg.port) catch return ConnError.ConnectFailed;
-        const stream = addr.connect(io, .{ .mode = .stream }) catch return ConnError.ConnectFailed;
+        // Resolve `cfg.host` to a socket. `IpAddress.resolve` ONLY parses IP literals
+        // (incl. scoped IPv6) — it returns `ParseFailed` on any real DNS name — so an IP
+        // literal ("127.0.0.1", "::1") connects directly, while anything else ("localhost",
+        // "db.internal") is a hostname that must go through the OS resolver (/etc/hosts +
+        // resolv.conf) via `HostName.connect`, which tries every resolved A/AAAA address.
+        const stream = if (net.IpAddress.resolve(io, cfg.host, cfg.port)) |addr|
+            addr.connect(io, .{ .mode = .stream }) catch return ConnError.ConnectFailed
+        else |_| blk: {
+            const host_name = net.HostName.init(cfg.host) catch return ConnError.ConnectFailed;
+            break :blk host_name.connect(io, cfg.port, .{ .mode = .stream }) catch return ConnError.ConnectFailed;
+        };
 
         self.* = .{
             .gpa = gpa,
@@ -270,21 +279,21 @@ pub const Conn = struct {
         const ca_src: []const u8 = cfg.sslrootcert orelse "the system root store";
         switch (e) {
             error.CertificateHostMismatch => {
-                std.log.err(
+                logMisconfig(
                     "postgres TLS: the server certificate does not match host '{s}' (sslmode=verify-full). Connect by the name in the certificate, or use sslmode=verify-ca if you cannot.",
                     .{cfg.host},
                 );
                 return ConnError.CertHostnameMismatch;
             },
             error.CertificateExpired => {
-                std.log.err(
+                logMisconfig(
                     "postgres TLS: the server certificate for {s}:{d} is EXPIRED. Renew the server certificate (and check this host's system clock).",
                     .{ cfg.host, cfg.port },
                 );
                 return ConnError.CertExpired;
             },
             error.CertificateNotYetValid => {
-                std.log.err(
+                logMisconfig(
                     "postgres TLS: the server certificate for {s}:{d} is not yet valid. Check the server certificate and this host's system clock.",
                     .{ cfg.host, cfg.port },
                 );
@@ -294,14 +303,14 @@ pub const Conn = struct {
             error.CertificateIssuerMismatch,
             error.CertificateSignatureInvalid,
             => {
-                std.log.err(
+                logMisconfig(
                     "postgres TLS: the certificate chain for {s}:{d} could not be verified against {s} (sslmode={s}). For a private CA, pass sslrootcert=<pem-path> in ZIGBASE_DB_URL.",
                     .{ cfg.host, cfg.port, ca_src, cfg.sslmode.label() },
                 );
                 return ConnError.CertUntrusted;
             },
             else => {
-                std.log.err("postgres TLS: handshake with {s}:{d} failed ({s}).", .{ cfg.host, cfg.port, @errorName(e) });
+                logMisconfig("postgres TLS: handshake with {s}:{d} failed ({s}).", .{ cfg.host, cfg.port, @errorName(e) });
                 return ConnError.TlsHandshakeFailed;
             },
         }
