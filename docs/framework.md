@@ -2250,7 +2250,7 @@ zigbase.App(.{
         .projects = .{
             .fields = .{
                 .{ .name = "title",   .type = .text },
-                .{ .name = "account", .type = .text },   // holds the owning account id
+                .{ .name = "account", .type = .relation, .target = "accounts" }, // owning account
             },
             .tenant_field = "account",                   // <- makes `projects` tenant-owned
             .rules = .{ .list = "@public", .view = "@public" },
@@ -2258,6 +2258,10 @@ zigbase.App(.{
     },
 });
 ```
+
+`.tenant_field` accepts any TEXT-storage field — a plain `.text` column works too — but a
+`.relation` is recommended: it's the form `.abilities`' `.via` requires (below), so the same
+`account` column can back both tenancy scoping and relationship-based abilities.
 
 **Data model.** Migration `0014_tenancy` creates three system collections (visible in
 `_collections`, `system = 1`):

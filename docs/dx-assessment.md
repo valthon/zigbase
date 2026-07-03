@@ -1,5 +1,12 @@
 # ZigBase framework DX assessment
 
+> **Point-in-time audit — 2026-06-13 (updated 2026-06-27).** This document records the
+> state of the framework surface, its papercuts, and the fixes landed in response *at
+> that time*. Version strings, line numbers, and "tracked for post-v0.1" style notes
+> below reflect that snapshot, not the current release — treat this as a historical
+> record of a completed audit, not living guidance. See `KNOWN_LIMITATIONS.md` and
+> `CHANGELOG.md` for current status.
+
 An evidence-based audit of the developer experience of **extending ZigBase as an
 embeddable Zig framework** — `zig fetch --save`, `@import("zigbase")`, and
 configuring `zigbase.App(.{...})`. Every claim is cited to `file:line`. This is an
