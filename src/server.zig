@@ -805,6 +805,20 @@ test "guard chain: path_secret AND rate_limit composed on one route" {
     try std.testing.expectEqual(@as(u16, 429), (try dispatchIp(a, &app, "/api/both/open", "5.5.5.5")).status);
 }
 
+/// §B transport: transmit `[offset, offset+len)` of `path` through facil.io's PUBLIC
+/// `http_sendfile(h, fd, length, offset)` extern (zap src/fio.zig:426) — the same fd
+/// primitive `http_sendfile2` itself finishes through, so ZigBase reimplements no
+/// socket/streaming code. facil.io takes ownership of the fd (closes it on every path,
+/// http.c:367-377) and adds Content-Length / Content-Type / Date ONLY-IF-MISSING, so
+/// every header the handler set goes on the wire exactly once (the §B.1 double-header
+/// analysis). The zap handle is consumed on success — mark the request finished so
+/// zap's implicit-response machinery stays quiet.
+fn sendFileRange(r: zap.Request, io: std.Io, path: []const u8, offset: u64, len: u64) !void {
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    if (zap.fio.http_sendfile(r.h, f.handle, len, offset) != 0) return error.SendFile;
+    r.markAsFinished(true);
+}
+
 /// Last-resort raw error envelope, used only when even building the normal ApiError
 /// response fails (allocation failure). Sends a fixed JSON body bypassing the arena.
 fn sendRawEnvelope(r: zap.Request, status: u16, body: []const u8) void {
@@ -908,10 +922,23 @@ fn onRequest(r: zap.Request) !void {
         }) catch {};
     }
     for (resp.extra_headers) |h| r.setHeader(h.name, h.value) catch {};
-    if (resp.file_path) |path| {
-        r.sendFile(path) catch {
-            sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
-        };
+    if (resp.file) |f| {
+        if (f.len) |len| {
+            // ZigBase-owned plan (record files, §B): status + headers were set above;
+            // Content-Type comes from the handler's Response (facil.io's
+            // add_content_type is set-if-missing, so this value wins, exactly once).
+            r.setHeader("content-type", resp.content_type) catch {};
+            sendFileRange(r, self.app.io, f.path, f.offset, len) catch {
+                // Open failure => the existing 404 raw envelope (unchanged semantics).
+                sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
+            };
+        } else {
+            // Wholesale facil.io delegation (dir-mode static): mime, ETag, 304,
+            // `.gz` sidecar, Range are ALL facil.io's (§A.3) — byte-identical to today.
+            r.sendFile(f.path) catch {
+                sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
+            };
+        }
         return;
     }
     r.setHeader("content-type", resp.content_type) catch {};

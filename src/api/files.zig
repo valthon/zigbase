@@ -147,7 +147,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         .{ .name = "Cache-Control", .value = cache },
         .{ .name = "Content-Disposition", .value = disposition },
     });
-    return .{ .status = 200, .body = "", .file_path = path, .extra_headers = headers };
+    return .{ .status = 200, .body = "", .file = .{ .path = path }, .extra_headers = headers };
 }
 
 test "PIN: file-download view-authz + cache route through policy byte-identically" {
