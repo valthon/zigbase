@@ -1,6 +1,40 @@
 const std = @import("std");
 const request = @import("../request.zig");
 
+/// Max concurrent subscriptions per connection (bounds per-conn facil.io subscription state).
+/// Shared by BOTH realtime transports via hub.subscribeCheck.
+pub const MAX_SUBS: usize = 256;
+
+/// F9: global cap on concurrent realtime connections — ONE counter covering WebSocket AND SSE
+/// (issue #188: mirror WS knobs — it is the same knob). Deliberately a module-level constant in
+/// the realtime layer (NOT config.zig) so an operator can't accidentally disable it and a
+/// parallel config workstream doesn't conflict. New upgrades past this cap are rejected with 503.
+pub const MAX_CONNECTIONS: usize = 10_000;
+
+/// Live realtime connection count (WS + SSE). Bumped on a successful upgrade, decremented on
+/// close. Different sockets run on different threads, so this is an atomic.
+var live_connections: std.atomic.Value(usize) = .init(0);
+
+/// Current live realtime connection count (test/introspection helper).
+pub fn connectionCount() usize {
+    return live_connections.load(.monotonic);
+}
+
+/// Atomically reserve a global connection slot (F9). Returns false (and leaves the count
+/// unchanged) when the cap is already reached, so the caller must reject the upgrade. Pair a
+/// successful reservation with exactly one `releaseConnectionSlot`.
+pub fn reserveConnectionSlot() bool {
+    if (live_connections.fetchAdd(1, .monotonic) >= MAX_CONNECTIONS) {
+        _ = live_connections.fetchSub(1, .monotonic);
+        return false;
+    }
+    return true;
+}
+
+pub fn releaseConnectionSlot() void {
+    _ = live_connections.fetchSub(1, .monotonic);
+}
+
 /// A verified connection identity. `exp` is the token's unix expiry; past it the connection is
 /// treated as anonymous until a fresh `auth` message.
 pub const AuthIdentity = struct {
@@ -107,4 +141,21 @@ test "requestContext: anonymous, authed, expired" {
     try std.testing.expect(conn.requestContext(2001).auth == null);
     conn.setAuth(.{ .record = .{ .object = rec }, .is_superuser = true, .exp = 2000 });
     try std.testing.expect(conn.requestContext(1500).is_superuser);
+}
+
+test "F9: global connection cap reserves/releases and rejects past MAX_CONNECTIONS" {
+    // Drive the count up to the cap, confirm the next reservation is rejected, then release.
+    const start = connectionCount();
+    try std.testing.expectEqual(@as(usize, 0), start); // tests run single-threaded; clean slate
+    // Pre-load to one below the cap without spinning MAX_CONNECTIONS times.
+    live_connections.store(MAX_CONNECTIONS - 1, .monotonic);
+    try std.testing.expect(reserveConnectionSlot()); // fills the last slot
+    try std.testing.expectEqual(MAX_CONNECTIONS, connectionCount());
+    try std.testing.expect(!reserveConnectionSlot()); // at cap -> rejected, count unchanged
+    try std.testing.expectEqual(MAX_CONNECTIONS, connectionCount());
+    releaseConnectionSlot();
+    try std.testing.expectEqual(MAX_CONNECTIONS - 1, connectionCount());
+    try std.testing.expect(reserveConnectionSlot()); // a freed slot is reusable
+    // Clean up the counter so a later test sees a clean slate.
+    live_connections.store(0, .monotonic);
 }
