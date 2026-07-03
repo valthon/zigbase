@@ -59,6 +59,9 @@ pub const protocol = @import("protocol.zig");
 test {
     _ = @import("scram.zig");
     _ = @import("saslprep.zig");
+    // SP3-A item 2: live SASLprep/SCRAM coverage (NFC pass-through + needs-NFKC hard
+    // error). Skips without PG.
+    _ = @import("scram_pg_test.zig");
     _ = @import("protocol.zig");
     _ = @import("connstr.zig");
     _ = @import("tls_trust.zig");

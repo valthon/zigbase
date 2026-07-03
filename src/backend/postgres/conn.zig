@@ -35,6 +35,9 @@ pub const ConnError = error{
     CertHostnameMismatch,
     CertExpired,
     CertNotYetValid,
+    /// SCRAM: the password requires NFKC normalization the driver does not perform
+    /// (RFC 4013). The log at the failure site names the fix.
+    PasswordNeedsNormalization,
 };
 
 /// Reject an identifier that cannot be safely interpolated into a double-quoted SQL
@@ -392,7 +395,16 @@ pub const Conn = struct {
         if ((c1.int32() orelse return ConnError.Protocol) != proto.Auth.sasl_continue) return ConnError.Protocol;
         const server_first = c1.rest();
 
-        const client_final = client.clientFinal(cfg.password, server_first) catch return ConnError.AuthFailed;
+        const client_final = client.clientFinal(cfg.password, server_first) catch |e| switch (e) {
+            error.PasswordNeedsNormalization => {
+                std.log.err(
+                    "postgres auth: the password contains Unicode that requires NFKC normalization (RFC 4013 SASLprep), which this driver does not perform. Supply the password pre-normalized to NFKC, or change it to an ASCII password.",
+                    .{},
+                );
+                return ConnError.PasswordNeedsNormalization;
+            },
+            else => return ConnError.AuthFailed,
+        };
         defer self.gpa.free(client_final);
         {
             var mb = proto.MsgBuilder.init(self.gpa, &self.scratch);

@@ -8,15 +8,20 @@
 //!   3. `clientFinal`     → `c=biws,r=<combined-nonce>,p=<b64 ClientProof>`
 //!   4. server-final      ← `v=<b64 ServerSignature>`  (verified by `verifyServerFinal`)
 //!
-//! Limitation: passwords are used verbatim (no SASLprep/RFC 4013). ASCII passwords —
-//! the overwhelmingly common case — are unaffected; a password containing non-ASCII
-//! that requires normalization may fail to authenticate. Documented, not yet handled.
+//! Passwords are SASLprep-prepared (RFC 4013) before PBKDF2 — see `saslprep.zig` for the
+//! exact contract: printable-ASCII passwords are untouched (zero-alloc identity), mapping
+//! (soft hyphen removal, non-ASCII space -> space) is applied, prohibited/bidi-invalid and
+//! non-UTF-8 passwords use PostgreSQL's own use-verbatim parity, and a password that would
+//! require real NFKC normalization fails loudly with `ScramError.PasswordNeedsNormalization`
+//! (surfaced at connect with a message naming the fix) instead of a mysterious
+//! `password authentication failed`.
 
 const std = @import("std");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const pbkdf2 = std.crypto.pwhash.pbkdf2;
 const b64 = std.base64.standard;
+const saslprep = @import("saslprep.zig");
 
 pub const ScramError = error{
     MalformedServerFirst,
@@ -29,6 +34,9 @@ pub const ScramError = error{
     AuthenticationRejected,
     /// Server requested an unreasonable PBKDF2 iteration count (auth-time CPU DoS guard).
     IterationCountTooHigh,
+    /// The password requires NFKC normalization (RFC 4013 SASLprep), which this driver
+    /// does not perform. Supply it pre-normalized to NFKC, or use an ASCII password.
+    PasswordNeedsNormalization,
 };
 
 /// Upper bound on the server-supplied PBKDF2 iteration count. PostgreSQL defaults to 4096;
@@ -93,8 +101,15 @@ pub const Client = struct {
         b64.Decoder.decode(salt_buf[0..salt_len], salt_b64) catch return ScramError.InvalidBase64;
         const salt = salt_buf[0..salt_len];
 
-        // SaltedPassword = PBKDF2-HMAC-SHA256(password, salt, i, 32)
-        pbkdf2(&self.salted_password, password, salt, iterations, HmacSha256) catch
+        // RFC 4013 SASLprep (see module header). ASCII passwords alias straight through.
+        const prepped = saslprep.prepare(self.allocator, password) catch |e| switch (e) {
+            error.PasswordNeedsNormalization => return ScramError.PasswordNeedsNormalization,
+            error.OutOfMemory => return ScramError.OutOfMemory,
+        };
+        defer prepped.deinit(self.allocator);
+
+        // SaltedPassword = PBKDF2-HMAC-SHA256(SASLprep(password), salt, i, 32)
+        pbkdf2(&self.salted_password, prepped.bytes, salt, iterations, HmacSha256) catch
             return ScramError.MalformedServerFirst;
 
         // ClientKey = HMAC(SaltedPassword, "Client Key"); StoredKey = SHA256(ClientKey)
@@ -238,4 +253,55 @@ test "scram rejects an absurd iteration count before running pbkdf2" {
     const server_first = try std.fmt.allocPrint(a, "r={s}zz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i={d}", .{ client.client_nonce, max_iterations + 1 });
     defer a.free(server_first);
     try std.testing.expectError(ScramError.IterationCountTooHigh, client.clientFinal("pencil", server_first));
+}
+
+test "scram: SASLprep feeds PBKDF2 — a soft-hyphen password authenticates as its prepped form" {
+    // Client uses "I\u{00AD}X"; the server stub derives its verifier from "IX" (what a
+    // SASLprep-conformant PostgreSQL stores). The exchange only verifies if clientFinal
+    // ran the password through prepare() before PBKDF2.
+    const a = std.testing.allocator;
+    var seed: [24]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast(i +% 11);
+    var client = try Client.init(a, seed);
+    defer client.deinit();
+
+    const salt = "W22ZaJ0SNY7soEsUEjb6gQ==";
+    var salt_raw: [64]u8 = undefined;
+    const salt_len = try b64.Decoder.calcSizeForSlice(salt);
+    try b64.Decoder.decode(salt_raw[0..salt_len], salt);
+    const server_first = try std.fmt.allocPrint(a, "r={s}servernonce,s={s},i=4096", .{ client.client_nonce, salt });
+    defer a.free(server_first);
+
+    const cfinal = try client.clientFinal("I\u{00AD}X", server_first);
+    defer a.free(cfinal);
+
+    // Server side: SaltedPassword from the PREPPED password "IX".
+    var server_sig: [32]u8 = undefined;
+    {
+        var salted: [32]u8 = undefined;
+        try pbkdf2(&salted, "IX", salt_raw[0..salt_len], 4096, HmacSha256);
+        var server_key: [32]u8 = undefined;
+        HmacSha256.create(&server_key, "Server Key", &salted);
+        const cfnp = try std.fmt.allocPrint(a, "c=biws,r={s}servernonce", .{client.client_nonce});
+        defer a.free(cfnp);
+        const auth_message = try std.fmt.allocPrint(a, "{s},{s},{s}", .{ client.client_first_bare, server_first, cfnp });
+        defer a.free(auth_message);
+        HmacSha256.create(&server_sig, auth_message, &server_key);
+    }
+    var sig_b64: [b64.Encoder.calcSize(32)]u8 = undefined;
+    _ = b64.Encoder.encode(&sig_b64, &server_sig);
+    const server_final = try std.fmt.allocPrint(a, "v={s}", .{&sig_b64});
+    defer a.free(server_final);
+    try client.verifyServerFinal(server_final);
+}
+
+test "scram: a needs-NFKC password fails clientFinal loudly" {
+    const a = std.testing.allocator;
+    var seed: [24]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast(i +% 13);
+    var client = try Client.init(a, seed);
+    defer client.deinit();
+    const server_first = try std.fmt.allocPrint(a, "r={s}zz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", .{client.client_nonce});
+    defer a.free(server_first);
+    try std.testing.expectError(ScramError.PasswordNeedsNormalization, client.clientFinal("\u{2168}", server_first));
 }
