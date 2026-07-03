@@ -22,6 +22,7 @@
 //! target reprovisions the Postgres full-text index idempotently at startup.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const db = @import("db.zig");
 const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
@@ -102,6 +103,7 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     // restore it explicitly before commit). Best-effort: needs a superuser target, otherwise we
     // fall back to topological table order.
     const fk_suspended = suspendForeignKeys(target);
+    if (!fk_suspended) try deferForeignKeys(target);
 
     // The returned report outlives this function's arena, so allocate it with the caller's `gpa`.
     // On the error path (e.g. a rejected row → rollback) free the table names duped so far too.
@@ -112,6 +114,19 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     }
     var total: usize = 0;
     const order = try tableLoadOrder(a, target_tables, src_cols, fk_suspended);
+
+    // Clear every target table we will (re)load BEFORE inserting any rows. Doing all clears up
+    // front keeps a --force re-run idempotent while avoiding a subtle interaction on the
+    // deferred-FK (non-superuser) path: once a row with a deferred FK check has been inserted,
+    // Postgres refuses to TRUNCATE any table with pending trigger events — so an interleaved
+    // clear-then-insert-per-table fails when a later table's `TRUNCATE … CASCADE` reaches a table
+    // already loaded this transaction. (The superuser path disables FK triggers, so it never has
+    // pending events, but clearing up front is correct — and cheaper — for both.)
+    for (order) |tname| {
+        if (std.mem.eql(u8, tname, "_migrations")) continue;
+        try clearTarget(a, source, target, tname);
+    }
+
     for (order) |tname| {
         // Never copy the `_migrations` ledger: the target already applied its OWN migrations during
         // provisioning. Overwriting it with the source's ledger would desync the recorded version
@@ -132,7 +147,10 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     try resetRollupWatermarks(target);
 
     if (fk_suspended) restoreForeignKeys(target);
-    try target.commit();
+    target.commit() catch |e| {
+        if (!fk_suspended) logDeferredFkCommitFailure(a, src_cols);
+        return e;
+    };
 
     return .{
         .tables = try reports.toOwnedSlice(gpa),
@@ -152,9 +170,13 @@ fn resetRollupWatermarks(target: *db.Db) Error!void {
 // Target provisioning
 // ===========================================================================
 
-/// Create, on `target`, the physical record table for every source collection whose table does
-/// not yet exist (system collections' tables are created by the migrations). Tables are created
-/// in relation-dependency order so a FK's referenced table exists first. Returns the count created.
+/// Create, on `target`, the physical record table for every source collection whose table
+/// does not yet exist (system collections' tables come from the migrations), in
+/// dependency order. On a POSTGRES target, relation-cycle FK edges are OMITTED from
+/// CREATE TABLE (cyclic inline REFERENCES cannot be created in any order there) and added
+/// back afterwards as `DEFERRABLE INITIALLY IMMEDIATE` constraints — identical to a plain
+/// FK outside explicit SET CONSTRAINTS, deferrable by the load transaction. SQLite permits
+/// forward/cyclic inline FK DDL natively, so its DDL is unchanged. Returns the count created.
 fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const schema.Collection) Error!usize {
     const d = db.dbDialect(target);
     // id -> table name, so a relation field's stored targetCollectionId (an id) resolves to the
@@ -162,16 +184,21 @@ fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const
     var id_to_name = std.StringHashMap([]const u8).init(a);
     for (src_cols) |c| try id_to_name.put(c.id, c.name);
 
-    const order = try collectionCreateOrder(a, src_cols);
+    const plan = try planCreateOrder(a, src_cols);
+    const defer_cycle_fks = db.dbBackend(target) == .postgres;
+    const created_flags = try a.alloc(bool, src_cols.len);
+    @memset(created_flags, false);
+
     var created: usize = 0;
-    for (order) |idx| {
+    for (plan.order) |idx| {
         const col = src_cols[idx];
         if (try tableExists(a, target, col.name)) continue; // system tables already exist
         // For auth collections, materialize the injected system columns (passwordHash/tokenKey/…)
         // exactly as `collections.create` does, so the physical table matches.
         const full = try schema.injectAuthFields(a, col);
         const ddl_col = try resolveRelationTargets(a, full, id_to_name);
-        try target.exec(try a.dupeZ(u8, try ddl.createTableSql(a, ddl_col, null, d)));
+        const skip: []const []const u8 = if (defer_cycle_fks) try cycleFieldNames(a, plan.cycle_edges, src_cols, idx) else &.{};
+        try target.exec(try a.dupeZ(u8, try ddl.createTableSql(a, ddl_col, null, d, skip)));
         for (col.indexes) |ix| target.exec(try a.dupeZ(u8, try ddl.createIndexSql(a, col.name, ix, d))) catch |e| {
             std.log.warn("migrate-db: index '{s}' on '{s}' skipped ({s})", .{ ix.name, col.name, @errorName(e) });
         };
@@ -179,9 +206,39 @@ fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const
             for (col.options.auth.identityFields) |idf|
                 try target.exec(try a.dupeZ(u8, try ddl.authIdentityIndexSql(a, col.name, idf)));
         }
+        created_flags[idx] = true;
         created += 1;
     }
+
+    // Add the omitted cycle-edge FKs back, deferrable, now that every table exists.
+    // Only for tables created THIS run — a pre-existing table keeps its constraints.
+    if (defer_cycle_fks) {
+        for (plan.cycle_edges) |e| {
+            if (!created_flags[e.col_idx]) continue;
+            const col = src_cols[e.col_idx];
+            const f = col.fields[e.field_idx];
+            const r = f.options.relation;
+            const tgt = id_to_name.get(r.targetCollectionId) orelse r.targetCollectionId;
+            const sql = try ddl.addDeferrableFkSql(a, col.name, f.name, tgt, r.cascadeDelete);
+            target.exec(try a.dupeZ(u8, sql)) catch |err| {
+                std.log.err(
+                    "migrate-db: could not add deferrable FK \"fk_{s}_{s}\" on \"{s}\"(\"{s}\") -> \"{s}\"(\"id\"): {s}. Fix the target schema (or use a superuser target role) and re-run.",
+                    .{ col.name, f.name, col.name, f.name, tgt, @errorName(err) },
+                );
+                return err;
+            };
+        }
+    }
     return created;
+}
+
+/// Field names of `col_idx`'s cycle edges — the FK clauses `createTableSql` must omit.
+fn cycleFieldNames(a: std.mem.Allocator, edges: []const CycleEdge, cols: []const schema.Collection, col_idx: usize) Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (edges) |e| {
+        if (e.col_idx == col_idx) try out.append(a, cols[col_idx].fields[e.field_idx].name);
+    }
+    return out.toOwnedSlice(a);
 }
 
 /// A copy of `col` with each single-relation field's `targetCollectionId` rewritten from the
@@ -205,10 +262,24 @@ fn resolveRelationTargets(a: std.mem.Allocator, col: schema.Collection, id_to_na
     return out;
 }
 
-/// Order collection indices so a relation target is created before the collection referencing it.
-/// Falls back to declaration order on a cycle (the FK create then fails loudly — acceptable, a
-/// circular hard-FK schema is not representable as inline FKs on either backend).
-fn collectionCreateOrder(a: std.mem.Allocator, cols: []const schema.Collection) Error![]usize {
+pub const CycleEdge = struct { col_idx: usize, field_idx: usize };
+
+pub const CreatePlan = struct {
+    /// Collection indices in creation order. Every collection appears exactly once;
+    /// cycle members are appended in declaration order after the acyclic prefix.
+    order: []usize,
+    /// Single-relation fields that participate in a dependency cycle — every relation
+    /// edge between two Kahn leftovers (conservative) plus EVERY self-relation (its DDL
+    /// is legal inline, but its rows still need COMMIT-time deferral):
+    /// `cols[e.col_idx].fields[e.field_idx]`. Empty for an acyclic graph.
+    cycle_edges: []CycleEdge,
+};
+
+/// Kahn-style creation plan over the collection relation graph. Pure (arena-allocating,
+/// no I/O) so cycle handling is unit-testable. The nodes Kahn cannot place form the
+/// cyclic core; on Postgres their in-cycle FK edges are provisioned as deferrable
+/// `ALTER TABLE ADD CONSTRAINT`s instead of inline REFERENCES (see provisionRecordTables).
+fn planCreateOrder(a: std.mem.Allocator, cols: []const schema.Collection) Error!CreatePlan {
     const n = cols.len;
     const placed = try a.alloc(bool, n);
     @memset(placed, false);
@@ -225,9 +296,51 @@ fn collectionCreateOrder(a: std.mem.Allocator, cols: []const schema.Collection) 
             }
         }
     }
-    // Append any cycle remainder in declaration order.
-    for (0..n) |i| if (!placed[i]) try order.append(a, i);
-    return order.toOwnedSlice(a);
+
+    // Cycle edges: FK-bearing (single) relations where BOTH endpoints are Kahn leftovers,
+    // plus every self-relation regardless of placement.
+    var cycle_edges: std.ArrayList(CycleEdge) = .empty;
+    for (cols, 0..) |c, i| {
+        for (c.fields, 0..) |f, fi| switch (f.options) {
+            .relation => |r| {
+                if (r.maxSelect != 1) continue; // multi-relations carry no FK
+                const j = findCollection(cols, r.targetCollectionId) orelse continue;
+                if (i == j) {
+                    try cycle_edges.append(a, .{ .col_idx = i, .field_idx = fi });
+                } else if (!placed[i] and !placed[j]) {
+                    try cycle_edges.append(a, .{ .col_idx = i, .field_idx = fi });
+                }
+            },
+            else => {},
+        };
+    }
+
+    // Append the cyclic core in declaration order (its tables are still created — only
+    // the in-cycle FK clauses are handled specially) and log the members once.
+    var had_cycle = false;
+    for (0..n) |i| {
+        if (!placed[i]) {
+            if (!had_cycle) {
+                had_cycle = true;
+                std.log.info("migrate-db: relation cycle detected; deferring its FK edges to COMMIT. Members:", .{});
+            }
+            std.log.info("migrate-db:   cycle member '{s}'", .{cols[i].name});
+            try order.append(a, i);
+        }
+    }
+    return .{
+        .order = try order.toOwnedSlice(a),
+        .cycle_edges = try cycle_edges.toOwnedSlice(a),
+    };
+}
+
+/// Index of the collection whose id OR name equals `target` (relation targets are stored
+/// either way), or null for out-of-set targets (e.g. system `_superusers`).
+fn findCollection(cols: []const schema.Collection, target: []const u8) ?usize {
+    for (cols, 0..) |c, j| {
+        if (std.mem.eql(u8, c.id, target) or std.mem.eql(u8, c.name, target)) return j;
+    }
+    return null;
 }
 
 /// True if every user-collection relation target of `c` is already placed. Targets that are not
@@ -252,11 +365,43 @@ fn depsPlaced(cols: []const schema.Collection, c: schema.Collection, placed: []c
 // Bulk copy
 // ===========================================================================
 
+/// Clear `table` on the target iff `copyTable` would (re)load it — the source has the table and it
+/// shares at least one column. Called for every table BEFORE any inserts (see the copy loop in
+/// `run`) so a --force re-run is idempotent without an interleaved TRUNCATE tripping the deferred-FK
+/// path's pending-trigger-events restriction. Postgres uses `TRUNCATE … RESTART IDENTITY CASCADE`:
+/// RESTART IDENTITY resets owned sequences so a re-migration regenerates `_events._seq` (and any
+/// IDENTITY) densely from 1 — deterministic repeats, preserving the dense-`_seq`-from-1 invariant
+/// the rollup-watermark reset relies on; CASCADE clears a parent with seeded/old child rows (every
+/// table is reloaded anyway). SQLite has no TRUNCATE, so `DELETE FROM` (rowids restart when empty).
+fn clearTarget(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []const u8) Error!void {
+    var ta = std.heap.ArenaAllocator.init(a);
+    defer ta.deinit();
+    const al = ta.allocator();
+
+    if (!try tableExists(al, source, table)) return;
+    const tgt_cols = try listColumns(al, target, table, false);
+    const src_cols = try listColumns(al, source, table, false);
+    var src_set = std.StringHashMap(void).init(al);
+    for (src_cols) |c| try src_set.put(c, {});
+    var any = false;
+    for (tgt_cols) |c| if (src_set.contains(c)) {
+        any = true;
+        break;
+    };
+    if (!any) return; // no shared columns → copyTable skips it, so leave it untouched
+
+    const clear_sql = switch (db.dbBackend(target)) {
+        .postgres => try std.fmt.allocPrintSentinel(al, "TRUNCATE TABLE {s} RESTART IDENTITY CASCADE;", .{try ddl.quoteIdent(al, table)}, 0),
+        .sqlite => try std.fmt.allocPrintSentinel(al, "DELETE FROM {s};", .{try ddl.quoteIdent(al, table)}, 0),
+    };
+    try target.exec(clear_sql);
+}
+
 /// Copy every row of `table` from `source` into `target`. The column set is the target's
 /// (non-identity) columns intersected with the source's columns, preserving target order. The
-/// target table is truncated first so re-runs (under `--force`) are idempotent. Each value is
-/// bound by its source storage type, so encrypted TEXT envelopes are carried verbatim. Returns the
-/// number of rows loaded.
+/// target table is cleared beforehand by `clearTarget` so re-runs (under `--force`) are idempotent.
+/// Each value is bound by its source storage type, so encrypted TEXT envelopes are carried verbatim.
+/// Returns the number of rows loaded.
 fn copyTable(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []const u8) Error!usize {
     var ta = std.heap.ArenaAllocator.init(a);
     defer ta.deinit();
@@ -282,17 +427,9 @@ fn copyTable(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []cons
     for (tgt_cols) |c| if (src_set.contains(c)) try cols.append(al, c);
     if (cols.items.len == 0) return 0;
 
-    // Clear the target table first so a re-run (under --force) is idempotent. Postgres uses
-    // TRUNCATE … RESTART IDENTITY CASCADE: RESTART IDENTITY resets owned sequences so a --force
-    // re-migration regenerates `_events._seq` (and any IDENTITY) densely from 1 — making repeat
-    // migrations deterministic and preserving the dense-`_seq`-from-1 invariant the rollup
-    // watermark reset relies on; CASCADE clears a parent with seeded/old child rows (every table is
-    // reloaded anyway). SQLite has no TRUNCATE, so DELETE FROM (rowids restart on an emptied table).
-    const clear_sql = switch (db.dbBackend(target)) {
-        .postgres => try std.fmt.allocPrintSentinel(al, "TRUNCATE TABLE {s} RESTART IDENTITY CASCADE;", .{try ddl.quoteIdent(al, table)}, 0),
-        .sqlite => try std.fmt.allocPrintSentinel(al, "DELETE FROM {s};", .{try ddl.quoteIdent(al, table)}, 0),
-    };
-    try target.exec(clear_sql);
+    // The target was cleared up front (see `clearTarget`, called before the copy loop) so a
+    // --force re-run is idempotent — we do NOT clear here, because on the deferred-FK path an
+    // interleaved TRUNCATE would hit a table with pending trigger events once rows are loaded.
 
     // Build the column list + a parameter list for the INSERT and the SELECT.
     var collist: std.ArrayList(u8) = .empty;
@@ -443,18 +580,68 @@ fn countRows(a: std.mem.Allocator, d: *db.Db, table: []const u8) Error!usize {
 /// Suspend FK enforcement on the target for the duration of the load (Postgres only, best effort).
 /// `SET session_replication_role = replica` disables FK triggers so rows load in any order and
 /// self-references never trip. Returns false if it could not be set (non-superuser target) — the
-/// caller then falls back to topological table ordering.
+/// caller then falls back to `deferForeignKeys`.
+///
+/// The attempt is wrapped in a SAVEPOINT: on Postgres, ANY failed statement poisons the rest of
+/// the enclosing transaction (every later statement errors "current transaction is aborted" until
+/// a ROLLBACK), so a plain failed `SET` here would silently break the load transaction for the
+/// non-superuser fallback path that follows it in `run`. Rolling back to the savepoint undoes just
+/// this one failed statement, leaving the load transaction otherwise usable.
 fn suspendForeignKeys(d: *db.Db) bool {
     if (db.dbBackend(d) != .postgres) return false;
+    d.exec("SAVEPOINT zb_fk_suspend;") catch return false;
     d.exec("SET session_replication_role = replica;") catch {
-        std.log.warn("migrate-db: could not suspend FK enforcement (target role is not superuser); loading in dependency order", .{});
+        d.exec("ROLLBACK TO SAVEPOINT zb_fk_suspend;") catch {};
+        std.log.warn("migrate-db: could not suspend FK enforcement (target role is not superuser); deferring constraints to COMMIT instead", .{});
         return false;
     };
+    d.exec("RELEASE SAVEPOINT zb_fk_suspend;") catch {};
     return true;
 }
 
 fn restoreForeignKeys(d: *db.Db) void {
     d.exec("SET session_replication_role = origin;") catch {};
+}
+
+/// The non-superuser path: instead of suspending FK enforcement, defer constraint
+/// checking to COMMIT inside the (already-open) load transaction. Postgres:
+/// `SET CONSTRAINTS ALL DEFERRED` — no privilege required, affects only DEFERRABLE
+/// constraints, i.e. exactly the cycle-edge FKs provisioned by provisionRecordTables.
+/// SQLite: `PRAGMA defer_foreign_keys=ON` — transaction-scoped, auto-resets at COMMIT
+/// (SQLite's inline FK DDL is already cycle-capable; only row order needs this).
+fn deferForeignKeys(d: *db.Db) Error!void {
+    switch (db.dbBackend(d)) {
+        .postgres => try d.exec("SET CONSTRAINTS ALL DEFERRED;"),
+        .sqlite => try d.exec("PRAGMA defer_foreign_keys=ON;"),
+    }
+}
+
+/// A COMMIT failure on the deferred-constraint path means a dangling reference in the
+/// source data — the ONLY hard error left in the non-superuser design. Name the cycle
+/// members so the operator can find it. (Errors are logged here, then the DbError
+/// propagates; the CLI wrapper prints its usual abort message.)
+fn logDeferredFkCommitFailure(a: std.mem.Allocator, src_cols: []const schema.Collection) void {
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(a);
+    if (planCreateOrder(a, src_cols)) |plan| {
+        for (plan.cycle_edges) |e| {
+            const n = src_cols[e.col_idx].name;
+            if (std.mem.indexOf(u8, names.items, n) != null) continue;
+            if (names.items.len > 0) names.appendSlice(a, ", ") catch break;
+            names.appendSlice(a, n) catch break;
+        }
+    } else |_| {}
+    // A dangling cyclic reference is a hard `.err` in production, but Zig's test runner counts
+    // every `std.log.err` as a test failure — and the deferred-FK rollback test deliberately
+    // exercises this path. Under the test runner emit the identical message at `.warn`; the
+    // returned `DbError` (the test's real assertion) is unchanged.
+    if (builtin.is_test) std.log.warn(
+        "migrate-db: foreign-key cycle across collections [{s}] could not be satisfied at commit — a row references a missing target. The target was rolled back; fix the dangling reference in the source (or use a superuser target role) and re-run.",
+        .{names.items},
+    ) else std.log.err(
+        "migrate-db: foreign-key cycle across collections [{s}] could not be satisfied at commit — a row references a missing target. The target was rolled back; fix the dangling reference in the source (or use a superuser target role) and re-run.",
+        .{names.items},
+    );
 }
 
 /// The order to load tables in. When FK enforcement is suspended, the target's natural (name)
@@ -464,7 +651,7 @@ fn restoreForeignKeys(d: *db.Db) void {
 fn tableLoadOrder(a: std.mem.Allocator, tables: []const []const u8, src_cols: []const schema.Collection, fk_suspended: bool) Error![]const []const u8 {
     if (fk_suspended) return tables;
     // Build a name->dependency(name) set from collections, then stable-topo the table list.
-    const order = try collectionCreateOrder(a, src_cols);
+    const order = (try planCreateOrder(a, src_cols)).order;
     var rank = std.StringHashMap(usize).init(a);
     for (order, 0..) |idx, r| try rank.put(src_cols[idx].name, r);
     const out = try a.dupe([]const u8, tables);
@@ -641,4 +828,139 @@ test "dumpload: per-table report counts equal the real target row counts (M1)" {
     defer n.finalize();
     try std.testing.expect(try n.step());
     try std.testing.expectEqual(@as(i64, 2), n.columnInt(0));
+}
+
+test "dumpload: self-referential relation rows load in any order (defer_foreign_keys)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var source = try db.Db.openMemory();
+    defer source.close();
+    try migrations.run(&source);
+    const col = schema.Collection{ .id = "_", .name = "nodes", .fields = &[_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "parent", .options = .{ .relation = .{ .targetCollectionId = "nodes", .maxSelect = 1 } } },
+    } };
+    _ = try collections.create(al, io, &source, col);
+    // r1 references the LATER row r2: with foreign_keys=ON and no deferral, copying in natural
+    // order would fail at the first INSERT — dumpload's defer_foreign_keys validates at COMMIT
+    // instead. The vendored SQLite is built with SQLITE_DEFAULT_FOREIGN_KEYS=1, so FK enforcement
+    // is ON by default even on a bare test handle — seeding r1 before r2 exists would fail here
+    // too without deferring, mirroring how such a row order can legitimately exist in a real
+    // database (e.g. itself loaded via a deferred-FK bulk import).
+    try source.exec("BEGIN;");
+    try source.exec("PRAGMA defer_foreign_keys=ON;");
+    try source.exec("INSERT INTO \"nodes\" (\"id\",\"created\",\"updated\",\"title\",\"parent\") VALUES ('r1','t','t','child','r2');");
+    try source.exec("INSERT INTO \"nodes\" (\"id\",\"created\",\"updated\",\"title\",\"parent\") VALUES ('r2','t','t','root',NULL);");
+    try source.exec("COMMIT;");
+
+    var target = try db.Db.openMemory();
+    defer target.close();
+    // FK enforcement is already ON by default (SQLITE_DEFAULT_FOREIGN_KEYS=1), matching the
+    // production pool writer (backend/sqlite/db.zig); set it explicitly anyway so the test does
+    // not silently pass if that compile default is ever dropped.
+    try target.exec("PRAGMA foreign_keys=ON;");
+
+    const report = try run(a, &source, &target, .{});
+    defer report.deinit(a);
+
+    var st = try target.prepare("SELECT \"parent\" FROM \"nodes\" WHERE \"id\"='r1';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("r2", st.columnText(0));
+}
+
+// --- planCreateOrder (pure cycle detection) ---------------------------------------
+
+fn relField(comptime id: []const u8, comptime name: []const u8, comptime target: []const u8) schema.Field {
+    return .{ .id = id, .name = name, .options = .{ .relation = .{ .targetCollectionId = target, .maxSelect = 1 } } };
+}
+
+test "dumpload: planCreateOrder — acyclic graph orders dependencies first, zero cycle edges" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const post_fields = [_]schema.Field{relField("f1", "author", "authors")};
+    const cols = [_]schema.Collection{
+        .{ .id = "c_posts", .name = "posts", .fields = &post_fields },
+        .{ .id = "c_auth", .name = "authors", .fields = &.{} },
+    };
+    const plan = try planCreateOrder(al, &cols);
+    try std.testing.expectEqual(@as(usize, 0), plan.cycle_edges.len);
+    try std.testing.expectEqual(@as(usize, 2), plan.order.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.order[0]); // authors first
+    try std.testing.expectEqual(@as(usize, 0), plan.order[1]); // then posts
+}
+
+test "dumpload: planCreateOrder — a self-relation is ALWAYS a cycle edge (but places normally)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const node_fields = [_]schema.Field{relField("f1", "parent", "nodes")};
+    const cols = [_]schema.Collection{
+        .{ .id = "c_nodes", .name = "nodes", .fields = &node_fields },
+    };
+    const plan = try planCreateOrder(al, &cols);
+    try std.testing.expectEqual(@as(usize, 1), plan.order.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.cycle_edges.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.cycle_edges[0].col_idx);
+    try std.testing.expectEqual(@as(usize, 0), plan.cycle_edges[0].field_idx);
+}
+
+test "dumpload: planCreateOrder — 2-cycle and 3-cycle mark every in-cycle edge" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    {
+        const af = [_]schema.Field{relField("f1", "buddy", "beta")};
+        const bf = [_]schema.Field{relField("f2", "buddy", "alpha")};
+        const cols = [_]schema.Collection{
+            .{ .id = "c_a", .name = "alpha", .fields = &af },
+            .{ .id = "c_b", .name = "beta", .fields = &bf },
+        };
+        const plan = try planCreateOrder(al, &cols);
+        try std.testing.expectEqual(@as(usize, 2), plan.order.len); // both still created
+        try std.testing.expectEqual(@as(usize, 2), plan.cycle_edges.len);
+    }
+    {
+        const xf = [_]schema.Field{relField("f1", "next", "y")};
+        const yf = [_]schema.Field{relField("f2", "next", "z")};
+        const zf = [_]schema.Field{relField("f3", "next", "x")};
+        const cols = [_]schema.Collection{
+            .{ .id = "c_x", .name = "x", .fields = &xf },
+            .{ .id = "c_y", .name = "y", .fields = &yf },
+            .{ .id = "c_z", .name = "z", .fields = &zf },
+        };
+        const plan = try planCreateOrder(al, &cols);
+        try std.testing.expectEqual(@as(usize, 3), plan.cycle_edges.len);
+    }
+}
+
+test "dumpload: planCreateOrder — a diamond feeding a cycle only defers the in-cycle edges" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    // base <- x, base <- y (acyclic diamond); a -> {x, b}, b -> {y, a} (a/b cycle).
+    const xf = [_]schema.Field{relField("f1", "root", "base")};
+    const yf = [_]schema.Field{relField("f2", "root", "base")};
+    const af = [_]schema.Field{ relField("f3", "via", "x"), relField("f4", "pair", "b") };
+    const bf = [_]schema.Field{ relField("f5", "via", "y"), relField("f6", "pair", "a") };
+    const cols = [_]schema.Collection{
+        .{ .id = "c_base", .name = "base", .fields = &.{} },
+        .{ .id = "c_x", .name = "x", .fields = &xf },
+        .{ .id = "c_y", .name = "y", .fields = &yf },
+        .{ .id = "c_a", .name = "a", .fields = &af },
+        .{ .id = "c_b", .name = "b", .fields = &bf },
+    };
+    const plan = try planCreateOrder(al, &cols);
+    try std.testing.expectEqual(@as(usize, 5), plan.order.len);
+    // ONLY a.pair and b.pair are cycle edges — a.via/b.via point at placed (acyclic) nodes.
+    try std.testing.expectEqual(@as(usize, 2), plan.cycle_edges.len);
+    for (plan.cycle_edges) |e| {
+        const f = cols[e.col_idx].fields[e.field_idx];
+        try std.testing.expectEqualStrings("pair", f.name);
+    }
 }

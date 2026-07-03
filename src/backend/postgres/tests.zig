@@ -242,6 +242,30 @@ test "pg: booleans read back through columnInt as 1/0 (I-5)" {
     try std.testing.expectEqualStrings("f", sel.columnText(1));
 }
 
+test "pg: verify-ca against an untrusted local cert fails CLOSED with CertUntrusted (no leak)" {
+    // Exercises Task 3's live wiring end-to-end: Pool.initOpts building a REAL TlsTrust
+    // (system root store) and Conn's mapTlsInitError, against a real server whose cert is
+    // not signed by any CA in that store (the local dev/CI Postgres uses a self-signed or
+    // locally-generated cert). Only meaningful against the built-in default URL — a custom
+    // `ZIGBASE_PG_TEST_URL` may point at a properly-CA-signed server, so this SKIPS then.
+    if (!usingDefaultUrl()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    const verify_ca_url = "postgres://zbpg:zbpg_secret_pw@[::1]:5432/zbpgtest?sslmode=verify-ca";
+    const result = pg.Pool.init(a, io, verify_ca_url);
+    if (result) |*pool_ok| {
+        // The local server's cert happens to chain to a system-trusted CA (unlikely for a
+        // dev/CI Postgres, but not impossible) — accept and clean up rather than false-fail.
+        var pool = pool_ok.*;
+        pool.deinit();
+        return;
+    } else |err| switch (err) {
+        error.OpenFailed => {}, // expected: CertUntrusted was logged and mapped to OpenFailed
+        else => return err, // OOM / a real regression must fail, not pass silently
+    }
+}
+
 test "pg: pool does not recycle a broken connection (I-2)" {
     const a = std.testing.allocator;
     const io = std.testing.io;

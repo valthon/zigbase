@@ -141,6 +141,23 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 - **Admin UI:** no logs screen, and the record editor uses a plain textarea (no WYSIWYG
   rich-text editor) — both deferred.
 
+## Postgres backend
+
+- **`verify-full` hostname checks match DNS names only.** Dialing an IP literal under
+  the default `sslmode=verify-full` generally fails hostname verification even when
+  the certificate carries an iPAddress SAN — connect by DNS name, or use
+  `sslmode=verify-ca` on an otherwise-trusted path. Client certificates (mTLS),
+  CRL/OCSP, and SCRAM channel binding (`SCRAM-SHA-256-PLUS`) are not supported.
+- **SCRAM passwords that require NFKC normalization are rejected.** The driver
+  implements RFC 4013 SASLprep except full NFKC normalization: a password whose
+  SASLprep output would need NFKC fails at connect with an actionable error — supply
+  it pre-normalized to NFKC, or use an ASCII password. (Everything else is correctly
+  prepped or intentionally matches PostgreSQL's own use-verbatim behavior.)
+- **`migrate-db`: the superuser fast path is faster; the non-superuser path is fully
+  supported.** A superuser target suspends FK enforcement wholesale; a non-superuser
+  target provisions cycle-edge FKs as deferrable and defers them to COMMIT — correct
+  for cyclic and self-referential graphs, verified against live Postgres in CI.
+
 ## Other deferred work
 
 - Image thumbnails / transforms; an S3 (or other remote) storage backend — a pluggable

@@ -89,9 +89,15 @@ const frozen_unix: i64 = 1867593600; // = datetime.parse(frozen_iso)
 /// Open a raw `Conn`, or null to signal "no reachable PG → skip" (only a connect failure skips).
 fn connectOrSkip(a: std.mem.Allocator, io: std.Io) !?*conn_mod.Conn {
     const connstr = @import("connstr.zig");
+    const tls_trust = @import("tls_trust.zig");
     var cfg = connstr.parse(a, pgtests.testUrl()) catch return null;
     defer cfg.deinit();
-    return conn_mod.Conn.connect(a, io, cfg) catch null;
+    if (cfg.sslmode.verifiesCertificate()) {
+        var trust = tls_trust.TlsTrust.init(a, io, &cfg) catch return null;
+        defer trust.deinit();
+        return conn_mod.Conn.connect(a, io, cfg, &trust) catch null;
+    }
+    return conn_mod.Conn.connect(a, io, cfg, null) catch null;
 }
 
 fn scalarText(a: std.mem.Allocator, conn: *conn_mod.Conn, sql: []const u8) ![]const u8 {

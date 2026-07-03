@@ -121,8 +121,11 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
       # sslmode=prefer: the stock postgres image has no server TLS, so the driver negotiates
       # SSLRequest and transparently falls back to plaintext. SCRAM is still exercised here;
-      # TLS-handshake coverage runs against a TLS-enabled local PostgreSQL during development.
+      # TLS-handshake + verification coverage runs in the postgres-tls job.
       ZIGBASE_PG_TEST_URL: postgres://zbpg:zbpg_secret_pw@127.0.0.1:5432/zbpgtest?sslmode=prefer
+      # No server TLS in this job: gates the live test asserting the DEFAULT (verify-full)
+      # refuses a plaintext-only server with the actionable "server refused TLS" error.
+      ZIGBASE_PG_PLAINTEXT: "1"
     services:
       postgres:
         # pgvector/pgvector:pg16 = postgres:16 + the pgvector extension AVAILABLE (#159, PR-11), so
@@ -175,6 +178,8 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
       ZIGBASE_PG_TEST_URL: postgres://zbpg:zbpg_secret_pw@127.0.0.1:5432/zbpgtest?sslmode=require
+      # Points the live verify-full tests at the self-signed server cert generated below.
+      ZIGBASE_PG_TLS_CA: ${{ github.workspace }}/pgtls/server.crt
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -197,6 +202,7 @@ jobs:
           mkdir -p "$PWD/pgtls"
           openssl req -new -x509 -days 2 -nodes -text \
             -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost" \
             -out "$PWD/pgtls/server.crt" -keyout "$PWD/pgtls/server.key"
           chmod 600 "$PWD/pgtls/server.key"
           # The postgres image runs as uid 999; it must own the key to load it.

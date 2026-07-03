@@ -13,21 +13,20 @@
 //! Everything in this subtree is reachable only when `build_options.postgres` is true; the
 //! default build never references it, so the shipped binary is byte-identical.
 //!
-//! ============================ SECURITY: TLS IS UN-AUTHENTICATED ============================
-//! The driver encrypts transport but does NOT yet authenticate the server, in ANY sslmode:
-//!   * `sslmode=disable` — plaintext.
-//!   * `sslmode=prefer` (default) — opportunistic TLS, but an active MITM can strip it to
-//!     plaintext (the server's "no SSL" reply is trusted).
-//!   * `sslmode=require` — TLS is mandatory, but the server certificate chain and hostname are
-//!     NOT verified (`host=.no_verification, ca=.no_verification`), so a MITM presenting any
-//!     certificate is accepted. This matches libpq `sslmode=require` semantics.
-//!   * `sslmode=verify-ca` / `verify-full` — REJECTED at parse time (the driver cannot honor
-//!     them yet), rather than silently downgraded to encryption-only.
-//! So the driver provides NO protection against an active man-in-the-middle today. Use it only
-//! on a trusted network path (loopback, private VPC, mTLS sidecar) until verify-full lands.
-//! Real certificate + hostname verification (a true `verify-full`) is the immediate tracked
-//! follow-up. The user-facing security note ships with the PR-1b wiring docs.
-//! ==========================================================================================
+//! ================================ SECURITY: TLS ================================
+//! Since 0.10.0 the driver verifies the server by DEFAULT: an unqualified
+//! `postgres://` URL gets `sslmode=verify-full` (chain verified against the system
+//! root store or `sslrootcert=<pem>`, hostname checked against the URL host, cert
+//! validity checked against real wall time). Explicit opt-downs remain available —
+//! `require` (encrypted, unverified — libpq parity), `prefer`/`allow` (opportunistic,
+//! MITM-strippable), `disable` (plaintext) — and each logs a startup warning when
+//! chosen explicitly. Misconfiguration (missing/empty CA bundle, refused TLS,
+//! untrusted chain, hostname mismatch) fails AT STARTUP with an error naming the fix.
+//! Not supported: client certificates (mTLS), sslcrl/OCSP, and SCRAM channel binding
+//! (`SCRAM-SHA-256-PLUS`). Hostname verification matches DNS names — an IP-literal
+//! host under verify-full generally fails even with an iPAddress SAN (use the DNS
+//! name, or verify-ca on an otherwise-trusted path).
+//! ===============================================================================
 
 const std = @import("std");
 
@@ -51,6 +50,7 @@ pub const PoolOptions = @import("pool.zig").PoolOptions;
 pub const Conn = @import("conn.zig").Conn;
 pub const ConnError = @import("conn.zig").ConnError;
 pub const connstr = @import("connstr.zig");
+pub const tls_trust = @import("tls_trust.zig");
 pub const scram = @import("scram.zig");
 pub const protocol = @import("protocol.zig");
 
@@ -58,8 +58,13 @@ pub const protocol = @import("protocol.zig");
 // into the unit-test root (gated behind `build_options.postgres` in `src/root.zig`).
 test {
     _ = @import("scram.zig");
+    _ = @import("saslprep.zig");
+    // SP3-A item 2: live SASLprep/SCRAM coverage (NFC pass-through + needs-NFKC hard
+    // error). Skips without PG.
+    _ = @import("scram_pg_test.zig");
     _ = @import("protocol.zig");
     _ = @import("connstr.zig");
+    _ = @import("tls_trust.zig");
     _ = @import("conn.zig");
     _ = @import("stmt.zig");
     _ = @import("db.zig");
@@ -85,4 +90,6 @@ test {
     // PR-11: live pgvector KNN parity (?vector= → <=>/<->) + tenant/ability-scoped vector-search
     // chokepoint composition. Skips if no PG or if -Dvector is off.
     _ = @import("vector_pg_test.zig");
+    // SP3-A: live TLS-verification coverage. Skips without ZIGBASE_PG_TLS_CA / ZIGBASE_PG_PLAINTEXT.
+    _ = @import("tls_pg_test.zig");
 }

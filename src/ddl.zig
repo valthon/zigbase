@@ -59,7 +59,12 @@ fn fieldCollate(c: schema.Collection, f: schema.Field, d: dialect.Dialect) []con
     return d.textCollate();
 }
 
-pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel_target: ?[]const u8, d: dialect.Dialect) ![]u8 {
+fn nameIn(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel_target: ?[]const u8, d: dialect.Dialect, skip_fk_fields: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, "CREATE TABLE ");
@@ -75,7 +80,10 @@ pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel
     }
     for (c.fields) |f| {
         switch (f.options) {
-            .relation => |r| if (r.maxSelect == 1) {
+            // skip_fk_fields (migrate-db cycle edges, Postgres target): the COLUMN was
+            // already emitted above — only the inline FK clause is omitted; the caller
+            // adds it back post-creation via `addDeferrableFkSql`.
+            .relation => |r| if (r.maxSelect == 1 and !nameIn(skip_fk_fields, f.name)) {
                 const target = single_rel_target orelse r.targetCollectionId;
                 const on_delete = if (r.cascadeDelete) "CASCADE" else "SET NULL";
                 try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, ", FOREIGN KEY (\"{s}\") REFERENCES \"{s}\" (\"id\") ON DELETE {s}", .{ f.name, target, on_delete }));
@@ -132,6 +140,21 @@ pub fn authIdentityIndexSql(alloc: std.mem.Allocator, table: []const u8, field: 
     );
 }
 
+/// A deferrable FK added AFTER table creation for a relation edge that participates in a
+/// dependency cycle (migrate-db, Postgres target — cyclic inline REFERENCES cannot be
+/// created in any order there). `DEFERRABLE INITIALLY IMMEDIATE` behaves identically to a
+/// plain FK outside an explicit `SET CONSTRAINTS`, so the running server sees no semantic
+/// drift; it exists purely so the load transaction can defer it to COMMIT. The constraint
+/// name matches `rebuildPlanPg`'s `fk_<table>_<field>` convention.
+pub fn addDeferrableFkSql(alloc: std.mem.Allocator, table: []const u8, field: []const u8, target: []const u8, cascade_delete: bool) ![]u8 {
+    const on_delete = if (cascade_delete) "CASCADE" else "SET NULL";
+    return std.fmt.allocPrint(
+        alloc,
+        "ALTER TABLE \"{s}\" ADD CONSTRAINT \"fk_{s}_{s}\" FOREIGN KEY (\"{s}\") REFERENCES \"{s}\" (\"id\") ON DELETE {s} DEFERRABLE INITIALLY IMMEDIATE;",
+        .{ table, table, field, field, target, on_delete },
+    );
+}
+
 /// Produce the ordered DDL statements that migrate a collection's physical table from `old` to
 /// `new`, matching retained columns by **stable field id** (`of.id == nf.id`) so data survives a
 /// rename/retype. SQLite (which cannot drop/retype a column in place pre-3.35) does this via a
@@ -147,7 +170,7 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
     const tmp = try std.fmt.allocPrint(alloc, "{s}__new", .{new.name});
     var tmp_col = new;
     tmp_col.name = tmp;
-    try stmts.append(alloc, try createTableSql(alloc, tmp_col, null, d));
+    try stmts.append(alloc, try createTableSql(alloc, tmp_col, null, d, &.{}));
 
     var new_cols: std.ArrayList(u8) = .empty;
     var src_cols: std.ArrayList(u8) = .empty;
@@ -274,7 +297,7 @@ test "createTableSql includes system columns, field columns, and FK for single r
         .{ .id = "c", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users", .cascadeDelete = true, .maxSelect = 1 } } },
     };
     const col = schema.Collection{ .id = "c1", .name = "posts", .fields = &fields };
-    const sql = try createTableSql(a, col, "users", .sqlite);
+    const sql = try createTableSql(a, col, "users", .sqlite, &.{});
     // SQLite is byte-identical: textCollate() is "" so no COLLATE clauses appear.
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"id\" TEXT PRIMARY KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"created\" TEXT") != null);
@@ -295,7 +318,7 @@ test "createTableSql (Postgres) pins TEXT columns to COLLATE \"C\" except .nocas
     };
     const idx = [_]schema.Index{.{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase }};
     const col = schema.Collection{ .id = "c1", .name = "posts", .fields = &fields, .indexes = &idx };
-    const sql = try createTableSql(a, col, null, .postgres);
+    const sql = try createTableSql(a, col, null, .postgres, &.{});
     // System tiebreaker columns + plain text field get the byte-order collation.
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"id\" TEXT COLLATE \"C\" PRIMARY KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"created\" TEXT COLLATE \"C\"") != null);
@@ -305,6 +328,37 @@ test "createTableSql (Postgres) pins TEXT columns to COLLATE \"C\" except .nocas
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"email\" TEXT,") != null or std.mem.indexOf(u8, sql, "\"email\" TEXT UNIQUE") != null or std.mem.indexOf(u8, sql, "\"email\" TEXT)") != null);
     // Non-text column never gets a collation.
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"price\" DOUBLE PRECISION") != null);
+}
+
+test "createTableSql omits the FK clause for skip_fk_fields (cycle edges) but keeps the column" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]schema.Field{
+        .{ .id = "a", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } },
+        .{ .id = "b", .name = "pair", .options = .{ .relation = .{ .targetCollectionId = "twins", .maxSelect = 1 } } },
+    };
+    const col = schema.Collection{ .id = "c1", .name = "posts", .fields = &fields };
+    const sql = try createTableSql(a, col, null, .postgres, &.{"pair"});
+    // The skipped edge keeps its COLUMN (data still loads) but loses the inline FK.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"pair\" TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "FOREIGN KEY (\"pair\")") == null);
+    // The non-cycle FK is unchanged.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "FOREIGN KEY (\"author\") REFERENCES \"users\" (\"id\") ON DELETE SET NULL") != null);
+}
+
+test "addDeferrableFkSql matches rebuildPlanPg naming and emits DEFERRABLE INITIALLY IMMEDIATE" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings(
+        "ALTER TABLE \"posts\" ADD CONSTRAINT \"fk_posts_pair\" FOREIGN KEY (\"pair\") REFERENCES \"twins\" (\"id\") ON DELETE SET NULL DEFERRABLE INITIALLY IMMEDIATE;",
+        try addDeferrableFkSql(a, "posts", "pair", "twins", false),
+    );
+    try std.testing.expectEqualStrings(
+        "ALTER TABLE \"posts\" ADD CONSTRAINT \"fk_posts_pair\" FOREIGN KEY (\"pair\") REFERENCES \"twins\" (\"id\") ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE;",
+        try addDeferrableFkSql(a, "posts", "pair", "twins", true),
+    );
 }
 
 test "createIndexSql builds unique and non-unique" {
