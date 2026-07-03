@@ -86,4 +86,6 @@ test {
     // PR-11: live pgvector KNN parity (?vector= → <=>/<->) + tenant/ability-scoped vector-search
     // chokepoint composition. Skips if no PG or if -Dvector is off.
     _ = @import("vector_pg_test.zig");
+    // SP3-A: live TLS-verification coverage. Skips without ZIGBASE_PG_TLS_CA / ZIGBASE_PG_PLAINTEXT.
+    _ = @import("tls_pg_test.zig");
 }
