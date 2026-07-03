@@ -54,6 +54,17 @@ export interface RecordAbilities {
   delete: boolean;
 }
 
+/** One active server-side session row (server `.session_store = .table` only). */
+export interface SessionInfo {
+  id: string;
+  created: string;
+  last_seen: string;
+  user_agent: string;
+  ip: string;
+  /** True for the session THIS request was authenticated with. */
+  is_current: boolean;
+}
+
 export class CollectionService {
   constructor(
     protected readonly transport: Transport,
@@ -141,6 +152,65 @@ export class CollectionService {
       body: { token, password },
       skipAuth: true,
     });
+  }
+
+  /**
+   * Change an auth record's password via `PATCH /records/:id` with `{ password, oldPassword }`
+   * (requires ZigBase >= 0.10.0). The server verifies `oldPassword` against the TARGET record
+   * (superusers are exempt) and rotates its tokenKey — every outstanding session dies. For a
+   * self-change the server re-issues THIS device's session via Set-Cookie (cookie mode needs
+   * nothing else); this helper additionally re-runs `authWithPassword` with the stored identity
+   * and the new password when the store's principal IS the target, so bearer-token clients stay
+   * logged in too (a harmless extra login in cookie mode). Wrong/missing `oldPassword` rejects
+   * with the login-identical 400 "Invalid credentials." (non-oracle). `oldPassword` also passes
+   * through plain `update()` for callers who want the raw record response.
+   */
+  async changePassword(id: string, oldPassword: string, newPassword: string): Promise<void> {
+    await this.update(id, { password: newPassword, oldPassword });
+    const rec = this.authStore.record as Record<string, unknown> | null;
+    const identity = (rec?.["email"] ?? rec?.["username"]) as string | undefined;
+    if (rec?.["id"] === id && identity) {
+      await this.authWithPassword(identity, newPassword);
+    }
+  }
+
+  /**
+   * GET /api/collections/:col/auth/sessions — the caller's active sessions, newest first
+   * (requires the server to run `.session_store = .table`; the default `.epoch` mode
+   * answers 404, surfaced as a standard ZigbaseError).
+   */
+  async listSessions(opts: { signal?: AbortSignal; requestKey?: string } = {}): Promise<SessionInfo[]> {
+    const res = await this.transport.send<{ items: SessionInfo[] }>(`${this.base()}/auth/sessions`, {
+      method: "GET",
+      signal: opts.signal,
+      requestKey: opts.requestKey,
+    });
+    return res.items;
+  }
+
+  /**
+   * DELETE /api/collections/:col/auth/sessions/:sid — "log out THIS device" (table mode
+   * only). A non-owned or absent id is a 404, indistinguishable by design.
+   */
+  revokeSession(id: string, opts: { signal?: AbortSignal; requestKey?: string } = {}): Promise<void> {
+    return this.transport.send<void>(`${this.base()}/auth/sessions/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal: opts.signal,
+      requestKey: opts.requestKey,
+    });
+  }
+
+  /**
+   * DELETE /api/collections/:col/auth/sessions — "log out everywhere" (works in BOTH
+   * session-store modes: epoch bump + table-row wipe). The current session dies too;
+   * the local auth store is cleared even if the request fails (parity with `logout()`).
+   */
+  async revokeAllSessions(): Promise<void> {
+    try {
+      await this.transport.send<void>(`${this.base()}/auth/sessions`, { method: "DELETE" });
+    } finally {
+      this.authStore.clear();
+    }
   }
 
   /** `/api/collections/<name>/records` */

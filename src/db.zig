@@ -214,6 +214,9 @@ pub const Pool = if (build_options.postgres) struct {
     /// pointer to it, preserving the SQLite pool's `acquireWriter() *Db` contract. It is a
     /// single shared slot, which is safe because the writer mutex serializes holders.
     writer_view: Db = undefined,
+    /// Observability/test counter: total successful writer acquisitions across either
+    /// backend. Mirrors the inner pools' own counters (see `backend/sqlite/db.zig`).
+    writer_acquires: usize = 0,
 
     const Impl = union(Backend) {
         sqlite: sqlite.Pool,
@@ -243,6 +246,7 @@ pub const Pool = if (build_options.postgres) struct {
         switch (self.impl) {
             inline else => |*p, tag| {
                 const inner = p.acquireWriter();
+                self.writer_acquires += 1;
                 self.writer_view = @unionInit(Db, @tagName(tag), inner.*);
                 return &self.writer_view;
             },

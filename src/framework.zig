@@ -18,6 +18,7 @@ const clock = @import("clock.zig");
 const entropy_mod = @import("entropy.zig");
 const mail = @import("mail/mailer.zig");
 const provision = @import("provision.zig");
+const oauth_client = @import("oauth/client.zig");
 const schema = @import("schema.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
@@ -1873,7 +1874,18 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
                 config.EnvGetter{ .environ = environ },
                 schema_collections,
             );
-            try provision.applySpecs(allocator, io, w, resolved);
+            // OIDC discovery (spec §F4): startup-only, HTTPS-only, issuer-checked; ANY
+            // failure refuses to start (fail closed — no silently-dead login).
+            const hc = try oauth_client.httpContext(prov_arena.allocator(), io);
+            const resolved2 = provision.resolveDiscoveryProviders(
+                prov_arena.allocator(),
+                oauth_client.httpTransport(hc),
+                resolved,
+            ) catch |e| {
+                std.log.err("refusing to start: OIDC discovery failed ({s}); fix the provider's .discoveryURL / network and restart", .{@errorName(e)});
+                return e;
+            };
+            try provision.applySpecs(allocator, io, w, resolved2);
         }
         // Fail-closed for RUNTIME-created encrypted fields (Theme B1, gap #102). The
         // comptime guard above only sees the `.collections` literal; a collection whose

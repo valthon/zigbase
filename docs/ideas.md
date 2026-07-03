@@ -230,6 +230,13 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   in `App` to avoid a DB read on the hot auth path). Admin API + SPA tab to view/kill sessions.
 - **Risk:** Medium — adds work to the hot auth path; cache carefully.
 - **Depends on / ordering:** After A1. Synergizes with A5 (unified credential listing).
+- **Status (0.10.0): shipped, opt-in.** `ctx.auth()` verbs, a REST surface
+  (`GET`/`DELETE /api/collections/:col/auth/sessions[/:sid]`), and the TypeScript SDK
+  (`listSessions`/`revokeSession`/`revokeAllSessions`) all ship. The default `session_store`
+  is **still `.epoch`** (stateless, zero extra DB work) — per-device list/revoke requires
+  opting into `.session_store = .table` (one extra read per authenticated request). See
+  [framework.md → Revoking sessions](framework.md#ctxauth--session-management) and
+  [typescript-sdk.md → Sessions](typescript-sdk.md#sessions-listsessions--revokesession--revokeallsessions).
 
 #### A7. RBAC / roles beyond superuser-vs-record — **Effort L, Risk Medium, Parity+Diff**
 - **What:** Named roles/permissions; rules that reference `@request.auth.role`; per-collection role grants.
@@ -241,6 +248,14 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   that reference them get validated at compile time.
 - **Risk:** Medium — rule-language surface growth; migration of existing rules. Keep backward compatible.
 - **Depends on / ordering:** After the query/rule placeholder layer is stable. Pairs with A5 scopes.
+- **Status: deferred, by choice.** Equality-composition already works today with zero rule-grammar
+  growth — put a `role` select field on the auth collection and reference it via
+  `@request.auth.role = "editor"` (see [recipes.md → Global roles with a select
+  field](recipes.md#recipe-global-roles-with-a-select-field-no-framework-rbac)). Per-account roles ship an
+  ordered ladder via the tenancy system (`_memberships.role`, `@request.account.role`,
+  `.abilities.min_role`). What's still missing is a **global** ordered comparison (`role >= editor`
+  outside a tenancy scope) — that needs the rule-grammar growth this idea flags as its risk.
+  Revisit post-1.0 if the select-field recipe proves insufficient in practice.
 
 #### A8. More OAuth providers + generic OIDC — **Effort S each / M for generic, Risk Low, Parity**
 - **What:** Apple, GitLab, Twitch, Facebook, etc., plus a **generic OIDC** provider configured by
@@ -252,6 +267,11 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   standard claims (`sub`/`email`/`name`/`picture`).
 - **Risk:** Low (table-driven). Apple is the fiddly one (client-secret-as-JWT, form_post).
 - **Depends on / ordering:** Independent; pick off opportunistically.
+- **Status (0.10.0): generic OIDC shipped** (`.discoveryURL`, resolved once at startup,
+  fail-closed) — see [framework.md → Generic OIDC
+  discovery](framework.md#oauth2-providers-authoauth2). Named presets beyond the existing
+  `google`/`github`/`microsoft`/`discord` table (Apple, GitLab, Twitch, Facebook, …) remain
+  opportunistic — pick off as requested.
 
 ---
 
@@ -658,8 +678,9 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   *uniquely* good (comptime, single-binary, embeddable). F4 lands early in the increment because
   reliable webhooks and scheduled backups both want a durable queue.
 
-**Deferred / opportunistic:** A6 sessions, A7 RBAC, A8 (more OAuth/OIDC — pick off as requested),
-B2/B6/B7/B8/B9 (data depth, as usage demands), D4 admin logs/settings UI, E3/E4/E5/E6 (ops maturity),
+**Deferred / opportunistic:** A6 (`.table` session mode as the default — awaits perf data), A7 RBAC
+(deferred by choice — see recipe), A8 (named OAuth presets beyond the current table — pick off as
+requested), B2/B6/B7/B8/B9 (data depth, as usage demands), D4 admin logs/settings UI, E3/E4/E5/E6 (ops maturity),
 F2 (presence), G1/G3 (multi-node — only when single-node limits are *measured*), D5 (WASM — only if
 recompilation proves a barrier).
 
@@ -672,11 +693,12 @@ recompilation proves a barrier).
   `app.submit`); a pluggable `Mailer` vtable with `LogMailer` + `SmtpMailer` wired into auth;
   comptime storage/mailer plugins; comptime pool levers (`.pools.readers`/`.pools.jobs`); a
   reader-connection pool; the `Storage` vtable (S3-ready); FTS5 compiled in; schema migrations +
-  `ddl.zig` rebuild plans; OAuth2 PKCE; rule-filtered realtime; Sentry error reporting.
-- **PocketBase-parity gaps still to close:** rate limiting, SMTP TLS, S3 *implementation*, image
-  transforms, MFA, API keys, session management, more OAuth/OIDC, FTS *wiring*, aggregations,
-  soft-delete, `fields=`, ETags, webhooks, metrics/logs UI, backups, dynamic-collection migrations,
-  generated SDK.
+  `ddl.zig` rebuild plans; OAuth2 PKCE; rule-filtered realtime; Sentry error reporting; rate
+  limiting; SMTP TLS; per-device session management (opt-in `.table` mode) + REST/SDK surface;
+  generic OIDC discovery.
+- **PocketBase-parity gaps still to close:** S3 *implementation*, image transforms, MFA, API keys,
+  named OAuth presets beyond the current table, FTS *wiring*, aggregations, soft-delete, `fields=`,
+  ETags, webhooks, metrics/logs UI, backups, dynamic-collection migrations, generated SDK.
 - **Differentiators (the Zig/comptime/single-binary/embeddable angle):** comptime-typed record
   structs (D1), compile-time-validated schema+rules+roles (A7+D1), atomic batch endpoint on the
   single serialized writer (B3), DB-per-tenant via single-file SQLite (E6), trivially-reliable

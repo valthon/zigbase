@@ -371,14 +371,28 @@ pub fn sessionOwner(alloc: std.mem.Allocator, conn: *db.Db, sid: []const u8) !?s
     return .{ .collection = try alloc.dupe(u8, st.columnText(0)), .record = try alloc.dupe(u8, st.columnText(1)) };
 }
 
+/// The monotonic insertion-order column that breaks `created`-timestamp ties deterministically
+/// (two logins in the same wall-clock second — `created` is `datetime('now')`, second-resolution).
+/// SQLite has the implicit `rowid`; Postgres has none (and the app `id` is a RANDOM base36 string,
+/// not monotonic), so migration `0020_sessions_seq` adds an identity column `_seq` that serves the
+/// same purpose — mirrors `analytics.seqCol`/`0017_events_seq` for `_events` exactly.
+fn sessionSeqCol(conn: *db.Db) []const u8 {
+    return switch (db.dbDialect(conn).kind) {
+        .sqlite => "\"rowid\"",
+        .postgres => "\"_seq\"",
+    };
+}
+
 /// List a principal's active (unexpired) sessions, newest first. Caller adds `is_current`.
 pub fn listSessions(alloc: std.mem.Allocator, conn: *db.Db, collection: []const u8, rid: []const u8) ![]SessionRow {
     const now = try nowUnix(conn);
-    var st = try prep(conn, 
+    var sqlbuf: [320]u8 = undefined;
+    const sql = std.fmt.bufPrintZ(&sqlbuf,
         \\SELECT "id","created","lastSeen","userAgent","ip" FROM "_sessions"
         \\ WHERE "collectionRef" = ?1 AND "recordRef" = ?2 AND ("expires" IS NULL OR "expires" > ?3)
-        \\ ORDER BY "created" DESC;
-    );
+        \\ ORDER BY "created" DESC, {s} DESC;
+    , .{sessionSeqCol(conn)}) catch unreachable;
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, collection);
     try st.bindText(2, rid);
@@ -546,6 +560,15 @@ pub fn hasAuthLifecycle(app: *@import("../app.zig").App) bool {
     return d.auth_lifecycle != null;
 }
 
+/// True iff a `beforeAuthSuccess` hook (#80) is registered. The legacy password login
+/// takes the transactional writer path ONLY then — the hook-free epoch path keeps
+/// issuing on the reader (zero writer acquisitions), matching authLogout's
+/// `hasAuthLifecycle` fast-path gate.
+pub fn hasBeforeAuthSuccess(app: *@import("../app.zig").App) bool {
+    const d = app.dispatch orelse return false;
+    return d.before_auth_success != null;
+}
+
 /// Fire a BEFORE auth-lifecycle hook (#98) — register/logout/refresh/password-change.
 /// Mirrors `fireBeforeAuthSuccess`: the hook's `*Ctx` is bound to `conn` (the action's
 /// connection; in-transaction for register/refresh/password-change), so its
@@ -659,10 +682,44 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     // Optional verification gate: refuse to mint a session for an unverified record.
     if (col.options.auth.require_verified and !recordVerified(rec))
         return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
-    // Epoch mode issues on the READER (no write, zero overhead — unchanged). Table mode must
-    // INSERT a `_sessions` row, so it acquires the WRITER now — AFTER the costly argon2 verify,
-    // so logins still don't serialize on argon2. The reader stays held (independent resource).
+    // Issuance (three paths):
+    //  1. HOOK path (#80, 0.10.0): a registered `beforeAuthSuccess` runs inside a write
+    //     transaction so its side-writes commit atomically with issuance and an abort blocks
+    //     the session (fail closed) — byte-for-byte the auth_methods.complete discipline.
+    //     `onAuth` fires only AFTER the durable commit. Fires for `_superusers` too (the
+    //     admin SPA logs in through this route) — an unconditionally-erroring hook locks
+    //     superusers out; that is consistent fail-closed behavior (documented Breaking).
+    //  2. Hook-free TABLE mode: unchanged — acquire the writer only for the `_sessions`
+    //     INSERT (a single autocommit statement), after the costly argon2 verify.
+    //  3. Hook-free EPOCH mode (the common case): unchanged — issue on the READER; zero
+    //     writer acquisitions (pinned by the writer_acquires test below).
     const issued = blk: {
+        if (hasBeforeAuthSuccess(app)) {
+            const w = app.pool.acquireWriter();
+            defer app.pool.releaseWriter();
+            try w.beginImmediate();
+            // Safety net for every error-return after begin (the hook can propagate,
+            // issueSessionNoEmit, commit); value-returns roll back explicitly — a later
+            // double-rollback is a harmless no-op.
+            errdefer w.rollback() catch {};
+            if (try fireBeforeAuthSuccess(ctx, w, col.name, rid, .password, rec)) |resp| {
+                w.rollback() catch {};
+                return resp;
+            }
+            const iss = issueSessionNoEmit(ctx, w, col.name, rid) catch |err| switch (err) {
+                error.NotFound => {
+                    w.rollback() catch {};
+                    return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
+                },
+                else => return err, // errdefer rolls back
+            };
+            w.commit() catch |e| {
+                w.rollback() catch {};
+                return e;
+            };
+            emitAuth(ctx, col.name, rec, .password);
+            break :blk iss;
+        }
         if (app.session_store == .table) {
             const w = app.pool.acquireWriter();
             defer app.pool.releaseWriter();
@@ -708,6 +765,13 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return resp;
     }
+    // #80 on the legacy refresh (0.10.0): `beforeAuthSuccess` slots into the SAME
+    // transaction, AFTER `before_refresh` (surrounding phase first, then the seam).
+    // Either abort rolls back the whole refresh — old session/row intact, fail closed.
+    if (try fireBeforeAuthSuccess(ctx, w, col_name, rid, .refresh, rec_mut)) |resp| {
+        w.rollback() catch {};
+        return resp;
+    }
     // Table mode: rotate the session row — drop this token's old `sid` row before issue()
     // inserts the replacement, so a device keeps exactly ONE row across refreshes (no leak).
     // In txn: an error trips the errdefer rollback above (fail closed, session not reissued).
@@ -723,7 +787,7 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return e;
     };
-    emitAuth(ctx, col_name, rec_mut, .password);
+    emitAuth(ctx, col_name, rec_mut, .refresh);
     emitAuthLifecycle(ctx, w, col_name, rid, .after_refresh, &rec_mut, rec_mut);
 
     var root: std.json.ObjectMap = .empty;
@@ -2203,4 +2267,178 @@ test "#98 password-change: aborting beforePasswordChange leaves password + reset
     // And the new password now works.
     const new_token = loginToken(env, a, "pcb", "pc@x.io", "newpassword") catch "";
     try std.testing.expect(new_token.len > 0);
+}
+
+test "#80 legacy login: beforeAuthSuccess fires, side-write commits with the session" {
+    var env = try TestEnv.initAuth("lg1");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "lg1", "u@x.io", "password123");
+
+    const Hook = struct {
+        var seen: usize = 0;
+        var method_seen: events.AuthMethod = .custom;
+        fn h(cx: *Ctx, ev: *events.AuthSuccessEvent) anyerror!void {
+            seen += 1;
+            method_seen = ev.method;
+            // Side-write through the bound in-transaction connection: commits WITH the login.
+            var patch: std.json.ObjectMap = .empty;
+            try patch.put(cx.arena, "bio", .{ .string = "logged-in" });
+            _ = try cx.records().update("lg1", ev.record_id, .{ .object = patch });
+        }
+    };
+    Hook.seen = 0;
+    var disp = events.Dispatch{ .before_auth_success = Hook.h };
+    env.app.dispatch = &disp;
+
+    const p = [_]http.Param{.{ .key = "col", .value = "lg1" }};
+    var login = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"password123\"}", &p);
+    const res = try authWithPassword(&login);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqual(@as(usize, 1), Hook.seen);
+    try std.testing.expectEqual(events.AuthMethod.password, Hook.method_seen);
+    // Side-write durably committed.
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        var st = try r.prepare("SELECT \"bio\" FROM \"lg1\" WHERE \"email\" = 'u@x.io';");
+        defer st.finalize();
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqualStrings("logged-in", st.columnText(0));
+    }
+}
+
+test "#80 legacy login: aborting beforeAuthSuccess blocks the session and rolls back side-writes" {
+    var env = try TestEnv.initAuth("lg2");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "lg2", "u@x.io", "password123");
+
+    const Hook = struct {
+        fn h(cx: *Ctx, ev: *events.AuthSuccessEvent) anyerror!void {
+            // Side-write FIRST, then abort: the write must be rolled back with the login.
+            var patch: std.json.ObjectMap = .empty;
+            try patch.put(cx.arena, "bio", .{ .string = "MUST-NOT-PERSIST" });
+            _ = try cx.records().update("lg2", ev.record_id, .{ .object = patch });
+            return cx.fail(451, "login vetoed");
+        }
+    };
+    var disp = events.Dispatch{ .before_auth_success = Hook.h };
+    env.app.dispatch = &disp;
+
+    const p = [_]http.Param{.{ .key = "col", .value = "lg2" }};
+    var login = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"password123\"}", &p);
+    const res = try authWithPassword(&login);
+    try std.testing.expectEqual(@as(u16, 451), res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "token") == null); // no session
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        var st = try r.prepare("SELECT COALESCE(\"bio\",'') FROM \"lg2\" WHERE \"email\" = 'u@x.io';");
+        defer st.finalize();
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqualStrings("", st.columnText(0)); // rolled back
+    }
+    // Writer not poisoned: with the hook removed, login succeeds cleanly.
+    env.app.dispatch = null;
+    const tok = loginToken(env, a, "lg2", "u@x.io", "password123") catch "";
+    try std.testing.expect(tok.len > 0);
+}
+
+test "#80 hook-free epoch login never acquires the writer" {
+    var env = try TestEnv.initAuth("lg3");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "lg3", "u@x.io", "password123");
+    // env.app.dispatch == null and session_store == .epoch (defaults): the fast path.
+    const before = env.pool.writer_acquires;
+    const p = [_]http.Param{.{ .key = "col", .value = "lg3" }};
+    var login = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"password123\"}", &p);
+    try std.testing.expectEqual(@as(u16, 200), (try authWithPassword(&login)).status);
+    try std.testing.expectEqual(before, env.pool.writer_acquires); // reader-only login
+}
+
+test "#80 authRefresh: before_refresh then beforeAuthSuccess(.refresh) in ONE txn; seam abort rolls back both" {
+    var env = try TestEnv.initAuth("rf1");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    env.app.session_store = .table; // so we can observe the sid row surviving the rollback
+    try env.createUser(a, "rf1", "u@x.io", "password123");
+    const tok = try loginToken(env, a, "rf1", "u@x.io", "password123");
+
+    const Order = struct {
+        var log: [4]u8 = undefined;
+        var n: usize = 0;
+        var seam_method: events.AuthMethod = .custom;
+        fn lifecycle(cx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
+            _ = cx;
+            if (ev.phase == .before_refresh) {
+                log[n] = 'L';
+                n += 1;
+            }
+        }
+        fn seam(cx: *Ctx, ev: *events.AuthSuccessEvent) anyerror!void {
+            _ = cx;
+            log[n] = 'S';
+            n += 1;
+            seam_method = ev.method;
+            return error.Forbidden; // abort AFTER before_refresh ran → whole refresh rolls back
+        }
+    };
+    Order.n = 0;
+    var disp = events.Dispatch{
+        .auth_lifecycle = events.buildAuthLifecycleDispatcher(.{ .beforeRefresh = Order.lifecycle }),
+        .before_auth_success = Order.seam,
+    };
+    env.app.dispatch = &disp;
+
+    const p = [_]http.Param{.{ .key = "col", .value = "rf1" }};
+    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    var refresh = env.ctx(a, .POST, "", &p);
+    refresh.authorization = bearer;
+    const res = try authRefresh(&refresh);
+    try std.testing.expectEqual(@as(u16, 403), res.status);
+    try std.testing.expectEqual(@as(usize, 2), Order.n);
+    try std.testing.expectEqualStrings("LS", Order.log[0..2]); // lifecycle first, then the seam
+    try std.testing.expectEqual(events.AuthMethod.refresh, Order.seam_method);
+    // Fail closed: the OLD session row is intact (rolled-back delete) and the token still works.
+    env.app.dispatch = null;
+    var refresh2 = env.ctx(a, .POST, "", &p);
+    refresh2.authorization = bearer;
+    try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh2)).status);
+}
+
+test "#80 onAuth reports .refresh (not .password) on auth-refresh" {
+    var env = try TestEnv.initAuth("rf2");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "rf2", "u@x.io", "password123");
+    const tok = try loginToken(env, a, "rf2", "u@x.io", "password123");
+
+    const Tag = struct {
+        var seen: ?events.AuthMethod = null;
+        fn h(ev: *events.AuthEvent) void {
+            seen = ev.method;
+        }
+    };
+    Tag.seen = null;
+    var disp = events.Dispatch{ .on_auth = Tag.h };
+    env.app.dispatch = &disp;
+
+    const p = [_]http.Param{.{ .key = "col", .value = "rf2" }};
+    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    var refresh = env.ctx(a, .POST, "", &p);
+    refresh.authorization = bearer;
+    try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
+    try std.testing.expectEqual(events.AuthMethod.refresh, Tag.seen.?);
 }

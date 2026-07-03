@@ -41,6 +41,80 @@ def page(server):
         yield pg
         ctx.close(); browser.close()
 
+
+# ---------------------------------------------------------------------------
+# auth-round-2 fixture (fixtures/auth2): table-mode sessions + a registered
+# beforeAuthSuccess hook, for the browser suite's F1-F3 login/session coverage.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def auth2_binary():
+    """The auth-round-2 fixture server: .session_store = .table + a registered
+    beforeAuthSuccess (fixtures/auth2). Honors the CI-prebuilt override."""
+    override = os.environ.get("ZIGBASE_TEST_AUTH2_BINARY")
+    if override:
+        if not pathlib.Path(override).exists():
+            raise FileNotFoundError(f"ZIGBASE_TEST_AUTH2_BINARY={override} does not exist")
+        return override
+    subprocess.run(ZIG + ["build", "auth2-server"], cwd=REPO, check=True)
+    path = REPO / "zig-out" / "bin" / "auth2-server"
+    assert path.exists(), f"auth2-server not built at {path}"
+    return str(path)
+
+def _wait_reachable_or_fail(proc, port, log_path, timeout_s=5.0):
+    """Poll the port until it accepts connections; raise loudly instead of returning
+    silently if the server dies early or never comes up. A fixture that raises here
+    fails cleanly at setup, instead of yielding a base URL nothing is listening on and
+    leaving every test in the fixture to fail later with a generic connection error."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break  # process already exited; no point polling further
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill(); proc.wait(timeout=5)
+    output = pathlib.Path(log_path).read_text(errors="replace") if pathlib.Path(log_path).exists() else "<no output captured>"
+    raise AssertionError(f"server on port {port} never became reachable (exit={proc.returncode}):\n{output}")
+
+@pytest.fixture()
+def auth2_server(auth2_binary):
+    """A live table-mode server with the beforeAuthSuccess fixture hook registered."""
+    data = tempfile.mkdtemp(prefix="zb_auth2_")
+    subprocess.run([auth2_binary, "superuser", "create", "--email", "admin@x.io",
+                    "--password", "adminpassword", "--data-dir", data], check=True)
+    port = _free_port()
+    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
+    log_path = os.path.join(data, "server.log")
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen([auth2_binary, "serve", "--insecure-cookies"], env=env,
+                                stdout=log, stderr=subprocess.STDOUT)
+    try:
+        _wait_reachable_or_fail(proc, port, log_path)
+    except AssertionError:
+        shutil.rmtree(data, ignore_errors=True)
+        raise
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
+
+@pytest.fixture()
+def auth2_page(auth2_server):
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        ctx = browser.new_context(base_url=auth2_server)
+        pg = ctx.new_page()
+        yield pg
+        ctx.close(); browser.close()
+
+
 def login(page):
     page.goto("/_/#/login")
     page.fill('[data-test=email]', 'admin@x.io')

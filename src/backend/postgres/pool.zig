@@ -37,6 +37,9 @@ pub const Pool = struct {
 
     /// Type-erased field-encryption cipher pointer; stamped onto every acquired connection.
     field_cipher: ?*const anyopaque = null,
+    /// Observability/test counter: total successful writer acquisitions. Mirrors the SQLite
+    /// pool's counter (see `backend/sqlite/db.zig`).
+    writer_acquires: usize = 0,
 
     /// Shared CA trust for verify-ca/verify-full (heap-pinned: the TLS handshake takes
     /// pointers into it, and `Pool` itself moves by value). Built once in `initOpts`,
@@ -127,6 +130,7 @@ pub const Pool = struct {
     /// `releaseWriter` when done.
     pub fn acquireWriter(self: *Pool) *Db {
         self.writer_mutex.lockUncancelable(self.io);
+        self.writer_acquires += 1;
         self.writer.field_cipher = self.field_cipher;
         return &self.writer;
     }

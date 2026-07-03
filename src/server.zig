@@ -15,6 +15,7 @@ const auth_methods_api = @import("api/auth_methods.zig");
 const magic_link_consume_api = @import("api/magic_link_consume.zig");
 const webauthn_register_api = @import("api/webauthn_register.zig");
 const oauth_api = @import("api/oauth.zig");
+const sessions_api = @import("api/sessions.zig");
 const files_api = @import("api/files.zig");
 const settings_api = @import("api/settings.zig");
 const features_api = @import("api/features.zig");
@@ -63,6 +64,12 @@ const routes = [_]router.Route{
     .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/begin", .handler = webauthn_register_api.begin },
     .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/finish", .handler = webauthn_register_api.finish },
     .{ .method = .GET, .pattern = "/api/collections/:col/auth/oauth2/providers", .handler = oauth_api.oauth2Providers },
+    // Per-device sessions (spec §F3). NOTE: the `sessions` segment under /auth/ is RESERVED —
+    // a custom auth-method slug named "sessions" is rejected at comptime (provision.zig) so a
+    // method's /auth/:method/* routes can never shadow or be shadowed by these.
+    .{ .method = .GET, .pattern = "/api/collections/:col/auth/sessions", .handler = sessions_api.list },
+    .{ .method = .DELETE, .pattern = "/api/collections/:col/auth/sessions/:sid", .handler = sessions_api.revoke },
+    .{ .method = .DELETE, .pattern = "/api/collections/:col/auth/sessions", .handler = sessions_api.revokeAll },
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
     .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
     // HEAD mirrors GET (status/headers/Content-Length, no body) — `serve` itself branches

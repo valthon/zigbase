@@ -352,6 +352,43 @@ patterns:
 
 Pattern 1 is sturdier (the client cannot get it wrong); pattern 2 needs no Zig code.
 
+## Recipe: global roles with a select field (no framework RBAC)
+
+ZigBase deliberately has no global role ladder — the rule language composes one from
+existing pieces. Put a `role` select on the auth collection, reference it from rules, and
+guard escalation with a one-line hook:
+
+```zig
+.users = .{
+    .type = .auth,
+    .fields = .{
+        .{ .name = "role", .type = .select, .values = .{ "member", "editor", "admin" } },
+    },
+    ...
+},
+.posts = .{
+    // Editors and admins may update any post:
+    .rules = .{ .update = "@request.auth.role = \"editor\" || @request.auth.role = \"admin\"", ... },
+},
+```
+
+```zig
+// Self-escalation guard: only superusers may change `role`.
+fn guardRole(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
+    _ = ctx;
+    if (ev.phase != .before_update) return;
+    if (ev.ctx.is_superuser) return;
+    if (ev.record.* == .object and ev.record.object.get("role") != null)
+        return error.Forbidden;
+}
+```
+
+Wire `guardRole` as a `beforeUpdate` hook on `users` (or express the same thing as a
+field-guarding `updateRule`). For **per-account** roles with an ordered ladder
+(`viewer < editor < admin < owner`), use the built-in tenancy system instead —
+`_memberships.role`, `@request.account.role`, and `.abilities` `.min_role` already ship
+ordered comparisons (see [Tenancy](./tenancy) and [Abilities](./abilities)).
+
 ## Recipe: a computed-field / validation `beforeCreate` hook
 
 A `beforeCreate` hook runs **after** access rules pass and **before** the write. It may

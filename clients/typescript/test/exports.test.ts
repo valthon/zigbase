@@ -31,4 +31,13 @@ describe("public exports (Plan 2)", () => {
     expect(typeof zb.SendersService).toBe("function");
     expect(typeof zb.AccountsService).toBe("function");
   });
+
+  it("exposes changePassword + per-device session methods on CollectionService", () => {
+    const client = zb.createClient("http://api.test");
+    const col = client.collection("x");
+    expect(typeof col.changePassword).toBe("function");
+    expect(typeof col.listSessions).toBe("function");
+    expect(typeof col.revokeSession).toBe("function");
+    expect(typeof col.revokeAllSessions).toBe("function");
+  });
 });

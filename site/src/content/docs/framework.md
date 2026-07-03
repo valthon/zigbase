@@ -1398,7 +1398,7 @@ One handler each, registered by the matching config key:
 | `onFeatureExposure` | `fn (ev: *zigbase.ExposureEvent) void` | Notify-only, each time a declared flag/experiment is resolved. Zero-cost when unset. See [Exposure events](#exposure-events-onfeatureexposure). |
 
 `AuthEvent` carries `app`, `ctx`, `collection`, `record: ?std.json.Value`, and `method`
-(`.password` | `.oauth2` | `.magic_link` | `.otp` | `.webauthn` | `.custom`). `FileEvent` carries `app`, `ctx`, `collection`,
+(`.password` | `.oauth2` | `.magic_link` | `.otp` | `.webauthn` | `.custom` | `.refresh`). `FileEvent` carries `app`, `ctx`, `collection`,
 `record_id`, and `filename`. `LifecycleEvent` carries `app`.
 
 ### Auth lifecycle (`beforeAuthSuccess`)
@@ -1434,11 +1434,16 @@ Guarantees:
   reflects the just-authenticated principal.
 
 Where it fires: the unified `POST /api/collections/:col/auth/:method/complete` endpoint
-(password / otp / webauthn / oauth2 / custom) and the magic-link
-`GET …/auth/magic_link/consume` link. The legacy `/auth-with-password` and `/auth-refresh`
-endpoints do not fire `beforeAuthSuccess`. `onAuth` still fires once, after issuance, as
-before. The surrounding lifecycle phases (register / logout / refresh / password-change)
-have their own before/after hooks — see below.
+(password / otp / webauthn / oauth2 / custom), the magic-link `GET …/auth/magic_link/consume`
+link, and — since 0.10.0 — the legacy `POST …/auth-with-password` (tag `.password`) and
+`POST …/auth-refresh` (tag `.refresh`, in the same transaction as `beforeRefresh`, lifecycle
+phase first). **This includes `_superusers`: the admin SPA logs in through
+`_superusers/auth-with-password`, so a hook that errors unconditionally will lock superusers
+out of the admin UI.** That is deliberate fail-closed behavior; recovery is fixing the hook
+and rebuilding (hooks are comptime-compiled — operator == developer). `onAuth` still fires
+once, after issuance; on refresh it now reports `.refresh` (previously mislabeled `.password`).
+The surrounding lifecycle phases (register / logout / refresh / password-change) have their
+own before/after hooks — see below.
 
 ### Auth lifecycle hooks (register / logout / refresh / password-change)
 
@@ -1471,7 +1476,7 @@ and unchanged.
 | `register` | record create for an **auth** collection (`POST /api/collections/:col/records`) | ✅ (mutate the new account) | ✅ (in the create txn) | abort rolls back → **no account created** |
 | `logout` | `POST /api/collections/:col/auth-logout` | ✅ (bound writer) | — (no write txn) | abort → mapped response, **cookies not cleared** |
 | `refresh` | `POST /api/collections/:col/auth-refresh` | ✅ | ✅ | abort rolls back → **no new session** |
-| `password-change` | `POST /api/collections/:col/confirm-password-reset` | ✅ | ✅ | abort rolls back → **password unchanged, reset token un-consumed** |
+| `password-change` | `POST /api/collections/:col/confirm-password-reset` **and** `PATCH …/records/:id` with a `password` (non-superusers must also send a verifying `oldPassword`) | ✅ | ✅ | abort rolls back → **password unchanged** (reset token un-consumed, on the reset-confirm path) |
 
 Semantics, consistent across phases:
 
@@ -1493,6 +1498,9 @@ Semantics, consistent across phases:
   `before_register` exposes a writable record.)
 - `logout` keeps a no-writer fast path: it only resolves the caller and acquires the writer
   when an `.auth` hook is actually registered (an empty `.auth = .{}` installs nothing).
+- On the `PATCH /records/:id` password-change path, `beforePasswordChange` runs **inside**
+  the update transaction, **after** the record's own `beforeUpdate` hooks — so a record hook
+  can still veto the write first, and the auth hook sees the already-validated patch.
 
 ```zig
 // Seed a profile row atomically with the new account.
@@ -1504,11 +1512,12 @@ fn seedProfile(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerr
 }
 ```
 
-**Deferred (designed, not wired):** self-service password change via `PATCH /records`
-(use the record `beforeUpdate`/`afterUpdate` hooks on the auth collection), and firing
-`beforeAuthSuccess` on the legacy `/auth-with-password` / `/auth-refresh` endpoints. (The
-`ctx.auth()` refresh / rotate / revoke session verbs **are** wired — see [§6 Session
-verbs](#ctxauth--session-management).) See the auth-lifecycle-hooks design spec.
+Both formerly-deferred items are now wired (0.10.0): self-service password change rides
+`PATCH /records` (see the lifecycle table above — the `password-change` hooks fire there
+too, and the endpoint enforces `oldPassword` for non-superusers), and `beforeAuthSuccess`
+fires on the legacy `/auth-with-password` / `/auth-refresh` endpoints (tag `.password` /
+`.refresh`). The `ctx.auth()` session verbs also gained a REST surface — see [§6 Session
+verbs](#ctxauth--session-management).
 
 ### Auth methods overview
 
@@ -1727,7 +1736,34 @@ A generic provider requires `authURL`, `tokenURL`, and `userinfoURL` (all must b
 | `authURL` | `null` | Generic provider only. |
 | `tokenURL` | `null` | Generic provider only. |
 | `userinfoURL` | `null` | Generic provider only. |
-| `scopes` | `null` | Override default scopes for a preset, or supply scopes for a generic provider. |
+| `discoveryURL` | `null` | Generic provider only; alternative to `authURL`/`tokenURL`/`userinfoURL`. See below. |
+| `scopes` | `null` | Override default scopes for a preset, or supply scopes for a generic provider (default `openid email profile` when using `discoveryURL`). |
+
+**Generic OIDC discovery (`discoveryURL`).** Any OIDC-compliant IdP (Auth0, Okta, Keycloak,
+Entra custom tenants, Zitadel, …) is one line — point at its discovery document instead of
+hand-copying three endpoint URLs:
+
+```zig
+.providers = .{
+    .{ .name = "okta",
+       .discoveryURL = "https://acme.okta.com/.well-known/openid-configuration",
+       .redirectUrls = .{"https://app.acme.com/oauth/callback"} },
+},
+```
+
+`discoveryURL` is mutually exclusive with explicit `authURL`/`tokenURL`/`userinfoURL`
+(compile error), https-only, and rejected for the built-in preset names. Resolution happens
+**once, at startup**: the framework fetches the document over the same TLS transport every
+OAuth call uses, requires all three of `authorization_endpoint`/`token_endpoint`/
+`userinfo_endpoint` (https-only) plus an `issuer` that prefixes the discovery URL, and
+**refuses to start** on any failure (a half-configured IdP must never silently disable
+login). The resolved endpoints are persisted exactly like literal generic endpoints, so the
+usual provisioning caveat applies (re-resolution needs a migration or an admin-API PATCH —
+there is no per-request discovery dependency). Scopes default to `openid email profile`
+(override with `.scopes`); the claim mapping is the fixed OIDC standard set; PKCE is already
+unconditional. `id_token`/JWKS validation remains out of scope — identity is verified via
+the `userinfo` endpoint over TLS, as for every provider. (Provider fields keep their
+documented camelCase style — `discoveryURL` matches `authURL`/`tokenURL`.)
 
 #### Runtime secrets via environment variables
 
@@ -1965,6 +2001,19 @@ maintains a server-side `_sessions` row per session, enabling a full per-device 
 |---|---|
 | `ctx.auth().listActiveSessions()` | the current principal's active sessions (`id`, `created`, `last_seen`, `user_agent`, `ip`, `is_current`), newest first. |
 | `ctx.auth().revoke(sessionId)` | "log out THIS device" — delete one session row. Authorized: only the owning user (or a superuser) may revoke a given session; a non-owner gets `error.NotFound` (indistinguishable from an absent id, so revoke can't probe other users' session ids). |
+
+Since 0.10.0 the table-mode verbs also have a canonical REST surface (the SDK's
+`listSessions`/`revokeSession`/`revokeAllSessions` ride it):
+
+| Route | Mode | Behavior |
+|---|---|---|
+| `GET /api/collections/:col/auth/sessions` | `.table` only | `200 {"items":[{id,created,last_seen,user_agent,ip,is_current},…]}` newest-first |
+| `DELETE /api/collections/:col/auth/sessions/:sid` | `.table` only | `204`; a non-owned or absent `sid` is an indistinguishable `404` |
+| `DELETE /api/collections/:col/auth/sessions` | both modes | "log out everywhere": epoch bump (+ row wipe in table mode) → `204` with cleared cookies |
+
+In `.epoch` mode the two per-device routes return `404` (feature not enabled). `:col`
+must match the caller's authenticated collection (else `401`). The `sessions` segment
+under `/auth/` is reserved — a custom auth-method slug named `sessions` is a compile error.
 
 In table mode, login/refresh/oauth issuance records a session row and embeds its id in the
 token (`sid` claim); **verify checks the row exists and is unexpired** (one extra indexed read

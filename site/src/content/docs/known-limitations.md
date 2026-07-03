@@ -11,14 +11,18 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 ## Auth & email
 
-- **Per-device session list/revoke requires opt-in `.session_store = .table`.** The default
-  `App(.{ .session_store = .epoch })` revokes per **principal** via the token epoch —
-  `revokeAllSessions()` ("log out everywhere"), `refresh()`, `rotate()` — stateless, with
-  zero extra DB work and unchanged token format. Opting into `App(.{ .session_store = .table })`
-  adds a server-side `_sessions` store enabling `listActiveSessions()` and per-session
-  `revoke(sessionId)` ("log out THIS device"), at the cost of **one extra read per authenticated
-  request** (the documented trade-off). In `.epoch` mode the two per-device verbs return
-  `error.SessionStoreNotEnabled`.
+- **Per-device session list/revoke requires opt-in `.session_store = .table`; the default is
+  still `.epoch`.** The default `App(.{ .session_store = .epoch })` revokes per **principal**
+  via the token epoch — `revokeAllSessions()` ("log out everywhere"), `refresh()`, `rotate()`
+  — stateless, with zero extra DB work and unchanged token format. Opting into
+  `App(.{ .session_store = .table })` adds a server-side `_sessions` store enabling
+  per-device list/revoke, at the cost of **one extra read per authenticated request** (the
+  documented trade-off; flipping the default awaits real-world perf data). The surface now
+  spans three layers, all gated the same way: the `ctx.auth()` verbs (`listActiveSessions()` /
+  `revoke(sessionId)`), the REST endpoints (`GET`/`DELETE /api/collections/:col/auth/sessions[/:sid]`),
+  and the TypeScript SDK (`listSessions()` / `revokeSession(id)`). In `.epoch` mode,
+  `ctx.auth()` returns `error.SessionStoreNotEnabled` and the REST/SDK surface returns a
+  non-oracle `404`.
 - **Mailer requires SMTP configuration for production.** Verification and password-reset
   email is delivered when SMTP is configured (`ZIGBASE_SMTP_HOST` + friends; supports `none`
   / `starttls` / `implicit` TLS). **Without SMTP configured, those tokens are logged to the

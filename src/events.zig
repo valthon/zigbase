@@ -343,7 +343,10 @@ fn routeAuthGuard(comptime s: anytype) ?RouteAuthGuard {
     return lowerRouteAuthGuard(s.auth, s.path);
 }
 
-pub const AuthMethod = enum { password, oauth2, magic_link, otp, webauthn, custom };
+/// Which flow minted (or is about to mint) the session. `.refresh` (new in 0.10.0) tags
+/// `POST …/auth-refresh` — previously mislabeled `.password` on `onAuth`. Exhaustive
+/// `switch`es over this enum must add a `.refresh` arm (compile error — the good kind).
+pub const AuthMethod = enum { password, oauth2, magic_link, otp, webauthn, custom, refresh };
 pub const AuthEvent = struct {
     app: *App,
     ctx: *const request.RequestContext,
@@ -367,7 +370,8 @@ pub const AuthSuccessEvent = struct {
     collection: []const u8,
     /// The authenticated record's id.
     record_id: []const u8,
-    /// Which method completed (`.password`/`.magic_link`/`.otp`/`.webauthn`/`.oauth2`/`.custom`).
+    /// Which method completed (`.password`/`.magic_link`/`.otp`/`.webauthn`/`.oauth2`/`.custom`),
+    /// or `.refresh` on the auth-refresh path.
     method: AuthMethod,
     /// The authenticated record (always provided). The hook may also read fresh state
     /// via `ctx.records().get(collection, record_id, .{})` on the bound connection.
@@ -1351,6 +1355,7 @@ test "AuthMethod enumerates all method tags" {
     try std.testing.expectEqualStrings("custom", @tagName(AuthMethod.custom));
     try std.testing.expectEqualStrings("otp", @tagName(AuthMethod.otp));
     try std.testing.expectEqualStrings("webauthn", @tagName(AuthMethod.webauthn));
+    try std.testing.expectEqualStrings("refresh", @tagName(AuthMethod.refresh));
 }
 
 test "isUntypedHandler detects raw-response handlers and routeMeta flags them out of codegen" {

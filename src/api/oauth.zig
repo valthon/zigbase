@@ -344,6 +344,33 @@ test "resolveProvider: preset, generic, and https rejection" {
     try std.testing.expect(resolveProvider(.{ .name = "google", .tokenURL = "http://evil/tok" }) == null);
 }
 
+test "resolveProvider: a discovery-resolved provider is equivalent to a hand-configured generic one" {
+    // What resolveDiscoveryProviders produces: cfg with the three URLs filled + discoveryURL set.
+    const discovered = resolveProvider(.{
+        .name = "okta",
+        .discoveryURL = "https://acme.okta.com/.well-known/openid-configuration",
+        .authURL = "https://acme.okta.com/oauth2/v1/authorize",
+        .tokenURL = "https://acme.okta.com/oauth2/v1/token",
+        .userinfoURL = "https://acme.okta.com/oauth2/v1/userinfo",
+    }).?;
+    const hand = resolveProvider(.{
+        .name = "okta",
+        .authURL = "https://acme.okta.com/oauth2/v1/authorize",
+        .tokenURL = "https://acme.okta.com/oauth2/v1/token",
+        .userinfoURL = "https://acme.okta.com/oauth2/v1/userinfo",
+    }).?;
+    try std.testing.expectEqualStrings(hand.tokenURL, discovered.tokenURL);
+    try std.testing.expectEqualStrings(hand.userinfoURL, discovered.userinfoURL);
+    try std.testing.expectEqualStrings("sub", discovered.mapping.id); // fixed OIDC-standard mapping
+    try std.testing.expectEqual(@as(usize, 3), discovered.scopes.len); // openid email profile default
+    // An UNRESOLVED discovery provider (URLs still null — e.g. a code path that skipped
+    // startup resolution) must fail closed: resolveProvider returns null, never a half-provider.
+    try std.testing.expect(resolveProvider(.{
+        .name = "okta",
+        .discoveryURL = "https://acme.okta.com/.well-known/openid-configuration",
+    }) == null);
+}
+
 const TestEnv = struct {
     tmp: std.testing.TmpDir,
     pool: db.Pool,

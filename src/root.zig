@@ -246,6 +246,7 @@ test {
     _ = @import("api/collections.zig");
     _ = @import("api/records.zig");
     _ = @import("api/auth.zig");
+    _ = @import("api/sessions.zig");
     _ = @import("api/oauth.zig");
     _ = @import("api/files.zig");
     _ = @import("api/settings.zig");
@@ -254,6 +255,7 @@ test {
     _ = @import("oauth/secrets.zig");
     _ = @import("oauth/providers.zig");
     _ = @import("oauth/client.zig");
+    _ = @import("oauth/discovery.zig");
     _ = @import("query/params.zig");
     _ = @import("query/lexer.zig");
     _ = @import("query/parser.zig");

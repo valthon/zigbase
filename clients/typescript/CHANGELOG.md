@@ -4,6 +4,19 @@ All notable changes to `@zigbase/client` are documented here. The format is base
 on [Keep a Changelog](https://keepachangelog.com/), and this package adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `CollectionService.changePassword(id, oldPassword, newPassword)` — self-service password
+  change via `PATCH /records/:id`; transparently re-authenticates the current device when the
+  caller changes their own password (requires ZigBase >= 0.10.0).
+- `CollectionService.listSessions()`, `revokeSession(id)`, `revokeAllSessions()` — per-device
+  session management against `/auth/sessions[/:sid]`. `listSessions`/`revokeSession` require
+  the server to run `.session_store = .table`; `revokeAllSessions` works in both session-store
+  modes.
+- `SessionInfo` type.
+
 ## [0.2.0] - 2026-06-21
 
 Tracks the server's auth overhaul. **Requires ZigBase server ≥ 0.5.0** — the legacy

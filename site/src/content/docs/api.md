@@ -177,6 +177,30 @@ Record endpoints operate on a collection by name (`:col`).
 
 Access to each operation is governed by the collection's [access rules](#access-rules).
 
+### Update: changing a password on an auth collection
+
+A `PATCH` on an **auth** collection's record that includes a `password` field is a
+self-service password change, gated on top of the normal update rule:
+
+- **Non-superusers must also send a verifying `oldPassword`.** A wrong `oldPassword`, a
+  missing `oldPassword`, an unknown record, or a target record with no password set
+  (passwordless — e.g. OAuth2-only) all return the **same** login-identical
+  `400 {"message":"Invalid credentials."}` — the failure modes are indistinguishable by
+  design, so the endpoint can't be used to probe which accounts have a password.
+  Passwordless accounts cannot bootstrap a password via `PATCH`; use the password-reset
+  email flow or a superuser update instead.
+- **Superusers are exempt** from the `oldPassword` check (and from its rate limit — see
+  [Rate limiting](#rate-limiting)).
+- On a successful **self-change** (the caller is the record being updated), the response
+  sets fresh `zb_auth`/`zb_csrf` cookies — the JSON body itself stays the plain updated
+  record.
+- Every other outstanding session for the record is invalidated (the same guarantee as
+  `confirm-password-reset`).
+
+This rides the record `beforeUpdate`/`afterUpdate` hooks plus the `.auth`
+`beforePasswordChange`/`afterPasswordChange` lifecycle hooks — see
+[Framework → Auth lifecycle hooks](./framework#auth-lifecycle-hooks-register--logout--refresh--password-change).
+
 ### List: query parameters
 
 The list endpoint supports two pagination styles: **offset** (`page`/`perPage`) and
@@ -505,6 +529,9 @@ Auth endpoints target an auth-type collection (`:col`).
 | POST | `/api/collections/:col/confirm-verification` | Confirm verification with a token. |
 | POST | `/api/collections/:col/request-password-reset` | Request a password-reset token. |
 | POST | `/api/collections/:col/confirm-password-reset` | Confirm a reset with a token. |
+| GET | `/api/collections/:col/auth/sessions` | List the caller's active sessions. `.session_store = .table` only — `404` in `.epoch` mode. |
+| DELETE | `/api/collections/:col/auth/sessions/:sid` | "Log out THIS device". `.session_store = .table` only — `404` in `.epoch` mode. |
+| DELETE | `/api/collections/:col/auth/sessions` | "Log out everywhere" — works in both session-store modes. |
 
 ### auth-with-password
 
@@ -528,10 +555,41 @@ When you authenticate via these cookies, writes must echo the `zb_csrf` cookie i
 > **Embeddable hooks.** When ZigBase is used as a Zig library, `auth-refresh` and
 > `auth-logout` run through the `.auth` lifecycle hook group (`before_refresh` /
 > `after_refresh`, `before_logout` / `after_logout`); a `before` hook that fails closed
-> aborts the request before any session change. Embedders also get the `ctx.auth()` session
-> verbs (`refresh` / `rotate` / `revokeAllSessions`, and per-device `listActiveSessions` /
-> `revoke`) and the optional table-backed session store. See
-> [Framework §6](./framework#6-auth--file--lifecycle-events).
+> aborts the request before any session change. `beforeAuthSuccess` also fires on
+> `auth-with-password` (tag `.password`) and `auth-refresh` (tag `.refresh`, in the same
+> transaction as `beforeRefresh`, lifecycle phase first) — see
+> [Framework → Auth lifecycle](./framework#auth-lifecycle-beforeauthsuccess). Embedders
+> also get the `ctx.auth()` session verbs (`refresh` / `rotate` / `revokeAllSessions`, and
+> per-device `listActiveSessions` / `revoke`) and the optional table-backed session store.
+> See [Framework §6](./framework#6-auth--file--lifecycle-events).
+
+### Session management
+
+`GET`/`DELETE /api/collections/:col/auth/sessions[/:sid]` (added in the auth endpoints
+table above) are the REST surface over the table-mode `ctx.auth()` session verbs (the
+TypeScript SDK's `listSessions`/`revokeSession`/`revokeAllSessions` ride these):
+
+```json
+// GET /api/collections/:col/auth/sessions — 200
+{
+  "items": [
+    { "id": "...", "created": "...", "last_seen": "...", "user_agent": "...", "ip": "...", "is_current": true }
+  ]
+}
+```
+
+- `items` is newest-first.
+- `DELETE …/auth/sessions/:sid` ("log out this device") returns **`204`** with an empty
+  body on success. A `:sid` you don't own and an absent `:sid` are an **identical `404`**
+  (non-owner probing can't be distinguished from a stale/unknown id).
+- Both per-device routes return **`404`** when the collection is running in `.epoch` mode
+  (the feature simply isn't enabled — same non-oracle policy as a disabled auth-method slug).
+- `DELETE …/auth/sessions` ("log out everywhere") works in **both** modes: it bumps the
+  token epoch (killing every outstanding token, including ones minted before `.table` was
+  enabled) and, in table mode, also wipes the principal's session rows. It returns `204`
+  and **clears** the caller's own auth cookies — the current session dies too, by design.
+- `:col` must match the caller's authenticated collection, else `401` (parity with
+  `auth-refresh`).
 
 ### Registration / signup
 
@@ -709,7 +767,9 @@ registered in your `App(.{ .onAuth = ... })`. This is the single chokepoint for
 cross-cutting session logic (audit logging, account-state checks, etc.). There is no
 path through ZigBase's session-issuance machinery that bypasses it.
 
-`AuthEvent.method` is an enum: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`, or `.custom` for custom plugins.
+`AuthEvent.method` is an enum: `.password`, `.oauth2`, `.magic_link`, `.otp`, `.webauthn`,
+`.custom` for custom plugins, or `.refresh` for `auth-refresh` (previously mislabeled
+`.password`).
 
 See [Framework §6](./framework#6-auth--file--lifecycle-events) for the
 `zigbase.auth` helper surface and the seam guarantee.
@@ -717,9 +777,12 @@ See [Framework §6](./framework#6-auth--file--lifecycle-events) for the
 ### Rate limiting
 
 The sensitive auth endpoints — `auth-with-password` (login), `request-verification`,
-`request-password-reset`, and all `auth/:method/initiate` / `auth/:method/complete`
-endpoints — are rate limited. Over the limit, the endpoint returns **`429
-Too Many Requests`** (`{ "message": "Too many requests. Try again later." }`).
+`request-password-reset`, password change (`PATCH …/records/:id` with a `password`, scope
+`pwchange`), and all `auth/:method/initiate` / `auth/:method/complete` endpoints — are rate
+limited. Over the limit, the endpoint returns **`429 Too Many Requests`**
+(`{ "message": "Too many requests. Try again later." }`). Password change shares the same
+global `ZIGBASE_RATE_LIMIT_MAX`/`ZIGBASE_RATE_LIMIT_WINDOW` budget as `login`/`verify`/`reset`
+(it isn't a `.auth.methods` entry, so it has no per-method override); superusers bypass it.
 
 Per-method rate-limit behavior is configured in `.auth.methods` via the `rate_limit` field (`.default` | `.off` | `.{ .custom = .{ .max, .window_s } }`). See [Framework §6](./framework#6-auth--file--lifecycle-events).
 
