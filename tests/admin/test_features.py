@@ -1,9 +1,11 @@
 """
 Admin UI tests for the Feature Flags & Experiments screen (PR4 / 0.8.0).
 
-The standalone zigbase binary declares two flags (dark_mode, maintenance) and one
-experiment (onboarding_flow) in src/main.zig, so the GET /api/features response is
-non-empty and the UI can be exercised end-to-end.
+The features-fixture binary (fixtures/features/main.zig) declares two flags
+(dark_mode, maintenance) and one experiment (onboarding_flow), so the GET
+/api/features response is non-empty and the UI can be exercised end-to-end.
+The demo flags were evicted from the release binary (R2-1) — the stock
+zigbase binary now declares nothing.
 
 Covers:
 - Navigation to the Features view
@@ -11,7 +13,19 @@ Covers:
 - Declared experiments panel: editing weights writes the override; reset clears it
 - data-test hooks present as specified in the PR4 plan
 """
+import pathlib
+import pytest
+from _bin import resolve_binary
 from conftest import login, api_request
+
+REPO = pathlib.Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(scope="session")
+def binary():
+    # The demo flags/experiments were evicted from the release binary (R2-1);
+    # these tests drive the dedicated fixture app instead.
+    return resolve_binary("ZIGBASE_FEATURES_BINARY", REPO, "features-fixture")
 
 
 # ── Navigation ──────────────────────────────────────────────────────────────

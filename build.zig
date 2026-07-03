@@ -141,6 +141,19 @@ pub fn build(b: *std.Build) void {
     const auth2_srv_step = b.step("auth2-server", "Build the auth-round-2 e2e fixture server (table sessions + beforeAuthSuccess)");
     auth2_srv_step.dependOn(&b.addInstallArtifact(auth2_srv_exe, .{}).step);
 
+    // --- features-fixture: demo flags/experiments server for the browser suite ---
+    const features_fix_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/features/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    features_fix_mod.addImport("zigbase", zigbase_mod);
+    const features_fix_exe = b.addExecutable(.{ .name = "features-fixture", .root_module = features_fix_mod });
+    const features_fix_step = b.step("features-fixture", "Build the demo-features fixture server (browser tests)");
+    features_fix_step.dependOn(&b.addInstallArtifact(features_fix_exe, .{}).step);
+
+
     // Unit tests run against the library module (where all internal test{} live).
     const tests = b.addTest(.{ .root_module = zigbase_mod });
     const run_tests = b.addRunArtifact(tests);

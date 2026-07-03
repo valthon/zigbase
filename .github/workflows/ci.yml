@@ -59,6 +59,8 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build dating-server -Dcpu=baseline
       - name: Build auth2-server (e2e fixture binary)
         run: mise exec zig@0.16.0 -- zig build auth2-server -Dcpu=baseline
+      - name: Build features-fixture (demo flags/experiments browser fixture)
+        run: mise exec zig@0.16.0 -- zig build features-fixture -Dcpu=baseline
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
@@ -76,6 +78,7 @@ jobs:
             zig-out/bin/zigbase
             zig-out/bin/dating-server
             zig-out/bin/auth2-server
+            zig-out/bin/features-fixture
             examples/blog/zig-out/bin/blog
             examples/golfsim/zig-out/bin/golfsim
             examples/plugins/zig-out/bin/plugins
@@ -312,6 +315,8 @@ jobs:
           echo "ZIGBASE_TEST_AUTH2_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/auth2-server" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_BLOG_BINARY=$GITHUB_WORKSPACE/artifacts/examples/blog/zig-out/bin/blog" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/features-fixture
+          echo "ZIGBASE_FEATURES_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/features-fixture" >> "$GITHUB_ENV"
       - name: Install Python test deps + resolve Playwright version
         id: pw
         run: |
