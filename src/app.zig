@@ -124,6 +124,10 @@ pub const App = struct {
     captcha_secret: []const u8 = "",
     /// Type-erased pointer to the running Scheduler (set by Scheduler.start); null = not running.
     scheduler: ?*anyopaque = null,
+    /// Type-erased pointer to the running memory-queue worker Pool (`queue/memory.zig`),
+    /// set by `Pool.install` in serveImpl; null = not serving (tests/CLI). Memory-backend
+    /// `ctx.enqueue` jobs and `app.submit` tasks run on this bounded, shutdown-joined pool.
+    memory_pool: ?*anyopaque = null,
     /// Submit an ad-hoc job task for async execution; set by Scheduler.start. Task 5 wires App.submit().
     submit_fn: ?*const fn (ctx: *anyopaque, name: []const u8, task: @import("events.zig").JobTask) anyerror!void = null,
 

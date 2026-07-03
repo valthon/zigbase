@@ -1,9 +1,14 @@
-//! Memory queue backend (#137 PR2): jobs run in-process on a detached background
-//! thread with in-process backoff retry. AT-MOST-ONCE across restart — an enqueued
-//! memory job lives only in RAM, so a crash (or a shutdown before the detached thread
-//! runs) drops it. Use a `durable` queue when a job MUST survive a restart. This
-//! mirrors `App.submit`'s detached-thread model (the thread is not joined at
-//! shutdown), and is the default backend so a queue "just works" with zero schema.
+//! Memory queue backend (#137 PR2; bounded pool since 0.10.0): jobs run in-process on a
+//! small shared worker pool (spawned lazily on first use, DRAINED AND JOINED at shutdown)
+//! with in-process backoff retry. AT-MOST-ONCE across restart — an enqueued memory job
+//! lives only in RAM, so a crash drops it. The ring is bounded: when it is full, enqueue
+//! returns error.QueueFull instead of blocking (a blocking policy could deadlock when a
+//! handler enqueues from a pool worker) or spawning unbounded threads. `app.submit` tasks
+//! ride the same pool (see Pool.submitThunk). A retrying job holds one worker for the
+//! whole backoff — size retry policies accordingly; use a `durable` queue when a job MUST
+//! survive a restart or for sustained high-volume work. Without an installed pool (unit
+//! tests / CLI helpers) enqueue runs the job INLINE, synchronously — deterministic for
+//! tests, and no code path spawns detached threads anymore.
 
 const std = @import("std");
 const queue = @import("queue.zig");
@@ -11,6 +16,7 @@ const events = @import("../events.zig");
 const App = @import("../app.zig").App;
 const Ctx = @import("../ctx.zig").Ctx;
 const entropy = @import("../entropy.zig");
+const scheduler_mod = @import("../scheduler.zig");
 
 const QueueDef = queue.QueueDef;
 const RetryPolicy = queue.RetryPolicy;
@@ -45,36 +51,191 @@ pub fn runWithRetry(app: *App, handler: queue.JobHandler, payload: []const u8, p
     }
 }
 
-const Job = struct {
+/// One queued unit of pool work: a memory-queue job or an `app.submit` task. Heap-allocated
+/// with app.allocator; owns its payload/name copies; freed by the worker after running.
+const Task = struct {
     app: *App,
-    handler: queue.JobHandler,
-    policy: RetryPolicy,
-    payload: []u8, // owned (app.allocator)
+    kind: Kind,
 
-    fn run(self: *Job) void {
-        defer {
-            self.app.allocator.free(self.payload);
-            self.app.allocator.destroy(self);
+    const Kind = union(enum) {
+        job: struct { handler: queue.JobHandler, policy: RetryPolicy, payload: []u8 },
+        submit: struct { name: []u8, task: events.JobTask },
+    };
+
+    fn run(self: *Task) void {
+        defer self.destroy();
+        switch (self.kind) {
+            .job => |j| _ = runWithRetry(self.app, j.handler, j.payload, j.policy),
+            .submit => |s| {
+                var ev = events.JobEvent{ .app = self.app, .name = s.name };
+                // Arena declared before cx so its deinit runs last (LIFO): cx.deinit only
+                // releases a pooled reader; the arena owns ctx.records() results.
+                var arena = std.heap.ArenaAllocator.init(self.app.allocator);
+                defer arena.deinit();
+                var cx = Ctx{ .app = self.app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+                defer cx.deinit();
+                s.task(&cx, &ev) catch |e| {
+                    var err_ev = events.ErrorEvent{ .app = self.app, .ctx = null, .err = e, .phase = .job, .message = @errorName(e) };
+                    events.dispatchError(self.app, self.app.dispatch, &err_ev);
+                };
+            },
         }
-        _ = runWithRetry(self.app, self.handler, self.payload, self.policy);
+    }
+
+    fn destroy(self: *Task) void {
+        const a = self.app.allocator;
+        switch (self.kind) {
+            .job => |j| a.free(j.payload),
+            .submit => |s| a.free(s.name),
+        }
+        a.destroy(self);
     }
 };
 
-/// Enqueue a memory job: copy `payload` and run it on a DETACHED background thread with
-/// retry. Returns once the thread is spawned (never blocks the caller on the handler).
-/// At-most-once: the job is lost on crash/shutdown before it completes.
+/// Bounded worker pool for memory-backend jobs + `app.submit` tasks. Reuses the
+/// Scheduler's spinlock-ring pattern (scheduler.zig): all ring/started mutation under
+/// `mutex`; workers poll the ring (20 ms idle sleep, matching the scheduler's cadence).
+/// Threads spawn LAZILY on the first push (zero overhead when unused) and `stop()`
+/// drains the ring and joins every worker (tasks queued before shutdown complete;
+/// pushes after shutdown are rejected).
+pub const Pool = struct {
+    /// Ring capacity. Overflow returns error.QueueFull — reject-not-block, because a
+    /// handler may enqueue from a pool worker (block-on-full would self-deadlock).
+    pub const capacity = 256;
+    /// Fixed worker count. Matches facil.io's 4 HTTP threads: a burst drains 4-wide
+    /// without reserving idle threads for the common no-queue deployment (lazy spawn).
+    pub const num_workers = 4;
+
+    app: *App,
+    ring: [capacity]*Task = undefined,
+    head: usize = 0,
+    len: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+    started: bool = false, // guarded by mutex
+    nworkers: usize = 0, // actually-spawned workers (== num_workers unless spawn failed)
+    shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    workers: [num_workers]std.Thread = undefined,
+
+    pub fn init(app: *App) Pool {
+        return .{ .app = app };
+    }
+
+    /// Route this app's memory-queue jobs AND `app.submit` through this pool.
+    /// Call once, before serving; pair with `stop()` at shutdown.
+    pub fn install(self: *Pool, app: *App) void {
+        app.memory_pool = self;
+        app.submit_fn = &submitThunk;
+    }
+
+    /// Reject new pushes, let the workers DRAIN the remaining ring, join them, and
+    /// uninstall from the app. Idempotent; safe when no worker was ever spawned.
+    pub fn stop(self: *Pool) void {
+        self.shutdown.store(true, .release);
+        self.lockPool();
+        const n = if (self.started) self.nworkers else 0;
+        self.started = false;
+        self.unlockPool();
+        for (self.workers[0..n]) |t| t.join();
+        if (self.app.memory_pool == @as(?*anyopaque, @ptrCast(self))) {
+            self.app.memory_pool = null;
+            self.app.submit_fn = null;
+        }
+        // Free anything a failed spawn stranded in the ring (drain normally empties it).
+        self.lockPool();
+        while (self.dequeue()) |t| t.destroy();
+        self.unlockPool();
+    }
+
+    fn lockPool(self: *Pool) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn unlockPool(self: *Pool) void {
+        self.mutex.unlock();
+    }
+
+    fn dequeue(self: *Pool) ?*Task { // caller holds lock
+        if (self.len == 0) return null;
+        const t = self.ring[self.head];
+        self.head = (self.head + 1) % capacity;
+        self.len -= 1;
+        return t;
+    }
+
+    /// Queue `task` (ownership transfers on success). Lazily spawns the workers on the
+    /// first push. error.QueueFull when the ring is full; error.ShuttingDown after stop().
+    fn push(self: *Pool, task: *Task) !void {
+        self.lockPool();
+        errdefer self.unlockPool();
+        if (self.shutdown.load(.acquire)) return error.ShuttingDown;
+        if (!self.started) {
+            // One-time spawn under the spinlock: slow (a few syscalls) but happens once.
+            // 1 MiB stacks — same rationale + floor as the scheduler's threads.
+            var spawned: usize = 0;
+            for (self.workers[0..num_workers]) |*t| {
+                t.* = std.Thread.spawn(
+                    .{ .stack_size = scheduler_mod.min_job_stack_size },
+                    workerLoop,
+                    .{self},
+                ) catch break;
+                spawned += 1;
+            }
+            if (spawned == 0) return error.SystemResources;
+            self.nworkers = spawned;
+            self.started = true;
+        }
+        if (self.len == capacity) return error.QueueFull;
+        self.ring[(self.head + self.len) % capacity] = task;
+        self.len += 1;
+        self.unlockPool();
+    }
+
+    fn workerLoop(self: *Pool) void {
+        while (true) {
+            self.lockPool();
+            const maybe = self.dequeue();
+            self.unlockPool();
+            const task = maybe orelse {
+                // Empty ring: exit ONLY on shutdown — this is what makes stop() a drain.
+                if (self.shutdown.load(.acquire)) return;
+                self.app.io.sleep(std.Io.Duration.fromMilliseconds(20), .awake) catch {};
+                continue;
+            };
+            task.run();
+        }
+    }
+
+    /// `app.submit` entry point (wired by install() onto app.submit_fn). Copies `name`
+    /// (the caller's slice may be request-arena-backed and dead before the task runs —
+    /// the old detached-thread code captured it unsafely).
+    pub fn submitThunk(ptr: *anyopaque, name: []const u8, task: events.JobTask) anyerror!void {
+        const self: *Pool = @ptrCast(@alignCast(ptr));
+        const t = try self.app.allocator.create(Task);
+        errdefer self.app.allocator.destroy(t);
+        const name_copy = try self.app.allocator.dupe(u8, name);
+        errdefer self.app.allocator.free(name_copy);
+        t.* = .{ .app = self.app, .kind = .{ .submit = .{ .name = name_copy, .task = task } } };
+        try self.push(t);
+    }
+};
+
+fn poolFrom(app: *App) ?*Pool {
+    return @ptrCast(@alignCast(app.memory_pool orelse return null));
+}
+
+/// Enqueue a memory job. With an installed Pool (serving): copy `payload`, queue it on the
+/// bounded worker ring, return immediately (error.QueueFull when the ring is full — reject,
+/// never block). Without a pool (unit tests / CLI helpers): run the job INLINE, synchronously.
+/// At-most-once across restart either way.
 pub fn enqueue(app: *App, def: QueueDef, handler: queue.JobHandler, payload: []const u8) !void {
-    const job = try app.allocator.create(Job);
-    errdefer app.allocator.destroy(job);
-    job.* = .{
-        .app = app,
-        .handler = handler,
-        .policy = def.retry,
-        .payload = try app.allocator.dupe(u8, payload),
-    };
-    errdefer app.allocator.free(job.payload);
-    const th = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, Job.run, .{job});
-    th.detach();
+    if (poolFrom(app)) |p| {
+        const t = try app.allocator.create(Task);
+        errdefer app.allocator.destroy(t);
+        const pcopy = try app.allocator.dupe(u8, payload);
+        errdefer app.allocator.free(pcopy);
+        t.* = .{ .app = app, .kind = .{ .job = .{ .handler = handler, .policy = def.retry, .payload = pcopy } } };
+        return p.push(t);
+    }
+    _ = runWithRetry(app, handler, payload, def.retry);
 }
 
 fn randomU64(io: std.Io) u64 {
@@ -84,8 +245,8 @@ fn randomU64(io: std.Io) u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — exercise the synchronous core (`runWithRetry`); the detached-thread
-// `enqueue` is covered end-to-end via ctx.enqueue in ctx.zig.
+// Tests — exercise the synchronous core (`runWithRetry`), the inline no-pool
+// `enqueue` fallback, and the bounded worker `Pool` (push/drain/overflow/submit).
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -149,4 +310,80 @@ test "memory runWithRetry exhausts attempts -> failed + onError" {
     try testing.expectEqual(Outcome.failed, out);
     try testing.expectEqual(@as(usize, 3), m_runs);
     try testing.expectEqual(@as(usize, 1), m_err);
+}
+
+var g_gate = std.atomic.Value(bool).init(false);
+var g_blocked = std.atomic.Value(usize).init(0);
+
+fn blockingH(ctx: *Ctx, payload: []const u8) anyerror!void {
+    _ = payload;
+    _ = g_blocked.fetchAdd(1, .monotonic);
+    while (!g_gate.load(.acquire)) {
+        ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+}
+
+test "pool runs enqueued jobs and stop() drains the ring + joins the workers" {
+    m_runs = 0;
+    var app = testApp();
+    var pool = Pool.init(&app);
+    pool.install(&app);
+    const def = QueueDef{ .name = "default", .backend = .memory, .retry = .{ .base_ms = 0, .jitter = false } };
+    for (0..8) |_| try enqueue(&app, def, okH, "{}");
+    pool.stop(); // drains + joins => deterministic, no spin-wait needed
+    try testing.expectEqual(@as(usize, 8), m_runs);
+    try testing.expect(app.memory_pool == null); // uninstalled
+}
+
+test "pool overflow: full ring rejects with error.QueueFull (burst does not spawn threads per job)" {
+    m_runs = 0;
+    g_gate.store(false, .monotonic);
+    g_blocked.store(0, .monotonic);
+    var app = testApp();
+    var pool = Pool.init(&app);
+    pool.install(&app);
+    const def = QueueDef{ .name = "default", .backend = .memory, .retry = .{ .max_attempts = 1, .base_ms = 0, .jitter = false } };
+    // Occupy every worker with a gated job, deterministically.
+    for (0..Pool.num_workers) |_| try enqueue(&app, def, blockingH, "{}");
+    var spins: usize = 0;
+    while (g_blocked.load(.acquire) < Pool.num_workers and spins < 2000) : (spins += 1) {
+        app.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expectEqual(@as(usize, Pool.num_workers), g_blocked.load(.acquire));
+    // Fill the ring exactly, then one more must be rejected — bounded, not thread-per-enqueue.
+    for (0..Pool.capacity) |_| try enqueue(&app, def, okH, "{}");
+    try testing.expectError(error.QueueFull, enqueue(&app, def, okH, "{}"));
+    g_gate.store(true, .release);
+    pool.stop(); // drain: all capacity fillers run
+    try testing.expectEqual(@as(usize, Pool.capacity), m_runs);
+}
+
+test "submitThunk routes app.submit tasks through the pool (name copied, joined at stop)" {
+    const S = struct {
+        var ran = std.atomic.Value(bool).init(false);
+        fn task(cx: *Ctx, ev: *events.JobEvent) anyerror!void {
+            _ = cx;
+            try testing.expectEqualStrings("reindex", ev.name);
+            ran.store(true, .release);
+        }
+    };
+    S.ran.store(false, .monotonic);
+    var app = testApp();
+    var pool = Pool.init(&app);
+    pool.install(&app);
+    // Pass an EPHEMERAL name buffer to prove submitThunk copies it.
+    var name_buf: [7]u8 = undefined;
+    @memcpy(&name_buf, "reindex");
+    try Pool.submitThunk(@ptrCast(&pool), name_buf[0..], S.task);
+    @memset(&name_buf, 'X');
+    pool.stop();
+    try testing.expect(S.ran.load(.acquire));
+}
+
+test "enqueue with no installed pool runs inline (unit-test/CLI fallback)" {
+    m_runs = 0;
+    var app = testApp();
+    const def = QueueDef{ .name = "default", .backend = .memory, .retry = .{ .base_ms = 0, .jitter = false } };
+    try enqueue(&app, def, okH, "{}");
+    try testing.expectEqual(@as(usize, 1), m_runs); // ran synchronously, no thread
 }
