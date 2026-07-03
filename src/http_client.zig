@@ -1,7 +1,7 @@
 const std = @import("std");
 const testcapture = @import("testcapture.zig");
 
-pub const Method = enum { GET, POST, PUT, PATCH, DELETE };
+pub const Method = enum { GET, POST, PUT, PATCH, DELETE, HEAD };
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const HttpResponse = struct {
     status: u16,
@@ -32,6 +32,26 @@ pub const RequestOptions = struct {
 };
 
 pub const PostOptions = struct { headers: []const Header = &.{}, body: ?[]const u8 = null };
+
+/// True when a response to this method/status is DEFINED to carry no body, no matter
+/// what Content-Length/Transfer-Encoding header it arrives with (RFC 9110 §6.4.1): a
+/// HEAD response, any 1xx, 204 No Content, or 304 Not Modified. `std.http.Client`
+/// applies this same rule when framing the HEAD (`receiveHead()` stops at the blank
+/// line for exactly these cases regardless of headers) but does NOT propagate it
+/// anywhere else — both our own body read below AND `Request.deinit()`'s own
+/// connection-reuse safety net independently decide whether to read a body from
+/// `method.responseHasBody()` alone, which is TRUE for DELETE (a DELETE response CAN
+/// carry a body in general). Against MinIO specifically, a 204 DELETE response has
+/// neither Content-Length nor Transfer-Encoding, so whichever of those two reads a
+/// "body" falls back to "read until the connection closes" — and blocks forever on
+/// a keep-alive connection a spec-conforming server never closes (observed: ~30s,
+/// the connection's own idle timeout finally firing, not ours). Every caller of this
+/// function MUST ALSO force `connection.closing = true` on a true result — see the
+/// call sites — so `deinit()`'s own drain-and-reuse attempt is skipped too.
+fn responseHasNoBody(method: std.http.Method, status: std.http.Status) bool {
+    return method == .HEAD or status.class() == .informational or
+        status == .no_content or status == .not_modified;
+}
 
 /// Lightweight outbound HTTP client.
 ///
@@ -89,6 +109,7 @@ pub const HttpClient = struct {
             .PUT => .PUT,
             .PATCH => .PATCH,
             .DELETE => .DELETE,
+            .HEAD => .HEAD,
         };
         // Mirror std.http.Client.fetch: follow up to 3 redirects for bodyless
         // requests; leave redirect handling to the caller for requests with a body.
@@ -128,6 +149,21 @@ pub const HttpClient = struct {
             });
         }
         const captured_headers = try header_list.toOwnedSlice(self.alloc);
+
+        // A response DEFINED to have no body (see `responseHasNoBody`) is never read —
+        // any Content-Length it carries describes what a GET would have returned, not
+        // actual bytes on this wire. Force the connection closed rather than pooled:
+        // `deinit()` (via `defer` above) would otherwise try its OWN body drain using
+        // `method.responseHasBody()`, which doesn't know about this status/method and
+        // would hang exactly the way we just avoided.
+        if (responseHasNoBody(method, response.head.status)) {
+            if (req.connection) |connection| connection.closing = true;
+            return .{
+                .status = @intFromEnum(response.head.status),
+                .headers = captured_headers,
+                .body = fw.buffered(),
+            };
+        }
 
         // Read and optionally decompress the response body (mirrors fetch()).
         const decompress_buffer: []u8 = switch (response.head.content_encoding) {
@@ -246,6 +282,44 @@ const TestHttpServer = struct {
         ) catch return;
         w.interface.flush() catch {};
     }
+
+    /// Like `serveOne`, but for `responseHasNoBody` regression coverage: emits ONLY the
+    /// status line + `extra_headers` (no `Content-Length`, no `Connection: close`, no
+    /// blank-line body) and then holds the connection open for `hold_ms` before closing
+    /// — mimicking a keep-alive server (MinIO) that never closes on its own. A correct
+    /// client returns as soon as the headers are parsed, without waiting on `hold_ms`;
+    /// a regressed client (trying to read a body this response is defined not to have)
+    /// blocks until this forced close unblocks it — bounding the failure mode to
+    /// `hold_ms`, not a real hang, so a regression fails the test slowly rather than
+    /// wedging the suite.
+    fn serveOneNoBodyThenHold(status_code: u16, extra_headers: []const u8, hold_ms: i64) !TestHttpServer {
+        var addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var srv = try addr.listen(std.testing.io, .{});
+        errdefer srv.deinit(std.testing.io);
+        const port = srv.socket.address.getPort();
+        const thread = try std.Thread.spawn(.{}, struct {
+            fn run(s: std.Io.net.Server, code: u16, headers: []const u8, ms: i64) void {
+                var server = s;
+                const stream = server.accept(std.testing.io) catch return;
+                defer stream.close(std.testing.io);
+                var read_buf: [4096]u8 = undefined;
+                var r = stream.reader(std.testing.io, &read_buf);
+                var total: usize = 0;
+                while (total < read_buf.len) {
+                    const data = r.interface.peek(total + 1) catch break;
+                    total = data.len;
+                    if (std.mem.indexOf(u8, data, "\r\n\r\n") != null) break;
+                    if (total >= read_buf.len) break;
+                }
+                var write_buf: [4096]u8 = undefined;
+                var w = stream.writer(std.testing.io, &write_buf);
+                w.interface.print("HTTP/1.1 {d} OK\r\n{s}\r\n", .{ code, headers }) catch return;
+                w.interface.flush() catch {};
+                std.testing.io.sleep(std.Io.Duration.fromMilliseconds(ms), .awake) catch {};
+            }
+        }.run, .{ srv, status_code, extra_headers, hold_ms });
+        return .{ .thread = thread, .server = srv, .port = port };
+    }
 };
 
 test "HttpClient.get returns status and body from a loopback server" {
@@ -285,4 +359,42 @@ test "HttpClient.get captures response headers" {
         }
     }
     try std.testing.expect(found); // header must be present
+}
+
+// Regression coverage for the ~30s MinIO DELETE/HEAD stall (see `responseHasNoBody`'s
+// doc comment): a 204 with a misleadingly-present Content-Length, and a 204 with none
+// at all, must both return near-instantly — NOT wait for the server to close the
+// connection (`serveOneNoBodyThenHold`'s `hold_ms` — a correct client never sees it).
+
+test "HttpClient.request: a 204 with a (misleading) Content-Length returns instantly, not after the server closes" {
+    var server = try TestHttpServer.serveOneNoBodyThenHold(204, "Content-Length: 10\r\n", 2000);
+    defer server.stop();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const client = HttpClient{ .alloc = arena.allocator(), .io = std.testing.io };
+
+    const t0 = std.Io.Timestamp.now(std.testing.io, .awake);
+    const res = try client.request(.{ .method = .DELETE, .url = try server.url(arena.allocator()) });
+    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds - t0.nanoseconds, std.time.ns_per_ms);
+
+    try std.testing.expectEqual(@as(u16, 204), res.status);
+    try std.testing.expectEqualStrings("", res.body);
+    // Generous margin over near-instant; the server's forced close is 2000ms away, so
+    // a regression (waiting for it) fails this by roughly 40x, never flakily.
+    try std.testing.expect(elapsed_ms < 500);
+}
+
+test "HttpClient.request: a HEAD 200 with a real Content-Length returns instantly, not after the server closes" {
+    var server = try TestHttpServer.serveOneNoBodyThenHold(200, "Content-Length: 12345\r\n", 2000);
+    defer server.stop();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const client = HttpClient{ .alloc = arena.allocator(), .io = std.testing.io };
+
+    const t0 = std.Io.Timestamp.now(std.testing.io, .awake);
+    const res = try client.request(.{ .method = .HEAD, .url = try server.url(arena.allocator()) });
+    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds - t0.nanoseconds, std.time.ns_per_ms);
+
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expect(elapsed_ms < 500);
 }
