@@ -65,7 +65,15 @@ const nosniff = http.Header{ .name = "X-Content-Type-Options", .value = "nosniff
 /// Returns null for unsafe paths (no leading '/', NUL, backslash, "..").
 /// "" means "the root" (callers resolve it to index.html). Caller owns the slice.
 pub fn sanitize(alloc: std.mem.Allocator, path: []const u8) !?[]const u8 {
-    // `path` is already percent-decoded by the HTTP layer (facil.io), so "%2e%2e" cannot sneak past the ".." check.
+    // NOTE (audited): the HTTP layer does NOT percent-decode this path. facil.io's http1
+    // parser stores the request path raw, zap passes it through untouched, and facil.io's
+    // http_decode_path only ever runs inside http_sendfile2 on its `encoded` argument —
+    // which zap calls with NULL. So an encoded traversal like "%2e%2e" reaches this check
+    // as a LITERAL "%2e%2e" segment: it never becomes ".." and dir mode stat()s a file
+    // literally named "%2e%2e" (404, fail-closed). The flip side: files whose names need
+    // percent-encoding ("my file.pdf" -> /my%20file.pdf) are not servable. If that is ever
+    // wanted, decode BEFORE sanitize() so the ".." check sees decoded bytes (facil.io's
+    // http_decode_path is already extern'd in zap's fio.zig).
     if (path.len == 0 or path[0] != '/') return null;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
     if (std.mem.indexOfScalar(u8, path, '\\') != null) return null;

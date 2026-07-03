@@ -113,6 +113,10 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   symlink-aware: a served file is canonicalized and refused if its real path escapes the
   configured static root, so a symlink inside the root pointing outside it is not followed
   out.
+- Percent-encoded file names are not decoded: the request path reaches the static layer
+  raw, so a file whose URL requires encoding (`my file.pdf` → `/my%20file.pdf`) is not
+  servable (404). Encoded traversal (`%2e%2e`) stays a literal — and harmless — path
+  segment for the same reason.
 - No on-the-fly compression; pre-compress at the CDN or reverse proxy if needed.
 - In **dir** mode (`--serve-static` or comptime `.dir`), caching is controlled by
   facil.io's `sendFile` (fixed `Cache-Control: max-age=3600`) — this value is not
