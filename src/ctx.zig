@@ -27,6 +27,7 @@ const queue_mod = @import("queue/queue.zig");
 const queue_memory = @import("queue/memory.zig");
 const queue_durable = @import("queue/durable.zig");
 const mail_send = @import("mail/send.zig");
+const mail_bulk = @import("mail/bulk.zig");
 const mail_unsubscribe = @import("mail/unsubscribe.zig");
 const webhook_mod = @import("webhook.zig");
 const analytics = @import("analytics/analytics.zig");
@@ -1083,6 +1084,38 @@ pub const MailApi = struct {
         const w = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
         return queue_durable.cancelJob(w, job_id);
+    }
+
+    pub const BulkSend = mail_bulk.BulkSend;
+    pub const BulkRecipient = mail_bulk.BulkRecipient;
+    pub const BatchReport = mail_bulk.BatchReport;
+
+    /// Submit a bulk list send (#154 round 2): one templated message fanned out as
+    /// per-recipient durable jobs with a durable send-report. Validates EVERYTHING at
+    /// the call site (a bad recipient anywhere persists nothing). Requires a durable
+    /// queue (`error.BulkRequiresDurable`) and a wired registry. Returns the batch id
+    /// (arena-owned) — hand it to `batchStatus`/`cancelBatch`.
+    pub fn sendBulk(self: MailApi, b: BulkSend) ![]const u8 {
+        const account = b.account orelse self.ctx.rctx.account_id; // withScope parity: explicit wins
+        const reg = queue_mod.registryFromApp(self.ctx.app) orelse return error.QueuesUnavailable;
+        if (self.ctx.bound_conn) |c| return mail_bulk.sendBulk(self.ctx.app, self.ctx.arena, reg, c, false, b, account);
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return mail_bulk.sendBulk(self.ctx.app, self.ctx.arena, reg, w, true, b, account);
+    }
+
+    /// Cancel every still-pending recipient of a batch (idempotent; stray queued item
+    /// jobs drain as no-ops). Returns how many recipients moved pending→canceled.
+    pub fn cancelBatch(self: MailApi, batch_id: []const u8) !usize {
+        if (self.ctx.bound_conn) |c| return mail_bulk.cancelBatch(self.ctx.app, c, false, batch_id);
+        const w = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return mail_bulk.cancelBatch(self.ctx.app, w, true, batch_id);
+    }
+
+    /// The durable per-recipient send-report, aggregated.
+    pub fn batchStatus(self: MailApi, batch_id: []const u8) !BatchReport {
+        return mail_bulk.batchStatus(self.ctx.app, self.ctx.arena, batch_id);
     }
 
     /// Escape hatch for hand-rolled list mail: the signed one-click unsubscribe URL for

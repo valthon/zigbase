@@ -507,6 +507,65 @@ fn init_0018_rt_delete_snapshots(m: *Migrator) db.DbError!void {
     try m.exec("CREATE INDEX IF NOT EXISTS \"idx_rt_delsnap_created\" ON \"_rt_delete_snapshots\" (\"created\");");
 }
 
+fn init_0019_bulk_mail(m: *Migrator) db.DbError!void {
+    // Bulk / list mail (#154 round 2). One `_mail_batches` row per sendBulk call (the
+    // templates live ONCE here — per-recipient jobs carry only {batch,to}); one
+    // `_mail_batch_recipients` row per DISTINCT recipient (the durable send-report).
+    // The UNIQUE (batch,email) index is BOTH submit-time duplicate-recipient dedup
+    // (ON CONFLICT DO NOTHING) and the idempotency record for at-least-once delivery
+    // (the mail_batch_item handler no-ops any row whose status is not 'pending').
+    // `updated` exists on both tables because the records engine's base-column SELECT
+    // (id/created/updated) is unconditional — same rationale as _events (0015).
+    try m.execLowered(
+        \\CREATE TABLE IF NOT EXISTS "_mail_batches" (
+        \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL DEFAULT '',
+        \\  "account"  TEXT NOT NULL DEFAULT '',
+        \\  "list"     TEXT NOT NULL DEFAULT '',
+        \\  "queue"    TEXT NOT NULL,
+        \\  "from_addr" TEXT NOT NULL DEFAULT '',
+        \\  "reply_to"  TEXT NOT NULL DEFAULT '',
+        \\  "subject_tpl" TEXT NOT NULL,
+        \\  "text_tpl"  TEXT NOT NULL DEFAULT '',
+        \\  "html_tpl"  TEXT NOT NULL DEFAULT '',
+        \\  "total"  INTEGER NOT NULL DEFAULT 0,
+        \\  "status" TEXT NOT NULL DEFAULT 'active'
+        \\);
+    );
+    try m.execLowered(
+        \\CREATE TABLE IF NOT EXISTS "_mail_batch_recipients" (
+        \\  "id" TEXT PRIMARY KEY, "created" TEXT NOT NULL, "updated" TEXT NOT NULL DEFAULT '',
+        \\  "batch" TEXT NOT NULL, "email" TEXT NOT NULL,
+        \\  "vars_json" TEXT NOT NULL DEFAULT '{}',
+        \\  "status" TEXT NOT NULL DEFAULT 'pending',
+        \\  "attempts" INTEGER NOT NULL DEFAULT 0,
+        \\  "last_error" TEXT NOT NULL DEFAULT '',
+        \\  "sent_at" TEXT NOT NULL DEFAULT ''
+        \\);
+    );
+    try m.execLowered("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_mail_batch_rcpt_unique\" ON \"_mail_batch_recipients\" (\"batch\",\"email\");");
+    try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_mail_batch_rcpt_status\" ON \"_mail_batch_recipients\" (\"batch\",\"status\");");
+
+    // Retrofit: 0016 shipped _suppressions WITHOUT an `updated` column, so browsing it
+    // through the records API (base-column SELECT) errors. Additive, default ''.
+    // `catch {}` mirrors 0002's ALTER idempotence pattern (ADD COLUMN has no IF NOT EXISTS).
+    m.execLowered("ALTER TABLE \"_suppressions\" ADD COLUMN \"updated\" TEXT NOT NULL DEFAULT '';") catch {};
+
+    // Seed the two `_collections` rows (system=1). id/created/updated are implicit base
+    // columns and are NOT listed. Rules NULL = Locked (superusers only) — the superuser
+    // records API is the send-report read surface; writes happen only via sendBulk.
+    try m.execLowered(
+        \\INSERT OR IGNORE INTO "_collections"
+        \\  ("id","name","type","system","schema","indexes","options","listRule","viewRule","createRule","updateRule","deleteRule","created","updated")
+        \\ VALUES
+        \\  ('_mailbatches___','_mail_batches','base',1,
+        \\    '[{"id":"mbtaccnt","name":"account","type":"text","options":{}},{"id":"mbtlist_","name":"list","type":"text","options":{}},{"id":"mbtqueue","name":"queue","type":"text","options":{}},{"id":"mbtfrom_","name":"from_addr","type":"text","options":{}},{"id":"mbtreply","name":"reply_to","type":"text","options":{}},{"id":"mbtsubjt","name":"subject_tpl","type":"text","options":{}},{"id":"mbttextt","name":"text_tpl","type":"text","options":{}},{"id":"mbthtmlt","name":"html_tpl","type":"text","options":{}},{"id":"mbttotal","name":"total","type":"number","options":{}},{"id":"mbtstatu","name":"status","type":"text","options":{}}]',
+        \\    '[]','{}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now')),
+        \\  ('_mailbatchrcpts','_mail_batch_recipients','base',1,
+        \\    '[{"id":"mbrbatch","name":"batch","type":"text","options":{}},{"id":"mbremail","name":"email","type":"email","options":{}},{"id":"mbrvars_","name":"vars_json","type":"json","options":{}},{"id":"mbrstatu","name":"status","type":"text","options":{}},{"id":"mbratmpt","name":"attempts","type":"number","options":{}},{"id":"mbrlerr_","name":"last_error","type":"text","options":{}},{"id":"mbrsenta","name":"sent_at","type":"text","options":{}}]',
+        \\    '[]','{}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now'));
+    );
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -526,6 +585,7 @@ pub const all = [_]Migration{
     .{ .name = "0016_email", .up = init_0016_email },
     .{ .name = "0017_events_seq", .up = init_0017_events_seq },
     .{ .name = "0018_rt_delete_snapshots", .up = init_0018_rt_delete_snapshots },
+    .{ .name = "0019_bulk_mail", .up = init_0019_bulk_mail },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {
@@ -807,7 +867,7 @@ test "0016 creates email tables, uniqueness, and seeds _collections" {
     // Tables exist with the expected column counts.
     inline for (.{
         .{ "_sender_identities", @as(i64, 8) }, // id,created,updated,account,email,verified_at,verification_token,status
-        .{ "_suppressions", @as(i64, 6) }, // id,created,account,email,reason,source
+        .{ "_suppressions", @as(i64, 7) }, // id,created,account,email,reason,source,updated (0019 retrofit)
     }) |spec| {
         var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('" ++ spec[0] ++ "');");
         defer t.finalize();
@@ -844,6 +904,46 @@ test "0016 creates email tables, uniqueness, and seeds _collections" {
     defer dup.finalize();
     _ = try dup.step();
     try std.testing.expectEqual(@as(i64, 1), dup.columnInt(0));
+}
+
+test "0019 creates bulk-mail tables, dedup uniqueness, and seeds Locked _collections rows" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try run(&d);
+    // Tables exist and accept the canonical column set.
+    try d.exec("INSERT INTO \"_mail_batches\" (\"id\",\"created\",\"queue\",\"subject_tpl\") VALUES ('b1',datetime('now'),'emails','Hi {{ name }}');");
+    try d.exec("INSERT INTO \"_mail_batch_recipients\" (\"id\",\"created\",\"batch\",\"email\") VALUES ('r1',datetime('now'),'b1','a@x.io');");
+    // (batch,email) is UNIQUE — a duplicate recipient is a constraint violation.
+    try std.testing.expectError(error.ExecFailed, d.exec(
+        "INSERT INTO \"_mail_batch_recipients\" (\"id\",\"created\",\"batch\",\"email\") VALUES ('r2',datetime('now'),'b1','a@x.io');",
+    ));
+    // Same email on a DIFFERENT batch is fine.
+    try d.exec("INSERT INTO \"_mail_batch_recipients\" (\"id\",\"created\",\"batch\",\"email\") VALUES ('r3',datetime('now'),'b2','a@x.io');");
+    // Seeded as SYSTEM collections with NULL (Locked) rules.
+    var st = try d.prepare("SELECT \"system\", \"listRule\" IS NULL FROM \"_collections\" WHERE \"name\" IN ('_mail_batches','_mail_batch_recipients');");
+    defer st.finalize();
+    var n: usize = 0;
+    while (try st.step()) : (n += 1) {
+        try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
+        try std.testing.expectEqual(@as(i64, 1), st.columnInt(1));
+    }
+    try std.testing.expectEqual(@as(usize, 2), n);
+
+    // Re-running migrations does not duplicate the seeded collection rows.
+    try run(&d);
+    var dup = try d.prepare("SELECT COUNT(*) FROM \"_collections\" WHERE name IN ('_mail_batches','_mail_batch_recipients');");
+    defer dup.finalize();
+    _ = try dup.step();
+    try std.testing.expectEqual(@as(i64, 2), dup.columnInt(0));
+}
+
+test "0019 retrofits updated onto _suppressions (records-API base-column fix)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try run(&d);
+    // The unconditional records-engine SELECT of id/created/updated must now prepare.
+    var st = try d.prepare("SELECT \"id\",\"created\",\"updated\" FROM \"_suppressions\" LIMIT 1;");
+    st.finalize();
 }
 
 test "0015 creates the _events table, indexes, and seeds the _events collection" {

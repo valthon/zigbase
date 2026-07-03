@@ -31,6 +31,8 @@ pub const Captured = struct {
     subject: []u8,
     text: []u8,
     html: ?[]u8,
+    reply_to: ?[]u8,
+    list_unsubscribe: ?[]u8,
 };
 
 /// A `Mailer` backend that records messages in memory. NOT thread-safe across concurrent worker
@@ -52,6 +54,8 @@ pub const CaptureMailer = struct {
             self.alloc.free(m.subject);
             self.alloc.free(m.text);
             if (m.html) |h| self.alloc.free(h);
+            if (m.reply_to) |rt| self.alloc.free(rt);
+            if (m.list_unsubscribe) |lu| self.alloc.free(lu);
         }
         self.messages.deinit(self.alloc);
     }
@@ -84,12 +88,18 @@ pub const CaptureMailer = struct {
         errdefer self.alloc.free(text_copy);
         const html_copy: ?[]u8 = if (email.html_body) |h| try self.alloc.dupe(u8, h) else null;
         errdefer if (html_copy) |h| self.alloc.free(h);
+        const reply_to_copy: ?[]u8 = if (email.reply_to) |rt| try self.alloc.dupe(u8, rt) else null;
+        errdefer if (reply_to_copy) |rt| self.alloc.free(rt);
+        const list_unsubscribe_copy: ?[]u8 = if (email.list_unsubscribe) |lu| try self.alloc.dupe(u8, lu) else null;
+        errdefer if (list_unsubscribe_copy) |lu| self.alloc.free(lu);
         try self.messages.append(self.alloc, .{
             .from = from_copy,
             .to = to_copy,
             .subject = subject_copy,
             .text = text_copy,
             .html = html_copy,
+            .reply_to = reply_to_copy,
+            .list_unsubscribe = list_unsubscribe_copy,
         });
     }
 
@@ -107,6 +117,26 @@ pub const CaptureMailer = struct {
         return self.messages.items[self.messages.items.len - 1];
     }
 
+    /// Every captured message, oldest first. BORROWED — valid until the next `record`/
+    /// `clear`/`deinit` (single-threaded test usage; take the values you need eagerly).
+    pub fn all(self: *CaptureMailer) []const Captured {
+        lockMutex(&self.mutex);
+        defer self.mutex.unlock();
+        return self.messages.items;
+    }
+
+    /// Number of captured messages addressed to exactly `addr` (bulk tests assert
+    /// per-recipient fan-out and dedup with this).
+    pub fn countTo(self: *CaptureMailer, addr: []const u8) usize {
+        lockMutex(&self.mutex);
+        defer self.mutex.unlock();
+        var n: usize = 0;
+        for (self.messages.items) |m| {
+            if (std.mem.eql(u8, m.to, addr)) n += 1;
+        }
+        return n;
+    }
+
     /// Drop all captured messages (freeing their copies).
     pub fn clear(self: *CaptureMailer) void {
         lockMutex(&self.mutex);
@@ -117,6 +147,8 @@ pub const CaptureMailer = struct {
             self.alloc.free(m.subject);
             self.alloc.free(m.text);
             if (m.html) |h| self.alloc.free(h);
+            if (m.reply_to) |rt| self.alloc.free(rt);
+            if (m.list_unsubscribe) |lu| self.alloc.free(lu);
         }
         self.messages.clearRetainingCapacity();
     }
@@ -164,6 +196,8 @@ test "CaptureMailer records sends without a network and is assertable" {
         .subject = "Welcome",
         .text_body = "hello",
         .html_body = "<b>hi</b>",
+        .reply_to = "support@zigbase.dev",
+        .list_unsubscribe = "https://app.example/u?t=1",
     });
     try testing.expectEqual(@as(usize, 1), cap.count());
     const last = cap.last().?;
@@ -171,10 +205,31 @@ test "CaptureMailer records sends without a network and is assertable" {
     try testing.expectEqualStrings("Welcome", last.subject);
     try testing.expectEqualStrings("hello", last.text);
     try testing.expectEqualStrings("<b>hi</b>", last.html.?);
+    try testing.expectEqualStrings("support@zigbase.dev", last.reply_to.?);
+    try testing.expectEqualStrings("https://app.example/u?t=1", last.list_unsubscribe.?);
+
+    try m.send(testing.io, testing.allocator, .{
+        .to = "user2@example.com",
+        .subject = "Welcome",
+        .text_body = "hello",
+    });
+    try m.send(testing.io, testing.allocator, .{
+        .to = "user@example.com",
+        .subject = "Again",
+        .text_body = "hi",
+    });
+    try testing.expectEqual(@as(usize, 3), cap.all().len);
+    try testing.expectEqual(@as(usize, 2), cap.countTo("user@example.com"));
+    try testing.expectEqual(@as(usize, 1), cap.countTo("user2@example.com"));
+    try testing.expectEqual(@as(usize, 0), cap.countTo("nobody@example.com"));
+    // The freshly-added messages carry no reply_to/list_unsubscribe.
+    try testing.expect(cap.all()[1].reply_to == null);
+    try testing.expect(cap.all()[1].list_unsubscribe == null);
 
     cap.clear();
     try testing.expectEqual(@as(usize, 0), cap.count());
     try testing.expect(cap.last() == null);
+    try testing.expectEqual(@as(usize, 0), cap.all().len);
 }
 
 test "renderPreview escapes header fields and embeds the html part" {

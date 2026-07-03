@@ -645,6 +645,52 @@ The data model: migration `0016_email` seeds two system collections — `_sender
 email, verified_at, verification_token, status)` (UNIQUE `(account,email)`) and
 `_suppressions(account, email, reason, source)` (UNIQUE `(account,email)`).
 
+**Bulk list sends (`sendBulk`).** `ctx.mail().sendBulk(BulkSend)` fans one templated message out to
+many recipients over the durable queue, rendering per-recipient personalization at delivery time.
+`BulkSend` is `{ subject, text?, html?, from?, reply_to?, recipients, list = "", queue = "default",
+at?, account? }` — `recipients` is `[]const BulkRecipient{ to, vars = &.{} }`. Subject/text/html are
+**template sources**, rendered per recipient against `vars` with the same engine as transactional
+mail: `{{ name }}` is HTML-escaped, `{{{ name }}}` is the explicit raw opt-in. A bulk queue **must be
+durable** (`error.BulkRequiresDurable`) — memory jobs can't survive a restart, carry a report, or be
+rate-throttled.
+
+```zig
+const batch_id = try ctx.mail().sendBulk(.{
+    .subject = "Hi {{ name }} — May updates",
+    .html = "<p>Hi {{ name }},</p><p>…</p>",
+    .list = "newsletter",
+    .queue = "ses_mail",
+    .recipients = &.{
+        .{ .to = "a@example.com", .vars = &.{.{ .key = "name", .value = "Ann" }} },
+        .{ .to = "b@example.com", .vars = &.{.{ .key = "name", .value = "Bo" }} },
+    },
+});
+const report = try ctx.mail().batchStatus(batch_id); // {total, pending, sent, suppressed, invalid, failed, canceled}
+```
+
+Under the hood, `sendBulk` writes one `_mail_batches` row (the templates, once) and one
+`_mail_batch_recipients` row per distinct recipient, then enqueues one durable `"mail_batch_item"`
+job per distinct recipient with the tiny payload `{"batch":"…","to":"…"}` — N small jobs rather than
+one driver job, so per-recipient retry/backoff, priority ordering, visibility-timeout crash recovery,
+and queue rate throttling all come from the existing job engine for free. `ctx.mail().batchStatus(id)`
+reads the durable send-report back as a `BatchReport`; a superuser can also browse `_mail_batches` /
+`_mail_batch_recipients` directly over the records API (they're **Locked** system collections —
+superusers only, same as every other `_`-prefixed table). `ctx.mail().cancelBatch(id)` flips every
+still-`pending` recipient row to `canceled` and returns the count; it's idempotent, and a stray
+in-flight `"mail_batch_item"` job for an already-canceled batch drains as a no-op rather than an
+error.
+
+Suppression on list mail is **always enforced**, independent of the `.mail.check_suppression` knob
+(which only gates *transactional* `send`/`enqueue`) — sending past a suppression is a compliance
+issue, not a tuning choice. A suppressed recipient is a **reported outcome** (`status = "suppressed"`
+on its row), not a job failure. Account attribution mirrors `send()`: `b.account` defaults to the
+request's active account scope (explicit `""` is a system send), and when `.require_verified_sender`
+is on and the batch is account-scoped, `b.from` is asserted against `_sender_identities` **once at
+submit** (delivery re-checks anyway). Like every durable job, delivery is **at-least-once**: a crash
+between the backend accepting the message and the recipient row being marked `sent` replays the job,
+producing one duplicate send — identical to the `"mail"` job kind, and the reason durable handlers
+must tolerate replays.
+
 **Scheduled sends + the drip recipe (`deliverAt` / `cancel`).** `EnqueueOpts` gained `at: ?i64` and
 `delay_s: ?u32` (unix-seconds absolute / relative-from-now) — set at most one
 (`error.ConflictingSchedule`), and either requires a **durable** queue (`error.ScheduleRequiresDurable`

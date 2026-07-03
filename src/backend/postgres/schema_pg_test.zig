@@ -75,6 +75,7 @@ test "pg: all system migrations apply on a fresh database (tables + seeds + ledg
         "_kv",          "_sessions",          "_experiment_assignments", "_queue_jobs",
         "_accounts",    "_memberships",       "_invitations",    "_events",
         "_sender_identities", "_suppressions",
+        "_mail_batches", "_mail_batch_recipients",
     }) |t| {
         const n = try scalarCount(w,
             "SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = '" ++ t ++ "';");
@@ -84,12 +85,13 @@ test "pg: all system migrations apply on a fresh database (tables + seeds + ledg
         }
     }
 
-    // Seeds landed: _superusers + the tenancy/email/events system collections.
+    // Seeds landed: _superusers + the tenancy/email/events/bulk-mail system collections.
     try std.testing.expectEqual(@as(i64, 1), try scalarCount(w,
         "SELECT count(*) FROM \"_collections\" WHERE name='_superusers' AND system=1;"));
-    try std.testing.expectEqual(@as(i64, 6), try scalarCount(w,
+    try std.testing.expectEqual(@as(i64, 8), try scalarCount(w,
         "SELECT count(*) FROM \"_collections\" WHERE name IN " ++
-        "('_accounts','_memberships','_invitations','_events','_sender_identities','_suppressions') AND system=1;"));
+        "('_accounts','_memberships','_invitations','_events','_sender_identities','_suppressions'," ++
+        "'_mail_batches','_mail_batch_recipients') AND system=1;"));
 
     // token_epoch identity column (0010) is BIGINT on PG and reads back 0 by default.
     try w.exec("INSERT INTO \"_superusers\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('s1','','','a@b.c');");

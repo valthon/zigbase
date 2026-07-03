@@ -52,6 +52,10 @@ pub const CommandMailer = @import("mail/mailer.zig").CommandMailer;
 pub const SmtpTls = @import("config.zig").SmtpTls;
 // Outbound application mail (#141): `ctx.mail().send`/`.enqueue` take a `MailMessage`.
 pub const MailMessage = @import("mail/send.zig").MailMessage;
+// Bulk / list mail (#154 round 2): `ctx.mail().sendBulk`/`.cancelBatch`/`.batchStatus`.
+pub const BulkSend = @import("mail/bulk.zig").BulkSend;
+pub const BulkRecipient = @import("mail/bulk.zig").BulkRecipient;
+pub const BatchReport = @import("mail/bulk.zig").BatchReport;
 // Email subsystem (#154): HTTP-API providers, in-memory capture (tests), template engine, config.
 pub const SesMailer = @import("mail/ses.zig").SesMailer;
 pub const PostmarkMailer = @import("mail/postmark.zig").PostmarkMailer;
@@ -281,6 +285,7 @@ test {
     _ = @import("scheduler.zig");
     _ = @import("mail/mailer.zig");
     _ = @import("mail/send.zig");
+    _ = @import("mail/bulk.zig");
     _ = @import("mail/template.zig");
     _ = @import("mail/addr.zig");
     _ = @import("aws/sigv4.zig");

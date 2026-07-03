@@ -31,6 +31,7 @@ const queue_config = @import("queue/config.zig");
 const queue_durable = @import("queue/durable.zig");
 const queue_memory = @import("queue/memory.zig");
 const mail_send = @import("mail/send.zig");
+const mail_bulk = @import("mail/bulk.zig");
 const mail_cfg = @import("mail/config.zig");
 const webhook = @import("webhook.zig");
 const captcha = @import("captcha.zig");
@@ -442,10 +443,12 @@ pub fn App(comptime cfg: anytype) type {
 
         /// Framework-owned built-in job kinds, prepended to the consumer `.jobs` registry
         /// below. `"mail"` (#141) backs `ctx.mail().enqueue` — a `"mail"` job deserializes
-        /// the `MailMessage` payload and delivers it via `mail/send.zig`. Kept as its own
+        /// the `MailMessage` payload and delivers it via `mail/send.zig`. `"mail_batch_item"`
+        /// (#154 round 2) backs `ctx.mail().sendBulk` — see `mail/bulk.zig`. Kept as its own
         /// const so sibling PRs (e.g. webhook, #144) can add their built-ins self-contained.
         const builtin_job_regs: []const queue.JobReg = &.{
             .{ .kind = "mail", .handler = mail_send.jobHandler },
+            .{ .kind = mail_bulk.job_kind, .handler = mail_bulk.jobHandler },
             .{ .kind = webhook.job_kind, .handler = webhook.webhookJobHandler },
         };
 
@@ -2249,11 +2252,13 @@ test "App(cfg) lowers .queues/.workers/.jobs and installs durable poller + GC jo
         .jobs = .{ .send = qTestHandler },
     });
     try std.testing.expect(A.has_durable_queue);
-    // job_regs = built-ins "mail" (#141) + "webhook" (#144) ++ consumer kinds; built-ins first.
-    try std.testing.expectEqual(@as(usize, 3), A.job_regs.len);
+    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144)
+    // ++ consumer kinds; built-ins first.
+    try std.testing.expectEqual(@as(usize, 4), A.job_regs.len);
     try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
-    try std.testing.expectEqualStrings("webhook", A.job_regs[1].kind);
-    try std.testing.expectEqualStrings("send", A.job_regs[2].kind);
+    try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[1].kind);
+    try std.testing.expectEqualStrings("webhook", A.job_regs[2].kind);
+    try std.testing.expectEqualStrings("send", A.job_regs[3].kind);
     try std.testing.expectEqualStrings("send", @tagName(@as(A.Job, .send)));
     try std.testing.expectEqualStrings("emails", @tagName(@as(A.Queue, .emails)));
 
@@ -2271,11 +2276,13 @@ test "App(cfg) keeps legacy .jobs.pool_size working alongside the job registry" 
     // `.jobs.pool_size` is the legacy scheduler-pool lever; it must NOT become a job kind.
     const A = App(.{ .jobs = .{ .pool_size = 3, .resize = qTestHandler } });
     try std.testing.expectEqual(@as(usize, 3), A.job_pool_size);
-    // job_regs = built-ins "mail" (#141) + "webhook" (#144) ++ consumer "resize"; pool_size is skipped.
-    try std.testing.expectEqual(@as(usize, 3), A.job_regs.len);
+    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144)
+    // ++ consumer "resize"; pool_size is skipped.
+    try std.testing.expectEqual(@as(usize, 4), A.job_regs.len);
     try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
-    try std.testing.expectEqualStrings("webhook", A.job_regs[1].kind);
-    try std.testing.expectEqualStrings("resize", A.job_regs[2].kind);
+    try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[1].kind);
+    try std.testing.expectEqualStrings("webhook", A.job_regs[2].kind);
+    try std.testing.expectEqualStrings("resize", A.job_regs[3].kind);
     // The compile-checked Job enum still reflects ONLY the consumer kinds (mail is a
     // built-in reached via ctx.mail().enqueue / ctx.enqueueByName, not the typed enum).
     try std.testing.expectEqual(@as(usize, 1), std.meta.fields(A.Job).len);
