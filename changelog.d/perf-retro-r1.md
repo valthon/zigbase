@@ -7,9 +7,6 @@
 - `app.submit` tasks and memory-queue jobs are now drained and joined at shutdown (a task
   submitted before shutdown completes instead of being cut off), and `app.submit` works
   whenever the server is running — a configured scheduler is no longer required.
-- The embedded admin UI's assets now carry build-time `ETag`s and answer `If-None-Match`
-  with `304 Not Modified`, so revisiting the admin no longer re-downloads the SPA bundle
-  on every load.
 
 ### Performance
 
@@ -26,6 +23,9 @@
   collection create/update/delete (SQLite backend; Postgres deployments keep direct reads
   so multi-instance DDL stays coherent) — removing a `_collections` SELECT plus a full
   schema-JSON parse per request and per realtime fan-out delivery.
+- The embedded admin UI's assets now carry build-time `ETag`s and answer `If-None-Match`
+  with `304 Not Modified`, so revisiting the admin no longer re-downloads the SPA bundle
+  on every load.
 
 ### Internal
 
