@@ -58,6 +58,7 @@ pub const protocol = @import("protocol.zig");
 // into the unit-test root (gated behind `build_options.postgres` in `src/root.zig`).
 test {
     _ = @import("scram.zig");
+    _ = @import("saslprep.zig");
     _ = @import("protocol.zig");
     _ = @import("connstr.zig");
     _ = @import("tls_trust.zig");
