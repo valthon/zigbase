@@ -26,7 +26,7 @@ ZigBase v0.9.0 is an early release. The gaps below are known and tracked for fut
 - **The test clock is impossible to enable on a production build.** It is compiled in only when the `dev_clock` build option is true (on in `Debug`, off in any release build; the release script ships it off). A production binary never reads `ZIGBASE_FAKE_NOW` — the override folds to a comptime no-op — so time can never be frozen in production.
 
 ## Platform & UI
-- **No Windows build** — Linux and macOS only (the embedded HTTP server depends on facil.io/zap).
+- **No Windows build** — Linux and macOS only (the embedded HTTP server depends on facil.io/zap). The official Docker image (`ghcr.io/valthon/zigbase`, see [docs/docker.md](docs/docker.md)) is the supported path on Windows hosts.
 - **Admin UI:** no logs screen, and the record editor uses a plain textarea (no WYSIWYG rich-text editor) — both deferred.
 
 ## Static file serving

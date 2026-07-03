@@ -82,6 +82,20 @@ const binaries = TARGETS.map((t) => ({
       </aside>
     </section>
 
+    <section class="dl__section" aria-labelledby="docker">
+      <h2 id="docker">Docker</h2>
+      <p>
+        The official image ships the same binary as the release tarballs above — no
+        Windows build required.
+      </p>
+      <pre class="dl__code"><code>docker run -d -p 8090:8090 -v zigbase_data:/data ghcr.io/valthon/zigbase:{ZIGBASE_VERSION}</code></pre>
+      <p class="dl__links">
+        <code>latest</code>, <code>{'{'}X.Y.Z{'}'}</code>, and rolling <code>{'{'}X.Y{'}'}</code>/<code>{'{'}X{'}'}</code>
+        tags are published to <a href="https://github.com/valthon/zigbase/pkgs/container/zigbase" target="_blank" rel="noopener noreferrer">ghcr.io/valthon/zigbase</a>.
+        See the <a href="/docs/docker">Docker guide</a> for the data-volume and non-root-user details.
+      </p>
+    </section>
+
     <section class="dl__section" aria-labelledby="from-source">
       <h2 id="from-source">Build from source</h2>
       <p>

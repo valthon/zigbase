@@ -1,0 +1,22 @@
+.git
+.github
+zig-out
+zig-cache
+.zig-cache
+node_modules
+site/dist
+site/node_modules
+clients/typescript/node_modules
+examples/*/zig-out
+examples/*/zig-cache
+examples/*/frontend/node_modules
+examples/*/frontend/dist
+*.tar.gz
+
+# Editor / IDE / agent-tooling directories — never needed in the build context
+.claude
+.idea
+.vscode
+.superpowers
+*.swp
+.DS_Store

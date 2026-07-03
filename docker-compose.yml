@@ -1,0 +1,28 @@
+# Quick-start compose file for the official ZigBase image. See docs/docker.md
+# for the full guide (data-volume ownership, TLS/reverse-proxy notes, healthcheck).
+services:
+  zigbase:
+    image: ghcr.io/valthon/zigbase:latest
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - zigbase_data:/data
+    environment:
+      # Plain-HTTP local/LAN use only — auth cookies are Secure by default.
+      # Remove this (or set back to true) once you're behind TLS.
+      ZIGBASE_COOKIE_SECURE: "false"
+    healthcheck:
+      # distroless has no shell/curl, so compose's healthcheck runs the binary
+      # itself (/zigbase version) as a liveness check instead of an HTTP probe.
+      # For a real HTTP health probe, front this with a reverse proxy (e.g.
+      # Traefik/Caddy) that can itself curl GET /api/health, or use your
+      # orchestrator's HTTP probe type (e.g. Kubernetes httpGet) directly
+      # against the container — see docs/docker.md#healthchecks.
+      test: ["CMD", "/zigbase", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  zigbase_data:
