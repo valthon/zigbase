@@ -14,6 +14,8 @@ const params_mod = @import("../query/params.zig");
 const events = @import("../events.zig");
 const tenancy = @import("../tenancy/tenancy.zig");
 const ApiError = @import("error.zig").ApiError;
+const serve_file = @import("../files/serve_file.zig");
+const mime = @import("../files/mime.zig");
 
 /// Extensions safe to render inline in a browser (no script execution). Everything else downloads.
 fn isInlineSafeExt(ext: []const u8) bool {
@@ -126,11 +128,39 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
 
     const storage = app.storage orelse return ApiError.internal().toResponse(ctx.allocator);
     const path = (try storage.localPath(ctx.allocator, col.name, rid, name)) orelse return ApiError.internal().toResponse(ctx.allocator);
+    // The DB references this file but the backend can't produce it: 404 (hide existence),
+    // matching the old sendFile-catch behavior — but planned here so the conditional
+    // headers below never describe a file we can't stat. (PR4 renames localPath -> fetch
+    // and adds the loud std.log.err for the null case; the 404 shape is set up now.)
+    const st = std.Io.Dir.cwd().statFile(app.io, path, .{}) catch
+        return ApiError.notFound().toResponse(ctx.allocator);
+
+    // §B.2/§B.3: plan status + byte window from the request's conditional headers.
+    // Authorization (above) already completed — no plan output can leak denied bytes.
+    const etag = try serve_file.fileEtag(ctx.allocator, col.name, rid, name);
+    const p = try serve_file.plan(ctx.allocator, .{
+        .size = st.size,
+        .etag = etag,
+        .range = ctx.header("range") orelse "",
+        .if_none_match = ctx.if_none_match,
+        .if_range = ctx.header("if-range") orelse "",
+        .head = ctx.method == .HEAD,
+    });
+    const cache = cacheControlFor(col);
+    if (p.status == 304) {
+        // RFC 9110 §15.4.5: a 304 replays the validator + cache policy only.
+        const hs304 = try ctx.allocator.dupe(http.Header, &.{
+            .{ .name = "ETag", .value = etag },
+            .{ .name = "Cache-Control", .value = cache },
+        });
+        return .{ .status = 304, .body = "", .extra_headers = hs304 };
+    }
 
     const qp = params_mod.parse(ctx.allocator, ctx.query) catch null;
-    const force_download = if (qp) |p| (p.get("download") != null) else false;
-
-    // Only render inline for known-safe types; everything else downloads (neutralizes HTML/SVG/JS XSS).
+    const force_download = if (qp) |pq| (pq.get("download") != null) else false;
+    // Only render inline for known-safe types; everything else downloads
+    // (neutralizes HTML/SVG/JS XSS). ?download and ?token compose orthogonally
+    // with Range — disposition/identity are resolved before/independent of the plan.
     const ext = blk: {
         const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse break :blk "";
         break :blk name[dot + 1 ..];
@@ -138,16 +168,44 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     const inline_safe = isInlineSafeExt(ext);
     const disp_kind: []const u8 = if (force_download or !inline_safe) "attachment" else "inline";
     const disposition = try std.fmt.allocPrint(ctx.allocator, "{s}; filename=\"{s}\"", .{ disp_kind, name });
+    // facil.io no longer infers Content-Type on this route (the owned path bypasses
+    // http_sendfile2's mime lookup): set it explicitly; unknown -> octet-stream.
+    const content_type = mime.fromExtension(name);
 
-    const cache = cacheControlFor(col);
-    const headers = try ctx.allocator.dupe(http.Header, &.{
+    var hs: std.ArrayList(http.Header) = .empty;
+    try hs.appendSlice(ctx.allocator, &.{
         .{ .name = "Referrer-Policy", .value = "no-referrer" },
         .{ .name = "X-Content-Type-Options", .value = "nosniff" },
         .{ .name = "Content-Security-Policy", .value = "default-src 'none'; sandbox" },
-        .{ .name = "Cache-Control", .value = cache },
+        .{ .name = "Cache-Control", .value = cache }, // exactly ONCE now (§B.1 fix)
         .{ .name = "Content-Disposition", .value = disposition },
+        .{ .name = "ETag", .value = etag },
+        .{ .name = "Accept-Ranges", .value = "bytes" },
     });
-    return .{ .status = 200, .body = "", .file = .{ .path = path }, .extra_headers = headers };
+    if (p.content_range) |cr| try hs.append(ctx.allocator, .{ .name = "Content-Range", .value = cr });
+    if (p.status == 416) {
+        return .{ .status = 416, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator) };
+    }
+    if (ctx.method == .HEAD) {
+        // facil.io's http1_sendfile does NOT strip bodies for HEAD, so mirror
+        // facil.io's own static HEAD handling (http.c:585-590): explicit
+        // Content-Length + empty body — http_send_body's add_content_length is
+        // set-if-missing, so the real length survives while zero bytes are sent.
+        try hs.append(ctx.allocator, .{
+            .name = "Content-Length",
+            .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{p.len}),
+        });
+        return .{ .status = p.status, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator) };
+    }
+    // 200 or 206: ALWAYS set len (the planner computed it even for the full body), so
+    // this route deterministically takes server.zig's owned http_sendfile path.
+    return .{
+        .status = p.status,
+        .body = "",
+        .content_type = content_type,
+        .file = .{ .path = path, .offset = p.offset, .len = p.len },
+        .extra_headers = try hs.toOwnedSlice(ctx.allocator),
+    };
 }
 
 test "PIN: file-download view-authz + cache route through policy byte-identically" {
@@ -269,6 +327,96 @@ test "recordReferencesFile matches single + array file fields, ignores non-file 
     try std.testing.expect(!recordReferencesFile(col, rval, "evil.html"));
     // A non-object record is never a reference.
     try std.testing.expect(!recordReferencesFile(col, .{ .string = "x" }, "pic.png"));
+}
+
+test "serve: header emission — exactly one Cache-Control, ETag, Accept-Ranges; 206/304/416/HEAD" {
+    // Env: tmp-dir pool (api/records.zig TestEnv pattern), one @public collection with a
+    // file field, one record referencing "a_0000000000.png", LocalStorage rooted in the
+    // same tmp dir holding 1000 bytes for it, and an App wired with pool + storage.
+    const migrations = @import("../migrations.zig");
+    const files_storage = @import("../files/storage.zig");
+    const app_mod = @import("../app.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ga = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(ga);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/test.db", .{dir_path}, 0);
+    var pool = try db.Pool.init(ga, std.testing.io, db_path);
+    defer pool.deinit();
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try migrations.run(w);
+        _ = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "docs", .viewRule = "@public", .fields = &[_]schema.Field{
+            .{ .id = "d1", .name = "file", .options = .{ .file = .{ .maxSelect = 1 } } },
+        } });
+        try w.exec("INSERT INTO docs (id,created,updated,file) VALUES ('r1','t','t','a_0000000000.png');");
+    }
+    var local = files_storage.LocalStorage.init(dir_path);
+    const storage_iface = local.storage();
+    try storage_iface.put(std.testing.io, "docs", "r1", "a_0000000000.png", "x" ** 1000);
+    var app = app_mod.App{ .allocator = ga, .io = std.testing.io, .pool = &pool, .storage = &storage_iface };
+
+    const params = [_]http.Param{
+        .{ .key = "col", .value = "docs" }, .{ .key = "rec", .value = "r1" }, .{ .key = "name", .value = "a_0000000000.png" },
+    };
+    // Plain GET: 200, exactly one Cache-Control, ETag + Accept-Ranges, owned file ref.
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params };
+    const r200 = try serve(&ctx);
+    try std.testing.expectEqual(@as(u16, 200), r200.status);
+    try std.testing.expect(r200.file != null);
+    try std.testing.expectEqual(@as(?u64, 1000), r200.file.?.len); // ALWAYS len => owned path
+    var cc_count: usize = 0;
+    var etag_val: []const u8 = "";
+    for (r200.extra_headers) |h| {
+        if (std.mem.eql(u8, h.name, "Cache-Control")) cc_count += 1;
+        if (std.mem.eql(u8, h.name, "ETag")) etag_val = h.value;
+    }
+    try std.testing.expectEqual(@as(usize, 1), cc_count); // §B.1 regression pin
+    try std.testing.expectEqual(@as(usize, 18), etag_val.len);
+    try std.testing.expectEqualStrings("image/png", r200.content_type); // explicit Content-Type
+
+    // Range GET: 206 window + Content-Range.
+    const range_hdrs = [_]http.Param{.{ .key = "range", .value = "bytes=100-" }};
+    var ctx206 = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params, .headers = &range_hdrs };
+    const r206 = try serve(&ctx206);
+    try std.testing.expectEqual(@as(u16, 206), r206.status);
+    try std.testing.expectEqual(@as(u64, 100), r206.file.?.offset);
+    try std.testing.expectEqual(@as(?u64, 900), r206.file.?.len);
+
+    // Conditional GET with the minted ETag: 304 with ETag + Cache-Control ONLY.
+    var ctx304 = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params, .if_none_match = etag_val };
+    const r304 = try serve(&ctx304);
+    try std.testing.expectEqual(@as(u16, 304), r304.status);
+    try std.testing.expectEqual(@as(usize, 2), r304.extra_headers.len);
+
+    // Unsatisfiable range: 416 + `bytes */1000`, security headers intact, no file ref.
+    const bad = [_]http.Param{.{ .key = "range", .value = "bytes=5000-" }};
+    var ctx416 = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params, .headers = &bad };
+    const r416 = try serve(&ctx416);
+    try std.testing.expectEqual(@as(u16, 416), r416.status);
+    try std.testing.expect(r416.file == null);
+    var got_cr = false;
+    for (r416.extra_headers) |h| if (std.mem.eql(u8, h.name, "Content-Range")) {
+        try std.testing.expectEqualStrings("bytes */1000", h.value);
+        got_cr = true;
+    };
+    try std.testing.expect(got_cr);
+
+    // HEAD mirrors GET: explicit Content-Length, empty body, no file ref.
+    var ctxh = http.RequestCtx{ .method = .HEAD, .path = "/", .allocator = a, .app = &app, .params = &params };
+    const rh = try serve(&ctxh);
+    try std.testing.expectEqual(@as(u16, 200), rh.status);
+    try std.testing.expect(rh.file == null);
+    var got_cl = false;
+    for (rh.extra_headers) |h| if (std.mem.eql(u8, h.name, "Content-Length")) {
+        try std.testing.expectEqualStrings("1000", h.value);
+        got_cl = true;
+    };
+    try std.testing.expect(got_cl);
 }
 
 /// POST /api/files/token — authenticated; mints a short-lived file-access token.

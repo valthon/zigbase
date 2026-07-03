@@ -64,6 +64,10 @@ const routes = [_]router.Route{
     .{ .method = .GET, .pattern = "/api/collections/:col/auth/oauth2/providers", .handler = oauth_api.oauth2Providers },
     .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
     .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
+    // HEAD mirrors GET (status/headers/Content-Length, no body) — `serve` itself branches
+    // on `ctx.method == .HEAD`; without this route entry a HEAD request never reaches it
+    // (router.tryDispatch requires an exact method match) and 404s before the handler runs.
+    .{ .method = .HEAD, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
     .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
     // Multi-tenancy (#156): activate an account scope for browser apps (sets the signed
     // `zb_account` cookie). 404s when tenancy is disabled; 403 without an active membership.

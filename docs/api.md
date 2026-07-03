@@ -1026,6 +1026,24 @@ bmp/ico, plus pdf). Everything else is served as a download:
 `Content-Disposition: attachment` with `X-Content-Type-Options: nosniff` (this
 neutralizes HTML/SVG/JS XSS). Appending `?download` forces a download for any type.
 
+### Range and conditional requests
+
+File downloads support HTTP range and conditional requests (0.10.0):
+
+- `Accept-Ranges: bytes` on every 200/206. A single `Range: bytes=a-b`, `bytes=a-`,
+  or `bytes=-n` answers `206 Partial Content` with `Content-Range`; a syntactically
+  multi-range request is served as a full `200` (RFC-permitted). An unsatisfiable
+  range answers `416` with `Content-Range: bytes */<size>`.
+- Every response carries a strong `ETag` derived from the stored file's identity
+  (stored names are content-immutable — an update mints a new name), so
+  `If-None-Match` revalidation answers `304`. `If-Range` requires an exact strong
+  match, otherwise the range is ignored.
+- `HEAD` mirrors `GET` (status, headers, `Content-Length`) with no body.
+- `?download` and `?token=` compose with `Range` unchanged.
+- **File tokens vs. seeking:** `ZIGBASE_FILE_TOKEN_TTL` defaults to 120 s; a video
+  player seeking via `?token=` URLs gets 404s once the token expires mid-playback.
+  Use cookie/bearer auth for long media, or re-mint tokens per seek.
+
 ---
 
 ## Static files
