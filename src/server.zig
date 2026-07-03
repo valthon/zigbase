@@ -39,76 +39,23 @@ fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
     return health.handle(ctx);
 }
 
-const routes = [_]router.Route{
-    .{ .method = .GET, .pattern = "/api/health", .handler = healthHandler },
-    .{ .method = .GET, .pattern = "/api/collections", .handler = collections_api.list },
-    .{ .method = .POST, .pattern = "/api/collections", .handler = collections_api.create },
-    .{ .method = .GET, .pattern = "/api/collections/:idOrName", .handler = collections_api.get },
-    .{ .method = .PATCH, .pattern = "/api/collections/:idOrName", .handler = collections_api.update },
-    .{ .method = .DELETE, .pattern = "/api/collections/:idOrName", .handler = collections_api.delete },
-    .{ .method = .GET, .pattern = "/api/collections/:col/records", .handler = records_api.list },
-    .{ .method = .GET, .pattern = "/api/collections/:col/records/:id", .handler = records_api.view },
-    .{ .method = .GET, .pattern = "/api/collections/:col/records/:id/abilities", .handler = records_api.abilities },
-    .{ .method = .POST, .pattern = "/api/collections/:col/records", .handler = records_api.create },
-    .{ .method = .PATCH, .pattern = "/api/collections/:col/records/:id", .handler = records_api.update },
-    .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id", .handler = records_api.delete },
-    .{ .method = .POST, .pattern = "/api/collections/:col/auth-with-password", .handler = auth_api.authWithPassword },
-    .{ .method = .POST, .pattern = "/api/collections/:col/auth-refresh", .handler = auth_api.authRefresh },
-    .{ .method = .POST, .pattern = "/api/collections/:col/auth-logout", .handler = auth_api.authLogout },
-    .{ .method = .POST, .pattern = "/api/collections/:col/request-verification", .handler = auth_api.requestVerification },
-    .{ .method = .POST, .pattern = "/api/collections/:col/confirm-verification", .handler = auth_api.confirmVerification },
-    .{ .method = .POST, .pattern = "/api/collections/:col/request-password-reset", .handler = auth_api.requestPasswordReset },
-    .{ .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .handler = auth_api.confirmPasswordReset },
-    .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/initiate", .handler = auth_methods_api.initiate },
-    .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/complete", .handler = auth_methods_api.complete },
-    .{ .method = .GET, .pattern = "/api/collections/:col/auth/magic_link/consume", .handler = magic_link_consume_api.consume },
-    .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/begin", .handler = webauthn_register_api.begin },
-    .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/finish", .handler = webauthn_register_api.finish },
-    .{ .method = .GET, .pattern = "/api/collections/:col/auth/oauth2/providers", .handler = oauth_api.oauth2Providers },
-    // Per-device sessions (spec §F3). NOTE: the `sessions` segment under /auth/ is RESERVED —
-    // a custom auth-method slug named "sessions" is rejected at comptime (provision.zig) so a
-    // method's /auth/:method/* routes can never shadow or be shadowed by these.
-    .{ .method = .GET, .pattern = "/api/collections/:col/auth/sessions", .handler = sessions_api.list },
-    .{ .method = .DELETE, .pattern = "/api/collections/:col/auth/sessions/:sid", .handler = sessions_api.revoke },
-    .{ .method = .DELETE, .pattern = "/api/collections/:col/auth/sessions", .handler = sessions_api.revokeAll },
-    .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
-    .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
-    // HEAD mirrors GET (status/headers/Content-Length, no body) — `serve` itself branches
-    // on `ctx.method == .HEAD`; without this route entry a HEAD request never reaches it
-    // (router.tryDispatch requires an exact method match) and 404s before the handler runs.
-    .{ .method = .HEAD, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
-    .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
-    // Realtime SSE uplink (#188): auth/subscribe/unsubscribe verbs for an EventSource stream.
-    // The clientId is a stream-delivered capability; unknown/expired/closed ids 404 (non-oracle).
-    .{ .method = .POST, .pattern = "/api/realtime/sse/:clientId", .handler = realtime_api.sseUplink },
-    // Multi-tenancy (#156): activate an account scope for browser apps (sets the signed
-    // `zb_account` cookie). 404s when tenancy is disabled; 403 without an active membership.
-    .{ .method = .POST, .pattern = "/api/accounts/:id/activate", .handler = accounts_api.activate },
-    // Email (#154): verified per-account sender identities. Tenant-scoped + fail closed (handlers
-    // authenticate + resolve the active account internally, like accounts.activate).
-    .{ .method = .GET, .pattern = "/api/senders", .handler = senders_api.list },
-    .{ .method = .POST, .pattern = "/api/senders", .handler = senders_api.create },
-    .{ .method = .POST, .pattern = "/api/senders/:id/verify", .handler = senders_api.verify },
-    // Email (#154): inbound bounce/complaint webhook (SES/Postmark). 404 unless a webhook_secret is
-    // configured; 401 on a bad signature (constant-time compare); upserts suppressions on success.
-    .{ .method = .POST, .pattern = "/api/mail/webhooks/:provider", .handler = mail_inbound.webhook_handler },
-    // Email (#154 round 2): PUBLIC one-click unsubscribe (RFC 8058). 404 unless
-    // unsubscribe_base_url is configured; signed-token authorized; GET never mutates.
-    .{ .method = .POST, .pattern = "/api/mail/unsubscribe", .handler = mail_unsub_api.post },
-    .{ .method = .GET, .pattern = "/api/mail/unsubscribe", .handler = mail_unsub_api.get },
-    // Public, UNAUTHENTICATED feature-state projection (#130). Mounted at the default
-    // "/api/state"; the handler 404s when disabled or remapped (a custom path is
-    // dispatched dynamically in onRequest). NEVER exposes the superuser settings verbs.
-    .{ .method = .GET, .pattern = "/api/state", .handler = state_api.handle },
-    .{ .method = .GET, .pattern = "/api/settings", .handler = settings_api.list },
-    .{ .method = .GET, .pattern = "/api/settings/:key", .handler = settings_api.get },
-    .{ .method = .PUT, .pattern = "/api/settings/:key", .handler = settings_api.put },
-    .{ .method = .DELETE, .pattern = "/api/settings/:key", .handler = settings_api.delete },
-    .{ .method = .GET, .pattern = "/api/features", .handler = features_api.get },
-    // Product analytics (#158): tenant-scoped read API. The raw activity feed and a rollup's
-    // summary rows. Both authenticate + fail closed — a member never sees another account's data.
-    .{ .method = .GET, .pattern = "/api/analytics/events", .handler = analytics_api.events },
-    .{ .method = .GET, .pattern = "/api/analytics/rollups/:name", .handler = analytics_api.rollups },
+/// Comptime gates for the built-in route table + admin SPA (R2-2/R2-3). Every
+/// field default-true: `Server(.{})` is byte-equivalent to the historical table.
+/// INVARIANT (gating policy): no unconditional fn-pointer registration for
+/// optional capabilities — fn-pointer tables are where Zig's lazy analysis dies,
+/// so every optional subsystem's routes concat in ONLY under its gate.
+pub const Gates = struct {
+    admin: bool = true,
+    analytics: bool = true,
+    senders: bool = true,
+    mail_webhook: bool = true,
+    tenancy: bool = true,
+    webauthn: bool = true,
+    magic_link: bool = true,
+    oauth2: bool = true,
+    /// #194 round 2: PUBLIC one-click unsubscribe (RFC 8058). Its own route group and
+    /// module (`api/mail_unsubscribe.zig`), gated like senders/mail_webhook on `.mail`.
+    mail_unsubscribe: bool = true,
 };
 
 // ── §C.1: tunable static Cache-Control via facil.io's OWN state-callback API ────────
@@ -142,29 +89,258 @@ fn replaceStaticMaxAge(_: ?*anyopaque) callconv(.c) void {
     HTTP_HVALUE_MAX_AGE = zap.fio.fiobj_str_new(static_cache_control_value.ptr, static_cache_control_value.len);
 }
 
-pub const Server = struct {
-    app: *app_mod.App,
-    host: [:0]const u8,
-    port: u16,
+/// Type-erased pointer to the running app, set by whichever `Server(gates)` instance calls
+/// `listen()`. `realtime/ws.zig`'s `on_upgrade` callback runs outside any particular `Server`
+/// instantiation (it doesn't know the comptime `gates` used to build it), so it can't name
+/// `Server(gates).instance` — it reads this module-level global instead.
+pub var active_app: ?*app_mod.App = null;
 
-    pub var instance: ?*Server = null;
+pub fn Server(comptime gates: Gates) type {
+    return struct {
+        const Self = @This();
 
-    pub fn listen(self: *Server) !void {
-        instance = self;
-        var listener = zap.HttpListener.init(.{ .port = self.port, .on_request = onRequest, .on_upgrade = realtime_ws.handleUpgrade, .log = false, .max_body_size = @intCast(self.app.max_upload_size) });
-        if (self.app.static_cache_control) |v| {
-            static_cache_control_value = v;
-            fio_state_callback_add(FIO_CALL_PRE_START, replaceStaticMaxAge, null);
+        /// The comptime-assembled built-in route table for this app's gates.
+        pub const routes: []const router.Route = blk: {
+            var t: []const router.Route = &.{
+                .{ .method = .GET, .pattern = "/api/health", .handler = healthHandler },
+                .{ .method = .GET, .pattern = "/api/collections", .handler = collections_api.list },
+                .{ .method = .POST, .pattern = "/api/collections", .handler = collections_api.create },
+                .{ .method = .GET, .pattern = "/api/collections/:idOrName", .handler = collections_api.get },
+                .{ .method = .PATCH, .pattern = "/api/collections/:idOrName", .handler = collections_api.update },
+                .{ .method = .DELETE, .pattern = "/api/collections/:idOrName", .handler = collections_api.delete },
+                .{ .method = .GET, .pattern = "/api/collections/:col/records", .handler = records_api.list },
+                .{ .method = .GET, .pattern = "/api/collections/:col/records/:id", .handler = records_api.view },
+                .{ .method = .GET, .pattern = "/api/collections/:col/records/:id/abilities", .handler = records_api.abilities },
+                .{ .method = .POST, .pattern = "/api/collections/:col/records", .handler = records_api.create },
+                .{ .method = .PATCH, .pattern = "/api/collections/:col/records/:id", .handler = records_api.update },
+                .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id", .handler = records_api.delete },
+                .{ .method = .POST, .pattern = "/api/collections/:col/auth-with-password", .handler = auth_api.authWithPassword },
+                .{ .method = .POST, .pattern = "/api/collections/:col/auth-refresh", .handler = auth_api.authRefresh },
+                .{ .method = .POST, .pattern = "/api/collections/:col/auth-logout", .handler = auth_api.authLogout },
+                .{ .method = .POST, .pattern = "/api/collections/:col/request-verification", .handler = auth_api.requestVerification },
+                .{ .method = .POST, .pattern = "/api/collections/:col/confirm-verification", .handler = auth_api.confirmVerification },
+                .{ .method = .POST, .pattern = "/api/collections/:col/request-password-reset", .handler = auth_api.requestPasswordReset },
+                .{ .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .handler = auth_api.confirmPasswordReset },
+                .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/initiate", .handler = auth_methods_api.initiate },
+                .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/complete", .handler = auth_methods_api.complete },
+                // Per-device sessions (spec §F3). Always registered — the handlers branch on the
+                // app's `session_store` mode at runtime (`.table` serves the per-device verbs;
+                // `.epoch` 404s the two device routes, the DELETE-all works in BOTH), so there is
+                // no optional subsystem to gate. NOTE: the `sessions` segment under /auth/ is
+                // RESERVED — a custom auth-method slug named "sessions" is rejected at comptime
+                // (provision.zig) so a method's /auth/:method/* routes can never shadow these.
+                .{ .method = .GET, .pattern = "/api/collections/:col/auth/sessions", .handler = sessions_api.list },
+                .{ .method = .DELETE, .pattern = "/api/collections/:col/auth/sessions/:sid", .handler = sessions_api.revoke },
+                .{ .method = .DELETE, .pattern = "/api/collections/:col/auth/sessions", .handler = sessions_api.revokeAll },
+                .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
+                // HEAD mirrors GET (status/headers/Content-Length, no body) — `serve` itself branches
+                // on `ctx.method == .HEAD`; without this route entry a HEAD request never reaches it
+                // (router.tryDispatch requires an exact method match) and 404s before the handler runs.
+                .{ .method = .HEAD, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
+                .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
+                // Realtime SSE uplink (#188): auth/subscribe/unsubscribe verbs for an EventSource stream.
+                // Always registered — realtime (WS + SSE) is not an optional gated subsystem; the clientId
+                // is a stream-delivered capability, so unknown/expired/closed ids 404 (non-oracle).
+                .{ .method = .POST, .pattern = "/api/realtime/sse/:clientId", .handler = realtime_api.sseUplink },
+                // Public, UNAUTHENTICATED feature-state projection (#130). Mounted at the default
+                // "/api/state"; the handler 404s when disabled or remapped (a custom path is
+                // dispatched dynamically in onRequest). NEVER exposes the superuser settings verbs.
+                .{ .method = .GET, .pattern = "/api/state", .handler = state_api.handle },
+                .{ .method = .GET, .pattern = "/api/settings", .handler = settings_api.list },
+                .{ .method = .GET, .pattern = "/api/settings/:key", .handler = settings_api.get },
+                .{ .method = .PUT, .pattern = "/api/settings/:key", .handler = settings_api.put },
+                .{ .method = .DELETE, .pattern = "/api/settings/:key", .handler = settings_api.delete },
+                .{ .method = .GET, .pattern = "/api/features", .handler = features_api.get },
+            };
+            if (gates.magic_link) t = t ++ &[_]router.Route{
+                .{ .method = .GET, .pattern = "/api/collections/:col/auth/magic_link/consume", .handler = magic_link_consume_api.consume },
+            };
+            if (gates.webauthn) t = t ++ &[_]router.Route{
+                .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/begin", .handler = webauthn_register_api.begin },
+                .{ .method = .POST, .pattern = "/api/collections/:col/auth/webauthn/register/finish", .handler = webauthn_register_api.finish },
+            };
+            if (gates.oauth2) t = t ++ &[_]router.Route{
+                .{ .method = .GET, .pattern = "/api/collections/:col/auth/oauth2/providers", .handler = oauth_api.oauth2Providers },
+                .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id/external-auths/:provider", .handler = oauth_api.unlinkProvider },
+            };
+            // Multi-tenancy (#156): activate an account scope for browser apps (sets the signed
+            // `zb_account` cookie). 404s when tenancy is disabled; 403 without an active membership.
+            if (gates.tenancy) t = t ++ &[_]router.Route{
+                .{ .method = .POST, .pattern = "/api/accounts/:id/activate", .handler = accounts_api.activate },
+            };
+            // Email (#154): verified per-account sender identities. Tenant-scoped + fail closed (handlers
+            // authenticate + resolve the active account internally, like accounts.activate).
+            if (gates.senders) t = t ++ &[_]router.Route{
+                .{ .method = .GET, .pattern = "/api/senders", .handler = senders_api.list },
+                .{ .method = .POST, .pattern = "/api/senders", .handler = senders_api.create },
+                .{ .method = .POST, .pattern = "/api/senders/:id/verify", .handler = senders_api.verify },
+            };
+            // Email (#154): inbound bounce/complaint webhook (SES/Postmark). 404 unless a webhook_secret is
+            // configured; 401 on a bad signature (constant-time compare); upserts suppressions on success.
+            if (gates.mail_webhook) t = t ++ &[_]router.Route{
+                .{ .method = .POST, .pattern = "/api/mail/webhooks/:provider", .handler = mail_inbound.webhook_handler },
+            };
+            // Email (#154 round 2): PUBLIC one-click unsubscribe (RFC 8058). 404 unless
+            // unsubscribe_base_url is configured; signed-token authorized; GET never mutates.
+            if (gates.mail_unsubscribe) t = t ++ &[_]router.Route{
+                .{ .method = .POST, .pattern = "/api/mail/unsubscribe", .handler = mail_unsub_api.post },
+                .{ .method = .GET, .pattern = "/api/mail/unsubscribe", .handler = mail_unsub_api.get },
+            };
+            // Product analytics (#158): tenant-scoped read API. The raw activity feed and a rollup's
+            // summary rows. Both authenticate + fail closed — a member never sees another account's data.
+            if (gates.analytics) t = t ++ &[_]router.Route{
+                .{ .method = .GET, .pattern = "/api/analytics/events", .handler = analytics_api.events },
+                .{ .method = .GET, .pattern = "/api/analytics/rollups/:name", .handler = analytics_api.rollups },
+            };
+            break :blk t;
+        };
+
+        app: *app_mod.App,
+        host: [:0]const u8,
+        port: u16,
+
+        pub var instance: ?*Self = null;
+
+        pub fn listen(self: *Self) !void {
+            instance = self;
+            active_app = self.app;
+            var listener = zap.HttpListener.init(.{ .port = self.port, .on_request = onRequest, .on_upgrade = realtime_ws.handleUpgrade, .log = false, .max_body_size = @intCast(self.app.max_upload_size) });
+            if (self.app.static_cache_control) |v| {
+                static_cache_control_value = v;
+                fio_state_callback_add(FIO_CALL_PRE_START, replaceStaticMaxAge, null);
+            }
+            try listener.listen();
+            std.log.info("zigbase listening on http://{s}:{d}", .{ self.host, self.port });
+            realtime_ws.active = true; // reactor about to run; allow broadcast to publish
+            // #159, PR-6b: on Postgres, fan realtime across app instances via LISTEN/NOTIFY. A no-op
+            // on SQLite (single-process) — self-gated, so no backend branch is needed here.
+            realtime_ws.startRemoteListener(self.app);
+            zap.start(.{ .threads = 4, .workers = 1 });
         }
-        try listener.listen();
-        std.log.info("zigbase listening on http://{s}:{d}", .{ self.host, self.port });
-        realtime_ws.active = true; // reactor about to run; allow broadcast to publish
-        // #159, PR-6b: on Postgres, fan realtime across app instances via LISTEN/NOTIFY. A no-op
-        // on SQLite (single-process) — self-gated, so no backend branch is needed here.
-        realtime_ws.startRemoteListener(self.app);
-        zap.start(.{ .threads = 4, .workers = 1 });
-    }
-};
+
+        fn onRequest(r: zap.Request) !void {
+            const self = Self.instance.?;
+            var arena = std.heap.ArenaAllocator.init(self.app.allocator);
+            defer arena.deinit();
+            var ctx = http.RequestCtx{
+                .method = methodFromZap(r),
+                .path = r.path orelse "/",
+                .query = r.query orelse "",
+                .body = r.body orelse "",
+                .allocator = arena.allocator(),
+                .app = self.app,
+            };
+            ctx.authorization = r.getHeader("authorization") orelse "";
+            ctx.cookie_header = r.getHeader("cookie") orelse "";
+            ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
+            ctx.content_type = r.getHeader("content-type") orelse "";
+            ctx.if_none_match = r.getHeader("if-none-match") orelse "";
+            ctx.user_agent = r.getHeader("user-agent") orelse "";
+            // Client IP for rate limiting (F8). Proxy hop headers (X-Forwarded-For / X-Real-IP)
+            // are spoofable on direct exposure, so they are honored ONLY when trust_proxy is set.
+            // Otherwise "" — the limiter keys on the submitted identity (never header-spoofable).
+            ctx.remote_ip = clientIp(r, self.app.trust_proxy);
+            // Generic header lookup for the route-guard `.header` source (#139). `r` lives on this
+            // frame for the whole request, so a pointer to it is valid for the lookup thunk's life.
+            var zap_req = r;
+            ctx.raw_header_ctx = &zap_req;
+            ctx.raw_header_fn = zapHeaderLookup;
+            ctx.raw_header_set_fn = zapHeaderSet;
+            const multipart_err = try applyMultipart(&ctx);
+            const resp = blk: {
+                if (multipart_err) |er| break :blk er;
+                if (comptime gates.admin) {
+                    if (std.mem.startsWith(u8, ctx.path, "/_/") or std.mem.eql(u8, ctx.path, "/_"))
+                        break :blk admin.serve(&ctx);
+                }
+                // Built-in API routes win over custom routes.
+                const builtin = router.tryDispatch(routes, &ctx) catch {
+                    break :blk ApiError.internal().toResponse(arena.allocator()) catch {
+                        sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
+                        return;
+                    };
+                };
+                if (builtin) |hit| break :blk hit;
+                // Public feature-state projection at a CUSTOM-configured path. The default
+                // "/api/state" is already in the static table above; this covers a remapped
+                // `.features = .{ .public_route = "/custom" }`. Reserved ahead of custom routes
+                // so a consumer route cannot shadow it. Disabled (null) → skipped entirely.
+                if (self.app.features_public_route) |fp| {
+                    if ((ctx.method == .GET or ctx.method == .HEAD) and
+                        !std.mem.eql(u8, fp, "/api/state") and
+                        std.mem.eql(u8, ctx.path, fp))
+                    {
+                        break :blk state_api.handle(&ctx) catch ApiError.internal().toResponse(arena.allocator()) catch {
+                            sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
+                            return;
+                        };
+                    }
+                }
+                if (dispatchCustom(&ctx) catch null) |hit| break :blk hit;
+                // The whole /api namespace stays JSON — including the bare "/api" path
+                // (mirrors the exact-"/_" handling in the admin guard above).
+                if (std.meta.activeTag(self.app.static_source) != .none and
+                    (ctx.method == .GET or ctx.method == .HEAD) and
+                    !std.mem.startsWith(u8, ctx.path, "/api/") and
+                    !std.mem.eql(u8, ctx.path, "/api"))
+                {
+                    if (static_files.serve(self.app.io, &ctx, self.app.static_source, .{
+                        .routes = self.app.static_routes,
+                        .spa_roots = self.app.spa_roots,
+                        .spa_marker_enabled = self.app.spa_marker_enabled,
+                        .cache_control = self.app.static_cache_control,
+                    }) catch null) |hit| break :blk hit;
+                    // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.
+                    break :blk http.Response{ .status = 404, .body = "not found", .content_type = "text/plain; charset=utf-8" };
+                }
+                break :blk ApiError.notFound().toResponse(arena.allocator()) catch {
+                    sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
+                    return;
+                };
+            };
+            setZapStatus(r, resp.status);
+            for (resp.cookies) |c| {
+                r.setCookie(.{
+                    .name = c.name,
+                    .value = c.value,
+                    .path = c.path,
+                    .domain = c.domain,
+                    .max_age_s = @intCast(c.max_age_s),
+                    .secure = c.secure,
+                    .http_only = c.http_only,
+                    .same_site = switch (c.same_site) {
+                        .default => .Default,
+                        .lax => .Lax,
+                        .strict => .Strict,
+                        .none => .None,
+                    },
+                }) catch {};
+            }
+            for (resp.extra_headers) |h| r.setHeader(h.name, h.value) catch {};
+            if (resp.file) |f| {
+                if (f.len) |len| {
+                    // ZigBase-owned plan (record files, §B): status + headers were set above;
+                    // Content-Type comes from the handler's Response (facil.io's
+                    // add_content_type is set-if-missing, so this value wins, exactly once).
+                    r.setHeader("content-type", resp.content_type) catch {};
+                    sendFileRange(r, self.app.io, f.path, f.offset, len) catch {
+                        // Open failure => the existing 404 raw envelope (unchanged semantics).
+                        sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
+                    };
+                } else {
+                    // Wholesale facil.io delegation (dir-mode static): mime, ETag, 304,
+                    // `.gz` sidecar, Range are ALL facil.io's (§A.3) — byte-identical to today.
+                    r.sendFile(f.path) catch {
+                        sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
+                    };
+                }
+                return;
+            }
+            r.setHeader("content-type", resp.content_type) catch {};
+            r.sendBody(resp.body) catch {};
+        }
+    };
+}
 
 fn methodFromZap(r: zap.Request) http.Method {
     return switch (r.methodAsEnum()) {
@@ -893,122 +1069,41 @@ fn sendRawEnvelope(r: zap.Request, status: u16, body: []const u8) void {
     r.sendBody(body) catch {};
 }
 
-fn onRequest(r: zap.Request) !void {
-    const self = Server.instance.?;
-    var arena = std.heap.ArenaAllocator.init(self.app.allocator);
-    defer arena.deinit();
-    var ctx = http.RequestCtx{
-        .method = methodFromZap(r),
-        .path = r.path orelse "/",
-        .query = r.query orelse "",
-        .body = r.body orelse "",
-        .allocator = arena.allocator(),
-        .app = self.app,
-    };
-    ctx.authorization = r.getHeader("authorization") orelse "";
-    ctx.cookie_header = r.getHeader("cookie") orelse "";
-    ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
-    ctx.content_type = r.getHeader("content-type") orelse "";
-    ctx.if_none_match = r.getHeader("if-none-match") orelse "";
-    ctx.user_agent = r.getHeader("user-agent") orelse "";
-    // Client IP for rate limiting (F8). Proxy hop headers (X-Forwarded-For / X-Real-IP)
-    // are spoofable on direct exposure, so they are honored ONLY when trust_proxy is set.
-    // Otherwise "" — the limiter keys on the submitted identity (never header-spoofable).
-    ctx.remote_ip = clientIp(r, self.app.trust_proxy);
-    // Generic header lookup for the route-guard `.header` source (#139). `r` lives on this
-    // frame for the whole request, so a pointer to it is valid for the lookup thunk's life.
-    var zap_req = r;
-    ctx.raw_header_ctx = &zap_req;
-    ctx.raw_header_fn = zapHeaderLookup;
-    ctx.raw_header_set_fn = zapHeaderSet;
-    const multipart_err = try applyMultipart(&ctx);
-    const resp = blk: {
-        if (multipart_err) |er| break :blk er;
-        if (std.mem.startsWith(u8, ctx.path, "/_/") or std.mem.eql(u8, ctx.path, "/_"))
-            break :blk admin.serve(&ctx);
-        // Built-in API routes win over custom routes.
-        const builtin = router.tryDispatch(&routes, &ctx) catch {
-            break :blk ApiError.internal().toResponse(arena.allocator()) catch {
-                sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
-                return;
-            };
-        };
-        if (builtin) |hit| break :blk hit;
-        // Public feature-state projection at a CUSTOM-configured path. The default
-        // "/api/state" is already in the static table above; this covers a remapped
-        // `.features = .{ .public_route = "/custom" }`. Reserved ahead of custom routes
-        // so a consumer route cannot shadow it. Disabled (null) → skipped entirely.
-        if (self.app.features_public_route) |fp| {
-            if ((ctx.method == .GET or ctx.method == .HEAD) and
-                !std.mem.eql(u8, fp, "/api/state") and
-                std.mem.eql(u8, ctx.path, fp))
-            {
-                break :blk state_api.handle(&ctx) catch ApiError.internal().toResponse(arena.allocator()) catch {
-                    sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
-                    return;
-                };
-            }
-        }
-        if (dispatchCustom(&ctx) catch null) |hit| break :blk hit;
-        // The whole /api namespace stays JSON — including the bare "/api" path
-        // (mirrors the exact-"/_" handling in the admin guard above).
-        if (std.meta.activeTag(self.app.static_source) != .none and
-            (ctx.method == .GET or ctx.method == .HEAD) and
-            !std.mem.startsWith(u8, ctx.path, "/api/") and
-            !std.mem.eql(u8, ctx.path, "/api"))
-        {
-            if (static_files.serve(self.app.io, &ctx, self.app.static_source, .{
-                .routes = self.app.static_routes,
-                .spa_roots = self.app.spa_roots,
-                .spa_marker_enabled = self.app.spa_marker_enabled,
-                .cache_control = self.app.static_cache_control,
-            }) catch null) |hit| break :blk hit;
-            // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.
-            break :blk http.Response{ .status = 404, .body = "not found", .content_type = "text/plain; charset=utf-8" };
-        }
-        break :blk ApiError.notFound().toResponse(arena.allocator()) catch {
-            sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
-            return;
-        };
-    };
-    setZapStatus(r, resp.status);
-    for (resp.cookies) |c| {
-        r.setCookie(.{
-            .name = c.name,
-            .value = c.value,
-            .path = c.path,
-            .domain = c.domain,
-            .max_age_s = @intCast(c.max_age_s),
-            .secure = c.secure,
-            .http_only = c.http_only,
-            .same_site = switch (c.same_site) {
-                .default => .Default,
-                .lax => .Lax,
-                .strict => .Strict,
-                .none => .None,
-            },
-        }) catch {};
-    }
-    for (resp.extra_headers) |h| r.setHeader(h.name, h.value) catch {};
-    if (resp.file) |f| {
-        if (f.len) |len| {
-            // ZigBase-owned plan (record files, §B): status + headers were set above;
-            // Content-Type comes from the handler's Response (facil.io's
-            // add_content_type is set-if-missing, so this value wins, exactly once).
-            r.setHeader("content-type", resp.content_type) catch {};
-            sendFileRange(r, self.app.io, f.path, f.offset, len) catch {
-                // Open failure => the existing 404 raw envelope (unchanged semantics).
-                sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
-            };
-        } else {
-            // Wholesale facil.io delegation (dir-mode static): mime, ETag, 304,
-            // `.gz` sidecar, Range are ALL facil.io's (§A.3) — byte-identical to today.
-            r.sendFile(f.path) catch {
-                sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
-            };
-        }
-        return;
-    }
-    r.setHeader("content-type", resp.content_type) catch {};
-    r.sendBody(resp.body) catch {};
+fn hasRoute(rs: []const router.Route, method: http.Method, pattern: []const u8) bool {
+    for (rs) |r| if (r.method == method and std.mem.eql(u8, r.pattern, pattern)) return true;
+    return false;
+}
+
+test "R2-3: Gates assemble the built-in route table at comptime" {
+    const full = Server(.{}); // all-on default == today's table
+    try std.testing.expect(hasRoute(full.routes, .GET, "/api/analytics/events"));
+    try std.testing.expect(hasRoute(full.routes, .GET, "/api/senders"));
+    try std.testing.expect(hasRoute(full.routes, .POST, "/api/mail/webhooks/:provider"));
+    try std.testing.expect(hasRoute(full.routes, .POST, "/api/mail/unsubscribe"));
+    try std.testing.expect(hasRoute(full.routes, .POST, "/api/accounts/:id/activate"));
+    try std.testing.expect(hasRoute(full.routes, .POST, "/api/collections/:col/auth/webauthn/register/begin"));
+
+    const lean = Server(.{
+        .admin = false, .analytics = false, .senders = false, .mail_webhook = false,
+        .mail_unsubscribe = false,
+        .tenancy = false, .webauthn = false, .magic_link = false, .oauth2 = false,
+    });
+    // Core stays.
+    try std.testing.expect(hasRoute(lean.routes, .GET, "/api/health"));
+    try std.testing.expect(hasRoute(lean.routes, .POST, "/api/collections/:col/auth-with-password"));
+    try std.testing.expect(hasRoute(lean.routes, .GET, "/api/settings"));
+    // Optional subsystems are ABSENT (not 404-at-runtime — absent from the table).
+    try std.testing.expect(!hasRoute(lean.routes, .GET, "/api/analytics/events"));
+    try std.testing.expect(!hasRoute(lean.routes, .GET, "/api/analytics/rollups/:name"));
+    try std.testing.expect(!hasRoute(lean.routes, .GET, "/api/senders"));
+    try std.testing.expect(!hasRoute(lean.routes, .POST, "/api/senders/:id/verify"));
+    try std.testing.expect(!hasRoute(lean.routes, .POST, "/api/mail/webhooks/:provider"));
+    try std.testing.expect(!hasRoute(lean.routes, .POST, "/api/mail/unsubscribe"));
+    try std.testing.expect(!hasRoute(lean.routes, .GET, "/api/mail/unsubscribe"));
+    try std.testing.expect(!hasRoute(lean.routes, .POST, "/api/accounts/:id/activate"));
+    try std.testing.expect(!hasRoute(lean.routes, .POST, "/api/collections/:col/auth/webauthn/register/begin"));
+    try std.testing.expect(!hasRoute(lean.routes, .POST, "/api/collections/:col/auth/webauthn/register/finish"));
+    try std.testing.expect(!hasRoute(lean.routes, .GET, "/api/collections/:col/auth/magic-link/consume"));
+    try std.testing.expect(!hasRoute(lean.routes, .GET, "/api/collections/:col/auth/oauth2/providers"));
+    try std.testing.expect(!hasRoute(lean.routes, .DELETE, "/api/collections/:col/records/:id/external-auths/:provider"));
 }

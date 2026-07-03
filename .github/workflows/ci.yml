@@ -61,6 +61,12 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build auth2-server -Dcpu=baseline
       - name: Build features-fixture (demo flags/experiments browser fixture)
         run: mise exec zig@0.16.0 -- zig build features-fixture -Dcpu=baseline
+      - name: Build lean gating fixture
+        run: mise exec zig@0.16.0 -- zig build minimal-server
+      - name: Build full gating fixture (positive control)
+        run: mise exec zig@0.16.0 -- zig build full-fixture
+      - name: Gating invariant (absent-symbols check)
+        run: ./scripts/check-gating.sh
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh

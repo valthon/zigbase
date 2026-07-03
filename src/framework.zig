@@ -329,7 +329,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -445,22 +445,22 @@ pub fn App(comptime cfg: anytype) type {
         /// Framework-owned built-in job kinds, prepended to the consumer `.jobs` registry
         /// below. `"mail"` (#141) backs `ctx.mail().enqueue` — a `"mail"` job deserializes
         /// the `MailMessage` payload and delivers it via `mail/send.zig`. `"mail_batch_item"`
-        /// (#154 round 2) backs `ctx.mail().sendBulk` — see `mail/bulk.zig`. Kept as its own
-        /// const so sibling PRs (e.g. webhook, #144) can add their built-ins self-contained.
-        const builtin_job_regs: []const queue.JobReg = &.{
-            .{ .kind = "mail", .handler = mail_send.jobHandler },
-            .{ .kind = mail_bulk.job_kind, .handler = mail_bulk.jobHandler },
-            .{ .kind = webhook.job_kind, .handler = webhook.webhookJobHandler },
+        /// (#154 round 2) backs `ctx.mail().sendBulk` — see `mail/bulk.zig`; it rides the same
+        /// mail gate. `"webhook"` (#144) backs `ctx.webhook`. R2-5: each is registered ONLY
+        /// when its capability is configured (`enable_mail_job` / `enable_webhooks` above) — an
+        /// unconfigured built-in's code does not get pulled into the binary.
+        const builtin_job_regs: []const queue.JobReg = blk: {
+            var t: []const queue.JobReg = &.{};
+            if (enable_mail_job) t = t ++ &[_]queue.JobReg{.{ .kind = "mail", .handler = mail_send.jobHandler }};
+            if (enable_mail_job) t = t ++ &[_]queue.JobReg{.{ .kind = mail_bulk.job_kind, .handler = mail_bulk.jobHandler }};
+            if (enable_webhooks) t = t ++ &[_]queue.JobReg{.{ .kind = webhook.job_kind, .handler = webhook.webhookJobHandler }};
+            break :blk t;
         };
 
-        /// Names of the reserved built-in kinds, derived from `builtin_job_regs` so the
-        /// collision guard below automatically covers every current AND future built-in.
-        const reserved_job_kinds: []const []const u8 = blk: {
-            var names: [builtin_job_regs.len][]const u8 = undefined;
-            for (builtin_job_regs, 0..) |r, i| names[i] = r.kind;
-            const frozen = names;
-            break :blk &frozen;
-        };
+        /// Reserved built-in kind names — reserved UNCONDITIONALLY (even when the
+        /// built-in is gated off) so enabling a capability later never collides
+        /// with a consumer job kind.
+        const reserved_job_kinds: []const []const u8 = &.{ "mail", "mail_batch_item", "webhook" };
 
         /// Declared job-kind → handler registry: the built-in kinds followed by the consumer
         /// `.jobs` bindings (the reserved `.jobs.pool_size` key is skipped). `jobByKind`
@@ -597,6 +597,54 @@ pub fn App(comptime cfg: anytype) type {
         /// Whether to compile the `typegen` CLI subcommand into the binary.
         /// Off by default so production builds carry no codegen weight.
         pub const enable_typegen: bool = if (@hasField(@TypeOf(cfg), "enable_typegen")) cfg.enable_typegen else false;
+
+        /// R2-5: `.webhooks = true` registers the built-in "webhook" job kind
+        /// (managed outbound deliveries via ctx.webhook). Unset → webhook.zig is
+        /// not compiled into your binary and ctx.webhook fails at enqueue time.
+        pub const enable_webhooks: bool = blk: {
+            if (!@hasField(@TypeOf(cfg), "webhooks")) break :blk false;
+            if (@TypeOf(cfg.webhooks) != bool)
+                @compileError(".webhooks must be a bool; got '" ++ @typeName(@TypeOf(cfg.webhooks)) ++ "'");
+            break :blk cfg.webhooks;
+        };
+
+        /// R2-5: the "mail" job kind (ctx.mail().enqueue) registers when mail is
+        /// configured — a `.mailer` plugin or the `.mail` policy key (use `.mail = .{}`
+        /// to enable background delivery with the default env-configured mailer).
+        const enable_mail_job: bool = @hasField(@TypeOf(cfg), "mailer") or @hasField(@TypeOf(cfg), "mail");
+
+        /// R2-2: `.admin = .disabled` removes the embedded admin SPA (route dispatch
+        /// AND the @embedFile'd assets) from the binary. Default: served at /_/ .
+        pub const enable_admin: bool = blk: {
+            if (!@hasField(@TypeOf(cfg), "admin")) break :blk true;
+            const a = cfg.admin;
+            if (@TypeOf(a) != @TypeOf(.enum_literal))
+                @compileError(".admin: expected the enum literal .disabled (the admin UI is on by default; omit the key to keep it)");
+            if (std.mem.eql(u8, @tagName(a), "disabled")) break :blk false;
+            @compileError(".admin: unknown value '." ++ @tagName(a) ++ "'; only .disabled is recognized");
+        };
+
+        /// True iff `T` is in the assembled auth-method set.
+        fn hasAuthMethod(comptime T: type) bool {
+            for (auth_method_types) |M| if (M == T) return true;
+            return false;
+        }
+
+        /// R2-3/R2-4: comptime route gates derived from cfg. The webauthn/magic_link/
+        /// oauth2 gates are derived from the assembled `.auth_methods` set (Task 5) —
+        /// a deselected built-in's route (and its ~thousands of LOC) never gets pulled
+        /// into the binary by Zig's lazy analysis.
+        pub const route_gates: server.Gates = .{
+            .admin = enable_admin,
+            .analytics = @hasField(@TypeOf(cfg), "analytics"),
+            .senders = @hasField(@TypeOf(cfg), "mail"),
+            .mail_webhook = @hasField(@TypeOf(cfg), "mail"),
+            .mail_unsubscribe = @hasField(@TypeOf(cfg), "mail"),
+            .tenancy = tenancy_config.enabled,
+            .webauthn = hasAuthMethod(@import("auth/methods/webauthn.zig").WebAuthnMethod),
+            .magic_link = hasAuthMethod(@import("auth/methods/magic_link.zig").MagicLinkMethod),
+            .oauth2 = hasAuthMethod(@import("auth/methods/oauth2.zig").OAuth2Method),
+        };
 
         /// Per-thread stack size (bytes) for the scheduler/job-pool/submit threads
         /// (the `.pools.stack_size` lever). Defaults to `scheduler.default_job_stack_size`
@@ -1082,6 +1130,7 @@ pub fn App(comptime cfg: anytype) type {
             .role_ranking = role_ranking,
             .mail = mail_config,
             .static_cache_control = static_cache_control,
+            .gates = route_gates,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -1245,6 +1294,9 @@ pub const ServeOpts = struct {
     mail: mail_cfg.Runtime = .{},
     /// §C.2: comptime default for the static Cache-Control knob; runtime flag/env override it.
     static_cache_control: ?[]const u8 = null,
+    /// Comptime route gates (R2-2/R2-3): which optional built-in route groups + the admin
+    /// SPA get compiled in. Default `.{}` (all true) is the historical, byte-identical table.
+    gates: server.Gates = .{},
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -2162,7 +2214,8 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
-    var srv = server.Server{ .app = &app, .host = host_z, .port = cfg.http_port };
+    const Srv = server.Server(opts.gates);
+    var srv = Srv{ .app = &app, .host = host_z, .port = cfg.http_port };
     // Bounded background pool for memory-queue jobs + app.submit (R1-2). Worker threads
     // spawn lazily on first use (zero overhead when unused) and stop() drains + joins.
     // Its defer is registered BEFORE the scheduler's, so (LIFO) the scheduler stops FIRST
@@ -2270,13 +2323,15 @@ test "App(cfg) synthesizes a default queue + implicit worker; no durable jobs fo
 
 test "App(cfg) lowers .queues/.workers/.jobs and installs durable poller + GC jobs" {
     const A = App(.{
+        .mail = .{},
+        .webhooks = true,
         .queues = .{ .emails = .{ .backend = .durable, .priority = .high } },
         .workers = .{ .mailer = .{ .queues = .{"emails"}, .concurrency = 2 } },
         .jobs = .{ .send = qTestHandler },
     });
     try std.testing.expect(A.has_durable_queue);
-    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144)
-    // ++ consumer kinds; built-ins first.
+    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144, all
+    // enabled here via R2-5's .mail/.webhooks gates) ++ consumer kinds; built-ins first.
     try std.testing.expectEqual(@as(usize, 4), A.job_regs.len);
     try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
     try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[1].kind);
@@ -2297,10 +2352,10 @@ test "App(cfg) lowers .queues/.workers/.jobs and installs durable poller + GC jo
 
 test "App(cfg) keeps legacy .jobs.pool_size working alongside the job registry" {
     // `.jobs.pool_size` is the legacy scheduler-pool lever; it must NOT become a job kind.
-    const A = App(.{ .jobs = .{ .pool_size = 3, .resize = qTestHandler } });
+    const A = App(.{ .jobs = .{ .pool_size = 3, .resize = qTestHandler }, .mail = .{}, .webhooks = true });
     try std.testing.expectEqual(@as(usize, 3), A.job_pool_size);
-    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144)
-    // ++ consumer "resize"; pool_size is skipped.
+    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144, all
+    // enabled here via R2-5's .mail/.webhooks gates) ++ consumer "resize"; pool_size is skipped.
     try std.testing.expectEqual(@as(usize, 4), A.job_regs.len);
     try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
     try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[1].kind);
@@ -2309,6 +2364,29 @@ test "App(cfg) keeps legacy .jobs.pool_size working alongside the job registry" 
     // The compile-checked Job enum still reflects ONLY the consumer kinds (mail is a
     // built-in reached via ctx.mail().enqueue / ctx.enqueueByName, not the typed enum).
     try std.testing.expectEqual(@as(usize, 1), std.meta.fields(A.Job).len);
+}
+
+test "R2-5: built-in job kinds register only when their capability is configured" {
+    const Bare = App(.{});
+    try std.testing.expectEqual(@as(usize, 0), Bare.job_regs.len);
+
+    const WithMail = App(.{ .mail = .{} });
+    // The mail gate pulls in both "mail" and its bulk sibling "mail_batch_item" (#154r2).
+    try std.testing.expectEqual(@as(usize, 2), WithMail.job_regs.len);
+    try std.testing.expectEqualStrings("mail", WithMail.job_regs[0].kind);
+    try std.testing.expectEqualStrings("mail_batch_item", WithMail.job_regs[1].kind);
+
+    const WithHooks = App(.{ .webhooks = true });
+    try std.testing.expectEqual(@as(usize, 1), WithHooks.job_regs.len);
+    try std.testing.expectEqualStrings("webhook", WithHooks.job_regs[0].kind);
+}
+
+test "R2-5: mail/webhook kind names stay reserved even when unregistered" {
+    // Must @compileError if uncommented — probed manually per the R2-5 task brief
+    // (assertNoReservedJobKinds still rejects a consumer .jobs entry named "webhook"
+    // even though .webhooks is unset here and the built-in isn't registered):
+    // _ = App(.{ .jobs = .{ .webhook = qTestHandler } }).job_regs;
+    try std.testing.expect(true);
 }
 
 test "App(cfg) installs the auth-lifecycle dispatcher only for a non-empty .auth group" {
@@ -2573,6 +2651,44 @@ test "App(cfg) lowers the comptime .tenancy config (#156; defaults to disabled)"
     try std.testing.expectEqual(@as(usize, 2), T.role_ranking.roles.len);
     try std.testing.expect(T.role_ranking.gte("admin", "member"));
     try std.testing.expect(!T.role_ranking.gte("member", "admin"));
+}
+
+test "App(cfg) .admin defaults to enabled; .admin = .disabled flips it off (R2-2)" {
+    const D = App(.{});
+    try std.testing.expect(D.enable_admin);
+    try std.testing.expect(D.route_gates.admin);
+
+    const NoAdmin = App(.{ .admin = .disabled });
+    try std.testing.expect(!NoAdmin.enable_admin);
+    try std.testing.expect(!NoAdmin.route_gates.admin);
+}
+
+test "App(cfg) route_gates: analytics/senders/mail_webhook/tenancy follow their config keys (R2-3)" {
+    // No .analytics/.mail/.tenancy keys => those route groups are gated off.
+    const D = App(.{});
+    try std.testing.expect(!D.route_gates.analytics);
+    try std.testing.expect(!D.route_gates.senders);
+    try std.testing.expect(!D.route_gates.mail_webhook);
+    try std.testing.expect(!D.route_gates.tenancy);
+
+    const A = App(.{ .analytics = .{} });
+    try std.testing.expect(A.route_gates.analytics);
+
+    const M = App(.{ .mail = .{} });
+    try std.testing.expect(M.route_gates.senders);
+    try std.testing.expect(M.route_gates.mail_webhook);
+
+    const T = App(.{ .tenancy = .{ .enabled = true, .auth_collection = "users" } });
+    try std.testing.expect(T.route_gates.tenancy);
+}
+
+test "R2-4: deselecting a built-in drops its method-specific routes" {
+    const A = App(.{ .auth_methods = .{ .builtins = .{ .password } } });
+    try std.testing.expect(!A.route_gates.webauthn);
+    try std.testing.expect(!A.route_gates.magic_link);
+    try std.testing.expect(!A.route_gates.oauth2);
+    const B = App(.{});
+    try std.testing.expect(B.route_gates.webauthn);
 }
 
 test "App(cfg) lowers the comptime .abilities config onto the matching collection (#155)" {

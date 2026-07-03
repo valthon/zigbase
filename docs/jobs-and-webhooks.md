@@ -138,10 +138,22 @@ after a crash — reuses the same key, letting the receiver dedupe. TLS verifica
 
 ## Built-in job kinds
 
-The framework registers built-in job kinds on this same engine, so both ride your `.queues`
+The framework can register built-in job kinds on this same engine, so both ride your `.queues`
 config: `"mail"` backs [`ctx.mail().enqueue`](./email.md) (deserializes a `MailMessage` payload and
 delivers it), and `"webhook"` backs `ctx.webhook()` above. Both are reached via their respective
 helper, not the compile-checked `Job` enum, which reflects only your declared `.jobs`.
+
+**Each is config-gated** — an unconfigured built-in's code is not compiled into your binary:
+
+- `"mail"` registers when mail is configured: a `.mailer` plugin TYPE, or `.mail = .{}` to enable
+  background delivery with the default env-configured mailer.
+- `"webhook"` registers only with `.webhooks = true` in `App(.{...})` (off by default; opts in
+  `webhook.zig`, ~689 LOC).
+
+Enqueueing against a gated-off kind fails at call time with `error.UnknownJobKind` (logged with a
+hint naming the missing config key). Either way, the kind names `mail`/`webhook` are reserved —
+a consumer `.jobs` entry named `mail` or `webhook` is a compile error even when the built-in is
+gated off, so turning it on later can never collide with your own job kinds.
 
 ## Reference
 

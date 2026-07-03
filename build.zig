@@ -153,6 +153,37 @@ pub fn build(b: *std.Build) void {
     const features_fix_step = b.step("features-fixture", "Build the demo-features fixture server (browser tests)");
     features_fix_step.dependOn(&b.addInstallArtifact(features_fix_exe, .{}).step);
 
+    // --- minimal-server: gating-invariant fixture (R2-7) --------------------------
+    // A consumer App with NOTHING optional configured. scripts/check-gating.sh nm-scans
+    // this binary to prove deselected subsystems (webauthn/magic_link/oauth2, analytics,
+    // senders, mail webhook, webhook/mail job kinds, admin SPA) leave zero symbols. Debug
+    // (the default optimize) keeps `strip` off (see the `strip` option above), so a plain
+    // `zig build minimal-server` is unstripped — no extra flag needed.
+    const minimal_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/minimal/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    minimal_mod.addImport("zigbase", zigbase_mod);
+    const minimal_exe = b.addExecutable(.{ .name = "minimal-server", .root_module = minimal_mod });
+    const minimal_step = b.step("minimal-server", "Build the lean gating-invariant fixture (Debug, unstripped)");
+    minimal_step.dependOn(&b.addInstallArtifact(minimal_exe, .{}).step);
+
+    // --- full-fixture: gating-invariant POSITIVE control (R2-7) -------------------
+    // The stock `zigbase` binary above doesn't configure .mail/.webhooks/.analytics,
+    // so scripts/check-gating.sh needs a binary that does, to prove those patterns
+    // aren't just drifted/vacuous. See fixtures/full/main.zig for the full rationale.
+    const full_fix_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/full/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    full_fix_mod.addImport("zigbase", zigbase_mod);
+    const full_fix_exe = b.addExecutable(.{ .name = "full-fixture", .root_module = full_fix_mod });
+    const full_fix_step = b.step("full-fixture", "Build the gating-invariant positive-control fixture (Debug, unstripped)");
+    full_fix_step.dependOn(&b.addInstallArtifact(full_fix_exe, .{}).step);
 
     // Unit tests run against the library module (where all internal test{} live).
     const tests = b.addTest(.{ .root_module = zigbase_mod });

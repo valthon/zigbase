@@ -306,6 +306,9 @@ pub const Ctx = struct {
     /// `Idempotency-Key` minted ONCE here and frozen onto the (durable) job row so
     /// every retry/replay reuses it. Requires a wired queue registry
     /// (`error.QueuesUnavailable` otherwise).
+    ///
+    /// Requires `.webhooks = true` in the App config — without it the "webhook" kind
+    /// is not compiled in and this call fails at enqueue with `error.UnknownJobKind`.
     pub fn webhook(self: *Ctx, url: []const u8, payload: anytype, opts: WebhookOpts) !void {
         const body = try self.serializePayload(payload);
         // 32 hex chars = 16 bytes / 128 bits — UUID-grade, collision-free at any volume.
@@ -398,7 +401,13 @@ pub const Ctx = struct {
     pub fn enqueueByName(self: *Ctx, queue_name: []const u8, kind: []const u8, payload: anytype) !void {
         const reg = queue_mod.registryFromApp(self.app) orelse return error.QueuesUnavailable;
         const q = reg.queueByName(queue_name) orelse return error.UnknownQueue;
-        const j = reg.jobByKind(kind) orelse return error.UnknownJobKind;
+        const j = reg.jobByKind(kind) orelse {
+            // std.log.warn, not .err — this path is exercised by a passing test
+            // (`ctx.enqueue errors on unknown queue / kind / no registry`); a real
+            // `std.log.err` here would fail Zig's test runner (see events.zig:1119).
+            std.log.warn("job kind '{s}' is not registered — built-ins are config-gated: \"webhook\" needs `.webhooks = true`, \"mail\" needs `.mail`/`.mailer` in App(.{{...}})", .{kind});
+            return error.UnknownJobKind;
+        };
         const payload_json = try self.serializePayload(payload);
         switch (q.backend) {
             .memory => try queue_memory.enqueue(self.app, q, j.handler, payload_json),
@@ -1036,6 +1045,10 @@ pub const MailApi = struct {
     /// durable → persisted to `_queue_jobs`, drained by a worker). Validating BEFORE
     /// enqueue means a malformed message fails fast at the call site, not later in a
     /// worker. Requires a wired queue registry (`error.QueuesUnavailable` otherwise).
+    ///
+    /// Requires `.mail` (use `.mail = .{}` for defaults) or a `.mailer` plugin in the
+    /// App config — without one the "mail" kind is not compiled in and this call fails
+    /// at enqueue with `error.UnknownJobKind`.
     pub fn enqueue(self: MailApi, msg: Message, opts: EnqueueOpts) !void {
         if (opts.at != null or opts.delay_s != null) {
             _ = try self.deliverAt(msg, opts);

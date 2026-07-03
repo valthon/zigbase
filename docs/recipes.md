@@ -778,11 +778,15 @@ Key behaviours to note:
 
 ## Recipe: enable magic-link + OTP via config
 
-No route code needed — enable methods in your collection declaration:
+No route code needed — enable methods in your collection declaration. If you don't
+use WebAuthn or OAuth2, select the exact built-in set with `.auth_methods.builtins`
+so their code (WebAuthn's CBOR/COSE stack in particular, ~3.2k LOC) never ends up
+in your binary:
 
 ```zig
 // No route code needed — enable methods in your collection declaration:
 zigbase.App(.{
+    .auth_methods = .{ .builtins = .{ .password, .magic_link, .otp } },
     .collections = .{
         .members = .{ .type = .auth, .auth = .{
             .methods = .{

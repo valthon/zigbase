@@ -915,6 +915,8 @@ flags — see
 Tenant-scoped verified sender identities and a bounce/complaint ingestion webhook. These are
 **additive and off by default** — see
 [Framework → Email subsystem](./framework#email-subsystem-154-templates-providers-verified-senders-suppression).
+Present only when `.mail` is configured — without it these routes are absent from your binary
+(not merely 404 at runtime).
 The sender routes require an authenticated principal and resolve the active account (via the
 `X-Account-Id` header or signed `zb_account` cookie); a member may only manage its own account's
 senders (fail closed, `403`). Superusers may target any account.
