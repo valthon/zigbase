@@ -75,6 +75,13 @@ fn dropNosuper(admin: *dbm.Db, al: std.mem.Allocator, schema_name: []const u8, r
 /// mutual 2-cycle ("alpha" <-> "beta": a1.buddy -> b1, b1.buddy -> a1 — both non-NULL,
 /// which NULL-then-UPDATE could never load). `dangling` additionally points a1.buddy at
 /// a missing id to exercise the COMMIT-time rollback.
+///
+/// The mutual cycle cannot be created in a single pass — a relation field's target must
+/// already exist when the collection is created (`resolveRelations` rejects a forward
+/// reference). So we mirror how a real app builds a cycle: create `alpha` without its
+/// back-edge, create `beta` (buddy -> alpha, which now exists), then ADD `alpha.buddy`
+/// -> beta as an additive field update. (`nodes.parent` is a self-relation, resolved
+/// without a lookup, so it creates in one pass.)
 fn buildCyclicSource(al: std.mem.Allocator, io: std.Io, dangling: bool) !dbm.Db {
     var source = try dbm.Db.openMemory();
     errdefer source.close();
@@ -84,15 +91,23 @@ fn buildCyclicSource(al: std.mem.Allocator, io: std.Io, dangling: bool) !dbm.Db 
         .{ .id = "n1", .name = "parent", .options = .{ .relation = .{ .targetCollectionId = "nodes", .maxSelect = 1 } } },
     } };
     _ = try collections.create(al, io, &source, nodes);
-    const alpha = schema.Collection{ .id = "_", .name = "alpha", .fields = &[_]schema.Field{
-        .{ .id = "a1", .name = "buddy", .options = .{ .relation = .{ .targetCollectionId = "beta", .maxSelect = 1 } } },
-    } };
+    const alpha = schema.Collection{ .id = "_", .name = "alpha", .fields = &[_]schema.Field{} };
     const created_alpha = try collections.create(al, io, &source, alpha);
     const beta = schema.Collection{ .id = "_", .name = "beta", .fields = &[_]schema.Field{
         .{ .id = "b1", .name = "buddy", .options = .{ .relation = .{ .targetCollectionId = created_alpha.id, .maxSelect = 1 } } },
     } };
-    _ = try collections.create(al, io, &source, beta);
+    const created_beta = try collections.create(al, io, &source, beta);
+    // Now that beta exists, add the alpha -> beta back-edge to close the cycle.
+    const alpha_closed = schema.Collection{ .id = created_alpha.id, .name = "alpha", .fields = &[_]schema.Field{
+        .{ .id = "a1", .name = "buddy", .options = .{ .relation = .{ .targetCollectionId = created_beta.id, .maxSelect = 1 } } },
+    } };
+    _ = try collections.update(al, io, &source, created_alpha.id, alpha_closed);
 
+    // The cyclic rows below are intentionally unsatisfiable under immediate FK checks (r1
+    // points at r2 before it exists; alpha<->beta reference each other) — that is exactly
+    // what the deferred-FK target load exists to handle. collections.update re-enables
+    // SQLite's foreign_keys pragma, so turn it back off to seed the source cycle.
+    try source.exec("PRAGMA foreign_keys=OFF;");
     try source.exec("INSERT INTO \"nodes\" (\"id\",\"created\",\"updated\",\"parent\") VALUES ('r1','t','t','r2');");
     try source.exec("INSERT INTO \"nodes\" (\"id\",\"created\",\"updated\",\"parent\") VALUES ('r2','t','t',NULL);");
     if (dangling) {

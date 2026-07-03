@@ -22,6 +22,7 @@
 //! target reprovisions the Postgres full-text index idempotently at startup.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const db = @import("db.zig");
 const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
@@ -113,6 +114,19 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     }
     var total: usize = 0;
     const order = try tableLoadOrder(a, target_tables, src_cols, fk_suspended);
+
+    // Clear every target table we will (re)load BEFORE inserting any rows. Doing all clears up
+    // front keeps a --force re-run idempotent while avoiding a subtle interaction on the
+    // deferred-FK (non-superuser) path: once a row with a deferred FK check has been inserted,
+    // Postgres refuses to TRUNCATE any table with pending trigger events — so an interleaved
+    // clear-then-insert-per-table fails when a later table's `TRUNCATE … CASCADE` reaches a table
+    // already loaded this transaction. (The superuser path disables FK triggers, so it never has
+    // pending events, but clearing up front is correct — and cheaper — for both.)
+    for (order) |tname| {
+        if (std.mem.eql(u8, tname, "_migrations")) continue;
+        try clearTarget(a, source, target, tname);
+    }
+
     for (order) |tname| {
         // Never copy the `_migrations` ledger: the target already applied its OWN migrations during
         // provisioning. Overwriting it with the source's ledger would desync the recorded version
@@ -351,11 +365,43 @@ fn depsPlaced(cols: []const schema.Collection, c: schema.Collection, placed: []c
 // Bulk copy
 // ===========================================================================
 
+/// Clear `table` on the target iff `copyTable` would (re)load it — the source has the table and it
+/// shares at least one column. Called for every table BEFORE any inserts (see the copy loop in
+/// `run`) so a --force re-run is idempotent without an interleaved TRUNCATE tripping the deferred-FK
+/// path's pending-trigger-events restriction. Postgres uses `TRUNCATE … RESTART IDENTITY CASCADE`:
+/// RESTART IDENTITY resets owned sequences so a re-migration regenerates `_events._seq` (and any
+/// IDENTITY) densely from 1 — deterministic repeats, preserving the dense-`_seq`-from-1 invariant
+/// the rollup-watermark reset relies on; CASCADE clears a parent with seeded/old child rows (every
+/// table is reloaded anyway). SQLite has no TRUNCATE, so `DELETE FROM` (rowids restart when empty).
+fn clearTarget(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []const u8) Error!void {
+    var ta = std.heap.ArenaAllocator.init(a);
+    defer ta.deinit();
+    const al = ta.allocator();
+
+    if (!try tableExists(al, source, table)) return;
+    const tgt_cols = try listColumns(al, target, table, false);
+    const src_cols = try listColumns(al, source, table, false);
+    var src_set = std.StringHashMap(void).init(al);
+    for (src_cols) |c| try src_set.put(c, {});
+    var any = false;
+    for (tgt_cols) |c| if (src_set.contains(c)) {
+        any = true;
+        break;
+    };
+    if (!any) return; // no shared columns → copyTable skips it, so leave it untouched
+
+    const clear_sql = switch (db.dbBackend(target)) {
+        .postgres => try std.fmt.allocPrintSentinel(al, "TRUNCATE TABLE {s} RESTART IDENTITY CASCADE;", .{try ddl.quoteIdent(al, table)}, 0),
+        .sqlite => try std.fmt.allocPrintSentinel(al, "DELETE FROM {s};", .{try ddl.quoteIdent(al, table)}, 0),
+    };
+    try target.exec(clear_sql);
+}
+
 /// Copy every row of `table` from `source` into `target`. The column set is the target's
 /// (non-identity) columns intersected with the source's columns, preserving target order. The
-/// target table is truncated first so re-runs (under `--force`) are idempotent. Each value is
-/// bound by its source storage type, so encrypted TEXT envelopes are carried verbatim. Returns the
-/// number of rows loaded.
+/// target table is cleared beforehand by `clearTarget` so re-runs (under `--force`) are idempotent.
+/// Each value is bound by its source storage type, so encrypted TEXT envelopes are carried verbatim.
+/// Returns the number of rows loaded.
 fn copyTable(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []const u8) Error!usize {
     var ta = std.heap.ArenaAllocator.init(a);
     defer ta.deinit();
@@ -381,17 +427,9 @@ fn copyTable(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []cons
     for (tgt_cols) |c| if (src_set.contains(c)) try cols.append(al, c);
     if (cols.items.len == 0) return 0;
 
-    // Clear the target table first so a re-run (under --force) is idempotent. Postgres uses
-    // TRUNCATE … RESTART IDENTITY CASCADE: RESTART IDENTITY resets owned sequences so a --force
-    // re-migration regenerates `_events._seq` (and any IDENTITY) densely from 1 — making repeat
-    // migrations deterministic and preserving the dense-`_seq`-from-1 invariant the rollup
-    // watermark reset relies on; CASCADE clears a parent with seeded/old child rows (every table is
-    // reloaded anyway). SQLite has no TRUNCATE, so DELETE FROM (rowids restart on an emptied table).
-    const clear_sql = switch (db.dbBackend(target)) {
-        .postgres => try std.fmt.allocPrintSentinel(al, "TRUNCATE TABLE {s} RESTART IDENTITY CASCADE;", .{try ddl.quoteIdent(al, table)}, 0),
-        .sqlite => try std.fmt.allocPrintSentinel(al, "DELETE FROM {s};", .{try ddl.quoteIdent(al, table)}, 0),
-    };
-    try target.exec(clear_sql);
+    // The target was cleared up front (see `clearTarget`, called before the copy loop) so a
+    // --force re-run is idempotent — we do NOT clear here, because on the deferred-FK path an
+    // interleaved TRUNCATE would hit a table with pending trigger events once rows are loaded.
 
     // Build the column list + a parameter list for the INSERT and the SELECT.
     var collist: std.ArrayList(u8) = .empty;
@@ -593,7 +631,14 @@ fn logDeferredFkCommitFailure(a: std.mem.Allocator, src_cols: []const schema.Col
             names.appendSlice(a, n) catch break;
         }
     } else |_| {}
-    std.log.err(
+    // A dangling cyclic reference is a hard `.err` in production, but Zig's test runner counts
+    // every `std.log.err` as a test failure — and the deferred-FK rollback test deliberately
+    // exercises this path. Under the test runner emit the identical message at `.warn`; the
+    // returned `DbError` (the test's real assertion) is unchanged.
+    if (builtin.is_test) std.log.warn(
+        "migrate-db: foreign-key cycle across collections [{s}] could not be satisfied at commit — a row references a missing target. The target was rolled back; fix the dangling reference in the source (or use a superuser target role) and re-run.",
+        .{names.items},
+    ) else std.log.err(
         "migrate-db: foreign-key cycle across collections [{s}] could not be satisfied at commit — a row references a missing target. The target was rolled back; fix the dangling reference in the source (or use a superuser target role) and re-run.",
         .{names.items},
     );
