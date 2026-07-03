@@ -100,6 +100,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         error.Conflict => return ApiError.conflict("Collection already exists.").toResponse(ctx.allocator),
         else => return e,
     };
+    if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache
     return .{ .status = 201, .body = try schema.collectionToJson(ctx.allocator, created) };
 }
 
@@ -133,6 +134,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         error.Conflict => return ApiError.conflict("Conflict.").toResponse(ctx.allocator),
         else => return e,
     };
+    if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache
     return .{ .status = 200, .body = try schema.collectionToJson(ctx.allocator, updated) };
 }
 
@@ -147,6 +149,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         error.Conflict => return ApiError.conflict("Collection is referenced by a relation.").toResponse(ctx.allocator),
         else => return e,
     };
+    if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache
     return .{ .status = 204, .body = "" };
 }
 
@@ -378,4 +381,43 @@ test "non-https generic provider endpoint is rejected at save" {
     var c = ctxFor(env, a, .POST, "/api/collections", body, &.{});
     c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 400), (try create(&c)).status);
+}
+
+test "R1-4: collection DDL invalidates the metadata cache (negative entry cleared)" {
+    const colcache = @import("../colcache.zig");
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cache = colcache.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    env.app.col_cache = &cache;
+    defer env.app.col_cache = null;
+
+    // Prime a NEGATIVE entry (the collection doesn't exist yet).
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var pre = try colcache.lease(&cache, w, a, "cachedcol");
+        defer pre.release();
+        try std.testing.expect(pre.col == null);
+    }
+
+    // Create it through the admin handler (mirrors the existing create-handler tests).
+    const token = try env.superuserToken(a);
+    const body =
+        \\{"name":"cachedcol","fields":[{"id":"","name":"title","type":"text","options":{}}]}
+    ;
+    var ctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+    ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    const resp = try create(&ctx);
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+
+    // The stale negative entry MUST be gone: the cache now resolves the collection.
+    const w2 = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var post = try colcache.lease(&cache, w2, a, "cachedcol");
+    defer post.release();
+    try std.testing.expect(post.col != null);
 }

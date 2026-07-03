@@ -374,8 +374,9 @@ pub const Ctx = struct {
     // Background jobs & queues (#137 PR2).
     //
     // `enqueue` is the generic public API: serialize `payload` to JSON and route
-    // it to the named queue's backend (memory → in-process detached retry; durable
-    // → persisted to `_queue_jobs`, drained by a worker poller). `q`/`job` are enum
+    // it to the named queue's backend (memory → the bounded in-process worker pool with
+    // retry, error.QueueFull when its ring is full; durable → persisted to
+    // `_queue_jobs`, drained by a worker poller). `q`/`job` are enum
     // literals (`.queue`, `.kind`). The typed, compile-checked `App.enqueue(ctx,
     // .queue, .kind, payload)` (mirroring `App.flag`) is the preferred call site — a
     // typo'd queue/kind is a compile error there; this method validates at runtime.
@@ -1921,9 +1922,7 @@ test "ctx.enqueue durable round-trips: serializes payload into a _queue_jobs row
     try std.testing.expectEqualStrings("pending", st.columnText(3));
 }
 
-test "ctx.enqueue memory round-trips: runs the handler in-process" {
-    // Use the thread-safe GPA (not an arena) because the memory backend runs on a
-    // DETACHED thread that allocs/frees its own per-attempt arena + the job context.
+test "ctx.enqueue memory round-trips: runs the handler on the bounded pool" {
     queue_test.mem_runs = 0;
     queue_test.mem_payload_len = 0;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1934,18 +1933,14 @@ test "ctx.enqueue memory round-trips: runs the handler in-process" {
         .jobs = &.{.{ .kind = "echo", .handler = queue_test.memHandler }},
     };
     app.queues = @ptrCast(&reg);
+    var pool = queue_memory.Pool.init(&app);
+    pool.install(&app);
 
     var ctx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{} };
     defer ctx.deinit();
     try ctx.enqueueByName("default", "echo", .{ .v = "hi" });
 
-    // The memory backend runs on a detached thread; spin-wait for the handler, then a
-    // short settle so the thread's defer-frees complete before the leak check.
-    var spins: usize = 0;
-    while (queue_test.mem_runs == 0 and spins < 500) : (spins += 1) {
-        app.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake) catch {};
-    }
-    app.io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+    pool.stop(); // drain + join: deterministic
     try std.testing.expectEqual(@as(usize, 1), queue_test.mem_runs);
     try std.testing.expectEqualStrings("{\"v\":\"hi\"}", queue_test.mem_payload_buf[0..queue_test.mem_payload_len]);
 }
@@ -2066,7 +2061,6 @@ test "#141 ctx.mail().enqueue memory round-trips: built-in handler delivers + is
     if (!testcapture.enabled) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    // Mailer must outlive the detached memory-job thread; we spin-wait for completion.
     var lm = mailer_mod.LogMailer.init();
     const m = lm.mailer();
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined, .mailer = &m };
@@ -2075,6 +2069,8 @@ test "#141 ctx.mail().enqueue memory round-trips: built-in handler delivers + is
         .jobs = &.{mail_job_reg},
     };
     app.queues = @ptrCast(&reg);
+    var pool = queue_memory.Pool.init(&app);
+    pool.install(&app);
 
     testcapture.mail.reset();
     defer testcapture.mail.reset();
@@ -2084,12 +2080,7 @@ test "#141 ctx.mail().enqueue memory round-trips: built-in handler delivers + is
     defer ctx.deinit();
     try ctx.mail().enqueue(.{ .to = "queued@example.com", .subject = "Async", .text = "later" }, .{});
 
-    // The memory backend runs on a detached thread; spin-wait for the captured send.
-    var spins: usize = 0;
-    while (testcapture.mail.count() == 0 and spins < 500) : (spins += 1) {
-        app.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake) catch {};
-    }
-    app.io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+    pool.stop(); // drain + join: deterministic
     try std.testing.expectEqual(@as(usize, 1), testcapture.mail.count());
     try std.testing.expectEqualStrings("queued@example.com", testcapture.mail.get(0).?.to);
 }

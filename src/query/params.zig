@@ -14,6 +14,13 @@ pub const Params = struct {
 
 /// Parse a raw URL query string ("a=1&b=hello%20world") into decoded key/value pairs.
 /// '+' is treated as space; '%XX' is percent-decoded. Values are owned by `alloc`.
+///
+/// OWNED ON PURPOSE — do not "deduplicate" into facil.io: fio's http_parse_query
+/// type-guesses values through fiobj (`filter=123` becomes an int — the same corruption
+/// class that forced the multipart parser off fio, see server.zig's multipart note /
+/// commit 205859e), and zap's getParamSlice returns values NON-decoded. The filter/sort/
+/// expand grammar needs exact decoded strings, so ZigBase splits the ~20 lines itself
+/// and lets std.Uri do the decoding.
 pub fn parse(alloc: std.mem.Allocator, query: []const u8) !Params {
     var list: std.ArrayList(Params.Pair) = .empty;
     errdefer list.deinit(alloc);

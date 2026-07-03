@@ -58,9 +58,21 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   day-of-month with day-of-week** (unlike Vixie cron, which ORs them when one is `*`).
 - **Interval jobs fire measured from completion**, so a long-running interval job drifts from
   a fixed wall-clock cadence. Runs never overlap (single-flight).
-- **`app.submit` runs ad-hoc tasks on a detached thread** that is not joined at shutdown; a
-  task submitted right before shutdown may be cut off. (Cron jobs use the bounded, cleanly
-  joined pool.)
+- **`app.submit` and memory-queue jobs run on a small bounded in-process worker pool**
+  (drained and joined at shutdown, so tasks submitted before shutdown complete). The ring is
+  bounded: overflow is rejected with `error.QueueFull` rather than blocking the caller, and a
+  retrying memory job holds one pool worker for its whole backoff — put sustained
+  high-volume or long-retry work on a durable queue.
+- **Background-job queue delivery semantics (`.queues`/`ctx.enqueue`).** *Durable* queues are
+  **at-least-once**: a job whose handler exceeds its queue's `visibility_timeout_s`, or that
+  crashes after a side effect but before completion, may run **more than once** — make
+  durable handlers **idempotent** (set `visibility_timeout_s` above the queue's longest job
+  runtime, and use an idempotency key for external effects). Durable workers **poll** (~0.5s
+  cadence), so jobs drain with low but non-zero latency, and a worker's `concurrency` is a
+  per-cycle batch processed serially (parallelism = more workers). *Memory* queues are
+  **at-most-once across restart** (in-RAM only; lost on crash/shutdown) and run on the
+  bounded worker pool (a full ring rejects new jobs with `error.QueueFull`); use a durable
+  queue when a job must survive a restart or for sustained throughput.
 - **TTL record physical deletion is eventually consistent (~5 minutes), but expired rows are
   hidden from reads immediately.** Expired rows in a `.ttl_field` collection are
   **automatically excluded from every read** (list, get, relation expand — via the HTTP API and
@@ -113,6 +125,10 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   symlink-aware: a served file is canonicalized and refused if its real path escapes the
   configured static root, so a symlink inside the root pointing outside it is not followed
   out.
+- Percent-encoded file names are not decoded: the request path reaches the static layer
+  raw, so a file whose URL requires encoding (`my file.pdf` → `/my%20file.pdf`) is not
+  servable (404). Encoded traversal (`%2e%2e`) stays a literal — and harmless — path
+  segment for the same reason.
 - No on-the-fly compression; pre-compress at the CDN or reverse proxy if needed.
 - In **dir** mode (`--serve-static` or comptime `.dir`), caching is controlled by
   facil.io's `sendFile` (fixed `Cache-Control: max-age=3600`) — this value is not

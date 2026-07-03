@@ -9,21 +9,31 @@ const Migrator = @import("migrator.zig").Migrator;
 /// SQLite byte-identical.
 pub const Migration = struct { name: []const u8, up: *const fn (m: *Migrator) db.DbError!void };
 
+/// The `_collections` registry DDL (SQLite flavor). Single source shared by init_0001
+/// (which lowers it per dialect) and the realtime delete-snapshot sandbox
+/// (hub.matchesSnapshot), which needs ONLY this table — never the full suite.
+pub const collections_table_sql: [:0]const u8 =
+    \\CREATE TABLE IF NOT EXISTS "_collections" (
+    \\  "id" TEXT PRIMARY KEY, "name" TEXT UNIQUE NOT NULL, "type" TEXT NOT NULL DEFAULT 'base',
+    \\  "system" INTEGER NOT NULL DEFAULT 0, "schema" TEXT NOT NULL DEFAULT '[]',
+    \\  "indexes" TEXT NOT NULL DEFAULT '[]',
+    \\  "listRule" TEXT, "viewRule" TEXT, "createRule" TEXT, "updateRule" TEXT, "deleteRule" TEXT,
+    \\  "created" TEXT NOT NULL, "updated" TEXT NOT NULL
+    \\);
+;
+
+/// The additive `options` column from init_0002 — the sandbox applies it after
+/// collections_table_sql so its `_collections` matches the live shape.
+pub const collections_options_column_sql: [:0]const u8 =
+    "ALTER TABLE \"_collections\" ADD COLUMN \"options\" TEXT NOT NULL DEFAULT '{}';";
+
 fn init_0001(m: *Migrator) db.DbError!void {
-    try m.execLowered(
-        \\CREATE TABLE IF NOT EXISTS "_collections" (
-        \\  "id" TEXT PRIMARY KEY, "name" TEXT UNIQUE NOT NULL, "type" TEXT NOT NULL DEFAULT 'base',
-        \\  "system" INTEGER NOT NULL DEFAULT 0, "schema" TEXT NOT NULL DEFAULT '[]',
-        \\  "indexes" TEXT NOT NULL DEFAULT '[]',
-        \\  "listRule" TEXT, "viewRule" TEXT, "createRule" TEXT, "updateRule" TEXT, "deleteRule" TEXT,
-        \\  "created" TEXT NOT NULL, "updated" TEXT NOT NULL
-        \\);
-    );
+    try m.execLowered(collections_table_sql);
 }
 
 fn init_0002(m: *Migrator) db.DbError!void {
     // add the options column (ignore the duplicate-column error if somehow re-run)
-    m.execLowered("ALTER TABLE \"_collections\" ADD COLUMN \"options\" TEXT NOT NULL DEFAULT '{}';") catch {};
+    m.execLowered(collections_options_column_sql) catch {};
     // _superusers system auth collection: its physical table + its _collections row
     try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_superusers" (

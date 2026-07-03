@@ -1956,13 +1956,13 @@ try ctx.app.submit("reindex", reindexTask);
 // reindexTask: fn (ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void
 ```
 
-`submit` returns `error.SchedulerUnavailable` if no scheduler is running (e.g.
-CLI/tests/no jobs configured).
+`submit` returns `error.SchedulerUnavailable` when the server is not running (unit tests /
+CLI); while serving it is always available — no scheduler configuration required (0.10.0).
 
-> **Caveat:** ad-hoc submitted tasks currently run on a **detached thread that is NOT
-> joined at shutdown**. A task submitted near shutdown may outlive the scheduler's
-> stop/deinit and must not assume `app` (or its pool/storage) outlives it indefinitely.
-> Cron/interval jobs, by contrast, use the bounded, cleanly-joined worker pool.
+> Submitted tasks run on the bounded background worker pool (shared with memory-queue
+> jobs). At shutdown the pool is drained and joined, so a task submitted before shutdown
+> completes. When the pool's ring is full, `submit` returns `error.QueueFull` rather than
+> blocking — sustained high-volume background work belongs on a durable queue.
 
 ## 7b. Background jobs & queues (`.queues` / `.workers` / `.jobs`)
 
@@ -2038,7 +2038,7 @@ payload and delivers it). It is reached via that helper (or `ctx.enqueueByName(q
 
 ### Backends, priority, and reliability
 
-- **Backend `memory`** (default): the job runs in-process on a detached thread with backoff
+- **Backend `memory`** (default): the job runs in-process on the bounded background worker pool with backoff
   retry. **At-most-once across restart** — an enqueued memory job lives only in RAM, so a
   crash/shutdown before it completes drops it. Zero schema; great for best-effort work.
 - **Backend `durable`**: the job is persisted to the `_queue_jobs` table and drained by a
@@ -2067,7 +2067,7 @@ payload and delivers it). It is reached via that helper (or `ctx.enqueueByName(q
 
 - Durable workers **poll** (roughly every scheduler tick, ~0.5s), so durable jobs drain with
   low but non-zero latency. The scheduler is single-process (see §7 caveats).
-- Memory jobs run on detached threads not joined at shutdown (like `app.submit`).
+- Memory jobs run on a bounded worker pool that is drained and joined at shutdown (like `app.submit`); jobs still queued at a hard crash are lost (at-most-once), and a full ring rejects with `error.QueueFull`.
 
 ## 8. Define your schema in code (`.collections` + `.migrations`)
 

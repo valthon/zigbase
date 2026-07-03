@@ -29,6 +29,7 @@ const ctx_mod = @import("ctx.zig");
 const queue = @import("queue/queue.zig");
 const queue_config = @import("queue/config.zig");
 const queue_durable = @import("queue/durable.zig");
+const queue_memory = @import("queue/memory.zig");
 const mail_send = @import("mail/send.zig");
 const mail_cfg = @import("mail/config.zig");
 const webhook = @import("webhook.zig");
@@ -38,6 +39,7 @@ const roles = @import("tenancy/roles.zig");
 const abilities_mod = @import("authz/abilities.zig");
 const analytics = @import("analytics/analytics.zig");
 const analytics_config = @import("analytics/config.zig");
+const colcache = @import("colcache.zig");
 
 /// True if any collection declares an `.encrypted` field (Theme B1). Drives the
 /// fail-closed startup check (refuse to serve without ZIGBASE_FIELD_KEY).
@@ -1969,6 +1971,17 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         // the global default. (null only in tests/CLI that construct App directly.)
         .rate_limiter = &rate_limiter,
     };
+    // Collection-metadata cache (R1-4): SQLite only — single-process, so the in-process
+    // invalidation on the admin DDL endpoints is complete. Postgres multi-instance
+    // deployments skip it (another instance's DDL would be unseen, so reads stay direct).
+    // Declared here (before mem_pool/scheduler) so LIFO tears it down LAST — realtime and
+    // record handlers borrow leases from it until zap stops.
+    var col_cache_inst: ?colcache.Cache = if (db.poolDialect(&pool).kind == .sqlite)
+        colcache.Cache.init(allocator)
+    else
+        null;
+    defer if (col_cache_inst) |*c| c.deinit();
+    if (col_cache_inst) |*c| app.col_cache = c;
     // Loud startup warning for the captcha dev-bypass: a configured provider with an empty
     // secret silently passes EVERY verifyCaptcha (the dev-bypass), a prod footgun. Mirrors
     // the `@public`-rule startup warning so operators catch it before deploying.
@@ -2006,6 +2019,13 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
     var srv = server.Server{ .app = &app, .host = host_z, .port = cfg.http_port };
+    // Bounded background pool for memory-queue jobs + app.submit (R1-2). Worker threads
+    // spawn lazily on first use (zero overhead when unused) and stop() drains + joins.
+    // Its defer is registered BEFORE the scheduler's, so (LIFO) the scheduler stops FIRST
+    // — a cron handler may still enqueue/submit during its final run.
+    var mem_pool = queue_memory.Pool.init(&app);
+    mem_pool.install(&app);
+    defer mem_pool.stop();
     // Start the scheduler only when jobs are configured. Registered LAST among the teardown
     // defers, so (LIFO) its stop()+deinit() runs FIRST on return — joining worker threads
     // before pool.deinit()/storage_inst go out of scope, since workers touch app.pool/storage.

@@ -668,7 +668,20 @@ pub fn compile(alloc: std.mem.Allocator, pattern: []const u8) CompileError!Progr
     // Build into a heap-allocated scratch Builder (it is large for the stack).
     const b = try alloc.create(Builder);
     defer alloc.destroy(b);
-    b.* = .{};
+    // Do NOT write `b.* = .{}` here: the `.{}` default value forces the compiler to
+    // materialize the ENTIRE ~3 MB Builder as an all-zero .rodata template that is
+    // memcpy'd at runtime — it was ~40% of the shipped binary (see the 0.9.x binary-size
+    // audit). The big array fields are declared `= undefined` anyway; only the scalar
+    // fields need initialization. (`compileComptime`'s `.{}` is comptime-only — no blob.)
+    b.* = undefined;
+    b.ninsts = 0;
+    b.nclasses = 0;
+    b.nnodes = 0;
+    b.nkids = 0;
+    b.scratch_len = 0;
+    b.pat = &.{};
+    b.pos = 0;
+    b.depth = 0;
     try b.build(pattern);
 
     const n = b.ninsts;

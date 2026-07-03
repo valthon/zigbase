@@ -67,7 +67,7 @@ and the job is routed to the named queue's backend.
 
 ## Durability & retries
 
-- **Backend `memory`** (default): the job runs in-process on a detached thread with backoff
+- **Backend `memory`** (default): the job runs in-process on the bounded background worker pool with backoff
   retry. **At-most-once across restart** — an enqueued memory job lives only in RAM, so a
   crash/shutdown before it completes drops it. Zero schema; great for best-effort work.
 - **Backend `durable`**: the job is persisted to the `_queue_jobs` table and drained by a
