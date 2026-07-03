@@ -1022,9 +1022,13 @@ the live create/update path (which compares the ciphertext column); a rule that 
 `.encrypted` field therefore authorizes a delete identically everywhere. On **SQLite**
 (single-process) nothing changes — there is no cross-process step, no side table, and the in-process
 path is byte-identical (for the common case of no encrypted fields the delete takes no extra read).
-Custom-channel
-`ctx.realtime().broadcast`/`signal` events are **per-instance** (not yet fanned out cross-instance);
-record-change events are the cross-instance path.
+Custom-channel `ctx.realtime().broadcast`/`signal` events also fan out cross-instance on Postgres
+(best-effort, at-most-once, unordered): a `signal` NOTIFYs only the topic name (payload-less), while a
+`broadcast` stores its enveloped frame in the `_rt_broadcasts` side table keyed by a random token and
+NOTIFYs only the token — receivers read the frame back over their own connection and re-deliver it
+through the same per-subscriber authorization path (a forged/expired token finds no row and is
+dropped). The `__features` flag/experiment signal is cross-instance for the same reason. On SQLite
+(single-process) these stay in-process and byte-identical.
 
 ### Test-mode capture — assert sent mail + mock outbound HTTP (`zigbase.testcapture`)
 
@@ -1370,6 +1374,8 @@ ws.onmessage = (e) => {
   if (m.type === "signal" && m.topic === "__features") refetchState();
 };
 ```
+
+The signal is transport-agnostic — WebSocket and SSE subscribers receive the identical frame.
 
 Changed in 0.10.0: this channel previously emitted a bespoke `{"type":"features.changed"}`
 frame; it now uses the same standard signal frame as every custom topic.

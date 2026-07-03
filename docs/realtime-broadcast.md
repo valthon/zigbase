@@ -75,6 +75,25 @@ ws.onopen = () => ws.send(JSON.stringify({ action: "subscribe", topic: "availabi
 ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.topic === "availability") refreshSlots(); };
 ```
 
+The same subscription works over SSE — no WebSocket, no SDK, just `EventSource` and `fetch`:
+
+```js
+const es = new EventSource('/api/realtime/sse');
+let clientId;
+es.onmessage = async (e) => {
+  const m = JSON.parse(e.data);
+  if (m.type === 'connect') {
+    clientId = m.clientId;
+    await fetch('/api/realtime/sse/' + clientId, {
+      method: 'POST',
+      body: JSON.stringify({ action: 'subscribe', topic: 'orders' }),
+    });
+  } else if (m.topic === 'orders') {
+    console.log(m);
+  }
+};
+```
+
 `@zigbase/client` 0.3.0+ wraps this in a typed helper, `subscribeTopic`, for custom channels:
 
 ```js
@@ -88,14 +107,17 @@ const unsub = await client.realtime.subscribeTopic('orders', (msg) => {
 `subscribeTopic` requires client **0.3.0 or newer** — older `@zigbase/client` versions only expose
 the record-subscription helpers.
 
-Custom-channel `broadcast`/`signal` events are currently **per-instance** — they are not (yet)
-fanned out across app instances when running on the Postgres backend. Record-change events remain
-the cross-instance path (see [Multi-instance realtime](./framework.md#multi-instance-realtime-postgres));
-if you need a custom event to reach every instance, model it as a record write instead.
+On the **Postgres** backend, custom-channel `broadcast`/`signal` events fan out across app instances
+(best-effort, at-most-once, unordered): a `signal` puts only the topic name on the `LISTEN`/`NOTIFY`
+wire, while a `broadcast` stores its enveloped frame in the `_rt_broadcasts` side table keyed by a
+random token and NOTIFYs only the token — the receiving instance reads the frame back over its own
+connection and re-delivers it through the same per-subscriber authorization path (a forged or expired
+token finds no row and is dropped). See [Multi-instance realtime](./framework.md#multi-instance-realtime-postgres).
+On **SQLite** (single-process) delivery is in-process only.
 
 ## Reference
 
 - [ctx.realtime()](./framework.md#ctxrealtime--broadcast-on-custom-channels)
 - [canSubscribe](./framework.md#who-may-subscribe-realtime---cansubscribe--fn)
 - [Multi-instance realtime](./framework.md#multi-instance-realtime-postgres)
-- [Realtime protocol](./api.md#realtime-websocket)
+- [Realtime protocol](./api.md#realtime-websocket--sse)

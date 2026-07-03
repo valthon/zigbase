@@ -1,0 +1,5 @@
+### Internal
+
+- Realtime delivery/verb authorization extracted from the WebSocket adapter into transport-neutral `hub.frameForDelivery`/`hub.authVerb`/`hub.subscribeCheck` (behavior-preserving; WS wire byte-identical) — groundwork for the SSE transport.
+- SSE connection registry scaffolding (`realtime/sse.zig`): `SseConn` + pin/unref refcount, closed-flag lifecycle, and the per-delivery snapshot, with a strict `registry_mu`/`conn.mu` never-nested lock-ordering law and threaded-stress unit tests. Internal until the transport is wired end-to-end.
+- SSE stream lifecycle wired onto the shared realtime upgrade path (`realtime/ws.zig` `handleUpgrade` now dispatches `sse` targets on `/api/realtime/sse`): `on_open` dups the handle, registers, and writes the connect frame; `on_close` runs the single authoritative reap; delivery snapshots under `conn.mu` and authorizes through the same `hub.frameForDelivery` chokepoint as WebSocket. Not yet a usable transport (no subscribe uplink until the next slice); Internal until then.

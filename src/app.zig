@@ -33,6 +33,9 @@ pub const App = struct {
     oauth_state_server: bool = true,
     oauth_state_ttl_s: i64 = 600,
     realtime_allowed_origins: []const u8 = "",
+    /// SSE heartbeat interval seconds (#188); 0 = inherit the listener ws_timeout tick.
+    /// Applied per-connection via http_sse_set_timout at stream open. Startup-validated.
+    sse_heartbeat_seconds: u8 = 0,
     /// When false (default), client-IP logic ignores X-Forwarded-For/X-Real-IP and
     /// keys on the real socket peer. Only honor proxy headers when true (behind a
     /// trusted reverse proxy). See F8.

@@ -6,13 +6,122 @@ const policy = @import("../policy.zig");
 const tenancy = @import("../tenancy/tenancy.zig");
 const request = @import("../request.zig");
 const collections = @import("../collections.zig");
+const colcache = @import("../colcache.zig");
 const records = @import("../records.zig");
 const migrations = @import("../migrations.zig");
+const auth = @import("../auth.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 const Conn = connection.Conn;
+const App = @import("../app.zig").App;
+const Ctx = @import("../ctx.zig").Ctx;
 
 pub const DeliverError = policy.PolicyError;
+
+/// Fixed PUBLIC realtime channel for the feature-management "changed" signal (#128/#129/#130).
+/// (moved from ws.zig — the delivery chokepoint needs it; ws.zig re-exports it.)
+pub const FEATURES_CHANNEL = "__features";
+
+/// F5: may a socket subscribe to a collection with this `view_rule`? Anonymous sockets may
+/// subscribe ONLY to a public (@public) collection. Any other collection — locked, owner-scoped,
+/// or any expression — requires a live authenticated (or superuser) identity first. Delivery is
+/// still independently gated per record by `hub.shouldDeliver`; this just stops anonymous sockets
+/// from registering subscriptions on gated data.
+pub fn subscribeAuthorized(view_rule: ?[]const u8, authed: bool, is_superuser: bool) bool {
+    if (policy.isPublic(view_rule)) return true;
+    return authed or is_superuser;
+}
+
+/// The result of authorizing a subscribe request. `.limit` (NEW in the extraction) is the
+/// MAX_SUBS rejection — previously an inline check in ws.onMessage; folded in here so BOTH
+/// transports share the complete decision.
+pub const SubscribeOutcome = enum { ok, unknown, auth_required, limit };
+
+/// Pure subscribe-authorization decision (#143, F5), factored out so the security PRECEDENCE
+/// is testable in one place: a REAL collection topic (`col != null`) ALWAYS uses per-collection
+/// authz (`subscribeAuthorized`) — the custom-topic predicate is NEVER consulted for it, so a
+/// custom subscribe can't reach a collection's records. Only a NON-collection custom topic
+/// (`col == null`) is gated by `custom_allowed` (the `canSubscribe` result; default true).
+pub fn subscribeDecision(col: ?schema.Collection, authed: bool, is_superuser: bool, custom_allowed: bool) SubscribeOutcome {
+    if (col) |c| {
+        return if (subscribeAuthorized(c.viewRule, authed, is_superuser)) .ok else .auth_required;
+    }
+    return if (custom_allowed) .ok else .auth_required;
+}
+
+/// #143: may a socket subscribe to a NON-collection custom topic? Consulted ONLY after the
+/// topic is confirmed NOT to be a collection (collection topics keep their own per-record
+/// authz). DEFAULT — no `.realtime = .{ .canSubscribe = fn }` configured — is to ALLOW any
+/// named custom topic, i.e. custom topics are PUBLIC signal channels (exactly the historical
+/// `__features` behavior). A configured predicate gates private channels: returning false
+/// denies. The predicate receives a lightweight `Ctx` carrying the socket's resolved identity
+/// (`ctx.user()` / `ctx.rctx`); it may acquire its own reader for richer checks.
+pub fn canSubscribeTopic(app: *App, arena: std.mem.Allocator, rctx: request.RequestContext, topic: []const u8) bool {
+    const d = app.dispatch orelse return true;
+    const predicate = d.realtime_can_subscribe orelse return true;
+    var cx = Ctx{ .app = app, .arena = arena, .rctx = rctx };
+    defer cx.deinit();
+    return predicate(&cx, topic);
+}
+
+/// The string `id` of a record JSON object, or "" when absent/non-object.
+fn recordIdOf(rec: std.json.Value) []const u8 {
+    if (rec != .object) return "";
+    const v = rec.object.get("id") orelse return "";
+    return if (v == .string) v.string else "";
+}
+
+/// The `auth` verb body (moved from ws.onMessage, #156): verify the token on a pooled reader,
+/// install/clear the connection identity, resolve + cache the tenancy scope. Returns the
+/// {"type":"auth","status":"ok"|"error"} outcome; the CALLER writes the frame on its own
+/// transport. `durable_alloc` MUST be the connection-durable arena (the auth record and
+/// resolved memberships persist across frames). `requested_account` is the handshake-captured
+/// account request (header/signed-cookie), verified here against _memberships — an unverified
+/// value never grants scope. A pool-acquire failure is an auth failure (false), matching the
+/// old inline behavior (authFrame(false)).
+pub fn authVerb(app: *App, conn: *Conn, durable_alloc: std.mem.Allocator, token: []const u8, requested_account: []const u8) bool {
+    var r = app.pool.acquireReader() catch return false;
+    defer app.pool.releaseReader(&r);
+    if (auth.verifyToken(durable_alloc, app, &r, token)) |v| {
+        conn.setAuth(.{ .record = v.record, .is_superuser = v.is_superuser, .exp = v.exp });
+        // #156: resolve + cache the active account scope against _memberships (durable
+        // allocator → persists across frames). Superusers bypass tenancy. A failed/absent
+        // resolution leaves account_id="" → tenant-owned delivery fails closed (deny).
+        if (conn.tenancy_enabled and !v.is_superuser) {
+            const uid = recordIdOf(v.record);
+            if (uid.len > 0) {
+                const res = tenancy.resolve(durable_alloc, &r, v.collection, uid, requested_account) catch tenancy.Resolution{};
+                conn.setTenancyScope(res.account_id, res.memberships);
+            }
+        }
+        return true;
+    }
+    conn.clearAuth();
+    return false;
+}
+
+/// The `subscribe` authorization body (moved from ws.onMessage, F5/#143): MAX_SUBS cap, the
+/// public __features carve-out, collection lookup, and the subscribeDecision precedence (a REAL
+/// collection topic ALWAYS uses per-collection authz; the canSubscribe predicate gates ONLY
+/// non-collection custom topics). Pure decision — the caller performs the transport-side
+/// subscription + reply. `alloc` is per-call scratch (the collection lookup borrows it).
+pub fn subscribeCheck(app: *App, conn: *const Conn, alloc: std.mem.Allocator, topic: []const u8) SubscribeOutcome {
+    if (conn.subs.count() >= connection.MAX_SUBS) return .limit;
+    const t = protocol.parseTopic(topic);
+    // The feature-management signal channel is PUBLIC and is not a collection.
+    if (std.mem.eql(u8, t.collection, FEATURES_CHANNEL)) return .ok;
+    var r = app.pool.acquireReader() catch return .unknown;
+    const now = auth.nowUnixPub(&r) catch 0;
+    const rctx = conn.requestContext(now);
+    const lookup = collections.get(alloc, &r, t.collection) catch {
+        app.pool.releaseReader(&r);
+        return .unknown;
+    };
+    // Release the reader now: the canSubscribe predicate is handed a Ctx that may acquire its own.
+    app.pool.releaseReader(&r);
+    const custom_allowed = lookup == null and canSubscribeTopic(app, alloc, rctx, topic);
+    return subscribeDecision(lookup, rctx.auth != null, rctx.is_superuser, custom_allowed);
+}
 
 /// Combine clauses with `&&`, each parenthesized: `(c1) && (c2)`.
 fn combineClauses(alloc: std.mem.Allocator, clauses: []const []const u8) ![]u8 {
@@ -202,7 +311,7 @@ pub const EventFrames = struct {
 };
 
 /// Private key carrying the deleted record's authorization SNAPSHOT inside the *published* delete
-/// frame (F4). It is consumed by `onChannelMessage` for per-subscriber authz and STRIPPED before
+/// frame (F4). It is consumed by `frameForDelivery` for per-subscriber authz and STRIPPED before
 /// the id-only frame is delivered to the client — a subscriber never sees it.
 pub const delete_snapshot_key = "_deleteSnapshot";
 
@@ -224,7 +333,7 @@ pub fn buildEventFrames(
         var o: std.json.ObjectMap = .empty;
         try o.put(alloc, "id", .{ .string = record_id });
         // Attach the deletion snapshot (if any) so subscribers can re-authorize owner-scoped
-        // deletes. Stripped in onChannelMessage before the frame reaches the client.
+        // deletes. Stripped in frameForDelivery before the frame reaches the client.
         if (record) |snap| try o.put(alloc, delete_snapshot_key, snap);
         break :blk .{ .object = o };
     } else record.?;
@@ -235,6 +344,71 @@ pub fn buildEventFrames(
         .frame_collection = try protocol.serializeEvent(alloc, coll_channel, action, body),
         .frame_record = try protocol.serializeEvent(alloc, rec_channel, action, body),
     };
+}
+
+/// Transport-neutral per-subscriber delivery (the body of the old ws.onChannelMessage —
+/// F4 delete-snapshot authz, #143 custom-topic verbatim forward, #156 tenancy, all via
+/// `shouldDeliver`). Returns the frame to deliver or null; both transports reduce to
+/// `if (frameForDelivery(...)) |f| <transport write>(f)`. The caller has already checked
+/// `conn.hasSub(channel)` and passes the subscription's filter — this function never reads
+/// `conn.subs`, so SSE may pass an identity-only snapshot Conn (see sse.snapshotForDelivery).
+pub fn frameForDelivery(
+    a: std.mem.Allocator,
+    app: *App,
+    conn: *const Conn,
+    sub_filter: ?[]const u8,
+    channel: []const u8,
+    message: []const u8,
+) ?[]const u8 {
+    // The public feature-signal channel carries a fixed, non-record frame: forward verbatim
+    // (no per-record viewRule authorization, no collection lookup).
+    if (std.mem.eql(u8, channel, FEATURES_CHANNEL)) return message;
+
+    const t = protocol.parseTopic(channel);
+    var r = app.pool.acquireReader() catch return null;
+    defer app.pool.releaseReader(&r);
+
+    // Resolve the topic to a collection FIRST. A non-collection topic is a consumer CUSTOM
+    // channel (#143): forward its frame VERBATIM with NO per-record viewRule — subscription
+    // was already authorized at subscribe time via `canSubscribe`.
+    // R1-4: cached metadata — this runs once per SUBSCRIBER per event; the cache removes
+    // the per-delivery `_collections` SELECT + schema-JSON parse (and caches the NEGATIVE
+    // result for custom non-collection topics). Falls back to a direct load when no cache
+    // is installed (tests / Postgres backend).
+    var col_lease = colcache.lease(app.col_cache, &r, a, t.collection) catch return null;
+    defer col_lease.release();
+    const col = col_lease.col orelse return message;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, a, message, .{}) catch return null;
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+    const av = obj.get("action") orelse return null;
+    if (av != .string) return null;
+    const action: protocol.Action = if (std.mem.eql(u8, av.string, "create")) .create
+        else if (std.mem.eql(u8, av.string, "update")) .update
+        else if (std.mem.eql(u8, av.string, "delete")) .delete
+        else return null;
+    const rv = obj.get("record") orelse return null;
+    if (rv != .object) return null;
+    const idv = rv.object.get("id") orelse return null;
+    if (idv != .string) return null;
+    const record_id = idv.string;
+
+    // F4: the deleted-record authorization snapshot rides the published frame under a private
+    // key. Pull it out for per-subscriber authz, then strip it so the client frame is id-only.
+    const delete_snapshot: ?std.json.Value = if (action == .delete) rv.object.get(delete_snapshot_key) else null;
+
+    const now = auth.nowUnixPub(&r) catch return null;
+    const deliver = shouldDeliver(a, app.io, &r, col, conn, now, action, record_id, sub_filter, delete_snapshot) catch return null;
+    if (!deliver) return null;
+
+    if (action == .delete and delete_snapshot != null) {
+        // Re-serialize an id-only delete frame so the private snapshot never reaches the client.
+        var clean: std.json.ObjectMap = .empty;
+        clean.put(a, "id", idv) catch return null;
+        return protocol.serializeEvent(a, channel, .delete, .{ .object = clean }) catch null;
+    }
+    return message;
 }
 
 const TestDb = struct {
@@ -249,9 +423,14 @@ const TestDb = struct {
     }
     fn mkColl(self: *TestDb, a: std.mem.Allocator, name: []const u8, view_rule: ?[]const u8) !schema.Collection {
         return collections.create(a, std.testing.io, &self.d, .{
-            .id = "", .name = name,
+            .id = "",
+            .name = name,
             .fields = &[_]schema.Field{.{ .id = "f1", .name = "owner", .options = .{ .text = .{} } }},
-            .listRule = "", .viewRule = view_rule, .createRule = "", .updateRule = "", .deleteRule = "",
+            .listRule = "",
+            .viewRule = view_rule,
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
         });
     }
     fn mkRec(self: *TestDb, a: std.mem.Allocator, col: schema.Collection, owner: []const u8) ![]const u8 {
@@ -398,7 +577,10 @@ test "tenant scoping: a subscriber receives ONLY its account's frames; unresolve
         .{ .id = "f2", .name = "account", .options = .{ .text = .{} } },
     };
     var col = try collections.create(a, std.testing.io, &tdb.d, .{
-        .id = "", .name = "projects", .fields = &fields, .viewRule = rules.public_sentinel,
+        .id = "",
+        .name = "projects",
+        .fields = &fields,
+        .viewRule = rules.public_sentinel,
     });
     col.options.tenant_field = "account";
     try tdb.d.exec("INSERT INTO projects (id,created,updated,title,account) VALUES " ++
@@ -511,4 +693,256 @@ test "R1-3: delete sandbox schema is minimal — 2 DDLs, not the migration suite
     // Exactly the _collections registry. This pins the per-subscriber-per-delete cost:
     // the full suite (migrations.run) creates dozens of tables; the sandbox needs one.
     try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
+}
+
+test "F5: anonymous subscribe allowed only on @public; gated collections require auth" {
+    // @public -> anyone (incl. anonymous) may subscribe.
+    try std.testing.expect(subscribeAuthorized("@public", false, false));
+    try std.testing.expect(subscribeAuthorized("@public", true, false));
+    // null (locked): anonymous rejected; authed/superuser allowed (delivery still gated later).
+    try std.testing.expect(!subscribeAuthorized(null, false, false));
+    try std.testing.expect(subscribeAuthorized(null, true, false));
+    try std.testing.expect(subscribeAuthorized(null, false, true));
+    // "" (now LOCKED): anonymous rejected.
+    try std.testing.expect(!subscribeAuthorized("", false, false));
+    // owner/expression rule: anonymous rejected, authed allowed to subscribe.
+    try std.testing.expect(!subscribeAuthorized("owner = @request.auth.id", false, false));
+    try std.testing.expect(subscribeAuthorized("owner = @request.auth.id", true, false));
+}
+
+test "subscribeDecision: collection topics ALWAYS use collection authz, custom topics use the predicate (#143)" {
+    // A REAL collection topic is authorized by its viewRule REGARDLESS of the custom predicate:
+    // even with custom_allowed=true, a LOCKED collection denies an anonymous socket. This is the
+    // security guarantee that a custom subscribe can't reach a collection's records.
+    const locked = schema.Collection{ .id = "c1", .name = "secrets", .fields = &.{}, .viewRule = null };
+    try std.testing.expectEqual(SubscribeOutcome.auth_required, subscribeDecision(locked, false, false, true));
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(locked, true, false, true)); // authed
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(locked, false, true, true)); // superuser
+    // A @public collection is open to anonymous (the custom predicate is irrelevant either way).
+    const pub_col = schema.Collection{ .id = "c2", .name = "posts", .fields = &.{}, .viewRule = "@public" };
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(pub_col, false, false, false));
+    // A NON-collection custom topic (col == null) is gated solely by custom_allowed.
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(null, false, false, true)); // default public
+    try std.testing.expectEqual(SubscribeOutcome.auth_required, subscribeDecision(null, false, false, false)); // guard denied
+}
+
+test "canSubscribeTopic: default allows any custom topic (public signal channel) (#143)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var app: App = undefined;
+    const anon = request.RequestContext{};
+    // No dispatch wired (tests/CLI): custom topics default to PUBLIC signal channels.
+    app.dispatch = null;
+    try std.testing.expect(canSubscribeTopic(&app, a, anon, "availability"));
+    // Dispatch present but NO predicate -> still public by default.
+    var d = @import("../events.zig").Dispatch{};
+    app.dispatch = &d;
+    try std.testing.expect(canSubscribeTopic(&app, a, anon, "orders"));
+}
+
+test "canSubscribeTopic: a canSubscribe guard returning false denies (#143)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Guard = struct {
+        fn deny(ctx: *Ctx, topic: []const u8) bool {
+            _ = ctx;
+            _ = topic;
+            return false;
+        }
+        fn onlyAuthed(ctx: *Ctx, topic: []const u8) bool {
+            _ = topic;
+            return ctx.rctx.auth != null or ctx.rctx.is_superuser;
+        }
+    };
+    var app: App = undefined;
+    var d = @import("../events.zig").Dispatch{ .realtime_can_subscribe = Guard.deny };
+    app.dispatch = &d;
+    const anon = request.RequestContext{};
+    try std.testing.expect(!canSubscribeTopic(&app, a, anon, "private"));
+    // A guard gating on auth: anonymous denied, authenticated allowed.
+    d.realtime_can_subscribe = Guard.onlyAuthed;
+    try std.testing.expect(!canSubscribeTopic(&app, a, anon, "private"));
+    var rec: std.json.ObjectMap = .empty;
+    try rec.put(a, "id", .{ .string = "u1" });
+    const authed = request.RequestContext{ .auth = .{ .object = rec }, .is_superuser = false };
+    try std.testing.expect(canSubscribeTopic(&app, a, authed, "private"));
+}
+
+const PoolEnv = struct {
+    tmp: std.testing.TmpDir,
+    db_path: [:0]u8,
+    pool: db.Pool,
+
+    fn init() !PoolEnv {
+        const ga = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+        defer ga.free(dir_path);
+        const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        errdefer ga.free(db_path);
+        var pool = try db.Pool.init(ga, std.testing.io, db_path);
+        errdefer pool.deinit();
+        {
+            const w = pool.acquireWriter();
+            defer pool.releaseWriter();
+            try migrations.run(w);
+        }
+        return .{ .tmp = tmp, .db_path = db_path, .pool = pool };
+    }
+    fn deinit(self: *PoolEnv) void {
+        self.pool.deinit();
+        std.testing.allocator.free(self.db_path);
+        self.tmp.cleanup();
+    }
+};
+
+test "subscribeCheck decision table: limit / __features / unknown / auth_required / ok (transport-neutral)" {
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+
+    // Provision a @public and a locked collection on the pool's writer.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "pub_posts",
+            .fields = &.{},
+            .viewRule = rules.public_sentinel,
+        });
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "locked_posts",
+            .fields = &.{},
+            .viewRule = null,
+        });
+    }
+
+    var anon = Conn{};
+    // __features: always ok, even anonymous, even at any sub count below the cap.
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeCheck(&app, &anon, a, FEATURES_CHANNEL));
+    // @public collection: anonymous ok.
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeCheck(&app, &anon, a, "pub_posts"));
+    // locked collection: anonymous rejected.
+    try std.testing.expectEqual(SubscribeOutcome.auth_required, subscribeCheck(&app, &anon, a, "locked_posts"));
+    // non-collection custom topic: default-allowed (public signal channel, #143).
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeCheck(&app, &anon, a, "availability"));
+    // MAX_SUBS: a conn at the cap is rejected BEFORE any lookup.
+    var full = Conn{};
+    var i: usize = 0;
+    while (i < connection.MAX_SUBS) : (i += 1) {
+        const topic = try std.fmt.allocPrint(a, "t{d}", .{i});
+        try full.addSub(a, topic, null);
+    }
+    try std.testing.expectEqual(SubscribeOutcome.limit, subscribeCheck(&app, &full, a, "one_more"));
+}
+
+test "authVerb: bad token clears auth and returns false (transport-neutral)" {
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    var c = Conn{};
+    // Pre-install an identity to prove a failed auth CLEARS it (the ws contract).
+    var rec: std.json.ObjectMap = .empty;
+    try rec.put(a, "id", .{ .string = "u1" });
+    c.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
+    try std.testing.expect(!authVerb(&app, &c, a, "not-a-jwt", ""));
+    try std.testing.expect(c.auth == null);
+}
+
+test "frameForDelivery: custom topic + __features forward VERBATIM (no authz, no parse requirement)" {
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    var anon = Conn{};
+    // A non-collection topic: the exact message bytes come back (pointer-equal slice).
+    const msg = "{\"type\":\"message\",\"topic\":\"orders\",\"data\":1}";
+    const out = frameForDelivery(a, &app, &anon, null, "orders", msg).?;
+    try std.testing.expectEqualStrings(msg, out);
+    // __features: verbatim too.
+    const sig = "{\"type\":\"signal\",\"topic\":\"__features\"}";
+    try std.testing.expectEqualStrings(sig, frameForDelivery(a, &app, &anon, null, FEATURES_CHANNEL, sig).?);
+}
+
+test "frameForDelivery: viewRule deny -> null; @public + matching filter -> frame; mismatching filter -> null" {
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    var rid: []const u8 = undefined;
+    var rec_val: std.json.Value = undefined;
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const pub_col = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "fitems", .fields = &[_]schema.Field{.{ .id = "f1", .name = "owner", .options = .{ .text = .{} } }},
+            .viewRule = rules.public_sentinel,
+        });
+        var data: std.json.ObjectMap = .empty;
+        try data.put(a, "owner", .{ .string = "alice" });
+        rec_val = try records.create(a, std.testing.io, w, pub_col, .{ .object = data });
+        rid = rec_val.object.get("id").?.string;
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "flocked", .fields = &.{}, .viewRule = null,
+        });
+    }
+    const ef = try buildEventFrames(a, "fitems", .create, rid, rec_val);
+    var anon = Conn{};
+    // @public, no filter: delivered verbatim.
+    try std.testing.expectEqualStrings(ef.frame_collection, frameForDelivery(a, &app, &anon, null, "fitems", ef.frame_collection).?);
+    // Filter narrows: match delivers, mismatch denies.
+    try std.testing.expect(frameForDelivery(a, &app, &anon, "owner = \"alice\"", "fitems", ef.frame_collection) != null);
+    try std.testing.expect(frameForDelivery(a, &app, &anon, "owner = \"bob\"", "fitems", ef.frame_collection) == null);
+    // Locked collection: anonymous denied outright (frame for a locked col).
+    const lf = try buildEventFrames(a, "flocked", .create, "R1", rec_val);
+    try std.testing.expect(frameForDelivery(a, &app, &anon, null, "flocked", lf.frame_collection) == null);
+}
+
+test "frameForDelivery: F4 delete snapshot authorizes, then is STRIPPED to an id-only frame" {
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "", .name = "fnotes", .fields = &[_]schema.Field{.{ .id = "f1", .name = "owner", .options = .{ .text = .{} } }},
+            .viewRule = "owner = @request.auth.id",
+        });
+    }
+    var snap: std.json.ObjectMap = .empty;
+    try snap.put(a, "id", .{ .string = "GONE" });
+    try snap.put(a, "owner", .{ .string = "u1" });
+    const ef = try buildEventFrames(a, "fnotes", .delete, "GONE", .{ .object = snap });
+    // The published frame carries the private snapshot (precondition).
+    try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, delete_snapshot_key) != null);
+
+    var owner = try authedConn(a, "u1", false);
+    var other = try authedConn(a, "u2", false);
+    // Owner: delivered — and the delivered frame is ID-ONLY (snapshot + owner field stripped).
+    const out = frameForDelivery(a, &app, &owner, null, "fnotes", ef.frame_collection).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, delete_snapshot_key) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"owner\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"GONE\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"action\":\"delete\"") != null);
+    // Non-owner: nothing (no id leak).
+    try std.testing.expect(frameForDelivery(a, &app, &other, null, "fnotes", ef.frame_collection) == null);
 }

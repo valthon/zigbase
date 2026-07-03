@@ -1158,7 +1158,7 @@ the static root, so never place secrets there. For access-controlled file delive
   `static_routes` rewrites, consulted before the marker. See
   [Framework → Static files](./framework#13-serve-a-frontend-static-files) for details. <a id="spa-fallback"></a>
 
-## Realtime (WebSocket)
+## Realtime (WebSocket + SSE)
 
 Connect to `ws://<host>/api/realtime` (the upgrade is gated to that exact path and the
 connection Origin is validated against the server's allowlist). The allowlist is
@@ -1222,6 +1222,68 @@ so an owner-scoped (or otherwise gated) `viewRule` only notifies subscribers who
 to view that record — a delete on someone else's record is not leaked to other subscribers.
 
 Malformed or unknown client frames produce `{ "type": "error", "message": "..." }`.
+
+### SSE transport
+
+Everything above — the frame grammar (`connect`/`auth`/`ack`/`event`/`signal`/`message`/`error`),
+per-record delivery authorization, subscription rules, the Origin policy, and the shared
+10,000-connection cap — applies identically over Server-Sent Events. SSE is a second pipe under
+the same hub, not a second protocol.
+
+**Connect (downlink).** `GET /api/realtime/sse` with `Accept: text/event-stream` — the header
+must be EXACT for non-browser clients (the server dispatches SSE upgrades on an exact match;
+`EventSource` always sends it). Every hub frame arrives as one `data: <json>` event (default
+event name → `EventSource.onmessage`; no `id:`/`event:`/`retry:` fields). The first event is the
+standard connect frame: `{"type":"connect","clientId":"<32 chars>"}`.
+
+**Verbs (uplink).** `POST /api/realtime/sse/:clientId` with the same JSON verb body the WS
+socket sends (`auth` / `subscribe` / `unsubscribe`). The response body is the exact frame the
+WS socket would have written — the frame body is the protocol; the HTTP status is just framing:
+
+| Condition | Response |
+|---|---|
+| unknown, expired, or just-closed `clientId` | `404` standard error envelope — **non-oracle**: byte-identical for never-existed vs. just-closed |
+| body fails to parse as a verb | `400`, body `{"type":"error","message":"bad message"}` |
+| verb processed | `200`, body = `{"type":"auth","status":"ok"\|"error"}`, `{"type":"ack",…}`, or `{"type":"error","message":…}` |
+
+Error-frame outcomes return `200` deliberately — WS keeps the connection open and replies a
+frame; clients share one frame-handling path across transports.
+
+**Auth.** Identical to WS: the ONLY identity path is the `auth` verb with the token in the POST
+body — a bearer token never appears in any URL, and the auth cookie is intentionally NOT used.
+The `clientId` is a crypto-random capability delivered only on the Origin-gated stream; no CORS
+headers are emitted. Deployment note: unlike the WS handle, the uplink `clientId` rides the URL
+*path* (`POST /api/realtime/sse/:clientId`), so it can land in HTTP access/proxy logs — the
+mitigation is that it's a 165-bit CSPRNG capability that dies with the connection, and a leaked
+id only permits griefing that connection (unsubscribe/auth-clear), never data exfiltration
+(deliveries flow to the victim's held-open stream socket, not the uplink POST response).
+
+**Heartbeats.** The server writes the SSE comment `: ping` on every protocol-timeout tick
+(invisible to `EventSource`). Default interval: the listener's 40s timeout; override with
+`--sse-heartbeat-seconds N` / `ZIGBASE_SSE_HEARTBEAT_SECONDS` (1..=255; validated at startup).
+
+**Limits.** WS and SSE share ONE global connection cap (10,000; upgrades past it → `503`) and
+the 256-subscriptions-per-connection cap. Browser note: HTTP/1.1 `EventSource` is limited to
+~6 streams per origin by browsers.
+
+**No-SDK example.**
+
+```js
+const es = new EventSource('/api/realtime/sse');
+let clientId;
+es.onmessage = async (e) => {
+  const m = JSON.parse(e.data);
+  if (m.type === 'connect') {
+    clientId = m.clientId;
+    await fetch('/api/realtime/sse/' + clientId, {
+      method: 'POST',
+      body: JSON.stringify({ action: 'subscribe', topic: 'posts' }),
+    });
+  } else if (m.type === 'event') {
+    console.log(m.action, m.record);
+  }
+};
+```
 
 ## Health
 

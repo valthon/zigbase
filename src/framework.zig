@@ -1363,6 +1363,8 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                      (serve only). Set ONLY behind a trusted reverse proxy. [default off]
         \\  --realtime-origins CSV  Allowed WebSocket Origins (serve only). Empty denies cross-origin
         \\                      browser upgrades. [env ZIGBASE_REALTIME_ORIGINS]
+        \\  --sse-heartbeat-seconds N  SSE heartbeat (": ping") interval in seconds (serve only).
+        \\                      0 = inherit the 40s listener timeout. [env ZIGBASE_SSE_HEARTBEAT_SECONDS]
         \\
     , .{});
     if (show_serve_static) emit(io, file,
@@ -1452,7 +1454,8 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_
         \\
         \\USAGE:
         \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
-        \\                [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]{s}
+        \\                [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
+        \\                [--sse-heartbeat-seconds N]{s}
         \\
         \\FLAGS:
         \\  --http-host H    Address to bind; loopback by default. Pass 0.0.0.0 for all
@@ -1462,6 +1465,8 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_
         \\  --insecure-cookies   Drop the Secure cookie flag (plain-HTTP local dev only).
         \\  --trust-proxy        Trust X-Forwarded-For/X-Real-IP (behind a trusted proxy only).
         \\  --realtime-origins CSV  Allowed WebSocket Origins; empty denies cross-origin upgrades.
+        \\  --sse-heartbeat-seconds N  SSE heartbeat interval in seconds; 0 inherits the 40s
+        \\                         listener timeout. [env ZIGBASE_SSE_HEARTBEAT_SECONDS]
         \\
     , .{if (show_serve_static) " [--serve-static DIR]" else ""});
     if (show_serve_static) emit(io, file,
@@ -1575,6 +1580,7 @@ fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.C
     if (sa.insecure_cookies) cfg.cookie_secure = false;
     if (sa.trust_proxy) cfg.trust_proxy = true;
     if (sa.realtime_origins) |v| cfg.realtime_allowed_origins = v;
+    if (sa.sse_heartbeat_seconds) |v| cfg.sse_heartbeat_seconds = v;
     return cfg;
 }
 
@@ -1826,6 +1832,10 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     if (cfg.realtime_allowed_origins.len == 0) {
         std.log.info("realtime: no allowed Origins configured; cross-origin browser WebSocket upgrades are DENIED (set ZIGBASE_REALTIME_ORIGINS)", .{});
     }
+    if (cfg.sse_heartbeat_seconds != 0 and cfg.sse_heartbeat_seconds > 255) {
+        std.log.err("refusing to start: ZIGBASE_SSE_HEARTBEAT_SECONDS/--sse-heartbeat-seconds must be 0 (inherit) or 1..=255, got {d}", .{cfg.sse_heartbeat_seconds});
+        return error.InvalidSseHeartbeat;
+    }
     var pool = try openPoolSelect(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib }, environ);
     defer pool.deinit();
     // Transparent at-rest field encryption (Theme B1). Resolve the cipher ONCE from
@@ -2055,6 +2065,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .oauth_state_server = cfg.oauth_state_server,
         .oauth_state_ttl_s = cfg.oauth_state_ttl_s,
         .realtime_allowed_origins = cfg.realtime_allowed_origins,
+        .sse_heartbeat_seconds = @intCast(cfg.sse_heartbeat_seconds),
         .trust_proxy = cfg.trust_proxy,
         .max_upload_size = cfg.max_upload_size,
         .file_token_ttl_s = cfg.file_token_ttl_s,

@@ -5,15 +5,14 @@ const App = @import("../app.zig").App;
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
-const colcache = @import("../colcache.zig");
 const records = @import("../records.zig");
-const policy = @import("../policy.zig");
 const pg_bridge = @import("pg_bridge.zig");
 const auth = @import("../auth.zig");
 const id = @import("../id.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 const hub = @import("hub.zig");
+const sse = @import("sse.zig");
 const request = @import("../request.zig");
 const tenancy = @import("../tenancy/tenancy.zig");
 const Ctx = @import("../ctx.zig").Ctx;
@@ -22,88 +21,13 @@ const Ctx = @import("../ctx.zig").Ctx;
 /// facil.io reactor isn't running (tests/CLI), avoiding "facil.io cluster inactive" noise + UB.
 pub var active: bool = false;
 
-/// Fixed PUBLIC realtime channel for the feature-management "changed" signal
-/// (#128/#129/#130). It is signal-only: the STANDARD signal frame
-/// `{"type":"signal","topic":"__features"}` is published whenever any flag/experiment
-/// override changes (0.10.0 — the bespoke `{"type":"features.changed"}` frame is gone);
-/// clients re-`GET /api/state` on receipt. No per-subject state or experiment assignment
-/// is ever pushed. It is NOT a collection — the subscribe path allows anonymous
-/// subscription to it explicitly and the delivery path forwards its frames unchanged.
-pub const FEATURES_CHANNEL = "__features";
+/// Re-exported from hub.zig (moved so the delivery chokepoint can use it); consumers/tests keep
+/// this name.
+pub const FEATURES_CHANNEL = hub.FEATURES_CHANNEL;
 
-/// Max concurrent subscriptions per connection (bounds per-conn facil.io subscription state).
-const MAX_SUBS = 256;
-
-/// F9: global cap on concurrent WebSocket connections. Deliberately a module-level constant in the
-/// realtime layer (NOT config.zig) so an operator can't accidentally disable it and a parallel
-/// config workstream doesn't conflict. New upgrades past this cap are rejected with 503.
-pub const MAX_CONNECTIONS: usize = 10_000;
-
-/// Live WS connection count. Bumped on a successful upgrade, decremented on close. Connection
-/// callbacks for one socket are serialized by facil.io but different sockets run on different
-/// threads, so this is an atomic.
-var live_connections: std.atomic.Value(usize) = .init(0);
-
-/// Current live WS connection count (test/introspection helper).
-pub fn connectionCount() usize {
-    return live_connections.load(.monotonic);
-}
-
-/// Atomically reserve a global connection slot (F9). Returns false (and leaves the count unchanged)
-/// when the cap is already reached, so the caller must reject the upgrade. Pair a successful
-/// reservation with exactly one `releaseConnectionSlot`.
-fn reserveConnectionSlot() bool {
-    if (live_connections.fetchAdd(1, .monotonic) >= MAX_CONNECTIONS) {
-        _ = live_connections.fetchSub(1, .monotonic);
-        return false;
-    }
-    return true;
-}
-
-fn releaseConnectionSlot() void {
-    _ = live_connections.fetchSub(1, .monotonic);
-}
-
-/// F5: may a socket subscribe to a collection with this `view_rule`? Anonymous sockets may
-/// subscribe ONLY to a public (@public) collection. Any other collection — locked, owner-scoped,
-/// or any expression — requires a live authenticated (or superuser) identity first. Delivery is
-/// still independently gated per record by `hub.shouldDeliver`; this just stops anonymous sockets
-/// from registering subscriptions on gated data.
-fn subscribeAuthorized(view_rule: ?[]const u8, authed: bool, is_superuser: bool) bool {
-    if (policy.isPublic(view_rule)) return true;
-    return authed or is_superuser;
-}
-
-/// The result of authorizing a subscribe request: deliver, unknown-collection error, or
-/// authentication-required error.
-const SubscribeOutcome = enum { ok, unknown, auth_required };
-
-/// Pure subscribe-authorization decision (#143, F5), factored out so the security PRECEDENCE
-/// is testable in one place: a REAL collection topic (`col != null`) ALWAYS uses per-collection
-/// authz (`subscribeAuthorized`) — the custom-topic predicate is NEVER consulted for it, so a
-/// custom subscribe can't reach a collection's records. Only a NON-collection custom topic
-/// (`col == null`) is gated by `custom_allowed` (the `canSubscribe` result; default true).
-fn subscribeDecision(col: ?schema.Collection, authed: bool, is_superuser: bool, custom_allowed: bool) SubscribeOutcome {
-    if (col) |c| {
-        return if (subscribeAuthorized(c.viewRule, authed, is_superuser)) .ok else .auth_required;
-    }
-    return if (custom_allowed) .ok else .auth_required;
-}
-
-/// #143: may a socket subscribe to a NON-collection custom topic? Consulted ONLY after the
-/// topic is confirmed NOT to be a collection (collection topics keep their own per-record
-/// authz). DEFAULT — no `.realtime = .{ .canSubscribe = fn }` configured — is to ALLOW any
-/// named custom topic, i.e. custom topics are PUBLIC signal channels (exactly the historical
-/// `__features` behavior). A configured predicate gates private channels: returning false
-/// denies. The predicate receives a lightweight `Ctx` carrying the socket's resolved identity
-/// (`ctx.user()` / `ctx.rctx`); it may acquire its own reader for richer checks.
-fn canSubscribeTopic(app: *App, arena: std.mem.Allocator, rctx: request.RequestContext, topic: []const u8) bool {
-    const d = app.dispatch orelse return true;
-    const predicate = d.realtime_can_subscribe orelse return true;
-    var cx = Ctx{ .app = app, .arena = arena, .rctx = rctx };
-    defer cx.deinit();
-    return predicate(&cx, topic);
-}
+/// Re-exported from connection.zig (hoisted for transport sharing); consumers/tests keep this name.
+pub const MAX_CONNECTIONS = connection.MAX_CONNECTIONS;
+pub const connectionCount = connection.connectionCount;
 
 /// Live per-connection state: the pure 7a `Conn` plus the zap handle / settings / app.
 ///
@@ -161,7 +85,7 @@ pub fn originAllowed(allowlist: []const u8, origin: ?[]const u8, host: ?[]const 
 /// the membership check at resolve time is the real gate) or the signed `zb_account` cookie. The
 /// returned slice is duped onto `da` (the connection-durable arena) because zap.Request buffers are
 /// freed after the upgrade callback returns. null when neither is present/valid. (#156)
-fn requestedAccountFromUpgrade(app: *App, r: zap.Request, da: std.mem.Allocator) ?[]const u8 {
+pub fn requestedAccountFromUpgrade(app: *App, r: zap.Request, da: std.mem.Allocator) ?[]const u8 {
     if (r.getHeader("x-account-id")) |h| if (h.len > 0) return da.dupe(u8, h) catch null;
     const ch = r.getHeader("cookie") orelse return null;
     const raw = cookieValue(ch, tenancy.account_cookie) orelse return null;
@@ -170,7 +94,7 @@ fn requestedAccountFromUpgrade(app: *App, r: zap.Request, da: std.mem.Allocator)
 }
 
 /// Extract the value of cookie `name` from a raw `Cookie` header (mirrors `http.RequestCtx.cookie`).
-fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
+pub fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, header, ';');
     while (it.next()) |pair| {
         const trimmed = std.mem.trim(u8, pair, " ");
@@ -181,19 +105,23 @@ fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The string `id` of a record JSON object, or "" when absent/non-object.
-fn recordIdOf(rec: std.json.Value) []const u8 {
-    if (rec != .object) return "";
-    const v = rec.object.get("id") orelse return "";
-    return if (v == .string) v.string else "";
-}
-
-/// Listener on_upgrade hook: validate Origin, allocate a LiveConn, upgrade. Path-gated to /api/realtime.
+/// Listener on_upgrade hook for BOTH realtime transports. facil.io routes an exact
+/// `Accept: text/event-stream` request here with target == "sse" (spike §1) — the same
+/// callback WS upgrades use. Dispatch:
+///   - "websocket" + /api/realtime      -> WS path (unchanged).
+///   - "sse"       + /api/realtime/sse  -> SSE path (#188).
+///   - anything else -> 404 + markAsFinished (fixes the old early-`return` that silently
+///     swallowed "sse" targets without finishing the request).
+/// Shared gates, in order: originAllowed (F12), the ONE global connection slot (F9 — WS+SSE
+/// share MAX_CONNECTIONS), tenancy capture (inside each arm; zap.Request buffers are freed
+/// after this returns).
 pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void {
     const Server = @import("../server.zig").Server;
     const app = Server.instance.?.app;
-    if (!std.mem.eql(u8, target_protocol, "websocket")) return;
-    if (!std.mem.eql(u8, r.path orelse "", "/api/realtime")) {
+    const path = r.path orelse "";
+    const is_ws = std.mem.eql(u8, target_protocol, "websocket") and std.mem.eql(u8, path, "/api/realtime");
+    const is_sse = std.mem.eql(u8, target_protocol, "sse") and std.mem.eql(u8, path, "/api/realtime/sse");
+    if (!is_ws and !is_sse) {
         r.setStatus(.not_found);
         r.markAsFinished(true);
         return;
@@ -203,14 +131,17 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
         r.markAsFinished(true);
         return;
     }
-    // F9: reserve a global connection slot up front; reject past the cap. Reserving before alloc
-    // (and releasing on any failure below) keeps the counter exact under concurrent upgrades.
-    if (!reserveConnectionSlot()) {
+    // F9: reserve the SHARED (WS+SSE) global connection slot up front; reject past the cap.
+    if (!connection.reserveConnectionSlot()) {
         r.setStatus(.service_unavailable);
         r.markAsFinished(true);
         return;
     }
-    errdefer releaseConnectionSlot();
+    if (is_sse) {
+        sse.openStream(r, app); // owns releasing the slot on any failure inside
+        return;
+    }
+    errdefer connection.releaseConnectionSlot();
     const lc = try app.allocator.create(LiveConn);
     lc.* = .{
         .app = app,
@@ -234,10 +165,18 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
         .context = lc,
     };
     WS.upgrade(r.h, &lc.settings) catch {
-        lc.durable.deinit();
-        lc.frame.deinit();
-        app.allocator.destroy(lc);
-        releaseConnectionSlot(); // release the reserved slot
+        // DO NOT tear down here. facil.io's upgrade-FAILURE paths invoke the connection's
+        // on_close (== our `onClose`, via zap's `internal_on_close`) THEMSELVES and then return
+        // -1 — so by the time this catch runs, `lc` has ALREADY been fully destroyed and the
+        // slot released. Both -1 paths do this:
+        //   • http_upgrade2ws invalid-handle           (http.c:718-720:  args.on_close(-1, udata))
+        //   • http1_http2websocket_server bad_request  (http1.c:365-368: http_send_error(400) then
+        //                                                args->on_close(0, udata))
+        // The bad_request path is unauthenticated + trivially remote-triggerable with a malformed
+        // `Sec-WebSocket-Version` header; repeating the teardown here was a heap double-free +
+        // double connection-slot release (release-build DoS). facil has also already sent the
+        // terminal response (http_send_error), so the caller must do NOTHING but stop — symmetric
+        // with the success path, which likewise returns without finishing the request.
         return;
     };
 }
@@ -262,61 +201,15 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
     };
     switch (msg) {
         .auth => |m| {
-            var r = lc.app.pool.acquireReader() catch {
-                WS.write(handle, try protocol.authFrame(fa, false), true) catch {};
-                return;
-            };
-            defer lc.app.pool.releaseReader(&r);
-            // auth record must persist across frames -> durable allocator
-            if (auth.verifyToken(da, lc.app, &r, m.token)) |v| {
-                lc.conn.setAuth(.{ .record = v.record, .is_superuser = v.is_superuser, .exp = v.exp });
-                // #156: resolve + cache the active account scope against _memberships (durable
-                // allocator → persists across frames). Superusers bypass tenancy. A failed/absent
-                // resolution leaves account_id="" → tenant-owned delivery fails closed (deny).
-                if (lc.conn.tenancy_enabled and !v.is_superuser) {
-                    const uid = recordIdOf(v.record);
-                    if (uid.len > 0) {
-                        const res = tenancy.resolve(da, &r, v.collection, uid, lc.requested_account) catch tenancy.Resolution{};
-                        lc.conn.setTenancyScope(res.account_id, res.memberships);
-                    }
-                }
-                WS.write(handle, try protocol.authFrame(fa, true), true) catch {};
-            } else {
-                lc.conn.clearAuth();
-                WS.write(handle, try protocol.authFrame(fa, false), true) catch {};
-            }
+            const ok = hub.authVerb(lc.app, &lc.conn, da, m.token, lc.requested_account);
+            WS.write(handle, try protocol.authFrame(fa, ok), true) catch {};
         },
         .subscribe => |m| {
-            if (lc.conn.subs.count() >= MAX_SUBS) {
-                WS.write(handle, try protocol.errorFrame(fa, "subscription limit reached"), true) catch {};
-                return;
-            }
-            const outcome: SubscribeOutcome = blk: {
-                const t = protocol.parseTopic(m.topic);
-                // The feature-management signal channel is PUBLIC and is not a collection:
-                // anyone (incl. anonymous) may subscribe; delivery forwards the signal frame
-                // verbatim (no per-record authorization).
-                if (std.mem.eql(u8, t.collection, FEATURES_CHANNEL)) break :blk .ok;
-                var r = lc.app.pool.acquireReader() catch break :blk .unknown;
-                const now = auth.nowUnixPub(&r) catch 0;
-                const rctx = lc.conn.requestContext(now);
-                const lookup = collections.get(fa, &r, t.collection) catch {
-                    lc.app.pool.releaseReader(&r);
-                    break :blk .unknown;
-                };
-                // Release the reader now: `lookup` (and `col.viewRule`) live on the frame arena, and
-                // the canSubscribe predicate is handed a Ctx that may acquire its own reader.
-                lc.app.pool.releaseReader(&r);
-                // A REAL collection topic ALWAYS goes through normal per-collection authz, so the
-                // custom-topic predicate can never be used to reach a collection's records: the
-                // canSubscribe guard (#143) is consulted ONLY when `lookup == null` (a non-collection
-                // custom topic). DEFAULT (no `.realtime.canSubscribe`) allows any custom topic, i.e.
-                // custom topics are PUBLIC signal channels — exactly today's `__features` behavior.
-                const custom_allowed = lookup == null and canSubscribeTopic(lc.app, fa, rctx, m.topic);
-                break :blk subscribeDecision(lookup, rctx.auth != null, rctx.is_superuser, custom_allowed);
-            };
-            switch (outcome) {
-                .ok => {},
+            switch (hub.subscribeCheck(lc.app, &lc.conn, fa, m.topic)) {
+                .limit => {
+                    WS.write(handle, try protocol.errorFrame(fa, "subscription limit reached"), true) catch {};
+                    return;
+                },
                 .unknown => {
                     WS.write(handle, try protocol.errorFrame(fa, "unknown collection"), true) catch {};
                     return;
@@ -325,19 +218,16 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
                     WS.write(handle, try protocol.errorFrame(fa, "authentication required to subscribe"), true) catch {};
                     return;
                 },
+                .ok => {},
             }
-            // subscription keys/filters + sub_args must persist across frames -> durable allocator.
-            // m.topic is parsed from the per-message buffer and is freed once onMessage returns, so
-            // dupe it durably and use that copy for BOTH the facil.io subscription args and the
-            // sub_ids key. Keying sub_ids off the ephemeral m.topic was a use-after-free: a later
-            // unsubscribe's fetchRemove() would compare against freed memory and crash the worker.
+            // fio-side residue (UNCHANGED — ws.zig:328-341): durable channel dupe, conn.addSub,
+            // SubscribeArgs, WS.subscribe, sub_ids bookkeeping, ack write.
             const channel = da.dupe(u8, m.topic) catch return;
             lc.conn.addSub(da, m.topic, m.filter) catch return;
             const args = da.create(WS.SubscribeArgs) catch return;
             args.* = .{ .channel = channel, .on_message = onChannelMessage, .context = lc };
             const sub_id = WS.subscribe(handle, args) catch 0;
             lc.sub_args.append(da, args) catch {};
-            // track topic -> facil.io subscription id so unsubscribe can really cancel it
             if (sub_id != 0) lc.sub_ids.put(da, channel, sub_id) catch {};
             WS.write(handle, try protocol.ackFrame(fa, "subscribe", m.topic), true) catch {};
         },
@@ -355,70 +245,12 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
 fn onChannelMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, channel: []const u8, message: []const u8) anyerror!void {
     const lc = context orelse return;
     if (!lc.conn.hasSub(channel)) return; // keep BEFORE reset/alloc so dead channels cost nothing
-    // The public feature-signal channel carries a fixed, non-record frame: forward it
-    // verbatim (no per-record viewRule authorization, no collection lookup).
-    if (std.mem.eql(u8, channel, FEATURES_CHANNEL)) {
-        WS.write(handle, message, true) catch {};
-        return;
-    }
     _ = lc.frame.reset(.retain_capacity);
     const a = lc.frame.allocator();
-
-    const t = protocol.parseTopic(channel);
-    var r = lc.app.pool.acquireReader() catch return;
-    defer lc.app.pool.releaseReader(&r);
-
-    // Resolve the topic to a collection FIRST. A non-collection topic is a consumer CUSTOM
-    // channel (#143): forward its frame VERBATIM with NO per-record viewRule — subscription
-    // was already authorized at subscribe time via `canSubscribe`. This mirrors the
-    // `__features` precedent and is strictly scoped to topics that are NOT collections, so a
-    // custom-topic delivery can never leak a collection's records.
-    // R1-4: cached metadata — this runs once per SUBSCRIBER per event; the cache removes
-    // the per-delivery `_collections` SELECT + schema-JSON parse (and caches the NEGATIVE
-    // result for custom non-collection topics). Falls back to a direct load when no cache
-    // is installed (tests / Postgres backend).
-    var col_lease = colcache.lease(lc.app.col_cache, &r, a, t.collection) catch return;
-    defer col_lease.release();
-    const col = col_lease.col orelse {
-        WS.write(handle, message, true) catch {};
-        return;
-    };
-
-    const parsed = std.json.parseFromSlice(std.json.Value, a, message, .{}) catch return;
-    if (parsed.value != .object) return;
-    const obj = parsed.value.object;
-    const av = obj.get("action") orelse return;
-    if (av != .string) return;
-    const action_str = av.string;
-    const action: protocol.Action = if (std.mem.eql(u8, action_str, "create")) .create
-        else if (std.mem.eql(u8, action_str, "update")) .update
-        else if (std.mem.eql(u8, action_str, "delete")) .delete
-        else return;
-    const rv = obj.get("record") orelse return;
-    if (rv != .object) return;
-    const idv = rv.object.get("id") orelse return;
-    if (idv != .string) return;
-    const record_id = idv.string;
-
-    // F4: the deleted-record authorization snapshot rides in the published delete frame under a
-    // private key. Pull it out for per-subscriber authz, then strip it so the client frame is id-only.
-    const delete_snapshot: ?std.json.Value = if (action == .delete) rv.object.get(hub.delete_snapshot_key) else null;
-
-    const now = auth.nowUnixPub(&r) catch return;
     const filter_ptr = lc.conn.subFilter(channel);
     const sub_filter: ?[]const u8 = if (filter_ptr) |p| p.* else null;
-
-    const deliver = hub.shouldDeliver(a, lc.app.io, &r, col, &lc.conn, now, action, record_id, sub_filter, delete_snapshot) catch return;
-    if (!deliver) return;
-
-    if (action == .delete and delete_snapshot != null) {
-        // Re-serialize an id-only delete frame so the private snapshot never reaches the client.
-        var clean: std.json.ObjectMap = .empty;
-        clean.put(a, "id", idv) catch return;
-        const frame = protocol.serializeEvent(a, channel, .delete, .{ .object = clean }) catch return;
+    if (hub.frameForDelivery(a, lc.app, &lc.conn, sub_filter, channel, message)) |frame| {
         WS.write(handle, frame, true) catch {};
-    } else {
-        WS.write(handle, message, true) catch {};
     }
 }
 
@@ -429,7 +261,7 @@ fn onClose(context: ?*LiveConn, uuid: isize) anyerror!void {
     lc.durable.deinit();
     lc.frame.deinit();
     app.allocator.destroy(lc);
-    releaseConnectionSlot(); // F9: free the global connection slot
+    connection.releaseConnectionSlot(); // F9: free the global connection slot
 }
 
 /// Publish a record event to its collection + record channels. Called from the record-writer path
@@ -482,7 +314,7 @@ pub fn prepareDelete(alloc: std.mem.Allocator, app: *App, w: *db.Db, col: schema
 }
 
 /// Build + publish the two event frames into the LOCAL in-process hub (no NOTIFY). Shared by the
-/// writer path (`broadcast`) and the cross-instance listener (`onRemoteEvent`), so a notification
+/// writer path (`broadcast`) and the cross-instance listener (`onRemoteRecordEvent`), so a notification
 /// from another instance flows through the exact same `onChannelMessage` per-subscriber authz.
 fn publishFrames(collection: []const u8, action: protocol.Action, record_id: []const u8, record: ?std.json.Value) void {
     if (!active) return;
@@ -494,12 +326,44 @@ fn publishFrames(collection: []const u8, action: protocol.Action, record_id: []c
     WS.publish(.{ .channel = ef.record_channel, .message = ef.frame_record });
 }
 
-/// Cross-instance bridge callback (#159, PR-6b): a record event NOTIFY'd by ANOTHER instance.
-/// Re-feeds the local hub so each local subscriber's existing view/ability/tenant authz runs in
-/// `onChannelMessage` — create/update re-fetch the live row, delete reads the at-rest snapshot from
-/// the side table by token. Swallowed failures are logged so a silently-undelivered remote event is
-/// visible to operators.
-fn onRemoteEvent(app: *App, ev: pg_bridge.Event) void {
+/// Cross-instance bridge callback: a payload NOTIFY'd by ANOTHER instance. Record events re-feed
+/// the local hub (unchanged); signals rebuild the byte-identical frame with the SAME
+/// signalFrameAlloc builder; message broadcasts read the enveloped frame back from _rt_broadcasts
+/// by token (no row = forged/expired = drop, fail closed). All three re-publish into the LOCAL
+/// hub, so each is delivered through the SAME per-subscriber authz chokepoint (`onChannelMessage`
+/// → `hub.frameForDelivery`): a remote origin never bypasses per-record/per-topic authorization,
+/// which was already enforced at subscribe time on THIS (receiving) instance.
+fn onRemotePayload(app: *App, p: pg_bridge.Payload) void {
+    if (!active) return;
+    switch (p) {
+        .record => |ev| onRemoteRecordEvent(app, ev),
+        .signal => |s| {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const frame = signalFrameAlloc(arena.allocator(), s.topic) catch return;
+            WS.publish(.{ .channel = s.topic, .message = frame });
+        },
+        .message => |m| {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var r = app.pool.acquireReader() catch |e| {
+                std.log.err("realtime: remote broadcast dropped (pool acquire failed): {s}", .{@errorName(e)});
+                return;
+            };
+            defer app.pool.releaseReader(&r);
+            const b = pg_bridge.readBroadcast(a, &r, m.token) orelse return; // forged/expired: drop
+            WS.publish(.{ .channel = b.topic, .message = b.frame });
+        },
+    }
+}
+
+/// A record event NOTIFY'd by ANOTHER instance (#159, PR-6b). Re-feeds the local hub so each
+/// local subscriber's existing view/ability/tenant authz runs in `onChannelMessage` —
+/// create/update re-fetch the live row, delete reads the at-rest snapshot from the side table by
+/// token. Swallowed failures are logged so a silently-undelivered remote event is visible to
+/// operators.
+fn onRemoteRecordEvent(app: *App, ev: pg_bridge.Event) void {
     if (!active) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -537,7 +401,7 @@ fn onRemoteEvent(app: *App, ev: pg_bridge.Event) void {
 /// active backend is not Postgres. Best-effort: a failure to start logs + leaves single-instance
 /// realtime working. Called once by the server just before `zap.start` (reactor live).
 pub fn startRemoteListener(app: *App) void {
-    pg_bridge.startListener(app, &onRemoteEvent) catch |e| {
+    pg_bridge.startListener(app, &onRemotePayload) catch |e| {
         std.log.warn("realtime: Postgres LISTEN bridge unavailable: {s}", .{@errorName(e)});
     };
 }
@@ -571,8 +435,11 @@ fn messageEnvelopeAlloc(a: std.mem.Allocator, topic: []const u8, data_json: []co
 /// write path (`ctx.setFlag`/`App.setFlag` and the admin settings verbs). A no-op when the
 /// reactor isn't running (tests/CLI). NEVER pushes per-subject state or experiment
 /// assignments — those stay behind the authenticated `/api/state` projection.
-pub fn broadcastFeaturesChanged() void {
-    signalTopic(FEATURES_CHANNEL);
+///
+/// On Postgres this fans the `__features` signal out across instances (#188 theme), so a flag
+/// or experiment override on one instance re-syncs every instance's subscribers automatically.
+pub fn broadcastFeaturesChanged(app: *App) void {
+    signalTopic(app, FEATURES_CHANNEL);
 }
 
 /// #143: consumer broadcast. Wrap `data_json` — an ALREADY-SERIALIZED JSON value — in the
@@ -587,23 +454,41 @@ pub fn broadcastFeaturesChanged() void {
 /// re-fetch for per-subject state). A no-op when the reactor isn't running (tests/CLI).
 /// `topic` is a consumer channel name, not a collection name. Callable from any thread
 /// (incl. a background job): `fio_publish` is a non-blocking enqueue that copies the frame.
-pub fn broadcastTopic(topic: []const u8, data_json: []const u8) void {
+///
+/// On Postgres this ALSO fans the ENVELOPED frame out across instances (#188 theme) — never
+/// payload bytes on the NOTIFY wire: the frame is stored in `_rt_broadcasts` keyed by a random
+/// token, and only the token is NOTIFY'd; the receiving instance reads the frame back over its
+/// own connection and re-publishes it through the unchanged per-subscriber delivery path.
+/// Byte-identical no-op on SQLite (single-process).
+///
+/// `bound_conn`, when the caller already holds the pool writer (e.g. a record hook's
+/// `Ctx.bound_conn`), MUST be threaded through — the side-table write reuses it instead of
+/// acquiring a second writer, which would deadlock the single non-reentrant writer lock.
+pub fn broadcastTopic(app: *App, bound_conn: ?*db.Db, topic: []const u8, data_json: []const u8) void {
     if (!active) return; // reactor not running (tests/CLI): no-op
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const frame = messageEnvelopeAlloc(arena.allocator(), topic, data_json) catch return;
     WS.publish(.{ .channel = topic, .message = frame });
+    // #188 theme: on Postgres, fan the ENVELOPED frame out via token + _rt_broadcasts —
+    // never payload bytes on the NOTIFY wire. Byte-identical no-op on SQLite.
+    pg_bridge.emitMessage(app, bound_conn, topic, frame);
 }
 
 /// #143: signal-only consumer push. Publish `{"type":"signal","topic":"<topic>"}` on a custom
 /// `topic` so subscribers re-fetch over an authenticated GET — the recommended default for
 /// private/per-subject state (carries NO payload). A no-op when the reactor isn't running.
-pub fn signalTopic(topic: []const u8) void {
+///
+/// On Postgres the signal fans out across instances (#188 theme): only the topic name rides the
+/// NOTIFY wire (payload-less), so every instance's subscribers are told to re-fetch. Byte-identical
+/// no-op on SQLite.
+pub fn signalTopic(app: *App, topic: []const u8) void {
     if (!active) return; // reactor not running (tests/CLI): no-op
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const frame = signalFrameAlloc(arena.allocator(), topic) catch return;
     WS.publish(.{ .channel = topic, .message = frame });
+    pg_bridge.emitSignal(app, topic); // payload-less: only the topic name rides the wire
 }
 
 test "originAllowed: empty allowlist denies cross-origin browser upgrades (F12); same-origin + CSV allowed" {
@@ -623,6 +508,29 @@ test "originAllowed: empty allowlist denies cross-origin browser upgrades (F12);
     try std.testing.expect(!originAllowed("https://a.com", "https://evil.com", "api.myhost"));
 }
 
+test "WS upgrade-failure teardown: facil's on_close frees the LiveConn + releases the slot exactly once (no leak)" {
+    // Proves the fix does not LEAK. On the upgrade-failure path facil.io calls the connection's
+    // on_close (== this onClose, via zap's internal_on_close) and the caller's catch block now does
+    // NOTHING — so onClose must be the SOLE, COMPLETE teardown: both arenas deinit'd, `lc` destroyed
+    // exactly once, and the shared connection slot released exactly once. We build the LiveConn +
+    // reserve the slot exactly as handleUpgrade does (the state at the moment WS.upgrade fails), then
+    // invoke onClose once — the same call facil makes on the failure path.
+    const base = connection.connectionCount();
+    var app: App = .{ .allocator = std.testing.allocator, .io = undefined, .pool = undefined };
+    const lc = try app.allocator.create(LiveConn);
+    lc.* = .{
+        .app = &app,
+        .durable = std.heap.ArenaAllocator.init(app.allocator),
+        .frame = std.heap.ArenaAllocator.init(app.allocator),
+    };
+    _ = connection.reserveConnectionSlot(); // handleUpgrade reserved the slot before WS.upgrade
+    try std.testing.expectEqual(base + 1, connection.connectionCount());
+    try onClose(lc, -1); // == facil.io's on_close on the -1 failure path: frees lc + releases slot
+    // Slot released exactly once (back to baseline). std.testing.allocator fails the test on a
+    // leak OR a double-free — that IS the exactly-once assertion for the LiveConn + its arenas.
+    try std.testing.expectEqual(base, connection.connectionCount());
+}
+
 test "broadcast is a no-op when inactive" {
     // active defaults to false; broadcast must return immediately without touching the reactor.
     try std.testing.expect(!active);
@@ -634,30 +542,17 @@ test "broadcastFeaturesChanged is a no-op when inactive" {
     // Like broadcast, the feature signal must early-return when the reactor isn't running
     // so the override write paths (ctx.setFlag / admin settings) are safe in tests/CLI.
     try std.testing.expect(!active);
-    broadcastFeaturesChanged(); // would touch the inactive cluster (UB) if it didn't early-return
-}
-
-test "F5: anonymous subscribe allowed only on @public; gated collections require auth" {
-    // @public -> anyone (incl. anonymous) may subscribe.
-    try std.testing.expect(subscribeAuthorized("@public", false, false));
-    try std.testing.expect(subscribeAuthorized("@public", true, false));
-    // null (locked): anonymous rejected; authed/superuser allowed (delivery still gated later).
-    try std.testing.expect(!subscribeAuthorized(null, false, false));
-    try std.testing.expect(subscribeAuthorized(null, true, false));
-    try std.testing.expect(subscribeAuthorized(null, false, true));
-    // "" (now LOCKED): anonymous rejected.
-    try std.testing.expect(!subscribeAuthorized("", false, false));
-    // owner/expression rule: anonymous rejected, authed allowed to subscribe.
-    try std.testing.expect(!subscribeAuthorized("owner = @request.auth.id", false, false));
-    try std.testing.expect(subscribeAuthorized("owner = @request.auth.id", true, false));
+    var app: App = undefined;
+    broadcastFeaturesChanged(&app); // would touch the inactive cluster (UB) if it didn't early-return
 }
 
 test "broadcastTopic/signalTopic are no-ops when inactive (#143)" {
     // Like broadcast/broadcastFeaturesChanged, the consumer publish entry points must early-return
     // when the reactor isn't running so ctx.realtime() is safe to call from tests/CLI/background jobs.
     try std.testing.expect(!active);
-    broadcastTopic("orders", "{\"n\":1}"); // pre-serialized payload; enveloped internally
-    signalTopic("availability"); // builds + would publish a signal frame; must early-return
+    var app: App = undefined;
+    broadcastTopic(&app, null, "orders", "{\"n\":1}"); // pre-serialized payload; enveloped internally
+    signalTopic(&app, "availability"); // builds + would publish a signal frame; must early-return
 }
 
 test "messageEnvelopeAlloc splices the standard message envelope + JSON-escapes the topic" {
@@ -684,81 +579,4 @@ test "broadcastFeaturesChanged uses the standard signal frame (0.10.0 wire fix)"
         "{\"type\":\"signal\",\"topic\":\"__features\"}",
         try signalFrameAlloc(a, FEATURES_CHANNEL),
     );
-}
-
-test "subscribeDecision: collection topics ALWAYS use collection authz, custom topics use the predicate (#143)" {
-    // A REAL collection topic is authorized by its viewRule REGARDLESS of the custom predicate:
-    // even with custom_allowed=true, a LOCKED collection denies an anonymous socket. This is the
-    // security guarantee that a custom subscribe can't reach a collection's records.
-    const locked = schema.Collection{ .id = "c1", .name = "secrets", .fields = &.{}, .viewRule = null };
-    try std.testing.expectEqual(SubscribeOutcome.auth_required, subscribeDecision(locked, false, false, true));
-    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(locked, true, false, true)); // authed
-    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(locked, false, true, true)); // superuser
-    // A @public collection is open to anonymous (the custom predicate is irrelevant either way).
-    const pub_col = schema.Collection{ .id = "c2", .name = "posts", .fields = &.{}, .viewRule = "@public" };
-    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(pub_col, false, false, false));
-    // A NON-collection custom topic (col == null) is gated solely by custom_allowed.
-    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeDecision(null, false, false, true)); // default public
-    try std.testing.expectEqual(SubscribeOutcome.auth_required, subscribeDecision(null, false, false, false)); // guard denied
-}
-
-test "canSubscribeTopic: default allows any custom topic (public signal channel) (#143)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var app: App = undefined;
-    const anon = request.RequestContext{};
-    // No dispatch wired (tests/CLI): custom topics default to PUBLIC signal channels.
-    app.dispatch = null;
-    try std.testing.expect(canSubscribeTopic(&app, a, anon, "availability"));
-    // Dispatch present but NO predicate -> still public by default.
-    var d = @import("../events.zig").Dispatch{};
-    app.dispatch = &d;
-    try std.testing.expect(canSubscribeTopic(&app, a, anon, "orders"));
-}
-
-test "canSubscribeTopic: a canSubscribe guard returning false denies (#143)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const Guard = struct {
-        fn deny(ctx: *Ctx, topic: []const u8) bool {
-            _ = ctx;
-            _ = topic;
-            return false;
-        }
-        fn onlyAuthed(ctx: *Ctx, topic: []const u8) bool {
-            _ = topic;
-            return ctx.rctx.auth != null or ctx.rctx.is_superuser;
-        }
-    };
-    var app: App = undefined;
-    var d = @import("../events.zig").Dispatch{ .realtime_can_subscribe = Guard.deny };
-    app.dispatch = &d;
-    const anon = request.RequestContext{};
-    try std.testing.expect(!canSubscribeTopic(&app, a, anon, "private"));
-    // A guard gating on auth: anonymous denied, authenticated allowed.
-    d.realtime_can_subscribe = Guard.onlyAuthed;
-    try std.testing.expect(!canSubscribeTopic(&app, a, anon, "private"));
-    var rec: std.json.ObjectMap = .empty;
-    try rec.put(a, "id", .{ .string = "u1" });
-    const authed = request.RequestContext{ .auth = .{ .object = rec }, .is_superuser = false };
-    try std.testing.expect(canSubscribeTopic(&app, a, authed, "private"));
-}
-
-test "F9: global connection cap reserves/releases and rejects past MAX_CONNECTIONS" {
-    // Drive the count up to the cap, confirm the next reservation is rejected, then release.
-    const start = connectionCount();
-    try std.testing.expectEqual(@as(usize, 0), start); // tests run single-threaded; clean slate
-    // Pre-load to one below the cap without spinning MAX_CONNECTIONS times.
-    live_connections.store(MAX_CONNECTIONS - 1, .monotonic);
-    try std.testing.expect(reserveConnectionSlot()); // fills the last slot
-    try std.testing.expectEqual(MAX_CONNECTIONS, connectionCount());
-    try std.testing.expect(!reserveConnectionSlot()); // at cap -> rejected, count unchanged
-    try std.testing.expectEqual(MAX_CONNECTIONS, connectionCount());
-    releaseConnectionSlot();
-    try std.testing.expectEqual(MAX_CONNECTIONS - 1, connectionCount());
-    try std.testing.expect(reserveConnectionSlot()); // a freed slot is reusable
-    // Clean up the counter so a later test sees a clean slate.
-    live_connections.store(0, .monotonic);
 }

@@ -98,7 +98,7 @@ pub fn put(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     try d.kvSet(key, parsed.value.value);
     // Signal-only realtime push on a feature-override change (no-op if the key isn't one).
-    if (isFeatureOverrideKey(key)) realtime_ws.broadcastFeaturesChanged();
+    if (isFeatureOverrideKey(key)) realtime_ws.broadcastFeaturesChanged(app);
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, try entryJsonKeyValue(ctx.allocator, key, parsed.value.value), .{});
     return .{ .status = 200, .body = body };
 }
@@ -112,7 +112,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     if (!(try d.kvDelete(key))) return ApiError.notFound().toResponse(ctx.allocator);
     // Clearing a feature override reverts to the declared default; signal subscribers.
-    if (isFeatureOverrideKey(key)) realtime_ws.broadcastFeaturesChanged();
+    if (isFeatureOverrideKey(key)) realtime_ws.broadcastFeaturesChanged(app);
     return .{ .status = 204, .body = "" };
 }
 

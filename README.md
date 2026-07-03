@@ -3,7 +3,7 @@
 ZigBase is a single-binary, PocketBase-inspired (but **not** API-compatible) backend in
 **Zig 0.16**. It bundles a collections + schema engine, a typed records query API
 (filter / sort / expand), per-collection access rules, authentication (argon2id password
-plus OAuth2 with PKCE), realtime updates over WebSocket, local file storage, and an
+plus OAuth2 with PKCE), realtime updates over WebSocket and SSE, local file storage, and an
 embedded admin UI at `/_/` — all in one statically-linked executable, backed by embedded
 SQLite by default with PostgreSQL as an opt-in build flag.
 It is also an **embeddable Zig framework**: import it as a library and extend the server
@@ -56,7 +56,7 @@ See [docs/docker.md](docs/docker.md) for the data-volume/non-root/healthcheck de
 - **TTL / expiry** — collections with a `.ttl_field` have expired records reaped automatically by an internal GC job. → [docs/framework.md](docs/framework.md)
 - **KV store & feature flags** — lightweight typed key-value store with a built-in flag layer; manageable from the admin Settings UI. → [docs/framework.md](docs/framework.md)
 - **Rate limiting** — global sensitive-auth limiter plus per-method custom limits; configurable window and count. → [docs/api.md](docs/api.md)
-- **Realtime** — subscribe to record changes over WebSocket. → [docs/api.md](docs/api.md)
+- **Realtime** — subscribe to record changes over WebSocket or SSE (EventSource — no SDK needed). → [docs/api.md](docs/api.md)
 - **Files** — local file storage with serving and short-lived file-access tokens; opt-in S3-compatible storage (`-Ds3` build flag — AWS S3, MinIO, Cloudflare R2) selected by `ZIGBASE_S3_*` config alone, served through the same Range/ETag/tenancy-identical download path via a local spool cache. → [docs/api.md](docs/api.md)
 - **TypeScript SDK** — published official client (`@zigbase/client`): auth, records,
   offset + cursor pagination, files, realtime + live store — plus a fully-typed client
@@ -143,7 +143,8 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_AUTH_TOKEN_TTL` | — | `1209600` (14 days) | auth token lifetime, seconds |
 | `ZIGBASE_VERIFICATION_TTL` | — | `604800` (7 days) | email-verification token lifetime, seconds |
 | `ZIGBASE_PASSWORD_RESET_TTL` | — | `3600` (1 hour) | password-reset token lifetime, seconds |
-| `ZIGBASE_REALTIME_ORIGINS` | `--realtime-origins` | `""` (deny cross-origin) | CSV of allowed WebSocket `Origin`s. Empty denies cross-origin browser upgrades |
+| `ZIGBASE_REALTIME_ORIGINS` | `--realtime-origins` | `""` (deny cross-origin) | CSV of allowed WebSocket/SSE `Origin`s — the gate applies to both transports. Empty denies cross-origin browser upgrades |
+| `ZIGBASE_SSE_HEARTBEAT_SECONDS` | `--sse-heartbeat-seconds` | `0` (inherit 40s listener timeout) | SSE heartbeat (`: ping`) interval, 1–255 seconds |
 | `ZIGBASE_MAX_UPLOAD_SIZE` | — | `52428800` (50 MiB) | max request body size, bytes |
 | `ZIGBASE_FILE_TOKEN_TTL` | — | `120` (2 min) | file-access token lifetime, seconds |
 | `ZIGBASE_SENTRY_DSN` | — | `""` (log to stderr) | set to enable Sentry error reporting |
