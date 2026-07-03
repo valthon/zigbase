@@ -3,7 +3,7 @@ export const VERSION = "0.3.0";
 export { createClient } from "./client.js";
 export type { Client, ClientOptions, SendOptions } from "./client.js";
 export { CollectionService } from "./collection.js";
-export type { RecordAbilities } from "./collection.js";
+export type { RecordAbilities, SessionInfo } from "./collection.js";
 export {
   BaseAuthStore,
   MemoryAuthStore,

@@ -132,6 +132,70 @@ await zb.collection("users").requestPasswordReset("you@example.com");
 await zb.collection("users").confirmPasswordReset(tokenFromEmail, "new-secret");
 ```
 
+### Changing a password (`changePassword`)
+
+*Requires ZigBase >= 0.10.0.*
+
+```ts
+await zb.collection("users").changePassword(userId, "old-secret", "new-secret");
+```
+
+This is a self-service change while already logged in — distinct from the "forgot
+password" flow above. It rides `PATCH /records/:id` with `{ password, oldPassword }`; the
+server verifies `oldPassword` against the target record (non-oracle: wrong/missing
+`oldPassword` both fail the same way) and rotates the record's session epoch, so every
+other outstanding session dies. Behavior depends on your `AuthStore`:
+
+- **Cookie mode** (`CookieAuthStore` / server sets `Set-Cookie`): the PATCH response
+  itself re-issues fresh session cookies on a self-change — you stay logged in with no
+  extra round trip.
+- **Token mode** (`MemoryAuthStore` / `LocalAuthStore`): PATCH doesn't hand back a new
+  bearer token, so the helper transparently re-authenticates — it calls
+  `authWithPassword` with the store's current identity and the new password right after
+  the change, keeping the local store valid.
+
+`oldPassword` also passes through plain `update()` for callers who want the raw updated
+record instead of `changePassword`'s `void`:
+
+```ts
+await zb.collection("users").update(userId, { password: "new-secret", oldPassword: "old-secret" });
+```
+
+### Sessions (`listSessions` / `revokeSession` / `revokeAllSessions`)
+
+*Requires ZigBase >= 0.10.0. `listSessions`/`revokeSession` additionally require the
+server to run `App(.{ .session_store = .table })` — the default `.epoch` mode has no
+per-device state to list, and the call surfaces the server's `404` as a standard
+`ClientResponseError`/`ZigbaseError`.*
+
+```ts
+import type { SessionInfo } from "@zigbase/client";
+
+const sessions: SessionInfo[] = await zb.collection("users").listSessions();
+// newest first; sessions[i].is_current marks the one THIS request authenticated with
+
+await zb.collection("users").revokeSession(sessions[1].id); // log out one other device
+
+await zb.collection("users").revokeAllSessions(); // log out everywhere, incl. this device
+```
+
+`SessionInfo`:
+
+```ts
+interface SessionInfo {
+  id: string;
+  created: string;
+  last_seen: string;
+  user_agent: string;
+  ip: string;
+  is_current: boolean; // true for the session THIS request was authenticated with
+}
+```
+
+`revokeAllSessions()` works in **both** session-store modes (it bumps the token epoch, and
+also wipes `_sessions` rows in table mode) and always clears the local `AuthStore`, even if
+the request fails — the same parity `logout()` has.
+
 ### Security notes
 
 - **`isValid` is not authorization.** It decodes the JWT `exp` claim **client-side** purely so
@@ -1061,6 +1125,7 @@ but two wire shapes were fixed for consistency and only exist as of 0.10.0:
 | native `in` where-DSL | 400 parse error | works | works |
 | `senders.*` (`{items}` envelope) | 404 | shape mismatch (bare array) — do not use | works |
 | `subscribeTopic("__features")` feature-change signals | nothing delivered | nothing delivered (old `features.changed` frame is dropped) | works |
+| `listSessions` / `revokeSession` / `revokeAllSessions` | 404 | 404 | works (`listSessions`/`revokeSession` additionally require server `.session_store = .table`, else 404) |
 | client 0.2.x against >= 0.9.0 / 0.10.0 | — | works | works (it never consumed the two changed wire shapes) |
 
 The behavior change against **old** servers is the where-DSL `in` operator switching to native

@@ -536,6 +536,9 @@ Auth endpoints target an auth-type collection (`:col`).
 | POST | `/api/collections/:col/confirm-verification` | Confirm verification with a token. |
 | POST | `/api/collections/:col/request-password-reset` | Request a password-reset token. |
 | POST | `/api/collections/:col/confirm-password-reset` | Confirm a reset with a token. |
+| GET | `/api/collections/:col/auth/sessions` | List the caller's active sessions. `.session_store = .table` only — `404` in `.epoch` mode. |
+| DELETE | `/api/collections/:col/auth/sessions/:sid` | "Log out THIS device". `.session_store = .table` only — `404` in `.epoch` mode. |
+| DELETE | `/api/collections/:col/auth/sessions` | "Log out everywhere" — works in both session-store modes. |
 
 ### auth-with-password
 
@@ -560,10 +563,41 @@ the `X-CSRF-Token` header — see
 > **Embeddable hooks.** When ZigBase is used as a Zig library, `auth-refresh` and
 > `auth-logout` run through the `.auth` lifecycle hook group (`before_refresh` /
 > `after_refresh`, `before_logout` / `after_logout`); a `before` hook that fails closed
-> aborts the request before any session change. Embedders also get the `ctx.auth()` session
-> verbs (`refresh` / `rotate` / `revokeAllSessions`, and per-device `listActiveSessions` /
-> `revoke`) and the optional table-backed session store. See
-> [framework.md §6](framework.md#6-auth--file--lifecycle-events).
+> aborts the request before any session change. `beforeAuthSuccess` also fires on
+> `auth-with-password` (tag `.password`) and `auth-refresh` (tag `.refresh`, in the same
+> transaction as `beforeRefresh`, lifecycle phase first) — see
+> [framework.md → Auth lifecycle](framework.md#auth-lifecycle-beforeauthsuccess). Embedders
+> also get the `ctx.auth()` session verbs (`refresh` / `rotate` / `revokeAllSessions`, and
+> per-device `listActiveSessions` / `revoke`) and the optional table-backed session store.
+> See [framework.md §6](framework.md#6-auth--file--lifecycle-events).
+
+### Session management
+
+`GET`/`DELETE /api/collections/:col/auth/sessions[/:sid]` (added in the auth endpoints
+table above) are the REST surface over the table-mode `ctx.auth()` session verbs (the
+TypeScript SDK's `listSessions`/`revokeSession`/`revokeAllSessions` ride these):
+
+```json
+// GET /api/collections/:col/auth/sessions — 200
+{
+  "items": [
+    { "id": "...", "created": "...", "last_seen": "...", "user_agent": "...", "ip": "...", "is_current": true }
+  ]
+}
+```
+
+- `items` is newest-first.
+- `DELETE …/auth/sessions/:sid` ("log out this device") returns **`204`** with an empty
+  body on success. A `:sid` you don't own and an absent `:sid` are an **identical `404`**
+  (non-owner probing can't be distinguished from a stale/unknown id).
+- Both per-device routes return **`404`** when the collection is running in `.epoch` mode
+  (the feature simply isn't enabled — same non-oracle policy as a disabled auth-method slug).
+- `DELETE …/auth/sessions` ("log out everywhere") works in **both** modes: it bumps the
+  token epoch (killing every outstanding token, including ones minted before `.table` was
+  enabled) and, in table mode, also wipes the principal's session rows. It returns `204`
+  and **clears** the caller's own auth cookies — the current session dies too, by design.
+- `:col` must match the caller's authenticated collection, else `401` (parity with
+  `auth-refresh`).
 
 ### Registration / signup
 

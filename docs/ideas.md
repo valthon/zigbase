@@ -230,6 +230,13 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   in `App` to avoid a DB read on the hot auth path). Admin API + SPA tab to view/kill sessions.
 - **Risk:** Medium — adds work to the hot auth path; cache carefully.
 - **Depends on / ordering:** After A1. Synergizes with A5 (unified credential listing).
+- **Status (0.10.0): shipped, opt-in.** `ctx.auth()` verbs, a REST surface
+  (`GET`/`DELETE /api/collections/:col/auth/sessions[/:sid]`), and the TypeScript SDK
+  (`listSessions`/`revokeSession`/`revokeAllSessions`) all ship. The default `session_store`
+  is **still `.epoch`** (stateless, zero extra DB work) — per-device list/revoke requires
+  opting into `.session_store = .table` (one extra read per authenticated request). See
+  [framework.md → Revoking sessions](framework.md#ctxauth--session-management) and
+  [typescript-sdk.md → Sessions](typescript-sdk.md#sessions-listsessions--revokesession--revokeallsessions).
 
 #### A7. RBAC / roles beyond superuser-vs-record — **Effort L, Risk Medium, Parity+Diff**
 - **What:** Named roles/permissions; rules that reference `@request.auth.role`; per-collection role grants.

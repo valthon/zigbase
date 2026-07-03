@@ -61,6 +61,28 @@ def auth2_binary():
     assert path.exists(), f"auth2-server not built at {path}"
     return str(path)
 
+def _wait_reachable_or_fail(proc, port, log_path, timeout_s=5.0):
+    """Poll the port until it accepts connections; raise loudly instead of returning
+    silently if the server dies early or never comes up. A fixture that raises here
+    fails cleanly at setup, instead of yielding a base URL nothing is listening on and
+    leaving every test in the fixture to fail later with a generic connection error."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break  # process already exited; no point polling further
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill(); proc.wait(timeout=5)
+    output = pathlib.Path(log_path).read_text(errors="replace") if pathlib.Path(log_path).exists() else "<no output captured>"
+    raise AssertionError(f"server on port {port} never became reachable (exit={proc.returncode}):\n{output}")
+
 @pytest.fixture()
 def auth2_server(auth2_binary):
     """A live table-mode server with the beforeAuthSuccess fixture hook registered."""
@@ -69,14 +91,15 @@ def auth2_server(auth2_binary):
                     "--password", "adminpassword", "--data-dir", data], check=True)
     port = _free_port()
     env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
-    proc = subprocess.Popen([auth2_binary, "serve", "--insecure-cookies"], env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(50):
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                break
-        except OSError:
-            time.sleep(0.1)
+    log_path = os.path.join(data, "server.log")
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen([auth2_binary, "serve", "--insecure-cookies"], env=env,
+                                stdout=log, stderr=subprocess.STDOUT)
+    try:
+        _wait_reachable_or_fail(proc, port, log_path)
+    except AssertionError:
+        shutil.rmtree(data, ignore_errors=True)
+        raise
     try:
         yield f"http://127.0.0.1:{port}"
     finally:

@@ -566,6 +566,23 @@ fn init_0019_bulk_mail(m: *Migrator) db.DbError!void {
     );
 }
 
+fn init_0020_sessions_seq(m: *Migrator) db.DbError!void {
+    // `listSessions` orders newest-first by `("created" DESC, <tiebreaker> DESC)`: `created` is
+    // second-resolution (`datetime('now')`), so two logins in the same wall-clock second need a
+    // MONOTONIC insertion-order tiebreaker to stay deterministic. SQLite has the implicit `rowid`;
+    // Postgres has none, and the app `id` is a RANDOM base36 string (not monotonic) so it cannot
+    // serve. On Postgres only, add an identity column `_seq` to the `_sessions` table (created by
+    // 0011) — mirrors `0017_events_seq` / `analytics.seqCol` for `_events` exactly.
+    //
+    // Its OWN additive migration (not folded into 0011) so a Postgres database that already applied
+    // 0011 — which the version-tracking ledger will NOT re-run — still gets `_seq` as a fresh
+    // additive step. On SQLite this migration is a no-op (the rowid already exists), keeping SQLite
+    // byte-identical. `IF NOT EXISTS` makes it safe even where a prior hand-applied column exists.
+    if (m.dialect.kind == .postgres) {
+        try m.db.exec("ALTER TABLE \"_sessions\" ADD COLUMN IF NOT EXISTS \"_seq\" BIGINT GENERATED ALWAYS AS IDENTITY;");
+    }
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -586,6 +603,7 @@ pub const all = [_]Migration{
     .{ .name = "0017_events_seq", .up = init_0017_events_seq },
     .{ .name = "0018_rt_delete_snapshots", .up = init_0018_rt_delete_snapshots },
     .{ .name = "0019_bulk_mail", .up = init_0019_bulk_mail },
+    .{ .name = "0020_sessions_seq", .up = init_0020_sessions_seq },
 };
 
 pub fn run(w: *db.Db) db.DbError!void {

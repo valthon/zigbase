@@ -412,6 +412,16 @@ fn buildOAuth2Provider(comptime p: anytype) schema.OAuth2Provider {
         if (@hasField(P, "tokenURL")) out.tokenURL = p.tokenURL;
         if (@hasField(P, "userinfoURL")) out.userinfoURL = p.userinfoURL;
         if (@hasField(P, "scopes")) out.scopes = strTupleToSlice(p.scopes);
+        if (@hasField(P, "discoveryURL")) {
+            if (@hasField(P, "authURL") or @hasField(P, "tokenURL") or @hasField(P, "userinfoURL"))
+                @compileError("oauth2 provider '" ++ pname ++ "': .discoveryURL is mutually exclusive with explicit .authURL/.tokenURL/.userinfoURL");
+            const durl: []const u8 = p.discoveryURL;
+            if (!(durl.len > "https://".len and std.mem.startsWith(u8, durl, "https://")))
+                @compileError("oauth2 provider '" ++ pname ++ "': .discoveryURL must be an https:// URL");
+            if (@import("oauth/providers.zig").lookup(pname) != null)
+                @compileError("oauth2 provider '" ++ pname ++ "' is a built-in preset; .discoveryURL is for generic OIDC providers — pick a non-preset name");
+            out.discoveryURL = durl;
+        }
         return out;
     }
 }

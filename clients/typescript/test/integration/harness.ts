@@ -60,6 +60,14 @@ const BIN = process.env.ZIGBASE_TEST_BINARY || join(REPO_ROOT, "zig-out", "bin",
  */
 export const DATING_BIN =
   process.env.ZIGBASE_TEST_DATING_BINARY || join(REPO_ROOT, "zig-out", "bin", "dating-server");
+/**
+ * Absolute path to the auth-round-2 e2e fixture compiled as a server (Task 5:
+ * `zig build auth2-server` — `.session_store = .table` + a registered `beforeAuthSuccess`).
+ * CI supplies a prebuilt one via ZIGBASE_TEST_AUTH2_BINARY; otherwise it is the
+ * zig-out path produced by ensureBuilt()'s `zig build auth2-server`.
+ */
+export const AUTH2_BIN =
+  process.env.ZIGBASE_TEST_AUTH2_BINARY || join(REPO_ROOT, "zig-out", "bin", "auth2-server");
 
 export interface TestServer {
   url: string;
@@ -71,16 +79,22 @@ export interface TestServer {
 let built = false;
 function ensureBuilt(): void {
   if (built) return;
-  // Prebuilt binaries supplied via ZIGBASE_TEST_BINARY + ZIGBASE_TEST_DATING_BINARY
-  // (e.g. CI artifacts) skip the toolchain entirely — no Zig needed in that job.
-  if (process.env.ZIGBASE_TEST_BINARY && process.env.ZIGBASE_TEST_DATING_BINARY) {
+  // Prebuilt binaries supplied via ZIGBASE_TEST_BINARY + ZIGBASE_TEST_DATING_BINARY +
+  // ZIGBASE_TEST_AUTH2_BINARY (e.g. CI artifacts) skip the toolchain entirely — no
+  // Zig needed in that job.
+  if (
+    process.env.ZIGBASE_TEST_BINARY &&
+    process.env.ZIGBASE_TEST_DATING_BINARY &&
+    process.env.ZIGBASE_TEST_AUTH2_BINARY
+  ) {
     built = true;
     return;
   }
   // The binaries MUST be built with zig 0.16.0; plain `zig` on PATH may be older.
-  // Build both the generic binary (runtime-created collections) and the
-  // dating-server fixture (schema baked in) so every integration test can spawn.
-  for (const steps of [["build"], ["build", "dating-server"]]) {
+  // Build the generic binary (runtime-created collections), the dating-server
+  // fixture, and the auth2-server fixture (schemas baked in) so every integration
+  // test can spawn.
+  for (const steps of [["build"], ["build", "dating-server"], ["build", "auth2-server"]]) {
     const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", ...steps], {
       cwd: REPO_ROOT,
       stdio: "inherit",

@@ -246,6 +246,7 @@ test {
     _ = @import("api/collections.zig");
     _ = @import("api/records.zig");
     _ = @import("api/auth.zig");
+    _ = @import("api/sessions.zig");
     _ = @import("api/oauth.zig");
     _ = @import("api/files.zig");
     _ = @import("api/settings.zig");

@@ -1975,6 +1975,19 @@ maintains a server-side `_sessions` row per session, enabling a full per-device 
 | `ctx.auth().listActiveSessions()` | the current principal's active sessions (`id`, `created`, `last_seen`, `user_agent`, `ip`, `is_current`), newest first. |
 | `ctx.auth().revoke(sessionId)` | "log out THIS device" — delete one session row. Authorized: only the owning user (or a superuser) may revoke a given session; a non-owner gets `error.NotFound` (indistinguishable from an absent id, so revoke can't probe other users' session ids). |
 
+Since 0.10.0 the table-mode verbs also have a canonical REST surface (the SDK's
+`listSessions`/`revokeSession`/`revokeAllSessions` ride it):
+
+| Route | Mode | Behavior |
+|---|---|---|
+| `GET /api/collections/:col/auth/sessions` | `.table` only | `200 {"items":[{id,created,last_seen,user_agent,ip,is_current},…]}` newest-first |
+| `DELETE /api/collections/:col/auth/sessions/:sid` | `.table` only | `204`; a non-owned or absent `sid` is an indistinguishable `404` |
+| `DELETE /api/collections/:col/auth/sessions` | both modes | "log out everywhere": epoch bump (+ row wipe in table mode) → `204` with cleared cookies |
+
+In `.epoch` mode the two per-device routes return `404` (feature not enabled). `:col`
+must match the caller's authenticated collection (else `401`). The `sessions` segment
+under `/auth/` is reserved — a custom auth-method slug named `sessions` is a compile error.
+
 In table mode, login/refresh/oauth issuance records a session row and embeds its id in the
 token (`sid` claim); **verify checks the row exists and is unexpired** (one extra indexed read
 per authenticated request — the accepted cost of this mode). Logout and `revoke` delete the

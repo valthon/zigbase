@@ -371,14 +371,28 @@ pub fn sessionOwner(alloc: std.mem.Allocator, conn: *db.Db, sid: []const u8) !?s
     return .{ .collection = try alloc.dupe(u8, st.columnText(0)), .record = try alloc.dupe(u8, st.columnText(1)) };
 }
 
+/// The monotonic insertion-order column that breaks `created`-timestamp ties deterministically
+/// (two logins in the same wall-clock second — `created` is `datetime('now')`, second-resolution).
+/// SQLite has the implicit `rowid`; Postgres has none (and the app `id` is a RANDOM base36 string,
+/// not monotonic), so migration `0020_sessions_seq` adds an identity column `_seq` that serves the
+/// same purpose — mirrors `analytics.seqCol`/`0017_events_seq` for `_events` exactly.
+fn sessionSeqCol(conn: *db.Db) []const u8 {
+    return switch (db.dbDialect(conn).kind) {
+        .sqlite => "\"rowid\"",
+        .postgres => "\"_seq\"",
+    };
+}
+
 /// List a principal's active (unexpired) sessions, newest first. Caller adds `is_current`.
 pub fn listSessions(alloc: std.mem.Allocator, conn: *db.Db, collection: []const u8, rid: []const u8) ![]SessionRow {
     const now = try nowUnix(conn);
-    var st = try prep(conn, 
+    var sqlbuf: [320]u8 = undefined;
+    const sql = std.fmt.bufPrintZ(&sqlbuf,
         \\SELECT "id","created","lastSeen","userAgent","ip" FROM "_sessions"
         \\ WHERE "collectionRef" = ?1 AND "recordRef" = ?2 AND ("expires" IS NULL OR "expires" > ?3)
-        \\ ORDER BY "created" DESC;
-    );
+        \\ ORDER BY "created" DESC, {s} DESC;
+    , .{sessionSeqCol(conn)}) catch unreachable;
+    var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, collection);
     try st.bindText(2, rid);
