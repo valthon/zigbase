@@ -1,0 +1,2 @@
+### Internal
+- Postgres backend: added `scripts/gen-saslprep-tables.py`, vendored RFC 3454 / Unicode 16.0.0 UCD source extracts (`vendor/unicode/`), and the generated `src/backend/postgres/saslprep_tables.zig` range tables (RFC 3454 B.1/C.1.2/C.2.x/C.3–C.9/D.1/D.2, plus UCD `NFKC_QC` and canonical-combining-class data) that a follow-up SASLprep normalization pass will consume. Not yet wired into any code path.
