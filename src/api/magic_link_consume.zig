@@ -1,6 +1,6 @@
 /// GET email-link passwordless mode for the built-in `magic_link` method.
 ///
-///   GET /api/collections/:col/auth/magic_link/consume?token=...&redirect=/app
+///   GET /api/collections/:col/auth/magic-link/consume?token=...&redirect=/app
 ///
 /// The classic email UX: the user clicks a plain GET link from their inbox and
 /// lands logged-in on an app page. This handler reads the token from the query,
@@ -107,7 +107,7 @@ fn resolveRedirect(ml: schema.MagicLinkMethodOpts, requested: ?[]const u8) []con
 // Handler
 // ---------------------------------------------------------------------------
 
-/// GET /api/collections/:col/auth/magic_link/consume — verify+consume a magic
+/// GET /api/collections/:col/auth/magic-link/consume — verify+consume a magic
 /// link token, set the session cookies, and 302 to the (validated) redirect.
 pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator);

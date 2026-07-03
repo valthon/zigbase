@@ -77,6 +77,26 @@ fn ensureTenantIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection
     std.log.info("provision: ensured tenant index on '{s}'.'{s}'", .{ col.name, tf });
 }
 
+/// Wrap `fts.ensureIndex`: on SQLite, a build compiled with `-Dfts5=false` cannot serve a
+/// `.searchable` schema. Rather than let that surface as a silent no-op (and a later `?search=`
+/// 500), fail LOUDLY at startup with an actionable message — the fail-fast-at-boot principle
+/// (better a clear boot error than a runtime surprise). Postgres is never affected (the flag
+/// doesn't gate `ensureIndexPg`).
+fn ensureSearchIndex(alloc: std.mem.Allocator, w: *db.Db, spec: schema.Collection) ProvisionError!void {
+    fts.ensureIndex(alloc, w, spec) catch |err| switch (err) {
+        error.SearchDisabled => {
+            std.log.err(
+                "refusing to start: collection '{s}' declares .searchable fields but this binary was built with -Dfts5=false — rebuild with -Dfts5 (or its default) to enable full-text search",
+                .{spec.name},
+            );
+            return error.FtsDisabled;
+        },
+        // `err`'s static type is fts.EnsureIndexError (includes SearchDisabled, handled above);
+        // every OTHER member is genuinely a ProvisionError member, so this narrowing cast is safe.
+        else => return @errorCast(err),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Comptime builder: a `.collections` literal -> []const schema.Collection
 // ---------------------------------------------------------------------------
@@ -719,7 +739,7 @@ pub const Migration = struct {
 // Runtime provisioner
 // ---------------------------------------------------------------------------
 
-pub const ProvisionError = error{ UnknownRelationTarget, RelationTargetMissing } ||
+pub const ProvisionError = error{ UnknownRelationTarget, RelationTargetMissing, FtsDisabled } ||
     collections.EngineError;
 
 /// Apply the comptime-defined schema to the live database. Safe to call on
@@ -935,7 +955,7 @@ pub fn ensureCollection(
         _ = try collections.create(alloc, io, w, spec);
         std.log.info("provision: created collection '{s}'", .{spec.name});
         try ensureTenantIndex(alloc, w, spec);
-        try fts.ensureIndex(alloc, w, spec);
+        try ensureSearchIndex(alloc, w, spec);
         return;
     }
     const live = existing.?;
@@ -944,7 +964,7 @@ pub fn ensureCollection(
     // Provision/refresh the FTS5 full-text index (#157) — idempotent; rebuilds if the searchable
     // column set drifted or an earlier additive rebuild dropped the sync triggers. Runs every
     // startup so an upgrade that adds `.searchable` builds the index without a migration.
-    try fts.ensureIndex(alloc, w, spec);
+    try ensureSearchIndex(alloc, w, spec);
 
     // Diff user fields. `live.fields` from get() includes injected auth system
     // fields for auth collections; compare only against non-system field names.
@@ -1026,7 +1046,7 @@ pub fn ensureCollection(
     std.log.info("provision: collection '{s}' added {d} field(s)", .{ spec.name, additions.items.len });
     // The additive rebuild drops triggers tied to the old table; re-ensure the FTS index so its
     // sync triggers (and any newly-searchable column) are restored.
-    try fts.ensureIndex(alloc, w, spec);
+    try ensureSearchIndex(alloc, w, spec);
 }
 
 /// Return a copy of `col` where each single-relation field's targetCollectionId

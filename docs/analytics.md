@@ -59,9 +59,11 @@ valid identifier is a `@compileError`.
 
 Both endpoints are **authenticated and fail closed**:
 
-- `GET /api/analytics/events?name=&actor=&since=&limit=` — the raw activity feed (newest first).
-  Filters: `name` (exact event name), `actor` (exact principal id), `since` (an ISO-8601 lower
-  bound on `occurred_at`), `limit` (default 50, max 200).
+- `GET /api/analytics/events?name=&actor=&since=&limit=&cursor=` — the raw activity feed (newest
+  first). Filters: `name` (exact event name), `actor` (exact principal id), `since` (an ISO-8601
+  lower bound on `occurred_at`), `limit` (default 50, max 200). Paginates with the house cursor:
+  the response carries `nextCursor`/`hasNext` alongside `items`; feed the previous `nextCursor`
+  back as `?cursor=` to fetch the next page. A malformed `cursor` is `400 "Invalid cursor."`.
 - `GET /api/analytics/rollups/:name?from=&to=` — a rollup's summary rows. `:name` must be a
   **declared** rollup (else `404`, no table-name oracle). Filters: `from` / `to` bound the
   `bucket` value. Each row is `{ bucket, account, actor, value, computed_at }`; columns absent

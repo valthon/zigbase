@@ -63,7 +63,7 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     // not bookable. `ctx.records()` manages the pooled connection itself.
     const listing = (try ctx.records().get("listings", listing_id, .{})) orelse return error.ListingNotFound;
 
-    // COMPUTE a derived field — note: mutations allocate with ev.arena, NOT ev.app.allocator.
+    // COMPUTE a derived field — note: mutations allocate with ev.arena.
     const price_total = hours * rate;
     try rec.put(ev.arena, "price_total", .{ .float = price_total });
 
@@ -75,7 +75,7 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
 Returning an error from a `before_create` hook **rejects** the write → the client
 gets a `400`. Record mutations **must** allocate with `ev.arena` (the request-scoped
-allocator that owns `ev.record`), never `ev.app.allocator`.
+allocator that owns `ev.record`).
 
 ## The business route (path param + DB write)
 

@@ -116,8 +116,7 @@ pub fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
 /// share MAX_CONNECTIONS), tenancy capture (inside each arm; zap.Request buffers are freed
 /// after this returns).
 pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void {
-    const Server = @import("../server.zig").Server;
-    const app = Server.instance.?.app;
+    const app = @import("../server.zig").active_app.?;
     const path = r.path orelse "";
     const is_ws = std.mem.eql(u8, target_protocol, "websocket") and std.mem.eql(u8, path, "/api/realtime");
     const is_sse = std.mem.eql(u8, target_protocol, "sse") and std.mem.eql(u8, path, "/api/realtime/sse");

@@ -15,6 +15,9 @@ server actually implements.
 - **Base path:** all REST endpoints live under `/api`.
 - **Encoding:** requests and responses are JSON (`Content-Type: application/json`),
   except file uploads (`multipart/form-data`, see [Files](#files)) and file downloads.
+- **List envelope:** every list endpoint returns `{"items":[…]}`, never a bare array. Endpoints
+  that paginate additionally use the records cursor vocabulary (`?cursor=`/`?limit=` request
+  params; `nextCursor`/`hasNext` response keys — see [Cursor (keyset) pagination](#cursor-keyset-pagination)).
 - **Error envelope:** every error response is a JSON object of the shape:
 
   ```json
@@ -92,7 +95,7 @@ Collection management endpoints are **superuser-only**.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/collections` | List all collections. |
+| GET | `/api/collections` | List all collections: `{"items":[…]}` (changed: was a bare array). |
 | POST | `/api/collections` | Create a collection. |
 | GET | `/api/collections/:idOrName` | Get one collection by id or name. |
 | PATCH | `/api/collections/:idOrName` | Update a collection. |
@@ -443,6 +446,12 @@ reduce to nothing (e.g. operator-only, `?search=AND`) matches **no rows** rather
 whole collection. A `search` on a collection with no `searchable` field returns **400**. The
 `_fts` collection-name suffix is reserved (it backs the per-collection shadow tables).
 
+**SQLite FTS5 is compiled in by default — opt out with `-Dfts5=false`.** A lean custom build
+that never declares a `.searchable` field can drop FTS5 (`~250-400 KB` smaller); a `?search=`
+then answers a clean **400**, and the server **refuses to start** over a `.searchable` SQLite
+schema. Postgres full-text search (below) is unaffected by the flag. See
+[docs/search.md](./search.md#build-requirement--dfts5-default-on).
+
 **Full-text on Postgres.** On a Postgres backend the SAME `.searchable` schema flag
 and `?search=` API are backed by PostgreSQL's native full-text search instead of FTS5: each
 searchable collection gets a `STORED` `tsvector` **generated column** (`to_tsvector('simple', …)`
@@ -532,13 +541,13 @@ Auth endpoints target an auth-type collection (`:col`).
 | POST | `/api/collections/:col/auth-with-password` | Log in with identity + password. |
 | POST | `/api/collections/:col/auth-refresh` | Issue a fresh token for the current session. |
 | POST | `/api/collections/:col/auth-logout` | Clear the auth cookies. |
-| POST | `/api/collections/:col/request-verification` | Request an email-verification token. |
-| POST | `/api/collections/:col/confirm-verification` | Confirm verification with a token. |
-| POST | `/api/collections/:col/request-password-reset` | Request a password-reset token. |
-| POST | `/api/collections/:col/confirm-password-reset` | Confirm a reset with a token. |
+| POST | `/api/collections/:col/request-verification` | Request an email-verification token. `204` (no body). |
+| POST | `/api/collections/:col/confirm-verification` | Confirm verification with a token. `204` (no body) on success. |
+| POST | `/api/collections/:col/request-password-reset` | Request a password-reset token. `204` (no body). |
+| POST | `/api/collections/:col/confirm-password-reset` | Confirm a reset with a token. `204` (no body) on success. |
 | GET | `/api/collections/:col/auth/sessions` | List the caller's active sessions. `.session_store = .table` only — `404` in `.epoch` mode. |
-| DELETE | `/api/collections/:col/auth/sessions/:sid` | "Log out THIS device". `.session_store = .table` only — `404` in `.epoch` mode. |
-| DELETE | `/api/collections/:col/auth/sessions` | "Log out everywhere" — works in both session-store modes. |
+| DELETE | `/api/collections/:col/auth/sessions/:sid` | "Log out THIS device". `204` (no body). `.session_store = .table` only — `404` in `.epoch` mode. |
+| DELETE | `/api/collections/:col/auth/sessions` | "Log out everywhere" — works in both session-store modes. `204` (no body). |
 
 ### auth-with-password
 
@@ -621,7 +630,8 @@ a `400`. After signup, obtain a token via `auth-with-password` above. Full walkt
 
 The `request-verification` and `request-password-reset` endpoints mint a token and
 deliver it via the configured mailer, then return `204` (they never reveal whether
-the email exists). The matching `confirm-*` endpoint takes that `token` in its body.
+the email exists). The matching `confirm-*` endpoint takes that `token` in its body and
+also returns `204` (no body) on success.
 
 - **With SMTP configured** (`ZIGBASE_SMTP_HOST` + friends — see the
   [README config table](../README.md#configuration)), the token is **emailed** over
@@ -661,7 +671,7 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 | Method | Path | Description |
 |---|---|---|
 | POST | `/api/collections/:col/auth/webauthn/register/begin` | Returns WebAuthn creation options (challenge, rpId, rpName). |
-| POST | `/api/collections/:col/auth/webauthn/register/finish` | Stores the new passkey bound to the authenticated user. |
+| POST | `/api/collections/:col/auth/webauthn/register/finish` | Stores the new passkey bound to the authenticated user. `204` (no body) on success. |
 
 **magic_link initiate:**
 ```json
@@ -680,9 +690,15 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 
 **magic_link consume + redirect (the classic email-link UX):**
 
+> Renamed from `magic_link` to dash-case in 0.10: `GET .../auth/magic-link/consume` (was
+> `auth/magic_link/consume`). Hard cutover — no redirect shim — so links emailed by a
+> pre-upgrade server 404 after the upgrade; tokens are short-lived, so this is a narrow
+> window. The method **slug** (`magic_link`, used by `initiate`/`complete` above and in
+> `onAuth`) is unchanged — only this bespoke consume path uses the dash.
+
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/collections/:col/auth/magic_link/consume?token=...&redirect=/app` | Verify + consume the token, set `zb_auth`/`zb_csrf` cookies, and `302` to the redirect target. For browser email links: the user clicks a plain GET URL and lands logged-in. Fires `onAuth(.magic_link)` and honors `require_verified` (403) exactly like `complete`. |
+| GET | `/api/collections/:col/auth/magic-link/consume?token=...&redirect=/app` | Verify + consume the token, set `zb_auth`/`zb_csrf` cookies, and `302` to the redirect target. For browser email links: the user clicks a plain GET URL and lands logged-in. Fires `onAuth(.magic_link)` and honors `require_verified` (403) exactly like `complete`. |
 
 The token is single-use (replay returns `400 Link already used.`); a missing token returns `400`, and the route `404`s unless `magic_link` is enabled on the collection.
 
@@ -810,7 +826,7 @@ exclusively through the standard auth-method contract endpoints:
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/collections/:col/auth/oauth2/providers` | List enabled providers (`name`, `authURL`, `clientId`, `scopes`). Secrets are never returned. Gated on `.auth.oauth2.enabled`. |
+| GET | `/api/collections/:col/auth/oauth2/providers` | List enabled providers (`name`, `authURL`, `clientId`, `scopes`) as `{"items":[…]}` (changed: was `{"providers":[…]}`). Secrets are never returned. Gated on `.auth.oauth2.enabled`. |
 | POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata so the client can drive the authorization redirect. |
 | POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session. |
 | DELETE | `/api/collections/:col/records/:id/external-auths/:provider` | Unlink a provider from a record. |
@@ -819,7 +835,7 @@ exclusively through the standard auth-method contract endpoints:
 
 ```json
 {
-  "providers": [
+  "items": [
     { "name": "google", "authURL": "https://accounts.google.com/o/oauth2/v2/auth?...", "clientId": "my-client-id.apps.googleusercontent.com", "scopes": ["openid", "email", "profile"] }
   ]
 }
@@ -895,7 +911,7 @@ server-managed and never public by default.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/settings` | List every setting: `[{ key, value, created, updated }, …]`. |
+| GET | `/api/settings` | List every setting: `{"items":[{ key, value, created, updated }, …]}` (changed: was a bare array). |
 | GET | `/api/settings/:key` | Fetch one: `{ key, value }`; `404` if absent. |
 | PUT | `/api/settings/:key` | Upsert. Body `{ "value": "..." }`; returns `{ key, value }`. A malformed body is `400`. |
 | DELETE | `/api/settings/:key` | Remove; `204`, or `404` if absent. |
@@ -917,6 +933,8 @@ flags — see
 Tenant-scoped verified sender identities and a bounce/complaint ingestion webhook. These are
 **additive and off by default** — see
 [framework.md → Email subsystem](framework.md#email-subsystem-154-templates-providers-verified-senders-suppression).
+Present only when `.mail` is configured — without it these routes are absent from your binary
+(not merely 404 at runtime).
 The sender routes require an authenticated principal and resolve the active account (via the
 `X-Account-Id` header or signed `zb_account` cookie); a member may only manage its own account's
 senders (fail closed, `403`). Superusers may target any account.
@@ -1012,11 +1030,12 @@ TypeScript SDK exposes this as `zb.flags.resolveAll(subject)` — see
 Read the built-in product-analytics data: the raw event feed and the declarative rollups
 (see [framework → Product analytics](framework.md#product-analytics-analytics--ctxtrack)).
 Events are emitted server-side with `ctx.track(name, payload)`; the rollups aggregate them on
-a schedule into per-rollup summary tables.
+a schedule into per-rollup summary tables. Present only when `.analytics` is configured —
+without it these routes are absent from your binary (not merely 404 at runtime).
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/analytics/events?name=&actor=&since=&limit=` | The raw activity feed (newest first). |
+| GET | `/api/analytics/events?name=&actor=&since=&limit=&cursor=` | The raw activity feed (newest first). |
 | GET | `/api/analytics/rollups/:name?from=&to=` | A rollup's summary rows. |
 
 Both endpoints are **authenticated and fail closed**. A **superuser** sees all data; a **member**
@@ -1034,6 +1053,10 @@ payloads) and all of its rollup buckets. The trust boundary is the tenant, not t
 lower bound on `occurred_at`), `limit` (default 50, max 200). The `actor` / `account` / `occurred_at`
 fields are stamped server-side at capture time and cannot be forged by a client.
 
+Events paginate with the house cursor vocabulary: pass the previous page's `nextCursor` back as
+`?cursor=` to fetch the next page. `nextCursor`/`hasNext` are always present, even on the last page
+(`nextCursor: null`, `hasNext: false`). A malformed `cursor` is `400 "Invalid cursor."`.
+
 ```json
 // GET /api/analytics/events?name=user.signup&limit=2   (Authorization + X-Account-Id)
 {
@@ -1041,7 +1064,9 @@ fields are stamped server-side at capture time and cannot be forged by a client.
     { "id": "…", "created": "2026-06-29T12:00:05Z", "name": "user.signup",
       "payload": { "plan": "pro" }, "actor_collection": "users", "actor": "u_123",
       "account": "acc_abc", "occurred_at": "2026-06-29T12:00:05Z" }
-  ]
+  ],
+  "nextCursor": "2026-06-29T12:00:05Z|e_122",
+  "hasNext": true
 }
 ```
 

@@ -94,7 +94,7 @@ pub fn oauth2Providers(ctx: *http.RequestCtx) anyerror!http.Response {
         try arr.append(.{ .object = o });
     }
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "providers", .{ .array = arr });
+    try root.put(ctx.allocator, "items", .{ .array = arr });
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}) };
 }
 
@@ -430,6 +430,7 @@ test "auth/oauth2/providers lists enabled providers without secrets" {
     var c = env.ctx(a, .GET, "", &p);
     const res = try oauth2Providers(&c);
     try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expect(std.mem.startsWith(u8, res.body, "{\"items\":["));
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"name\":\"google\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"clientId\":\"cid\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "stub-secret") == null);

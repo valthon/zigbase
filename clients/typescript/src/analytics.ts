@@ -31,7 +31,9 @@ export class AnalyticsService {
 
   /**
    * GET /api/analytics/events — the tenant-scoped activity feed. 401 anonymous; empty
-   * `items` with no active account; a superuser sees everything.
+   * `items` with no active account; a superuser sees everything. Paginates with the house
+   * cursor: pass the previous page's `nextCursor` back as `opts.cursor` to fetch the next one;
+   * `hasNext` is false (and `nextCursor` null) on the last page.
    */
   events(
     opts: {
@@ -39,16 +41,26 @@ export class AnalyticsService {
       actor?: string;
       since?: string | Date;
       limit?: number;
+      cursor?: string;
       signal?: AbortSignal;
       requestKey?: string;
     } = {},
-  ): Promise<{ items: AnalyticsEvent[] }> {
-    return this.transport.send<{ items: AnalyticsEvent[] }>("/api/analytics/events", {
-      method: "GET",
-      query: { name: opts.name, actor: opts.actor, since: iso(opts.since), limit: opts.limit },
-      signal: opts.signal,
-      requestKey: opts.requestKey,
-    });
+  ): Promise<{ items: AnalyticsEvent[]; nextCursor: string | null; hasNext: boolean }> {
+    return this.transport.send<{ items: AnalyticsEvent[]; nextCursor: string | null; hasNext: boolean }>(
+      "/api/analytics/events",
+      {
+        method: "GET",
+        query: {
+          name: opts.name,
+          actor: opts.actor,
+          since: iso(opts.since),
+          limit: opts.limit,
+          cursor: opts.cursor,
+        },
+        signal: opts.signal,
+        requestKey: opts.requestKey,
+      },
+    );
   }
 
   /**

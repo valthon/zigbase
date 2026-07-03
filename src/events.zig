@@ -14,20 +14,19 @@ const route_types = @import("route_types.zig");
 const rpc_ts = @import("codegen/rpc_ts.zig");
 
 // ---------------------------------------------------------------------------
-// RAII DB-access handles for `RouteEvent` (the one app-only event that still
-// exposes raw writer()/reader()). JobEvent/LifecycleEvent get DB access through
-// the `*Ctx` parameter their handlers now receive (`ctx.records()`), which
-// lazily checks out a pooled connection and releases it on `ctx.deinit()`.
-// Unlike RecordEvent — whose ctx is bound to the in-transaction writer for the
-// triggering write — RouteEvent has no ambient connection, so a handler that
-// wants raw DB access must check one out of the pool and (crucially) hand it
-// back. These handles make that lifetime explicit and leak-safe:
+// RAII DB-access handles used where a `*Ctx` isn't already bound to a live
+// connection (e.g. `Ctx.connForRead`'s lazily-cached reader, `AuthCtx`'s
+// writer/reader in `auth/method.zig`). RecordEvent hooks get DB access through
+// the `*Ctx` parameter their handlers receive (`ctx.records()`), whose
+// `bound_conn` is the triggering write's in-transaction connection; these
+// handles are for callers with no ambient connection, who must check one out
+// of the pool and (crucially) hand it back:
 //
-//   var w = ev.writer();         // acquires the shared pool writer (mutex-guarded)
+//   var w: WriterData = .{ .app = app, .pool = app.pool, .conn = app.pool.acquireWriter() };
 //   defer w.deinit();            // releases it back to the pool — no leak
 //   _ = try w.data().create(...);
 //
-//   var r = try ev.reader();     // checks out a pooled read-only connection
+//   var r: ReaderData = .{ .app = app, .pool = app.pool, .conn = try app.pool.acquireReader() };
 //   defer r.deinit();            // returns it to the warm pool — no leak
 //   const rec = try r.data().findById(...);
 //
@@ -78,20 +77,6 @@ pub const ReaderData = struct {
     }
 };
 
-/// Acquire the pool's writer for create/update/delete. Caller MUST `deinit()`
-/// the returned handle (use `defer`) to release the writer.
-fn acquireWriter(app: *App) WriterData {
-    const conn = app.pool.acquireWriter();
-    return .{ .app = app, .pool = app.pool, .conn = conn };
-}
-
-/// Check out a pooled read-only connection for reads. Caller MUST `deinit()` the
-/// returned handle (use `defer`) to return it to the pool.
-fn acquireReader(app: *App) db.DbError!ReaderData {
-    const conn = try app.pool.acquireReader();
-    return .{ .app = app, .pool = app.pool, .conn = conn };
-}
-
 // NOTE: adding a variant requires updating phaseFieldName() and the consumer-facing camelCase field name.
 pub const RecordPhase = enum {
     before_create,
@@ -103,11 +88,13 @@ pub const RecordPhase = enum {
 };
 
 pub const RecordEvent = struct {
-    app: *App,
-    ctx: *const request.RequestContext,
+    /// Resolved request context (auth identity, is_superuser, method) for the
+    /// triggering request. Named `rctx` to match `Ctx.rctx` — `ctx` always means
+    /// `*Ctx` in a handler signature.
+    rctx: *const request.RequestContext,
     /// Request-scoped allocator that owns `record`'s JSON storage. Hooks MUST use
-    /// this (not `app.allocator`) for any allocation that becomes part of `record`,
-    /// so growth is consistent with the map's backing and is freed with the request.
+    /// this for any allocation that becomes part of `record`. (The old `ev.app`
+    /// escape to the WRONG allocator was removed — use `ctx.app` for app access.)
     arena: std.mem.Allocator,
     collection: []const u8,
     record: *std.json.Value, // mutable in before_*; the persisted record in after_*
@@ -210,39 +197,6 @@ pub const RouteAuthGuard = union(enum) {
 /// trust_proxy-honored client IP. Receives the request-bound `*Ctx`.
 pub const RateLimitKeyFn = *const fn (*Ctx) ?[]const u8;
 
-pub const RouteEvent = struct {
-    app: *App,
-    ctx: *http.RequestCtx,
-    /// Resolved request/auth context (auth identity, is_superuser, method). Built by
-    /// the framework before the handler runs; `.public` routes still get it (anonymous).
-    rctx: request.RequestContext,
-
-    /// Acquire the pool writer for create/update/delete:
-    /// `var w = ev.writer(); defer w.deinit(); _ = try w.data().create(...);`.
-    pub fn writer(ev: *RouteEvent) WriterData {
-        return acquireWriter(ev.app);
-    }
-    /// Check out a pooled read-only connection for reads:
-    /// `var r = try ev.reader(); defer r.deinit(); _ = try r.data().findById(...);`.
-    pub fn reader(ev: *RouteEvent) db.DbError!ReaderData {
-        return acquireReader(ev.app);
-    }
-    /// Mint a session for a known record via the audited seam (`.custom` method tag).
-    /// Acquires the DB writer, calls `auth_helpers.issueSession`, releases the writer,
-    /// and returns the signed JWT + 2 cookies. Fires `onAuth` exactly once.
-    ///
-    /// WARNING: this function acquires the pool writer internally. If the calling
-    /// handler already holds the writer (`var w = ev.writer()`), do NOT call this —
-    /// it would attempt to acquire the single non-reentrant writer a second time and
-    /// deadlock permanently. Instead call `zigbase.auth.issueSession(ev.ctx, w.conn,
-    /// collection, record_id)` with the connection you already hold.
-    pub fn issueSession(ev: *RouteEvent, collection: []const u8, record_id: []const u8) !@import("auth_helpers.zig").Issued {
-        var w = ev.writer();
-        defer w.deinit();
-        return @import("auth_helpers.zig").issueSession(ev.ctx, w.conn, collection, record_id);
-    }
-
-};
 pub const RouteHandler = *const fn (ctx: *Ctx) anyerror!http.Response;
 
 /// Re-exported for config code that needs to name the rate-limit callback type.
@@ -1039,7 +993,7 @@ test "record dispatcher fires wildcard then specific, in order, and mutations st
     defer obj.deinit(std.testing.allocator);
     try obj.put(std.testing.allocator, "touched", .{ .bool = false });
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
+    var ev = RecordEvent{ .rctx = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
     var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
     defer ctx.deinit();
 
@@ -1063,7 +1017,7 @@ test "before hook error aborts (propagates) and unrelated collection is skipped"
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .arena = std.testing.allocator, .collection = "comments", .record = &rec, .phase = .before_create };
+    var ev = RecordEvent{ .rctx = undefined, .arena = std.testing.allocator, .collection = "comments", .record = &rec, .phase = .before_create };
     var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
     defer ctx.deinit();
     try dispatch(&ctx, &ev); // "comments" not registered -> no-op, no error
@@ -1183,7 +1137,7 @@ test "only the matching phase's handler runs" {
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .app = undefined, .ctx = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
+    var ev = RecordEvent{ .rctx = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
     var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
     defer ctx.deinit();
     try dispatch(&ctx, &ev); // before_create fired, but only afterCreate is registered -> no call
@@ -1461,17 +1415,15 @@ const TestEnv = struct {
     }
 };
 
-test "RouteEvent.writer() create round-trips and releases the writer (no leak)" {
+test "WriterData create round-trips and releases the writer (no leak)" {
     const env = try TestEnv.init();
     defer env.deinit();
     const a = env.arena.allocator();
 
-    var ev = RouteEvent{ .app = &env.app, .ctx = undefined, .rctx = .{} };
-
     var id_buf: [64]u8 = undefined;
     var id_len: usize = 0;
     {
-        var w = ev.writer();
+        var w: WriterData = .{ .app = &env.app, .pool = &env.pool, .conn = env.pool.acquireWriter() };
         defer w.deinit();
         var obj: std.json.ObjectMap = .empty;
         try obj.put(a, "title", .{ .string = "hello" });

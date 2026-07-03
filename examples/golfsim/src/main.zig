@@ -53,7 +53,7 @@ const zigbase = @import("zigbase");
 //    error REJECTS the write and surfaces as a 400 to the client. DB access is via
 //    `ctx.records()` (bound to the triggering write's in-transaction connection).
 //    Record mutations MUST allocate with `ev.arena` (the request-scoped allocator
-//    that owns `ev.record`), never `ev.app.allocator`.
+//    that owns `ev.record`). Need the app itself? Use `ctx.app`.
 // ---------------------------------------------------------------------------
 fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     if (ev.record.* != .object) return error.InvalidBooking;
@@ -90,7 +90,7 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     // Double-booking check: reject if there is already a non-cancelled booking
     // for the same listing whose time window overlaps ours.
     //   overlap condition: existing.starts_at < our ends_at AND existing.ends_at > our starts_at
-    // Allocate the filter in ev.arena (request-scoped; never ev.app.allocator here).
+    // Allocate the filter in ev.arena (request-scoped).
     const overlap_filter = try std.fmt.allocPrint(
         ev.arena,
         "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
@@ -108,8 +108,8 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     try rec.put(ev.arena, "price_total", .{ .float = price_total });
 
     // Stamp the guest from the authenticated identity (server-authoritative;
-    // never trust a client-supplied guest). `ev.ctx.auth` is the auth record.
-    if (ev.ctx.auth) |auth| if (auth == .object) {
+    // never trust a client-supplied guest). `ev.rctx.auth` is the auth record.
+    if (ev.rctx.auth) |auth| if (auth == .object) {
         if (auth.object.get("id")) |idv| if (idv == .string) {
             const guest = try ev.arena.dupe(u8, idv.string);
             try rec.put(ev.arena, "guest", .{ .string = guest });
@@ -570,7 +570,7 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
     // Resolve the authenticated identity (server-authoritative author).
     var author_id: ?[]const u8 = null;
-    if (ev.ctx.auth) |auth| if (auth == .object) {
+    if (ev.rctx.auth) |auth| if (auth == .object) {
         if (auth.object.get("id")) |idv| if (idv == .string) {
             author_id = idv.string;
         };
@@ -609,7 +609,7 @@ fn prepareHold(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
     // Server-authoritative guest = the authenticated identity (overwrites client input).
     var guest_id: ?[]const u8 = null;
-    if (ev.ctx.auth) |auth| if (auth == .object) {
+    if (ev.rctx.auth) |auth| if (auth == .object) {
         if (auth.object.get("id")) |idv| if (idv == .string) {
             guest_id = idv.string;
         };
@@ -853,7 +853,7 @@ pub const App = zigbase.App(.{
             // Public read of a single feature flag — see `flagStatus`. Untyped (raw JSON).
             .{ .method = .GET, .path = "/api/golfsim/flags/:name", .handler = flagStatus, .auth = .public },
         },
-        .jobs = .{ .pool_size = 2 },
+        .pools = .{ .jobs = 2 },
         .cron = .{
             .{
                 .name = "expire-holds",

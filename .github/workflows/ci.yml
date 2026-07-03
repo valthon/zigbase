@@ -59,6 +59,14 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build dating-server -Dcpu=baseline
       - name: Build auth2-server (e2e fixture binary)
         run: mise exec zig@0.16.0 -- zig build auth2-server -Dcpu=baseline
+      - name: Build features-fixture (demo flags/experiments browser fixture)
+        run: mise exec zig@0.16.0 -- zig build features-fixture -Dcpu=baseline
+      - name: Build lean gating fixture
+        run: mise exec zig@0.16.0 -- zig build minimal-server
+      - name: Build full gating fixture (positive control)
+        run: mise exec zig@0.16.0 -- zig build full-fixture
+      - name: Gating invariant (absent-symbols check)
+        run: ./scripts/check-gating.sh
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
@@ -76,6 +84,7 @@ jobs:
             zig-out/bin/zigbase
             zig-out/bin/dating-server
             zig-out/bin/auth2-server
+            zig-out/bin/features-fixture
             examples/blog/zig-out/bin/blog
             examples/golfsim/zig-out/bin/golfsim
             examples/plugins/zig-out/bin/plugins
@@ -111,6 +120,14 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build test --summary all
       - name: "Unit tests (prod gate: -Ddev-clock=false)"
         run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-clock=false
+      # Lean-build gate (R2-6): -Dfts5=false must still COMPILE — the whole point is that FTS5 (and
+      # SQLite's -DSQLITE_ENABLE_FTS5) folds out of a build that never declares a `.searchable`
+      # field. Build-only, not a full test run: a handful of pre-existing fixtures (policy.zig,
+      # rewrap.zig, codegen/typegen_cli.zig) construct a searchable collection unconditionally and
+      # would need their own -Dfts5-awareness to pass here — the comptime-dead-code guarantee and
+      # fts.zig's own "enabled reflects build_options" test are what this flag actually needs proven.
+      - name: "Build check: -Dfts5=false (lean build without SQLite FTS5)"
+        run: mise exec zig@0.16.0 -- zig build -Dfts5=false
 
   # Opt-in PostgreSQL backend (#159). Runs the full suite WITH -Dpostgres=true against a
   # real postgres service container, exercising the pure-Zig wire driver's SCRAM-SHA-256
@@ -312,6 +329,8 @@ jobs:
           echo "ZIGBASE_TEST_AUTH2_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/auth2-server" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_BLOG_BINARY=$GITHUB_WORKSPACE/artifacts/examples/blog/zig-out/bin/blog" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/features-fixture
+          echo "ZIGBASE_FEATURES_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/features-fixture" >> "$GITHUB_ENV"
       - name: Install Python test deps + resolve Playwright version
         id: pw
         run: |

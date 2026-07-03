@@ -29,6 +29,20 @@ describe("analytics", () => {
     expect(out.items).toEqual([]);
   });
 
+  it("events() forwards opts.cursor and returns the house cursor envelope", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = new URL(url);
+      expect(u.pathname).toBe("/api/analytics/events");
+      expect(u.searchParams.get("cursor")).toBe("2026-01-01T00:00:02Z|e2");
+      return jsonResponse({ items: [{ id: "e1" }], nextCursor: null, hasNext: false });
+    }) as unknown as typeof fetch;
+    const zb = createClient("http://api.test", { fetch: fetchMock });
+    const out = await zb.analytics.events({ cursor: "2026-01-01T00:00:02Z|e2" });
+    expect(out.items).toHaveLength(1);
+    expect(out.nextCursor).toBeNull();
+    expect(out.hasNext).toBe(false);
+  });
+
   it("rollup() hits /api/analytics/rollups/:name with from/to (name URL-encoded)", async () => {
     const fetchMock = vi.fn(async (url: string) => {
       const u = new URL(url);

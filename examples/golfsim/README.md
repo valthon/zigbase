@@ -39,7 +39,7 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     const listing = (try ctx.records().get("listings", listing_id, .{})) orelse
         return error.ListingNotFound;
 
-    // 2. Double-booking check — allocate filter with ev.arena (NEVER ev.app.allocator).
+    // 2. Double-booking check — allocate filter with ev.arena.
     const overlap_filter = try std.fmt.allocPrint(ev.arena,
         "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing_id, ends_at, starts_at });
@@ -57,8 +57,8 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 ```
 
 Record mutations that enter `ev.record` **must** allocate with `ev.arena`
-(the request-scoped allocator that owns `ev.record`), never `ev.app.allocator`.
-Returning any error rejects the write → HTTP 400 to the client.
+(the request-scoped allocator that owns `ev.record`). Need the app itself?
+Use `ctx.app`. Returning any error rejects the write → HTTP 400 to the client.
 
 #### `prepareReview` — `beforeCreate` on `reviews`
 

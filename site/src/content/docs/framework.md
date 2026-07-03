@@ -79,38 +79,69 @@ pub fn main(init: std.process.Init) !void {
 
 `App(.{...})` accepts exactly these optional keys. **Any other key is a compile error.**
 
-| Key | Purpose |
-| --- | --- |
-| `hooks` | Per-collection record lifecycle hooks (before/after create/update/delete). |
-| `onError` | Consumer error handler, runs before the built-in backstop. |
-| `routes` | Custom HTTP routes. |
-| `onAuth` | Notify-only: fires *after* a session is issued (login / oauth2). |
-| `beforeAuthSuccess` | Writable, transactional, abortable hook that runs *before* the session is issued (claim records on first login; veto a login). |
-| `auth` | Auth lifecycle hooks: before/after `register`, `logout`, `refresh`, `password-change`. |
-| `onFileServe` | Fires before serving a file download (may deny). |
-| `onFileUpload` | Fires after a file upload. |
-| `onBootstrap` | Lifecycle: after bootstrap. |
-| `onBeforeServe` | Lifecycle: just before the server starts serving. |
-| `onBeforeTerminate` | Lifecycle: just before shutdown. |
-| `cron` | Scheduled job table. |
-| `jobs` | Scheduler `.pool_size` **and** the queue job-kind registry (kind → handler). See [Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs). |
-| `queues` | Named background-job queues (backend `memory`/`durable`, priority, retry). A `.default` queue is always synthesized. See [Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs). |
-| `workers` | Named queue workers (queue subset drained in strict priority + concurrency). Omit → one implicit worker over all queues. |
-| `collections` | Comptime schema: collections provisioned at startup (additive auto-migration). |
-| `migrations` | Explicit migrations (the escape hatch for non-additive schema changes). |
-| `static_files` | Comptime static-file mode: absent (default flag), `.disabled`, `.{ .dir = "..." }`, `.{ .embedded = ... }`. |
-| `storage` | Storage plugin TYPE (defaults to local-disk storage). |
-| `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). |
-| `auth_methods` | Register custom `AuthMethod` plugin TYPES (comptime, like `.storage`/`.mailer`). |
-| `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. |
-| `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. |
-| `session_store` | Session-management model: `.epoch` (default, stateless token-epoch revocation, zero extra DB work) or `.table` (server-side `_sessions` store for per-device list/revoke, one extra read per request). See [Revoking sessions](#revoking-sessions-99). |
-| `session_gc_cron` | Cadence (UTC cron) for the table-mode expired-`_sessions` GC sweep. Default `"0 * * * *"` (hourly). Only valid with `.session_store = .table` — setting it otherwise is a `@compileError`. |
-| `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). |
-| `experiments` | Declared A/B/n experiments (variants + weights, optional `.sticky`). See [Feature flags + experiments](#feature-flags--experiments-declared). |
-| `experiment_assignment_ttl` | TTL in **days** for sticky `_experiment_assignments` rows (default `90`). Only valid when a `.sticky` experiment is declared — setting it otherwise is a `@compileError`. |
-| `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. |
-| `realtime` | Realtime broadcast guard: `.{ .canSubscribe = fn }` gates who may subscribe to a custom (non-collection) topic (default: custom topics are public). See [`ctx.realtime()`](#ctxrealtime--broadcast-on-custom-channels). |
+| Key | Purpose | Unset ⇒ in your binary? |
+| --- | --- | --- |
+| `hooks` | Per-collection record lifecycle hooks (before/after create/update/delete). | always — dispatch plumbing is core; empty when you register nothing. |
+| `onError` | Consumer error handler, runs before the built-in backstop. | always — the backstop itself always ships. |
+| `routes` | Custom HTTP routes. | always — routing plumbing is core; a route's code is only in your binary because you wrote it. |
+| `onAuth` | Notify-only: fires *after* a session is issued (login / oauth2). | always — auth lifecycle plumbing is core. |
+| `beforeAuthSuccess` | Writable, transactional, abortable hook that runs *before* the session is issued (claim records on first login; veto a login). | always — auth lifecycle plumbing is core. |
+| `auth` | Auth lifecycle hooks: before/after `register`, `logout`, `refresh`, `password-change`. | always — an empty `.auth = .{}` is a documented no-op, not a compiled subsystem. |
+| `onFileServe` | Fires before serving a file download (may deny). | always — file-serving plumbing is core. |
+| `onFileUpload` | Fires after a file upload. | always — file-upload plumbing is core. |
+| `onBootstrap` | Lifecycle: after bootstrap. | always — lifecycle dispatch is core. |
+| `onBeforeServe` | Lifecycle: just before the server starts serving. | always — lifecycle dispatch is core. |
+| `onBeforeTerminate` | Lifecycle: just before shutdown. | always — lifecycle dispatch is core. |
+| `cron` | Scheduled job table. | always — the scheduler is core; empty table when unset. |
+| `jobs` | The queue job-kind registry (kind → handler). See [Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs). | always — the registry is core; a job kind's code is only in your binary because you wrote it. |
+| `queues` | Named background-job queues (backend `memory`/`durable`, priority, retry). A `.default` queue is always synthesized. See [Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs). | excluded — the durable-backend poller + GC jobs compile in only when a queue declares `.backend = .durable`; the synthesized in-memory `.default` queue is always present. |
+| `workers` | Named queue workers (queue subset drained in strict priority + concurrency). Omit → one implicit worker over all queues. | always — the queue-draining loop is core (it runs even for the implicit single worker). |
+| `collections` | Comptime schema: collections provisioned at startup (additive auto-migration). | always — the provisioner is core; empty when unset. |
+| `migrations` | Explicit migrations (the escape hatch for non-additive schema changes); a bare tuple or a typed slice. | always — the migration runner is core; empty when unset. |
+| `static_files` | Comptime static-file mode: absent (default flag), `.disabled`, `.{ .dir = "..." }`, `.{ .embedded = ... }`. | always — static serving is core; this key only selects its mode. |
+| `storage` | Storage plugin TYPE (defaults to local-disk storage). | always — you always get a storage plugin, default or custom. |
+| `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). | always — you always get a mailer plugin, default or custom. Together with `.mail`, also enables the built-in `"mail"` job kind (see `.mail` below). |
+| `auth_methods` | Auth method set. Bare tuple = register custom `AuthMethod` TYPES alongside all five built-ins; `.{ .builtins = .{ .password, … }, .custom = .{ … } }` selects the exact built-in set (a deselected built-in — e.g. `.webauthn`, ~3.2k LOC — is excluded from your binary, along with its routes). | excluded — a deselected built-in (its route + implementation) never gets pulled in by Zig's lazy analysis. |
+| `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
+| `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
+| `session_store` | Session-management model: `.epoch` (default, stateless token-epoch revocation, zero extra DB work) or `.table` (server-side `_sessions` store for per-device list/revoke, one extra read per request). See [Revoking sessions](#revoking-sessions-99). | excluded — `.table` mode's extra store/GC machinery compiles in only when selected; `.epoch` (the default) adds nothing. |
+| `session_gc_cron` | Cadence (UTC cron) for the table-mode expired-`_sessions` GC sweep. Default `"0 * * * *"` (hourly). Only valid with `.session_store = .table` — setting it otherwise is a `@compileError`. | excluded — tied 1:1 to `.table` mode; no GC job is installed at all in `.epoch` mode. |
+| `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
+| `experiments` | Declared A/B/n experiments (variants + weights, optional `.sticky`). See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Experiment` enum when unset. |
+| `features` | Public feature-state projection: `.{ .public_route = "/api/state" }` (custom path) or `.{ .public_route = .disabled }`. Default `"/api/state"` (auto-mounted). | always — the projection route is mounted by default; this key only customizes or disables it. |
+| `onFeatureExposure` | Notify-only hook fired when a declared flag/experiment is resolved for a subject (exposure logging). | excluded — zero-cost when absent: the resolver gates on the dispatch field and never even constructs the event. |
+| `experiment_assignment_ttl` | TTL in **days** for sticky `_experiment_assignments` rows (default `90`). Only valid when a `.sticky` experiment is declared — setting it otherwise is a `@compileError`. | excluded — the sticky-assignment GC sweep installs no job/timer/writer touch unless a `.sticky` experiment is declared. |
+| `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. | excluded — off by default so production builds carry no codegen weight. |
+| `captcha` | CAPTCHA verification: `.{ .provider = .<provider>, .secret = "..." }`. Powers `ctx.verifyCaptcha`; an empty/absent `.secret` activates the dev-bypass (no network call). | data-only — lowers to a `null` provider + `""` secret when unset; `ctx.verifyCaptcha` is only reachable if you call it. |
+| `realtime` | Realtime broadcast guard: `.{ .canSubscribe = fn }` gates who may subscribe to a custom (non-collection) topic (default: custom topics are public). See [`ctx.realtime()`](#ctxrealtime--broadcast-on-custom-channels). | always — realtime (the WebSocket hub + per-record view-rule reapplication) is core, not optional; this key only adds a guard for custom topics. |
+| `tenancy` | Multi-tenant account scoping: `.{ .enabled = true, .auth_collection = "...", .resolver = ..., .roles = .{...} }`. | excluded — the account-activation endpoints and membership-scoping code exist only when `.tenancy.enabled = true`. |
+| `abilities` | Declarative relationship-based row abilities per collection: `.{ .<col> = .{ .view = <rule>, … } }`. Requires `.tenancy.enabled = true`. | data-only — the composition code is core policy plumbing that always runs; unset just means every collection's ability predicate is `null` (a no-op). |
+| `mail` | Email-subsystem policy knobs (`.require_verified_sender`, `.webhook_secret`, …) threaded into `app.mail`. Together with `.mailer`, enables the built-in `"mail"` job kind backing `ctx.mail().enqueue`. | excluded — the `senders` API and inbound bounce/complaint webhook exist only when `.mail` is set. |
+| `analytics` | Product analytics: `.{ .rollups = .{ … } }` declares rollup specs, each producing a scheduled `_rollup:<name>` aggregation job; also gates the analytics read API. `ctx.track` always captures to `_events` regardless. | excluded — the rollup jobs and analytics read API exist only when `.analytics` is set. |
+| `static_routes` | Tier-2 comptime static rewrites: a list of `.{ .match = "/…", .serve = "/…" }` entries mapping request paths to fixed served paths/files. | data-only — lowers to an empty list when unset. |
+| `enable_spa_marker` | Tier-1 `.spa` marker enablement for static serving (issue #183). Default: on when `.static_routes` is absent/empty (byte-identical to the shipped binary), off when routes are declared; an explicit bool always wins. | always — a bool feeding core static-serving logic, not an optional subsystem. |
+| `static_cache_control` | Comptime default `Cache-Control` for static responses (embedded + dir). Runtime `--static-cache-control` / `ZIGBASE_STATIC_CACHE_CONTROL` override it; unset → facil.io's stock `max-age=3600`. | data-only — a `?[]const u8` default feeding core static serving, not an optional subsystem. |
+| `admin` | `.admin = .disabled` removes the embedded admin SPA (route dispatch **and** the ~58 KiB of `@embedFile`-d assets) from your binary — useful for headless/embedded consumers. Default: served at `/_/`. | excluded, opt-**out** — the admin SPA ships by default; set `.admin = .disabled` to exclude it (the only key in this table where "unset" means *included*). |
+| `webhooks` | `.webhooks = true` registers the built-in `"webhook"` job kind, compiling in `ctx.webhook()`'s managed outbound delivery (`webhook.zig`, ~689 LOC). Default: off, so a consumer that never sends managed webhooks pays nothing for it. See [`ctx.webhook()`](#ctxwebhook--managed-outbound-webhooks-144). | excluded — off by default; `webhook.zig` is not compiled in unless `.webhooks = true`. |
+
+Route gating: the built-in `analytics`, `senders`/mail-webhook, and `tenancy` (account
+activation) endpoints exist only when their config key is set (`.analytics`, `.mail`,
+`.tenancy.enabled`) — an unset key leaves no trace of those routes (or the handlers they'd
+call) in your binary; they aren't merely 404 at runtime.
+
+### Choosing a config plane
+
+**The assignment rule:** structure/behavior = comptime `App(.{…})` key; deploy-varying
+values & secrets = env var (+ CLI flag if path-like); alternatives with real binary cost
+(extra C sources, wire protocols, dev-only codepaths) = `-D` build flag. Never gate a whole
+subsystem on a runtime value alone.
+
+**The laziness contract:** for every key marked *excluded* above, "unset" means the
+subsystem is not in your binary — not compiled, not routed, not registered. This holds
+because of the gating invariant: **no unconditional fn-pointer registration for optional
+capabilities** (fn-pointer tables defeat Zig's lazy analysis; `builtin_routes` and the
+built-in job registry are comptime-assembled from your config, enforced by
+`scripts/check-gating.sh` in CI).
 
 ## 3b. The `typegen` gate (`.enable_typegen`) {#the-apptypegen-gate-enable_typegen}
 
@@ -181,13 +212,16 @@ when a hook doesn't use it.
 
 `zigbase.RecordEvent` fields:
 
-- `app: *Runtime` — the runtime app context.
-- `ctx` — the request context; `ev.ctx.auth` is the authenticated record (if any).
+- `rctx` — the request context; `ev.rctx.auth` is the authenticated record (if any). Named
+  `rctx` (not `ctx`) — `ctx` always means the `*zigbase.Ctx` parameter in a hook signature.
 - `arena: std.mem.Allocator` — the **request-scoped** allocator that owns `record`'s JSON
   storage.
 - `collection: []const u8` — the collection name.
 - `record: *std.json.Value` — mutable in `before_*`; the persisted record in `after_*`.
 - `phase: RecordPhase`.
+
+Need the app itself (e.g. `app.allocator`, `app.io`)? Use the hook's `ctx.app` —
+`RecordEvent` has no `app` field of its own.
 
 ### Semantics
 
@@ -196,11 +230,11 @@ when a hook doesn't use it.
 - **`after*` hooks** are post-commit. An error returned from an after-hook is swallowed and
   routed to the error backstop (it does not undo the committed write).
 
-### CRITICAL: use `ev.arena`, not `ev.app.allocator`
+### Always allocate record data with `ev.arena`
 
 Any allocation that becomes part of `ev.record` MUST use `ev.arena` (the request allocator
-that owns the record's JSON map), **not** `ev.app.allocator` (the long-lived gpa). Mixing
-allocators on the arena-backed JSON map is undefined behavior.
+that owns the record's JSON map). Mixing allocators on the arena-backed JSON map is
+undefined behavior.
 
 From the worked example's `slugify` (`before_create` on `posts`):
 
@@ -214,7 +248,7 @@ fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
         else => return,
     } else return;
 
-    const buf = try ev.arena.alloc(u8, title.len); // <-- ev.arena, NOT ev.app.allocator
+    const buf = try ev.arena.alloc(u8, title.len); // <-- ev.arena
     var len: usize = 0;
     // ... build the slug into buf ...
     try ev.record.object.put(ev.arena, "slug", .{ .string = buf[0..len] }); // <-- ev.arena
@@ -555,6 +589,12 @@ try ctx.mail().send(.{
 try ctx.mail().enqueue(.{ .to = "user@example.com", .subject = "Digest", .html = "<p>…</p>" }, .{ .queue = "emails" });
 ```
 
+> `enqueue`/`deliverLater` require mail to be configured — a `.mailer` plugin TYPE, or
+> `.mail = .{}` (defaults) to enable background delivery with the env-configured mailer.
+> Without either, the `"mail"` kind is not compiled in and `enqueue` fails at call time
+> with `error.UnknownJobKind` (logged with a hint). `send` is unaffected either way — it
+> delivers directly through the mailer, not the queue.
+
 `send` delivers through the same `Mailer.send` vtable seam every backend (Log / SMTP /
 Command / a custom `.mailer` plugin) routes through — including the dev-only
 `testcapture.mail` outbox, so consumer mail is assertable in tests exactly like the
@@ -787,6 +827,10 @@ const res2 = try client.post("https://webhook.example.com/notify", .{
 is its **managed, retrying** counterpart: it serializes `payload` to JSON, enqueues a
 background `"webhook"` job (a built-in queue kind, like `"mail"`), and a worker POSTs it
 with automatic retries and back-off.
+
+> Requires `.webhooks = true` in your `App(.{...})` config — without it `webhook.zig` is
+> not compiled into your binary and `ctx.webhook` fails at enqueue time with
+> `error.UnknownJobKind` (logged with a hint pointing at the missing key).
 
 ```zig
 try ctx.webhook("https://hooks.example.com/booking", .{
@@ -1357,7 +1401,7 @@ KV store (every endpoint requires a valid superuser token):
 
 | Method & path | Effect |
 |---|---|
-| `GET /api/settings` | List all settings (`[{key,value,created,updated}, …]`). |
+| `GET /api/settings` | List all settings (`{"items":[{key,value,created,updated}, …]}`). |
 | `GET /api/settings/:key` | Fetch one (`{key,value}`); 404 if absent. |
 | `PUT /api/settings/:key` | Upsert; body `{"value":"…"}`. |
 | `DELETE /api/settings/:key` | Remove; 204, or 404 if absent. |
@@ -1440,7 +1484,7 @@ Guarantees:
   reflects the just-authenticated principal.
 
 Where it fires: the unified `POST /api/collections/:col/auth/:method/complete` endpoint
-(password / otp / webauthn / oauth2 / custom), the magic-link `GET …/auth/magic_link/consume`
+(password / otp / webauthn / oauth2 / custom), the magic-link `GET …/auth/magic-link/consume`
 link, and — since 0.10.0 — the legacy `POST …/auth-with-password` (tag `.password`) and
 `POST …/auth-refresh` (tag `.refresh`, in the same transaction as `beforeRefresh`, lifecycle
 phase first). **This includes `_superusers`: the admin SPA logs in through
@@ -1620,6 +1664,19 @@ For verification logic that the built-ins don't cover, implement an `AuthMethod`
     .methods = .{ .password = .{}, .custom = &.{"corp-sso"} },
 } },
 ```
+
+**Selecting the built-in set.** The bare-tuple form above always keeps all five built-ins (`.password`, `.magic_link`, `.otp`, `.webauthn`, `.oauth2`) — non-breaking, unchanged from before. To drop built-ins you don't use — WebAuthn's CBOR/COSE stack is the big one at ~3.2k LOC — switch to the named form and list exactly the built-ins you want:
+
+```zig
+.auth_methods = .{
+    .builtins = .{ .password, .otp },   // exactly these two; the other three are never
+                                          // analyzed, so their code (and routes) is
+                                          // absent from the binary
+    .custom = .{ CorpSsoMethod },
+},
+```
+
+Omitting `.builtins` keeps all five (equivalent to the bare-tuple form); `.builtins = .{}` drops every built-in and leaves only `.custom`. A deselected built-in's method-specific route group (`webauthn`/`magic_link`/`oauth2`) is dropped too — the flat core auth routes (`auth-with-password`, `auth-refresh`, `auth-logout`, verification, password reset) are always present regardless of the built-in set, since they don't go through the method registry.
 
 **The contract** — every plugin type must implement three functions:
 
@@ -1804,7 +1861,7 @@ OAuth2 (Google, GitHub, etc.) is the **fifth built-in `AuthMethod`** (slug `oaut
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/collections/:col/auth/oauth2/providers` | Discovery — list enabled providers (name, authURL, clientId, scopes). Secrets never returned. |
+| GET | `/api/collections/:col/auth/oauth2/providers` | Discovery — list enabled providers (name, authURL, clientId, scopes) as `{"items":[…]}`. Secrets never returned. |
 | POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata so the client can drive the authorization redirect. |
 | POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session. |
 
@@ -2052,15 +2109,17 @@ absent. In `.epoch` mode `listActiveSessions`/`revoke` return `error.SessionStor
 ## 7. Scheduled jobs (`.cron` + `.jobs`)
 
 ```zig
-.jobs = .{ .pool_size = 2 }, // worker pool size; defaults to 2 when unset
+.pools = .{ .jobs = 2 }, // scheduler worker-pool size; defaults to 2 when unset
 .cron = .{
     .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
 },
 ```
 
-> `.jobs` does double duty: the reserved `.pool_size` key sets the scheduler worker-pool
-> size (above), and any OTHER key registers a queue **job-kind handler** — see
-> [§7b Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs).
+> `.pools = .{ .jobs = N }` is the ONE lever for the scheduler worker-pool size. `.jobs`
+> is purely the queue **job-kind handler** registry (`kind = handlerFn` bindings) — see
+> [§7b Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs). The
+> pre-0.10 `.jobs = .{ .pool_size = N }` spelling was removed; it is now a compile error
+> naming `.pools = .{ .jobs = N }`.
 
 Each `cron` spec needs `.name`, `.schedule`, and `.handler` (missing/wrong-typed → compile
 error). The three schedule modes (`zigbase.schedule.Schedule`):
@@ -2170,7 +2229,7 @@ App(.{
         .general = .{ .queues = .{ "reports", "default" } },
     },
     // Job-kind registry: kind name → handler `fn(*Ctx, payload: []const u8) anyerror!void`.
-    // (`.pool_size` is reserved here for the scheduler pool size — see §7.)
+    // (Scheduler pool size is set separately via `.pools = .{ .jobs = N }` — see §7.)
     .jobs = .{
         .resize_image = resizeImage,
         .reindex      = reindex,
@@ -2202,11 +2261,15 @@ try ctx.enqueue(.emails, .resize_image, .{ .id = "abc123" });
 `payload` is JSON-serialized (a `[]const u8` is treated as raw JSON and passed through
 unchanged), and the job is routed to the queue's backend.
 
-The framework registers one **built-in job kind** on the same engine: `"mail"`, which backs
-[`ctx.mail().enqueue`](#ctxmail--send-application-mail) (it deserializes a `MailMessage`
-payload and delivers it). It is reached via that helper (or `ctx.enqueueByName(queue,
-"mail", msg)`), not the compile-checked `Job` enum, which reflects only your declared
-`.jobs`.
+The framework can register two **built-in job kinds** on the same engine, each gated by its
+own config key so an unconfigured one costs nothing: `"mail"` (needs `.mail`/`.mailer`)
+backs [`ctx.mail().enqueue`](#ctxmail--send-application-mail) (it deserializes a
+`MailMessage` payload and delivers it); `"webhook"` (needs `.webhooks = true`) backs
+[`ctx.webhook()`](#ctxwebhook--managed-outbound-webhooks-144). Each is reached via its
+helper (or `ctx.enqueueByName(queue, kind, payload)`), not the compile-checked `Job` enum,
+which reflects only your declared `.jobs`. The kind names `mail`/`webhook` are reserved
+either way, so a consumer `.jobs` entry with either name is a compile error even when the
+built-in itself is gated off.
 
 ### Backends, priority, and reliability
 
@@ -2574,7 +2637,8 @@ a `@compileError`.
 **Read API (tenant-scoped, fail-closed).** Both endpoints are authenticated and never leak across
 accounts:
 
-- `GET /api/analytics/events?name=&actor=&since=&limit=` — the raw activity feed.
+- `GET /api/analytics/events?name=&actor=&since=&limit=&cursor=` — the raw activity feed; paginates
+  with the house cursor (`nextCursor`/`hasNext` in the response).
 - `GET /api/analytics/rollups/:name?from=&to=` — a rollup's summary rows (for charts).
 
 A **superuser** sees everything; a **member** sees only their active account's data (resolved from a
@@ -2707,15 +2771,20 @@ For the changes auto-migration won't do, use the `.migrations` escape hatch.
 
 ### Explicit migrations (`.migrations`)
 
-`.migrations` is a **typed slice** of `zigbase.Migration` records, each run **once**
-(recorded in `_migrations` under a `prov:` prefix) **before** provisioning. The field is
-`[]const zigbase.Migration`, so it must be a typed slice (`&[_]zigbase.Migration{ ... }`) —
-a bare anonymous tuple does **not** coerce:
+`.migrations` is a list of `zigbase.Migration` records, each run **once** (recorded in
+`_migrations` under a `prov:` prefix) **before** provisioning. It accepts either a
+**bare tuple** (lowered at comptime, like every other list-shaped config key —
+`.routes`, `.cron`, `.static_routes`) or a **typed slice** `&[_]zigbase.Migration{ ... }`,
+which coerces directly:
 
 ```zig
-.migrations = &[_]zigbase.Migration{
+.migrations = .{
     .{ .id = "0001_rename_title", .up = renameTitle },
 },
+// or, equivalently, the typed-slice form:
+// .migrations = &[_]zigbase.Migration{
+//     .{ .id = "0001_rename_title", .up = renameTitle },
+// },
 // .up signature: fn (m: *zigbase.Migrator) anyerror!void
 //   `m` carries the active SQL dialect, the writer connection (`m.db`), a scratch
 //   arena (`m.arena`), and `m.io`. It exposes exec/execLowered/prepare/rawFor.
@@ -2923,7 +2992,7 @@ each defaults to the historical value:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `.readers` | `16` | warm reader-connection pool cap — shrink to reduce the connection footprint. |
-| `.jobs` | `2` | scheduler worker-pool size (same as `.jobs.pool_size`). |
+| `.jobs` | `2` | scheduler worker-pool size. |
 | `.stack_size` | `1 MiB` | per-thread stack for scheduler/job/`submit` threads (vs `std.Thread`'s 16 MiB default). **Clamped up** to a safe floor — the lever can only *raise* the stack, e.g. for unusually deep job handlers. |
 | `.cache_kib` | `1024` | SQLite per-connection page cache (KiB), across the writer + warm readers — shrink to save memory, raise for large working sets. |
 
@@ -2933,8 +3002,9 @@ zigbase.App(.{
 }).runCli(init);
 ```
 
-`.pools.jobs` is the unified job-pool lever; the legacy `.jobs = .{ .pool_size = N }` still
-works (and `.pools.jobs` takes precedence when both are set).
+`.pools = .{ .jobs = N }` is the ONE lever for the scheduler worker-pool size. The
+legacy `.jobs = .{ .pool_size = N }` spelling was removed; it is now a compile error
+naming the replacement.
 
 ## 10b. Pagination (`.pagination`)
 
@@ -2999,7 +3069,7 @@ pub fn main(init: std.process.Init) !void {
         .routes = .{
             .{ .method = .GET, .path = "/api/blog/ping", .handler = ping, .auth = .public },
         },
-        .jobs = .{ .pool_size = 2 },
+        .pools = .{ .jobs = 2 },
         .cron = .{
             .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
         },
@@ -3259,13 +3329,26 @@ You can also force the prod-safe behavior explicitly: `zig build -Ddev-clock=fal
 
 CI runs both passes: the default `Debug` pass (dev features on, prod-gate assertions skipped) and a `-Ddev-clock=false` prod-gate pass (dev features off, prod-gate assertions executed) to verify the compiled-out guarantee.
 
+## Compile-time build flags
+
+`zig build`/`zig build -Dname=value` accepts these consumer-facing flags. Each folds its gated
+code to comptime-dead when off, so a build that doesn't need a feature doesn't pay for it:
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `-Dfts5` | **on** | SQLite full-text search (FTS5). `-Dfts5=false` drops `-DSQLITE_ENABLE_FTS5` from the SQLite build (~250-400 KB smaller) for lean binaries with no `.searchable` field; `?search=` then 400s and the server refuses to start over a `.searchable` SQLite schema. Postgres full-text search is unaffected. → [docs/search](./search#build-requirement--dfts5-default-on) |
+| `-Dvector` | off | Opt-in nearest-neighbor `?vector=` KNN search — sqlite-vec on SQLite, pgvector on Postgres. → [docs/search](./search#vector-search-opt-in) |
+| `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres](./postgres) |
+| `-Ddev-clock` | on in `Debug`, off in release | The `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` dev-only test seams (§14 above); the release script forces it off for shipped binaries. |
+| `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
+
 ## Exported names reference
 
 The public surface (from `src/root.zig`):
 
 - `zigbase.App` — the comptime application builder.
 - `zigbase.Runtime` — the runtime app context type (the `*App` you receive on events).
-- `zigbase.Config`, `zigbase.Server`.
+- `zigbase.Config`, `zigbase.Server` (a generic `Server(comptime gates: Gates) type`; `App(cfg).runCli`/`serve` instantiate it for you from your config — see the `.admin` key and route gating above).
 - `zigbase.http` — HTTP types (`http.Response`, `http.Method`, ...).
 - `zigbase.Ctx` — the per-request capability object passed as the first parameter to every
   route / hook / job / lifecycle handler (`ctx.records()`, `ctx.http()`, `ctx.user()`,
@@ -3279,8 +3362,8 @@ The public surface (from `src/root.zig`):
 - `zigbase.Req`, `zigbase.RouteError` — the typed-route handler input wrapper and error set.
 - `zigbase.Tx` — the transaction scope passed to a `ctx.tx(T, fn(*Tx) ...)` callback
   (`t.records()`, `t.arena()`).
-- `zigbase.Migration` — the `.migrations` slice element type; `zigbase.Db` — the writer
-  connection passed to a migration's `.up`.
+- `zigbase.Migration` — the `.migrations` entry type (bare tuple or typed slice);
+  `zigbase.Db` — the writer connection passed to a migration's `.up`.
 - `zigbase.StaticFile` — the embedded manifest entry type (path, bytes, etag); used by
   `.static_files = .{ .embedded = ... }`.
 - `zigbase.Storage` / `zigbase.Mailer` / `zigbase.Email` — the storage & mailer plugin

@@ -60,6 +60,9 @@ Running `zigbase` with no recognised command prints usage.
 | — | `--serve-static` | `""` (off) | serve static files from DIR at the root path (default mode only) |
 | `ZIGBASE_STATIC_CACHE_CONTROL` | `--static-cache-control` | `"max-age=3600"` (facil.io stock) | `Cache-Control` value for static responses (embedded + dir); flag wins over env, both win over the comptime `.static_cache_control` default. See [Framework → Static files](./framework#13-serve-a-frontend-static-files) |
 | `ZIGBASE_JWT_SECRET` | — | _auto-generated_ | token signing secret (≥32 bytes). Unset → a random secret is generated + persisted at `<data-dir>/.jwt_secret` (0600); a shorter provided value is refused |
+| `ZIGBASE_FIELD_KEY` | — | `""` (unset) | key for at-rest field encryption (`.encrypted` fields). Never auto-generated/persisted/logged; the server **refuses to start** if any collection declares an encrypted field while this is empty |
+| `ZIGBASE_FIELD_KEY_GENERATION` | — | `1` | generation of the primary (write) field-encryption key — the envelope version stamped on writes (`v<N>:`). Bump to rotate, then run `zigbase rewrap` |
+| `ZIGBASE_FIELD_KEY_V<n>` | — | _unset_ | older read-only key for generation `<n>`, needed to decrypt existing `v<n>:` data after a key rotation |
 | `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
 | `ZIGBASE_TRUST_PROXY` | `--trust-proxy` (sets `true`) | `false` | trust `X-Forwarded-For`/`X-Real-IP` for client-IP / rate-limit keying (set only behind a trusted reverse proxy) |
 | `ZIGBASE_AUTH_TOKEN_TTL` | — | `1209600` (14 days) | auth token lifetime, seconds |
@@ -71,6 +74,9 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_SENTRY_DSN` | — | `""` (log to stderr) | set to enable Sentry error reporting |
 | `ZIGBASE_RATE_LIMIT_MAX` | — | `10` | max sensitive-auth attempts per window per client; `0` disables rate limiting |
 | `ZIGBASE_RATE_LIMIT_WINDOW` | — | `60` | rate-limit window length, seconds |
+| `ZIGBASE_OAUTH_STATE_SERVER` | — | `true` | server-side OAuth `state` (CSRF) store is **on by default**; set `false` to opt out (client-driven state only — PKCE still required) |
+| `ZIGBASE_OAUTH_STATE_TTL` | — | `600` (10 min) | server-side OAuth `state` lifetime, seconds |
+| `ZIGBASE_PUBLIC_URL` | — | `""` | public base URL used to build user-facing links (magic-link sign-in emails). Unset → magic-link emails contain the raw token instead of a clickable URL |
 | `ZIGBASE_SMTP_HOST` | — | `""` (use LogMailer) | SMTP server host; set to deliver verify/reset email instead of logging |
 | `ZIGBASE_SMTP_PORT` | — | `25` | SMTP server port |
 | `ZIGBASE_SMTP_USERNAME` | — | `""` | SMTP username; non-empty enables `AUTH LOGIN` |

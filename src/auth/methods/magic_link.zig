@@ -147,7 +147,7 @@ fn buildMailBody(
     const base = std.mem.trimEnd(u8, public_url, "/");
     return std.fmt.allocPrint(
         alloc,
-        "Click the link to sign in:\n\n{s}/api/collections/{s}/auth/magic_link/consume?token={s}&redirect={s}\n",
+        "Click the link to sign in:\n\n{s}/api/collections/{s}/auth/magic-link/consume?token={s}&redirect={s}\n",
         .{ base, col_name, token, redirect },
     );
 }
@@ -423,7 +423,7 @@ test "buildMailBody: clickable consume link when public_url is set (trailing sla
     defer arena.deinit();
     const body = try buildMailBody(arena.allocator(), "http://blog.test/", "users", "TOK.EN", "/dashboard");
     try std.testing.expectEqualStrings(
-        "Click the link to sign in:\n\nhttp://blog.test/api/collections/users/auth/magic_link/consume?token=TOK.EN&redirect=/dashboard\n",
+        "Click the link to sign in:\n\nhttp://blog.test/api/collections/users/auth/magic-link/consume?token=TOK.EN&redirect=/dashboard\n",
         body,
     );
 }

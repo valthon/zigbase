@@ -113,7 +113,8 @@ export class CollectionService {
     }
   }
 
-  listAuthProviders(): Promise<{ providers: OAuth2Provider[] }> {
+  /** Changed in server 0.10: was `{providers}`, now the house `{items}` list envelope. */
+  listAuthProviders(): Promise<{ items: OAuth2Provider[] }> {
     return this.transport.send(`${this.base()}/auth/oauth2/providers`, { method: "GET" });
   }
 
@@ -131,7 +132,7 @@ export class CollectionService {
     });
   }
 
-  confirmVerification(token: string): Promise<{ verified: boolean }> {
+  confirmVerification(token: string): Promise<void> {
     return this.transport.send(`${this.base()}/confirm-verification`, {
       method: "POST",
       body: { token },
@@ -146,7 +147,7 @@ export class CollectionService {
     });
   }
 
-  confirmPasswordReset(token: string, password: string): Promise<{ success: boolean }> {
+  confirmPasswordReset(token: string, password: string): Promise<void> {
     return this.transport.send(`${this.base()}/confirm-password-reset`, {
       method: "POST",
       body: { token, password },

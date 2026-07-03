@@ -29,8 +29,8 @@ const zigbase = @import("zigbase");
 
 /// before_create on "posts": derive a URL slug from the title if one isn't set.
 /// NOTE: record mutations MUST allocate with `ev.arena` (the request-scoped
-/// allocator that owns `ev.record`), NOT `ev.app.allocator` (the long-lived gpa) —
-/// mixing allocators on the arena-backed JSON map is undefined behavior.
+/// allocator that owns `ev.record`) — mixing allocators on the arena-backed
+/// JSON map is undefined behavior. Need the app itself? Use `ctx.app`.
 fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     _ = ctx;
     if (ev.record.* != .object) return; // framework already guards this; defensive
@@ -69,7 +69,7 @@ fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 fn setAuthor(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     _ = ctx;
     if (ev.record.* != .object) return;
-    if (ev.ctx.auth) |auth| if (auth == .object) {
+    if (ev.rctx.auth) |auth| if (auth == .object) {
         if (auth.object.get("id")) |idv| if (idv == .string) {
             const uid = try ev.arena.dupe(u8, idv.string);
             try ev.record.object.put(ev.arena, "author", .{ .string = uid });
@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .method = .GET, .path = "/api/blog/ping", .handler = ping, .auth = .public },
             .{ .method = .GET, .path = "/api/blog/posts/:slug", .handler = getPostBySlug, .auth = .public },
         },
-        .jobs = .{ .pool_size = 2 },
+        .pools = .{ .jobs = 2 },
         .cron = .{
             .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
         },

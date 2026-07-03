@@ -127,7 +127,7 @@ pub fn begin(ctx: *http.RequestCtx) anyerror!http.Response {
 ///
 /// Requires: authenticated session.
 /// Body: { ceremonyId, attestationObject, clientDataJSON }
-/// Returns: { "registered": true } on success.
+/// Returns: 204 No Content on success.
 pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator);
 
@@ -234,7 +234,7 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         );
     }
 
-    return http.Response{ .status = 200, .body = "{\"registered\":true}" };
+    return http.Response{ .status = 204, .body = "" };
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +304,7 @@ test "webauthn_register begin: unauthenticated returns 401" {
     try std.testing.expectEqual(@as(u16, 401), res.status);
 }
 
-test "webauthn_register finish: stores credential and returns registered=true" {
+test "webauthn_register finish: stores credential and returns 204" {
     const api_auth = @import("auth.zig");
     const jwt = @import("../jwt.zig");
     const crypto = @import("../crypto.zig");
@@ -392,8 +392,8 @@ test "webauthn_register finish: stores credential and returns registered=true" {
 
     // Writer is released; finish() can now acquire it without deadlocking.
     const res = try finish(&ctx);
-    try std.testing.expectEqual(@as(u16, 200), res.status);
-    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"registered\":true") != null);
+    try std.testing.expectEqual(@as(u16, 204), res.status);
+    try std.testing.expectEqualStrings("", res.body);
 
     // Post-verify: re-acquire writer in a new scoped block to check stored credential.
     // Use alloc (testing allocator) so the explicit defer frees are valid.

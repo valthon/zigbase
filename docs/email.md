@@ -77,6 +77,11 @@ the call site rather than later inside a worker; it requires a wired queue (see 
 [jobs & webhooks guide](./jobs-and-webhooks.md)). When no mailer is wired (CLI/tests), `send` logs
 a fallback line instead of failing.
 
+`enqueue` also requires mail to be configured — a `.mailer` plugin, or `.mail = .{}` to enable
+background delivery with the default env-configured mailer. Without either, the `"mail"` job kind
+is not compiled in and `enqueue` fails at call time with `error.UnknownJobKind`. `send` is
+unaffected — it delivers directly through the mailer, not the queue.
+
 ## Senders & suppression
 
 **Verified per-account sender identities.** Prove an account controls a From address before it may

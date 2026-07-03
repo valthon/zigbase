@@ -337,9 +337,9 @@ Two patterns:
    fn setOwner(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
        _ = ctx;
        if (ev.record.* != .object) return;
-       const uid = ev.ctx.resolveMacro("@request.auth.id") orelse "";
+       const uid = ev.rctx.resolveMacro("@request.auth.id") orelse "";
        if (uid.len == 0) return error.Unauthenticated; // reject anonymous creates -> 400
-       try ev.record.object.put(ev.arena, "owner", .{ .string = uid }); // ev.arena, not app.allocator
+       try ev.record.object.put(ev.arena, "owner", .{ .string = uid }); // ev.arena
    }
    ```
    Register it as `.hooks = .{ .simulators = .{ .beforeCreate = setOwner } }`. See
@@ -452,8 +452,8 @@ Register it:
 Key points:
 
 - **Use `ev.arena`** for anything stored into `ev.record` (the request-scoped
-  allocator that owns the record's JSON), never `ev.app.allocator`. See
-  [framework.md → CRITICAL: use ev.arena](framework.md#critical-use-evarena-not-evappallocator).
+  allocator that owns the record's JSON). See
+  [framework.md → Always allocate record data with ev.arena](framework.md#always-allocate-record-data-with-evarena).
 - **`ctx.records().list(collection, opts)`** returns a `ListResult` with `totalItems`
   (a `?i64` — `orelse 0` it) and `items`; the `opts` is a `ListOptions` (`.filter`,
   `.sort`, `.page`, `.perPage`). `ctx.records()` also offers `get`, `create`, `update`, `delete`.
@@ -585,7 +585,7 @@ Register it on a schedule (cron/interval handlers have the
 `fn (*Ctx, *JobEvent) anyerror!void` signature):
 
 ```zig
-.jobs = .{ .pool_size = 2 },
+.pools = .{ .jobs = 2 },
 .cron = .{
     .{ .name = "expire-bookings",
        .schedule = zigbase.schedule.Schedule{ .cron = "0 3 * * *" }, // 03:00 UTC daily
@@ -778,11 +778,15 @@ Key behaviours to note:
 
 ## Recipe: enable magic-link + OTP via config
 
-No route code needed — enable methods in your collection declaration:
+No route code needed — enable methods in your collection declaration. If you don't
+use WebAuthn or OAuth2, select the exact built-in set with `.auth_methods.builtins`
+so their code (WebAuthn's CBOR/COSE stack in particular, ~3.2k LOC) never ends up
+in your binary:
 
 ```zig
 // No route code needed — enable methods in your collection declaration:
 zigbase.App(.{
+    .auth_methods = .{ .builtins = .{ .password, .magic_link, .otp } },
     .collections = .{
         .members = .{ .type = .auth, .auth = .{
             .methods = .{

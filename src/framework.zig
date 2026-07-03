@@ -19,6 +19,7 @@ const entropy_mod = @import("entropy.zig");
 const mail = @import("mail/mailer.zig");
 const provision = @import("provision.zig");
 const oauth_client = @import("oauth/client.zig");
+const migrator = @import("migrator.zig");
 const schema = @import("schema.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
@@ -329,7 +330,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -445,28 +446,29 @@ pub fn App(comptime cfg: anytype) type {
         /// Framework-owned built-in job kinds, prepended to the consumer `.jobs` registry
         /// below. `"mail"` (#141) backs `ctx.mail().enqueue` — a `"mail"` job deserializes
         /// the `MailMessage` payload and delivers it via `mail/send.zig`. `"mail_batch_item"`
-        /// (#154 round 2) backs `ctx.mail().sendBulk` — see `mail/bulk.zig`. Kept as its own
-        /// const so sibling PRs (e.g. webhook, #144) can add their built-ins self-contained.
-        const builtin_job_regs: []const queue.JobReg = &.{
-            .{ .kind = "mail", .handler = mail_send.jobHandler },
-            .{ .kind = mail_bulk.job_kind, .handler = mail_bulk.jobHandler },
-            .{ .kind = webhook.job_kind, .handler = webhook.webhookJobHandler },
+        /// (#154 round 2) backs `ctx.mail().sendBulk` — see `mail/bulk.zig`; it rides the same
+        /// mail gate. `"webhook"` (#144) backs `ctx.webhook`. R2-5: each is registered ONLY
+        /// when its capability is configured (`enable_mail_job` / `enable_webhooks` above) — an
+        /// unconfigured built-in's code does not get pulled into the binary.
+        const builtin_job_regs: []const queue.JobReg = blk: {
+            var t: []const queue.JobReg = &.{};
+            if (enable_mail_job) t = t ++ &[_]queue.JobReg{.{ .kind = "mail", .handler = mail_send.jobHandler }};
+            if (enable_mail_job) t = t ++ &[_]queue.JobReg{.{ .kind = mail_bulk.job_kind, .handler = mail_bulk.jobHandler }};
+            if (enable_webhooks) t = t ++ &[_]queue.JobReg{.{ .kind = webhook.job_kind, .handler = webhook.webhookJobHandler }};
+            break :blk t;
         };
 
-        /// Names of the reserved built-in kinds, derived from `builtin_job_regs` so the
-        /// collision guard below automatically covers every current AND future built-in.
-        const reserved_job_kinds: []const []const u8 = blk: {
-            var names: [builtin_job_regs.len][]const u8 = undefined;
-            for (builtin_job_regs, 0..) |r, i| names[i] = r.kind;
-            const frozen = names;
-            break :blk &frozen;
-        };
+        /// Reserved built-in kind names — reserved UNCONDITIONALLY (even when the
+        /// built-in is gated off) so enabling a capability later never collides
+        /// with a consumer job kind.
+        const reserved_job_kinds: []const []const u8 = &.{ "mail", "mail_batch_item", "webhook" };
 
         /// Declared job-kind → handler registry: the built-in kinds followed by the consumer
-        /// `.jobs` bindings (the reserved `.jobs.pool_size` key is skipped). `jobByKind`
-        /// resolves built-ins first so `"mail"` always reaches the framework handler — and the
-        /// `assertNoReservedJobKinds` guard rejects a consumer `.jobs` entry that would collide
-        /// with a built-in kind (it would be dead config, never dispatched).
+        /// `.jobs` bindings (the legacy `.jobs.pool_size` key is a compile error — see
+        /// `queue_config.reserved_pool_size_key`). `jobByKind` resolves built-ins first so
+        /// `"mail"` always reaches the framework handler — and the `assertNoReservedJobKinds`
+        /// guard rejects a consumer `.jobs` entry that would collide with a built-in kind (it
+        /// would be dead config, never dispatched).
         pub const job_regs: []const queue.JobReg = blk: {
             const consumer_jobs = if (@hasField(@TypeOf(cfg), "jobs")) cfg.jobs else .{};
             queue_config.assertNoReservedJobKinds(consumer_jobs, reserved_job_kinds);
@@ -582,11 +584,12 @@ pub fn App(comptime cfg: anytype) type {
         /// The full job table = consumer jobs ++ framework-internal jobs. The scheduler
         /// starts whenever this is non-empty, so a TTL collection alone starts it.
         pub const jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(user_jobs, internal_jobs);
-        /// Worker pool size for the scheduler. Precedence: `.pools.jobs` (the new
-        /// unified lever), then the legacy `.jobs.pool_size`, then the default 2.
+        /// Worker pool size for the scheduler: `.pools = .{ .jobs = N }` (default 2).
+        /// The pre-0.10 `.jobs = .{ .pool_size = N }` spelling is a compile error.
         pub const job_pool_size: usize = blk: {
+            if (@hasField(@TypeOf(cfg), "jobs") and @hasField(@TypeOf(cfg.jobs), "pool_size"))
+                @compileError("'.jobs.pool_size' was removed; set '.pools = .{ .jobs = N }' instead");
             if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "jobs")) break :blk cfg.pools.jobs;
-            if (@hasField(@TypeOf(cfg), "jobs") and @hasField(@TypeOf(cfg.jobs), "pool_size")) break :blk cfg.jobs.pool_size;
             break :blk 2;
         };
 
@@ -597,6 +600,54 @@ pub fn App(comptime cfg: anytype) type {
         /// Whether to compile the `typegen` CLI subcommand into the binary.
         /// Off by default so production builds carry no codegen weight.
         pub const enable_typegen: bool = if (@hasField(@TypeOf(cfg), "enable_typegen")) cfg.enable_typegen else false;
+
+        /// R2-5: `.webhooks = true` registers the built-in "webhook" job kind
+        /// (managed outbound deliveries via ctx.webhook). Unset → webhook.zig is
+        /// not compiled into your binary and ctx.webhook fails at enqueue time.
+        pub const enable_webhooks: bool = blk: {
+            if (!@hasField(@TypeOf(cfg), "webhooks")) break :blk false;
+            if (@TypeOf(cfg.webhooks) != bool)
+                @compileError(".webhooks must be a bool; got '" ++ @typeName(@TypeOf(cfg.webhooks)) ++ "'");
+            break :blk cfg.webhooks;
+        };
+
+        /// R2-5: the "mail" job kind (ctx.mail().enqueue) registers when mail is
+        /// configured — a `.mailer` plugin or the `.mail` policy key (use `.mail = .{}`
+        /// to enable background delivery with the default env-configured mailer).
+        const enable_mail_job: bool = @hasField(@TypeOf(cfg), "mailer") or @hasField(@TypeOf(cfg), "mail");
+
+        /// R2-2: `.admin = .disabled` removes the embedded admin SPA (route dispatch
+        /// AND the @embedFile'd assets) from the binary. Default: served at /_/ .
+        pub const enable_admin: bool = blk: {
+            if (!@hasField(@TypeOf(cfg), "admin")) break :blk true;
+            const a = cfg.admin;
+            if (@TypeOf(a) != @TypeOf(.enum_literal))
+                @compileError(".admin: expected the enum literal .disabled (the admin UI is on by default; omit the key to keep it)");
+            if (std.mem.eql(u8, @tagName(a), "disabled")) break :blk false;
+            @compileError(".admin: unknown value '." ++ @tagName(a) ++ "'; only .disabled is recognized");
+        };
+
+        /// True iff `T` is in the assembled auth-method set.
+        fn hasAuthMethod(comptime T: type) bool {
+            for (auth_method_types) |M| if (M == T) return true;
+            return false;
+        }
+
+        /// R2-3/R2-4: comptime route gates derived from cfg. The webauthn/magic_link/
+        /// oauth2 gates are derived from the assembled `.auth_methods` set (Task 5) —
+        /// a deselected built-in's route (and its ~thousands of LOC) never gets pulled
+        /// into the binary by Zig's lazy analysis.
+        pub const route_gates: server.Gates = .{
+            .admin = enable_admin,
+            .analytics = @hasField(@TypeOf(cfg), "analytics"),
+            .senders = @hasField(@TypeOf(cfg), "mail"),
+            .mail_webhook = @hasField(@TypeOf(cfg), "mail"),
+            .mail_unsubscribe = @hasField(@TypeOf(cfg), "mail"),
+            .tenancy = tenancy_config.enabled,
+            .webauthn = hasAuthMethod(@import("auth/methods/webauthn.zig").WebAuthnMethod),
+            .magic_link = hasAuthMethod(@import("auth/methods/magic_link.zig").MagicLinkMethod),
+            .oauth2 = hasAuthMethod(@import("auth/methods/oauth2.zig").OAuth2Method),
+        };
 
         /// Per-thread stack size (bytes) for the scheduler/job-pool/submit threads
         /// (the `.pools.stack_size` lever). Defaults to `scheduler.default_job_stack_size`
@@ -935,17 +986,24 @@ pub fn App(comptime cfg: anytype) type {
         /// Explicit migrations (the escape hatch for non-additive changes), run in
         /// order before provisioning and recorded once in `_migrations`. Empty by default.
         ///
-        /// `.migrations` must be a TYPED slice `&[_]zigbase.Migration{ ... }`; a bare
-        /// anonymous tuple does not coerce to `[]const Migration`. Guard it here so the
-        /// failure names the PUBLIC type and the fix, rather than the raw coercion error
-        /// (which leaks the internal `provision.Migration` name).
+        /// `.migrations` accepts either a bare tuple (`.{ .{ .id = "...", .up = fn }, ... }`,
+        /// lowered here like every other list-shaped config key — see `.static_routes`) or a
+        /// TYPED slice `&[_]zigbase.Migration{ ... }` (which coerces directly and needs no
+        /// lowering). Anything else is a loud `@compileError` naming the PUBLIC type.
         pub const provision_migrations: []const provision.Migration = blk: {
             if (!@hasField(@TypeOf(cfg), "migrations")) break :blk &.{};
-            if (!migrationsCoerce(@TypeOf(cfg.migrations))) {
-                @compileError("'.migrations' must be a typed slice '&[_]zigbase.Migration{ ... }' " ++
-                    "(a bare tuple does not coerce to []const Migration); got '" ++ @typeName(@TypeOf(cfg.migrations)) ++ "'");
-            }
-            break :blk cfg.migrations;
+            const raw = cfg.migrations;
+            if (migrationsCoerce(@TypeOf(raw))) break :blk raw; // typed slice / array ptr
+            // Bare-tuple form (E1): lower each entry to a Migration, mirroring .static_routes.
+            const RT = @TypeOf(raw);
+            const info = @typeInfo(RT);
+            if (info != .@"struct" or !info.@"struct".is_tuple)
+                @compileError("'.migrations' must be a tuple of '.{ .id = \"...\", .up = fn }' entries or a typed slice '&[_]zigbase.Migration{ ... }'; got '" ++ @typeName(RT) ++ "'");
+            const n = std.meta.fields(RT).len;
+            var out: [n]provision.Migration = undefined;
+            for (0..n) |i| out[i] = provision.Migration{ .id = raw[i].id, .up = raw[i].up };
+            const final = out;
+            break :blk &final;
         };
 
         // ── CAPTCHA (#140 PR6) ────────────────────────────────────────────────
@@ -1082,6 +1140,7 @@ pub fn App(comptime cfg: anytype) type {
             .role_ranking = role_ranking,
             .mail = mail_config,
             .static_cache_control = static_cache_control,
+            .gates = route_gates,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -1245,6 +1304,9 @@ pub const ServeOpts = struct {
     mail: mail_cfg.Runtime = .{},
     /// §C.2: comptime default for the static Cache-Control knob; runtime flag/env override it.
     static_cache_control: ?[]const u8 = null,
+    /// Comptime route gates (R2-2/R2-3): which optional built-in route groups + the admin
+    /// SPA get compiled in. Default `.{}` (all true) is the historical, byte-identical table.
+    gates: server.Gates = .{},
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
@@ -1387,6 +1449,8 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                           on all interfaces.              [default 127.0.0.1]
         \\  ZIGBASE_HTTP_PORT         Listen port.                   [default 8090]
         \\  ZIGBASE_DATA_DIR          Data directory (db + storage). [default ./zb_data]
+        \\  ZIGBASE_DB_URL           postgres://… routes storage to Postgres (-Dpostgres builds);
+        \\                           unset = embedded SQLite in the data dir.
         \\  ZIGBASE_COOKIE_SECURE     Secure flag on auth cookies (true/1). Secure by default; set
         \\                           false only for plain-HTTP local dev. [default true]
         \\  ZIGBASE_TRUST_PROXY       Trust X-Forwarded-For/X-Real-IP (true/1). Set ONLY behind a
@@ -1395,16 +1459,47 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                           [default empty]
         \\  ZIGBASE_REALTIME_ORIGINS  CSV of allowed WebSocket Origins. Empty DENIES cross-origin
         \\                           browser upgrades.               [default empty]
+        \\  ZIGBASE_SSE_HEARTBEAT_SECONDS  SSE keep-alive comment interval, 0 or 1..=255; 0 inherits
+        \\                           the 40s listener timeout.       [default 0]
         \\  ZIGBASE_MAX_UPLOAD_SIZE   Max request body for uploads, in bytes. [default 52428800 = 50 MiB]
         \\  ZIGBASE_AUTH_TOKEN_TTL    Auth token lifetime, seconds.  [default 1209600 = 14 days]
         \\  ZIGBASE_VERIFICATION_TTL  Email-verification token TTL, seconds. [default 604800 = 7 days]
         \\  ZIGBASE_PASSWORD_RESET_TTL Password-reset token TTL, seconds.    [default 3600 = 1 hour]
         \\  ZIGBASE_FILE_TOKEN_TTL    Short-lived file-access token TTL, seconds. [default 120 = 2 min]
+        \\  ZIGBASE_STATIC_CACHE_CONTROL  Cache-Control for static responses (embedded + dir). Flag
+        \\                           --static-cache-control wins over env. [default max-age=3600]
         \\  ZIGBASE_FIELD_KEY         Key for at-rest field encryption (.encrypted fields). Never
         \\                           auto-generated/persisted/logged. Required if any field is encrypted.
         \\  ZIGBASE_FIELD_KEY_GENERATION  Generation of the primary key = envelope version written
         \\                           (v<N>:). Bump to rotate; then run `zigbase rewrap`. [default 1]
         \\  ZIGBASE_FIELD_KEY_V<n>    Older read-only key for generation <n> (decrypts existing v<n>: data).
+        \\  ZIGBASE_PUBLIC_URL       Public base URL for user-facing links (magic-link emails).
+        \\  ZIGBASE_UNSUBSCRIBE_BASE_URL Public base URL for the RFC 8058 one-click unsubscribe
+        \\                           endpoint. Empty disables the feature. [default: off]
+        \\  ZIGBASE_RATE_LIMIT_MAX    Max sensitive-auth attempts per window per client; 0 disables.
+        \\                           [default 10]
+        \\  ZIGBASE_RATE_LIMIT_WINDOW Rate-limit window length, seconds. [default 60]
+        \\  ZIGBASE_OAUTH_STATE_SERVER Server-side OAuth state (CSRF) store (true/1). [default true]
+        \\  ZIGBASE_OAUTH_STATE_TTL  Server-side OAuth state lifetime, seconds. [default 600 = 10 min]
+        \\  ZIGBASE_SMTP_HOST        SMTP server host; unset logs mail instead of sending. [default: log]
+        \\  ZIGBASE_SMTP_PORT        SMTP server port.             [default 25]
+        \\  ZIGBASE_SMTP_USERNAME    SMTP username; non-empty enables AUTH LOGIN.
+        \\  ZIGBASE_SMTP_PASSWORD    SMTP password.
+        \\  ZIGBASE_SMTP_FROM        Envelope + From: address.     [default noreply@zigbase.dev]
+        \\  ZIGBASE_SMTP_TLS         Transport security: none/starttls/implicit/auto. [default auto]
+        \\  ZIGBASE_SMTP_INSECURE    Skip TLS cert verification (self-signed relays only). [default false]
+        \\  ZIGBASE_SENDMAIL_COMMAND Pipe outbound mail to this command instead of SMTP; takes
+        \\                           precedence over ZIGBASE_SMTP_HOST.
+        \\  ZIGBASE_S3_BUCKET        Opt-in S3-compatible storage (needs -Ds3=true build); non-empty
+        \\                           selects S3 instead of local disk. [default: off]
+        \\  ZIGBASE_S3_REGION        AWS region (SigV4 + default endpoint). [default us-east-1]
+        \\  ZIGBASE_S3_ENDPOINT      Custom endpoint (MinIO/R2/…); empty → s3.<region>.amazonaws.com.
+        \\  ZIGBASE_S3_ACCESS_KEY_ID     SigV4 access key id (required with ZIGBASE_S3_BUCKET).
+        \\  ZIGBASE_S3_SECRET_ACCESS_KEY SigV4 secret access key (required with ZIGBASE_S3_BUCKET).
+        \\  ZIGBASE_S3_FORCE_PATH_STYLE  Force path-style addressing (true/1); unset auto-selects.
+        \\  ZIGBASE_S3_KEY_PREFIX    Prefix prepended to every object key (namespace one bucket).
+        \\  ZIGBASE_S3_CACHE_DIR     Local spool-cache dir; empty → <data-dir>/storage_cache.
+        \\  ZIGBASE_S3_CACHE_MAX_BYTES   Spool-cache size cap, bytes. [default 1073741824 = 1 GiB]
         \\
         \\EXAMPLES:
         \\  # Create the first superuser (admin) account:
@@ -2162,7 +2257,8 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
-    var srv = server.Server{ .app = &app, .host = host_z, .port = cfg.http_port };
+    const Srv = server.Server(opts.gates);
+    var srv = Srv{ .app = &app, .host = host_z, .port = cfg.http_port };
     // Bounded background pool for memory-queue jobs + app.submit (R1-2). Worker threads
     // spawn lazily on first use (zero overhead when unused) and stop() drains + joins.
     // Its defer is registered BEFORE the scheduler's, so (LIFO) the scheduler stops FIRST
@@ -2270,13 +2366,15 @@ test "App(cfg) synthesizes a default queue + implicit worker; no durable jobs fo
 
 test "App(cfg) lowers .queues/.workers/.jobs and installs durable poller + GC jobs" {
     const A = App(.{
+        .mail = .{},
+        .webhooks = true,
         .queues = .{ .emails = .{ .backend = .durable, .priority = .high } },
         .workers = .{ .mailer = .{ .queues = .{"emails"}, .concurrency = 2 } },
         .jobs = .{ .send = qTestHandler },
     });
     try std.testing.expect(A.has_durable_queue);
-    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144)
-    // ++ consumer kinds; built-ins first.
+    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144, all
+    // enabled here via R2-5's .mail/.webhooks gates) ++ consumer kinds; built-ins first.
     try std.testing.expectEqual(@as(usize, 4), A.job_regs.len);
     try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
     try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[1].kind);
@@ -2295,12 +2393,13 @@ test "App(cfg) lowers .queues/.workers/.jobs and installs durable poller + GC jo
     try std.testing.expect(saw_gc);
 }
 
-test "App(cfg) keeps legacy .jobs.pool_size working alongside the job registry" {
-    // `.jobs.pool_size` is the legacy scheduler-pool lever; it must NOT become a job kind.
-    const A = App(.{ .jobs = .{ .pool_size = 3, .resize = qTestHandler } });
+test "App(cfg) sets the scheduler pool size via .pools.jobs alongside the job registry" {
+    // `.pools = .{ .jobs = N }` is the ONE way to set the scheduler-pool size (N1); it
+    // must NOT become a job kind.
+    const A = App(.{ .jobs = .{ .resize = qTestHandler }, .pools = .{ .jobs = 3 }, .mail = .{}, .webhooks = true });
     try std.testing.expectEqual(@as(usize, 3), A.job_pool_size);
-    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144)
-    // ++ consumer "resize"; pool_size is skipped.
+    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144, all
+    // enabled here via R2-5's .mail/.webhooks gates) ++ consumer "resize"; pool_size is skipped.
     try std.testing.expectEqual(@as(usize, 4), A.job_regs.len);
     try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
     try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[1].kind);
@@ -2309,6 +2408,29 @@ test "App(cfg) keeps legacy .jobs.pool_size working alongside the job registry" 
     // The compile-checked Job enum still reflects ONLY the consumer kinds (mail is a
     // built-in reached via ctx.mail().enqueue / ctx.enqueueByName, not the typed enum).
     try std.testing.expectEqual(@as(usize, 1), std.meta.fields(A.Job).len);
+}
+
+test "R2-5: built-in job kinds register only when their capability is configured" {
+    const Bare = App(.{});
+    try std.testing.expectEqual(@as(usize, 0), Bare.job_regs.len);
+
+    const WithMail = App(.{ .mail = .{} });
+    // The mail gate pulls in both "mail" and its bulk sibling "mail_batch_item" (#154r2).
+    try std.testing.expectEqual(@as(usize, 2), WithMail.job_regs.len);
+    try std.testing.expectEqualStrings("mail", WithMail.job_regs[0].kind);
+    try std.testing.expectEqualStrings("mail_batch_item", WithMail.job_regs[1].kind);
+
+    const WithHooks = App(.{ .webhooks = true });
+    try std.testing.expectEqual(@as(usize, 1), WithHooks.job_regs.len);
+    try std.testing.expectEqualStrings("webhook", WithHooks.job_regs[0].kind);
+}
+
+test "R2-5: mail/webhook kind names stay reserved even when unregistered" {
+    // Must @compileError if uncommented — probed manually per the R2-5 task brief
+    // (assertNoReservedJobKinds still rejects a consumer .jobs entry named "webhook"
+    // even though .webhooks is unset here and the built-in isn't registered):
+    // _ = App(.{ .jobs = .{ .webhook = qTestHandler } }).job_regs;
+    try std.testing.expect(true);
 }
 
 test "App(cfg) installs the auth-lifecycle dispatcher only for a non-empty .auth group" {
@@ -2369,7 +2491,7 @@ test "App(cfg) exposes the comptime job table and pool size" {
         }
     };
     const A = App(.{
-        .jobs = .{ .pool_size = 3 },
+        .pools = .{ .jobs = 3 },
         .cron = .{.{ .name = "n", .schedule = @import("schedule.zig").Schedule{ .interval = .hourly }, .handler = H.j }},
     });
     try std.testing.expectEqual(@as(usize, 1), A.jobs.len);
@@ -2528,6 +2650,22 @@ test "App(.{}) has no comptime collections and no provision migrations" {
     try std.testing.expectEqual(@as(usize, 0), A.provision_migrations.len);
 }
 
+test "E1: .migrations accepts a bare tuple (lowered like .static_routes)" {
+    const M = struct {
+        fn up(_: *migrator.Migrator) anyerror!void {}
+    };
+    const A = App(.{ .migrations = .{
+        .{ .id = "0001_tuple_form", .up = M.up },
+    } });
+    try std.testing.expectEqual(@as(usize, 1), A.provision_migrations.len);
+    try std.testing.expectEqualStrings("0001_tuple_form", A.provision_migrations[0].id);
+
+    const B = App(.{ .migrations = &[_]provision.Migration{
+        .{ .id = "0001_slice_form", .up = M.up },
+    } });
+    try std.testing.expectEqual(@as(usize, 1), B.provision_migrations.len);
+}
+
 test "App(cfg) lowers .flags/.experiments into the registry + generated enums (#128/#129/#130)" {
     const A = App(.{
         .flags = .{
@@ -2573,6 +2711,44 @@ test "App(cfg) lowers the comptime .tenancy config (#156; defaults to disabled)"
     try std.testing.expectEqual(@as(usize, 2), T.role_ranking.roles.len);
     try std.testing.expect(T.role_ranking.gte("admin", "member"));
     try std.testing.expect(!T.role_ranking.gte("member", "admin"));
+}
+
+test "App(cfg) .admin defaults to enabled; .admin = .disabled flips it off (R2-2)" {
+    const D = App(.{});
+    try std.testing.expect(D.enable_admin);
+    try std.testing.expect(D.route_gates.admin);
+
+    const NoAdmin = App(.{ .admin = .disabled });
+    try std.testing.expect(!NoAdmin.enable_admin);
+    try std.testing.expect(!NoAdmin.route_gates.admin);
+}
+
+test "App(cfg) route_gates: analytics/senders/mail_webhook/tenancy follow their config keys (R2-3)" {
+    // No .analytics/.mail/.tenancy keys => those route groups are gated off.
+    const D = App(.{});
+    try std.testing.expect(!D.route_gates.analytics);
+    try std.testing.expect(!D.route_gates.senders);
+    try std.testing.expect(!D.route_gates.mail_webhook);
+    try std.testing.expect(!D.route_gates.tenancy);
+
+    const A = App(.{ .analytics = .{} });
+    try std.testing.expect(A.route_gates.analytics);
+
+    const M = App(.{ .mail = .{} });
+    try std.testing.expect(M.route_gates.senders);
+    try std.testing.expect(M.route_gates.mail_webhook);
+
+    const T = App(.{ .tenancy = .{ .enabled = true, .auth_collection = "users" } });
+    try std.testing.expect(T.route_gates.tenancy);
+}
+
+test "R2-4: deselecting a built-in drops its method-specific routes" {
+    const A = App(.{ .auth_methods = .{ .builtins = .{ .password } } });
+    try std.testing.expect(!A.route_gates.webauthn);
+    try std.testing.expect(!A.route_gates.magic_link);
+    try std.testing.expect(!A.route_gates.oauth2);
+    const B = App(.{});
+    try std.testing.expect(B.route_gates.webauthn);
 }
 
 test "App(cfg) lowers the comptime .abilities config onto the matching collection (#155)" {

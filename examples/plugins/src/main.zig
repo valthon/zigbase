@@ -391,22 +391,22 @@ fn handleAuth(ev: *zigbase.AuthEvent) void {
 // ---------------------------------------------------------------------------
 // beforeCreate hook for comments -- auto-populate `commenter` from session.
 //
-//    The create rule (@request.auth.id != "") already gated access, so ev.ctx
+//    The create rule (@request.auth.id != "") already gated access, so ev.rctx
 //    is guaranteed to carry a valid auth identity at this point. We populate
 //    `commenter` from the session so the frontend does not need to pass it
 //    explicitly (and so the relation is always authoritative).
 //
-//    ev.ctx is *const request.RequestContext which carries:
+//    ev.rctx is *const request.RequestContext which carries:
 //      .auth: ?std.json.Value  -- the authenticated record object
 //    There is no direct `auth_id` shortcut; extract it from the JSON object.
 //    Allocate with ev.arena (the request-scoped allocator that owns ev.record's
-//    JSON storage) -- never ev.app.allocator.
+//    JSON storage) -- need the app itself? Use ctx.app.
 // ---------------------------------------------------------------------------
 fn beforeCreateComment(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     _ = ctx;
     // Populate `commenter` from the session identity if not provided by the client.
     if (ev.record.object.get("commenter") == null) {
-        const auth = ev.ctx.auth orelse return; // should never be null (rule gated)
+        const auth = ev.rctx.auth orelse return; // should never be null (rule gated)
         const auth_id = switch (auth.object.get("id") orelse .null) {
             .string => |s| s,
             else => return, // malformed auth object -- skip silently

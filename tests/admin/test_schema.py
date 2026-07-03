@@ -27,7 +27,7 @@ def test_number_fixed_scale_roundtrip(page):
     page.wait_for_selector('[data-test=nav-prices]', timeout=8000)
     page.wait_for_selector('[data-test=records-view]', timeout=8000)
     # the saved schema carries mode=fixed + scale=2
-    col = next(c for c in api_request(page, "GET", "/api/collections").json() if c["name"] == "prices")
+    col = next(c for c in api_request(page, "GET", "/api/collections").json()["items"] if c["name"] == "prices")
     fld = next(f for f in col["schema"] if f["name"] == "amount")
     assert fld["options"]["mode"] == "fixed"
     assert fld["options"]["scale"] == 2
@@ -39,7 +39,7 @@ def test_number_fixed_scale_roundtrip(page):
     page.select_option('[data-test=opt-mode]', 'float')
     save_collection_and_wait(page)
     page.wait_for_selector('[data-test=records-view]', timeout=8000)
-    col = next(c for c in api_request(page, "GET", "/api/collections").json() if c["name"] == "prices")
+    col = next(c for c in api_request(page, "GET", "/api/collections").json()["items"] if c["name"] == "prices")
     fld = next(f for f in col["schema"] if f["name"] == "amount")
     assert fld["options"]["mode"] == "float"
     assert "scale" not in fld["options"]
@@ -58,7 +58,7 @@ def test_number_fixed_without_scale_shows_field_error(page):
     # the server-side validation error renders under the field row
     page.wait_for_selector('[data-test=field-row] .error', timeout=8000)
     assert 'scale' in page.inner_text('[data-test=field-row] .error')
-    assert not any(c["name"] == "badprices" for c in api_request(page, "GET", "/api/collections").json())
+    assert not any(c["name"] == "badprices" for c in api_request(page, "GET", "/api/collections").json()["items"])
 
 def test_number_fixed_non_integer_scale_shows_field_error(page):
     login(page)
@@ -77,7 +77,7 @@ def test_number_fixed_non_integer_scale_shows_field_error(page):
     page.click('[data-test=save-collection]')
     page.wait_for_selector('[data-test=field-row] .error', timeout=8000)
     assert 'scale' in page.inner_text('[data-test=field-row] .error')
-    assert not any(c["name"] == "floatscale" for c in api_request(page, "GET", "/api/collections").json())
+    assert not any(c["name"] == "floatscale" for c in api_request(page, "GET", "/api/collections").json()["items"])
 
 def test_edit_rules_lock_toggle(page):
     login(page)
@@ -150,5 +150,5 @@ def test_rule_public_cancel_reverts_select(page):
     # the select reverts to 'locked' and no PUBLIC tag is shown; the rule stays unset (locked)
     page.wait_for_function("document.querySelector('[data-test=rulemode-viewRule]').value === 'locked'")
     assert page.locator('[data-test=pubtag-viewRule]').count() == 0
-    col = next(c for c in api_request(page, "GET", "/api/collections").json() if c["name"] == "cancels")
+    col = next(c for c in api_request(page, "GET", "/api/collections").json()["items"] if c["name"] == "cancels")
     assert col.get("viewRule") in (None, "")  # never became "@public"

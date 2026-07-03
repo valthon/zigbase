@@ -56,30 +56,44 @@ pub fn build(b: *std.Build) void {
     // default build already ships via SES) — no extra C sources.
     const s3 = b.option(bool, "s3", "Compile in the opt-in S3-compatible storage backend (default: off)") orelse false;
     build_options.addOption(bool, "s3", s3);
+    // SQLite FTS5 full-text search (#157). ON by default — it's a core feature, not an
+    // experiment. `-Dfts5=false` is the opt-OUT for lean custom builds that never declare a
+    // `.searchable` field: it drops `-DSQLITE_ENABLE_FTS5` from the SQLite C build (~250-400 KB
+    // smaller) and folds every FTS5 code path in src/search/fts.zig to comptime-dead. A disabled
+    // build fails a `?search=` request with a clean 400 and REFUSES TO START if any collection in
+    // the comptime schema declares a `.searchable` field (fail loud at boot, never a silent
+    // runtime 500 on first search). Postgres full-text search (tsvector/GIN) is a server-native
+    // feature and is NOT gated by this flag.
+    const fts5 = b.option(bool, "fts5", "Compile SQLite FTS5 full-text search into the binary (default true; -Dfts5=false for lean builds without .searchable fields)") orelse true;
+    build_options.addOption(bool, "fts5", fts5);
     zigbase_mod.addOptions("build_options", build_options);
 
     zigbase_mod.addIncludePath(b.path("vendor/sqlite"));
+    const sqlite_base_flags = [_][]const u8{
+        "-DSQLITE_THREADSAFE=1",
+        "-DSQLITE_DQS=0",
+        "-DSQLITE_DEFAULT_FOREIGN_KEYS=1",
+        "-DSQLITE_OMIT_LOAD_EXTENSION=1",
+        // Omit SQLite subsystems the framework provably never touches — db.zig uses
+        // only the UTF-8 prepare/step/bind/column/exec surface. This trims the
+        // amalgamation (smaller binary, ~10% faster C compile) with no behavior
+        // change. NOT trimmed by default: FTS5 (see `-Dfts5` above; a deliberate
+        // roadmap bet per docs/ideas.md) and anything the query/provision layers rely on.
+        "-DSQLITE_OMIT_UTF16", // no _text16/_prepare16/_column_text16 anywhere
+        "-DSQLITE_OMIT_DECLTYPE", // we read sqlite3_column_type, never _column_decltype
+        "-DSQLITE_OMIT_DEPRECATED", // no legacy APIs in use
+        "-DSQLITE_OMIT_PROGRESS_CALLBACK", // no sqlite3_progress_handler
+        "-DSQLITE_OMIT_TRACE", // no sqlite3_trace/profile
+        "-DSQLITE_OMIT_SHARED_CACHE", // single-process reader pool + one writer; never shared-cache
+        "-DSQLITE_DEFAULT_MEMSTATUS=0", // we never query sqlite3_memory_used/high_water
+    };
+    const sqlite_flags: []const []const u8 = if (fts5)
+        &(sqlite_base_flags ++ [_][]const u8{"-DSQLITE_ENABLE_FTS5"})
+    else
+        &sqlite_base_flags;
     zigbase_mod.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
-        .flags = &.{
-            "-DSQLITE_THREADSAFE=1",
-            "-DSQLITE_DQS=0",
-            "-DSQLITE_ENABLE_FTS5",
-            "-DSQLITE_DEFAULT_FOREIGN_KEYS=1",
-            "-DSQLITE_OMIT_LOAD_EXTENSION=1",
-            // Omit SQLite subsystems the framework provably never touches — db.zig uses
-            // only the UTF-8 prepare/step/bind/column/exec surface. This trims the
-            // amalgamation (smaller binary, ~10% faster C compile) with no behavior
-            // change. NOT trimmed: FTS5 (kept above; a deliberate roadmap bet per
-            // docs/ideas.md) and anything the query/provision layers rely on.
-            "-DSQLITE_OMIT_UTF16", // no _text16/_prepare16/_column_text16 anywhere
-            "-DSQLITE_OMIT_DECLTYPE", // we read sqlite3_column_type, never _column_decltype
-            "-DSQLITE_OMIT_DEPRECATED", // no legacy APIs in use
-            "-DSQLITE_OMIT_PROGRESS_CALLBACK", // no sqlite3_progress_handler
-            "-DSQLITE_OMIT_TRACE", // no sqlite3_trace/profile
-            "-DSQLITE_OMIT_SHARED_CACHE", // single-process reader pool + one writer; never shared-cache
-            "-DSQLITE_DEFAULT_MEMSTATUS=0", // we never query sqlite3_memory_used/high_water
-        },
+        .flags = sqlite_flags,
     });
     // Opt-in vector search: compile the sqlite-vec amalgamation STATICALLY into the same module
     // (SQLITE_CORE => it includes our vendored sqlite3.h and links against the in-tree SQLite;
@@ -140,6 +154,50 @@ pub fn build(b: *std.Build) void {
     const auth2_srv_exe = b.addExecutable(.{ .name = "auth2-server", .root_module = auth2_srv_mod });
     const auth2_srv_step = b.step("auth2-server", "Build the auth-round-2 e2e fixture server (table sessions + beforeAuthSuccess)");
     auth2_srv_step.dependOn(&b.addInstallArtifact(auth2_srv_exe, .{}).step);
+
+    // --- features-fixture: demo flags/experiments server for the browser suite ---
+    const features_fix_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/features/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    features_fix_mod.addImport("zigbase", zigbase_mod);
+    const features_fix_exe = b.addExecutable(.{ .name = "features-fixture", .root_module = features_fix_mod });
+    const features_fix_step = b.step("features-fixture", "Build the demo-features fixture server (browser tests)");
+    features_fix_step.dependOn(&b.addInstallArtifact(features_fix_exe, .{}).step);
+
+    // --- minimal-server: gating-invariant fixture (R2-7) --------------------------
+    // A consumer App with NOTHING optional configured. scripts/check-gating.sh nm-scans
+    // this binary to prove deselected subsystems (webauthn/magic_link/oauth2, analytics,
+    // senders, mail webhook, webhook/mail job kinds, admin SPA) leave zero symbols. Debug
+    // (the default optimize) keeps `strip` off (see the `strip` option above), so a plain
+    // `zig build minimal-server` is unstripped — no extra flag needed.
+    const minimal_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/minimal/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    minimal_mod.addImport("zigbase", zigbase_mod);
+    const minimal_exe = b.addExecutable(.{ .name = "minimal-server", .root_module = minimal_mod });
+    const minimal_step = b.step("minimal-server", "Build the lean gating-invariant fixture (Debug, unstripped)");
+    minimal_step.dependOn(&b.addInstallArtifact(minimal_exe, .{}).step);
+
+    // --- full-fixture: gating-invariant POSITIVE control (R2-7) -------------------
+    // The stock `zigbase` binary above doesn't configure .mail/.webhooks/.analytics,
+    // so scripts/check-gating.sh needs a binary that does, to prove those patterns
+    // aren't just drifted/vacuous. See fixtures/full/main.zig for the full rationale.
+    const full_fix_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/full/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    full_fix_mod.addImport("zigbase", zigbase_mod);
+    const full_fix_exe = b.addExecutable(.{ .name = "full-fixture", .root_module = full_fix_mod });
+    const full_fix_step = b.step("full-fixture", "Build the gating-invariant positive-control fixture (Debug, unstripped)");
+    full_fix_step.dependOn(&b.addInstallArtifact(full_fix_exe, .{}).step);
 
     // Unit tests run against the library module (where all internal test{} live).
     const tests = b.addTest(.{ .root_module = zigbase_mod });

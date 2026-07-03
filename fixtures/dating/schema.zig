@@ -152,6 +152,11 @@ pub const App = zigbase.App(.{
             },
         },
     },
+    // Enables the R2-3 route_gates.senders/mail_webhook group (`/api/senders`, `/api/senders/:id/verify`)
+    // so the TS integration suite (gap-services.integration.test.ts) can exercise sender-identity
+    // create/list/verify against this fixture. Enforcement stays fully off (all-default `Runtime`) —
+    // this only opts the fixture into the route surface, matching how a real consumer would enable it.
+    .mail = .{},
     .collections = .{
         .profiles = .{
             .type = .auth,

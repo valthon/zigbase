@@ -1,7 +1,12 @@
 //! Tenant-scoped analytics read API (#158).
 //!
-//!   GET /api/analytics/events?name=&actor=&since=&limit=   — the raw activity feed
-//!   GET /api/analytics/rollups/:name?from=&to=&group=       — a rollup's summary rows
+//!   GET /api/analytics/events?name=&actor=&since=&limit=&cursor=   — the raw activity feed
+//!   GET /api/analytics/rollups/:name?from=&to=&group=              — a rollup's summary rows
+//!
+//! `events` paginates with the house cursor vocabulary (R2/E7): the response carries
+//! `nextCursor`/`hasNext` alongside `items`, and a follow-up request passes that value back as
+//! `?cursor=`. The cursor is the opaque `"<occurred_at>|<id>"` keyset boundary of the last row
+//! of the previous page — a malformed cursor is a 400 "Invalid cursor.", never a partial page.
 //!
 //! BOTH endpoints are authenticated and FAIL CLOSED. Authorization, in one place so it can't drift:
 //!
@@ -91,6 +96,23 @@ fn emptyItems(ctx: *http.RequestCtx) !http.Response {
     return .{ .status = 200, .body = "{\"items\":[]}" };
 }
 
+/// `events`'s empty-result shape — the cursor keys are always present, never omitted, so a
+/// caller never has to special-case "did this response paginate."
+fn emptyEventsPage(ctx: *http.RequestCtx) !http.Response {
+    _ = ctx;
+    return .{ .status = 200, .body = "{\"items\":[],\"nextCursor\":null,\"hasNext\":false}" };
+}
+
+/// Split an opaque `"<occurred_at>|<id>"` cursor into its two keyset columns. Either half being
+/// empty (missing separator, or empty on one side) is malformed.
+fn parseCursor(raw: []const u8) ?struct { occurred_at: []const u8, id: []const u8 } {
+    const sep = std.mem.lastIndexOfScalar(u8, raw, '|') orelse return null;
+    const occurred_at = raw[0..sep];
+    const id = raw[sep + 1 ..];
+    if (occurred_at.len == 0 or id.len == 0) return null;
+    return .{ .occurred_at = occurred_at, .id = id };
+}
+
 /// GET /api/analytics/events — the tenant-scoped raw activity feed.
 ///
 /// VISIBILITY IS ACCOUNT-LEVEL, NOT ROLE-LEVEL: any ACTIVE member of the account (whatever their
@@ -111,10 +133,10 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
     if (scope.is_superuser) {
         // no base scope — superuser sees all events
     } else if (app.tenancy.enabled) {
-        if (scope.account.len == 0) return emptyItems(ctx); // no active account ⇒ nothing
+        if (scope.account.len == 0) return emptyEventsPage(ctx); // no active account ⇒ nothing
         try b.add("\"account\" =", scope.account);
     } else {
-        if (scope.actor.len == 0) return emptyItems(ctx);
+        if (scope.actor.len == 0) return emptyEventsPage(ctx);
         try b.add("\"actor\" =", scope.actor);
         try b.add("\"actor_collection\" =", scope.actor_collection);
     }
@@ -125,29 +147,55 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
     if (qp.get("actor")) |v| if (v.len > 0) try b.add("\"actor\" =", v);
     if (qp.get("since")) |v| if (v.len > 0) try b.add("\"occurred_at\" >=", v);
 
+    // Keyset pagination: `?cursor=` is the opaque "<occurred_at>|<id>" boundary of the last row
+    // of the previous page. Matches the ORDER BY below (occurred_at DESC, id DESC) — expanded to
+    // an OR rather than a SQLite row-value comparison for portability.
+    if (qp.get("cursor")) |raw| if (raw.len > 0) {
+        const cur = parseCursor(raw) orelse
+            return (ApiError{ .status = 400, .message = "Invalid cursor." }).toResponse(ctx.allocator);
+        const n1 = b.params.items.len + 1;
+        try b.conds.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator,
+            "(\"occurred_at\" < ?{d} OR (\"occurred_at\" = ?{d} AND \"id\" < ?{d}))", .{ n1, n1 + 1, n1 + 2 }));
+        try b.params.append(ctx.allocator, cur.occurred_at);
+        try b.params.append(ctx.allocator, cur.occurred_at);
+        try b.params.append(ctx.allocator, cur.id);
+    };
+
     const limit = parseLimit(qp.get("limit"));
     const where = try b.whereClause();
+    // Fetch one extra row as a hasNext lookahead; trimmed back to `limit` below.
     const sql = try std.fmt.allocPrintSentinel(ctx.allocator, "SELECT \"id\",\"created\",\"name\",\"payload\",\"actor_collection\",\"actor\",\"account\",\"occurred_at\" " ++
-        "FROM \"_events\"{s} ORDER BY \"occurred_at\" DESC, \"id\" DESC LIMIT {d};", .{ where, limit }, 0);
+        "FROM \"_events\"{s} ORDER BY \"occurred_at\" DESC, \"id\" DESC LIMIT {d};", .{ where, limit + 1 }, 0);
 
-    var st = reader.prepare(sql) catch return emptyItems(ctx);
+    var st = reader.prepare(sql) catch return emptyEventsPage(ctx);
     defer st.finalize();
     try b.bindAll(&st);
 
     var items = std.json.Array.init(ctx.allocator);
+    var fetched: usize = 0;
+    var has_next = false;
+    var pending_cursor: ?[]const u8 = null;
     while (try st.step()) {
+        fetched += 1;
+        if (fetched > limit) {
+            has_next = true;
+            break; // this row is only the lookahead — not part of the page
+        }
         var o: std.json.ObjectMap = .empty;
-        try o.put(ctx.allocator, "id", .{ .string = try ctx.allocator.dupe(u8, st.columnText(0)) });
+        const id = try ctx.allocator.dupe(u8, st.columnText(0));
+        try o.put(ctx.allocator, "id", .{ .string = id });
         try o.put(ctx.allocator, "created", .{ .string = try ctx.allocator.dupe(u8, st.columnText(1)) });
         try o.put(ctx.allocator, "name", .{ .string = try ctx.allocator.dupe(u8, st.columnText(2)) });
         try o.put(ctx.allocator, "payload", parsePayload(ctx.allocator, st.columnText(3)));
         try o.put(ctx.allocator, "actor_collection", .{ .string = try ctx.allocator.dupe(u8, st.columnText(4)) });
         try o.put(ctx.allocator, "actor", .{ .string = try ctx.allocator.dupe(u8, st.columnText(5)) });
         try o.put(ctx.allocator, "account", .{ .string = try ctx.allocator.dupe(u8, st.columnText(6)) });
-        try o.put(ctx.allocator, "occurred_at", .{ .string = try ctx.allocator.dupe(u8, st.columnText(7)) });
+        const occurred_at = try ctx.allocator.dupe(u8, st.columnText(7));
+        try o.put(ctx.allocator, "occurred_at", .{ .string = occurred_at });
         try items.append(.{ .object = o });
+        if (fetched == limit) pending_cursor = try std.fmt.allocPrint(ctx.allocator, "{s}|{s}", .{ occurred_at, id });
     }
-    return wrapItems(ctx, items);
+    return wrapEventsPage(ctx, items, if (has_next) pending_cursor else null, has_next);
 }
 
 /// GET /api/analytics/rollups/:name — a rollup's tenant-scoped summary rows.
@@ -214,6 +262,16 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
 fn wrapItems(ctx: *http.RequestCtx, items: std.json.Array) !http.Response {
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator, "items", .{ .array = items });
+    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}) };
+}
+
+/// `events`'s house cursor envelope: `items` plus `nextCursor`/`hasNext`, always present (never
+/// omitted, so a caller doesn't have to special-case a page with no more rows).
+fn wrapEventsPage(ctx: *http.RequestCtx, items: std.json.Array, next_cursor: ?[]const u8, has_next: bool) !http.Response {
+    var root: std.json.ObjectMap = .empty;
+    try root.put(ctx.allocator, "items", .{ .array = items });
+    try root.put(ctx.allocator, "nextCursor", if (next_cursor) |c| .{ .string = c } else .null);
+    try root.put(ctx.allocator, "hasNext", .{ .bool = has_next });
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}) };
 }
 
@@ -438,6 +496,56 @@ test "events read fails closed: a member who did not activate an account sees no
     const res = try events(&ctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "eA") == null);
+}
+
+test "events read paginates with the house cursor: a two-page walk over 3 events has no dup/skip" {
+    var env = try TenantTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("INSERT INTO \"_events\" (id,created,updated,name,payload,actor_collection,actor,account,occurred_at) VALUES " ++
+            "('e1','t','t','user.signup','{}','users','u1','accA','2026-01-01T00:00:01Z')," ++
+            "('e2','t','t','user.signup','{}','users','u1','accA','2026-01-01T00:00:02Z')," ++
+            "('e3','t','t','user.signup','{}','users','u1','accA','2026-01-01T00:00:03Z');");
+    }
+    const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
+
+    // Page 1 (limit=2): newest first -> e3, e2; more rows remain.
+    var c1 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "limit=2" };
+    const r1 = try events(&c1);
+    try std.testing.expectEqual(@as(u16, 200), r1.status);
+    const p1 = try std.json.parseFromSlice(std.json.Value, a, r1.body, .{});
+    const items1 = p1.value.object.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items1.len);
+    try std.testing.expectEqualStrings("e3", items1[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("e2", items1[1].object.get("id").?.string);
+    try std.testing.expect(p1.value.object.get("hasNext").?.bool);
+    const cursor1 = p1.value.object.get("nextCursor").?.string;
+
+    // Page 2: fed cursor1 back -> the remaining row (e1), exactly once; no more pages.
+    const q2 = try std.fmt.allocPrint(a, "limit=2&cursor={s}", .{cursor1});
+    var c2 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = q2 };
+    const r2 = try events(&c2);
+    try std.testing.expectEqual(@as(u16, 200), r2.status);
+    const p2 = try std.json.parseFromSlice(std.json.Value, a, r2.body, .{});
+    const items2 = p2.value.object.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), items2.len);
+    try std.testing.expectEqualStrings("e1", items2[0].object.get("id").?.string);
+    try std.testing.expect(!p2.value.object.get("hasNext").?.bool);
+    try std.testing.expect(p2.value.object.get("nextCursor").? == .null);
+}
+
+test "events read: a malformed cursor is a 400 \"Invalid cursor.\"" {
+    var env = try TenantTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+    const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "cursor=not-a-cursor" };
+    const res = try events(&ctx);
+    try std.testing.expectEqual(@as(u16, 400), res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "Invalid cursor.") != null);
 }
 
 test "events read requires authentication (anonymous -> 401)" {

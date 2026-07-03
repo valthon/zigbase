@@ -1173,6 +1173,8 @@ pub const ListQuery = struct {
     /// SEARCHABLE collection, a bound FTS5 `MATCH` predicate is AND-ed into the same WHERE
     /// composition as filter/rule/ability/tenant/ttl, and results are ranked by bm25 relevance
     /// (offset mode). A search on a non-searchable collection returns `error.NotSearchable`.
+    /// On SQLite, honored only in an `-Dfts5` build (default ON; else `error.SearchDisabled`) —
+    /// Postgres full-text search is unaffected by the flag.
     search: ?[]const u8 = null,
     /// Vector / nearest-neighbor search spec (#157, the `?vector=` param) — `<field>[:metric]:<json
     /// embedding>`. Honored only in a `-Dvector` build (else `error.VectorDisabled`); composes a

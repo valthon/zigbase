@@ -60,8 +60,8 @@ def _http(method, url, token=None, body=None):
 
 
 # ---------------------------------------------------------------------------
-# Stock binary: resolves its sample declared flags/experiments, public, no leakage.
-# (src/main.zig ships .flags = { dark_mode, maintenance }, .experiments = { onboarding_flow }.)
+# Stock binary: declares NO flags/experiments (R2-1 evicted the demo ones into
+# fixtures/features) — empty projection, public, no leakage.
 # ---------------------------------------------------------------------------
 
 def test_state_public_no_auth_returns_resolved_shape(server):
@@ -71,9 +71,9 @@ def test_state_public_no_auth_returns_resolved_shape(server):
     doc = json.loads(body)
     # Exactly two keys, both objects; values are RESOLVED (booleans / variant strings).
     assert set(doc.keys()) == {"flags", "experiments"}
-    # The stock binary's sample declarations resolve to their defaults.
-    assert doc["flags"] == {"dark_mode": False, "maintenance": False}
-    assert doc["experiments"]["onboarding_flow"] in ("control", "streamlined")
+    # The stock binary declares nothing — empty projection.
+    assert doc["flags"] == {}
+    assert doc["experiments"] == {}
     # Must NOT leak the _kv admin surface (raw keys / timestamps / key prefixes /
     # declared defaults / weights).
     for forbidden in ('"key"', '"created"', '"updated"', "flag:", "exp:",
