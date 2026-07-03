@@ -83,10 +83,10 @@ Running `zigbase` with no recognised command prints usage.
 ## Database backend (experimental)
 
 ZigBase defaults to its embedded SQLite database (`<data-dir>/data.db`) — the single-binary
-story, and the only backend in a stock build. A **pure-Zig PostgreSQL backend** (issue #159) is
-being built behind the opt-in `-Dpostgres` build flag; it is **off by default** and adds **no
-libpq, C, or OpenSSL** (TLS and SCRAM-SHA-256 use Zig `std` only), so the default binary stays
-fully static and OpenSSL-free, with its SQLite data path unchanged.
+story, and the only backend in a stock build. A **pure-Zig PostgreSQL backend** is available
+behind the opt-in `-Dpostgres` build flag; it is **off by default** and adds **no libpq, C, or
+OpenSSL** (TLS and SCRAM-SHA-256 use Zig `std` only), so the default binary stays fully static
+and OpenSSL-free, with its SQLite data path unchanged.
 
 When compiled in (`zig build -Dpostgres=true`), setting `ZIGBASE_DB_URL` to a
 `postgres://user:pass@host:port/dbname?sslmode=require` URL selects PostgreSQL at startup; any
@@ -95,11 +95,14 @@ other value (or an unset var) keeps SQLite. The backend is chosen once, by conne
 `ZIGBASE_DB_URL` does **not** silently write to local SQLite — it logs a prominent warning and
 falls back to SQLite, so a misconfigured deployment is visible rather than misdirecting data.
 
-This is **foundational scaffolding, not yet a supported deployment target**: full schema /
-query / migration / realtime parity lands in follow-up PRs. Transport is also **not yet
+This is a **fully supported deployment target** with **full feature parity**: record CRUD, the
+typed filter/sort/expand/search query engine, the access-rule + abilities + tenancy
+authorization stack, analytics rollups, the KV/TTL/rate-limit/feature-flag stores, field
+encryption + key rotation, the deterministic test-clock, and typed-client codegen all work
+identically on Postgres — verified against a live server in CI. Transport is also **not yet
 authenticated** — `sslmode=require` encrypts but does not verify the server certificate/hostname
 (libpq `require` parity), and `verify-ca`/`verify-full` are rejected — so use it only on a
-trusted network path for now. Full documentation ships with the parity work.
+trusted network path for now. See [PostgreSQL backend](./postgres) for the full guide.
 
 ## Email delivery
 

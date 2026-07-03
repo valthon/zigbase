@@ -4,7 +4,8 @@ ZigBase is a single-binary, PocketBase-inspired (but **not** API-compatible) bac
 **Zig 0.16**. It bundles a collections + schema engine, a typed records query API
 (filter / sort / expand), per-collection access rules, authentication (argon2id password
 plus OAuth2 with PKCE), realtime updates over WebSocket, local file storage, and an
-embedded admin UI at `/_/` — all in one statically-linked executable backed by SQLite.
+embedded admin UI at `/_/` — all in one statically-linked executable, backed by embedded
+SQLite by default with PostgreSQL as an opt-in build flag.
 It is also an **embeddable Zig framework**: import it as a library and extend the server
 with comptime record hooks, custom HTTP routes, and scheduled jobs.
 
