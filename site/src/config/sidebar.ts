@@ -27,6 +27,7 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'framework', label: 'Framework' },
       { slug: 'typescript-sdk', label: 'TypeScript SDK' },
       { slug: 'configuration', label: 'Configuration' },
+      { slug: 'docker', label: 'Docker' },
     ],
   },
   {
