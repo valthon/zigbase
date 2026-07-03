@@ -32,6 +32,17 @@ persisted at `<data-dir>/.jwt_secret` (mode 0600), then reused on later runs. Yo
 must be 0.16.0 — either activate mise (`eval "$(mise activate bash)"`) or prefix commands
 with `mise exec zig@0.16.0 --`.
 
+## Docker
+
+```sh
+docker run -d -p 8090:8090 -v zigbase_data:/data ghcr.io/valthon/zigbase:latest
+```
+
+The official image (`ghcr.io/valthon/zigbase`) ships the same static binary as the release
+tarballs. It's the supported path on Windows hosts (no native Windows build — see
+[Known limitations](KNOWN_LIMITATIONS.md)) and for Docker-first self-hosters generally.
+See [docs/docker.md](docs/docker.md) for the data-volume/non-root/healthcheck details.
+
 ## Features
 
 - **Collections & schema** — define collections with typed fields; schema migrations run on startup.
