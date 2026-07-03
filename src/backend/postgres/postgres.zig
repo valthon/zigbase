@@ -51,6 +51,7 @@ pub const PoolOptions = @import("pool.zig").PoolOptions;
 pub const Conn = @import("conn.zig").Conn;
 pub const ConnError = @import("conn.zig").ConnError;
 pub const connstr = @import("connstr.zig");
+pub const tls_trust = @import("tls_trust.zig");
 pub const scram = @import("scram.zig");
 pub const protocol = @import("protocol.zig");
 
@@ -60,6 +61,7 @@ test {
     _ = @import("scram.zig");
     _ = @import("protocol.zig");
     _ = @import("connstr.zig");
+    _ = @import("tls_trust.zig");
     _ = @import("conn.zig");
     _ = @import("stmt.zig");
     _ = @import("db.zig");
