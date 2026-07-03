@@ -853,7 +853,7 @@ pub const App = zigbase.App(.{
             // Public read of a single feature flag — see `flagStatus`. Untyped (raw JSON).
             .{ .method = .GET, .path = "/api/golfsim/flags/:name", .handler = flagStatus, .auth = .public },
         },
-        .jobs = .{ .pool_size = 2 },
+        .pools = .{ .jobs = 2 },
         .cron = .{
             .{
                 .name = "expire-holds",

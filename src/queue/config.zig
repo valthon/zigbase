@@ -186,16 +186,17 @@ pub fn workerMeta(comptime workers_cfg: anytype, comptime queue_defs: []const Qu
     }
 }
 
-/// The reserved key inside `.jobs` carrying the legacy scheduler worker-pool size
-/// (`.jobs = .{ .pool_size = N }`); it is NOT a job-kind handler and is skipped by the
-/// registry lowering. `.pools.jobs` is the preferred lever and takes precedence.
+/// The legacy `.jobs = .{ .pool_size = N }` key (pre-0.10 scheduler worker-pool size).
+/// It is no longer a valid `.jobs` field at all — `.pools = .{ .jobs = N }` is the one
+/// way to set the pool size now — so any `.jobs` field with this name is a loud
+/// `@compileError` naming the replacement, rather than being silently skipped.
 pub const reserved_pool_size_key = "pool_size";
 
 /// Reflect a `.jobs` config literal into `[]const JobReg`. Each field is `name =
 /// handlerFn` where the handler coerces to `fn(*Ctx, []const u8) anyerror!void`. The
-/// reserved `.pool_size` key (legacy scheduler pool size) is skipped — `.jobs` thus
-/// carries both the worker-pool size AND the job-kind registry. Loud `@compileError`
-/// on a non-coercible handler.
+/// reserved `.pool_size` key is REJECTED (see `reserved_pool_size_key`) rather than
+/// skipped — `.jobs` is now purely the job-kind registry. Loud `@compileError` on a
+/// non-coercible handler.
 pub fn jobsMeta(comptime jobs_cfg: anytype) []const JobReg {
     comptime {
         const T = @TypeOf(jobs_cfg);
@@ -203,7 +204,8 @@ pub fn jobsMeta(comptime jobs_cfg: anytype) []const JobReg {
             @compileError(".jobs must be a struct literal of kind = handlerFn bindings");
         var list: []const JobReg = &.{};
         for (std.meta.fields(T)) |f| {
-            if (std.mem.eql(u8, f.name, reserved_pool_size_key)) continue;
+            if (std.mem.eql(u8, f.name, reserved_pool_size_key))
+                @compileError("'.jobs.pool_size' was removed; set '.pools = .{ .jobs = N }' instead");
             const h = @field(jobs_cfg, f.name);
             const HT = @TypeOf(h);
             const is_fn = switch (@typeInfo(HT)) {
@@ -226,14 +228,20 @@ pub fn jobsMeta(comptime jobs_cfg: anytype) []const JobReg {
 /// consumer's handler would never run while still minting a misleading `Job.<kind>` enum
 /// member. We reject it instead (matching the subsystem's loud-`@compileError` philosophy
 /// for unknown keys / undeclared queues / the reserved `pool_size` key). `reserved` is the
-/// list of built-in kinds (derive it from `builtin_job_regs` so this stays general as more
-/// built-ins are added). The reserved `pool_size` key is skipped (it is not a job kind).
+/// list of built-in kinds — a STATIC list (`framework.zig`'s `reserved_job_kinds`), reserved
+/// UNCONDITIONALLY even when the built-in is gated off (R2-5): deriving it from
+/// `builtin_job_regs` instead would shrink the reserved set exactly when a built-in is
+/// deselected, defeating anti-collision right when it matters. The reserved `pool_size`
+/// key is REJECTED too (see
+/// `reserved_pool_size_key`) — this runs before `jobsMeta` in `App`, so it is the first
+/// site to report the removed-key message for a `.jobs = .{ .pool_size = N }` config.
 pub fn assertNoReservedJobKinds(comptime jobs_cfg: anytype, comptime reserved: []const []const u8) void {
     comptime {
         const T = @TypeOf(jobs_cfg);
         if (@typeInfo(T) != .@"struct") return; // jobsMeta validates shape; nothing to check here
         for (std.meta.fields(T)) |f| {
-            if (std.mem.eql(u8, f.name, reserved_pool_size_key)) continue;
+            if (std.mem.eql(u8, f.name, reserved_pool_size_key))
+                @compileError("'.jobs.pool_size' was removed; set '.pools = .{ .jobs = N }' instead");
             for (reserved) |r| {
                 if (std.mem.eql(u8, f.name, r))
                     @compileError("job kind '" ++ f.name ++ "' is reserved by the framework (use ctx." ++ f.name ++ "().enqueue) — rename your .jobs entry");
@@ -262,14 +270,16 @@ pub fn QueueEnum(comptime queues_cfg: anytype) type {
 }
 
 /// Build an exhaustive enum whose members are the declared job kinds (empty enum
-/// when there are no `.jobs`).
+/// when there are no `.jobs`). The reserved `.pool_size` key is REJECTED (see
+/// `reserved_pool_size_key`) rather than excluded from the enum.
 pub fn JobEnum(comptime jobs_cfg: anytype) type {
     comptime {
         const all = std.meta.fields(@TypeOf(jobs_cfg));
         var names: [all.len][:0]const u8 = undefined;
         var n: usize = 0;
         for (all) |f| {
-            if (std.mem.eql(u8, f.name, reserved_pool_size_key)) continue;
+            if (std.mem.eql(u8, f.name, reserved_pool_size_key))
+                @compileError("'.jobs.pool_size' was removed; set '.pools = .{ .jobs = N }' instead");
             names[n] = f.name;
             n += 1;
         }
@@ -376,11 +386,11 @@ test "jobsMeta lowers kind=handler bindings" {
     try testing.expectEqualStrings("reindex", regs[1].kind);
 }
 
-test "assertNoReservedJobKinds passes for non-colliding kinds (incl. pool_size + empty)" {
-    // Non-colliding consumer kinds compile; the reserved pool_size key is ignored; an
-    // empty `.jobs` is fine. (The collision case is a @compileError, not unit-testable.)
+test "assertNoReservedJobKinds passes for non-colliding kinds (incl. empty)" {
+    // Non-colliding consumer kinds compile; an empty `.jobs` is fine. (The collision
+    // case, and the removed-`.pool_size` case, are @compileErrors — not unit-testable.)
     const reserved: []const []const u8 = &.{ "mail", "webhook" };
-    comptime assertNoReservedJobKinds(.{ .resize = testHandler, .pool_size = 3 }, reserved);
+    comptime assertNoReservedJobKinds(.{ .resize = testHandler }, reserved);
     comptime assertNoReservedJobKinds(.{}, reserved);
 }
 

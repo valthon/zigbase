@@ -19,6 +19,7 @@ const entropy_mod = @import("entropy.zig");
 const mail = @import("mail/mailer.zig");
 const provision = @import("provision.zig");
 const oauth_client = @import("oauth/client.zig");
+const migrator = @import("migrator.zig");
 const schema = @import("schema.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
@@ -463,10 +464,11 @@ pub fn App(comptime cfg: anytype) type {
         const reserved_job_kinds: []const []const u8 = &.{ "mail", "mail_batch_item", "webhook" };
 
         /// Declared job-kind → handler registry: the built-in kinds followed by the consumer
-        /// `.jobs` bindings (the reserved `.jobs.pool_size` key is skipped). `jobByKind`
-        /// resolves built-ins first so `"mail"` always reaches the framework handler — and the
-        /// `assertNoReservedJobKinds` guard rejects a consumer `.jobs` entry that would collide
-        /// with a built-in kind (it would be dead config, never dispatched).
+        /// `.jobs` bindings (the legacy `.jobs.pool_size` key is a compile error — see
+        /// `queue_config.reserved_pool_size_key`). `jobByKind` resolves built-ins first so
+        /// `"mail"` always reaches the framework handler — and the `assertNoReservedJobKinds`
+        /// guard rejects a consumer `.jobs` entry that would collide with a built-in kind (it
+        /// would be dead config, never dispatched).
         pub const job_regs: []const queue.JobReg = blk: {
             const consumer_jobs = if (@hasField(@TypeOf(cfg), "jobs")) cfg.jobs else .{};
             queue_config.assertNoReservedJobKinds(consumer_jobs, reserved_job_kinds);
@@ -582,11 +584,12 @@ pub fn App(comptime cfg: anytype) type {
         /// The full job table = consumer jobs ++ framework-internal jobs. The scheduler
         /// starts whenever this is non-empty, so a TTL collection alone starts it.
         pub const jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(user_jobs, internal_jobs);
-        /// Worker pool size for the scheduler. Precedence: `.pools.jobs` (the new
-        /// unified lever), then the legacy `.jobs.pool_size`, then the default 2.
+        /// Worker pool size for the scheduler: `.pools = .{ .jobs = N }` (default 2).
+        /// The pre-0.10 `.jobs = .{ .pool_size = N }` spelling is a compile error.
         pub const job_pool_size: usize = blk: {
+            if (@hasField(@TypeOf(cfg), "jobs") and @hasField(@TypeOf(cfg.jobs), "pool_size"))
+                @compileError("'.jobs.pool_size' was removed; set '.pools = .{ .jobs = N }' instead");
             if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "jobs")) break :blk cfg.pools.jobs;
-            if (@hasField(@TypeOf(cfg), "jobs") and @hasField(@TypeOf(cfg.jobs), "pool_size")) break :blk cfg.jobs.pool_size;
             break :blk 2;
         };
 
@@ -983,17 +986,24 @@ pub fn App(comptime cfg: anytype) type {
         /// Explicit migrations (the escape hatch for non-additive changes), run in
         /// order before provisioning and recorded once in `_migrations`. Empty by default.
         ///
-        /// `.migrations` must be a TYPED slice `&[_]zigbase.Migration{ ... }`; a bare
-        /// anonymous tuple does not coerce to `[]const Migration`. Guard it here so the
-        /// failure names the PUBLIC type and the fix, rather than the raw coercion error
-        /// (which leaks the internal `provision.Migration` name).
+        /// `.migrations` accepts either a bare tuple (`.{ .{ .id = "...", .up = fn }, ... }`,
+        /// lowered here like every other list-shaped config key — see `.static_routes`) or a
+        /// TYPED slice `&[_]zigbase.Migration{ ... }` (which coerces directly and needs no
+        /// lowering). Anything else is a loud `@compileError` naming the PUBLIC type.
         pub const provision_migrations: []const provision.Migration = blk: {
             if (!@hasField(@TypeOf(cfg), "migrations")) break :blk &.{};
-            if (!migrationsCoerce(@TypeOf(cfg.migrations))) {
-                @compileError("'.migrations' must be a typed slice '&[_]zigbase.Migration{ ... }' " ++
-                    "(a bare tuple does not coerce to []const Migration); got '" ++ @typeName(@TypeOf(cfg.migrations)) ++ "'");
-            }
-            break :blk cfg.migrations;
+            const raw = cfg.migrations;
+            if (migrationsCoerce(@TypeOf(raw))) break :blk raw; // typed slice / array ptr
+            // Bare-tuple form (E1): lower each entry to a Migration, mirroring .static_routes.
+            const RT = @TypeOf(raw);
+            const info = @typeInfo(RT);
+            if (info != .@"struct" or !info.@"struct".is_tuple)
+                @compileError("'.migrations' must be a tuple of '.{ .id = \"...\", .up = fn }' entries or a typed slice '&[_]zigbase.Migration{ ... }'; got '" ++ @typeName(RT) ++ "'");
+            const n = std.meta.fields(RT).len;
+            var out: [n]provision.Migration = undefined;
+            for (0..n) |i| out[i] = provision.Migration{ .id = raw[i].id, .up = raw[i].up };
+            const final = out;
+            break :blk &final;
         };
 
         // ── CAPTCHA (#140 PR6) ────────────────────────────────────────────────
@@ -2350,9 +2360,10 @@ test "App(cfg) lowers .queues/.workers/.jobs and installs durable poller + GC jo
     try std.testing.expect(saw_gc);
 }
 
-test "App(cfg) keeps legacy .jobs.pool_size working alongside the job registry" {
-    // `.jobs.pool_size` is the legacy scheduler-pool lever; it must NOT become a job kind.
-    const A = App(.{ .jobs = .{ .pool_size = 3, .resize = qTestHandler }, .mail = .{}, .webhooks = true });
+test "App(cfg) sets the scheduler pool size via .pools.jobs alongside the job registry" {
+    // `.pools = .{ .jobs = N }` is the ONE way to set the scheduler-pool size (N1); it
+    // must NOT become a job kind.
+    const A = App(.{ .jobs = .{ .resize = qTestHandler }, .pools = .{ .jobs = 3 }, .mail = .{}, .webhooks = true });
     try std.testing.expectEqual(@as(usize, 3), A.job_pool_size);
     // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144, all
     // enabled here via R2-5's .mail/.webhooks gates) ++ consumer "resize"; pool_size is skipped.
@@ -2447,7 +2458,7 @@ test "App(cfg) exposes the comptime job table and pool size" {
         }
     };
     const A = App(.{
-        .jobs = .{ .pool_size = 3 },
+        .pools = .{ .jobs = 3 },
         .cron = .{.{ .name = "n", .schedule = @import("schedule.zig").Schedule{ .interval = .hourly }, .handler = H.j }},
     });
     try std.testing.expectEqual(@as(usize, 1), A.jobs.len);
@@ -2604,6 +2615,22 @@ test "App(.{}) has no comptime collections and no provision migrations" {
     const A = App(.{});
     try std.testing.expectEqual(@as(usize, 0), A.collections.len);
     try std.testing.expectEqual(@as(usize, 0), A.provision_migrations.len);
+}
+
+test "E1: .migrations accepts a bare tuple (lowered like .static_routes)" {
+    const M = struct {
+        fn up(_: *migrator.Migrator) anyerror!void {}
+    };
+    const A = App(.{ .migrations = .{
+        .{ .id = "0001_tuple_form", .up = M.up },
+    } });
+    try std.testing.expectEqual(@as(usize, 1), A.provision_migrations.len);
+    try std.testing.expectEqualStrings("0001_tuple_form", A.provision_migrations[0].id);
+
+    const B = App(.{ .migrations = &[_]provision.Migration{
+        .{ .id = "0001_slice_form", .up = M.up },
+    } });
+    try std.testing.expectEqual(@as(usize, 1), B.provision_migrations.len);
 }
 
 test "App(cfg) lowers .flags/.experiments into the registry + generated enums (#128/#129/#130)" {

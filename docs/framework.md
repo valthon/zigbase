@@ -2137,15 +2137,17 @@ modes. See the
 ## 7. Scheduled jobs (`.cron` + `.jobs`)
 
 ```zig
-.jobs = .{ .pool_size = 2 }, // worker pool size; defaults to 2 when unset
+.pools = .{ .jobs = 2 }, // scheduler worker-pool size; defaults to 2 when unset
 .cron = .{
     .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
 },
 ```
 
-> `.jobs` does double duty: the reserved `.pool_size` key sets the scheduler worker-pool
-> size (above), and any OTHER key registers a queue **job-kind handler** — see
-> [§7b Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs).
+> `.pools = .{ .jobs = N }` is the ONE lever for the scheduler worker-pool size. `.jobs`
+> is purely the queue **job-kind handler** registry (`kind = handlerFn` bindings) — see
+> [§7b Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs). The
+> pre-0.10 `.jobs = .{ .pool_size = N }` spelling was removed; it is now a compile error
+> naming `.pools = .{ .jobs = N }`.
 
 Each `cron` spec needs `.name`, `.schedule`, and `.handler` (missing/wrong-typed
 → compile error). The three schedule modes (`zigbase.schedule.Schedule`):
@@ -2258,7 +2260,7 @@ App(.{
         .general = .{ .queues = .{ "reports", "default" } },
     },
     // Job-kind registry: kind name → handler `fn(*Ctx, payload: []const u8) anyerror!void`.
-    // (`.pool_size` is reserved here for the scheduler pool size — see §7.)
+    // (Scheduler pool size is set separately via `.pools = .{ .jobs = N }` — see §7.)
     .jobs = .{
         .resize_image = resizeImage,
         .reindex      = reindex,
@@ -2804,16 +2806,20 @@ For the changes auto-migration won't do, use the `.migrations` escape hatch.
 
 ### Explicit migrations (`.migrations`)
 
-`.migrations` is a **typed slice** of `zigbase.Migration` records, each run
-**once** (recorded in `_migrations` under a `prov:` prefix) **before**
-provisioning. The field is `[]const zigbase.Migration`, so it must be a typed
-slice (`&[_]zigbase.Migration{ ... }`) — a bare anonymous tuple does **not**
-coerce:
+`.migrations` is a list of `zigbase.Migration` records, each run **once**
+(recorded in `_migrations` under a `prov:` prefix) **before** provisioning. It
+accepts either a **bare tuple** (lowered at comptime, like every other
+list-shaped config key — `.routes`, `.cron`, `.static_routes`) or a **typed
+slice** `&[_]zigbase.Migration{ ... }`, which coerces directly:
 
 ```zig
-.migrations = &[_]zigbase.Migration{
+.migrations = .{
     .{ .id = "0001_rename_title", .up = renameTitle },
 },
+// or, equivalently, the typed-slice form:
+// .migrations = &[_]zigbase.Migration{
+//     .{ .id = "0001_rename_title", .up = renameTitle },
+// },
 // .up signature: fn (m: *zigbase.Migrator) anyerror!void
 //   `m` carries the active SQL dialect, the writer connection (`m.db`), a scratch
 //   arena (`m.arena`), and `m.io`. It exposes exec/execLowered/prepare/rawFor.
@@ -3064,7 +3070,7 @@ optional; each defaults to the historical value:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `.readers` | `16` | warm reader-connection pool cap — shrink to reduce the connection footprint. |
-| `.jobs` | `2` | scheduler worker-pool size (same as `.jobs.pool_size`). |
+| `.jobs` | `2` | scheduler worker-pool size. |
 | `.stack_size` | `1 MiB` | per-thread stack for scheduler/job/`submit` threads (vs `std.Thread`'s 16 MiB default). **Clamped up** to a safe floor — the lever can only *raise* the stack, e.g. for unusually deep job handlers. |
 | `.cache_kib` | `1024` | SQLite per-connection page cache (KiB), across the writer + warm readers — shrink to save memory, raise for large working sets. |
 
@@ -3074,8 +3080,9 @@ zigbase.App(.{
 }).runCli(init);
 ```
 
-`.pools.jobs` is the unified job-pool lever; the legacy `.jobs = .{ .pool_size = N }`
-still works (and `.pools.jobs` takes precedence when both are set).
+`.pools = .{ .jobs = N }` is the ONE lever for the scheduler worker-pool size. The
+legacy `.jobs = .{ .pool_size = N }` spelling was removed; it is now a compile error
+naming the replacement.
 
 ## 10b. Pagination (`.pagination`)
 
@@ -3142,7 +3149,7 @@ pub fn main(init: std.process.Init) !void {
         .routes = .{
             .{ .method = .GET, .path = "/api/blog/ping", .handler = ping, .auth = .public },
         },
-        .jobs = .{ .pool_size = 2 },
+        .pools = .{ .jobs = 2 },
         .cron = .{
             .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
         },
@@ -3430,8 +3437,8 @@ The public surface (from `src/root.zig`):
   error set.
 - `zigbase.Tx` — the transaction scope passed to a `ctx.tx(T, fn(*Tx) ...)` callback
   (`t.records()`, `t.arena()`).
-- `zigbase.Migration` — the `.migrations` slice element type; `zigbase.Db` — the
-  writer connection passed to a migration's `.up`.
+- `zigbase.Migration` — the `.migrations` entry type (bare tuple or typed slice);
+  `zigbase.Db` — the writer connection passed to a migration's `.up`.
 - `zigbase.StaticFile` — the embedded manifest entry type (path, bytes, etag); used
   by `.static_files = .{ .embedded = ... }`.
 - `zigbase.Storage` / `zigbase.Mailer` / `zigbase.Email` — the storage & mailer

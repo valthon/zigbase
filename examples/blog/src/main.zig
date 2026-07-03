@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .method = .GET, .path = "/api/blog/ping", .handler = ping, .auth = .public },
             .{ .method = .GET, .path = "/api/blog/posts/:slug", .handler = getPostBySlug, .auth = .public },
         },
-        .jobs = .{ .pool_size = 2 },
+        .pools = .{ .jobs = 2 },
         .cron = .{
             .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
         },

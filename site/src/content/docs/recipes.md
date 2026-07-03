@@ -571,7 +571,7 @@ Register it on a schedule (cron/interval handlers have the `fn (*Ctx, *JobEvent)
 signature):
 
 ```zig
-.jobs = .{ .pool_size = 2 },
+.pools = .{ .jobs = 2 },
 .cron = .{
     .{ .name = "expire-bookings",
        .schedule = zigbase.schedule.Schedule{ .cron = "0 3 * * *" }, // 03:00 UTC daily

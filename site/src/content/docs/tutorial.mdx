@@ -448,7 +448,7 @@ pub fn main(init: std.process.Init) !void {
         .routes = .{
             .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
         },
-        .jobs = .{ .pool_size = 2 },
+        .pools = .{ .jobs = 2 },
         .cron = .{
             .{ .name = "expire-bookings",
                .schedule = zigbase.schedule.Schedule{ .cron = "0 3 * * *" },
