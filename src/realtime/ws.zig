@@ -12,6 +12,7 @@ const id = @import("../id.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 const hub = @import("hub.zig");
+const sse = @import("sse.zig");
 const request = @import("../request.zig");
 const tenancy = @import("../tenancy/tenancy.zig");
 const Ctx = @import("../ctx.zig").Ctx;
@@ -84,7 +85,7 @@ pub fn originAllowed(allowlist: []const u8, origin: ?[]const u8, host: ?[]const 
 /// the membership check at resolve time is the real gate) or the signed `zb_account` cookie. The
 /// returned slice is duped onto `da` (the connection-durable arena) because zap.Request buffers are
 /// freed after the upgrade callback returns. null when neither is present/valid. (#156)
-fn requestedAccountFromUpgrade(app: *App, r: zap.Request, da: std.mem.Allocator) ?[]const u8 {
+pub fn requestedAccountFromUpgrade(app: *App, r: zap.Request, da: std.mem.Allocator) ?[]const u8 {
     if (r.getHeader("x-account-id")) |h| if (h.len > 0) return da.dupe(u8, h) catch null;
     const ch = r.getHeader("cookie") orelse return null;
     const raw = cookieValue(ch, tenancy.account_cookie) orelse return null;
@@ -93,7 +94,7 @@ fn requestedAccountFromUpgrade(app: *App, r: zap.Request, da: std.mem.Allocator)
 }
 
 /// Extract the value of cookie `name` from a raw `Cookie` header (mirrors `http.RequestCtx.cookie`).
-fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
+pub fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, header, ';');
     while (it.next()) |pair| {
         const trimmed = std.mem.trim(u8, pair, " ");
@@ -104,12 +105,23 @@ fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Listener on_upgrade hook: validate Origin, allocate a LiveConn, upgrade. Path-gated to /api/realtime.
+/// Listener on_upgrade hook for BOTH realtime transports. facil.io routes an exact
+/// `Accept: text/event-stream` request here with target == "sse" (spike §1) — the same
+/// callback WS upgrades use. Dispatch:
+///   - "websocket" + /api/realtime      -> WS path (unchanged).
+///   - "sse"       + /api/realtime/sse  -> SSE path (#188).
+///   - anything else -> 404 + markAsFinished (fixes the old early-`return` that silently
+///     swallowed "sse" targets without finishing the request).
+/// Shared gates, in order: originAllowed (F12), the ONE global connection slot (F9 — WS+SSE
+/// share MAX_CONNECTIONS), tenancy capture (inside each arm; zap.Request buffers are freed
+/// after this returns).
 pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void {
     const Server = @import("../server.zig").Server;
     const app = Server.instance.?.app;
-    if (!std.mem.eql(u8, target_protocol, "websocket")) return;
-    if (!std.mem.eql(u8, r.path orelse "", "/api/realtime")) {
+    const path = r.path orelse "";
+    const is_ws = std.mem.eql(u8, target_protocol, "websocket") and std.mem.eql(u8, path, "/api/realtime");
+    const is_sse = std.mem.eql(u8, target_protocol, "sse") and std.mem.eql(u8, path, "/api/realtime/sse");
+    if (!is_ws and !is_sse) {
         r.setStatus(.not_found);
         r.markAsFinished(true);
         return;
@@ -119,11 +131,14 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
         r.markAsFinished(true);
         return;
     }
-    // F9: reserve a global connection slot up front; reject past the cap. Reserving before alloc
-    // (and releasing on any failure below) keeps the counter exact under concurrent upgrades.
+    // F9: reserve the SHARED (WS+SSE) global connection slot up front; reject past the cap.
     if (!connection.reserveConnectionSlot()) {
         r.setStatus(.service_unavailable);
         r.markAsFinished(true);
+        return;
+    }
+    if (is_sse) {
+        sse.openStream(r, app); // owns releasing the slot on any failure inside
         return;
     }
     errdefer connection.releaseConnectionSlot();

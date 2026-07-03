@@ -10,6 +10,7 @@ pub const ServeArgs = struct {
     insecure_cookies: bool = false, // --insecure-cookies => cookie_secure=false (plain-HTTP local dev)
     trust_proxy: bool = false, // --trust-proxy => honor X-Forwarded-For/X-Real-IP
     realtime_origins: ?[]const u8 = null, // --realtime-origins CSV => allowed WS Origins
+    sse_heartbeat_seconds: ?u16 = null, // --sse-heartbeat-seconds N => SSE ping interval (0 = inherit listener timeout)
 };
 
 pub const SuperuserArgs = struct {
@@ -243,6 +244,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
             sa.realtime_origins = args[i];
+        } else if (std.mem.eql(u8, a, "--sse-heartbeat-seconds")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            sa.sse_heartbeat_seconds = std.fmt.parseInt(u16, args[i], 10) catch return ParseError.BadValue;
         } else {
             return ParseError.UnknownFlag;
         }
@@ -341,6 +346,13 @@ test "superuser create parses email and password" {
 test "serve parses --serve-static when enabled" {
     const cmd = try parse(&.{ "serve", "--serve-static", "public" }, .{});
     try std.testing.expectEqualStrings("public", cmd.serve.serve_static.?);
+}
+
+test "serve --sse-heartbeat-seconds parses; bad/missing values rejected" {
+    const c = try parse(&.{ "serve", "--sse-heartbeat-seconds", "2" }, .{});
+    try std.testing.expectEqual(@as(?u16, 2), c.serve.sse_heartbeat_seconds);
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--sse-heartbeat-seconds", "abc" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--sse-heartbeat-seconds" }, .{}));
 }
 
 test "--serve-static is an unknown flag when disabled at comptime" {

@@ -13,11 +13,12 @@ def binary():
     return resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
 
 @pytest.fixture()
-def server(binary):
+def server(binary, request):
     data = tempfile.mkdtemp(prefix="zb_admin_")
     subprocess.run([binary, "superuser", "create", "--email", "admin@x.io", "--password", "adminpassword", "--data-dir", data], check=True)
     port = _free_port()
-    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
+    extra_env = getattr(request, "param", None) or {}
+    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port), **extra_env}
     # Plain-HTTP local test server: opt out of Secure cookies (default-on) so the
     # browser stores the auth/CSRF cookies over http://; the default loopback bind
     # and auto-generated JWT secret are exactly what we want.

@@ -22,6 +22,7 @@ const features_api = @import("api/features.zig");
 const state_api = @import("api/state.zig");
 const analytics_api = @import("analytics/api.zig");
 const realtime_ws = @import("realtime/ws.zig");
+const realtime_api = @import("api/realtime.zig");
 const files_multipart = @import("files/multipart.zig");
 const admin = @import("admin.zig");
 const static_files = @import("static_files.zig");
@@ -77,6 +78,9 @@ const routes = [_]router.Route{
     // (router.tryDispatch requires an exact method match) and 404s before the handler runs.
     .{ .method = .HEAD, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
     .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
+    // Realtime SSE uplink (#188): auth/subscribe/unsubscribe verbs for an EventSource stream.
+    // The clientId is a stream-delivered capability; unknown/expired/closed ids 404 (non-oracle).
+    .{ .method = .POST, .pattern = "/api/realtime/sse/:clientId", .handler = realtime_api.sseUplink },
     // Multi-tenancy (#156): activate an account scope for browser apps (sets the signed
     // `zb_account` cookie). 404s when tenancy is disabled; 403 without an active membership.
     .{ .method = .POST, .pattern = "/api/accounts/:id/activate", .handler = accounts_api.activate },

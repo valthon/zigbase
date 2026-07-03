@@ -47,6 +47,11 @@ pub const Config = struct {
     // is permitted only when no Origin header is present, i.e. a non-browser client).
     // Set explicit origins to allow browser clients. Empty no longer means "allow any".
     realtime_allowed_origins: []const u8 = "",
+    // SSE heartbeat interval in seconds (#188). facil.io's SSE protocol writes the comment
+    // `: ping\n\n` on every protocol-timeout tick; 0 (default) inherits the listener's
+    // ws_timeout (zap default 40s). Nonzero values are applied per-connection at stream open
+    // and validated AT STARTUP to 1..=255 (the fio timeout is a u8) — a bad value fails boot.
+    sse_heartbeat_seconds: u16 = 0,
     // When false (default), the rate limiter and any client-IP logic key on the real
     // socket peer and IGNORE X-Forwarded-For / X-Real-IP (which a direct attacker can
     // spoof). Set true ONLY when behind a trusted reverse proxy that sets those headers.
@@ -159,6 +164,7 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter.get("ZIGBASE_PASSWORD_RESET_TTL")) |v| cfg.password_reset_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter.get("ZIGBASE_REALTIME_ORIGINS")) |v| cfg.realtime_allowed_origins = v;
+        if (getter.get("ZIGBASE_SSE_HEARTBEAT_SECONDS")) |v| cfg.sse_heartbeat_seconds = try std.fmt.parseInt(u16, v, 10);
         if (getter.get("ZIGBASE_TRUST_PROXY")) |v| cfg.trust_proxy = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
         if (getter.get("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
         if (getter.get("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
@@ -211,9 +217,7 @@ pub const EnvGetter = struct {
 
 test "defaults apply when getter returns null" {
     const G = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 {
-            return null;
-        }
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
     };
     const cfg = try Config.load(G{});
     try std.testing.expectEqual(@as(u16, 8090), cfg.http_port);
@@ -454,4 +458,18 @@ test "s3_* config: defaults empty/us-east-1/null, overridable via env" {
     try std.testing.expectEqualStrings("tenant-a/", c1.s3_key_prefix);
     try std.testing.expectEqualStrings("/var/cache/zigbase", c1.s3_cache_dir);
     try std.testing.expectEqual(@as(u64, 1 << 31), c1.s3_cache_max_bytes);
+}
+
+test "sse heartbeat defaults 0 (inherit listener timeout), overridable via env" {
+    const G0 = struct {
+        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+    };
+    try std.testing.expectEqual(@as(u16, 0), (try Config.load(G0{})).sse_heartbeat_seconds);
+    const G1 = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_SSE_HEARTBEAT_SECONDS")) return "2";
+            return null;
+        }
+    };
+    try std.testing.expectEqual(@as(u16, 2), (try Config.load(G1{})).sse_heartbeat_seconds);
 }

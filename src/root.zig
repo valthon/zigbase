@@ -245,6 +245,7 @@ test {
     _ = @import("api/health.zig");
     _ = @import("api/collections.zig");
     _ = @import("api/records.zig");
+    _ = @import("api/realtime.zig");
     _ = @import("api/auth.zig");
     _ = @import("api/sessions.zig");
     _ = @import("api/oauth.zig");
@@ -270,6 +271,8 @@ test {
     _ = @import("realtime/hub.zig");
     _ = @import("realtime/ws.zig");
     _ = @import("realtime/pg_bridge.zig");
+    _ = @import("realtime/sse_fio.zig");
+    _ = @import("realtime/sse.zig");
     _ = @import("files/naming.zig");
     _ = @import("files/mime.zig");
     _ = @import("files/storage.zig");

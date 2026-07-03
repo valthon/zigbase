@@ -1341,6 +1341,8 @@ ws.onmessage = (e) => {
 };
 ```
 
+The signal is transport-agnostic — WebSocket and SSE subscribers receive the identical frame.
+
 Changed in 0.10.0: this channel previously emitted a bespoke `{"type":"features.changed"}`
 frame; it now uses the same standard signal frame as every custom topic.
 

@@ -80,6 +80,25 @@ ws.onopen = () => ws.send(JSON.stringify({ action: "subscribe", topic: "availabi
 ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.topic === "availability") refreshSlots(); };
 ```
 
+The same subscription works over SSE — no WebSocket, no SDK, just `EventSource` and `fetch`:
+
+```js
+const es = new EventSource('/api/realtime/sse');
+let clientId;
+es.onmessage = async (e) => {
+  const m = JSON.parse(e.data);
+  if (m.type === 'connect') {
+    clientId = m.clientId;
+    await fetch('/api/realtime/sse/' + clientId, {
+      method: 'POST',
+      body: JSON.stringify({ action: 'subscribe', topic: 'orders' }),
+    });
+  } else if (m.topic === 'orders') {
+    console.log(m);
+  }
+};
+```
+
 `@zigbase/client` 0.3.0+ wraps this in a typed helper, `subscribeTopic`, for custom channels:
 
 ```js
@@ -103,4 +122,4 @@ if you need a custom event to reach every instance, model it as a record write i
 - [ctx.realtime()](./framework#ctxrealtime--broadcast-on-custom-channels)
 - [canSubscribe](./framework#who-may-subscribe-realtime---cansubscribe--fn)
 - [Multi-instance realtime](./framework#multi-instance-realtime-postgres)
-- [Realtime protocol](./api#realtime-websocket)
+- [Realtime protocol](./api#realtime-websocket--sse)

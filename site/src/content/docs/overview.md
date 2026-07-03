@@ -9,7 +9,7 @@ group: getting-started
 
 **ZigBase is a single-binary, open-source backend** — collections and schema, a typed
 records query API, per-collection access rules, authentication (argon2id password plus
-OAuth2 with PKCE), realtime updates over WebSocket, local file storage, and an embedded
+OAuth2 with PKCE), realtime updates over WebSocket and SSE, local file storage, and an embedded
 admin UI — all in one statically-linked executable — embedded SQLite by default,
 PostgreSQL opt-in — written in **Zig 0.16**.
 
@@ -60,7 +60,7 @@ There are two ways to use ZigBase:
 - **Ctx capability layer** — a single `*Ctx` passed to every hook, route, and job wraps
   records, auth, KV, flags, outbound HTTP, and atomic transactions; connection pooling
   is handled for you. → [Framework](./framework)
-- **Realtime** — subscribe to record changes over WebSocket, broadcast on custom channels
+- **Realtime** — subscribe to record changes over WebSocket + SSE, broadcast on custom channels
   from routes and jobs; record-change delivery fans out across app instances on Postgres.
   → [Realtime broadcast](./realtime-broadcast)
 - **PostgreSQL backend (opt-in)** — build with `-Dpostgres` and point `ZIGBASE_DB_URL` at a
