@@ -1442,15 +1442,31 @@ endpoint (above), or a custom route if you need a bespoke shape.
 ### Admin UI
 
 The embedded admin UI (`/_/`) covers **Collections** (schema editor), **Records**
-(browse/query/edit), **Users**, **Features** (flags & experiments, below), and
-**Settings** (raw KV, above). It ships as browser-native ES modules — no build
-step — and every asset is served with a CRC32 `ETag`.
+(browse/query/edit), **Users**, **Email** (senders, suppressions, batches, below),
+**Features** (flags & experiments, below), and **Settings** (raw KV, above). It
+ships as browser-native ES modules — no build step — and every asset is served
+with a CRC32 `ETag`.
 
 **Users** (`/_/#/users`) manages both superusers and auth-collection users: list
 and search (filter-based) either, create/edit/delete records, an admin password
 reset (superuser `PATCH`), and a read-only OAuth-providers panel per auth
 collection. It composes the existing collections/records/auth REST API — no new
 endpoints ship for it. Per-device sessions are not yet exposed here.
+
+**Email** (`/_/#/email`) covers the [email subsystem](#email-subsystem-154-templates-providers-verified-senders-suppression)
+for superusers, in three tabs plus a read-only policy strip:
+
+- **Senders** — list, invite (`POST /api/senders`), and delete verified sender
+  identities.
+- **Suppressions** — list, add, remove, and filter by reason (including
+  one-click-unsubscribe entries).
+- **Batches** — read-only bulk-send progress; there is no send/cancel action
+  since no such endpoint exists yet.
+
+The policy strip reads the new superuser-only `GET /api/mail/config` — booleans
+only (`require_verified_sender`, `check_suppression`, whether a webhook secret and
+an unsubscribe base URL are configured) — never secrets. See
+[api.md → Email](api.md#email--verified-senders--bounce-webhook-154).
 
 The embedded admin UI (`/_/`) has a dedicated **Feature Flags & Experiments** screen
 (`/_/#/features`) that exposes the comptime-declared registry to superusers without
