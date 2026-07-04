@@ -1411,6 +1411,17 @@ endpoint (above), or a custom route if you need a bespoke shape.
 
 ### Admin UI
 
+The embedded admin UI (`/_/`) covers **Collections** (schema editor), **Records**
+(browse/query/edit), **Users**, **Features** (flags & experiments, below), and
+**Settings** (raw KV, above). It ships as browser-native ES modules — no build
+step — and every asset is served with a CRC32 `ETag`.
+
+**Users** (`/_/#/users`) manages both superusers and auth-collection users: list
+and search (filter-based) either, create/edit/delete records, an admin password
+reset (superuser `PATCH`), and a read-only OAuth-providers panel per auth
+collection. It composes the existing collections/records/auth REST API — no new
+endpoints ship for it. Per-device sessions are not yet exposed here.
+
 The embedded admin UI (`/_/`) has a dedicated **Feature Flags & Experiments** screen
 (`/_/#/features`) that exposes the comptime-declared registry to superusers without
 any API calls:

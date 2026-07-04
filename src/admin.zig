@@ -51,7 +51,7 @@ const assets = [_]Asset{
     mk("/_/assets/views/collections.js", @embedFile("admin/views/collections.js"), js_ctype),
     mk("/_/assets/views/features.js", @embedFile("admin/views/features.js"), js_ctype),
     mk("/_/assets/views/settings.js", @embedFile("admin/views/settings.js"), js_ctype),
-    // Task 3 adds: views/users.js
+    mk("/_/assets/views/users.js", @embedFile("admin/views/users.js"), js_ctype),
 };
 
 /// The SPA shell — served (with its own ETag/304) for "/_/" and any unknown "/_/…" path.

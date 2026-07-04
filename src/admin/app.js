@@ -4,6 +4,7 @@ import { go } from '/_/assets/lib/ui.js';
 import { RecordsTable, SchemaEditor } from '/_/assets/views/collections.js';
 import { FeaturesView } from '/_/assets/views/features.js';
 import { SettingsView } from '/_/assets/views/settings.js';
+import { UsersView } from '/_/assets/views/users.js';
 
 // --- tiny hash router ---
 function useHashRoute() {
@@ -21,6 +22,7 @@ function parseRoute(hash) {
   if (seg[0] === 'login') return { name: 'login' };
   if (seg[0] === 'settings') return { name: 'settings' };
   if (seg[0] === 'features') return { name: 'features' };
+  if (seg[0] === 'users') return { name: 'users' };
   if (seg[0] === 'collections' && seg[1] && seg[2] === 'records') return { name: 'records', col: decodeURIComponent(seg[1]) };
   if (seg[0] === 'collections' && seg[1]) return { name: 'schema', col: decodeURIComponent(seg[1]) };
   return { name: 'collections' };
@@ -83,13 +85,15 @@ function Shell({ route }) {
             <span class="hide-collapsed">${c.name} ${c.type !== 'base' ? html`<span class="badge">(${c.type})</span>` : ''}</span>${collapsed ? c.name[0] : ''}</a>`)}
         ${err && html`<div class="error">${err}</div>`}
         <div class="spacer"></div>
+        <a class=${'navitem hide-collapsed' + (route.name === 'users' ? ' active' : '')} href="#/users" data-test="nav-users">👤 Users</a>
         <a class=${'navitem hide-collapsed' + (route.name === 'features' ? ' active' : '')} href="#/features" data-test="nav-features">🚩 Features</a>
         <a class=${'navitem hide-collapsed' + (route.name === 'settings' ? ' active' : '')} href="#/settings" data-test="nav-settings">⚙ Settings</a>
         <a class="navitem hide-collapsed" href="#/collections" data-test="nav-collections">⚙ Collections</a>
         <a class="navitem" data-test="logout" onClick=${logout} style="cursor:pointer">⎋ <span class="hide-collapsed">Logout</span></a>
       </div>
       <div class="main">
-        ${route.name === 'features' ? html`<${FeaturesView}/>`
+        ${route.name === 'users' ? html`<${UsersView}/>`
+          : route.name === 'features' ? html`<${FeaturesView}/>`
           : route.name === 'settings' ? html`<${SettingsView}/>`
           : route.name === 'records' ? html`<${RecordsTable} col=${route.col}/>`
           : route.name === 'schema' ? html`<${SchemaEditor} name=${route.col}/>`
