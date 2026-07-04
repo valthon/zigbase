@@ -103,8 +103,9 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   **automatically excluded from every read** (list, get, relation expand — via the HTTP API and
   `ctx.records()`) by a read-time predicate that is ANDed with your filter, access rule, and
   keyset cursor, so no manual `expires_at > @now` filter is needed. Physical deletion is still
-  handled by an internal GC job that runs once at startup and then **every 5 minutes** (the
-  interval is not tunable), so an expired row may persist in the table until the next sweep —
+  handled by an internal GC job that runs once at startup and then on the `.ttl_gc_interval`
+  cadence (default **every 5 minutes**, tunable via the comptime `.ttl_gc_interval` App config
+  key), so an expired row may persist in the table until the next sweep —
   but it is never returned by a read in the meantime. A row whose ttl field is `null` never
   expires; a row with an unparseable ttl value is fail-safe (stays visible, never reaped).
 

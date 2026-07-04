@@ -330,7 +330,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -441,7 +441,7 @@ pub fn App(comptime cfg: anytype) type {
         /// TTL sweep job (when any collection opts into `.ttl_field`), else empty.
         const ttl_jobs: []const scheduler.RuntimeJob = if (has_ttl_collection)
             scheduler.buildJobs(.{
-                .{ .name = "_ttl_gc", .schedule = schedule.Schedule{ .interval = .{ .minutes = 5 } }, .handler = ttlGcJob },
+                .{ .name = "_ttl_gc", .schedule = schedule.Schedule{ .interval = ttl_gc_interval }, .handler = ttlGcJob },
             })
         else
             &.{};
@@ -765,6 +765,46 @@ pub fn App(comptime cfg: anytype) type {
                 @compileError(".auth.session.gc_cron has no effect without .auth.session.store = .table");
             break :blk if (@hasField(@TypeOf(auth_session_cfg), "gc_cron")) auth_session_cfg.gc_cron else "0 * * * *";
         };
+
+        /// Cadence for the framework-internal TTL garbage-collection sweep (`_ttl_gc`), which
+        /// reaps rows whose `.ttl_field` timestamp has passed. Default `.{ .minutes = 5 }`;
+        /// override with `.ttl_gc_interval = .hourly` (or any `schedule.Interval`). Only
+        /// consumed when at least one collection declares a `.ttl_field` (otherwise no GC job
+        /// is installed). Expired rows are hidden from reads immediately regardless of cadence.
+        pub const ttl_gc_interval: schedule.Interval = blk: {
+            // Fail loudly on misuse: setting the cadence without a `.ttl_field` collection is a
+            // silent no-op otherwise (the `_ttl_gc` job is only installed when has_ttl_collection).
+            // Only triggers when the user EXPLICITLY set the key — the default-unset case stays fine.
+            if (!@hasField(@TypeOf(cfg), "ttl_gc_interval")) break :blk schedule.Interval{ .minutes = 5 };
+            if (!has_ttl_collection)
+                @compileError(".ttl_gc_interval set but no collection declares .ttl_field");
+            // Config values arrive as untyped literals (`.hourly` enum literal or
+            // `.{ .minutes = N }` anon struct); coerce each form to the union explicitly.
+            const raw = cfg.ttl_gc_interval;
+            const R = @TypeOf(raw);
+            const iv: schedule.Interval = if (R == schedule.Interval)
+                raw
+            else if (R == @TypeOf(.enum_literal))
+                @unionInit(schedule.Interval, @tagName(raw), {})
+            else if (@typeInfo(R) == .@"struct" and @hasField(R, "minutes"))
+                schedule.Interval{ .minutes = raw.minutes }
+            else
+                @compileError(".ttl_gc_interval must be a schedule.Interval (.weekly / .daily / .hourly / .{ .minutes = N })");
+            if (iv == .minutes and iv.minutes == 0)
+                @compileError(".ttl_gc_interval must not be zero (.{ .minutes = 0 })");
+            break :blk iv;
+        };
+
+        // Force analysis of `ttl_gc_interval` so its misuse `@compileError` actually fires. It
+        // is otherwise a lazy `pub const` only referenced by the conditionally-installed
+        // `_ttl_gc` job (see `ttl_jobs`) — so a consumer that sets `.ttl_gc_interval` WITHOUT a
+        // `.ttl_field` collection never installs that job, the const is never analyzed, and the
+        // guard is silently dead. Referencing it in this always-analyzed comptime block makes
+        // the guard live on every `App(...)` instantiation (the default-unset case resolves to
+        // the 5-minute default with no error).
+        comptime {
+            _ = ttl_gc_interval;
+        }
 
         /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
         /// A custom type missing a contract method fails with a contract-specific message.
@@ -2629,6 +2669,36 @@ test "App(cfg) registers the internal _ttl_gc job when a collection opts into TT
     try std.testing.expectEqual(@as(usize, 1), Ttl.jobs.len);
     try std.testing.expectEqualStrings("_ttl_gc", Ttl.jobs[0].name);
     try std.testing.expect(Ttl.jobs[0].schedule == .interval);
+
+    // Default cadence is `.{ .minutes = 5 }` (the misuse case — setting the interval
+    // without a `.ttl_field` collection — is a @compileError, which can't be unit-tested).
+    try std.testing.expectEqual(schedule.Interval{ .minutes = 5 }, App(.{}).ttl_gc_interval);
+    try std.testing.expectEqual(schedule.Interval{ .minutes = 5 }, Ttl.ttl_gc_interval);
+    try std.testing.expectEqual(schedule.Interval{ .minutes = 5 }, Ttl.jobs[0].schedule.interval);
+
+    // `.ttl_gc_interval` overrides the cadence, and the resolved job carries it.
+    const TtlFast = App(.{
+        .collections = .{
+            .sessions = .{ .fields = .{
+                .{ .name = "token", .type = .text },
+                .{ .name = "expires_at", .type = .date },
+            }, .ttl_field = "expires_at" },
+        },
+        .ttl_gc_interval = .hourly,
+    });
+    try std.testing.expectEqual(schedule.Interval.hourly, TtlFast.ttl_gc_interval);
+    try std.testing.expectEqual(schedule.Interval.hourly, TtlFast.jobs[0].schedule.interval);
+
+    const TtlTen = App(.{
+        .collections = .{
+            .sessions = .{ .fields = .{
+                .{ .name = "token", .type = .text },
+                .{ .name = "expires_at", .type = .date },
+            }, .ttl_field = "expires_at" },
+        },
+        .ttl_gc_interval = .{ .minutes = 10 },
+    });
+    try std.testing.expectEqual(schedule.Interval{ .minutes = 10 }, TtlTen.ttl_gc_interval);
 }
 
 test "App(.{}) resolves the default storage + mailer plugins and reader pool" {

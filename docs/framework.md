@@ -105,6 +105,7 @@ error.**
 | `features` | Public feature-state projection: `.{ .public_route = "/api/state" }` (custom path) or `.{ .public_route = .disabled }`. Default `"/api/state"` (auto-mounted). | always — the projection route is mounted by default; this key only customizes or disables it. |
 | `onFeatureExposure` | Notify-only hook fired when a declared flag/experiment is resolved for a subject (exposure logging). | excluded — zero-cost when absent: the resolver gates on the dispatch field and never even constructs the event. |
 | `experiment_assignment_ttl` | TTL in **days** for sticky `_experiment_assignments` rows (default `90`). Only valid when a `.sticky` experiment is declared — setting it otherwise is a `@compileError`. | excluded — the sticky-assignment GC sweep installs no job/timer/writer touch unless a `.sticky` experiment is declared. |
+| `ttl_gc_interval` | Cadence (`schedule.Interval`) for the framework-internal `_ttl_gc` sweep that reaps expired `.ttl_field` rows (default `.{ .minutes = 5 }`). Only valid when a collection declares a `.ttl_field` — setting it otherwise, or to a degenerate `.{ .minutes = 0 }`, is a `@compileError`. Expired rows are hidden from reads immediately regardless of cadence. | excluded — the TTL GC sweep installs no job/timer/writer touch unless a collection declares a `.ttl_field`. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. | excluded — off by default so production builds carry no codegen weight. |
 | `realtime` | Realtime broadcast guard: `.{ .canSubscribe = fn }` gates who may subscribe to a custom (non-collection) topic (default: custom topics are public). See [`ctx.realtime()`](#ctxrealtime--broadcast-on-custom-channels). | always — realtime (the WebSocket hub + per-record view-rule reapplication) is core, not optional; this key only adds a guard for custom topics. |
 | `tenancy` | Multi-tenant account scoping: `.{ .enabled = true, .auth_collection = "...", .resolver = ..., .roles = .{...} }`. | excluded — the account-activation endpoints and membership-scoping code exist only when `.tenancy.enabled = true`. |
@@ -2264,9 +2265,10 @@ The scheduler is intentionally simple (see
 - **Single-flight** — a job never overlaps itself.
 
 The framework may also register **internal jobs** of its own alongside your
-`.cron` table. Declaring a TTL collection (`.ttl_field`, see §8) registers a
-5-minute interval job named `_ttl_gc` that reaps expired rows; it runs on the same
-worker pool and starts the scheduler even when you have no `.cron` configured.
+`.cron` table. Declaring a TTL collection (`.ttl_field`, see §8) registers an
+interval job named `_ttl_gc` that reaps expired rows on the `.ttl_gc_interval`
+cadence (default every 5 minutes); it runs on the same worker pool and starts the
+scheduler even when you have no `.cron` configured.
 
 ### Ad-hoc background work: `app.submit`
 
@@ -2516,10 +2518,12 @@ Semantics:
   (list and get, via the HTTP API, `ctx.records()`, and relation expand). The
   predicate is ANDed with your filter, access rule, and keyset cursor, so it composes
   transparently. You do not need to add a manual `expires_at > @now` filter.
-- The GC sweep still runs **once at startup** and then on a **5-minute interval**
-  (framework-internal job `_ttl_gc`; see §7), deleting expired rows so the table does
-  not grow unboundedly. Declaring a TTL collection starts the scheduler even if you
-  have no `.cron` of your own.
+- The GC sweep still runs **once at startup** and then on the **`.ttl_gc_interval`
+  cadence** (a `schedule.Interval`, default `.{ .minutes = 5 }`; framework-internal job
+  `_ttl_gc`, see §7), deleting expired rows so the table does not grow unboundedly.
+  Tune it with the top-level `.ttl_gc_interval` App config key (e.g. `.hourly`); the
+  read-time exclusion above hides expired rows immediately regardless of sweep cadence.
+  Declaring a TTL collection starts the scheduler even if you have no `.cron` of your own.
 - With an `.autodate` ttl field, prefer one whose value you set explicitly to the
   intended expiry (autodate defaults to write-on-create "now", which would expire
   the row immediately).
