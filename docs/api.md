@@ -1351,6 +1351,11 @@ es.onmessage = async (e) => {
 };
 ```
 
+**Admin stats.** `GET /api/realtime/stats` — **superuser-only**, read-only realtime
+health for the admin UI: `{ "connections": n, "max_connections": n, "max_subs": n,
+"outbound_hwm": n }` (live connection count, the two static caps above, and the
+configured outbound high-water-mark). `401` unauthenticated, `403` non-superuser.
+
 ---
 
 ## Health

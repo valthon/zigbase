@@ -63,8 +63,8 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build features-fixture -Dcpu=baseline
       - name: Build lean gating fixture
         run: mise exec zig@0.16.0 -- zig build minimal-server
-      - name: Build full gating fixture (positive control)
-        run: mise exec zig@0.16.0 -- zig build full-fixture
+      - name: Build full gating fixture (positive control; also the browser suite's analytics-enabled fixture)
+        run: mise exec zig@0.16.0 -- zig build full-fixture -Dcpu=baseline
       - name: Gating invariant (absent-symbols check)
         run: ./scripts/check-gating.sh
       - name: Dating client snapshot is fresh
@@ -85,6 +85,7 @@ jobs:
             zig-out/bin/dating-server
             zig-out/bin/auth2-server
             zig-out/bin/features-fixture
+            zig-out/bin/full-fixture
             examples/blog/zig-out/bin/blog
             examples/golfsim/zig-out/bin/golfsim
             examples/plugins/zig-out/bin/plugins
@@ -333,6 +334,8 @@ jobs:
           echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/features-fixture
           echo "ZIGBASE_FEATURES_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/features-fixture" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/full-fixture
+          echo "ZIGBASE_TEST_FULL_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/full-fixture" >> "$GITHUB_ENV"
       - name: Install Python test deps + resolve Playwright version
         id: pw
         run: |
