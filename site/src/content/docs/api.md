@@ -943,10 +943,14 @@ senders (fail closed, `403`). Superusers may target any account.
 | POST | `/api/senders/:id/verify` | Confirm a pending identity. Body `{ "token": "..." }`; `{ "verified": true }` on success, `404` on a wrong/absent token (no oracle). |
 | GET | `/api/senders` | List the active account's identities: `{ "items": [{ id, email, status, verified_at }, …] }` (changed in 0.10.0 — was a bare array). |
 | POST | `/api/mail/webhooks/:provider` | Inbound bounce/complaint ingestion (`provider` = `ses` \| `postmark`). Verifies a shared-secret HMAC-SHA256 signature over `"<X-Webhook-Timestamp>.<provider>.<X-Account-Id>.<body>"` (constant-time) and a ±5m timestamp-freshness window; `401` on a stale timestamp or bad signature, `404` when no `webhook_secret` is configured. Upserts a suppression per hard bounce / complaint; returns `{ "suppressed": n }`. A genuine provider webhook (no signature/`X-Account-Id`) is GLOBAL-only — per-account scoping requires a signing relay. |
+| GET | `/api/mail/config` | **Superuser-only**, read-only mail policy state for the admin UI: `{ "require_verified_sender": bool, "check_suppression": bool, "webhook_configured": bool, "unsubscribe_configured": bool }`. Booleans only — never exposes the webhook secret or the unsubscribe URL value. `401` unauthenticated, `403` non-superuser. |
 
 When `.mail.require_verified_sender = true`, an account-scoped send whose From is not a verified
 identity is rejected. When `.mail.check_suppression = true`, a send to a suppressed recipient is
 blocked.
+
+The embedded admin UI exposes senders/suppressions/batches and this policy state as the
+**Email** screen (`/_/#/email`) — see [Framework → Admin UI](./framework#admin-ui).
 
 ## Features (declared registry)
 

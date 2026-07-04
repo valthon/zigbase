@@ -41,4 +41,13 @@ export const API = {
   flagOverrideDel: (name) => api('DELETE', `/settings/flag:${encodeURIComponent(name)}`),
   expWeightsPut: (name, json) => api('PUT', `/settings/exp:${encodeURIComponent(name)}:weights`, { value: json }),
   expWeightsDel: (name) => api('DELETE', `/settings/exp:${encodeURIComponent(name)}:weights`),
+  mailConfig: () => api('GET', '/mail/config'),
+  senders: () => api('GET', '/senders'),
+  inviteSender: (email) => api('POST', '/senders', { email }),
+  deleteSender: (id) => api('DELETE', `/collections/_sender_identities/records/${encodeURIComponent(id)}`),
+  suppressions: (q) => api('GET', `/collections/_suppressions/records?${q}`),
+  addSuppression: (body) => api('POST', '/collections/_suppressions/records', body),
+  removeSuppression: (id) => api('DELETE', `/collections/_suppressions/records/${encodeURIComponent(id)}`),
+  batches: (q) => api('GET', `/collections/_mail_batches/records?${q}`),
+  batchRecipients: (q) => api('GET', `/collections/_mail_batch_recipients/records?${q}`),
 };
