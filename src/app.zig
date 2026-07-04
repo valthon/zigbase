@@ -71,6 +71,9 @@ pub const App = struct {
     /// resolution — false means a `.spa` is just another never-served dotfile.
     spa_marker_enabled: bool = false,
     storage: ?*const @import("files/storage.zig").Storage = null,
+    /// Non-secret storage backend info (files/info.zig), lowered from config in
+    /// serveImpl. Feeds GET /api/files/config. Never holds credentials.
+    storage_info: @import("files/info.zig").Info = .{},
     /// Pluggable mailer (resolved from the comptime mailer plugin in serveImpl).
     /// Default = LogMailer (logs); set SMTP config to upgrade to SmtpMailer. null in
     /// tests/CLI where no mailer was wired (callers must fall back to logging).
