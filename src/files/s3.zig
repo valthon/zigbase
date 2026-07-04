@@ -522,7 +522,18 @@ pub const S3Storage = struct {
         const self: *S3Storage = @ptrCast(@alignCast(ctx));
         const path = try std.fs.path.join(alloc, &.{ self.cache_dir, col, record_id, filename });
         if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
-            if (st.kind == .file) return path; // spool hit
+            if (st.kind == .file) {
+                // Approximate last-access LRU: bump the entry's mtime to now on a
+                // cache hit so `evictIfOver` (which drops oldest-mtime-first) treats
+                // a frequently-read file as recently accessed and evicts a rarely-read
+                // one instead. Best-effort — a failed touch must NEVER fail the serve,
+                // so the error is swallowed and we still return the hit.
+                std.Io.Dir.cwd().setTimestamps(io, path, .{
+                    .access_timestamp = .now,
+                    .modify_timestamp = .now,
+                }) catch {};
+                return path; // spool hit
+            }
         } else |_| {}
 
         var arena = std.heap.ArenaAllocator.init(self.gpa);
@@ -1129,6 +1140,70 @@ test "S3Storage: eviction removes oldest spool entries once over cache_max_bytes
     const path_c = try std.fs.path.join(testing.allocator, &.{ cache_dir, "col", "r4", "c.bin" });
     defer testing.allocator.free(path_c);
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, path_a, .{}));
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, path_c, .{});
+}
+
+test "S3Storage: a cache hit bumps mtime so eviction approximates last-access LRU" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    var cfg = testCfg(cache_dir);
+    // cap 170 -> low-water = 127. Two 60-byte entries (120) stay under the cap;
+    // the third (180) trips eviction, which frees exactly one 60-byte entry
+    // (120 <= 127) — the oldest by mtime.
+    cfg.s3_cache_max_bytes = 170;
+
+    testcapture.http.enable(true);
+    defer testcapture.http.reset();
+    testcapture.http.mock("zbtest", .{ .status = 404 }); // probe
+    var s3 = try S3Storage.create(testing.allocator, std.testing.io, cfg);
+    defer s3.deinit();
+    const st = s3.storage();
+
+    const body60 = "x" ** 60;
+    const nudge = std.Io.Duration.fromMilliseconds(10);
+
+    // Miss-fill a.bin, then b.bin (spacing mtimes apart — some filesystems have
+    // coarse mtime resolution). Total 120 <= 170, so no eviction yet.
+    const names = [_][]const u8{ "a.bin", "b.bin" };
+    for (names) |name| {
+        testcapture.http.reset();
+        testcapture.http.enable(true);
+        testcapture.http.mock(name, .{ .status = 200, .body = body60 });
+        const p = (try st.fetch(std.testing.io, testing.allocator, "col", "r5", name)).?;
+        testing.allocator.free(p);
+        std.testing.io.sleep(nudge, .awake) catch {};
+    }
+
+    // Cache HIT on a.bin — returns the spooled path with no HTTP request, and
+    // bumps a.bin's mtime above b.bin's, making b.bin the oldest entry.
+    const hit = (try st.fetch(std.testing.io, testing.allocator, "col", "r5", "a.bin")).?;
+    testing.allocator.free(hit);
+    std.testing.io.sleep(nudge, .awake) catch {};
+
+    // Miss-fill c.bin -> spool 180 > 170, eviction frees the oldest entry down to
+    // <= 127. With the touch, that oldest entry is b.bin; WITHOUT it a.bin (the
+    // create-time oldest) would be evicted instead.
+    testcapture.http.reset();
+    testcapture.http.enable(true);
+    testcapture.http.mock("c.bin", .{ .status = 200, .body = body60 });
+    const pc = (try st.fetch(std.testing.io, testing.allocator, "col", "r5", "c.bin")).?;
+    testing.allocator.free(pc);
+
+    const path_a = try std.fs.path.join(testing.allocator, &.{ cache_dir, "col", "r5", "a.bin" });
+    defer testing.allocator.free(path_a);
+    const path_b = try std.fs.path.join(testing.allocator, &.{ cache_dir, "col", "r5", "b.bin" });
+    defer testing.allocator.free(path_b);
+    const path_c = try std.fs.path.join(testing.allocator, &.{ cache_dir, "col", "r5", "c.bin" });
+    defer testing.allocator.free(path_c);
+
+    // b.bin (never re-hit -> oldest mtime) is evicted; the hot a.bin and the newest
+    // c.bin both survive.
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, path_b, .{}));
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, path_a, .{});
     _ = try std.Io.Dir.cwd().statFile(std.testing.io, path_c, .{});
 }
 
