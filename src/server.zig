@@ -10,6 +10,7 @@ const accounts_api = @import("api/accounts.zig");
 const senders_api = @import("api/senders.zig");
 const mail_inbound = @import("mail/inbound.zig");
 const mail_unsub_api = @import("api/mail_unsubscribe.zig");
+const mail_config_api = @import("api/mail_config.zig");
 const auth_api = @import("api/auth.zig");
 const auth_methods_api = @import("api/auth_methods.zig");
 const magic_link_consume_api = @import("api/magic_link_consume.zig");
@@ -185,6 +186,7 @@ pub fn Server(comptime gates: Gates) type {
             if (gates.mail_unsubscribe) t = t ++ &[_]router.Route{
                 .{ .method = .POST, .pattern = "/api/mail/unsubscribe", .handler = mail_unsub_api.post },
                 .{ .method = .GET, .pattern = "/api/mail/unsubscribe", .handler = mail_unsub_api.get },
+                .{ .method = .GET, .pattern = "/api/mail/config", .handler = mail_config_api.get },
             };
             // Product analytics (#158): tenant-scoped read API. The raw activity feed and a rollup's
             // summary rows. Both authenticate + fail closed — a member never sees another account's data.
