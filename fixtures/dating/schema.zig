@@ -111,7 +111,7 @@ const DeviceLinkMethod = struct {
 
 pub const App = zigbase.App(.{
     .enable_typegen = true,
-    .auth_methods = .{DeviceLinkMethod},
+    .auth = .{ .methods = .{DeviceLinkMethod} },
     // Feature flags + experiments (#130): exercise the typed `zb.flags.resolveAll`
     // surface (named booleans + a variant string-union) and the public GET /api/state.
     .flags = .{
@@ -215,7 +215,7 @@ pub const App = zigbase.App(.{
                 .{ .name = "to", .type = .relation, .target = "profiles" },
                 .{ .name = "body", .type = .text, .required = true, .searchable = true },
                 .{ .name = "sentAt", .type = .autodate, .onCreate = true },
-                .{ .name = "read", .type = .@"bool" },
+                .{ .name = "read", .type = .bool },
             },
             .rules = .{ .list = "@public", .view = "@public", .create = "@request.auth.id != \"\"", .update = "@request.auth.id != \"\"", .delete = "@request.auth.id != \"\"" },
         },
@@ -233,7 +233,7 @@ pub const App = zigbase.App(.{
                 .{ .name = "plan", .type = .select, .values = .{ "free", "plus", "premium" } },
                 .{ .name = "price", .type = .number, .mode = .fixed, .scale = 2 },
                 .{ .name = "renewsAt", .type = .date, .min = "2020-01-01", .max = "2099-12-31" },
-                .{ .name = "active", .type = .@"bool" },
+                .{ .name = "active", .type = .bool },
                 .{ .name = "metadata", .type = .json },
             },
             .rules = .{ .list = "@public", .view = "@public", .create = "@request.auth.id != \"\"", .update = "@request.auth.id != \"\"", .delete = "@request.auth.id != \"\"" },

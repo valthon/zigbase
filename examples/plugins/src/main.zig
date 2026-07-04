@@ -48,7 +48,7 @@
 //!      `[onAuth] collection=authors method=webauthn`, `method=custom` (api_token),
 //!      and `collection=commenters method=magic_link`.
 //!
-//!  10. CUSTOM `AuthMethod` PLUGIN (`ApiTokenMethod`) via `.auth_methods`.
+//!  10. CUSTOM `AuthMethod` PLUGIN (`ApiTokenMethod`) via `.auth = .{ .methods = ... }`.
 //!      Demonstrates the auth-method plugin contract alongside storage + mailer.
 //!      Enabled on `authors` via `.auth.methods.custom = .{"api_token"}`.
 //!
@@ -227,7 +227,7 @@ const AuditMailer = struct {
 //   deinit(*Self) void               -- release any resources.
 //
 // The framework validates this contract at comptime via assertAuthMethodContract.
-// Registered app-level via `.auth_methods = .{ApiTokenMethod}` and enabled on
+// Registered app-level via `.auth = .{ .methods = .{ApiTokenMethod} }` and enabled on
 // the `authors` collection via `.auth.methods.custom = .{"api_token"}`.
 //
 // AuthCtx helpers used here (all via public zigbase.AuthCtx):
@@ -516,8 +516,8 @@ pub fn main(init: std.process.Init) !void {
         .mailer = AuditMailer,
 
         // 10. App-level custom auth method registry.
-        //     ApiTokenMethod is enabled on `authors` via `.auth.methods.custom = .{"api_token"}`.
-        .auth_methods = .{ApiTokenMethod},
+        //     ApiTokenMethod is enabled on `authors` via the collection's `.auth.methods.custom`.
+        .auth = .{ .methods = .{ApiTokenMethod} },
 
         // 3. Comptime schema: FOUR related collections.
         //    Relation graph:

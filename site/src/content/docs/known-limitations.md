@@ -11,11 +11,11 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 ## Auth & email
 
-- **Per-device session list/revoke requires opt-in `.session_store = .table`; the default is
-  still `.epoch`.** The default `App(.{ .session_store = .epoch })` revokes per **principal**
+- **Per-device session list/revoke requires opt-in `.auth.session.store = .table`; the default is
+  still `.epoch`.** The default `App(.{ .auth = .{ .session = .{ .store = .epoch } } })` revokes per **principal**
   via the token epoch — `revokeAllSessions()` ("log out everywhere"), `refresh()`, `rotate()`
   — stateless, with zero extra DB work and unchanged token format. Opting into
-  `App(.{ .session_store = .table })` adds a server-side `_sessions` store enabling
+  `App(.{ .auth = .{ .session = .{ .store = .table } } })` adds a server-side `_sessions` store enabling
   per-device list/revoke, at the cost of **one extra read per authenticated request** (the
   documented trade-off; flipping the default awaits real-world perf data). The surface now
   spans three layers, all gated the same way: the `ctx.auth()` verbs (`listActiveSessions()` /
