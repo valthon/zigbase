@@ -93,9 +93,10 @@ function RecordsBrowser({ col, fields }) {
 }
 
 function FileDrawer({ col, fields, rec, onClose, onChanged }) {
-  if (!rec) return null;
+  // Hooks must run unconditionally on every render (Rules of Hooks); guard AFTER them.
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  if (!rec) return null;
   async function upload(field, input) {
     const file = input.files && input.files[0];
     if (!file) return;
