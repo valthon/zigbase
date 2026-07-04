@@ -17,28 +17,63 @@ fn crcEtag(comptime bytes: []const u8) *const [10:0]u8 {
     }
 }
 
-/// Serve an embedded asset with ETag + nosniff; answers a matching If-None-Match with
-/// 304 (same headers, empty body — RFC 7232: the 304 reports what the 200 would have).
-fn asset(ctx: *http.RequestCtx, comptime bytes: []const u8, comptime content_type: []const u8) http.Response {
-    const headers = comptime [_]http.Header{
-        .{ .name = "ETag", .value = crcEtag(bytes) },
-        .{ .name = "X-Content-Type-Options", .value = "nosniff" },
+const js_ctype = "application/javascript";
+
+const Asset = struct {
+    path: []const u8,
+    bytes: []const u8,
+    ctype: []const u8,
+    etag: []const u8,
+    headers: []const http.Header,
+};
+
+/// Build a manifest row with its comptime CRC32 ETag + [ETag, nosniff] headers.
+fn mk(comptime path: []const u8, comptime bytes: []const u8, comptime ctype: []const u8) Asset {
+    const tag: []const u8 = crcEtag(bytes);
+    return .{
+        .path = path,
+        .bytes = bytes,
+        .ctype = ctype,
+        .etag = tag,
+        .headers = &.{
+            .{ .name = "ETag", .value = tag },
+            .{ .name = "X-Content-Type-Options", .value = "nosniff" },
+        },
     };
-    if (serve_file.etagMatches(ctx.if_none_match, headers[0].value))
-        return .{ .status = 304, .body = "", .content_type = content_type, .extra_headers = &headers };
-    return .{ .status = 200, .body = bytes, .content_type = content_type, .extra_headers = &headers };
 }
 
-/// Serve the embedded admin SPA for any path under "/_/". Known assets return their bytes
-/// (with build-time CRC32 ETags / 304 revalidation); every other "/_/" path returns
-/// index.html (so client-side hash routes survive refresh/deep-link).
+const assets = [_]Asset{
+    mk("/_/assets/app.js", app_js, js_ctype),
+    mk("/_/assets/preact.js", preact_js, js_ctype),
+    mk("/_/assets/style.css", style_css, "text/css"),
+    mk("/_/assets/lib/api.js", @embedFile("admin/lib/api.js"), js_ctype),
+    mk("/_/assets/lib/ui.js", @embedFile("admin/lib/ui.js"), js_ctype),
+    mk("/_/assets/views/collections.js", @embedFile("admin/views/collections.js"), js_ctype),
+    mk("/_/assets/views/features.js", @embedFile("admin/views/features.js"), js_ctype),
+    mk("/_/assets/views/settings.js", @embedFile("admin/views/settings.js"), js_ctype),
+    mk("/_/assets/views/users.js", @embedFile("admin/views/users.js"), js_ctype),
+};
+
+/// The SPA shell — served (with its own ETag/304) for "/_/" and any unknown "/_/…" path.
+const spa_shell = mk("/_/", index_html, "text/html");
+
+fn respond(ctx: *http.RequestCtx, a: Asset) http.Response {
+    if (serve_file.etagMatches(ctx.if_none_match, a.etag))
+        return .{ .status = 304, .body = "", .content_type = a.ctype, .extra_headers = a.headers };
+    return .{ .status = 200, .body = a.bytes, .content_type = a.ctype, .extra_headers = a.headers };
+}
+
+/// Serve the embedded admin SPA for any path under "/_/". Known assets return their
+/// bytes (with a CRC32 ETag; 304 on a matching If-None-Match); every other "/_/" path
+/// returns the ETag'd index.html so client-side hash routes survive refresh.
 pub fn serve(ctx: *http.RequestCtx) http.Response {
     const p = ctx.path;
-    if (std.mem.eql(u8, p, "/_/assets/app.js")) return asset(ctx, app_js, "application/javascript");
-    if (std.mem.eql(u8, p, "/_/assets/preact.js")) return asset(ctx, preact_js, "application/javascript");
-    if (std.mem.eql(u8, p, "/_/assets/style.css")) return asset(ctx, style_css, "text/css");
-    if (std.mem.startsWith(u8, p, "/_/assets/")) return .{ .status = 404, .body = "not found", .content_type = "text/plain" };
-    return asset(ctx, index_html, "text/html");
+    for (assets) |a| {
+        if (std.mem.eql(u8, p, a.path)) return respond(ctx, a);
+    }
+    if (std.mem.startsWith(u8, p, "/_/assets/"))
+        return .{ .status = 404, .body = "not found", .content_type = "text/plain" };
+    return respond(ctx, spa_shell);
 }
 
 test "serve returns index.html for the root and unknown spa paths" {
@@ -88,4 +123,16 @@ test "admin assets carry a build-time ETag and answer If-None-Match with 304" {
     const rs = serve(&shell);
     var shell304 = http.RequestCtx{ .method = .GET, .path = "/_/", .allocator = std.testing.allocator, .if_none_match = rs.extra_headers[0].value };
     try std.testing.expectEqual(@as(u16, 304), serve(&shell304).status);
+}
+
+test "every manifest asset serves 200 with an ETag and 304s on its own etag" {
+    for (assets) |a| {
+        var g = http.RequestCtx{ .method = .GET, .path = a.path, .allocator = std.testing.allocator };
+        const r = serve(&g);
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expectEqualStrings("ETag", r.extra_headers[0].name);
+        try std.testing.expectEqualStrings("X-Content-Type-Options", r.extra_headers[1].name);
+        var c = http.RequestCtx{ .method = .GET, .path = a.path, .allocator = std.testing.allocator, .if_none_match = a.etag };
+        try std.testing.expectEqual(@as(u16, 304), serve(&c).status);
+    }
 }
