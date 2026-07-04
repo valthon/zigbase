@@ -216,6 +216,20 @@ fn ensureBroadcastTable(d: *dbm.Db) !void {
         "\"created\" TIMESTAMPTZ NOT NULL DEFAULT now());");
 }
 
+/// Block for the next real NOTIFY on `conn`, skipping the benign non-notification async messages
+/// (ParameterStatus / NoticeResponse) PostgreSQL may interleave. `dbWaitNotification` returns null
+/// for each such message by contract, so a SINGLE call races the first wire message and fails
+/// intermittently when a benign one arrives first. This loops — exactly as the production listener
+/// does (`pg_bridge.processUntilDrop`'s `orelse continue`) — bounded so a genuinely missing NOTIFY
+/// still fails the test instead of hanging.
+fn awaitNotification(conn: *dbm.Db, al: std.mem.Allocator) !dbm.Notification {
+    var tries: usize = 0;
+    while (tries < 100) : (tries += 1) {
+        if (try dbm.dbWaitNotification(conn, al)) |note| return note;
+    }
+    return error.@"no notification received";
+}
+
 test "pg cross-instance: a create NOTIFY (token-free) is received + decoded by a listener on conn B" {
     // Two app instances sharing one database: instance B LISTENs; instance A NOTIFYs a create with a
     // DIFFERENT origin id (a remote instance). B receives + decodes the minimal {o,c,a,i} payload that
@@ -236,7 +250,7 @@ test "pg cross-instance: a create NOTIFY (token-free) is received + decoded by a
     const payload = try pg_bridge.encode(al, "instanceA", "posts", .create, "REC42", null);
     try dbm.dbNotify(&conn_a, al, pg_bridge.channel, payload);
 
-    const note = (try dbm.dbWaitNotification(&conn_b, al)) orelse return error.@"no notification received";
+    const note = try awaitNotification(&conn_b, al);
     try std.testing.expectEqualStrings(pg_bridge.channel, note.channel);
     const ev = pg_bridge.decode(al, note.payload) orelse return error.@"decode failed";
     try std.testing.expectEqualStrings("instanceA", ev.origin);
@@ -273,13 +287,16 @@ test "pg cross-instance: a DELETE token is stored on A, NOTIFY'd, read back + au
     try snap.put(al, "owner", strVal("u9"));
     const token = pg_bridge.storeDeleteSnapshot(al, io, &conn_a, .{ .object = snap }) orelse return error.@"store failed";
     const payload = try pg_bridge.encode(al, "instanceA", "notes", .delete, "DEL1", token);
-    // The payload carries ONLY the token — no owner/row data.
-    try std.testing.expect(std.mem.indexOf(u8, payload, "u9") == null);
+    // The payload carries ONLY the token — no owner/row data. Anchor the leak-canary to the JSON
+    // string quotes (`"u9"`, not bare `u9`): the token is 32 random base36 chars ([0-9a-z]), so a
+    // bare `u9` collides ~2.4% of runs by chance (a postgres-tls flake) while a leaked owner value
+    // always rides the wire as a quoted JSON value — which a quote-less base36 token can never forge.
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"u9\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, token) != null);
     try dbm.dbNotify(&conn_a, al, pg_bridge.channel, payload);
 
     // B: receive the token, read the snapshot back from the shared side table.
-    const note = (try dbm.dbWaitNotification(&conn_b, al)) orelse return error.@"no notification received";
+    const note = try awaitNotification(&conn_b, al);
     const ev = pg_bridge.decode(al, note.payload) orelse return error.@"decode failed";
     try std.testing.expectEqual(protocol.Action.delete, ev.action);
     const back = pg_bridge.readDeleteSnapshot(al, &conn_b, ev.token.?) orelse return error.@"snapshot not found";
@@ -355,7 +372,10 @@ test "pg cross-instance: delete NOTIFY leaks no encrypted plaintext (token-only 
     // no ciphertext envelope (no field data of any kind rides the wire).
     try std.testing.expect(std.mem.indexOf(u8, payload, secret) == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "v1:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "ssn") == null);
+    // Quote-anchor the field-name canary: `ssn` is 3 base36 chars and the payload carries a random
+    // rid + token (~47 base36 chars), so a bare `ssn` collides ~0.1% of runs; leaked field data
+    // would appear as the quoted JSON key `"ssn"`, which a quote-less base36 token/id cannot forge.
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"ssn\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, token) != null);
 
     // Defense in depth: the side table holds the ciphertext, never the plaintext.
@@ -463,7 +483,7 @@ test "pg cross-instance: signal NOTIFY round-trips conn A -> conn B and decodes 
     try std.testing.expect(std.mem.indexOf(u8, payload, "data") == null);
     try dbm.dbNotify(&conn_a, al, pg_bridge.channel, payload);
 
-    const note = (try dbm.dbWaitNotification(&conn_b, al)) orelse return error.@"no notification received";
+    const note = try awaitNotification(&conn_b, al);
     try std.testing.expectEqualStrings(pg_bridge.channel, note.channel);
     const p = pg_bridge.decodeAny(al, note.payload) orelse return error.@"decode failed";
     try std.testing.expectEqualStrings("orders", p.signal.topic);
