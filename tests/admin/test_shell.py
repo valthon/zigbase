@@ -9,6 +9,10 @@ def test_bad_login_shows_error(page):
 
 def test_login_then_sidebar_lists_builtin_collections(page):
     login(page)
+    # login() only waits for the static nav-collections link; the built-in
+    # collection nav items (_superusers, ...) render asynchronously just after,
+    # so wait for the target before counting — a bare count() races and reads 0.
+    page.wait_for_selector('[data-test=nav-_superusers]', timeout=5000)
     assert page.locator('[data-test=nav-_superusers]').count() == 1
 
 def test_sidebar_shows_backend_badge(page):
