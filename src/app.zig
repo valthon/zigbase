@@ -36,6 +36,11 @@ pub const App = struct {
     /// SSE heartbeat interval seconds (#188); 0 = inherit the listener ws_timeout tick.
     /// Applied per-connection via http_sse_set_timout at stream open. Startup-validated.
     sse_heartbeat_seconds: u8 = 0,
+    /// Slow-consumer outbound high-water-mark (issue #203): max queued outbound frames per realtime
+    /// (WS/SSE) connection before the server disconnects the peer. Bounds per-connection memory under
+    /// a stalled/slow reader (OOM/DoS mitigation). Unit is frames. 0 disables. Read at the delivery
+    /// chokepoint (`realtime/{ws,sse}.zig` onChannelMessage).
+    realtime_outbound_hwm: u32 = @import("realtime/connection.zig").DEFAULT_OUTBOUND_HWM,
     /// When false (default), client-IP logic ignores X-Forwarded-For/X-Real-IP and
     /// keys on the real socket peer. Only honor proxy headers when true (behind a
     /// trusted reverse proxy). See F8.

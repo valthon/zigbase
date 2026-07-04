@@ -86,6 +86,12 @@ pub fn close(sse: Handle) void {
     _ = fio.http_sse_close(sse);
 }
 
+/// The underlying socket uuid for this SSE stream (http.h:749) — the key `fio_pending` wants for
+/// the slow-consumer outbound high-water-mark (issue #203).
+pub fn uuid(sse: Handle) isize {
+    return fio.http_sse2uuid(sse);
+}
+
 // ---- ABI smoke test ---------------------------------------------------------
 // The spike verified zap's extern structs field-for-field against facil.io's headers; this
 // test pins those layouts so a zap upgrade that changes them fails HERE, not at runtime.

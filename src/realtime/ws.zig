@@ -244,6 +244,16 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
 fn onChannelMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, channel: []const u8, message: []const u8) anyerror!void {
     const lc = context orelse return;
     if (!lc.conn.hasSub(channel)) return; // keep BEFORE reset/alloc so dead channels cost nothing
+    // Slow-consumer backpressure (issue #203): a peer that isn't draining its socket accumulates
+    // queued outbound frames in facil.io's per-socket buffer without bound (OOM/DoS). Past the
+    // per-connection high-water-mark, DISCONNECT it (bounds per-conn memory) rather than dropping
+    // frames — a drop would silently corrupt the client's view; a close forces a clean re-fetch.
+    const hwm = lc.app.realtime_outbound_hwm;
+    if (connection.outboundOverHwm(connection.pendingOutbound(fio.websocket_uuid(handle)), hwm)) {
+        std.log.warn("realtime: disconnecting slow WS consumer (outbound queue > {d} frames)", .{hwm});
+        fio.websocket_close(handle); // schedules on_close -> full teardown + slot release
+        return;
+    }
     _ = lc.frame.reset(.retain_capacity);
     const a = lc.frame.allocator();
     const filter_ptr = lc.conn.subFilter(channel);

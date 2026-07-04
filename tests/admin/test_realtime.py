@@ -1,6 +1,7 @@
 import json as _json
 import re
 import socket
+import time
 import pytest
 from urllib.parse import urlparse
 from conftest import login, api_request
@@ -151,6 +152,114 @@ def test_sse_stream_and_uplink_end_to_end(server, page):
     delivered = _recv_until(stream, b'"type":"signal"', timeout=8.0)
     stream.close()
     assert b'"topic":"__features"' in delivered, f"no __features signal delivered on the SSE stream: {delivered!r}"
+
+
+@pytest.mark.parametrize("server", [{"ZIGBASE_REALTIME_OUTBOUND_HWM": "4"}], indirect=True)
+def test_slow_sse_consumer_disconnected_at_hwm(server, page):
+    """issue #203: a STALLED SSE reader must be DISCONNECTED once its queued outbound frames
+    exceed the per-connection high-water-mark, instead of the server buffering frames without
+    bound (OOM/DoS). The server is launched with ZIGBASE_REALTIME_OUTBOUND_HWM=4.
+
+    Mechanism: open an SSE stream on a raw socket with a TINY SO_RCVBUF, subscribe to a @public
+    collection, then STOP reading. A burst of large-payload create events fills the peer's
+    receive window + the server's send buffer, so facil.io's per-socket queue (`fio_pending`)
+    climbs past the HWM; the delivery chokepoint then closes our stream. Oracle: the stalled
+    socket reaches EOF/reset (server dropped us) AND the server stays healthy afterwards. WS
+    shares the identical predicate + chokepoint (connection.outboundOverHwm, unit-tested).
+
+    Reliability (why LARGE frames + a settle BEFORE draining): `fio_pending` (the socket's
+    queued-write count) climbs once the server's send buffer is full and `write()` returns EAGAIN.
+    facil.io pins accepted sockets' SO_SNDBUF to 131072 (fio.c), so ~256 KiB blocks the socket —
+    with ~256 KiB frames that is ONE frame, so the HWM is crossed after only a handful of
+    deliveries. Crucially we must NOT start reading until the disconnect has latched: draining
+    reopens the peer's TCP window, frames flush, and `fio_pending` would fall back under the HWM —
+    so on a slow runner where the reactor lags the burst, an early read would let the connection
+    survive. We therefore hold the window closed (don't read) and sleep after the burst, giving the
+    reactor time to cross the HWM and latch `fio_close` (latched: it can't flush a blocked socket,
+    but the pending close survives until our later drain reopens the window). This is the fix for
+    the CI-only failure of the naive read-immediately version."""
+    u = urlparse(server)
+    host, port = u.hostname, u.port
+
+    # A @public collection with a large text field: each create event is a big frame, so a few
+    # unread frames fill the buffers and trip the (tiny) HWM deterministically — no need to fire
+    # thousands of records. createRule @public lets the burst be fast, anonymous raw HTTP.
+    login(page)
+    api_request(page, "POST", "/api/collections", {"name": "slow_pub", "type": "base",
+        "fields": [{"id": "", "name": "blob", "type": "text", "options": {}}],
+        "listRule": "@public", "viewRule": "@public", "createRule": "@public",
+        "updateRule": "", "deleteRule": ""})
+
+    # Open the SSE stream with a tiny receive buffer, learn the clientId, then never read again.
+    stream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    stream.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)  # shrink the peer window
+    stream.connect((host, port))
+    stream.settimeout(5.0)
+    stream.sendall((
+        "GET /api/realtime/sse HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        "Accept: text/event-stream\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n"
+    ).encode())
+    connect = _recv_until(stream, b'"clientId"', timeout=5.0)
+    m = re.search(rb'"clientId":"([^"]+)"', connect)
+    assert m, f"no clientId on the SSE stream: {connect!r}"
+    client_id = m.group(1).decode()
+
+    # Subscribe to the public collection over the uplink (separate short-lived connection).
+    sub = b'{"action":"subscribe","topic":"slow_pub"}'
+    ack = _raw_exchange(host, port, (
+        f"POST /api/realtime/sse/{client_id} HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(sub)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode() + sub)
+    assert b'"type":"ack"' in ack, f"subscribe not acked: {ack!r}"
+
+    # Burst of large-payload creates while the stream socket is NOT being read. Each ~256 KiB
+    # create is one ~256 KiB event frame queued to our stalled stream; with the pinned ~256 KiB
+    # send buffer the socket blocks after ~1 frame, so fio_pending crosses the HWM within a few
+    # deliveries. createRule @public lets the burst be fast, anonymous HTTP.
+    body = _json.dumps({"blob": "x" * (256 * 1024)}).encode()
+    for _ in range(32):
+        _raw_exchange(host, port, (
+            "POST /api/collections/slow_pub/records HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode() + body, timeout=5.0)
+
+    # Keep the peer window CLOSED (do NOT read) and let the reactor catch up: it delivers the
+    # queued frames, crosses the HWM, and latches fio_close on the stalled socket. Reading now
+    # would reopen the window and let fio_pending fall back under the HWM before the disconnect
+    # fires, so this settle is load-bearing for slow runners (see the docstring).
+    time.sleep(5.0)
+
+    # NOW drain: the first read reopens the window, facil flushes the backlog, then sends FIN once
+    # the latched close completes -> we read the backlog and hit EOF (b"") or a reset. A timeout
+    # with the socket still open => the server did NOT shed us (regression). Generous for slow CI.
+    stream.settimeout(15.0)
+    closed = False
+    try:
+        while True:
+            chunk = stream.recv(65536)
+            if not chunk:
+                closed = True  # clean EOF: the server closed the stream
+                break
+    except (ConnectionResetError, ConnectionAbortedError):
+        closed = True  # RST: the server dropped the slow consumer
+    except socket.timeout:
+        closed = False  # still open, no EOF => NOT disconnected
+    finally:
+        stream.close()
+    assert closed, "server did not disconnect the stalled slow SSE consumer (issue #203)"
+
+    # After shedding the slow consumer the server is still serving.
+    health = _raw_exchange(host, port, b"GET /api/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert b"200" in health, f"server unhealthy after disconnecting slow consumer: {health!r}"
 
 
 def test_features_changed_signal_on_override(page):

@@ -1315,6 +1315,14 @@ id only permits griefing that connection (unsubscribe/auth-clear), never data ex
 the 256-subscriptions-per-connection cap. Browser note: HTTP/1.1 `EventSource` is limited to
 ~6 streams per origin by browsers.
 
+**Slow-consumer backpressure.** A client that reads slowly or stalls without closing would
+otherwise let the server buffer its outbound frames without bound (an OOM/DoS risk). Each
+realtime connection therefore has a per-connection **outbound high-water-mark**: once its queued
+outbound frames exceed the bound, the server **disconnects** that consumer (the standard pub/sub
+choice — dropping individual frames would silently corrupt the client's view; a disconnect forces
+a clean reconnect + re-fetch). Applies to both WS and SSE. Default `1024` frames; tune with
+`--realtime-outbound-hwm N` / `ZIGBASE_REALTIME_OUTBOUND_HWM` (`0` disables the bound).
+
 **No-SDK example.**
 
 ```js

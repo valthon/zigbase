@@ -1,0 +1,2 @@
+### Security
+- Realtime slow-consumer backpressure (issue #203): each WebSocket/SSE connection now has a per-connection outbound high-water-mark. A client that reads slowly or stalls without closing used to let the server buffer its outbound frames without bound (an OOM/DoS risk); once a connection's queued outbound frames exceed the bound it is now disconnected (the standard pub/sub choice — a clean reconnect + re-fetch, never a silent frame drop). Default `1024` frames; tune with `--realtime-outbound-hwm N` / `ZIGBASE_REALTIME_OUTBOUND_HWM` (`0` disables).

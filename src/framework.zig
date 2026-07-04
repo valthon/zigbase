@@ -1427,6 +1427,8 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                      browser upgrades. [env ZIGBASE_REALTIME_ORIGINS]
         \\  --sse-heartbeat-seconds N  SSE heartbeat (": ping") interval in seconds (serve only).
         \\                      0 = inherit the 40s listener timeout. [env ZIGBASE_SSE_HEARTBEAT_SECONDS]
+        \\  --realtime-outbound-hwm N  Disconnect a slow WS/SSE consumer once its queued outbound
+        \\                      frames exceed N (serve only). 0 disables. [env ZIGBASE_REALTIME_OUTBOUND_HWM]
         \\
     , .{});
     if (show_serve_static) emit(io, file,
@@ -1461,6 +1463,8 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                           browser upgrades.               [default empty]
         \\  ZIGBASE_SSE_HEARTBEAT_SECONDS  SSE keep-alive comment interval, 0 or 1..=255; 0 inherits
         \\                           the 40s listener timeout.       [default 0]
+        \\  ZIGBASE_REALTIME_OUTBOUND_HWM  Disconnect a slow WS/SSE consumer once its queued outbound
+        \\                           frames exceed this; 0 disables.  [default 1024]
         \\  ZIGBASE_MAX_UPLOAD_SIZE   Max request body for uploads, in bytes. [default 52428800 = 50 MiB]
         \\  ZIGBASE_AUTH_TOKEN_TTL    Auth token lifetime, seconds.  [default 1209600 = 14 days]
         \\  ZIGBASE_VERIFICATION_TTL  Email-verification token TTL, seconds. [default 604800 = 7 days]
@@ -1550,7 +1554,7 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_
         \\USAGE:
         \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
         \\                [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
-        \\                [--sse-heartbeat-seconds N]{s}
+        \\                [--sse-heartbeat-seconds N] [--realtime-outbound-hwm N]{s}
         \\
         \\FLAGS:
         \\  --http-host H    Address to bind; loopback by default. Pass 0.0.0.0 for all
@@ -1562,6 +1566,8 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_
         \\  --realtime-origins CSV  Allowed WebSocket Origins; empty denies cross-origin upgrades.
         \\  --sse-heartbeat-seconds N  SSE heartbeat interval in seconds; 0 inherits the 40s
         \\                         listener timeout. [env ZIGBASE_SSE_HEARTBEAT_SECONDS]
+        \\  --realtime-outbound-hwm N  Disconnect a slow WS/SSE consumer past N queued outbound
+        \\                         frames; 0 disables. [env ZIGBASE_REALTIME_OUTBOUND_HWM]
         \\
     , .{if (show_serve_static) " [--serve-static DIR]" else ""});
     if (show_serve_static) emit(io, file,
@@ -1676,6 +1682,7 @@ fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.C
     if (sa.trust_proxy) cfg.trust_proxy = true;
     if (sa.realtime_origins) |v| cfg.realtime_allowed_origins = v;
     if (sa.sse_heartbeat_seconds) |v| cfg.sse_heartbeat_seconds = v;
+    if (sa.realtime_outbound_hwm) |v| cfg.realtime_outbound_hwm = v;
     return cfg;
 }
 
@@ -2161,6 +2168,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .oauth_state_ttl_s = cfg.oauth_state_ttl_s,
         .realtime_allowed_origins = cfg.realtime_allowed_origins,
         .sse_heartbeat_seconds = @intCast(cfg.sse_heartbeat_seconds),
+        .realtime_outbound_hwm = cfg.realtime_outbound_hwm,
         .trust_proxy = cfg.trust_proxy,
         .max_upload_size = cfg.max_upload_size,
         .file_token_ttl_s = cfg.file_token_ttl_s,

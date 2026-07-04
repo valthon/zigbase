@@ -294,6 +294,17 @@ fn onChannelMessage(h: sse_fio.Handle, channel_info: fio_str, message_info: fio_
     const sc: *SseConn = @ptrCast(@alignCast(udata orelse return));
     const channel = sse_fio.sliceOf(channel_info);
     const message = sse_fio.sliceOf(message_info);
+    // Slow-consumer backpressure (issue #203), identical policy to WS: a peer that isn't draining
+    // its stream accumulates queued outbound frames without bound (OOM/DoS). Past the per-connection
+    // high-water-mark, close the stream (on_close reaps) rather than dropping frames. This runs
+    // fio-serialized against on_close for THIS connection and takes NO lock — the lock-ordering law
+    // (registry_mu vs conn mu never nested) is untouched.
+    const hwm = sc.app.realtime_outbound_hwm;
+    if (connection.outboundOverHwm(connection.pendingOutbound(sse_fio.uuid(h)), hwm)) {
+        std.log.warn("realtime: disconnecting slow SSE consumer (outbound queue > {d} frames)", .{hwm});
+        sse_fio.close(h);
+        return;
+    }
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();

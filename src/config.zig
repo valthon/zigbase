@@ -52,6 +52,11 @@ pub const Config = struct {
     // ws_timeout (zap default 40s). Nonzero values are applied per-connection at stream open
     // and validated AT STARTUP to 1..=255 (the fio timeout is a u8) — a bad value fails boot.
     sse_heartbeat_seconds: u16 = 0,
+    // Slow-consumer outbound high-water-mark (issue #203): the max queued outbound frames facil.io
+    // may hold for ONE realtime (WS or SSE) connection before the server disconnects the peer. A
+    // stalled/slow reader otherwise accumulates queued frames without bound (OOM/DoS). Unit is
+    // FRAMES, not bytes. 0 disables the bound. Env override: ZIGBASE_REALTIME_OUTBOUND_HWM.
+    realtime_outbound_hwm: u32 = @import("realtime/connection.zig").DEFAULT_OUTBOUND_HWM,
     // When false (default), the rate limiter and any client-IP logic key on the real
     // socket peer and IGNORE X-Forwarded-For / X-Real-IP (which a direct attacker can
     // spoof). Set true ONLY when behind a trusted reverse proxy that sets those headers.
@@ -165,6 +170,7 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_PASSWORD_RESET_TTL")) |v| cfg.password_reset_ttl_s = try std.fmt.parseInt(i64, v, 10);
         if (getter.get("ZIGBASE_REALTIME_ORIGINS")) |v| cfg.realtime_allowed_origins = v;
         if (getter.get("ZIGBASE_SSE_HEARTBEAT_SECONDS")) |v| cfg.sse_heartbeat_seconds = try std.fmt.parseInt(u16, v, 10);
+        if (getter.get("ZIGBASE_REALTIME_OUTBOUND_HWM")) |v| cfg.realtime_outbound_hwm = try std.fmt.parseInt(u32, v, 10);
         if (getter.get("ZIGBASE_TRUST_PROXY")) |v| cfg.trust_proxy = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
         if (getter.get("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
         if (getter.get("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
