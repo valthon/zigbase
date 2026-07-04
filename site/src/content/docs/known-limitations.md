@@ -23,12 +23,16 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   and the TypeScript SDK (`listSessions()` / `revokeSession(id)`). In `.epoch` mode,
   `ctx.auth()` returns `error.SessionStoreNotEnabled` and the REST/SDK surface returns a
   non-oracle `404`.
-- **Mailer requires SMTP configuration for production.** Verification and password-reset
-  email is delivered when SMTP is configured (`ZIGBASE_SMTP_HOST` + friends; supports `none`
-  / `starttls` / `implicit` TLS). **Without SMTP configured, those tokens are logged to the
-  server** (the dev/CI default) rather than emailed — a real deployment must set SMTP. TLS
-  verifies certificates by default; `ZIGBASE_SMTP_INSECURE` disables verification for
-  self-signed relays only.
+- **A mail delivery path must be configured for production.** Verification and password-reset
+  email is delivered once a mailer is configured. Zero-code options selectable by env: **SMTP**
+  (`ZIGBASE_SMTP_HOST` + friends; `none` / `starttls` / `implicit` TLS — certificates verified by
+  default, `ZIGBASE_SMTP_INSECURE` disables verification for self-signed relays only), or a
+  **local sendmail/msmtp-style command** (`ZIGBASE_SENDMAIL_COMMAND`, e.g. `msmtp -t` or
+  `sendmail -t -i`; whitespace-split into argv, and it takes precedence over SMTP when set).
+  Embedded consumers can also swap in the built-in **SES** / **Postmark** backends or a custom
+  `Mailer` plugin via `App(.{ .mailer = T })`. **With none configured, those tokens are logged
+  to the server** (the dev/CI default) rather than emailed — a real deployment must configure one
+  of the above.
 - **Rate limiting keys on proxy headers only when `--trust-proxy` is set.** Login /
   verification / password-reset are rate limited. `X-Forwarded-For` / `X-Real-IP` are
   **ignored by default** (they are spoofable on direct exposure); set `--trust-proxy` /
@@ -55,13 +59,14 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 ## Framework / hooks
 
-- **`before`-hook side-writes are atomic with the triggering write, but `ctx.records()` results are
-  gpa-allocated.** On the HTTP create/update/delete path a `before`-hook runs *inside* the
-  triggering write's transaction, so its `ctx.records()` side-writes commit
-  atomically with the primary write and roll back together if the hook errors or the access rule
-  denies (fail closed). The one caveat: values *returned* by `ctx.records()` (e.g. a `.get` result)
-  are allocated from the app allocator, not `ev.arena` — copy with `ev.arena` before storing one
-  into `ev.record`.
+- **`before`-hook side-writes are atomic with the triggering write; copy `ctx.records()` results
+  into `ev.arena` before storing them in `ev.record`.** On the HTTP create/update/delete path a
+  `before`-hook runs *inside* the triggering write's transaction, so its `ctx.records()`
+  side-writes commit atomically with the primary write and roll back together if the hook errors
+  or the access rule denies (fail closed). The one caveat: values *returned* by `ctx.records()`
+  (e.g. a `.get` result) live on the hook's per-invocation arena, which is freed when the hook
+  returns — not on `ev.arena`, which owns `ev.record` and outlives the hook. Copy such a value
+  into `ev.arena` before storing it into `ev.record`, or it will dangle.
 
 ## Schema / migrations
 
@@ -165,8 +170,10 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 - **No Windows build** — Linux and macOS only (the embedded HTTP server depends on
   facil.io/zap).
-- **Admin UI:** no logs screen, and the record editor uses a plain textarea (no WYSIWYG
-  rich-text editor) — both deferred.
+- **Admin UI:** the record editor uses a plain textarea for `editor`- and `json`-type fields
+  (no WYSIWYG rich-text editor), deferred. The Logs & realtime view is capability-gated — it
+  appears only when the app enables `.analytics` (so it's hidden on the stock `zigbase serve`
+  binary).
 
 ## Postgres backend
 

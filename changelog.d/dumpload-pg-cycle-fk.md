@@ -1,7 +1,0 @@
-### Features
-
-- `migrate-db` now fully supports circular relations (self-relations and mutual/N-node cycles) end-to-end, not just provisioning: cycle-edge foreign keys are omitted from the initial `CREATE TABLE` and added back as `DEFERRABLE INITIALLY IMMEDIATE` constraints (Postgres cannot create tables with circular inline `REFERENCES` in any order), and the load transaction defers those constraints to `COMMIT` (`SET CONSTRAINTS ALL DEFERRED` on Postgres, `PRAGMA defer_foreign_keys=ON` on SQLite) so rows load in any order regardless of reference direction. Previously this schema shape failed outright during provisioning; SQLite targets were always cycle-capable (inline FK DDL tolerates cycles) but are now verified round-trip end to end. A dataset with a genuinely dangling reference fails clearly at `COMMIT`, naming the affected collections, and rolls the whole load back.
-
-### Fixes
-
-- `migrate-db` onto a non-superuser Postgres target (the common case for managed Postgres like RDS/Cloud SQL) no longer silently corrupts the load: the best-effort `SET session_replication_role = replica` FK-suspension attempt, when rejected for lack of privilege, was leaving the load transaction itself in Postgres's aborted state — so *every* subsequent statement in the load failed, regardless of whether the schema had any cycles at all. The attempt is now wrapped in a `SAVEPOINT` so a rejected privilege check no longer poisons the load.

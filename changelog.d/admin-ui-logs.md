@@ -1,2 +1,0 @@
-### Features
-- Admin UI: a **Logs & realtime** view — browse app analytics events with name/actor/since filters and cursor pagination, view an app-declared rollup's aggregated series, and a read-only realtime health strip (live connection count + caps). Backed by the existing analytics APIs plus a new superuser `GET /api/realtime/stats`. The Logs tab is capability-gated: it only appears when the app enables `.analytics` (the stock `zigbase serve` binary doesn't, so the tab is hidden there).
