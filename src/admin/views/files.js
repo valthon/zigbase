@@ -57,7 +57,7 @@ function fileUrl(col, id, name, dl) {
 function FileThumb({ col, id, name }) {
   return isImage(name)
     ? html`<img data-test="file-thumb" src=${fileUrl(col, id, name)} alt=${name} style="height:40px;width:40px;object-fit:cover;border:1px solid var(--line);border-radius:4px"/>`
-    : html`<a data-test="file-download" href=${fileUrl(col, id, name, true)}>${name}</a>`;
+    : html`<a data-test="file-download" href=${fileUrl(col, id, name, true)} onClick=${e => e.stopPropagation()}>${name}</a>`;
 }
 function RecordsBrowser({ col, fields }) {
   const [rows, setRows] = useState(null);
@@ -66,6 +66,7 @@ function RecordsBrowser({ col, fields }) {
   const [reload, setReload] = useState(0);
   const doReload = () => setReload(n => n + 1);
   useEffect(() => {
+    if (!col) return;
     let active = true; setRows(null);
     API.records(col, new URLSearchParams({ page: 1, perPage: 50, sort: '-created' }).toString())
       .then(r => { if (active) setRows(r.items); })
@@ -92,8 +93,10 @@ function RecordsBrowser({ col, fields }) {
 }
 
 function FileDrawer({ col, fields, rec, onClose, onChanged }) {
+  // Hooks must run unconditionally on every render (Rules of Hooks); guard AFTER them.
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  if (!rec) return null;
   async function upload(field, input) {
     const file = input.files && input.files[0];
     if (!file) return;
