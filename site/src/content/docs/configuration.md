@@ -69,6 +69,7 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_VERIFICATION_TTL` | — | `604800` (7 days) | email-verification token lifetime, seconds |
 | `ZIGBASE_PASSWORD_RESET_TTL` | — | `3600` (1 hour) | password-reset token lifetime, seconds |
 | `ZIGBASE_REALTIME_ORIGINS` | `--realtime-origins` | `""` (deny cross-origin) | CSV of allowed WebSocket `Origin`s. Empty denies cross-origin browser upgrades; same-origin upgrades are always allowed |
+| `ZIGBASE_REALTIME_OUTBOUND_HWM` | `--realtime-outbound-hwm` | `1024` (frames) | slow-consumer outbound high-water-mark: max queued outbound frames per realtime (WS/SSE) connection before the server disconnects the peer (bounds memory under a stalled/slow reader). `0` disables the bound |
 | `ZIGBASE_MAX_UPLOAD_SIZE` | — | `52428800` (50 MiB) | max request body size, bytes |
 | `ZIGBASE_FILE_TOKEN_TTL` | — | `120` (2 min) | file-access token lifetime, seconds |
 | `ZIGBASE_SENTRY_DSN` | — | `""` (log to stderr) | set to enable Sentry error reporting |

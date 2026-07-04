@@ -35,6 +35,38 @@ pub fn releaseConnectionSlot() void {
     _ = live_connections.fetchSub(1, .monotonic);
 }
 
+/// Slow-consumer outbound high-water-mark (issue #203). A WS or SSE peer that reads slowly,
+/// opens a tiny TCP window, or stalls without closing causes delivered frames to accumulate in
+/// facil.io's per-socket outgoing buffer WITHOUT BOUND — an OOM/DoS risk (MAX_SUBS/MAX_CONNECTIONS
+/// bound only subscription/connection *counts*, never a single connection's outbound queue depth).
+/// When the queue exceeds this bound the transport DISCONNECTS the consumer (the standard pub/sub
+/// choice — dropping individual frames would silently corrupt the client's view of the collection);
+/// the client reconnects + re-fetches cleanly. This is the DEFAULT; an operator overrides it via
+/// `ZIGBASE_REALTIME_OUTBOUND_HWM` / `--realtime-outbound-hwm`. `0` disables the bound.
+///
+/// Unit is FRAMES (facil.io counts queued `fio_write` calls, one per delivered frame), NOT bytes.
+pub const DEFAULT_OUTBOUND_HWM: u32 = 1024;
+
+/// facil.io `size_t fio_pending(intptr_t uuid)` (fio.h): the number of queued (un-flushed)
+/// `fio_write` calls on a socket. One realtime frame == one write, so this is the connection's
+/// pending outbound frame count. Safe on a dead/invalid uuid (facil.io returns 0). Linked from the
+/// vendored facil.io that zap compiles; only meaningful with the reactor running.
+extern fn fio_pending(uuid: isize) usize;
+
+/// Queued outbound frame count for a live realtime socket `uuid` (WS: `websocket_uuid`;
+/// SSE: `http_sse2uuid`). Reactor-only — never call from a unit test (no facil.io globals). The
+/// pure decision predicate is `outboundOverHwm`, which IS unit-testable.
+pub fn pendingOutbound(uuid: isize) usize {
+    return fio_pending(uuid);
+}
+
+/// Pure predicate (unit-testable): do `pending` queued outbound frames exceed the bound `hwm`?
+/// `hwm == 0` disables the bound (always false). Split from `pendingOutbound` so the policy is
+/// testable without a running facil.io reactor.
+pub fn outboundOverHwm(pending: usize, hwm: u32) bool {
+    return hwm != 0 and pending > hwm;
+}
+
 /// A verified connection identity. `exp` is the token's unix expiry; past it the connection is
 /// treated as anonymous until a fresh `auth` message.
 pub const AuthIdentity = struct {
@@ -141,6 +173,19 @@ test "requestContext: anonymous, authed, expired" {
     try std.testing.expect(conn.requestContext(2001).auth == null);
     conn.setAuth(.{ .record = .{ .object = rec }, .is_superuser = true, .exp = 2000 });
     try std.testing.expect(conn.requestContext(1500).is_superuser);
+}
+
+test "outboundOverHwm: disconnect decision boundary (issue #203)" {
+    // At/under the bound: keep delivering. Strictly over: disconnect.
+    try std.testing.expect(!outboundOverHwm(0, DEFAULT_OUTBOUND_HWM));
+    try std.testing.expect(!outboundOverHwm(DEFAULT_OUTBOUND_HWM, DEFAULT_OUTBOUND_HWM)); // == is NOT over
+    try std.testing.expect(outboundOverHwm(DEFAULT_OUTBOUND_HWM + 1, DEFAULT_OUTBOUND_HWM));
+    // A small explicit bound (as an e2e test / tight operator config would set).
+    try std.testing.expect(!outboundOverHwm(2, 2));
+    try std.testing.expect(outboundOverHwm(3, 2));
+    // hwm == 0 disables the bound entirely — never disconnects, even at a huge queue depth.
+    try std.testing.expect(!outboundOverHwm(0, 0));
+    try std.testing.expect(!outboundOverHwm(1_000_000, 0));
 }
 
 test "F9: global connection cap reserves/releases and rejects past MAX_CONNECTIONS" {

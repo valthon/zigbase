@@ -11,6 +11,7 @@ pub const ServeArgs = struct {
     trust_proxy: bool = false, // --trust-proxy => honor X-Forwarded-For/X-Real-IP
     realtime_origins: ?[]const u8 = null, // --realtime-origins CSV => allowed WS Origins
     sse_heartbeat_seconds: ?u16 = null, // --sse-heartbeat-seconds N => SSE ping interval (0 = inherit listener timeout)
+    realtime_outbound_hwm: ?u32 = null, // --realtime-outbound-hwm N => slow-consumer disconnect bound in frames (0 disables); issue #203
 };
 
 pub const SuperuserArgs = struct {
@@ -248,6 +249,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
             sa.sse_heartbeat_seconds = std.fmt.parseInt(u16, args[i], 10) catch return ParseError.BadValue;
+        } else if (std.mem.eql(u8, a, "--realtime-outbound-hwm")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            sa.realtime_outbound_hwm = std.fmt.parseInt(u32, args[i], 10) catch return ParseError.BadValue;
         } else {
             return ParseError.UnknownFlag;
         }
@@ -353,6 +358,16 @@ test "serve --sse-heartbeat-seconds parses; bad/missing values rejected" {
     try std.testing.expectEqual(@as(?u16, 2), c.serve.sse_heartbeat_seconds);
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--sse-heartbeat-seconds", "abc" }, .{}));
     try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--sse-heartbeat-seconds" }, .{}));
+}
+
+test "serve --realtime-outbound-hwm parses; bad/missing values rejected (issue #203)" {
+    const c = try parse(&.{ "serve", "--realtime-outbound-hwm", "16" }, .{});
+    try std.testing.expectEqual(@as(?u32, 16), c.serve.realtime_outbound_hwm);
+    // 0 is a valid value (disables the bound); not the same as absent (null).
+    const z = try parse(&.{ "serve", "--realtime-outbound-hwm", "0" }, .{});
+    try std.testing.expectEqual(@as(?u32, 0), z.serve.realtime_outbound_hwm);
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--realtime-outbound-hwm", "nope" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--realtime-outbound-hwm" }, .{}));
 }
 
 test "--serve-static is an unknown flag when disabled at comptime" {

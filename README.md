@@ -150,6 +150,7 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_PASSWORD_RESET_TTL` | — | `3600` (1 hour) | password-reset token lifetime, seconds |
 | `ZIGBASE_REALTIME_ORIGINS` | `--realtime-origins` | `""` (deny cross-origin) | CSV of allowed WebSocket/SSE `Origin`s — the gate applies to both transports. Empty denies cross-origin browser upgrades |
 | `ZIGBASE_SSE_HEARTBEAT_SECONDS` | `--sse-heartbeat-seconds` | `0` (inherit 40s listener timeout) | SSE heartbeat (`: ping`) interval, 1–255 seconds |
+| `ZIGBASE_REALTIME_OUTBOUND_HWM` | `--realtime-outbound-hwm` | `1024` (frames) | slow-consumer outbound high-water-mark: max queued outbound frames per realtime (WS/SSE) connection before the server disconnects the peer. `0` disables the bound |
 | `ZIGBASE_MAX_UPLOAD_SIZE` | — | `52428800` (50 MiB) | max request body size, bytes |
 | `ZIGBASE_FILE_TOKEN_TTL` | — | `120` (2 min) | file-access token lifetime, seconds |
 | `ZIGBASE_STATIC_CACHE_CONTROL` | `--static-cache-control` | `max-age=3600` (facil.io stock) | `Cache-Control` value for static responses (embedded + dir); flag wins over env, both win over the comptime `.static_cache_control` default |
