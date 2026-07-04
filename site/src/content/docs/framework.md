@@ -1413,9 +1413,10 @@ endpoint (above), or a custom route if you need a bespoke shape.
 
 The embedded admin UI (`/_/`) covers **Collections** (schema editor), **Records**
 (browse/query/edit), **Users**, **Files** (browse/upload, below), **Email**
-(senders, suppressions, batches, below), **Features** (flags & experiments,
-below), and **Settings** (raw KV, above). It ships as browser-native ES modules —
-no build step — and every asset is served with a CRC32 `ETag`.
+(senders, suppressions, batches, below), **Logs** (analytics events + rollups +
+realtime health, below), **Features** (flags & experiments, below), and
+**Settings** (raw KV, above). It ships as browser-native ES modules — no build
+step — and every asset is served with a CRC32 `ETag`.
 
 **Users** (`/_/#/users`) manages both superusers and auth-collection users: list
 and search (filter-based) either, create/edit/delete records, an admin password
@@ -1445,6 +1446,18 @@ The policy strip reads the new superuser-only `GET /api/mail/config` — boolean
 only (`require_verified_sender`, `check_suppression`, whether a webhook secret and
 an unsubscribe base URL are configured) — never secrets. See
 [API → Email](./api#email--verified-senders--bounce-webhook-154).
+
+**Logs** (`/_/#/logs`) is a **Logs & realtime** view: a filterable, cursor-paginated
+browser for the raw [analytics events feed](#product-analytics-analytics--ctxtrack)
+(`name`/`actor`/`since` filters, expandable payloads), a viewer for an app-declared
+rollup's aggregated series (by name, with `from`/`to` bounds), and a read-only
+realtime health strip (live connection count plus the connection/subscription caps
+and configured outbound high-water-mark, from the new superuser `GET
+/api/realtime/stats`). The tab is **capability-gated**: it only appears when the
+app configures `.analytics` (the stock `zigbase serve` binary doesn't enable it, so
+the tab is hidden there). It composes the existing analytics API — see
+[API → Analytics](./api#analytics) and
+[API → Realtime](./api#realtime-websocket--sse).
 
 The embedded admin UI (`/_/`) has a dedicated **Feature Flags & Experiments** screen
 (`/_/#/features`) that exposes the comptime-declared registry to superusers without

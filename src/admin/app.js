@@ -7,6 +7,7 @@ import { FilesView } from '/_/assets/views/files.js';
 import { FeaturesView } from '/_/assets/views/features.js';
 import { SettingsView } from '/_/assets/views/settings.js';
 import { UsersView } from '/_/assets/views/users.js';
+import { LogsView } from '/_/assets/views/logs.js';
 
 // --- tiny hash router ---
 function useHashRoute() {
@@ -27,6 +28,7 @@ function parseRoute(hash) {
   if (seg[0] === 'users') return { name: 'users' };
   if (seg[0] === 'email') return { name: 'email' };
   if (seg[0] === 'files') return { name: 'files' };
+  if (seg[0] === 'logs') return { name: 'logs' };
   if (seg[0] === 'collections' && seg[1] && seg[2] === 'records') return { name: 'records', col: decodeURIComponent(seg[1]) };
   if (seg[0] === 'collections' && seg[1]) return { name: 'schema', col: decodeURIComponent(seg[1]) };
   return { name: 'collections' };
@@ -70,10 +72,17 @@ function Shell({ route }) {
   const [err, setErr] = useState('');
   const [backend, setBackend] = useState('');
   const [collapsed, setCollapsed] = useState(localStorage.getItem('zb_sidebar') === '1');
+  // `/api/analytics/events` is comptime-gated (R2-3 lean build) — unmounted (404) unless the
+  // app configures `.analytics`. Probe it once so the Logs tab (and its deep-link) only ever
+  // appear when the feature actually exists, rather than showing a tab that 404s.
+  const [analyticsEnabled, setAnalyticsEnabled] = useState(false);
   useEffect(() => {
     API.collections().then(setCols).catch(x => setErr((x.data && x.data.message) || 'Failed to load collections'));
     // Read-only backend badge; degrade silently if /health is unreachable.
     API.health().then(h => setBackend(h && h.backend ? h.backend : '')).catch(() => {});
+    let active = true;
+    API.analyticsEvents('limit=1').then(() => { if (active) setAnalyticsEnabled(true); }).catch(() => { if (active) setAnalyticsEnabled(false); });
+    return () => { active = false; };
   }, []);
   function toggle() { const v = !collapsed; setCollapsed(v); localStorage.setItem('zb_sidebar', v ? '1' : '0'); }
   async function logout() { try { await API.logout(); } catch (_) {} go('#/login'); }
@@ -92,6 +101,7 @@ function Shell({ route }) {
         <a class=${'navitem hide-collapsed' + (route.name === 'users' ? ' active' : '')} href="#/users" data-test="nav-users">👤 Users</a>
         <a class=${'navitem hide-collapsed' + (route.name === 'email' ? ' active' : '')} href="#/email" data-test="nav-email">📧 Email</a>
         <a class=${'navitem hide-collapsed' + (route.name === 'files' ? ' active' : '')} href="#/files" data-test="nav-files">📁 Files</a>
+        ${analyticsEnabled && html`<a class=${'navitem hide-collapsed' + (route.name === 'logs' ? ' active' : '')} href="#/logs" data-test="nav-logs">📊 Logs</a>`}
         <a class=${'navitem hide-collapsed' + (route.name === 'features' ? ' active' : '')} href="#/features" data-test="nav-features">🚩 Features</a>
         <a class=${'navitem hide-collapsed' + (route.name === 'settings' ? ' active' : '')} href="#/settings" data-test="nav-settings">⚙ Settings</a>
         <a class="navitem hide-collapsed" href="#/collections" data-test="nav-collections">⚙ Collections</a>
@@ -101,6 +111,7 @@ function Shell({ route }) {
         ${route.name === 'users' ? html`<${UsersView}/>`
           : route.name === 'email' ? html`<${EmailView}/>`
           : route.name === 'files' ? html`<${FilesView}/>`
+          : route.name === 'logs' && analyticsEnabled ? html`<${LogsView}/>`
           : route.name === 'features' ? html`<${FeaturesView}/>`
           : route.name === 'settings' ? html`<${SettingsView}/>`
           : route.name === 'records' ? html`<${RecordsTable} col=${route.col}/>`

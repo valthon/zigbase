@@ -547,6 +547,53 @@ test "events read: a malformed cursor is a 400 \"Invalid cursor.\"" {
     try std.testing.expect(std.mem.indexOf(u8, res.body, "Invalid cursor.") != null);
 }
 
+test "events read: rows captured via analytics.insertEvent (the real ctx.track path) are visible through the handler and honor name/actor/since filters" {
+    var env = try TenantTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        // Two DIFFERENT events for the same account/actor, via the actual capture path
+        // (ctx.track calls this, never a raw INSERT) — this is what the admin UI's Events
+        // tab filters against.
+        try analytics.insertEvent(w, std.testing.io, .{ .name = "user.signup", .payload_json = "{\"plan\":\"pro\"}", .actor = "u1", .actor_collection = "users", .account = "accA" });
+        try analytics.insertEvent(w, std.testing.io, .{ .name = "user.login", .payload_json = "{}", .actor = "u1", .actor_collection = "users", .account = "accA" });
+    }
+    const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
+
+    // No filter -> both rows visible.
+    var c0 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs };
+    const r0 = try events(&c0);
+    try std.testing.expectEqual(@as(u16, 200), r0.status);
+    try std.testing.expect(std.mem.indexOf(u8, r0.body, "user.signup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r0.body, "user.login") != null);
+
+    // name filter narrows to the one matching row (and its payload survives the round-trip).
+    var c1 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "name=user.signup" };
+    const r1 = try events(&c1);
+    try std.testing.expectEqual(@as(u16, 200), r1.status);
+    const p1 = try std.json.parseFromSlice(std.json.Value, a, r1.body, .{});
+    const items1 = p1.value.object.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), items1.len);
+    try std.testing.expectEqualStrings("user.signup", items1[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("pro", items1[0].object.get("payload").?.object.get("plan").?.string);
+
+    // actor filter (matches both, both captured under the same actor).
+    var c2 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "actor=u1" };
+    const r2 = try events(&c2);
+    const p2 = try std.json.parseFromSlice(std.json.Value, a, r2.body, .{});
+    try std.testing.expectEqual(@as(usize, 2), p2.value.object.get("items").?.array.items.len);
+
+    // A `since` far in the future excludes everything captured just now (lower-bound filter).
+    var c3 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "since=2999-01-01T00:00:00Z" };
+    const r3 = try events(&c3);
+    try std.testing.expectEqual(@as(u16, 200), r3.status);
+    const p3 = try std.json.parseFromSlice(std.json.Value, a, r3.body, .{});
+    try std.testing.expectEqual(@as(usize, 0), p3.value.object.get("items").?.array.items.len);
+    try std.testing.expect(!p3.value.object.get("hasNext").?.bool);
+}
+
 test "events read requires authentication (anonymous -> 401)" {
     var env = try TenantTestEnv.init();
     defer env.deinit();

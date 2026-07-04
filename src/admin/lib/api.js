@@ -52,4 +52,7 @@ export const API = {
   batchRecipients: (q) => api('GET', `/collections/_mail_batch_recipients/records?${q}`),
   filesConfig: () => api('GET', '/files/config'),
   uploadFile: (col, id, formData) => api('PATCH', `/collections/${encodeURIComponent(col)}/records/${encodeURIComponent(id)}`, formData, true),
+  realtimeStats: () => api('GET', '/realtime/stats'),
+  analyticsEvents: (q) => api('GET', `/analytics/events?${q}`),
+  analyticsRollup: (name, q) => api('GET', `/analytics/rollups/${encodeURIComponent(name)}?${q}`),
 };
