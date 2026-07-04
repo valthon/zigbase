@@ -296,15 +296,9 @@ fn ensureIndexSqliteImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collec
     const new_list = try columnList(alloc, cols, "new");
     const old_list = try columnList(alloc, cols, "old");
 
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc,
-        "CREATE TRIGGER \"{s}_ai\" AFTER INSERT ON \"{s}\" BEGIN INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;",
-        .{ ft, col.name, ft, col_list, new_list })));
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc,
-        "CREATE TRIGGER \"{s}_ad\" AFTER DELETE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); END;",
-        .{ ft, col.name, ft, ft, col_list, old_list })));
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc,
-        "CREATE TRIGGER \"{s}_au\" AFTER UPDATE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;",
-        .{ ft, col.name, ft, ft, col_list, old_list, ft, col_list, new_list })));
+    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "CREATE TRIGGER \"{s}_ai\" AFTER INSERT ON \"{s}\" BEGIN INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;", .{ ft, col.name, ft, col_list, new_list })));
+    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "CREATE TRIGGER \"{s}_ad\" AFTER DELETE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); END;", .{ ft, col.name, ft, ft, col_list, old_list })));
+    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "CREATE TRIGGER \"{s}_au\" AFTER UPDATE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;", .{ ft, col.name, ft, ft, col_list, old_list, ft, col_list, new_list })));
 
     // Repopulate from the content table (no-op on an empty table).
     try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "INSERT INTO \"{s}\"(\"{s}\") VALUES ('rebuild');", .{ ft, ft })));
@@ -390,9 +384,7 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
     try expr.appendSlice(alloc, ")");
 
     {
-        const sql = try std.fmt.allocPrintSentinel(alloc,
-            "ALTER TABLE \"{s}\" ADD COLUMN \"{s}\" tsvector GENERATED ALWAYS AS ({s}) STORED;",
-            .{ col.name, tsv, expr.items }, 0);
+        const sql = try std.fmt.allocPrintSentinel(alloc, "ALTER TABLE \"{s}\" ADD COLUMN \"{s}\" tsvector GENERATED ALWAYS AS ({s}) STORED;", .{ col.name, tsv, expr.items }, 0);
         defer alloc.free(sql);
         try w.exec(sql);
     }
@@ -400,8 +392,7 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
     {
         // Record the searchable column set as a marker comment so a later additive change that adds
         // or removes a `.searchable` field is detected as drift and rebuilds the column.
-        const sql = try std.fmt.allocPrintSentinel(alloc,
-            "COMMENT ON COLUMN \"{s}\".\"{s}\" IS '{s}';", .{ col.name, tsv, want_marker }, 0);
+        const sql = try std.fmt.allocPrintSentinel(alloc, "COMMENT ON COLUMN \"{s}\".\"{s}\" IS '{s}';", .{ col.name, tsv, want_marker }, 0);
         defer alloc.free(sql);
         try w.exec(sql);
     }
@@ -453,9 +444,8 @@ const PgColumnState = union(enum) {
 fn pgColumnState(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: []const u8) !PgColumnState {
     // Postgres-only path → the native `$n` placeholders are written directly (this never flows
     // through the `?`→`$n` ParamSink renumber that the cross-backend CRUD/query producers use).
-    const sql = try std.fmt.allocPrintSentinel(alloc,
-        "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a " ++
-            "WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped;", .{}, 0);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a " ++
+        "WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped;", .{}, 0);
     defer alloc.free(sql);
     var st = try w.prepare(sql);
     defer st.finalize();
@@ -486,8 +476,7 @@ fn pgRelExists(alloc: std.mem.Allocator, w: *db.Db, rel: []const u8) !bool {
 /// a fresh provision and to recreate JUST the index when the column is already correct but the index
 /// went missing (so we never drop+rebuild the expensive STORED generated column for an index-only gap).
 fn createGinIndexPg(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: []const u8, idx: []const u8) !void {
-    const sql = try std.fmt.allocPrintSentinel(alloc,
-        "CREATE INDEX \"{s}\" ON \"{s}\" USING GIN (\"{s}\");", .{ idx, col_name, tsv }, 0);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "CREATE INDEX \"{s}\" ON \"{s}\" USING GIN (\"{s}\");", .{ idx, col_name, tsv }, 0);
     defer alloc.free(sql);
     try w.exec(sql);
 }

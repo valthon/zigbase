@@ -474,9 +474,15 @@ test "MagicLinkMethod: initiate auto_create=true creates record for unknown iden
         const existing = (try collections.get(a, w, "ml_ac")).?;
         try collections.delete(a, w, existing.id);
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "ml_ac", .type = .auth,
+            .id = "",
+            .name = "ml_ac",
+            .type = .auth,
             .fields = &[_]schema_mod.Field{},
-            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
             .options = .{ .auth = .{ .methods = .{ .magic_link = .{ .auto_create = true } } } },
         });
     }
@@ -522,9 +528,15 @@ test "MagicLinkMethod: initiate auto_create=false creates nothing for unknown id
         const existing = (try collections.get(a, w, "ml_noac")).?;
         try collections.delete(a, w, existing.id);
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "ml_noac", .type = .auth,
+            .id = "",
+            .name = "ml_noac",
+            .type = .auth,
             .fields = &[_]schema_mod.Field{},
-            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
             .options = .{ .auth = .{ .methods = .{ .magic_link = .{ .auto_create = false } } } },
         });
     }
@@ -570,9 +582,15 @@ test "MagicLinkMethod: auto_create initiate then complete succeeds end-to-end" {
         const existing = (try collections.get(a, w, "ml_e2e")).?;
         try collections.delete(a, w, existing.id);
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "ml_e2e", .type = .auth,
+            .id = "",
+            .name = "ml_e2e",
+            .type = .auth,
             .fields = &[_]schema_mod.Field{},
-            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
             .options = .{ .auth = .{ .methods = .{ .magic_link = .{ .auto_create = true } } } },
         });
     }

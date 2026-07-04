@@ -10,7 +10,7 @@ pub fn kindOf(f: schema.Field) TsKind {
     return switch (f.options) {
         .text, .email, .url, .editor, .date, .autodate => .string,
         .number => .number,
-        .@"bool" => .boolean,
+        .bool => .boolean,
         .json => .unknown,
         .select => .select_union,
         .relation => .relation_id,
@@ -61,7 +61,7 @@ test "scalar field types" {
     try std.testing.expectEqualStrings("string", try tsTypeOf(a, "posts", fieldT(.{ .url = .{} })));
     try std.testing.expectEqualStrings("string", try tsTypeOf(a, "posts", fieldT(.{ .editor = .{} })));
     try std.testing.expectEqualStrings("number", try tsTypeOf(a, "posts", fieldT(.{ .number = .{} })));
-    try std.testing.expectEqualStrings("boolean", try tsTypeOf(a, "posts", fieldT(.{ .@"bool" = .{} })));
+    try std.testing.expectEqualStrings("boolean", try tsTypeOf(a, "posts", fieldT(.{ .bool = .{} })));
     try std.testing.expectEqualStrings("string", try tsTypeOf(a, "posts", fieldT(.{ .date = .{} })));
     try std.testing.expectEqualStrings("string", try tsTypeOf(a, "posts", fieldT(.{ .autodate = .{} })));
     try std.testing.expectEqualStrings("unknown", try tsTypeOf(a, "posts", fieldT(.{ .json = .{} })));
@@ -102,7 +102,7 @@ test "file -> filename string; multi -> string[]" {
 test "kindOf branches" {
     try std.testing.expectEqual(TsKind.string, kindOf(fieldT(.{ .text = .{} })));
     try std.testing.expectEqual(TsKind.number, kindOf(fieldT(.{ .number = .{} })));
-    try std.testing.expectEqual(TsKind.boolean, kindOf(fieldT(.{ .@"bool" = .{} })));
+    try std.testing.expectEqual(TsKind.boolean, kindOf(fieldT(.{ .bool = .{} })));
     try std.testing.expectEqual(TsKind.unknown, kindOf(fieldT(.{ .json = .{} })));
     try std.testing.expectEqual(TsKind.select_union, kindOf(.{ .id = "x", .name = "s", .options = .{ .select = .{ .values = &.{"a"} } } }));
     try std.testing.expectEqual(TsKind.relation_id, kindOf(.{ .id = "x", .name = "r", .options = .{ .relation = .{ .targetCollectionId = "t" } } }));

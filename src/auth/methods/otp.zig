@@ -515,9 +515,15 @@ test "OtpMethod: initiate auto_create=true creates record for unknown identity" 
         const existing = (try collections.get(a, w, "otp_ac")).?;
         try collections.delete(a, w, existing.id);
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "otp_ac", .type = .auth,
+            .id = "",
+            .name = "otp_ac",
+            .type = .auth,
             .fields = &[_]schema_mod.Field{},
-            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
             .options = .{ .auth = .{ .methods = .{ .otp = .{ .auto_create = true } } } },
         });
     }
@@ -563,9 +569,15 @@ test "OtpMethod: initiate auto_create=false creates nothing for unknown identity
         const existing = (try collections.get(a, w, "otp_noac")).?;
         try collections.delete(a, w, existing.id);
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "otp_noac", .type = .auth,
+            .id = "",
+            .name = "otp_noac",
+            .type = .auth,
             .fields = &[_]schema_mod.Field{},
-            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
             .options = .{ .auth = .{ .methods = .{ .otp = .{ .auto_create = false } } } },
         });
     }
@@ -611,9 +623,15 @@ test "OtpMethod: auto_create initiate then complete succeeds end-to-end" {
         const existing = (try collections.get(a, w, "otp_e2e")).?;
         try collections.delete(a, w, existing.id);
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "otp_e2e", .type = .auth,
+            .id = "",
+            .name = "otp_e2e",
+            .type = .auth,
             .fields = &[_]schema_mod.Field{},
-            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
             .options = .{ .auth = .{ .methods = .{ .otp = .{ .auto_create = true } } } },
         });
     }

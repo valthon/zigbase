@@ -226,16 +226,23 @@ test "cbor: decode spec §6.5.1.1 EC2 COSE KAT" {
     // map(5)
     try buf.append(alloc, 0xa5);
     // 1: 2  (kty = EC2)
-    try buf.append(alloc, 0x01); try buf.append(alloc, 0x02);
+    try buf.append(alloc, 0x01);
+    try buf.append(alloc, 0x02);
     // 3: -7  (alg = ES256)
-    try buf.append(alloc, 0x03); try buf.append(alloc, 0x26);
+    try buf.append(alloc, 0x03);
+    try buf.append(alloc, 0x26);
     // -1: 1  (crv = P-256)
-    try buf.append(alloc, 0x20); try buf.append(alloc, 0x01);
+    try buf.append(alloc, 0x20);
+    try buf.append(alloc, 0x01);
     // -2: bstr(32, x)
-    try buf.append(alloc, 0x21); try buf.append(alloc, 0x58); try buf.append(alloc, 0x20);
+    try buf.append(alloc, 0x21);
+    try buf.append(alloc, 0x58);
+    try buf.append(alloc, 0x20);
     try buf.appendSlice(alloc, &x_bytes);
     // -3: bstr(32, y)
-    try buf.append(alloc, 0x22); try buf.append(alloc, 0x58); try buf.append(alloc, 0x20);
+    try buf.append(alloc, 0x22);
+    try buf.append(alloc, 0x58);
+    try buf.append(alloc, 0x20);
     try buf.appendSlice(alloc, &y_bytes);
 
     var r = Reader.init(buf.items);
@@ -432,10 +439,14 @@ test "cbor: legitimately nested structure within depth limit decodes fine" {
     //       42 68 69    bstr(2) "hi"
     const data = [_]u8{
         0xa1,
-        0x41, 'k',
+        0x41,
+        'k',
         0xa1,
-        0x41, 'v',
-        0x42, 'h', 'i',
+        0x41,
+        'v',
+        0x42,
+        'h',
+        'i',
     };
     var r = Reader.init(&data);
     // outer map

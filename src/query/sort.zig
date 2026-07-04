@@ -4,7 +4,7 @@ const schema = @import("../schema.zig");
 const dialect_mod = @import("../sql/dialect.zig");
 const Dialect = dialect_mod.Dialect;
 
-pub const SortError = error{ BadSort } || joiner.JoinError;
+pub const SortError = error{BadSort} || joiner.JoinError;
 
 /// A single resolved ORDER BY term: the already-joined column SQL, its direction, the
 /// resolved `schema.Field` (null for system columns id/created/updated, which bind as text),

@@ -99,8 +99,7 @@ fn valueSet(a: std.mem.Allocator, items: []std.json.Value, key: []const u8) !std
 /// reuses an attnum, so a stable attnum across a provision call proves the column was NOT
 /// dropped+recreated (it distinguishes "recreated just the index" from "rebuilt the column").
 fn colAttnum(a: std.mem.Allocator, d: *dbm.Db, table: []const u8, col: []const u8) !?i64 {
-    const sql = try std.fmt.allocPrintSentinel(a,
-        "SELECT a.attnum FROM pg_attribute a WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped;", .{}, 0);
+    const sql = try std.fmt.allocPrintSentinel(a, "SELECT a.attnum FROM pg_attribute a WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped;", .{}, 0);
     var st = try d.prepare(sql);
     defer st.finalize();
     try st.bindText(1, try std.fmt.allocPrint(a, "\"{s}\"", .{table}));

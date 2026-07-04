@@ -263,8 +263,7 @@ test "magic-link token type is distinct: email-verification token rejected by ve
     var ctx = h.ctx(a, .POST, "", &[_]http.Param{});
 
     // Mint a standard EMAIL-VERIFICATION token (type=.verification).
-    const ver_token = try api_auth.mintToken(&ctx, w, "members", rid,
-        (try api_auth.tokenKeyFor(a, w, "members", rid)).?, .verification, 900, "");
+    const ver_token = try api_auth.mintToken(&ctx, w, "members", rid, (try api_auth.tokenKeyFor(a, w, "members", rid)).?, .verification, 900, "");
 
     // verifyLinkToken must REJECT it (null) — cross-type security boundary.
     const result = try verifyLinkToken(&ctx, w, "members", ver_token);

@@ -53,7 +53,12 @@ pub fn decimalToScaledInt(s: []const u8, scale: u8) ValueError!i64 {
     if (s.len == 0) return error.BadNumber;
     var i: usize = 0;
     var neg = false;
-    if (s[0] == '-') { neg = true; i = 1; } else if (s[0] == '+') { i = 1; }
+    if (s[0] == '-') {
+        neg = true;
+        i = 1;
+    } else if (s[0] == '+') {
+        i = 1;
+    }
     var int_part: i64 = 0;
     var seen = false;
     while (i < s.len and s[i] != '.') : (i += 1) {
@@ -116,7 +121,7 @@ pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
             if (v != .string) return error.TypeMismatch;
             try bindStorage(alloc, stmt, idx, field, v.string);
         },
-        .@"bool" => {
+        .bool => {
             if (v != .bool) return error.TypeMismatch;
             try stmt.bindInt(idx, if (v.bool) 1 else 0);
         },
@@ -164,7 +169,7 @@ pub fn readValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
         .text, .email, .url, .editor, .date, .autodate => {
             return .{ .string = try readStorage(alloc, stmt, idx, field) };
         },
-        .@"bool" => return .{ .bool = stmt.columnInt(idx) != 0 },
+        .bool => return .{ .bool = stmt.columnInt(idx) != 0 },
         .number => |o| switch (o.mode) {
             .float => return .{ .float = stmt.columnDouble(idx) },
             .int => return .{ .string = try scaledIntToDecimal(alloc, stmt.columnInt(idx), 0) },
@@ -217,7 +222,7 @@ test "bool round-trips" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const f = schema.Field{ .id = "f", .name = "ok", .options = .{ .@"bool" = .{} } };
+    const f = schema.Field{ .id = "f", .name = "ok", .options = .{ .bool = .{} } };
     const out = try roundTrip(a, f, "INTEGER", .{ .bool = true });
     try std.testing.expectEqual(true, out.bool);
 }

@@ -65,7 +65,7 @@ fn isEqNe(op: lexer.TokKind) bool {
 fn likeAllowed(field: ?schema.Field) bool {
     const f = field orelse return true; // system columns (id/created/updated) are text
     return switch (f.options) {
-        .number, .@"bool" => false,
+        .number, .bool => false,
         else => true,
     };
 }
@@ -213,7 +213,7 @@ fn literalToParam(field: ?schema.Field, op: parser.Operand) CompileError!Param {
             .int => if (op == .num) return .{ .int = try values.decimalToScaledInt(op.num, 0) } else return error.BadValue,
             .fixed => if (op == .num) return .{ .int = try values.decimalToScaledInt(op.num, o.scale orelse 0) } else return error.BadValue,
         },
-        .@"bool" => if (op == .boolean) return .{ .int = if (op.boolean) 1 else 0 } else return error.BadValue,
+        .bool => if (op == .boolean) return .{ .int = if (op.boolean) 1 else 0 } else return error.BadValue,
         else => {},
     };
     return switch (op) {

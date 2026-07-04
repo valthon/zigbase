@@ -371,7 +371,7 @@ fn coerceFieldValue(alloc: std.mem.Allocator, col: schema.Collection, key: []con
     if (v != .string) return v;
     const s = v.string;
     switch (f.options) {
-        .@"bool" => {
+        .bool => {
             if (s.len == 0) return .null; // multipart "" = clear
             if (std.mem.eql(u8, s, "true")) return .{ .bool = true };
             if (std.mem.eql(u8, s, "false")) return .{ .bool = false };
@@ -419,7 +419,7 @@ fn coerceCol() schema.Collection {
             .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
             .{ .id = "f3", .name = "ratio", .options = .{ .number = .{ .mode = .float } } },
             .{ .id = "f4", .name = "qty", .options = .{ .number = .{ .mode = .int } } },
-            .{ .id = "f5", .name = "flag", .options = .{ .@"bool" = .{} } },
+            .{ .id = "f5", .name = "flag", .options = .{ .bool = .{} } },
             .{ .id = "f6", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 3 } } },
             .{ .id = "f7", .name = "status", .options = .{ .select = .{ .values = &.{ "a", "b" }, .maxSelect = 1 } } },
             .{ .id = "f8", .name = "meta", .options = .{ .json = .{} } },
@@ -1027,7 +1027,10 @@ pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
         try binds.append(alloc, .{ .idx = @intCast(next), .field = f, .value = provided });
         next += 1;
     }
-    if (errs.items.len > 0) { last_errors = errs.items; return error.Validation; }
+    if (errs.items.len > 0) {
+        last_errors = errs.items;
+        return error.Validation;
+    }
 
     const rcols = try columnList(alloc, col);
 
@@ -1319,9 +1322,7 @@ fn storeStatefulCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col
     id_gen.generate(io, &id_buf);
     const id: []const u8 = try alloc.dupe(u8, &id_buf);
     const now = try nowUnixDb(conn);
-    const insert_sql = try std.fmt.allocPrintSentinel(alloc,
-        "INSERT INTO \"_cursorStates\" (\"id\",\"collectionRef\",\"payload\",\"expires\",\"created\") VALUES (?1,?2,?3,?4,{s});",
-        .{db.dbDialect(w).nowExpr()}, 0);
+    const insert_sql = try std.fmt.allocPrintSentinel(alloc, "INSERT INTO \"_cursorStates\" (\"id\",\"collectionRef\",\"payload\",\"expires\",\"created\") VALUES (?1,?2,?3,?4,{s});", .{db.dbDialect(w).nowExpr()}, 0);
     var st = try prep(alloc, w, insert_sql);
     defer st.finalize();
     try st.bindText(1, id);
@@ -1959,7 +1960,10 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     const order_sql = try sort.orderByFromTerms(alloc, eff_terms, dialect);
 
     var joins_sql: std.ArrayList(u8) = .empty;
-    for (j.joins.items) |jn| { try joins_sql.append(alloc, ' '); try joins_sql.appendSlice(alloc, jn); }
+    for (j.joins.items) |jn| {
+        try joins_sql.append(alloc, ' ');
+        try joins_sql.appendSlice(alloc, jn);
+    }
     const where_clause = if (where_sql.len > 0) try std.fmt.allocPrint(alloc, " WHERE {s}", .{where_sql}) else "";
     const bcols = try baseColumnList(alloc, col);
     const per: u32 = blk: {

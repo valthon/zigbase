@@ -42,7 +42,10 @@ pub fn resolveProvider(cfg: schema.OAuth2Provider) ?providers.Provider {
         const tu = cfg.tokenURL orelse return null;
         const uu = cfg.userinfoURL orelse return null;
         p = .{
-            .name = cfg.name, .authURL = au, .tokenURL = tu, .userinfoURL = uu,
+            .name = cfg.name,
+            .authURL = au,
+            .tokenURL = tu,
+            .userinfoURL = uu,
             .scopes = cfg.scopes orelse &.{ "openid", "email", "profile" },
             .mapping = .{ .id = "sub", .email = "email", .emailVerified = "email_verified", .name = "name", .avatar = "picture" },
         };
@@ -254,8 +257,7 @@ pub fn prepareOAuth(ctx: *http.RequestCtx, col: schema.Collection) !PrepareResul
 
 /// The link/create decision tree given a fetched identity. Uses `conn` (writer).
 /// Returns the resolved record id + is_new, or a fail. Does NOT mint a session.
-pub fn resolveRecordFromIdentity(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection,
-    provider_name: []const u8, identity: providers.Identity) !Outcome {
+pub fn resolveRecordFromIdentity(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, provider_name: []const u8, identity: providers.Identity) !Outcome {
     const app = ctx.app.?;
 
     const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null);
@@ -401,15 +403,24 @@ const TestEnv = struct {
     fn seedOAuthCollection(env: *TestEnv, a: std.mem.Allocator, name: []const u8) !void {
         const blob = try secrets.encryptSecret(std.testing.io, a, env.app.jwt_secret, "stub-secret");
         const provs = [_]schema.OAuth2Provider{.{
-            .name = "google", .clientId = "cid", .clientSecret = blob, .enabled = true,
+            .name = "google",
+            .clientId = "cid",
+            .clientSecret = blob,
+            .enabled = true,
             .redirectUrls = &.{"https://app/cb"},
         }};
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = name, .type = .auth,
+            .id = "",
+            .name = name,
+            .type = .auth,
             .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
-            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
             .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
         });
     }
@@ -520,7 +531,10 @@ test "createOAuthRecord: unverified provider email is NOT claimed (no squat)" {
 
     // First identity: provider did NOT verify the email -> record created WITHOUT email.
     const rid1 = try createOAuthRecord(&req, w, col, .{
-        .providerUserId = "P1", .email = "victim@example.com", .emailVerified = false, .name = "Mallory",
+        .providerUserId = "P1",
+        .email = "victim@example.com",
+        .emailVerified = false,
+        .name = "Mallory",
     });
     {
         var st = try w.prepare("SELECT \"email\",\"verified\" FROM \"users\" WHERE \"id\"=?1;");
@@ -533,13 +547,19 @@ test "createOAuthRecord: unverified provider email is NOT claimed (no squat)" {
 
     // Second identity with the SAME unverified email must NOT collide (no unique email set).
     const rid2 = try createOAuthRecord(&req, w, col, .{
-        .providerUserId = "P2", .email = "victim@example.com", .emailVerified = false, .name = "Other",
+        .providerUserId = "P2",
+        .email = "victim@example.com",
+        .emailVerified = false,
+        .name = "Other",
     });
     try std.testing.expect(!std.mem.eql(u8, rid1, rid2));
 
     // A verified-email identity DOES claim the email.
     const rid3 = try createOAuthRecord(&req, w, col, .{
-        .providerUserId = "P3", .email = "real@example.com", .emailVerified = true, .name = "Real",
+        .providerUserId = "P3",
+        .email = "real@example.com",
+        .emailVerified = true,
+        .name = "Real",
     });
     {
         var st = try w.prepare("SELECT \"email\",\"verified\" FROM \"users\" WHERE \"id\"=?1;");
@@ -577,4 +597,3 @@ test "deleting an auth record removes its external-auth links" {
         try std.testing.expectEqual(@as(i64, 0), try linkCount(a, w, "users", "r3"));
     }
 }
-

@@ -217,7 +217,9 @@ pub const EnvGetter = struct {
 
 test "defaults apply when getter returns null" {
     const G = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     const cfg = try Config.load(G{});
     try std.testing.expectEqual(@as(u16, 8090), cfg.http_port);
@@ -462,7 +464,9 @@ test "s3_* config: defaults empty/us-east-1/null, overridable via env" {
 
 test "sse heartbeat defaults 0 (inherit listener timeout), overridable via env" {
     const G0 = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     try std.testing.expectEqual(@as(u16, 0), (try Config.load(G0{})).sse_heartbeat_seconds);
     const G1 = struct {

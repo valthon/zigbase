@@ -148,14 +148,14 @@ test "CredentialStore: insert / getByCredentialId / existsCredentialId / updateS
     try store.insert(
         alloc,
         io,
-        "users",       // collection_ref
-        "rec001",      // record_ref
+        "users", // collection_ref
+        "rec001", // record_ref
         "cred_b64url", // credential_id_b64
-        "pubkey_b64",  // cose_pubkey_b64
-        -7,            // alg  (ES256)
-        0,             // sign_count at registration
-        "aaguid_b64",  // aaguid
-        "usb,nfc",     // transports
+        "pubkey_b64", // cose_pubkey_b64
+        -7, // alg  (ES256)
+        0, // sign_count at registration
+        "aaguid_b64", // aaguid
+        "usb,nfc", // transports
     );
 
     // --- getByCredentialId returns the row ---

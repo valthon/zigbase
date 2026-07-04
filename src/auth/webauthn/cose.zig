@@ -46,9 +46,15 @@ pub fn parseCoseKey(bytes: []const u8) Error!struct { key: CoseKey, consumed: us
         while (i < map_len) : (i += 1) {
             const label = try r.readInt();
             switch (label) {
-                1 => { kty = try r.readInt(); },
-                3 => { alg = try r.readInt(); },
-                else => { try r.skip(); },
+                1 => {
+                    kty = try r.readInt();
+                },
+                3 => {
+                    alg = try r.readInt();
+                },
+                else => {
+                    try r.skip();
+                },
             }
         }
     }
@@ -71,27 +77,53 @@ pub fn parseCoseKey(bytes: []const u8) Error!struct { key: CoseKey, consumed: us
             switch (kty.?) {
                 1 => { // OKP
                     switch (label) {
-                        1, 3 => { try r.skip(); },
-                        -1 => { crv = try r.readInt(); },
-                        -2 => { x_bytes = try r.readBytes(); },
-                        else => { try r.skip(); },
+                        1, 3 => {
+                            try r.skip();
+                        },
+                        -1 => {
+                            crv = try r.readInt();
+                        },
+                        -2 => {
+                            x_bytes = try r.readBytes();
+                        },
+                        else => {
+                            try r.skip();
+                        },
                     }
                 },
                 2 => { // EC2
                     switch (label) {
-                        1, 3 => { try r.skip(); },
-                        -1 => { crv = try r.readInt(); },
-                        -2 => { x_bytes = try r.readBytes(); },
-                        -3 => { y_bytes = try r.readBytes(); },
-                        else => { try r.skip(); },
+                        1, 3 => {
+                            try r.skip();
+                        },
+                        -1 => {
+                            crv = try r.readInt();
+                        },
+                        -2 => {
+                            x_bytes = try r.readBytes();
+                        },
+                        -3 => {
+                            y_bytes = try r.readBytes();
+                        },
+                        else => {
+                            try r.skip();
+                        },
                     }
                 },
                 3 => { // RSA
                     switch (label) {
-                        1, 3 => { try r.skip(); },
-                        -1 => { n_bytes = try r.readBytes(); },
-                        -2 => { e_bytes = try r.readBytes(); },
-                        else => { try r.skip(); },
+                        1, 3 => {
+                            try r.skip();
+                        },
+                        -1 => {
+                            n_bytes = try r.readBytes();
+                        },
+                        -2 => {
+                            e_bytes = try r.readBytes();
+                        },
+                        else => {
+                            try r.skip();
+                        },
                     }
                 },
                 else => return error.UnknownKeyType,

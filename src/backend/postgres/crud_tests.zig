@@ -118,7 +118,7 @@ test "pg: CRUD round-trip (create/read/update/delete) with now()/ISO timestamps 
 
     const col = schema.Collection{ .id = "c1", .name = "people", .fields = &[_]schema.Field{
         .{ .id = "f1", .name = "name", .options = .{ .text = .{} } },
-        .{ .id = "f2", .name = "active", .options = .{ .@"bool" = .{} } },
+        .{ .id = "f2", .name = "active", .options = .{ .bool = .{} } },
     } };
     try provisionPg(al, &d, col);
 
@@ -358,7 +358,7 @@ test "pg: boolean round-trip + filter on a bool column" {
 
     const col = schema.Collection{ .id = "c", .name = "flags", .fields = &[_]schema.Field{
         .{ .id = "f1", .name = "label", .options = .{ .text = .{} } },
-        .{ .id = "f2", .name = "on", .options = .{ .@"bool" = .{} } },
+        .{ .id = "f2", .name = "on", .options = .{ .bool = .{} } },
     } };
     try provisionPg(al, &d, col);
 

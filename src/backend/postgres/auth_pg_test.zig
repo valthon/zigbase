@@ -79,8 +79,7 @@ test "pg: analytics insertEvent + incremental rollup (rowid->_seq watermark) on 
     const al = arena.allocator();
 
     // The PG-only monotonic insertion column the watermark advances over really exists.
-    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w,
-        "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='_events' AND column_name='_seq';"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='_events' AND column_name='_seq';"));
 
     // Three signups (2x acc1, 1x acc2) + one unrelated event.
     try analytics.insertEvent(w, std.testing.io, .{ .name = "user.signup", .payload_json = "{}", .account = "acc1" });
@@ -100,21 +99,17 @@ test "pg: analytics insertEvent + incremental rollup (rowid->_seq watermark) on 
     };
     try analytics.runRollup(w, al, spec);
 
-    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w,
-        "SELECT value FROM \"_rollup_signups_daily\" WHERE account='acc1';"));
-    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w,
-        "SELECT value FROM \"_rollup_signups_daily\" WHERE account='acc2';"));
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w, "SELECT value FROM \"_rollup_signups_daily\" WHERE account='acc1';"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT value FROM \"_rollup_signups_daily\" WHERE account='acc2';"));
 
     // Re-run with no new events: the `_seq` watermark guards an exact no-op (acc1 stays 2).
     try analytics.runRollup(w, al, spec);
-    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w,
-        "SELECT value FROM \"_rollup_signups_daily\" WHERE account='acc1';"));
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w, "SELECT value FROM \"_rollup_signups_daily\" WHERE account='acc1';"));
 
     // A NEW signup after the first pass is picked up next pass (the watermark advances, never drops).
     try analytics.insertEvent(w, std.testing.io, .{ .name = "user.signup", .payload_json = "{}", .account = "acc1" });
     try analytics.runRollup(w, al, spec);
-    try std.testing.expectEqual(@as(i64, 3), try scalarCount(w,
-        "SELECT value FROM \"_rollup_signups_daily\" WHERE account='acc1';"));
+    try std.testing.expectEqual(@as(i64, 3), try scalarCount(w, "SELECT value FROM \"_rollup_signups_daily\" WHERE account='acc1';"));
 }
 
 // ---------------------------------------------------------------------------
@@ -177,8 +172,7 @@ test "pg: oauth state single-use consume + external-auth link round-trip on Post
 
     // External-auth link insert (datetime->now ×2) + lookup.
     try oauth_api.insertLink(std.testing.io, al, w, "users", "rec1", "google", "GID-1");
-    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w,
-        "SELECT count(*) FROM \"_externalAuths\" WHERE \"provider\"='google' AND \"providerId\"='GID-1';"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM \"_externalAuths\" WHERE \"provider\"='google' AND \"providerId\"='GID-1';"));
     const link = try oauth_api.findLink(al, w, "google", "GID-1");
     try std.testing.expect(link != null);
     try std.testing.expectEqualStrings("users", link.?.collectionRef);
@@ -202,9 +196,15 @@ test "pg: auth identity lookup + login credential check + consumeToken + session
 
     // Create a real `users` auth collection + one record (PR-3 CRUD path on PG).
     _ = try collections.create(al, std.testing.io, w, .{
-        .id = "", .name = "users", .type = .auth,
+        .id = "",
+        .name = "users",
+        .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "name", .options = .{ .text = .{} } }},
-        .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+        .listRule = "",
+        .viewRule = "",
+        .createRule = "",
+        .updateRule = "",
+        .deleteRule = "",
     });
     const col = (try collections.get(al, w, "users")).?;
     var data: std.json.ObjectMap = .empty;
@@ -236,9 +236,7 @@ test "pg: auth identity lookup + login credential check + consumeToken + session
 
     // Server-side session store: insert a row (recordSession INSERT shape) for this record, then
     // list it and delete it.
-    try w.exec(try std.fmt.allocPrintSentinel(al,
-        "INSERT INTO \"_sessions\" (\"id\",\"collectionRef\",\"recordRef\",\"created\",\"lastSeen\",\"expires\",\"userAgent\",\"ip\") VALUES ('sid1','users','{s}','','',9999999999,'ua','ip');",
-        .{rid}, 0));
+    try w.exec(try std.fmt.allocPrintSentinel(al, "INSERT INTO \"_sessions\" (\"id\",\"collectionRef\",\"recordRef\",\"created\",\"lastSeen\",\"expires\",\"userAgent\",\"ip\") VALUES ('sid1','users','{s}','','',9999999999,'ua','ip');", .{rid}, 0));
     const sessions = try auth_api.listSessions(al, w, "users", rid);
     try std.testing.expectEqual(@as(usize, 1), sessions.len);
     try std.testing.expectEqualStrings("sid1", sessions[0].id);
@@ -260,10 +258,16 @@ test "pg: .nocase identity — case-insensitive lookup + case-variant duplicate 
     // A users auth collection whose `email` carries a `.nocase` UNIQUE index — the documented
     // email-uniqueness pattern the example apps use. On PG this provisions as `lower(email)`.
     _ = try collections.create(al, std.testing.io, w, .{
-        .id = "", .name = "users", .type = .auth,
+        .id = "",
+        .name = "users",
+        .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "name", .options = .{ .text = .{} } }},
         .indexes = &[_]schema.Index{.{ .name = "idx_users_email_nocase", .fields = &.{"email"}, .unique = true, .collation = .nocase }},
-        .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+        .listRule = "",
+        .viewRule = "",
+        .createRule = "",
+        .updateRule = "",
+        .deleteRule = "",
     });
     const col = (try collections.get(al, w, "users")).?;
 
@@ -305,8 +309,13 @@ test "pg: .nocase identity — case-insensitive lookup + case-variant duplicate 
 fn mintAuth(al: std.mem.Allocator, secret: []const u8, collection: []const u8, rid: []const u8, token_key: []const u8, sid: ?[]const u8, epoch: i64) ![]u8 {
     const key = crypto.deriveKey(secret, token_key);
     return jwt.sign(al, .{
-        .id = rid, .collection = collection, .type = .auth,
-        .token_epoch = epoch, .sid = sid, .iat = 1, .exp = 9999999999,
+        .id = rid,
+        .collection = collection,
+        .type = .auth,
+        .token_epoch = epoch,
+        .sid = sid,
+        .iat = 1,
+        .exp = 9999999999,
     }, &key);
 }
 
@@ -325,9 +334,15 @@ test "pg: token mint + VERIFY round-trip (epoch, table-session, superuser) on Po
 
     // A real users record + its server-generated tokenKey (the signing-key material).
     _ = try collections.create(al, std.testing.io, w, .{
-        .id = "", .name = "users", .type = .auth,
+        .id = "",
+        .name = "users",
+        .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "name", .options = .{ .text = .{} } }},
-        .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+        .listRule = "",
+        .viewRule = "",
+        .createRule = "",
+        .updateRule = "",
+        .deleteRule = "",
     });
     const col = (try collections.get(al, w, "users")).?;
     var data: std.json.ObjectMap = .empty;
@@ -348,9 +363,7 @@ test "pg: token mint + VERIFY round-trip (epoch, table-session, superuser) on Po
     // (2) TABLE MODE: a token carrying a `sid` must reference a live `_sessions` row — verify calls
     // sessionActive on PG. Present+unexpired → accept; missing → fail-closed (null).
     const app_table = .{ .jwt_secret = @as([]const u8, secret), .session_store = app_mod.SessionStore.table };
-    try w.exec(try std.fmt.allocPrintSentinel(al,
-        "INSERT INTO \"_sessions\" (\"id\",\"collectionRef\",\"recordRef\",\"created\",\"lastSeen\",\"expires\",\"userAgent\",\"ip\") VALUES ('sidLive','users','{s}','','',9999999999,'ua','ip');",
-        .{rid}, 0));
+    try w.exec(try std.fmt.allocPrintSentinel(al, "INSERT INTO \"_sessions\" (\"id\",\"collectionRef\",\"recordRef\",\"created\",\"lastSeen\",\"expires\",\"userAgent\",\"ip\") VALUES ('sidLive','users','{s}','','',9999999999,'ua','ip');", .{rid}, 0));
     const tok_live = try mintAuth(al, secret, "users", rid, ke.token_key, "sidLive", 0);
     const v2 = auth_core.verifyToken(al, app_table, w, tok_live) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sidLive", v2.sid);

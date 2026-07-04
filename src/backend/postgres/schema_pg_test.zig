@@ -65,20 +65,17 @@ test "pg: all system migrations apply on a fresh database (tables + seeds + ledg
     try migrations.run(w);
 
     // The ledger recorded exactly the full set of system migrations.
-    try std.testing.expectEqual(@as(i64, migrations.all.len), try scalarCount(w,
-        "SELECT count(*) FROM \"_migrations\";"));
+    try std.testing.expectEqual(@as(i64, migrations.all.len), try scalarCount(w, "SELECT count(*) FROM \"_migrations\";"));
 
     // Every system table provisioned (information_schema is the portable catalog).
     inline for (.{
-        "_collections", "_superusers",       "_externalAuths",  "_consumedTokens",
-        "_oauthStates", "_cursorStates",      "_authChallenges", "_webauthnCredentials",
-        "_kv",          "_sessions",          "_experiment_assignments", "_queue_jobs",
-        "_accounts",    "_memberships",       "_invitations",    "_events",
-        "_sender_identities", "_suppressions",
-        "_mail_batches", "_mail_batch_recipients",
+        "_collections",       "_superusers",   "_externalAuths",          "_consumedTokens",
+        "_oauthStates",       "_cursorStates", "_authChallenges",         "_webauthnCredentials",
+        "_kv",                "_sessions",     "_experiment_assignments", "_queue_jobs",
+        "_accounts",          "_memberships",  "_invitations",            "_events",
+        "_sender_identities", "_suppressions", "_mail_batches",           "_mail_batch_recipients",
     }) |t| {
-        const n = try scalarCount(w,
-            "SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = '" ++ t ++ "';");
+        const n = try scalarCount(w, "SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = '" ++ t ++ "';");
         if (n != 1) {
             std.log.err("pg migration: expected table '{s}' to exist", .{t});
             return error.TestUnexpectedResult;
@@ -86,22 +83,18 @@ test "pg: all system migrations apply on a fresh database (tables + seeds + ledg
     }
 
     // Seeds landed: _superusers + the tenancy/email/events/bulk-mail system collections.
-    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w,
-        "SELECT count(*) FROM \"_collections\" WHERE name='_superusers' AND system=1;"));
-    try std.testing.expectEqual(@as(i64, 8), try scalarCount(w,
-        "SELECT count(*) FROM \"_collections\" WHERE name IN " ++
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM \"_collections\" WHERE name='_superusers' AND system=1;"));
+    try std.testing.expectEqual(@as(i64, 8), try scalarCount(w, "SELECT count(*) FROM \"_collections\" WHERE name IN " ++
         "('_accounts','_memberships','_invitations','_events','_sender_identities','_suppressions'," ++
         "'_mail_batches','_mail_batch_recipients') AND system=1;"));
 
     // token_epoch identity column (0010) is BIGINT on PG and reads back 0 by default.
     try w.exec("INSERT INTO \"_superusers\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('s1','','','a@b.c');");
-    try std.testing.expectEqual(@as(i64, 0), try scalarCount(w,
-        "SELECT token_epoch FROM \"_superusers\" WHERE id='s1';"));
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(w, "SELECT token_epoch FROM \"_superusers\" WHERE id='s1';"));
 
     // A UNIQUE constraint from a migration index actually enforces on PG (0014 slug).
     try w.exec("INSERT INTO \"_accounts\" (\"id\",\"created\",\"updated\",\"slug\") VALUES ('a1','','','acme');");
-    try std.testing.expectError(error.ExecFailed, w.exec(
-        "INSERT INTO \"_accounts\" (\"id\",\"created\",\"updated\",\"slug\") VALUES ('a2','','','acme');"));
+    try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO \"_accounts\" (\"id\",\"created\",\"updated\",\"slug\") VALUES ('a2','','','acme');"));
 }
 
 test "pg: full comptime schema provisions on a fresh database" {
@@ -121,7 +114,7 @@ test "pg: full comptime schema provisions on a fresh database" {
         .posts = .{ .fields = .{
             .{ .name = "title", .type = .text },
             .{ .name = "views", .type = .number },
-            .{ .name = "published", .type = .@"bool" },
+            .{ .name = "published", .type = .bool },
             .{ .name = "author", .type = .relation, .target = "authors", .maxSelect = 1 },
         }, .indexes = .{
             .{ .name = "idx_posts_title", .fields = .{"title"} },
@@ -132,12 +125,9 @@ test "pg: full comptime schema provisions on a fresh database" {
     try provision.applySpecs(a, std.testing.io, w, specs);
 
     // The physical tables + the _collections metadata rows exist.
-    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w,
-        "SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='posts';"));
-    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w,
-        "SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='authors';"));
-    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w,
-        "SELECT count(*) FROM \"_collections\" WHERE name IN ('posts','authors');"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='posts';"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='authors';"));
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w, "SELECT count(*) FROM \"_collections\" WHERE name IN ('posts','authors');"));
 
     // The number field is BIGINT and the bool field is integer storage (0/1) — both insertable.
     try w.exec("INSERT INTO \"authors\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('au1','','','a@x.io');");
@@ -147,8 +137,7 @@ test "pg: full comptime schema provisions on a fresh database" {
 
     // The relation FK enforces: deleting the referenced author SET NULLs the post's author.
     try w.exec("DELETE FROM \"authors\" WHERE id='au1';");
-    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w,
-        "SELECT count(*) FROM \"posts\" WHERE id='p1' AND author IS NULL;"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM \"posts\" WHERE id='p1' AND author IS NULL;"));
 }
 
 test "pg: additive field-add rebuild (ALTER) preserves existing data" {
@@ -244,21 +233,17 @@ test "pg: a consumer .nocase UNIQUE index provisions case-INSENSITIVELY via lowe
 
     // The .nocase index provisions as a `lower(addr)` FUNCTIONAL index (an expression index, so
     // it carries no column collation — the column itself stays at the DB default, NOT pinned "C").
-    try std.testing.expectEqual(@as(i64, 0), try scalarCount(w,
-        "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() " ++
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(w, "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() " ++
         "AND table_name='contacts' AND column_name='addr' AND collation_name='C';"));
     // A functional `lower()` index over `addr` really exists (pg_indexes records its definition).
-    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w,
-        "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND tablename='contacts' " ++
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND tablename='contacts' " ++
         "AND indexname='idx_contacts_addr' AND indexdef ILIKE '%lower%';"));
 
     // PARITY (#159): case-variant values are now REJECTED — `Bob@x.com` then `bob@x.com` collide on
     // `lower(addr)`, exactly like SQLite's COLLATE NOCASE. Only the first row inserts.
     try w.exec("INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c1','','','Bob@x.com');");
-    try std.testing.expectError(error.ExecFailed, w.exec(
-        "INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c2','','','bob@x.com');"));
+    try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c2','','','bob@x.com');"));
     // The exact-duplicate is likewise rejected.
-    try std.testing.expectError(error.ExecFailed, w.exec(
-        "INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c3','','','Bob@x.com');"));
+    try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c3','','','Bob@x.com');"));
     try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM \"contacts\";"));
 }

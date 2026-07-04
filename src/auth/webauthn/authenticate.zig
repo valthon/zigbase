@@ -208,9 +208,16 @@ test "verifyAssertion: happy path — valid assertion succeeds with new_sign_cou
     const stored_key = cosekeyFromKp(kp);
 
     const result = try verifyAssertion(
-        alloc, rp_id, origin, &challenge_raw,
-        stored_key, 0, // stored_sign_count = 0 → new(1) > stored(0)
-        cdj, &auth_data, der, true,
+        alloc,
+        rp_id,
+        origin,
+        &challenge_raw,
+        stored_key,
+        0, // stored_sign_count = 0 → new(1) > stored(0)
+        cdj,
+        &auth_data,
+        der,
+        true,
     );
 
     try testing.expectEqual(@as(u32, 1), result.new_sign_count);
@@ -402,9 +409,16 @@ test "verifyAssertion: signCount clone — stored=5, assertion count=1 → clone
     const stored_key = cosekeyFromKp(kp);
 
     const result = try verifyAssertion(
-        alloc, rp_id, origin, &challenge_raw,
-        stored_key, 5, // stored_sign_count = 5 > new(1) → clone!
-        cdj, &auth_data, der, true,
+        alloc,
+        rp_id,
+        origin,
+        &challenge_raw,
+        stored_key,
+        5, // stored_sign_count = 5 > new(1) → clone!
+        cdj,
+        &auth_data,
+        der,
+        true,
     );
 
     try testing.expectEqual(@as(u32, 1), result.new_sign_count);
@@ -436,9 +450,16 @@ test "verifyAssertion: both-zero signCount — stored=0, assertion count=0 → c
     const stored_key = cosekeyFromKp(kp);
 
     const result = try verifyAssertion(
-        alloc, rp_id, origin, &challenge_raw,
-        stored_key, 0, // stored=0, assertion=0 → both-zero → NOT clone
-        cdj, &auth_data, der, true,
+        alloc,
+        rp_id,
+        origin,
+        &challenge_raw,
+        stored_key,
+        0, // stored=0, assertion=0 → both-zero → NOT clone
+        cdj,
+        &auth_data,
+        der,
+        true,
     );
 
     try testing.expectEqual(@as(u32, 0), result.new_sign_count);

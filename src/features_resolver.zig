@@ -162,9 +162,7 @@ fn stickyVariant(alloc: std.mem.Allocator, sc: StickyConns, def: ExperimentDef, 
     // CONFLICT DO NOTHING` (Postgres), `strftime` ISO now ⇄ `to_char(now())`, `?N` ⇄ `$n`.
     // `created` is the ISO-8601 `Z` shape (matches the records autodate format) → `nowIso8601Expr`.
     const dialect = db.dbDialect(writer);
-    const ins_tmpl = try std.fmt.allocPrintSentinel(alloc,
-        "{s} INTO \"_experiment_assignments\" (\"experiment\",\"subject\",\"variant\",\"created\") VALUES (?1, ?2, ?3, {s}){s};",
-        .{ dialect.insertVerb(true), dialect.nowIso8601Expr(), dialect.onConflictDoNothing() }, 0);
+    const ins_tmpl = try std.fmt.allocPrintSentinel(alloc, "{s} INTO \"_experiment_assignments\" (\"experiment\",\"subject\",\"variant\",\"created\") VALUES (?1, ?2, ?3, {s}){s};", .{ dialect.insertVerb(true), dialect.nowIso8601Expr(), dialect.onConflictDoNothing() }, 0);
     defer alloc.free(ins_tmpl);
     const ins_sql = try param_sink.renumberZ(alloc, dialect, ins_tmpl);
     defer if (dialect.kind == .postgres) alloc.free(ins_sql); // SQLite returns the input slice

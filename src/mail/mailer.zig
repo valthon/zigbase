@@ -728,7 +728,9 @@ test "buildMessage rejects CRLF in reply_to" {
 test "buildMessage emits BOTH RFC 8058 headers when list_unsubscribe is set, none when null" {
     const a = std.testing.allocator;
     const msg = try buildMessage(a, std.testing.io, "n@a.io", .{
-        .to = "u@x.io", .subject = "News", .text_body = "b",
+        .to = "u@x.io",
+        .subject = "News",
+        .text_body = "b",
         .list_unsubscribe = "https://app.example/api/mail/unsubscribe?t=abc.def",
     }, 0);
     defer a.free(msg);
@@ -742,7 +744,9 @@ test "buildMessage emits BOTH RFC 8058 headers when list_unsubscribe is set, non
 
 test "buildMessage rejects CRLF in the list_unsubscribe URL (header injection)" {
     try std.testing.expectError(error.HeaderInjection, buildMessage(std.testing.allocator, std.testing.io, "n@a.io", .{
-        .to = "u@x.io", .subject = "s", .text_body = "b",
+        .to = "u@x.io",
+        .subject = "s",
+        .text_body = "b",
         .list_unsubscribe = "https://x/u?t=1\r\nBcc: spam@evil.com",
     }, 0));
 }

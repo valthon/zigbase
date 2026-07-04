@@ -188,7 +188,7 @@ fn fieldOptionKeys(comptime ftype: schema.FieldType) []const []const u8 {
         .editor => &.{},
         .date => &.{ "min", "max" },
         .autodate => &.{ "onCreate", "onUpdate" },
-        .@"bool" => &.{},
+        .bool => &.{},
         .number => &.{ "mode", "scale", "min", "max" },
         .json => &.{"maxSize"},
         .select => &.{ "values", "maxSelect" },
@@ -535,7 +535,7 @@ fn buildOptions(comptime col: []const u8, comptime fname: []const u8, comptime f
                 .onCreate = if (@hasField(F, "onCreate")) f.onCreate else true,
                 .onUpdate = if (@hasField(F, "onUpdate")) f.onUpdate else false,
             } },
-            .@"bool" => .{ .@"bool" = .{} },
+            .bool => .{ .bool = .{} },
             .number => blk: {
                 const mode: schema.NumberMode = if (@hasField(F, "mode")) f.mode else .float;
                 const scale = optU8(f, "scale");
@@ -1234,7 +1234,7 @@ test "unknown-key gate (#103): accepts a spec exercising every recognized key, a
                 .{ .name = "rich", .type = .editor },
                 .{ .name = "d", .type = .date, .min = "2020-01-01", .max = "2030-01-01" },
                 .{ .name = "ad", .type = .autodate, .onCreate = true, .onUpdate = true },
-                .{ .name = "flag", .type = .@"bool" },
+                .{ .name = "flag", .type = .bool },
                 .{ .name = "n", .type = .number, .mode = .fixed, .scale = 2, .min = 0, .max = 100 },
                 .{ .name = "j", .type = .json, .maxSize = 4096 },
                 .{ .name = "sel", .type = .select, .values = .{ "a", "b" }, .maxSelect = 2 },
@@ -1560,7 +1560,7 @@ test "buildCollections lowers the dating-app fixture schema (every field type + 
                 .{ .name = "to", .type = .relation, .target = "profiles" },
                 .{ .name = "body", .type = .text, .required = true },
                 .{ .name = "sentAt", .type = .autodate, .onCreate = true },
-                .{ .name = "read", .type = .@"bool" },
+                .{ .name = "read", .type = .bool },
             },
         },
         .winks = .{
@@ -1576,7 +1576,7 @@ test "buildCollections lowers the dating-app fixture schema (every field type + 
                 .{ .name = "plan", .type = .select, .values = .{ "free", "plus", "premium" } },
                 .{ .name = "price", .type = .number, .mode = .fixed, .scale = 2 },
                 .{ .name = "renewsAt", .type = .date, .min = "2020-01-01", .max = "2099-12-31" },
-                .{ .name = "active", .type = .@"bool" },
+                .{ .name = "active", .type = .bool },
                 .{ .name = "metadata", .type = .json },
             },
         },
@@ -1620,7 +1620,7 @@ test "buildCollections lowers the dating-app fixture schema (every field type + 
     try std.testing.expectEqualStrings("profiles", messages.fields[1].options.relation.targetCollectionId);
     try std.testing.expectEqual(schema.FieldType.autodate, messages.fields[3].fieldType());
     try std.testing.expect(messages.fields[3].options.autodate.onCreate);
-    try std.testing.expectEqual(schema.FieldType.@"bool", messages.fields[4].fieldType());
+    try std.testing.expectEqual(schema.FieldType.bool, messages.fields[4].fieldType());
 
     const winks = findCol(cols, "winks").?;
     try std.testing.expectEqual(@as(usize, 3), winks.fields.len);
@@ -1669,13 +1669,19 @@ test "buildCollection lowers .auth.methods into collection options" {
 
 test "buildCollection lowers a per-method comptime rate_limit (.default / .off / .{ .custom })" {
     const specs = comptime buildCollections(.{
-        .accounts = .{ .type = .auth, .fields = .{}, .auth = .{ .methods = .{
-            // The struct form must lower without `@tagName`-on-a-struct failing.
-            .magic_link = .{ .rate_limit = .{ .custom = .{ .max = 5, .window_s = 60 } } },
-            // The enum-literal forms coexist.
-            .otp = .{ .rate_limit = .off },
-            .password = .{ .rate_limit = .default },
-        } } },
+        .accounts = .{
+            .type = .auth,
+            .fields = .{},
+            .auth = .{
+                .methods = .{
+                    // The struct form must lower without `@tagName`-on-a-struct failing.
+                    .magic_link = .{ .rate_limit = .{ .custom = .{ .max = 5, .window_s = 60 } } },
+                    // The enum-literal forms coexist.
+                    .otp = .{ .rate_limit = .off },
+                    .password = .{ .rate_limit = .default },
+                },
+            },
+        },
     });
     const ml = specs[0].options.auth.methods.magic_link.?;
     try std.testing.expect(ml.rate_limit == .custom);
@@ -1763,7 +1769,10 @@ test "injectOAuthSecrets sources clientId/secret from env and encrypts the secre
     };
     const provs = [_]schema.OAuth2Provider{.{ .name = "google", .redirectUrls = &.{"https://x/cb"} }};
     const cols = [_]schema.Collection{.{
-        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .id = "",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{},
         .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
     }};
 
@@ -1781,11 +1790,16 @@ test "injectOAuthSecrets leaves providers untouched when env is absent" {
     defer arena.deinit();
     const a = arena.allocator();
     const Getter = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     const provs = [_]schema.OAuth2Provider{.{ .name = "google" }};
     const cols = [_]schema.Collection{.{
-        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .id = "",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{},
         .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
     }};
     const out = try injectOAuthSecrets(a, std.testing.io, "app-secret", Getter{}, &cols);
@@ -1799,13 +1813,18 @@ test "injectOAuthSecrets encrypts a plaintext clientSecret baked into the litera
     defer arena.deinit();
     const a = arena.allocator();
     const Getter = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     // A provider with a plaintext clientSecret in the comptime literal and NO env var set:
     // the secret must still be encrypted before it could be persisted (parity with the admin path).
     const provs = [_]schema.OAuth2Provider{.{ .name = "google", .clientSecret = "literal-secret" }};
     const cols = [_]schema.Collection{.{
-        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .id = "",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{},
         .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
     }};
     const out = try injectOAuthSecrets(a, std.testing.io, "app-secret-32-bytes-long-xxxxxxx", Getter{}, &cols);
@@ -1820,7 +1839,9 @@ test "injectOAuthSecrets passes non-oauth collections through" {
     defer arena.deinit();
     const a = arena.allocator();
     const Getter = struct {
-        fn get(_: @This(), _: []const u8) ?[]const u8 { return null; }
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
     };
     const cols = [_]schema.Collection{.{ .id = "", .name = "posts", .fields = &.{} }};
     const out = try injectOAuthSecrets(a, std.testing.io, "app-secret", Getter{}, &cols);
@@ -1862,7 +1883,10 @@ test "resolveDiscoveryProviders fills endpoints for a discovery provider" {
     var stub = DiscoveryStubTransport{};
     const provs = [_]schema.OAuth2Provider{.{ .name = "okta", .discoveryURL = "https://acme.okta.com/.well-known/openid-configuration" }};
     const cols = [_]schema.Collection{.{
-        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .id = "",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{},
         .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
     }};
     const out = try resolveDiscoveryProviders(a, stub.transport(), &cols);
@@ -1879,7 +1903,10 @@ test "resolveDiscoveryProviders propagates a discovery failure" {
     var stub = DiscoveryStubTransport{ .status = 500, .body = "boom" };
     const provs = [_]schema.OAuth2Provider{.{ .name = "okta", .discoveryURL = "https://acme.okta.com/.well-known/openid-configuration" }};
     const cols = [_]schema.Collection{.{
-        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .id = "",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{},
         .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
     }};
     try std.testing.expectError(error.DiscoveryFetchFailed, resolveDiscoveryProviders(a, stub.transport(), &cols));
@@ -1892,7 +1919,10 @@ test "resolveDiscoveryProviders returns the same slice when no provider uses dis
     var stub = DiscoveryStubTransport{};
     const provs = [_]schema.OAuth2Provider{.{ .name = "google" }};
     const cols = [_]schema.Collection{.{
-        .id = "", .name = "users", .type = .auth, .fields = &.{},
+        .id = "",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{},
         .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
     }};
     const out = try resolveDiscoveryProviders(a, stub.transport(), &cols);

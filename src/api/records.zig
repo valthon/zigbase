@@ -709,42 +709,35 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
             writer_held = false;
         }
         switch (e) {
-        error.CursorState => return ApiError.gone("Cursor expired; re-fetch from the start.").toResponse(ctx.allocator),
-        error.BadCursorSort => return ApiError.badRequest("Cursor pagination requires a sortable, visible, non-relation sort field.").toResponse(ctx.allocator),
-        error.CursorSig => return ApiError.badRequest("Invalid cursor signature.").toResponse(ctx.allocator),
-        error.CursorSort => return ApiError.badRequest("Cursor does not match the requested sort.").toResponse(ctx.allocator),
-        error.CursorFilter => return ApiError.badRequest("Cursor does not match the requested filter.").toResponse(ctx.allocator),
-        error.BadCursor => return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator),
-        error.EncryptedField =>
-            return ApiError.badRequest("Cannot filter or sort by an encrypted field.").toResponse(ctx.allocator),
-        error.NotSearchable =>
-            return ApiError.badRequest("This collection has no searchable fields; `search` is not supported here.").toResponse(ctx.allocator),
-        error.SearchDisabled =>
-            return ApiError.badRequest("Full-text search is not enabled in this build.").toResponse(ctx.allocator),
-        error.VectorDisabled =>
-            return ApiError.badRequest("Vector search is not enabled in this build.").toResponse(ctx.allocator),
-        error.VectorCursorUnsupported =>
-            return ApiError.badRequest("Vector search does not support cursor pagination; use offset paging.").toResponse(ctx.allocator),
-        error.BadVector =>
-            return ApiError.badRequest("Invalid vector search query.").toResponse(ctx.allocator),
-        // A vector query that fails at execution surfaces as a backend runtime error (StepFailed) —
-        // only knowable at query time (dims aren't in the field schema). Map it to a clean 400 ONLY
-        // when a vector query was requested, so non-vector DB failures keep their 500. (The embedding
-        // JSON itself is already validated up front in `vector.build`.) The SAME StepFailed covers
-        // distinct operator conditions, so inspect the captured backend error (`conn.errMsg()`) to
-        // avoid MISDIRECTING the operator: a MISSING pgvector extension (`type "vector" does not
-        // exist`) gets an install hint, whereas a real dimension mismatch / malformed stored
-        // embedding gets the softened query-error message.
-        error.StepFailed => {
-            if (qp.get("vector") == null) return e;
-            const emsg = conn.errMsg();
-            if (std.mem.indexOf(u8, emsg, "does not exist") != null and std.mem.indexOf(u8, emsg, "vector") != null)
-                return ApiError.badRequest("Vector search is unavailable: the pgvector extension is not installed on this database (run `CREATE EXTENSION vector`).").toResponse(ctx.allocator);
-            return ApiError.badRequest("Invalid vector search query: the query embedding's dimension may not match the stored embeddings (or a stored embedding is malformed).").toResponse(ctx.allocator);
-        },
-        error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep =>
-            return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
-        else => return e,
+            error.CursorState => return ApiError.gone("Cursor expired; re-fetch from the start.").toResponse(ctx.allocator),
+            error.BadCursorSort => return ApiError.badRequest("Cursor pagination requires a sortable, visible, non-relation sort field.").toResponse(ctx.allocator),
+            error.CursorSig => return ApiError.badRequest("Invalid cursor signature.").toResponse(ctx.allocator),
+            error.CursorSort => return ApiError.badRequest("Cursor does not match the requested sort.").toResponse(ctx.allocator),
+            error.CursorFilter => return ApiError.badRequest("Cursor does not match the requested filter.").toResponse(ctx.allocator),
+            error.BadCursor => return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator),
+            error.EncryptedField => return ApiError.badRequest("Cannot filter or sort by an encrypted field.").toResponse(ctx.allocator),
+            error.NotSearchable => return ApiError.badRequest("This collection has no searchable fields; `search` is not supported here.").toResponse(ctx.allocator),
+            error.SearchDisabled => return ApiError.badRequest("Full-text search is not enabled in this build.").toResponse(ctx.allocator),
+            error.VectorDisabled => return ApiError.badRequest("Vector search is not enabled in this build.").toResponse(ctx.allocator),
+            error.VectorCursorUnsupported => return ApiError.badRequest("Vector search does not support cursor pagination; use offset paging.").toResponse(ctx.allocator),
+            error.BadVector => return ApiError.badRequest("Invalid vector search query.").toResponse(ctx.allocator),
+            // A vector query that fails at execution surfaces as a backend runtime error (StepFailed) —
+            // only knowable at query time (dims aren't in the field schema). Map it to a clean 400 ONLY
+            // when a vector query was requested, so non-vector DB failures keep their 500. (The embedding
+            // JSON itself is already validated up front in `vector.build`.) The SAME StepFailed covers
+            // distinct operator conditions, so inspect the captured backend error (`conn.errMsg()`) to
+            // avoid MISDIRECTING the operator: a MISSING pgvector extension (`type "vector" does not
+            // exist`) gets an install hint, whereas a real dimension mismatch / malformed stored
+            // embedding gets the softened query-error message.
+            error.StepFailed => {
+                if (qp.get("vector") == null) return e;
+                const emsg = conn.errMsg();
+                if (std.mem.indexOf(u8, emsg, "does not exist") != null and std.mem.indexOf(u8, emsg, "vector") != null)
+                    return ApiError.badRequest("Vector search is unavailable: the pgvector extension is not installed on this database (run `CREATE EXTENSION vector`).").toResponse(ctx.allocator);
+                return ApiError.badRequest("Invalid vector search query: the query embedding's dimension may not match the stored embeddings (or a stored embedding is malformed).").toResponse(ctx.allocator);
+            },
+            error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep => return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
+            else => return e,
         }
     };
     // Release the writer lock immediately on success — expand/serialize below run on the reader.
@@ -811,10 +804,15 @@ const TestEnv = struct {
             defer setup_arena.deinit();
             const sa = setup_arena.allocator();
             _ = try collections.create(sa, std.testing.io, w, .{
-                .id = "", .name = "posts",
+                .id = "",
+                .name = "posts",
                 .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
                 // Open fixture: "@public" is the allow-all sentinel (empty "" is now LOCKED).
-                .listRule = "@public", .viewRule = "@public", .createRule = "@public", .updateRule = "@public", .deleteRule = "@public",
+                .listRule = "@public",
+                .viewRule = "@public",
+                .createRule = "@public",
+                .updateRule = "@public",
+                .deleteRule = "@public",
             });
         }
         env.app = .{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = &env.pool };
@@ -1017,9 +1015,12 @@ fn seedRuled(env: *TestEnv, name: []const u8, listR: ?[]const u8, viewR: ?[]cons
     const w = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     _ = try collections.create(a, std.testing.io, w, .{
-        .id = "", .name = name,
+        .id = "",
+        .name = name,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
-        .listRule = listR, .viewRule = viewR, .createRule = createR,
+        .listRule = listR,
+        .viewRule = viewR,
+        .createRule = createR,
     });
 }
 
@@ -1058,10 +1059,15 @@ fn seedUpDelRuled(env: *TestEnv, name: []const u8, updateR: ?[]const u8, deleteR
     const w = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     _ = try collections.create(a, std.testing.io, w, .{
-        .id = "", .name = name,
+        .id = "",
+        .name = name,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
         // create/view permissive so a row can be seeded over the handler ("@public" = allow-all).
-        .listRule = "@public", .viewRule = "@public", .createRule = "@public", .updateRule = updateR, .deleteRule = deleteR,
+        .listRule = "@public",
+        .viewRule = "@public",
+        .createRule = "@public",
+        .updateRule = updateR,
+        .deleteRule = deleteR,
     });
 }
 
@@ -1127,10 +1133,16 @@ fn seedAuth(env: *TestEnv, name: []const u8, createR: ?[]const u8) !void {
     const w = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     _ = try collections.create(a, std.testing.io, w, .{
-        .id = "", .name = name, .type = .auth,
+        .id = "",
+        .name = name,
+        .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
         // Open fixture for list/view ("@public"); createR is supplied per test.
-        .listRule = "@public", .viewRule = "@public", .createRule = createR, .updateRule = "@public", .deleteRule = "@public",
+        .listRule = "@public",
+        .viewRule = "@public",
+        .createRule = createR,
+        .updateRule = "@public",
+        .deleteRule = "@public",
     });
 }
 
@@ -1271,23 +1283,33 @@ fn seedTyped(env: *TestEnv, name: []const u8) !void {
     const w = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     _ = try collections.create(a, std.testing.io, w, .{
-        .id = "", .name = name,
+        .id = "",
+        .name = name,
         .fields = &[_]schema.Field{
             .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
             .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
             .{ .id = "f3", .name = "ratio", .options = .{ .number = .{ .mode = .float } } },
-            .{ .id = "f4", .name = "flag", .options = .{ .@"bool" = .{} } },
+            .{ .id = "f4", .name = "flag", .options = .{ .bool = .{} } },
             .{ .id = "f5", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 3 } } },
             .{ .id = "f6", .name = "photos", .options = .{ .file = .{ .maxSelect = 3 } } },
         },
         // Open fixture ("@public" allow-all; empty "" is now LOCKED).
-        .listRule = "@public", .viewRule = "@public", .createRule = "@public", .updateRule = "@public", .deleteRule = "@public",
+        .listRule = "@public",
+        .viewRule = "@public",
+        .createRule = "@public",
+        .updateRule = "@public",
+        .deleteRule = "@public",
     });
 }
 
 fn formCtx(env: *TestEnv, a: std.mem.Allocator, m: http.Method, fields: std.json.ObjectMap, files: []const http.UploadedFile, params: []const http.Param) http.RequestCtx {
     return .{
-        .method = m, .path = "/", .body = "", .allocator = a, .app = &env.app, .params = params,
+        .method = m,
+        .path = "/",
+        .body = "",
+        .allocator = a,
+        .app = &env.app,
+        .params = params,
         .content_type = "multipart/form-data; boundary=x",
         .form_fields = .{ .object = fields },
         .files = files,
@@ -1551,12 +1573,15 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
         const prepared = try auth.applyCreate(std.testing.io, a, .{ .object = ud }, users_col.options.auth.minPasswordLength);
         _ = try records.create(a, std.testing.io, w, users_col, prepared);
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "projects",
+            .id = "",
+            .name = "projects",
             .fields = &[_]schema.Field{
                 .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
                 .{ .id = "f2", .name = "account", .options = .{ .text = .{} } },
             },
-            .createRule = "@public", .updateRule = "@public", .viewRule = "@public",
+            .createRule = "@public",
+            .updateRule = "@public",
+            .viewRule = "@public",
             .options = .{ .tenant_field = "account" },
         });
         try w.exec("INSERT INTO projects (id,created,updated,title,account) VALUES ('rA','t','t','a','accA'),('rB','t','t','b','accB');");
@@ -1586,7 +1611,10 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
     TenantHooks.before_update_calls = 0;
     const dispatch = events.Dispatch{ .record = events.buildRecordDispatcher(.{ .projects = .{ .beforeUpdate = TenantHooks.countBeforeUpdate } }) };
     var app = app_mod.App{
-        .allocator = gpa, .io = std.testing.io, .pool = &pool, .dispatch = &dispatch,
+        .allocator = gpa,
+        .io = std.testing.io,
+        .pool = &pool,
+        .dispatch = &dispatch,
         .tenancy = .{ .enabled = true, .resolver = .header, .auth_collection = "users" },
     };
 
@@ -1651,10 +1679,15 @@ const F1Env = struct {
             defer env.pool.releaseWriter();
             try migrations.run(w);
             _ = try collections.create(a, std.testing.io, w, .{
-                .id = "", .name = "users", .type = .auth,
+                .id = "",
+                .name = "users",
+                .type = .auth,
                 .fields = &.{},
-                .listRule = "@public", .viewRule = "@public", .createRule = "@public",
-                .updateRule = "@request.auth.id = id", .deleteRule = "@public",
+                .listRule = "@public",
+                .viewRule = "@public",
+                .createRule = "@public",
+                .updateRule = "@request.auth.id = id",
+                .deleteRule = "@public",
                 .options = .{ .auth = .{ .minPasswordLength = min_len } },
             });
         }

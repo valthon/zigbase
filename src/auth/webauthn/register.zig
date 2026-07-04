@@ -292,10 +292,7 @@ test "register: happy path — EC2/ES256 registration succeeds" {
     const alloc = std.testing.allocator;
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                                  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-                                  0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-                                  0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20 };
+    const challenge_raw = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20 };
     const cred_id = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11 };
     const aaguid = [_]u8{0} ** 16;
 
@@ -432,14 +429,18 @@ test "register: negative — fmt:packed rejected with UnsupportedAttestationForm
     // map(3)
     try buf.append(alloc, 0xa3);
     // "fmt": "packed"
-    try buf.append(alloc, 0x63); try buf.appendSlice(alloc, "fmt");
-    try buf.append(alloc, 0x66); try buf.appendSlice(alloc, "packed");
+    try buf.append(alloc, 0x63);
+    try buf.appendSlice(alloc, "fmt");
+    try buf.append(alloc, 0x66);
+    try buf.appendSlice(alloc, "packed");
     // "attStmt": {}
-    try buf.append(alloc, 0x67); try buf.appendSlice(alloc, "attStmt");
+    try buf.append(alloc, 0x67);
+    try buf.appendSlice(alloc, "attStmt");
     try buf.append(alloc, 0xa0);
     // "authData": bstr
     const ad_len = auth_data_buf.items.len;
-    try buf.append(alloc, 0x68); try buf.appendSlice(alloc, "authData");
+    try buf.append(alloc, 0x68);
+    try buf.appendSlice(alloc, "authData");
     try buf.append(alloc, 0x59);
     try buf.append(alloc, @intCast(ad_len >> 8));
     try buf.append(alloc, @intCast(ad_len & 0xff));

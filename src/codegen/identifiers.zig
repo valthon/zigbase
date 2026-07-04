@@ -91,7 +91,10 @@ pub fn routeMethodName(alloc: std.mem.Allocator, path: []const u8, api_prefix: [
             var seg_first = true;
             var upper_next = false;
             for (seg) |ch| {
-                if (ch == '_' or ch == '-') { upper_next = true; continue; }
+                if (ch == '_' or ch == '-') {
+                    upper_next = true;
+                    continue;
+                }
                 if (upper_next) {
                     try out.append(alloc, std.ascii.toUpper(ch));
                     upper_next = false;
@@ -124,14 +127,14 @@ pub fn isValidTsIdent(s: []const u8) bool {
 pub fn isReservedName(name: []const u8) bool {
     const reserved = [_][]const u8{
         // typed-core imports referenced by the generated file
-        "WithExpand",    "StringOps", "NumberOps", "BoolOps",  "DateOps",
-        "EnumOps",       "RelOps",    "Expr",      "FieldExpr", "TypedFieldExpr",
-        "RelationResolver", "RawTypedRealtime", "CollectionMeta",
-        "makeRecordService", "makeTypedRealtime", "makeTypedFiles",
-        "ListResult", "CursorPage", "FileUrlOptions", "Client",
+        "WithExpand",            "StringOps",        "NumberOps",      "BoolOps",           "DateOps",
+        "EnumOps",               "RelOps",           "Expr",           "FieldExpr",         "TypedFieldExpr",
+        "RelationResolver",      "RawTypedRealtime", "CollectionMeta", "makeRecordService", "makeTypedRealtime",
+        "makeTypedFiles",        "ListResult",       "CursorPage",     "FileUrlOptions",    "Client",
         "RealtimeEnabledClient", "createClient",
         // TS structural built-ins a record/where might shadow
-        "Partial", "Omit", "Promise", "AsyncIterableIterator", "File", "Blob",
+            "Partial",        "Omit",              "Promise",
+        "AsyncIterableIterator", "File",             "Blob",
     };
     for (reserved) |r| if (std.mem.eql(u8, name, r)) return true;
     return false;
