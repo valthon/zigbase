@@ -12,10 +12,34 @@ def _free_port():
 def binary():
     return resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
 
+# `superuser create` hashes the password with argon2id (deliberately CPU-slow),
+# and every per-test server fixture used to pay it fresh. Instead seed ONE
+# template data dir per binary (a single `data.db` with the superuser row — no
+# WAL/lock/JWT files, since it's only ever created, never served against) and
+# copytree it into each test's tempdir. `serve` then provisions collections as
+# normal per test. Keyed by binary path (the zigbase and auth2 builds differ);
+# memoized per worker process (each xdist worker builds its own once).
+_su_templates = {}
+
+def _su_template_for(binary):
+    tmpl = _su_templates.get(binary)
+    if tmpl is None:
+        tmpl = tempfile.mkdtemp(prefix="zb_tmpl_")
+        subprocess.run([binary, "superuser", "create", "--email", "admin@x.io",
+                        "--password", "adminpassword", "--data-dir", tmpl], check=True)
+        _su_templates[binary] = tmpl
+    return tmpl
+
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_su_templates():
+    yield
+    for p in _su_templates.values():
+        shutil.rmtree(p, ignore_errors=True)
+
 @pytest.fixture()
 def server(binary, request):
     data = tempfile.mkdtemp(prefix="zb_admin_")
-    subprocess.run([binary, "superuser", "create", "--email", "admin@x.io", "--password", "adminpassword", "--data-dir", data], check=True)
+    shutil.copytree(_su_template_for(binary), data, dirs_exist_ok=True)
     port = _free_port()
     extra_env = getattr(request, "param", None) or {}
     env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port), **extra_env}
@@ -102,8 +126,7 @@ def _wait_reachable_or_fail(proc, port, log_path, timeout_s=5.0):
 def auth2_server(auth2_binary):
     """A live table-mode server with the beforeAuthSuccess fixture hook registered."""
     data = tempfile.mkdtemp(prefix="zb_auth2_")
-    subprocess.run([auth2_binary, "superuser", "create", "--email", "admin@x.io",
-                    "--password", "adminpassword", "--data-dir", data], check=True)
+    shutil.copytree(_su_template_for(auth2_binary), data, dirs_exist_ok=True)
     port = _free_port()
     env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
     log_path = os.path.join(data, "server.log")
