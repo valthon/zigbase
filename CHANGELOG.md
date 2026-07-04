@@ -4,6 +4,208 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-07-04
+
+### Breaking
+
+- Auth configuration is now grouped under one comptime `App(.{ .auth = .{ … } })` key. The previously-scattered top-level auth keys moved under it:
+  - `.auth = .{ .beforeRegister = fn, … }` (the flat lifecycle-hook group) → `.auth = .{ .hooks = .{ .beforeRegister = fn, … } }`
+  - `.auth_methods = .{ … }` → `.auth = .{ .methods = .{ … } }` (both the bare-tuple and `.{ .builtins, .custom }` forms)
+  - `.captcha = .{ .provider, .secret }` → `.auth = .{ .captcha = .{ … } }`
+  - `.session_store = .epoch | .table` → `.auth = .{ .session = .{ .store = … } }`
+  - `.session_gc_cron = "…"` → `.auth = .{ .session = .{ .gc_cron = "…" } }`
+  Each old spelling is now a pointed `@compileError` naming its new location, so consumers get an actionable migration message rather than a silent no-op. Runtime auth knobs (`ZIGBASE_AUTH_TOKEN_TTL`, `ZIGBASE_OAUTH_STATE_*`, cookie security, `ZIGBASE_RATE_LIMIT_*`) intentionally remain env-configured and are **not** part of the `.auth` group.
+- `beforeAuthSuccess` now fires on the legacy `POST …/auth-with-password` and `POST …/auth-refresh` routes — **including `_superusers`** (the admin SPA login). A hook that errors unconditionally will lock superusers out of the admin UI (fail closed, by design); fix the hook and rebuild.
+- `events.AuthMethod` gained a `.refresh` variant; exhaustive `switch`es over the enum must add an arm (compile error).
+- Custom-route surface: `http.Response.file_path` is now `Response.file` (`.file_path = p` → `.file = .{ .path = p }`). Plain-path delegation behavior is unchanged; the new optional `offset`/`len` window enables handler-planned partial responses.
+- Postgres backend (`-Dpostgres` builds): the default `sslmode` for `postgres://` URLs is now **`verify-full`** (the server certificate chain and hostname are verified — see the TLS entry under Security). A server without TLS (e.g. a docker-compose dev database) now fails **at startup** with an error naming the one-parameter fix: append `?sslmode=disable` (plaintext) or `?sslmode=require` (encrypted, unverified) to `ZIGBASE_DB_URL`. Explicitly configured modes below `verify-full` keep working and log one startup warning.
+- Side-effect auth successes are now uniform **204 No Content**: `confirm-verification` (was `{"verified":true}`), `confirm-password-reset` (was `{"success":true}`), `webauthn/register/finish` (was `{"registered":true}`). Treat any 2xx as success; `@zigbase/client` types updated to `Promise<void>`.
+- The magic-link consume URL is now dash-case: `GET …/auth/magic-link/consume` (was `auth/magic_link/consume`). Hard cutover — links emailed by pre-upgrade servers 404 (tokens are short-lived). The method slug (`/auth/magic_link/initiate|complete`, `onAuth` tag) is unchanged.
+- The built-in job kinds are now config-gated (embedded consumers): `ctx.webhook` requires `.webhooks = true`; `ctx.mail().enqueue` requires `.mail` (use `.mail = .{}` for defaults) or a `.mailer` plugin. Without the key the kind is not compiled in and enqueue fails loudly with a hint. Direct mailer delivery (verification/password-reset emails) is unaffected. The kind names `mail`/`webhook` remain reserved either way.
+- Removed the legacy `.jobs = .{ .pool_size = N }` spelling; set `.pools = .{ .jobs = N }`. The old key is now a pointed compile error (N1).
+- `RecordEvent.ctx` is now `RecordEvent.rctx` (`ctx` always means `*Ctx` in a hook signature). Mechanical migration: `ev.ctx.` → `ev.rctx.`.
+- `RecordEvent.app` was removed — it put the UB footgun (`ev.app.allocator` vs `ev.arena`) one dot from every hook. Use the hook's `ctx.app`; allocate record data with `ev.arena`. (`JobEvent.app`/`ErrorEvent.app` are unchanged.)
+- `RouteEvent` was deleted. It was never passed to a live route (handlers take `*Ctx`); it existed only in tests. Events carry data; `ctx` carries capabilities.
+- `GET /api/collections` and `GET /api/settings` now return `{"items":[…]}` instead of a bare JSON array (superuser endpoints; admin SPA + typegen updated). `zigbase typegen --url` requires a server from this release.
+- `GET /api/collections/:col/auth/oauth2/providers` returns `{"items":[…]}` (was `{"providers":[…]}`); `@zigbase/client`'s `listAuthProviders` types updated.
+- `zigbase.Server` is now a generic `pub fn Server(comptime gates: Gates) type` instead of a concrete struct — the built-in route table is assembled per-app from `Gates` (R2-3). Framework consumers reach it exclusively through `App(cfg).runCli`/`serve`, which thread the new `gates` config automatically; only code that named `zigbase.Server` directly (bypassing `App`) needs an update, e.g. `server.Server(.{})` for the historical all-on table.
+- Storage plugin vtable: `localPath(ctx, alloc, col, record_id, filename)` is now `fetch(ctx, io, alloc, col, record_id, filename)` — return a local filesystem path whose contents are the file, **materializing it locally if necessary**; `null` = the backend has no such object. Local-disk backends migrate mechanically (rename + the `io` parameter).
+- `GET /api/senders` now returns `{"items":[…]}` instead of a bare JSON array (unified with the analytics endpoints' envelope).
+- The `__features` realtime channel now emits the standard `{"type":"signal","topic":"__features"}` frame instead of the bespoke `{"type":"features.changed"}` frame.
+
+### Features
+
+- Admin UI: an **Email** view — manage verified sender identities (list / invite / delete), the suppression list (add / remove / filter by reason, incl. one-click-unsubscribe entries), and read-only bulk-send batch progress, with a read-only mail-policy strip. Backed by the existing mail APIs plus a new superuser `GET /api/mail/config` (booleans only, no secrets).
+- Admin UI: a **Files** view — browse per-collection file fields with image previews, upload/replace files, and remove them, plus a read-only storage-backend strip (local disk vs S3). Backed by the existing records + file-serve APIs plus a new superuser `GET /api/files/config` (non-secret backend info only — never the S3 credentials).
+- Admin UI: a **Logs & realtime** view — browse app analytics events with name/actor/since filters and cursor pagination, view an app-declared rollup's aggregated series, and a read-only realtime health strip (live connection count + caps). Backed by the existing analytics APIs plus a new superuser `GET /api/realtime/stats`. The Logs tab is capability-gated: it only appears when the app enables `.analytics` (the stock `zigbase serve` binary doesn't, so the tab is hidden there).
+- Admin UI: a **Users** view for managing superusers and auth-collection users — list, search, create/edit/delete, admin password reset, and a read-only OAuth-providers panel. The admin SPA is now split into browser-native ES modules (no build step) and every asset is served with a CRC32 `ETag`.
+- Self-service password change via `PATCH /api/collections/:col/records/:id`: non-superusers must include a verifying `oldPassword` — a non-oracle check (wrong/missing values, unknown records, and passwordless targets all return the login-identical `400 "Invalid credentials."` with argon2 timing padding), rate-limited under a new `"pwchange"` scope before any argon2 work runs. On success every other session for the record is invalidated (tokenKey rotation, plus `_sessions` purge in table mode) while a self-change keeps the calling device signed in via fresh `Set-Cookie` headers. The `beforePasswordChange`/`afterPasswordChange` lifecycle hooks now fire on this path too. `@zigbase/client` gains `collection(col).changePassword(id, oldPassword, newPassword)` (transparent re-auth in token mode).
+- Official multi-arch Docker image, `ghcr.io/valthon/zigbase` — built from the existing static-musl release binaries (no in-image compilation), `distroless/static` base, non-root by default. The supported deployment path for Windows-hardware users, since ZigBase has no native Windows build. See `docs/docker.md`.
+- `migrate-db` now fully supports circular relations (self-relations and mutual/N-node cycles) end-to-end, not just provisioning: cycle-edge foreign keys are omitted from the initial `CREATE TABLE` and added back as `DEFERRABLE INITIALLY IMMEDIATE` constraints (Postgres cannot create tables with circular inline `REFERENCES` in any order), and the load transaction defers those constraints to `COMMIT` (`SET CONSTRAINTS ALL DEFERRED` on Postgres, `PRAGMA defer_foreign_keys=ON` on SQLite) so rows load in any order regardless of reference direction. Previously this schema shape failed outright during provisioning; SQLite targets were always cycle-capable (inline FK DDL tolerates cycles) but are now verified round-trip end to end. A dataset with a genuinely dangling reference fails clearly at `COMMIT`, naming the affected collections, and rolls the whole load back.
+- Bulk list sends: `ctx.mail().sendBulk(...)` fans one templated message out as per-recipient-rendered emails over the durable queue, with submit-time validation/dedup, per-recipient suppression checks, idempotent redelivery, and a durable send-report (`_mail_batches` / `_mail_batch_recipients`, readable as superuser via the records API) plus `batchStatus` / `cancelBatch`.
+- Scheduled sends: `ctx.mail().deliverAt(msg, .{ .at | .delay_s })` returns a cancellable job id, `ctx.mail().cancel(id)` calls a pending send off, and `sendBulk` accepts `.at` — the documented drip-sequence primitives.
+- One-click unsubscribe (RFC 8058): configure `.mail.unsubscribe_base_url` (or `ZIGBASE_UNSUBSCRIBE_BASE_URL`) and bulk mail automatically carries `List-Unsubscribe` / `List-Unsubscribe-Post` headers pointing at the new signed public `POST/GET /api/mail/unsubscribe` endpoint; one-click opt-outs are recorded as `unsubscribe` suppressions that block list mail only (transactional mail is unaffected).
+- Per-queue rate throttling: durable queues accept `.rate = .{ .per_second = N }` — a token-bucket ceiling enforced at claim time (e.g. match SES's 14 msg/s).
+- `ctx.mail()` warns when an HTML body exceeds ~100 KB (Gmail clipping threshold).
+- Record-file downloads (`GET /api/files/:col/:rec/:name`) support HTTP Range and conditional requests: `206` with `Content-Range` for `bytes=a-b` / `bytes=a-` / `bytes=-n`, `Accept-Ranges: bytes`, a strong content-immutable `ETag` with `304` revalidation, `If-Range`, `416` for unsatisfiable ranges, and `HEAD` parity.
+- Generic OIDC discovery for OAuth providers: set `.discoveryURL = "https://…/.well-known/openid-configuration"` on a provider (mutually exclusive with explicit endpoint URLs) and the endpoints are resolved once at startup — https-only, issuer-checked, and **fail-fast** (a failed discovery refuses to start). Covers Auth0/Okta/Keycloak/Entra-custom-tenant/Zitadel-class IdPs with one config line; scopes default to `openid email profile` with the standard OIDC claim mapping.
+- `.migrations` accepts a bare tuple (`.migrations = .{ .{ .id = "...", .up = f } }`) like every other list-shaped config key; the typed-slice form still works (E1).
+- New `-Dfts5` build flag (default **on**): lean custom builds can drop SQLite's FTS5 (~250-400 KB). With `-Dfts5=false`, `?search=` answers 400 and a `.searchable` SQLite schema refuses at startup. Default builds are unchanged; Postgres full-text search is independent of the flag.
+- New comptime `.admin = .disabled` key: headless/embedded consumers can drop the admin SPA (dispatch + ~58 KiB embedded assets) from their binary. Default unchanged — the admin UI serves at `/_/`.
+- `.auth.methods` (the app-level auth-method registry) gains an exact-set form: `.{ .builtins = .{ .password, .otp }, .custom = .{ MyMethod } }`. Deselected built-ins (WebAuthn's CBOR/COSE stack, magic-link, OAuth2, OTP) are excluded from the binary together with their routes. Absent key / bare-tuple form keep today's all-five behavior — non-breaking.
+- Cross-instance custom-topic realtime on Postgres (#188): `ctx.realtime().signal(topic)` / `ctx.realtime().broadcast(topic, payload)` and the `__features` flag/experiment signal now fan out across every app instance sharing one Postgres database (best-effort, at-most-once, unordered), not just the emitting process. No app data ever rides the `LISTEN`/`NOTIFY` wire: signals carry only the topic name, and message broadcasts store the enveloped frame in a new `_rt_broadcasts` side table keyed by a random CSPRNG token (TTL-GC'd), NOTIFYing only the token — the receiving instance reads the frame back over its own connection and re-delivers it through the same per-subscriber authorization chokepoint. A forged or expired token finds no row and is dropped (fail closed). The `ctx.realtime()` public API is unchanged; on SQLite (single-process) behavior is byte-identical.
+- Opt-in S3-compatible storage backend (`-Ds3` build flag; AWS S3, MinIO, Cloudflare R2), selected by configuration alone — set `ZIGBASE_S3_*` env vars on an `-Ds3` binary, no code change. Downloads are served through a local spool cache, so Range/ETag/tenancy behavior is byte-identical to local storage. A stock binary with `ZIGBASE_S3_BUCKET` set warns loudly and falls back to local storage. Startup runs a fail-fast HeadObject probe (DNS/TLS/SigV4/bucket/permissions verified before serving).
+- `@zigbase/client` 0.3.0: full-text `search` + structured `vector` queries (`vectorSpec`) on list reads, with per-collection compile-time gating in the generated tiers.
+- `@zigbase/client` 0.3.0: multi-tenant account scoping — `accountId` option, `client.withAccount(id)` scoped views (shared auth store), and `accounts.activate(id)`.
+- `@zigbase/client` 0.3.0: per-record abilities — `getAbilities(id)` on the base and every generated collection service.
+- `@zigbase/client` 0.3.0: analytics read APIs — `client.analytics.events(...)` and `client.analytics.rollup(name, ...)`.
+- `@zigbase/client` 0.3.0: verified sender management — `client.senders.list/create/verify` (list requires ZigBase >= 0.10.0).
+- `@zigbase/client` 0.3.0: realtime custom topics — `subscribeTopic`/`unsubscribeTopic` deliver `signal` and `message` frames (feature-change notifications are `subscribeTopic("__features", cb)`).
+- Generated TS clients surface `searchable`/`tenant` schema metadata: typed `search`/`vector` options, per-collection sort unions (`sort: "-age" | [...]`), tenant fields omitted from `*Create`/`*Update`, and `accounts`/`analytics`/`senders`/`withAccount` on the generated client.
+- Per-device session REST + SDK for `.auth.session.store = .table`: `GET /api/collections/:col/auth/sessions` (`{"items":[…]}`, newest first, `is_current` marked), `DELETE …/auth/sessions/:sid` (`204`; non-owned/absent ids are an indistinguishable `404`), and `DELETE …/auth/sessions` ("log out everywhere", works in **both** session-store modes, clears the session cookies). In the default `.epoch` mode the per-device routes answer `404`. `@zigbase/client` gains `listSessions()`, `revokeSession(id)`, `revokeAllSessions()` and the `SessionInfo` type. The `sessions` auth-method slug is now reserved.
+- SPA fallback routing (#183): a presence-only `.spa` marker file makes its static
+  directory an SPA root — GET/HEAD misses at or below it serve that directory's
+  `index.html` (200), so client-routed apps survive deep links and hard refreshes.
+  Works for both `--serve-static`/`.dir` trees and embedded manifests; real files,
+  `/api` (including via normalized/double-slash paths), admin, and custom routes
+  always win. In **dir** mode the marker is
+  resolved **live** against the filesystem on every miss — adding, removing, or
+  editing a `.spa`/`index.html` takes effect on the next request, no restart needed;
+  startup only fails fast (with a clear, path-naming error) when a `.spa`-marked
+  directory has no `index.html`, and an unreadable subdirectory is skipped with a
+  warning rather than aborting boot. **Embedded** manifests keep a startup-derived,
+  comptime-static marker set (there's no live filesystem to go stale). The fallback
+  shell is served `Cache-Control: no-cache` with a revalidation ETag so a redeploy
+  never strands deep links on a stale cached shell, and a file literally named
+  `.spa` denotes this marker (ASCII case-insensitive) rather than being served.
+- Comptime `static_routes` for custom builds (#183): declare `match → serve`
+  rewrites on `App(.{ .static_routes = &.{...} })` with minimal segment matching
+  (`:name` one segment, `*` one-or-more rest, `**` zero-or-more rest; first match
+  wins). Patterns and embedded serve targets are validated at compile time; dir
+  targets at startup. A new `enable_spa_marker` key gates the marker (default: on
+  without routes, off with routes).
+- Realtime over Server-Sent Events (#188): `GET /api/realtime/sse` (EventSource-compatible — no SDK required) + `POST /api/realtime/sse/:clientId` uplink speaking the same verb grammar as WebSocket. Same frames, same per-record delivery authorization, same Origin policy, same shared connection cap. New `--sse-heartbeat-seconds` / `ZIGBASE_SSE_HEARTBEAT_SECONDS` knob for the `: ping` heartbeat interval.
+- Tunable Cache-Control for static file serving: `App(.{ .static_cache_control = "…" })`
+  sets a comptime default, and `--static-cache-control <value>` /
+  `ZIGBASE_STATIC_CACHE_CONTROL` override it at runtime (flag wins over env, both win
+  over the comptime default). Applies only to static serving (dir/embedded/
+  `--serve-static`) — record-file downloads keep their authorization-derived
+  Cache-Control unchanged. Unset (the default) is byte-identical to today's stock
+  `max-age=3600`. The value must be non-empty, CR/LF-free, and at most 256 bytes;
+  an invalid value fails startup with a clear error instead of silently clamping
+  or ignoring it.
+- Static file serving now supports HTTP Range: `bytes=X-` (video seek), `bytes=-n`, and overlong ranges return correct `206` responses, unsatisfiable ranges `416` (previously these fell through to a full `200` or worse), and embedded static assets gain single-range `206`. A ranged **dir**-mode request with a matching `If-Range` now resumes with `206` instead of restarting as a full `200`: zigbase neutralizes an inverted `If-Range` branch in the vendored facil.io that deleted the `Range` header on a match (RFC 9110 §13.1.5), so interrupted downloads resume instead of re-downloading from scratch. Owned record-file (`/api/files/…`) and embedded serving were already RFC-correct here. (#192)
+
+### Fixes
+
+- `onAuth` on `POST …/auth-refresh` now reports `.refresh` instead of the mislabeled `.password`.
+- `migrate-db` onto a non-superuser Postgres target (the common case for managed Postgres like RDS/Cloud SQL) no longer silently corrupts the load: the best-effort `SET session_replication_role = replica` FK-suspension attempt, when rejected for lack of privilege, was leaving the load transaction itself in Postgres's aborted state — so *every* subsequent statement in the load failed, regardless of whether the schema had any cycles at all. The attempt is now wrapped in a `SAVEPOINT` so a rejected privilege check no longer poisons the load.
+- `_suppressions` gained the `updated` column the records engine's base-column SELECT requires, so superusers can actually browse it via the records API (migration `0019_bulk_mail`).
+- Record-file downloads no longer emit a duplicate `Cache-Control` header (the handler's per-collection value used to be joined on the wire by facil.io's global `max-age=3600`).
+- Shipped-binary size: fixed a code-gen accident in the bundled regex engine (`Builder`
+  was materialized as a ~3 MB all-zero `.rodata` template copied at runtime on every
+  `compile`) — the default ReleaseSafe binary shrinks ~40%, from ~7.6 MB to ~4.6 MB,
+  with identical behavior.
+- `app.submit` tasks and memory-queue jobs are now drained and joined at shutdown (a task
+  submitted before shutdown completes instead of being cut off), and `app.submit` works
+  whenever the server is running — a configured scheduler is no longer required.
+- Postgres SCRAM authentication now applies RFC 4013 SASLprep to passwords: soft hyphens are stripped and non-ASCII spaces map to space before PBKDF2, prohibited/bidi-invalid and non-UTF-8 passwords keep PostgreSQL's own use-verbatim parity, and a password that would require NFKC normalization fails loudly at connect with a message naming the fix (previously: verbatim bytes and a mysterious `password authentication failed`). Printable-ASCII passwords are byte-identical fast-path (zero allocation).
+- Postgres backend (`-Dpostgres` builds): a `postgres://` URL whose host is a DNS name (e.g. `localhost`, `db.internal`) now resolves through the OS resolver (`/etc/hosts` + `resolv.conf`) instead of failing to connect — previously only IP-literal hosts (`127.0.0.1`, `::1`) worked, so `verify-full` against a hostname could never complete its handshake.
+- The `App(.{…})` config-key table in docs/framework.md claimed to be exhaustive while omitting 9 keys (`captcha`, `tenancy`, `abilities`, `mail`, `analytics`, `static_routes`, `enable_spa_marker`, `onFeatureExposure`, `features`); it is now complete, states each key's binary-size contract ("unset ⇒ excluded/data-only/always"), and documents the config-plane assignment rule + laziness contract.
+- `ZIGBASE_DB_URL` (the SQLite-vs-Postgres selector), `ZIGBASE_PUBLIC_URL` (magic-link URL base), and `ZIGBASE_SENDMAIL_COMMAND` are now documented in the README env table and `zigbase help` — they were previously undiscoverable.
+- Field-encryption (`ZIGBASE_FIELD_KEY`, `ZIGBASE_FIELD_KEY_GENERATION`, `ZIGBASE_FIELD_KEY_V<n>`) env vars are now in the README env table (previously only in `zigbase help`). OAuth (`ZIGBASE_OAUTH_STATE_SERVER`/`_STATE_TTL`), rate-limit (`ZIGBASE_RATE_LIMIT_MAX`/`_WINDOW`), and SMTP (`ZIGBASE_SMTP_*`) env vars are now in `zigbase help` (previously only in the README).
+- README documented the `ZIGBASE_OAUTH_STATE_SERVER` default backwards (`false`); the server-side OAuth state store has defaulted **on** since it shipped. The env table now matches the code (set `=false` to opt out).
+- Outbound HTTP client (`http_client.zig`, shared by S3, webhooks, OAuth2, and CAPTCHA verification): a response DEFINED to carry no body (a `HEAD` response, any `1xx`, `204 No Content`, or `304 Not Modified`) was still read as if it might have one, using whatever `Content-Length` it happened to arrive with — or, absent that, "read until the connection closes." Real S3 servers don't close keep-alive connections, so every S3 `DELETE` (always `204`, no `Content-Length`) and every `HEAD` on an existing key blocked for ~30 seconds (an unrelated idle-connection timeout eventually unblocking it) before this was caught by the new live MinIO tests.
+- `.analytics.rollups` in the `App` config could never compile — a job-wrapper signature mismatch made the option dead-on-arrival since it was introduced.
+- The TypeScript code generator emitted an orphan `Expand` type key (breaking `tsc`) for relations that target a collection outside the generated set; it now emits `never` for those relations instead.
+- `@zigbase/client` realtime: concurrent `subscribe`/`subscribeTopic` calls for the same topic while the socket is open no longer send duplicate subscribe frames — later callers join the pending ack instead.
+- Embedded static assets now send a `Cache-Control` header (previously none — revalidation still works via the unchanged CRC32 ETag).
+- `.gz` sidecar responses now carry `Vary: Accept-Encoding` (shared-cache correctness).
+
+### Changed
+
+- Stale docs corrected: Postgres backend status in configuration, README backend
+  description, tenancy example harmonization.
+- `Email` / `MailMessage` gained an additive `list_unsubscribe` field (default `null`; CRLF-checked like every header field) emitted as RFC 8058 headers by all backends (SMTP/Command/SES/Postmark).
+- `durable.enqueue` now returns the generated job id, and the queue GC reaps `canceled` jobs (internal signature change, pre-1.0).
+- `CaptureMailer` records `reply_to`/`list_unsubscribe` and gained `all()` / `countTo()` accessors.
+- The release binary no longer ships the demo feature flags/experiment (`dark_mode`, `maintenance`, `onboarding_flow`) — they were Playwright fixtures riding in production. `GET /api/features` on a stock binary is now empty until you declare your own.
+- `GET /api/analytics/events` adopts the house cursor pagination: `?cursor=` request param and `nextCursor`/`hasNext` response keys (additive; `limit` cap 200 unchanged).
+- Built-in routes are now comptime-assembled from your `App(.{…})` config: analytics, senders, the inbound mail webhook, one-click unsubscribe, and `accounts/:id/activate` are registered (and compiled) only when `.analytics`, `.mail`, or `.tenancy` is configured. Previously these routes always existed and answered 404/fail-closed when unconfigured; now they 404 as unknown routes. The standalone `zigbase serve` binary opts into `.mail = .{}`, so its mail routes (verified senders, the inbound webhook, RFC 8058 unsubscribe) stay registered and behave exactly as before; only the still-unconfigured analytics and tenancy routes now 404 uniformly.
+- The typed where-DSL `in` operator now compiles to the native `field in (…)` filter operator (requires ZigBase >= 0.9.0; against older servers it is a 400).
+- Clients regenerated by this release require `@zigbase/client` >= 0.3.0 (enforced by a `CoreSupports_0_3` marker type with a self-explaining typecheck error).
+- The docs site gained dedicated feature guides for the 0.9.0 features (PostgreSQL, tenancy,
+  abilities, search, analytics, email, jobs & webhooks, realtime broadcast), a CAPTCHA
+  recipe, a refreshed landing page, and a competitor comparison page.
+
+### Performance
+
+- Collection-metadata cache: `invalidate()` no longer allocates while holding the cache spinlock. Detached entries are threaded onto an intrusive list and their arenas/keys are freed only after the lock is released, removing an alloc-under-spinlock latency/contention hazard (and any re-entrant-allocator deadlock risk) on the DDL path.
+- Memory-backend queues no longer spawn one detached OS thread (with a 1 MiB stack) per
+  enqueued job: jobs run on a small fixed worker pool with a bounded ring. Overflow
+  returns `error.QueueFull` instead of unbounded thread creation, so enqueue bursts can
+  no longer exhaust threads or address space.
+- Realtime delete fan-out: the per-subscriber authorization sandbox for delete events now
+  creates only the tables it needs (2 statements) instead of running the full ~28-table
+  migration suite once per subscriber per delete — removing the worst per-event fan-out
+  cost on the shared HTTP threads.
+- Collection metadata (the parsed schema consulted by every record API request and every
+  realtime delivery) is now served from a versioned in-process cache invalidated on
+  collection create/update/delete (SQLite backend; Postgres deployments keep direct reads
+  so multi-instance DDL stays coherent) — removing a `_collections` SELECT plus a full
+  schema-JSON parse per request and per realtime fan-out delivery.
+- The embedded admin UI's assets now carry build-time `ETag`s and answer `If-None-Match`
+  with `304 Not Modified`, so revisiting the admin no longer re-downloads the SPA bundle
+  on every load.
+
+### Security
+
+- The SASLprep mapping/prohibited/bidi/NFKC-quick-check sets are vendored-generated range tables (`scripts/gen-saslprep-tables.py` over the frozen RFC 3454 appendices + Unicode 16.0.0 UCD extracts) — auditable binary-search tables, mechanical to bump.
+- Postgres TLS supports real server-certificate verification: `sslmode=verify-ca` / `verify-full` are accepted (previously rejected at parse time), a new `sslrootcert=<path|system>` URL parameter selects the CA bundle (built once at startup, shared by all pooled connections, fail-fast on a missing/empty bundle), certificate validity is checked against real wall-clock time, and handshake failures surface actionable startup errors (untrusted chain, hostname mismatch, expired / not-yet-valid certificate, server refused TLS) that never include the connection URL.
+- Realtime slow-consumer backpressure (issue #203): each WebSocket/SSE connection now has a per-connection outbound high-water-mark. A client that reads slowly or stalls without closing used to let the server buffer its outbound frames without bound (an OOM/DoS risk); once a connection's queued outbound frames exceed the bound it is now disconnected (the standard pub/sub choice — a clean reconnect + re-fetch, never a silent frame drop). Default `1024` frames; tune with `--realtime-outbound-hwm N` / `ZIGBASE_REALTIME_OUTBOUND_HWM` (`0` disables).
+- Fixed an unauthenticated, remotely-triggerable heap double-free (and double connection-slot release) on the realtime WebSocket upgrade path: a malformed `Sec-WebSocket-Version` handshake drives facil.io's `bad_request` branch, which already invokes the connection's `on_close` teardown before returning failure — the adapter then tore the connection down a second time. In a release build this was a potential denial of service. The SSE upgrade path (new in 0.10.0) is hardened identically. Both transports now leave failure-path teardown solely to facil.io's `on_close`.
+- Comptime custom routes (an app's `.routes` config) now resolve the active account exactly like the REST record/analytics/senders endpoints. Previously `dispatchCustom` never resolved tenancy: `ctx.track()` calls from a custom route stamped an empty account, and — more seriously — reads of tenant-owned collections made through a custom route were served **unscoped**, exposing cross-tenant data to any caller who could reach the route. Custom routes now resolve tenancy identically to the REST chokepoints. File serving (`GET /api/files/:col/:rec/:name`) had the same gap and is fixed the same way: it now resolves the active account before evaluating `viewRule`, so a file on a tenant-owned collection is no longer reachable cross-tenant by a caller who merely knows the collection/record/filename, and `@request.account.*`/cookie-activated rules now see the correct scope.
+
+### Internal
+
+- CI now enforces formatting: a `zig fmt --check src build.zig` gate in the `unit` job fails the build on any unformatted file, paired with a one-shot tree-wide `zig fmt` sweep so the tree starts clean.
+- Scoped the `zig-local-*` build/test caches by branch (`github.ref_name` folded into both the `key:` and `restore-keys:` prefixes of every job) so one branch can no longer restore and reference another branch's cached objects — the cross-branch cache poisoning that surfaced a phantom symbol error in unrelated CI. The content-hash-keyed `zig-global-*` caches stay shared.
+- Added a multi-threaded stress test for the collection-metadata cache: N threads hammer `lease()`/`invalidate()`/release concurrently, asserting no use-after-free, no leak (via the leak-checking test allocator), and correct post-invalidation reload.
+- `dumpload.zig`'s collection-creation ordering is now a proper Kahn topological sort (`planCreateOrder`), with unit-tested, deterministic handling of relation cycles (self-relations and mutual/N-node cycles) that surfaces the in-cycle relation fields instead of just falling back to declaration order. Observable dump/load behavior for acyclic schemas (the common case) is unchanged; this lands the pure ordering primitive that Postgres deferred-FK cycle support (a follow-up task) builds on.
+- Parallelized the Playwright/browser test suite (`tests/admin/`) with pytest-xdist (`-n auto`) in CI and reworked the harness fixtures to reuse a per-worker Chromium browser and a template superuser data dir, cutting the suite's serial wall time (~4:53) to ~18s on a 32-core box. No consumer-visible change.
+- Fix a race in the admin browser test
+  `test_shell.py::test_login_then_sidebar_lists_builtin_collections`: it counted
+  the `nav-_superusers` sidebar link immediately after `login()`, but `login()`
+  only waits for the static `nav-collections` link while the built-in-collection
+  nav items render asynchronously just after — so the bare `count()` read 0 and
+  the `browser` job flaked. It now waits for the selector before counting.
+- Fix a ~2.4%-per-run flake in the Postgres realtime cross-instance tests
+  (`realtime_pg_test.zig`): the delete-snapshot leak-canary asserted a bare
+  owner value `u9` was absent from the NOTIFY payload, but the payload embeds a
+  32-char random base36 token that coincidentally contains `u9` ~2.4% of runs.
+  The canaries are now anchored to their JSON string quotes (`"u9"`, `"ssn"`),
+  which a quote-less token/id can never forge, while still catching a real leak.
+  The cross-instance waits also now loop over benign non-notification async
+  messages (matching the production `pg_bridge` listener's tolerant contract)
+  instead of failing on the first one.
+- Corrected a false load-bearing comment in `static_files.zig` (facil.io does NOT
+  percent-decode request paths; the `..` check is safe because encoded traversal stays a
+  literal segment) and documented why `query/params.zig` keeps its own query parser
+  (fio type-guesses values; zap returns them undecoded).
+- Postgres backend: added `scripts/gen-saslprep-tables.py`, vendored RFC 3454 / Unicode 16.0.0 UCD source extracts (`vendor/unicode/`), and the generated `src/backend/postgres/saslprep_tables.zig` range tables (RFC 3454 B.1/C.1.2/C.2.x/C.3–C.9/D.1/D.2, plus UCD `NFKC_QC` and canonical-combining-class data) that a follow-up SASLprep normalization pass will consume. Not yet wired into any code path.
+- A table↔`allowed`-tuple parity test (`tests/admin/test_docs_parity.py::test_config_key_table_matches_allowed_tuple`) guards the config-key table against future drift.
+- Tightened the env-var help-parity test's text slice to end at `EXAMPLES:` instead of running to EOF — the old unbounded slice would false-pass a `ZIGBASE_*` name that only appeared in a later `std.log` message, not in the actual help text.
+- Browser feature tests drive a dedicated `features-fixture` binary (`fixtures/features/`).
+- Doc-drift guard: `tests/admin/test_docs_parity.py` fails CI when a `ZIGBASE_*` var referenced in `src/` is missing from the README table or the help text.
+- CI now enforces the gating invariant: a minimal consumer build (`fixtures/minimal/`) is nm-scanned to prove deselected subsystems (WebAuthn, magic-link, OAuth2, analytics API, senders, mail webhook, webhook/mail job kinds, admin SPA) leave zero symbols (`scripts/check-gating.sh`), self-checked against a positive-control build (`fixtures/full/`) so a renamed/vacuous pattern also fails the check.
+- Realtime delivery/verb authorization extracted from the WebSocket adapter into transport-neutral `hub.frameForDelivery`/`hub.authVerb`/`hub.subscribeCheck` (behavior-preserving; WS wire byte-identical) — groundwork for the SSE transport.
+- SSE connection registry scaffolding (`realtime/sse.zig`): `SseConn` + pin/unref refcount, closed-flag lifecycle, and the per-delivery snapshot, with a strict `registry_mu`/`conn.mu` never-nested lock-ordering law and threaded-stress unit tests. Internal until the transport is wired end-to-end.
+- SSE stream lifecycle wired onto the shared realtime upgrade path (`realtime/ws.zig` `handleUpgrade` now dispatches `sse` targets on `/api/realtime/sse`): `on_open` dups the handle, registers, and writes the connect frame; `on_close` runs the single authoritative reap; delivery snapshots under `conn.mu` and authorizes through the same `hub.frameForDelivery` chokepoint as WebSocket. Not yet a usable transport (no subscribe uplink until the next slice); Internal until then.
+- New `s3` CI job: MinIO via `docker run` + gated live Zig tests + a raw-HTTP upload→Range→delete e2e (`tests/s3/`).
+- Generalized the AWS SigV4 signer (`src/mail/sigv4.zig` → `src/aws/sigv4.zig`): parameterized method / canonical URI (S3 `UriEncode`) / signed-header list / service, SES signatures pinned byte-identical. Groundwork for the S3 storage backend; zero behavior change.
+- Dual-transport (ws/sse) realtime e2e delivery matrix in the browser suite.
+- Static Range support is a ~20-line request-header normalization shim + `HTTP_HVALUE_MAX_AGE` FIOBJ swap at `FIO_CALL_PRE_START` — facil.io keeps ALL static serving (directive 1); no owned static layer.
+
 ## [0.9.0] - 2026-06-30
 
 A large release: a **PostgreSQL backend** alongside the default embedded SQLite, plus multi-tenancy, relationship-based authorization, full-text & vector search, product analytics, a transactional email subsystem, background job queues, outbound webhooks, CAPTCHA verification, and a realtime broadcast API.
