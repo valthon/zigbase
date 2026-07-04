@@ -25,6 +25,7 @@ const state_api = @import("api/state.zig");
 const analytics_api = @import("analytics/api.zig");
 const realtime_ws = @import("realtime/ws.zig");
 const realtime_api = @import("api/realtime.zig");
+const realtime_stats_api = @import("api/realtime_stats.zig");
 const files_multipart = @import("files/multipart.zig");
 const admin = @import("admin.zig");
 const static_files = @import("static_files.zig");
@@ -145,6 +146,9 @@ pub fn Server(comptime gates: Gates) type {
                 // Always registered — realtime (WS + SSE) is not an optional gated subsystem; the clientId
                 // is a stream-delivered capability, so unknown/expired/closed ids 404 (non-oracle).
                 .{ .method = .POST, .pattern = "/api/realtime/sse/:clientId", .handler = realtime_api.sseUplink },
+                // Superuser-only realtime health snapshot (admin-UI Phase 4). 3 segments, so it
+                // cannot collide with the 4-segment /api/realtime/sse/:clientId route above.
+                .{ .method = .GET, .pattern = "/api/realtime/stats", .handler = realtime_stats_api.get },
                 // Public, UNAUTHENTICATED feature-state projection (#130). Mounted at the default
                 // "/api/state"; the handler 404s when disabled or remapped (a custom path is
                 // dispatched dynamically in onRequest). NEVER exposes the superuser settings verbs.
