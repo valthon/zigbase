@@ -8,6 +8,6 @@ const zigbase = @import("zigbase");
 pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{
         .admin = .disabled,
-        .auth_methods = .{ .builtins = .{ .password } },
+        .auth = .{ .methods = .{ .builtins = .{.password} } },
     }).runCli(init);
 }

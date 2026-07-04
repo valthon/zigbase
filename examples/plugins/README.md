@@ -93,7 +93,7 @@ configures in code:
    [onAuth] collection=commenters method=magic_link record=<id>
    ```
 
-10. **Custom `AuthMethod` plugin** (`ApiTokenMethod`) via `.auth_methods = .{ApiTokenMethod}`.
+10. **Custom `AuthMethod` plugin** (`ApiTokenMethod`) via `.auth = .{ .methods = .{ApiTokenMethod} }`.
     Enabled on `authors` via `.auth.methods.custom = .{"api_token"}`. Implements the
     plugin contract `create(gpa, io, cfg) !Self` / `method(*Self) zigbase.AuthMethod` /
     `deinit(*Self) void`, using `zigbase.AuthCtx` helpers (`findByIdentity`, `rateLimit`,

@@ -1,5 +1,5 @@
 //! Auth-round-2 e2e fixture (spec §F1–F3 browser coverage): a consumer app with
-//! `.session_store = .table` and a REGISTERED `beforeAuthSuccess` hook, so the Playwright
+//! `.auth.session.store = .table` and a REGISTERED `beforeAuthSuccess` hook, so the Playwright
 //! suite can exercise (a) the hook firing/aborting on the LEGACY login routes — including
 //! the _superusers admin-SPA login — and (b) the per-device session REST surface.
 //! Kept deliberately tiny: this is a test fixture, not an example (the examples ladder
@@ -24,7 +24,7 @@ fn gateLogin(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!v
 }
 
 pub const App = zigbase.App(.{
-    .session_store = .table,
+    .auth = .{ .session = .{ .store = .table } },
     .beforeAuthSuccess = gateLogin,
     .collections = .{
         .users = .{

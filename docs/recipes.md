@@ -779,14 +779,14 @@ Key behaviours to note:
 ## Recipe: enable magic-link + OTP via config
 
 No route code needed — enable methods in your collection declaration. If you don't
-use WebAuthn or OAuth2, select the exact built-in set with `.auth_methods.builtins`
+use WebAuthn or OAuth2, select the exact built-in set with `.auth.methods.builtins`
 so their code (WebAuthn's CBOR/COSE stack in particular, ~3.2k LOC) never ends up
 in your binary:
 
 ```zig
 // No route code needed — enable methods in your collection declaration:
 zigbase.App(.{
-    .auth_methods = .{ .builtins = .{ .password, .magic_link, .otp } },
+    .auth = .{ .methods = .{ .builtins = .{ .password, .magic_link, .otp } } },
     .collections = .{
         .members = .{ .type = .auth, .auth = .{
             .methods = .{
@@ -884,7 +884,7 @@ const ApiKeyMethod = struct {
 // Register at the app level and enable per collection:
 pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{
-        .auth_methods = .{ApiKeyMethod},
+        .auth = .{ .methods = .{ApiKeyMethod} },
         .collections = .{
             .services = .{ .type = .auth, .auth = .{
                 .methods = .{
@@ -997,9 +997,11 @@ Configure the provider + secret in `App(cfg)`:
 
 ```zig
 pub const app = zigbase.App(.{
-    .captcha = .{
-        .provider = .recaptcha_v3,   // .recaptcha_v2 | .recaptcha_v3 | .hcaptcha | .turnstile
-        .secret   = "6LeXXXXXXXXX",  // server-side site-verify secret
+    .auth = .{
+        .captcha = .{
+            .provider = .recaptcha_v3,   // .recaptcha_v2 | .recaptcha_v3 | .hcaptcha | .turnstile
+            .secret   = "6LeXXXXXXXXX",  // server-side site-verify secret
+        },
     },
     // ...
 });

@@ -538,8 +538,8 @@ Auth endpoints target an auth-type collection (`:col`).
 | POST | `/api/collections/:col/confirm-verification` | Confirm verification with a token. `204` (no body) on success. |
 | POST | `/api/collections/:col/request-password-reset` | Request a password-reset token. `204` (no body). |
 | POST | `/api/collections/:col/confirm-password-reset` | Confirm a reset with a token. `204` (no body) on success. |
-| GET | `/api/collections/:col/auth/sessions` | List the caller's active sessions. `.session_store = .table` only — `404` in `.epoch` mode. |
-| DELETE | `/api/collections/:col/auth/sessions/:sid` | "Log out THIS device". `204` (no body). `.session_store = .table` only — `404` in `.epoch` mode. |
+| GET | `/api/collections/:col/auth/sessions` | List the caller's active sessions. `.auth.session.store = .table` only — `404` in `.epoch` mode. |
+| DELETE | `/api/collections/:col/auth/sessions/:sid` | "Log out THIS device". `204` (no body). `.auth.session.store = .table` only — `404` in `.epoch` mode. |
 | DELETE | `/api/collections/:col/auth/sessions` | "Log out everywhere" — works in both session-store modes. `204` (no body). |
 
 ### auth-with-password

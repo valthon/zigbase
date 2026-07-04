@@ -83,7 +83,7 @@ error.**
 | `routes` | Custom HTTP routes. | always — routing plumbing is core; a route's code is only in your binary because you wrote it. |
 | `onAuth` | Notify-only: fires *after* a session is issued (login / oauth2). | always — auth lifecycle plumbing is core. |
 | `beforeAuthSuccess` | Writable, transactional, abortable hook that runs *before* the session is issued (claim records on first login; veto a login). | always — auth lifecycle plumbing is core. |
-| `auth` | Auth lifecycle hooks: before/after `register`, `logout`, `refresh`, `password-change`. | always — an empty `.auth = .{}` is a documented no-op, not a compiled subsystem. |
+| `auth` | Auth config group: `.hooks` (lifecycle hooks — before/after `register`/`logout`/`refresh`/`password-change`), `.methods` (built-in auth-method set + custom `AuthMethod` types), `.captcha` (`.{ .provider, .secret }`), and `.session` (`.store = .epoch`\|`.table`, `.gc_cron`). See [Auth methods](#auth-methods-pluggable), [CAPTCHA](#captcha-verification-ctxverifycaptcha), and [Revoking sessions](#revoking-sessions-99). | mixed — the hook dispatch is core (empty when unset); a deselected `.methods` built-in, `.captcha`, and `.session = .{ .store = .table }`'s extra store/GC machinery are each *excluded* until configured. |
 | `onFileServe` | Fires before serving a file download (may deny). | always — file-serving plumbing is core. |
 | `onFileUpload` | Fires after a file upload. | always — file-upload plumbing is core. |
 | `onBootstrap` | Lifecycle: after bootstrap. | always — lifecycle dispatch is core. |
@@ -98,18 +98,14 @@ error.**
 | `static_files` | Comptime static-file mode: absent (default flag), `.disabled`, `.{ .dir = "..." }`, `.{ .embedded = ... }`. | always — static serving is core; this key only selects its mode. |
 | `storage` | Storage plugin TYPE (defaults to local-disk storage). | always — you always get a storage plugin, default or custom. |
 | `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). | always — you always get a mailer plugin, default or custom. Together with `.mail`, also enables the built-in `"mail"` job kind (see `.mail` below). |
-| `auth_methods` | Auth method set. Bare tuple = register custom `AuthMethod` TYPES alongside all five built-ins; `.{ .builtins = .{ .password, … }, .custom = .{ … } }` selects the exact built-in set (a deselected built-in — e.g. `.webauthn`, ~3.2k LOC — is excluded from your binary, along with its routes). | excluded — a deselected built-in (its route + implementation) never gets pulled in by Zig's lazy analysis. |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
-| `session_store` | Session-management model: `.epoch` (default, stateless token-epoch revocation, zero extra DB work) or `.table` (server-side `_sessions` store for per-device list/revoke, one extra read per request). See [Revoking sessions](#revoking-sessions-99). | excluded — `.table` mode's extra store/GC machinery compiles in only when selected; `.epoch` (the default) adds nothing. |
-| `session_gc_cron` | Cadence (UTC cron) for the table-mode expired-`_sessions` GC sweep. Default `"0 * * * *"` (hourly). Only valid with `.session_store = .table` — setting it otherwise is a `@compileError`. | excluded — tied 1:1 to `.table` mode; no GC job is installed at all in `.epoch` mode. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
 | `experiments` | Declared A/B/n experiments (variants + weights, optional `.sticky`). See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Experiment` enum when unset. |
 | `features` | Public feature-state projection: `.{ .public_route = "/api/state" }` (custom path) or `.{ .public_route = .disabled }`. Default `"/api/state"` (auto-mounted). | always — the projection route is mounted by default; this key only customizes or disables it. |
 | `onFeatureExposure` | Notify-only hook fired when a declared flag/experiment is resolved for a subject (exposure logging). | excluded — zero-cost when absent: the resolver gates on the dispatch field and never even constructs the event. |
 | `experiment_assignment_ttl` | TTL in **days** for sticky `_experiment_assignments` rows (default `90`). Only valid when a `.sticky` experiment is declared — setting it otherwise is a `@compileError`. | excluded — the sticky-assignment GC sweep installs no job/timer/writer touch unless a `.sticky` experiment is declared. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. | excluded — off by default so production builds carry no codegen weight. |
-| `captcha` | CAPTCHA verification: `.{ .provider = .<provider>, .secret = "..." }`. Powers `ctx.verifyCaptcha`; an empty/absent `.secret` activates the dev-bypass (no network call). | data-only — lowers to a `null` provider + `""` secret when unset; `ctx.verifyCaptcha` is only reachable if you call it. |
 | `realtime` | Realtime broadcast guard: `.{ .canSubscribe = fn }` gates who may subscribe to a custom (non-collection) topic (default: custom topics are public). See [`ctx.realtime()`](#ctxrealtime--broadcast-on-custom-channels). | always — realtime (the WebSocket hub + per-record view-rule reapplication) is core, not optional; this key only adds a guard for custom topics. |
 | `tenancy` | Multi-tenant account scoping: `.{ .enabled = true, .auth_collection = "...", .resolver = ..., .roles = .{...} }`. | excluded — the account-activation endpoints and membership-scoping code exist only when `.tenancy.enabled = true`. |
 | `abilities` | Declarative relationship-based row abilities per collection: `.{ .<col> = .{ .view = <rule>, … } }`. Requires `.tenancy.enabled = true`. | data-only — the composition code is core policy plumbing that always runs; unset just means every collection's ability predicate is `null` (a no-op). |
@@ -914,9 +910,11 @@ Verify a browser-submitted CAPTCHA token against one of four supported providers
 
 ```zig
 pub const app = zigbase.App(.{
-    .captcha = .{
-        .provider = .recaptcha_v3,   // .recaptcha_v2 | .recaptcha_v3 | .hcaptcha | .turnstile
-        .secret   = "6LeXXXXXXXXX",  // server-side site-verify secret
+    .auth = .{
+        .captcha = .{
+            .provider = .recaptcha_v3,   // .recaptcha_v2 | .recaptcha_v3 | .hcaptcha | .turnstile
+            .secret   = "6LeXXXXXXXXX",  // server-side site-verify secret
+        },
     },
     // ...
 });
@@ -957,7 +955,7 @@ fn submitHandler(ctx: *zigbase.Ctx) anyerror!http.Response {
 | `hcaptcha`     | `https://hcaptcha.com/siteverify`                                 |
 | `turnstile`    | `https://challenges.cloudflare.com/turnstile/v0/siteverify`       |
 
-**Dev-bypass:** when `app.captcha_secret` is empty (the default when `.captcha` is not
+**Dev-bypass:** when `app.captcha_secret` is empty (the default when `.auth.captcha` is not
 configured), `ctx.verifyCaptcha` returns `.{.ok = true}` immediately — no network call,
 no live key needed. This lets local development and unit tests work without a real provider.
 A configured-provider-with-empty-secret logs a loud startup warning.
@@ -1469,7 +1467,7 @@ One handler each, registered by the matching config key:
 | --- | --- | --- |
 | `onAuth` | `fn (ev: *zigbase.events.AuthEvent) void` | Notify-only, **after** a session is issued (login / oauth2). |
 | `beforeAuthSuccess` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!void` | Writable + abortable, **before** the session is issued. See [Auth lifecycle](#auth-lifecycle-beforeauthsuccess). |
-| `auth` | struct of `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerror!void` | before/after `register`/`logout`/`refresh`/`password-change`. See [Auth lifecycle hooks](#auth-lifecycle-hooks-register--logout--refresh--password-change). |
+| `auth.hooks` | struct of `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerror!void` | before/after `register`/`logout`/`refresh`/`password-change` (under the `.auth` config group). See [Auth lifecycle hooks](#auth-lifecycle-hooks-register--logout--refresh--password-change). |
 | `onFileServe` | `fn (ev: *zigbase.events.FileEvent) anyerror!void` | Before serving a download; **return an error to deny** (framework → `404`). |
 | `onFileUpload` | `fn (ev: *zigbase.events.FileEvent) void` | After a successful upload. |
 | `onBootstrap` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | After bootstrap. |
@@ -1527,22 +1525,24 @@ own before/after hooks — see below.
 
 ### Auth lifecycle hooks (register / logout / refresh / password-change)
 
-The `.auth` config group adds **before/after** hooks for the surrounding auth lifecycle,
-all following the `beforeAuthSuccess` discipline. Each handler is
+The `.auth.hooks` config group adds **before/after** hooks for the surrounding auth
+lifecycle, all following the `beforeAuthSuccess` discipline. Each handler is
 `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerror!void`; the event
 carries `.collection`, `.record_id`, `.phase`, and a writable `.record` where applicable.
 
 ```zig
 zigbase.App(.{
     .auth = .{
-        .beforeRegister       = gateSignup,    // validate / gate; abort blocks the account
-        .afterRegister        = seedProfile,    // post-create side effects
-        .beforeLogout         = onBeforeLogout,
-        .afterLogout          = onAfterLogout,
-        .beforeRefresh        = onBeforeRefresh,
-        .afterRefresh         = onAfterRefresh,
-        .beforePasswordChange = onBeforePwChange,
-        .afterPasswordChange  = onAfterPwChange,
+        .hooks = .{
+            .beforeRegister       = gateSignup,     // validate / gate; abort blocks the account
+            .afterRegister        = seedProfile,    // post-create side effects
+            .beforeLogout         = onBeforeLogout,
+            .afterLogout          = onAfterLogout,
+            .beforeRefresh        = onBeforeRefresh,
+            .afterRefresh         = onAfterRefresh,
+            .beforePasswordChange = onBeforePwChange,
+            .afterPasswordChange  = onAfterPwChange,
+        },
     },
 });
 ```
@@ -1577,7 +1577,7 @@ Semantics, consistent across phases:
   persisted. For mutations use a `before*` record hook or the writable register phase. (Only
   `before_register` exposes a writable record.)
 - `logout` keeps a no-writer fast path: it only resolves the caller and acquires the writer
-  when an `.auth` hook is actually registered (an empty `.auth = .{}` installs nothing).
+  when an `.auth.hooks` hook is actually registered (an empty `.auth = .{}` or `.auth = .{ .hooks = .{} }` installs nothing).
 - On the `PATCH /records/:id` password-change path, `beforePasswordChange` runs **inside**
   the update transaction, **after** the record's own `beforeUpdate` hooks — so a record hook
   can still veto the write first, and the auth hook sees the already-validated patch.
@@ -1611,10 +1611,18 @@ There are three tiers:
 | Tier | How | When |
 |---|---|---|
 | Built-in | `magic_link`, `otp`, `password`, `webauthn` in `.auth.methods` | Most apps — no Zig code needed |
-| Custom plugin | Register a TYPE in `.auth_methods`; reference by slug in `.auth.methods` | Non-standard verification (corp SSO, API keys, etc.) |
+| Custom plugin | Register a TYPE in the app-level `.auth.methods`; reference by slug in the collection's `.auth.methods` | Non-standard verification (corp SSO, API keys, etc.) |
 | Escape hatch | Custom routes + `ctx.issueSession` / `zigbase.auth` API (see below) | Exotic flows where the two-phase contract doesn't fit |
 
 **Backward compatibility:** an auth collection with no `.auth.methods` config defaults to `password` — existing deployments are unaffected.
+
+> **What lives under `.auth` (comptime) vs env.** The comptime `.auth` config group holds
+> the *structure/behavior* knobs: `.hooks`, `.methods`, `.captcha`, and `.session`
+> (`.store`/`.gc_cron`). The deploy-varying **runtime** auth knobs stay env-configured and are
+> deliberately **not** under `.auth`: token TTLs (`ZIGBASE_AUTH_TOKEN_TTL`), the server-side
+> OAuth `state` store (`ZIGBASE_OAUTH_STATE_*`), cookie security (`ZIGBASE_COOKIE_SECURE` /
+> `--insecure-cookies`), and rate-limiting (`ZIGBASE_RATE_LIMIT_*`). See the env table in the
+> README.
 
 ### Enabling auth methods per collection (`.auth.methods`)
 
@@ -1681,13 +1689,13 @@ The dispatch enforces enablement: a disabled or unknown method slug returns `404
 
 Every built-in `complete` resolves to `{ token }` (`AuthMethodResult`); the session cookies (`zb_auth`/`zb_csrf`) are also set on the response. **Custom methods** can be typed too: a bare-string slug (`.custom = .{"corp-sso"}`) stays on the untyped `Record<string, unknown>` / `unknown` stubs, while the **struct form** declares comptime I/O types the generator reflects into precise TS interfaces (named by the Zig type) — `.{ .slug = "corp-sso", .Initiate = .{ .Input = …, .Output = … }, .Complete = .{ .Input = …, .Output = … } }`. A `void` Input omits the input arg; a `void` Output maps to `Promise<void>`. See [typescript-sdk.md → Typed auth methods](typescript-sdk.md#typed-auth-methods--zbauth).
 
-### Custom `AuthMethod` plugin (`.auth_methods`)
+### Custom `AuthMethod` plugin (app-level `.auth.methods`)
 
-For verification logic that the built-ins don't cover, implement an `AuthMethod` plugin type and register it at the app level:
+For verification logic that the built-ins don't cover, implement an `AuthMethod` plugin type and register it at the app level, under the `.auth` config group:
 
 ```zig
 // App-level registration of custom method TYPES:
-.auth_methods = .{ WebAuthnMethod, CorpSsoMethod },
+.auth = .{ .methods = .{ WebAuthnMethod, CorpSsoMethod } },
 
 // Then reference by slug in a collection's .methods:
 .staff = .{ .type = .auth, .auth = .{
@@ -1698,12 +1706,12 @@ For verification logic that the built-ins don't cover, implement an `AuthMethod`
 **Selecting the built-in set.** The bare-tuple form above always keeps all five built-ins (`.password`, `.magic_link`, `.otp`, `.webauthn`, `.oauth2`) — non-breaking, unchanged from before. To drop built-ins you don't use — WebAuthn's CBOR/COSE stack is the big one at ~3.2k LOC — switch to the named form and list exactly the built-ins you want:
 
 ```zig
-.auth_methods = .{
+.auth = .{ .methods = .{
     .builtins = .{ .password, .otp },   // exactly these two; the other three are never
                                           // analyzed, so their code (and routes) is
                                           // absent from the binary
     .custom = .{ CorpSsoMethod },
-},
+} },
 ```
 
 Omitting `.builtins` keeps all five (equivalent to the bare-tuple form); `.builtins = .{}` drops every built-in and leaves only `.custom`. A deselected built-in's method-specific route group (`webauthn`/`magic_link`/`oauth2`) is dropped too — the flat core auth routes (`auth-with-password`, `auth-refresh`, `auth-logout`, verification, password reset) are always present regardless of the built-in set, since they don't go through the method registry.
@@ -2064,7 +2072,7 @@ fn logout(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 Sessions are stateless JWTs, but they are still **revocable** via a per-auth-record
 **token epoch**. Each `.auth` token embeds the record's `token_epoch`; verification rejects
 a token whose epoch no longer matches the record's current value (fail closed). This is the
-**default** model (`App(.{ .session_store = .epoch })`) and costs **no extra query on either
+**default** model (`App(.{ .auth = .{ .session = .{ .store = .epoch } } })`) and costs **no extra query on either
 the verify hot path or login** — the epoch is folded into the single `tokenKey` SELECT each
 already performs (one extra column, not an extra round-trip).
 
@@ -2087,7 +2095,7 @@ Free-function forms: `zigbase.auth.revokeAllSessions(ctx)` / `refresh(ctx)` / `r
 Back-compat is total: tokens minted before the epoch existed (no claim) and freshly created
 records (NULL column) both read as epoch `0`, so all existing valid tokens keep working.
 
-**Per-device sessions (Variant B, `.session_store = .table`).** Opting into the table model
+**Per-device sessions (Variant B, `.auth.session.store = .table`).** Opting into the table model
 maintains a server-side `_sessions` row per session, enabling a full per-device UI:
 
 | verb (table mode only) | effect |
@@ -2121,8 +2129,8 @@ authenticated request stays one read (no per-request write amplification on the 
 (`_session_gc`) that deletes expired `_sessions` rows (those whose `expires` has passed; NULL =
 never expires) in bounded batches on the writer — no opt-in needed, and **nothing is installed
 in `.epoch` mode** (no job, no timer). The default cadence is **hourly** (`"0 * * * *"`);
-override it with `.session_gc_cron` (UTC, minute-granularity cron syntax), e.g.
-`App(.{ .session_store = .table, .session_gc_cron = "*/30 * * * *" })` for every 30 minutes.
+override it with `.auth.session.gc_cron` (UTC, minute-granularity cron syntax), e.g.
+`App(.{ .auth = .{ .session = .{ .store = .table, .gc_cron = "*/30 * * * *" } } })` for every 30 minutes.
 (Expired rows are inert before collection — verify already rejects them — so GC is housekeeping,
 not a correctness gate.)
 

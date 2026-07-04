@@ -26,8 +26,9 @@ pub const Registry = struct {
 // assembleTypes — comptime list of method TYPES (built-ins ++ consumer types)
 // ---------------------------------------------------------------------------
 
-/// Comptime `[]const type` of auth methods. Three accepted forms for `cfg.auth_methods`:
-///   absent                        → all five built-ins (back-compat)
+/// Comptime `[]const type` of auth methods. The argument is the `.auth.methods` config
+/// VALUE (the caller passes `.{}` when the key is absent). Three accepted forms:
+///   .{ } (empty tuple / absent)   → all five built-ins (back-compat)
 ///   .{ CustomT, ... } (tuple)     → all five built-ins ++ customs (back-compat)
 ///   .{ .builtins = .{ .password, ... }, .custom = .{ CustomT, ... } }
 ///                                 → EXACTLY the named built-ins (in the order given)
@@ -35,20 +36,19 @@ pub const Registry = struct {
 ///                                   .builtins = .{} drops every built-in. R2-4: a
 ///                                   deselected built-in (e.g. .webauthn, ~3.2k LOC)
 ///                                   is never analyzed → absent from the binary.
-pub fn assembleTypes(comptime cfg: anytype) []const type {
+pub fn assembleTypes(comptime methods: anytype) []const type {
     const all_builtins: []const type = &.{ PasswordMethod, MagicLinkMethod, OtpMethod, WebAuthnMethod, OAuth2Method };
-    if (!@hasField(@TypeOf(cfg), "auth_methods")) return all_builtins;
-    const am = cfg.auth_methods;
+    const am = methods;
     const AM = @TypeOf(am);
     const info = @typeInfo(AM);
     if (info != .@"struct")
-        @compileError(".auth_methods must be a tuple of method types or '.{ .builtins = .{ ... }, .custom = .{ ... } }'");
+        @compileError(".auth.methods must be a tuple of method types or '.{ .builtins = .{ ... }, .custom = .{ ... } }'");
 
     if (!info.@"struct".is_tuple) {
         // New named form.
         for (std.meta.fields(AM)) |f| {
             if (!std.mem.eql(u8, f.name, "builtins") and !std.mem.eql(u8, f.name, "custom"))
-                @compileError(".auth_methods: unknown key '." ++ f.name ++ "' (recognized: .builtins, .custom)");
+                @compileError(".auth.methods: unknown key '." ++ f.name ++ "' (recognized: .builtins, .custom)");
         }
         comptime var result: []const type = &.{};
         if (@hasField(AM, "builtins")) {
@@ -61,9 +61,9 @@ pub fn assembleTypes(comptime cfg: anytype) []const type {
                     if (std.mem.eql(u8, name, "otp")) break :blk OtpMethod;
                     if (std.mem.eql(u8, name, "webauthn")) break :blk WebAuthnMethod;
                     if (std.mem.eql(u8, name, "oauth2")) break :blk OAuth2Method;
-                    @compileError(".auth_methods.builtins: unknown built-in '." ++ name ++ "' (expected .password/.magic_link/.otp/.webauthn/.oauth2)");
+                    @compileError(".auth.methods.builtins: unknown built-in '." ++ name ++ "' (expected .password/.magic_link/.otp/.webauthn/.oauth2)");
                 };
-                for (result) |seen| if (seen == T) @compileError(".auth_methods.builtins: duplicate '." ++ name ++ "'");
+                for (result) |seen| if (seen == T) @compileError(".auth.methods.builtins: duplicate '." ++ name ++ "'");
                 result = result ++ &[_]type{T};
             }
         } else {
@@ -143,7 +143,7 @@ pub fn deinit(comptime types: []const type, insts: *Instances(types)) void {
 // ---------------------------------------------------------------------------
 
 test "Registry: built-in methods are found by slug, unknown slug returns null" {
-    // assembleTypes with an empty cfg (no .auth_methods field) → built-in methods
+    // assembleTypes with an empty methods value (absent .auth.methods) → built-in methods
     const types = comptime assembleTypes(.{});
 
     var insts: Instances(types) = undefined;
@@ -176,7 +176,7 @@ test "Registry: built-in methods are found by slug, unknown slug returns null" {
     try std.testing.expect(missing == null);
 }
 
-test "Registry: assembleTypes with no .auth_methods key returns built-in methods" {
+test "Registry: assembleTypes with an empty methods value returns built-in methods" {
     const types = comptime assembleTypes(.{});
     try std.testing.expectEqual(@as(usize, 5), types.len);
     // Type identity must be checked at comptime.
@@ -187,7 +187,7 @@ test "Registry: assembleTypes with no .auth_methods key returns built-in methods
     comptime std.debug.assert(types[4] == OAuth2Method);
 }
 
-test "Registry: assembleTypes with .auth_methods appends custom types" {
+test "Registry: assembleTypes with a bare tuple appends custom types" {
     const FakeMethod = struct {
         pub fn create(_: std.mem.Allocator, _: std.Io, _: anytype) !@This() {
             return .{};
@@ -199,7 +199,7 @@ test "Registry: assembleTypes with .auth_methods appends custom types" {
         const vt = AuthMethod.VTable{ .initiate = undefined, .complete = undefined };
     };
 
-    const types = comptime assembleTypes(.{ .auth_methods = .{FakeMethod} });
+    const types = comptime assembleTypes(.{FakeMethod});
     try std.testing.expectEqual(@as(usize, 6), types.len);
     comptime std.debug.assert(types[0] == PasswordMethod);
     comptime std.debug.assert(types[1] == MagicLinkMethod);
@@ -221,7 +221,7 @@ test "Registry: assembleTypes with .auth_methods appends custom types" {
 }
 
 test "R2-4: assembleTypes .builtins selects an exact subset" {
-    const types = comptime assembleTypes(.{ .auth_methods = .{ .builtins = .{ .password, .otp } } });
+    const types = comptime assembleTypes(.{ .builtins = .{ .password, .otp } });
     try std.testing.expectEqual(@as(usize, 2), types.len);
     comptime std.debug.assert(types[0] == PasswordMethod);
     comptime std.debug.assert(types[1] == OtpMethod);
@@ -238,14 +238,14 @@ test "R2-4: assembleTypes .builtins + .custom composes" {
         pub fn deinit(_: *@This()) void {}
         const vt = AuthMethod.VTable{ .initiate = undefined, .complete = undefined };
     };
-    const types = comptime assembleTypes(.{ .auth_methods = .{ .builtins = .{.webauthn}, .custom = .{FakeMethod} } });
+    const types = comptime assembleTypes(.{ .builtins = .{.webauthn}, .custom = .{FakeMethod} });
     try std.testing.expectEqual(@as(usize, 2), types.len);
     comptime std.debug.assert(types[0] == WebAuthnMethod);
     comptime std.debug.assert(types[1] == FakeMethod);
 }
 
 test "R2-4: legacy bare tuple still means all builtins ++ customs" {
-    // (mirror of the existing ".auth_methods appends custom types" test — keep both green)
-    const types = comptime assembleTypes(.{ .auth_methods = .{} }); // empty tuple
+    // (mirror of the existing bare-tuple custom-append test — keep both green)
+    const types = comptime assembleTypes(.{}); // empty tuple
     try std.testing.expectEqual(@as(usize, 5), types.len);
 }

@@ -62,7 +62,7 @@ export const DATING_BIN =
   process.env.ZIGBASE_TEST_DATING_BINARY || join(REPO_ROOT, "zig-out", "bin", "dating-server");
 /**
  * Absolute path to the auth-round-2 e2e fixture compiled as a server (Task 5:
- * `zig build auth2-server` — `.session_store = .table` + a registered `beforeAuthSuccess`).
+ * `zig build auth2-server` — `.auth.session.store = .table` + a registered `beforeAuthSuccess`).
  * CI supplies a prebuilt one via ZIGBASE_TEST_AUTH2_BINARY; otherwise it is the
  * zig-out path produced by ensureBuilt()'s `zig build auth2-server`.
  */

@@ -388,7 +388,7 @@ fn convertHold(req: *zigbase.Req(ConvertIn)) zigbase.RouteError!std.json.Value {
 }
 
 // ---------------------------------------------------------------------------
-// 4c. Session management (#99). golfsim enables `.session_store = .table`, so every
+// 4c. Session management (#99). golfsim enables `.auth.session.store = .table`, so every
 //     login records a per-DEVICE session row and these routes expose the full surface:
 //       - logout-everywhere  -> ctx.auth().revokeAllSessions()
 //       - sessions (list)    -> ctx.auth().listActiveSessions()
@@ -405,7 +405,7 @@ fn logoutEverywhere(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 }
 
 /// GET /api/golfsim/sessions — "active devices": the caller's unexpired sessions, newest
-/// first, each flagged `is_current`. Requires `.session_store = .table` (else 500). Returns
+/// first, each flagged `is_current`. Requires `.auth.session.store = .table` (else 500). Returns
 /// `{"items":[ {id,created,last_seen,user_agent,ip,is_current}, ... ]}`.
 fn activeDevices(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     const sessions = req.ctx.auth().listActiveSessions() catch return error.RouteFailed;
@@ -428,7 +428,7 @@ fn activeDevices(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 
 /// POST /api/golfsim/sessions/:id/revoke — "log out this device": revoke ONE session by id.
 /// OWNER-AUTHORIZED — a caller may revoke only a session they own; a non-owner or absent id
-/// is indistinguishable (404). Requires `.session_store = .table`.
+/// is indistinguishable (404). Requires `.auth.session.store = .table`.
 const RevokeOut = struct { revoked: bool };
 fn revokeDevice(req: *zigbase.Req(void)) zigbase.RouteError!RevokeOut {
     const id = req.param("id") orelse return req.fail(400, "Missing session id.");
@@ -818,13 +818,17 @@ pub const App = zigbase.App(.{
         },
         // #80: increment a per-user login counter on every successful login, transactionally with the session.
         .beforeAuthSuccess = bumpLoginCount,
-        // #98: auth lifecycle hooks. Seed loginCount=0 on registration (in the create txn).
-        .auth = .{ .beforeRegister = seedNewUser },
-        // Per-device sessions (#99): every login records a row in the internal `_sessions`
-        // table, enabling the `listActiveSessions` / `revoke(id)` per-device surface below
-        // (and installing the periodic session-GC sweep). The default `.epoch` mode keeps
-        // only a token-epoch counter and has no per-session inventory.
-        .session_store = .table,
+        // Auth config group (E3): lifecycle hooks + session model live under one `.auth` key.
+        // #98: seed loginCount=0 on registration (in the create txn).
+        // #99 per-device sessions (`.session = .{ .store = .table }`): every login records a
+        // row in the internal `_sessions` table, enabling the `listActiveSessions` /
+        // `revoke(id)` per-device surface below (and installing the periodic session-GC
+        // sweep). The default `.epoch` mode keeps only a token-epoch counter and has no
+        // per-session inventory.
+        .auth = .{
+            .hooks = .{ .beforeRegister = seedNewUser },
+            .session = .{ .store = .table },
+        },
         // Seed mutable config (the booking webhook URL) from the environment into KV at boot.
         .onBootstrap = seedConfig,
         // Declared feature flags (#88/#128): only DECLARED flags resolve. `bookings_frozen`

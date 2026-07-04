@@ -164,7 +164,7 @@ await zb.collection("users").update(userId, { password: "new-secret", oldPasswor
 ### Sessions (`listSessions` / `revokeSession` / `revokeAllSessions`)
 
 *Requires ZigBase >= 0.10.0. `listSessions`/`revokeSession` additionally require the
-server to run `App(.{ .session_store = .table })` — the default `.epoch` mode has no
+server to run `App(.{ .auth = .{ .session = .{ .store = .table } } })` — the default `.epoch` mode has no
 per-device state to list, and the call surfaces the server's `404` as a standard
 `ClientResponseError`/`ZigbaseError`.*
 
@@ -1128,7 +1128,7 @@ but two wire shapes were fixed for consistency and only exist as of 0.10.0:
 | native `in` where-DSL | 400 parse error | works | works |
 | `senders.*` (`{items}` envelope) | 404 | shape mismatch (bare array) — do not use | works |
 | `subscribeTopic("__features")` feature-change signals | nothing delivered | nothing delivered (old `features.changed` frame is dropped) | works |
-| `listSessions` / `revokeSession` / `revokeAllSessions` | 404 | 404 | works (`listSessions`/`revokeSession` additionally require server `.session_store = .table`, else 404) |
+| `listSessions` / `revokeSession` / `revokeAllSessions` | 404 | 404 | works (`listSessions`/`revokeSession` additionally require server `.auth.session.store = .table`, else 404) |
 | client 0.2.x against >= 0.9.0 / 0.10.0 | — | works | works (it never consumed the two changed wire shapes) |
 
 The behavior change against **old** servers is the where-DSL `in` operator switching to native

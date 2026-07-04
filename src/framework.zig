@@ -330,18 +330,64 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "auth_methods", "session_store", "session_gc_cron", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "captcha", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
                 break :blk2 s;
             };
+            // Keys that moved under the `.auth` group (E3). Detected BEFORE the generic
+            // unknown-key error so a consumer on the old spelling gets a pointed migration
+            // message naming the new location instead of a bare "unknown field".
+            const moved = .{
+                .{ "auth_methods", ".auth = .{ .methods = ... }" },
+                .{ "captcha", ".auth = .{ .captcha = ... }" },
+                .{ "session_store", ".auth = .{ .session = .{ .store = ... } }" },
+                .{ "session_gc_cron", ".auth = .{ .session = .{ .gc_cron = ... } }" },
+            };
             for (std.meta.fields(@TypeOf(cfg))) |f| {
+                for (moved) |mv| {
+                    if (std.mem.eql(u8, f.name, mv[0]))
+                        @compileError("'." ++ mv[0] ++ "' moved in the auth config grouping: use '" ++ mv[1] ++ "'");
+                }
                 var ok = false;
                 for (allowed) |name| {
                     if (std.mem.eql(u8, f.name, name)) ok = true;
                 }
                 if (!ok) @compileError("unknown App cfg field '" ++ f.name ++ "'; expected one of " ++ allowed_list);
+            }
+            // Validate the `.auth` group's own sub-keys (E3): only `hooks`/`methods`/
+            // `captcha`/`session`. A field named like an old FLAT lifecycle hook (the
+            // pre-grouping spelling `.auth = .{ .beforeRegister = fn }`) gets a pointed
+            // "moved under .auth.hooks" message; anything else is a loud unknown-key error.
+            if (@hasField(@TypeOf(cfg), "auth")) {
+                const AuthT = @TypeOf(cfg.auth);
+                if (@typeInfo(AuthT) != .@"struct")
+                    @compileError(".auth must be a config group struct: .auth = .{ .hooks = ..., .methods = ..., .captcha = ..., .session = ... }");
+                const hook_names = .{ "beforeRegister", "afterRegister", "beforeLogout", "afterLogout", "beforeRefresh", "afterRefresh", "beforePasswordChange", "afterPasswordChange" };
+                for (std.meta.fields(AuthT)) |f| {
+                    for (hook_names) |hn| {
+                        if (std.mem.eql(u8, f.name, hn))
+                            @compileError(".auth hook groups moved under .auth.hooks = .{ ... } (e.g. .auth = .{ .hooks = .{ ." ++ hn ++ " = fn } })");
+                    }
+                    const sub_ok = std.mem.eql(u8, f.name, "hooks") or std.mem.eql(u8, f.name, "methods") or
+                        std.mem.eql(u8, f.name, "captcha") or std.mem.eql(u8, f.name, "session");
+                    if (!sub_ok) @compileError(".auth: unknown key '." ++ f.name ++ "' (recognized: .hooks, .methods, .captcha, .session)");
+                }
+                if (@hasField(AuthT, "hooks")) {
+                    const HT = @TypeOf(cfg.auth.hooks);
+                    if (@typeInfo(HT) != .@"struct")
+                        @compileError(".auth.hooks must be a struct of lifecycle hook functions: .hooks = .{ .beforeRegister = fn, ... }");
+                }
+                if (@hasField(AuthT, "session")) {
+                    const ST = @TypeOf(cfg.auth.session);
+                    if (@typeInfo(ST) != .@"struct")
+                        @compileError(".auth.session must be a struct: .session = .{ .store = .epoch|.table, .gc_cron = \"...\" }");
+                    for (std.meta.fields(ST)) |sf| {
+                        if (!std.mem.eql(u8, sf.name, "store") and !std.mem.eql(u8, sf.name, "gc_cron"))
+                            @compileError(".auth.session: unknown key '." ++ sf.name ++ "' (recognized: .store, .gc_cron)");
+                    }
+                }
             }
             var d = events.Dispatch{};
             if (@hasField(@TypeOf(cfg), "hooks")) d.record = events.buildRecordDispatcher(cfg.hooks);
@@ -349,11 +395,12 @@ pub fn App(comptime cfg: anytype) type {
             if (@hasField(@TypeOf(cfg), "routes")) d.routes = events.buildRoutes(cfg.routes);
             if (@hasField(@TypeOf(cfg), "onAuth")) d.on_auth = cfg.onAuth;
             if (@hasField(@TypeOf(cfg), "beforeAuthSuccess")) d.before_auth_success = cfg.beforeAuthSuccess;
-            // Only install the lifecycle dispatcher when the `.auth` group has ≥1 hook — an
-            // empty `.auth = .{}` must NOT make `hasAuthLifecycle()` true (that would force
-            // authLogout onto the writer+authenticate path for nothing).
-            if (@hasField(@TypeOf(cfg), "auth") and std.meta.fields(@TypeOf(cfg.auth)).len > 0)
-                d.auth_lifecycle = events.buildAuthLifecycleDispatcher(cfg.auth);
+            // Only install the lifecycle dispatcher when `.auth.hooks` has ≥1 hook — an
+            // empty (or hook-less) `.auth = .{}` must NOT make `hasAuthLifecycle()` true
+            // (that would force authLogout onto the writer+authenticate path for nothing).
+            if (@hasField(@TypeOf(cfg), "auth") and @hasField(@TypeOf(cfg.auth), "hooks") and
+                std.meta.fields(@TypeOf(cfg.auth.hooks)).len > 0)
+                d.auth_lifecycle = events.buildAuthLifecycleDispatcher(cfg.auth.hooks);
             if (@hasField(@TypeOf(cfg), "onFileServe")) d.on_file_serve = cfg.onFileServe;
             if (@hasField(@TypeOf(cfg), "onFileUpload")) d.on_file_upload = cfg.onFileUpload;
             if (@hasField(@TypeOf(cfg), "onBootstrap")) d.on_bootstrap = cfg.onBootstrap;
@@ -673,30 +720,50 @@ pub fn App(comptime cfg: anytype) type {
         /// stateless tokens). `@compileError`s on an unknown sub-field or both modes disabled.
         pub const pagination_config: pagination.Config = pagination.resolve(cfg);
 
-        /// Comptime session-management model resolved from `.session_store` (#99). Defaults
+        // ── The `.auth` config group (E3) ─────────────────────────────────────
+        // All auth config lives under one `.auth = .{ .hooks, .methods, .captcha,
+        // .session }` key. These private accessors resolve each sub-group (or its
+        // empty-struct default when absent) so the lowerings below read one place.
+
+        /// The `.auth.session` sub-group (`.{ .store, .gc_cron }`) or `.{}` when absent.
+        const auth_session_cfg = if (@hasField(@TypeOf(cfg), "auth") and @hasField(@TypeOf(cfg.auth), "session"))
+            cfg.auth.session
+        else
+            .{};
+
+        /// The `.auth.methods` sub-group (tuple or `.{ .builtins, .custom }`) or `.{}` when absent.
+        const auth_methods_cfg = if (@hasField(@TypeOf(cfg), "auth") and @hasField(@TypeOf(cfg.auth), "methods"))
+            cfg.auth.methods
+        else
+            .{};
+
+        /// True when `.auth.captcha` is configured.
+        const has_captcha = @hasField(@TypeOf(cfg), "auth") and @hasField(@TypeOf(cfg.auth), "captcha");
+
+        /// Comptime session-management model resolved from `.auth.session.store` (#99). Defaults
         /// to `.epoch` (stateless token-epoch revocation). `.table` opts into the server-side
         /// `_sessions` store for per-device list/revoke (DESIGNED-but-STUBBED). An unknown
         /// value is a `@compileError`.
         pub const session_store_config: app_mod.SessionStore = blk: {
-            if (!@hasField(@TypeOf(cfg), "session_store")) break :blk .epoch;
-            const ss = cfg.session_store;
+            if (!@hasField(@TypeOf(auth_session_cfg), "store")) break :blk .epoch;
+            const ss = auth_session_cfg.store;
             if (@TypeOf(ss) != @TypeOf(.enum_literal))
-                @compileError("session_store: expected the enum literal .epoch or .table");
+                @compileError(".auth.session.store: expected the enum literal .epoch or .table");
             if (std.mem.eql(u8, @tagName(ss), "epoch")) break :blk .epoch;
             if (std.mem.eql(u8, @tagName(ss), "table")) break :blk .table;
-            @compileError("session_store: unknown value '." ++ @tagName(ss) ++ "'; expected .epoch or .table");
+            @compileError(".auth.session.store: unknown value '." ++ @tagName(ss) ++ "'; expected .epoch or .table");
         };
 
         /// Cadence (UTC, minute-granularity cron) for the table-mode expired-`_sessions` GC
-        /// sweep (#114). Default hourly; override with `.session_gc_cron = "..."`. Only consumed
-        /// when `.session_store == .table` (otherwise no GC job is installed at all).
+        /// sweep (#114). Default hourly; override with `.auth.session.gc_cron = "..."`. Only
+        /// consumed when `.auth.session.store == .table` (otherwise no GC job is installed).
         pub const session_gc_cron: []const u8 = blk: {
             // Fail loudly on misuse: setting the cadence without enabling the table store is a
             // silent no-op otherwise (the GC job is only installed in table mode). Only triggers
             // when the user EXPLICITLY set the key — the default-unset case stays fine.
-            if (@hasField(@TypeOf(cfg), "session_gc_cron") and session_store_config != .table)
-                @compileError("session_gc_cron has no effect without session_store = .table");
-            break :blk if (@hasField(@TypeOf(cfg), "session_gc_cron")) cfg.session_gc_cron else "0 * * * *";
+            if (@hasField(@TypeOf(auth_session_cfg), "gc_cron") and session_store_config != .table)
+                @compileError(".auth.session.gc_cron has no effect without .auth.session.store = .table");
+            break :blk if (@hasField(@TypeOf(auth_session_cfg), "gc_cron")) auth_session_cfg.gc_cron else "0 * * * *";
         };
 
         /// Comptime-selected mailer plugin type (defaults to `DefaultMailerPlugin`).
@@ -708,12 +775,12 @@ pub fn App(comptime cfg: anytype) type {
         };
 
         /// Comptime-assembled list of auth method TYPES (built-ins ++ consumer types from
-        /// `.auth_methods`). Each type in the list is validated against the auth-method
+        /// `.auth.methods`). Each type in the list is validated against the auth-method
         /// contract (create/method/deinit) at compile time. Used in serveImpl to
         /// instantiate the Registry stack vars.
         pub const auth_method_types: []const type = blk: {
             const am = @import("auth/method.zig");
-            const types = registry.assembleTypes(cfg);
+            const types = registry.assembleTypes(auth_methods_cfg);
             // Validate every method type (built-ins AND consumer types) against the
             // contract, mirroring how assertPluginContract always runs on storage/mailer
             // — so a broken built-in can't silently escape comptime validation either.
@@ -1007,19 +1074,19 @@ pub fn App(comptime cfg: anytype) type {
         };
 
         // ── CAPTCHA (#140 PR6) ────────────────────────────────────────────────
-        // Lower `.captcha = .{ .provider = .<provider>, .secret = "..." }` into the
-        // serve opts. The only required sub-key is `.provider`; `.secret` defaults to
-        // `""` which activates the dev-bypass in `ctx.verifyCaptcha`. Unknown sub-keys
-        // are a `@compileError` (mirror the `.features` guard). The `"captcha"` key
-        // in `allowed` (above) lets the guard accept it; here we do the actual lowering.
+        // Lower `.auth.captcha = .{ .provider = .<provider>, .secret = "..." }` into
+        // the serve opts. The only required sub-key is `.provider`; `.secret` defaults
+        // to `""` which activates the dev-bypass in `ctx.verifyCaptcha`. Unknown sub-keys
+        // are a `@compileError` (mirror the `.features` guard). `has_captcha` (above) is
+        // true when the group is configured; here we do the actual lowering.
 
-        /// The comptime-lowered CAPTCHA provider (null when `.captcha` is absent).
+        /// The comptime-lowered CAPTCHA provider (null when `.auth.captcha` is absent).
         pub const captcha_provider: ?captcha.Provider = blk: {
-            if (!@hasField(@TypeOf(cfg), "captcha")) break :blk null;
-            const cc = cfg.captcha;
+            if (!has_captcha) break :blk null;
+            const cc = cfg.auth.captcha;
             const CT = @TypeOf(cc);
             if (@typeInfo(CT) != .@"struct")
-                @compileError(".captcha must be a struct, e.g. '.captcha = .{ .provider = .recaptcha_v3, .secret = \"...\" }'");
+                @compileError(".auth.captcha must be a struct, e.g. '.auth = .{ .captcha = .{ .provider = .recaptcha_v3, .secret = \"...\" } }'");
             for (std.meta.fields(CT)) |f| {
                 const ok = blk2: {
                     for (.{ "provider", "secret" }) |k| {
@@ -1027,17 +1094,17 @@ pub fn App(comptime cfg: anytype) type {
                     }
                     break :blk2 false;
                 };
-                if (!ok) @compileError(".captcha: unknown key '." ++ f.name ++ "' (recognized: .provider, .secret)");
+                if (!ok) @compileError(".auth.captcha: unknown key '." ++ f.name ++ "' (recognized: .provider, .secret)");
             }
             if (!@hasField(CT, "provider"))
-                @compileError(".captcha: missing required key .provider — set e.g. .provider = .recaptcha_v3");
+                @compileError(".auth.captcha: missing required key .provider — set e.g. .provider = .recaptcha_v3");
             break :blk cc.provider;
         };
 
         /// The comptime-lowered CAPTCHA secret (`""` = dev-bypass, no network call).
         pub const captcha_secret: []const u8 = blk: {
-            if (!@hasField(@TypeOf(cfg), "captcha")) break :blk "";
-            const cc = cfg.captcha;
+            if (!has_captcha) break :blk "";
+            const cc = cfg.auth.captcha;
             const CT = @TypeOf(cc);
             if (@typeInfo(CT) != .@"struct") break :blk "";
             break :blk if (@hasField(CT, "secret")) cc.secret else "";
@@ -2433,12 +2500,14 @@ test "R2-5: mail/webhook kind names stay reserved even when unregistered" {
     try std.testing.expect(true);
 }
 
-test "App(cfg) installs the auth-lifecycle dispatcher only for a non-empty .auth group" {
+test "App(cfg) installs the auth-lifecycle dispatcher only for a non-empty .auth.hooks group" {
     // No `.auth` at all → null (logout keeps its no-writer fast path).
     try std.testing.expect(App(.{}).dispatch.auth_lifecycle == null);
-    // Empty `.auth = .{}` → still null: an empty group must NOT force authLogout onto the
-    // writer+authenticate path (the #98 fast-path regression this guards against).
+    // Empty `.auth = .{}` and hook-less `.auth = .{ .hooks = .{} }` → still null: an empty
+    // group must NOT force authLogout onto the writer+authenticate path (the #98 fast-path
+    // regression this guards against).
     try std.testing.expect(App(.{ .auth = .{} }).dispatch.auth_lifecycle == null);
+    try std.testing.expect(App(.{ .auth = .{ .hooks = .{} } }).dispatch.auth_lifecycle == null);
     // A registered hook → installed.
     const H = struct {
         fn h(ctx: *@import("ctx.zig").Ctx, ev: *@import("events.zig").AuthLifecycleEvent) anyerror!void {
@@ -2446,7 +2515,27 @@ test "App(cfg) installs the auth-lifecycle dispatcher only for a non-empty .auth
             _ = ev;
         }
     };
-    try std.testing.expect(App(.{ .auth = .{ .beforeLogout = H.h } }).dispatch.auth_lifecycle != null);
+    try std.testing.expect(App(.{ .auth = .{ .hooks = .{ .beforeLogout = H.h } } }).dispatch.auth_lifecycle != null);
+}
+
+test "E3: grouped .auth lowers hooks/methods/captcha/session" {
+    const H = struct {
+        fn onBeforeRegister(ctx: *@import("ctx.zig").Ctx, ev: *@import("events.zig").AuthLifecycleEvent) anyerror!void {
+            _ = ctx;
+            _ = ev;
+        }
+    };
+    const A = App(.{ .auth = .{
+        .hooks = .{ .beforeRegister = H.onBeforeRegister },
+        .methods = .{ .builtins = .{ .password, .otp } },
+        .captcha = .{ .provider = .recaptcha_v3 },
+        .session = .{ .store = .table, .gc_cron = "30 * * * *" },
+    } });
+    try std.testing.expect(A.dispatch.auth_lifecycle != null);
+    try std.testing.expectEqual(@as(usize, 2), A.auth_method_types.len);
+    try std.testing.expectEqual(app_mod.SessionStore.table, A.session_store_config);
+    try std.testing.expectEqualStrings("30 * * * *", A.session_gc_cron);
+    try std.testing.expect(A.captcha_provider != null);
 }
 
 test "App(cfg) wires the realtime canSubscribe guard onto dispatch (#143)" {
@@ -2743,7 +2832,7 @@ test "App(cfg) route_gates: analytics/senders/mail_webhook/tenancy follow their 
 }
 
 test "R2-4: deselecting a built-in drops its method-specific routes" {
-    const A = App(.{ .auth_methods = .{ .builtins = .{.password} } });
+    const A = App(.{ .auth = .{ .methods = .{ .builtins = .{.password} } } });
     try std.testing.expect(!A.route_gates.webauthn);
     try std.testing.expect(!A.route_gates.magic_link);
     try std.testing.expect(!A.route_gates.oauth2);
@@ -2783,21 +2872,21 @@ test "App(cfg) lowers the comptime .abilities config onto the matching collectio
         try std.testing.expect(c.options.abilities == null);
 }
 
-test "App(cfg) resolves the comptime session_store config (#99; defaults to .epoch)" {
+test "App(cfg) resolves the comptime .auth.session.store config (#99; defaults to .epoch)" {
     try std.testing.expectEqual(app_mod.SessionStore.epoch, App(.{}).session_store_config);
-    try std.testing.expectEqual(app_mod.SessionStore.epoch, App(.{ .session_store = .epoch }).session_store_config);
-    try std.testing.expectEqual(app_mod.SessionStore.table, App(.{ .session_store = .table }).session_store_config);
+    try std.testing.expectEqual(app_mod.SessionStore.epoch, App(.{ .auth = .{ .session = .{ .store = .epoch } } }).session_store_config);
+    try std.testing.expectEqual(app_mod.SessionStore.table, App(.{ .auth = .{ .session = .{ .store = .table } } }).session_store_config);
 }
 
 test "#114 session-GC job installs in table mode only (absent in epoch); cadence overridable" {
     // Epoch (default): no `_session_gc` job is installed at all — zero-overhead guarantee.
     for (App(.{}).jobs) |j| try std.testing.expect(!std.mem.eql(u8, j.name, "_session_gc"));
-    for (App(.{ .session_store = .epoch }).jobs) |j| try std.testing.expect(!std.mem.eql(u8, j.name, "_session_gc"));
+    for (App(.{ .auth = .{ .session = .{ .store = .epoch } } }).jobs) |j| try std.testing.expect(!std.mem.eql(u8, j.name, "_session_gc"));
 
     // Table mode: exactly one `_session_gc` job with the default hourly cron.
     {
         var found = false;
-        for (App(.{ .session_store = .table }).jobs) |j| if (std.mem.eql(u8, j.name, "_session_gc")) {
+        for (App(.{ .auth = .{ .session = .{ .store = .table } } }).jobs) |j| if (std.mem.eql(u8, j.name, "_session_gc")) {
             found = true;
             try std.testing.expect(j.schedule == .cron);
             try std.testing.expectEqualStrings("0 * * * *", j.schedule.cron);
@@ -2805,14 +2894,14 @@ test "#114 session-GC job installs in table mode only (absent in epoch); cadence
         try std.testing.expect(found);
     }
 
-    // `.session_gc_cron` overrides the cadence.
-    for (App(.{ .session_store = .table, .session_gc_cron = "*/30 * * * *" }).jobs) |j|
+    // `.auth.session.gc_cron` overrides the cadence.
+    for (App(.{ .auth = .{ .session = .{ .store = .table, .gc_cron = "*/30 * * * *" } } }).jobs) |j|
         if (std.mem.eql(u8, j.name, "_session_gc")) try std.testing.expectEqualStrings("*/30 * * * *", j.schedule.cron);
 
-    // Valid combinations compile (the misuse case — session_gc_cron without table — is a
+    // Valid combinations compile (the misuse case — gc_cron without table — is a
     // @compileError, which can't be unit-tested): default-unset epoch + table-with-override.
     try std.testing.expectEqualStrings("0 * * * *", App(.{}).session_gc_cron);
-    try std.testing.expectEqualStrings("*/30 * * * *", App(.{ .session_store = .table, .session_gc_cron = "*/30 * * * *" }).session_gc_cron);
+    try std.testing.expectEqualStrings("*/30 * * * *", App(.{ .auth = .{ .session = .{ .store = .table, .gc_cron = "*/30 * * * *" } } }).session_gc_cron);
 }
 
 test "#129 experiment-GC job installs only when a .sticky experiment is declared" {

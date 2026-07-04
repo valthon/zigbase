@@ -92,7 +92,7 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 | `GET` | `/api/listings/:id/availability` | authed | Returns all non-cancelled bookings for a listing for availability calendar rendering. Reads via `req.ctx.records()`. |
 | `POST` | `/api/holds/:id/convert` | authed | Promotes the caller's `hold` into a pending `booking` for a chosen window. Runs the booking-create + hold-delete **atomically in one `ctx.tx()`**. 403 if caller is not the hold's guest. |
 | `POST` | `/api/golfsim/logout-everywhere` | authed | "Log out everywhere" via `ctx.auth().revokeAllSessions()` — bumps the token epoch and (in table mode) wipes the principal's session rows; also clears this device's cookies. |
-| `GET` | `/api/golfsim/sessions` | authed | "Active devices": `ctx.auth().listActiveSessions()` → `{"items":[…]}`, each session flagged `is_current`. Requires `.session_store = .table`. |
+| `GET` | `/api/golfsim/sessions` | authed | "Active devices": `ctx.auth().listActiveSessions()` → `{"items":[…]}`, each session flagged `is_current`. Requires `.auth.session.store = .table`. |
 | `POST` | `/api/golfsim/sessions/:id/revoke` | authed | "Log out this device": `ctx.auth().revoke(id)`. Owner-authorized — a non-owner or absent id is `404`. |
 | `GET` | `/api/golfsim/health` | public | Smoke endpoint. |
 | `GET` | `/api/golfsim/flags/:name` | public | Public read of one declared feature flag via `ctx.flagByName` → `{"name","enabled"}` (404 for an undeclared name). Manage values with the superuser settings API or `App.setFlag`. |
@@ -207,9 +207,9 @@ lifetime and releases any lazily-acquired connection on exit.
 
 ---
 
-### 7. Per-device session management (`.session_store = .table`)
+### 7. Per-device session management (`.auth.session.store = .table`)
 
-golfsim opts into **per-device sessions** with `App(.{ ..., .session_store = .table })`.
+golfsim opts into **per-device sessions** with `App(.{ ..., .auth = .{ .session = .{ .store = .table } } })`.
 Each login records a row in the internal `_sessions` table (the default `.epoch` mode
 keeps only a token-epoch counter and has no per-session inventory), and the framework
 installs a periodic session-GC sweep. The three routes expose the full `ctx.auth()`
@@ -532,7 +532,7 @@ To test locally:
   (0.10.0) this hook also fires on the legacy `/auth-with-password` and `/auth-refresh`
   endpoints, so `ev.method` can be `.password`, `.refresh`, or any other enabled method —
   one hook covers every session-issuing path.
-- **`.auth.beforeRegister` / `seedNewUser`** — runs inside the account-create
+- **`.auth.hooks.beforeRegister` / `seedNewUser`** — runs inside the account-create
   transaction before the row is inserted. Seeds `loginCount = 0` so the field is
   initialized at signup rather than only on the first login. Returning an error aborts
   registration entirely (the canonical hook for gating sign-ups).

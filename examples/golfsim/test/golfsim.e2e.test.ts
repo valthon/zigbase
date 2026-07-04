@@ -77,7 +77,7 @@ describe("golfsim generated client (live golfsim server)", () => {
   });
 
   /**
-   * Session management (#99). golfsim enables `.session_store = .table`, so each login
+   * Session management (#99). golfsim enables `.auth.session.store = .table`, so each login
    * records a per-device session row. This exercises the full surface:
    *   - GET  /api/golfsim/sessions            -> ctx.auth().listActiveSessions()
    *   - POST /api/golfsim/sessions/:id/revoke -> ctx.auth().revoke(id)  (owner-only)

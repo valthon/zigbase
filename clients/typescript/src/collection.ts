@@ -54,7 +54,7 @@ export interface RecordAbilities {
   delete: boolean;
 }
 
-/** One active server-side session row (server `.session_store = .table` only). */
+/** One active server-side session row (server `.auth.session.store = .table` only). */
 export interface SessionInfo {
   id: string;
   created: string;
@@ -177,7 +177,7 @@ export class CollectionService {
 
   /**
    * GET /api/collections/:col/auth/sessions — the caller's active sessions, newest first
-   * (requires the server to run `.session_store = .table`; the default `.epoch` mode
+   * (requires the server to run `.auth.session.store = .table`; the default `.epoch` mode
    * answers 404, surfaced as a standard ZigbaseError).
    */
   async listSessions(opts: { signal?: AbortSignal; requestKey?: string } = {}): Promise<SessionInfo[]> {

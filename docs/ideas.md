@@ -234,7 +234,7 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   (`GET`/`DELETE /api/collections/:col/auth/sessions[/:sid]`), and the TypeScript SDK
   (`listSessions`/`revokeSession`/`revokeAllSessions`) all ship. The default `session_store`
   is **still `.epoch`** (stateless, zero extra DB work) — per-device list/revoke requires
-  opting into `.session_store = .table` (one extra read per authenticated request). See
+  opting into `.auth.session.store = .table` (one extra read per authenticated request). See
   [framework.md → Revoking sessions](framework.md#ctxauth--session-management) and
   [typescript-sdk.md → Sessions](typescript-sdk.md#sessions-listsessions--revokesession--revokeallsessions).
 
