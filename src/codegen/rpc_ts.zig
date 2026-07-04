@@ -202,8 +202,12 @@ test "isRepresentable rejects unsupported" {
 }
 
 test "renderNamedDecls rejects two distinct types sharing a TS name" {
-    const NsA = struct { const Status = struct { a: i32 }; };
-    const NsB = struct { const Status = struct { b: bool }; };
+    const NsA = struct {
+        const Status = struct { a: i32 };
+    };
+    const NsB = struct {
+        const Status = struct { b: bool };
+    };
     const Container = struct { x: NsA.Status, y: NsB.Status };
     const a = std.testing.allocator;
     var w: std.ArrayList(u8) = .empty;

@@ -2743,7 +2743,7 @@ test "App(cfg) route_gates: analytics/senders/mail_webhook/tenancy follow their 
 }
 
 test "R2-4: deselecting a built-in drops its method-specific routes" {
-    const A = App(.{ .auth_methods = .{ .builtins = .{ .password } } });
+    const A = App(.{ .auth_methods = .{ .builtins = .{.password} } });
     try std.testing.expect(!A.route_gates.webauthn);
     try std.testing.expect(!A.route_gates.magic_link);
     try std.testing.expect(!A.route_gates.oauth2);

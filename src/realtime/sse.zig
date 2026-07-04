@@ -139,7 +139,6 @@ pub fn markClosedAndRelease(sc: *SseConn) void {
 }
 
 /// ---- uplink (POST /api/realtime/sse/:clientId) ------------------------------
-
 pub const Reply = struct { status: u16, frame: []const u8 };
 
 /// Run one uplink verb against a pinned conn (zap worker thread — the out-of-band path the

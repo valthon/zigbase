@@ -11,7 +11,18 @@ pub const NumberMode = enum { float, int, fixed };
 pub const fts_suffix = "_fts";
 
 pub const FieldType = enum {
-    text, email, url, editor, date, autodate, @"bool", number, json, select, relation, file,
+    text,
+    email,
+    url,
+    editor,
+    date,
+    autodate,
+    bool,
+    number,
+    json,
+    select,
+    relation,
+    file,
 };
 
 pub const FieldOptions = union(FieldType) {
@@ -21,7 +32,7 @@ pub const FieldOptions = union(FieldType) {
     editor: struct {},
     date: struct { min: ?[]const u8 = null, max: ?[]const u8 = null },
     autodate: struct { onCreate: bool = true, onUpdate: bool = false },
-    @"bool": struct {},
+    bool: struct {},
     number: struct { mode: NumberMode = .float, scale: ?u8 = null, min: ?f64 = null, max: ?f64 = null },
     json: struct { maxSize: ?u32 = null },
     select: struct { values: []const []const u8, maxSelect: u32 = 1 },
@@ -59,7 +70,7 @@ pub const Field = struct {
     /// bound as i64) is integer or text per below.
     pub fn storageClass(self: Field) dialect.StorageClass {
         return switch (self.options) {
-            .@"bool" => .integer,
+            .bool => .integer,
             .number => |n| if (n.mode == .float) .real else .integer,
             else => .text,
         };
@@ -464,19 +475,35 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
                 if (it != .object) continue;
                 const o = it.object;
                 var p = OAuth2Provider{ .name = "" };
-                if (o.get("name")) |x| if (x == .string) { p.name = try alloc.dupe(u8, x.string); };
-                if (o.get("clientId")) |x| if (x == .string) { p.clientId = try alloc.dupe(u8, x.string); };
-                if (o.get("clientSecret")) |x| if (x == .string) { p.clientSecret = try alloc.dupe(u8, x.string); };
-                if (o.get("enabled")) |x| if (x == .bool) { p.enabled = x.bool; };
+                if (o.get("name")) |x| if (x == .string) {
+                    p.name = try alloc.dupe(u8, x.string);
+                };
+                if (o.get("clientId")) |x| if (x == .string) {
+                    p.clientId = try alloc.dupe(u8, x.string);
+                };
+                if (o.get("clientSecret")) |x| if (x == .string) {
+                    p.clientSecret = try alloc.dupe(u8, x.string);
+                };
+                if (o.get("enabled")) |x| if (x == .bool) {
+                    p.enabled = x.bool;
+                };
                 if (o.get("redirectUrls")) |x| if (x == .array) {
                     var rl: std.ArrayList([]const u8) = .empty;
                     for (x.array.items) |ru| if (ru == .string) try rl.append(alloc, try alloc.dupe(u8, ru.string));
                     p.redirectUrls = try rl.toOwnedSlice(alloc);
                 };
-                if (o.get("authURL")) |x| if (x == .string) { p.authURL = try alloc.dupe(u8, x.string); };
-                if (o.get("tokenURL")) |x| if (x == .string) { p.tokenURL = try alloc.dupe(u8, x.string); };
-                if (o.get("userinfoURL")) |x| if (x == .string) { p.userinfoURL = try alloc.dupe(u8, x.string); };
-                if (o.get("discoveryURL")) |x| if (x == .string) { p.discoveryURL = try alloc.dupe(u8, x.string); };
+                if (o.get("authURL")) |x| if (x == .string) {
+                    p.authURL = try alloc.dupe(u8, x.string);
+                };
+                if (o.get("tokenURL")) |x| if (x == .string) {
+                    p.tokenURL = try alloc.dupe(u8, x.string);
+                };
+                if (o.get("userinfoURL")) |x| if (x == .string) {
+                    p.userinfoURL = try alloc.dupe(u8, x.string);
+                };
+                if (o.get("discoveryURL")) |x| if (x == .string) {
+                    p.discoveryURL = try alloc.dupe(u8, x.string);
+                };
                 if (o.get("scopes")) |x| if (x == .array) {
                     var sl: std.ArrayList([]const u8) = .empty;
                     for (x.array.items) |sc| if (sc == .string) try sl.append(alloc, try alloc.dupe(u8, sc.string));
@@ -496,10 +523,16 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
         };
         if (mo.get("magic_link")) |mlv| if (mlv == .object) {
             var ml = MagicLinkMethodOpts{};
-            if (mlv.object.get("ttl_s")) |x| if (x == .integer) { ml.ttl_s = x.integer; };
-            if (mlv.object.get("auto_create")) |x| if (x == .bool) { ml.auto_create = x.bool; };
+            if (mlv.object.get("ttl_s")) |x| if (x == .integer) {
+                ml.ttl_s = x.integer;
+            };
+            if (mlv.object.get("auto_create")) |x| if (x == .bool) {
+                ml.auto_create = x.bool;
+            };
             if (mlv.object.get("rate_limit")) |rlv| ml.rate_limit = rateLimitFromJson(rlv);
-            if (mlv.object.get("redirect_default")) |x| if (x == .string) { ml.redirect_default = try alloc.dupe(u8, x.string); };
+            if (mlv.object.get("redirect_default")) |x| if (x == .string) {
+                ml.redirect_default = try alloc.dupe(u8, x.string);
+            };
             if (mlv.object.get("redirect_allow")) |x| if (x == .array) {
                 var list: std.ArrayList([]const u8) = .empty;
                 for (x.array.items) |it| if (it == .string) try list.append(alloc, try alloc.dupe(u8, it.string));
@@ -509,19 +542,35 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
         };
         if (mo.get("otp")) |otpv| if (otpv == .object) {
             var otp = OtpMethodOpts{};
-            if (otpv.object.get("length")) |x| if (x == .integer) { otp.length = std.math.cast(u8, x.integer) orelse 6; };
-            if (otpv.object.get("ttl_s")) |x| if (x == .integer) { otp.ttl_s = x.integer; };
-            if (otpv.object.get("auto_create")) |x| if (x == .bool) { otp.auto_create = x.bool; };
+            if (otpv.object.get("length")) |x| if (x == .integer) {
+                otp.length = std.math.cast(u8, x.integer) orelse 6;
+            };
+            if (otpv.object.get("ttl_s")) |x| if (x == .integer) {
+                otp.ttl_s = x.integer;
+            };
+            if (otpv.object.get("auto_create")) |x| if (x == .bool) {
+                otp.auto_create = x.bool;
+            };
             if (otpv.object.get("rate_limit")) |rlv| otp.rate_limit = rateLimitFromJson(rlv);
             opts.auth.methods.otp = otp;
         };
         if (mo.get("webauthn")) |wav| if (wav == .object) {
             var wa = WebAuthnMethodOpts{};
-            if (wav.object.get("rp_id")) |x| if (x == .string) { wa.rp_id = try alloc.dupe(u8, x.string); };
-            if (wav.object.get("rp_name")) |x| if (x == .string) { wa.rp_name = try alloc.dupe(u8, x.string); };
-            if (wav.object.get("origin")) |x| if (x == .string) { wa.origin = try alloc.dupe(u8, x.string); };
-            if (wav.object.get("credentials_collection")) |x| if (x == .string) { wa.credentials_collection = try alloc.dupe(u8, x.string); };
-            if (wav.object.get("require_uv")) |x| if (x == .bool) { wa.require_uv = x.bool; };
+            if (wav.object.get("rp_id")) |x| if (x == .string) {
+                wa.rp_id = try alloc.dupe(u8, x.string);
+            };
+            if (wav.object.get("rp_name")) |x| if (x == .string) {
+                wa.rp_name = try alloc.dupe(u8, x.string);
+            };
+            if (wav.object.get("origin")) |x| if (x == .string) {
+                wa.origin = try alloc.dupe(u8, x.string);
+            };
+            if (wav.object.get("credentials_collection")) |x| if (x == .string) {
+                wa.credentials_collection = try alloc.dupe(u8, x.string);
+            };
+            if (wav.object.get("require_uv")) |x| if (x == .bool) {
+                wa.require_uv = x.bool;
+            };
             if (wav.object.get("rate_limit")) |rlv| wa.rate_limit = rateLimitFromJson(rlv);
             opts.auth.methods.webauthn = wa;
         };
@@ -599,7 +648,7 @@ pub fn authSystemFields() []const Field {
             .{ .id = "_username", .name = "username", .options = .{ .text = .{} } },
             .{ .id = "_pwhash", .name = "passwordHash", .hidden = true, .options = .{ .text = .{} } },
             .{ .id = "_tokkey", .name = "tokenKey", .hidden = true, .options = .{ .text = .{} } },
-            .{ .id = "_verified", .name = "verified", .options = .{ .@"bool" = .{} } },
+            .{ .id = "_verified", .name = "verified", .options = .{ .bool = .{} } },
             // Session epoch for Variant A revocation (#99). Hidden (never serialized);
             // an INTEGER counter bumped by "revoke all sessions" and embedded in issued
             // `.auth` tokens. A NULL value (fresh row / pre-migration) is read as 0.
@@ -757,12 +806,10 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
                 var min_secs: ?i64 = null;
                 var max_secs: ?i64 = null;
                 if (o.min) |mn| {
-                    if (datetime.parse(mn)) |s| min_secs = s else |_|
-                        try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date min is not a valid date." });
+                    if (datetime.parse(mn)) |s| min_secs = s else |_| try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date min is not a valid date." });
                 }
                 if (o.max) |mx| {
-                    if (datetime.parse(mx)) |s| max_secs = s else |_|
-                        try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date max is not a valid date." });
+                    if (datetime.parse(mx)) |s| max_secs = s else |_| try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date max is not a valid date." });
                 }
                 // Reject an unsatisfiable range: with both bounds enforced, min > max
                 // would make every value fail, so the field could never accept input.
@@ -849,7 +896,7 @@ fn fieldToValue(alloc: std.mem.Allocator, f: Field) !Value {
             try putOpt(alloc, &opts, "max", if (o.max) |x| try jInt(x) else null);
             try putOpt(alloc, &opts, "pattern", if (o.pattern) |x| jStr(x) else null);
         },
-        .email, .url, .editor, .@"bool" => {},
+        .email, .url, .editor, .bool => {},
         .date => |o| {
             try putOpt(alloc, &opts, "min", if (o.min) |x| jStr(x) else null);
             try putOpt(alloc, &opts, "max", if (o.max) |x| jStr(x) else null);
@@ -1013,7 +1060,7 @@ fn optionsFromValue(alloc: std.mem.Allocator, t: FieldType, opts: Value) !FieldO
             .onCreate = getBool(opts, "onCreate", true),
             .onUpdate = getBool(opts, "onUpdate", false),
         } },
-        .@"bool" => .{ .@"bool" = .{} },
+        .bool => .{ .bool = .{} },
         .number => blk: {
             var mode: NumberMode = .float;
             if (objGet(opts, "mode")) |m| {
@@ -1267,7 +1314,7 @@ test "sqlType mapping" {
     const tf = Field{ .id = "a", .name = "t", .options = .{ .text = .{} } };
     const nf = Field{ .id = "b", .name = "n", .options = .{ .number = .{ .mode = .float } } };
     const nif = Field{ .id = "c", .name = "m", .options = .{ .number = .{ .mode = .int } } };
-    const bf = Field{ .id = "d", .name = "b", .options = .{ .@"bool" = .{} } };
+    const bf = Field{ .id = "d", .name = "b", .options = .{ .bool = .{} } };
     try std.testing.expectEqualStrings("TEXT", tf.sqlType());
     try std.testing.expectEqualStrings("REAL", nf.sqlType());
     try std.testing.expectEqualStrings("INTEGER", nif.sqlType());
@@ -1478,7 +1525,10 @@ test "validate rejects an auth collection with a non-identifier identity field" 
     const a = arena.allocator();
     var errs: std.ArrayList(ValidationError) = .empty;
     const c = Collection{
-        .id = "c", .name = "users", .type = .auth, .fields = &.{},
+        .id = "c",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{},
         .options = .{ .auth = .{ .identityFields = &.{ "email", "x\") WHERE 1=1; --" } } },
     };
     try validate(a, c, &errs);
@@ -1495,7 +1545,10 @@ test "validate accepts an auth collection with valid identity fields" {
     const a = arena.allocator();
     var errs: std.ArrayList(ValidationError) = .empty;
     const c = Collection{
-        .id = "c", .name = "users", .type = .auth, .fields = &.{},
+        .id = "c",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{},
         .options = .{ .auth = .{ .identityFields = &.{ "email", "username" } } },
     };
     try validate(a, c, &errs);

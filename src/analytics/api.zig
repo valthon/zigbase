@@ -154,8 +154,7 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
         const cur = parseCursor(raw) orelse
             return (ApiError{ .status = 400, .message = "Invalid cursor." }).toResponse(ctx.allocator);
         const n1 = b.params.items.len + 1;
-        try b.conds.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator,
-            "(\"occurred_at\" < ?{d} OR (\"occurred_at\" = ?{d} AND \"id\" < ?{d}))", .{ n1, n1 + 1, n1 + 2 }));
+        try b.conds.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "(\"occurred_at\" < ?{d} OR (\"occurred_at\" = ?{d} AND \"id\" < ?{d}))", .{ n1, n1 + 1, n1 + 2 }));
         try b.params.append(ctx.allocator, cur.occurred_at);
         try b.params.append(ctx.allocator, cur.occurred_at);
         try b.params.append(ctx.allocator, cur.id);

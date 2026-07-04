@@ -189,7 +189,9 @@ test "Registry: assembleTypes with no .auth_methods key returns built-in methods
 
 test "Registry: assembleTypes with .auth_methods appends custom types" {
     const FakeMethod = struct {
-        pub fn create(_: std.mem.Allocator, _: std.Io, _: anytype) !@This() { return .{}; }
+        pub fn create(_: std.mem.Allocator, _: std.Io, _: anytype) !@This() {
+            return .{};
+        }
         pub fn method(self: *@This()) AuthMethod {
             return .{ .slug = "fake", .ctx = self, .vtable = &vt };
         }
@@ -227,14 +229,16 @@ test "R2-4: assembleTypes .builtins selects an exact subset" {
 
 test "R2-4: assembleTypes .builtins + .custom composes" {
     const FakeMethod = struct {
-        pub fn create(_: std.mem.Allocator, _: std.Io, _: anytype) !@This() { return .{}; }
+        pub fn create(_: std.mem.Allocator, _: std.Io, _: anytype) !@This() {
+            return .{};
+        }
         pub fn method(self: *@This()) AuthMethod {
             return .{ .slug = "fake", .ctx = self, .vtable = &vt };
         }
         pub fn deinit(_: *@This()) void {}
         const vt = AuthMethod.VTable{ .initiate = undefined, .complete = undefined };
     };
-    const types = comptime assembleTypes(.{ .auth_methods = .{ .builtins = .{ .webauthn }, .custom = .{FakeMethod} } });
+    const types = comptime assembleTypes(.{ .auth_methods = .{ .builtins = .{.webauthn}, .custom = .{FakeMethod} } });
     try std.testing.expectEqual(@as(usize, 2), types.len);
     comptime std.debug.assert(types[0] == WebAuthnMethod);
     comptime std.debug.assert(types[1] == FakeMethod);

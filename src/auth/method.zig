@@ -85,8 +85,8 @@ pub const AuthCtx = struct {
             try data.put(ac.ctx.allocator, idf, .{ .string = identity });
         }
         try data.put(ac.ctx.allocator, "passwordHash", .{ .string = "" });
-        try data.put(ac.ctx.allocator, "tokenKey",    .{ .string = tk });
-        try data.put(ac.ctx.allocator, "verified",    .{ .bool = false });
+        try data.put(ac.ctx.allocator, "tokenKey", .{ .string = tk });
+        try data.put(ac.ctx.allocator, "verified", .{ .bool = false });
 
         // 3. Insert. Two create errors are folded into the same enumeration-safe recovery:
         //    - error.StepFailed: a SQLite UNIQUE collision from a concurrent initiate for the
@@ -98,7 +98,10 @@ pub const AuthCtx = struct {
         //      since malformed input can never match a real identity).
         //    Any OTHER error propagates unchanged — genuine infra failures must not be masked.
         const rec = records_mod.create(
-            ac.ctx.allocator, ac.app.io, conn, ac.collection,
+            ac.ctx.allocator,
+            ac.app.io,
+            conn,
+            ac.collection,
             std.json.Value{ .object = data },
         ) catch |err| {
             if (err == error.StepFailed or err == error.Validation) {
@@ -156,8 +159,12 @@ pub fn assertAuthMethodContract(comptime P: type) void {
 
 test "assertAuthMethodContract accepts a well-formed method type and a Resolution round-trips" {
     const Good = struct {
-        pub fn create(_: std.mem.Allocator, _: std.Io, _: anytype) !@This() { return .{}; }
-        pub fn method(self: *@This()) AuthMethod { return .{ .slug = "x", .ctx = self, .vtable = &vt }; }
+        pub fn create(_: std.mem.Allocator, _: std.Io, _: anytype) !@This() {
+            return .{};
+        }
+        pub fn method(self: *@This()) AuthMethod {
+            return .{ .slug = "x", .ctx = self, .vtable = &vt };
+        }
         pub fn deinit(_: *@This()) void {}
         const vt = AuthMethod.VTable{ .initiate = undefined, .complete = undefined };
     };

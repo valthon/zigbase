@@ -112,7 +112,7 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const col =(try collections.get(ctx.allocator, w, key)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const col = (try collections.get(ctx.allocator, w, key)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     return .{ .status = 200, .body = try schema.collectionToJson(ctx.allocator, col) };
 }
 

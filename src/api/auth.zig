@@ -270,7 +270,7 @@ pub fn recordSession(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8
     var idbuf: [15]u8 = undefined;
     id_gen.generate(app.io, &idbuf);
     const sid = try ctx.allocator.dupe(u8, &idbuf);
-    var st = try prep(conn, 
+    var st = try prep(conn,
         \\INSERT INTO "_sessions" ("id","collectionRef","recordRef","created","lastSeen","expires","userAgent","ip")
         \\ VALUES (?1,?2,?3,datetime('now'),datetime('now'),?4,?5,?6);
     );
@@ -1406,9 +1406,15 @@ test "require_verified gates password login: unverified 403, verified 200" {
         const existing = (try collections.get(a, w, "gated")).?;
         try collections.delete(a, w, existing.id);
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "gated", .type = .auth,
+            .id = "",
+            .name = "gated",
+            .type = .auth,
             .fields = &[_]schema.Field{},
-            .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "",
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
             .options = .{ .auth = .{ .require_verified = true } },
         });
     }
@@ -1441,8 +1447,14 @@ test "auth_helpers.issueSession mints a session and fires onAuth(custom)" {
     const rid = (try findByIdentity(a, w0, col, "r@x.io")).?;
     env.pool.releaseWriter();
 
-    const Counter = struct { var seen: usize = 0; var m: events.AuthMethod = .password;
-        fn h(ev: *events.AuthEvent) void { seen += 1; m = ev.method; } };
+    const Counter = struct {
+        var seen: usize = 0;
+        var m: events.AuthMethod = .password;
+        fn h(ev: *events.AuthEvent) void {
+            seen += 1;
+            m = ev.method;
+        }
+    };
     Counter.seen = 0;
     var disp = events.Dispatch{ .on_auth = Counter.h };
     env.app.dispatch = &disp;
@@ -1997,7 +2009,10 @@ test "issueSession is the mint+emit seam: emits onAuth once with the method tag"
     const Counter = struct {
         var seen: usize = 0;
         var last_method: events.AuthMethod = .oauth2;
-        fn onAuth(ev: *events.AuthEvent) void { seen += 1; last_method = ev.method; }
+        fn onAuth(ev: *events.AuthEvent) void {
+            seen += 1;
+            last_method = ev.method;
+        }
     };
     Counter.seen = 0;
     var disp = events.Dispatch{ .on_auth = Counter.onAuth };
@@ -2020,9 +2035,15 @@ fn createBasePosts(env: *TestEnv, a: std.mem.Allocator) !void {
     const w = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     _ = try collections.create(a, std.testing.io, w, .{
-        .id = "", .name = "posts", .type = .base,
+        .id = "",
+        .name = "posts",
+        .type = .base,
         .fields = &[_]schema.Field{.{ .id = "t1", .name = "title", .options = .{ .text = .{} } }},
-        .listRule = null, .viewRule = null, .createRule = null, .updateRule = null, .deleteRule = null,
+        .listRule = null,
+        .viewRule = null,
+        .createRule = null,
+        .updateRule = null,
+        .deleteRule = null,
     });
 }
 

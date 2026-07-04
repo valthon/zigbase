@@ -233,5 +233,5 @@ test "isEncryptableType allows only text/editor/json" {
     try std.testing.expect(!isEncryptableType(.url));
     try std.testing.expect(!isEncryptableType(.number));
     try std.testing.expect(!isEncryptableType(.relation));
-    try std.testing.expect(!isEncryptableType(.@"bool"));
+    try std.testing.expect(!isEncryptableType(.bool));
 }

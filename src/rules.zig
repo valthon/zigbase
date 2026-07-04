@@ -35,7 +35,7 @@ pub fn decide(rule: ?[]const u8, rctx: *const request.RequestContext) Decision {
     return .check;
 }
 
-pub const RuleError = error{ BadRule } || lexer.LexError || parser.ParseError || compiler.CompileError || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(joiner.Joiner.resolve)).@"fn".return_type.?).error_union.error_set;
+pub const RuleError = error{BadRule} || lexer.LexError || parser.ParseError || compiler.CompileError || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(joiner.Joiner.resolve)).@"fn".return_type.?).error_union.error_set;
 
 /// Compile a `check`-state rule into a records.Guard (its own joiner; standalone guarded query).
 pub fn compileGuard(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, rule: []const u8, rctx: *const request.RequestContext) RuleError!records.Guard {
@@ -50,7 +50,10 @@ pub fn compileGuard(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collecti
 pub fn matches(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, id: []const u8, rule: []const u8, rctx: *const request.RequestContext) RuleError!bool {
     const g = try compileGuard(alloc, conn, col, rule, rctx);
     var joins: std.ArrayList(u8) = .empty;
-    for (g.joins) |jn| { try joins.append(alloc, ' '); try joins.appendSlice(alloc, jn); }
+    for (g.joins) |jn| {
+        try joins.append(alloc, ' ');
+        try joins.appendSlice(alloc, jn);
+    }
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, joins.items, col.name, g.where_sql }, 0);
     const param_sink = @import("sql/param_sink.zig");
     var st = try conn.prepare(try param_sink.renumberZ(alloc, db.dbDialect(conn), sql));
@@ -87,8 +90,10 @@ test "isPublic: only the exact sentinel is public" {
 }
 
 test "matches runs a guarded select" {
-    var d = try db.Db.openMemory(); defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator); defer arena.deinit();
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const a = arena.allocator();
     const migrations = @import("migrations.zig");
     const collections = @import("collections.zig");

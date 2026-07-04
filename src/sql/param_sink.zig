@@ -199,9 +199,7 @@ test "param_sink: lowerStmtZ lowers datetime('now') + renumbers on Postgres" {
     const out = try lowerStmtZ(testing.allocator, Dialect.postgres, sql);
     defer testing.allocator.free(out);
     const now_pg = Dialect.postgres.nowTextExpr();
-    const want = std.fmt.allocPrint(testing.allocator,
-        "INSERT INTO \"_sessions\" (\"id\",\"created\",\"lastSeen\",\"expires\") VALUES ($1,{s},{s},$2);",
-        .{ now_pg, now_pg }) catch unreachable;
+    const want = std.fmt.allocPrint(testing.allocator, "INSERT INTO \"_sessions\" (\"id\",\"created\",\"lastSeen\",\"expires\") VALUES ($1,{s},{s},$2);", .{ now_pg, now_pg }) catch unreachable;
     defer testing.allocator.free(want);
     try testing.expectEqualStrings(want, out);
     try testing.expectEqual(@as(u8, 0), out.ptr[out.len]); // NUL-terminated

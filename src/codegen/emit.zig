@@ -115,8 +115,7 @@ fn vectorLine(alloc: std.mem.Allocator, c: schema.Collection) ![]const u8 {
         try u.appendSlice(alloc, f.name);
         try u.append(alloc, '"');
     }
-    return std.fmt.allocPrint(alloc,
-        "    vector?: {{ field: {s}; metric?: \"cosine\" | \"l2\"; values: number[] }};\n", .{u.items});
+    return std.fmt.allocPrint(alloc, "    vector?: {{ field: {s}; metric?: \"cosine\" | \"l2\"; values: number[] }};\n", .{u.items});
 }
 
 /// The visible synthesized auth fields for an auth collection record.
@@ -126,7 +125,7 @@ fn vectorLine(alloc: std.mem.Allocator, c: schema.Collection) ![]const u8 {
 fn appendVisibleAuthFields(alloc: std.mem.Allocator, list: *std.ArrayList(schema.Field)) !void {
     try list.append(alloc, .{ .id = "_email", .name = "email", .options = .{ .email = .{} } });
     try list.append(alloc, .{ .id = "_username", .name = "username", .options = .{ .text = .{} } });
-    try list.append(alloc, .{ .id = "_verified", .name = "verified", .options = .{ .@"bool" = .{} } });
+    try list.append(alloc, .{ .id = "_verified", .name = "verified", .options = .{ .bool = .{} } });
 }
 
 /// The record fields, in emission order: id, (auth visible fields), user fields,
@@ -1025,7 +1024,7 @@ test "emitWhere / emitFields dedup injected auth fields — each appears exactly
     const injected_fields = [_]schema.Field{
         .{ .id = "_email", .name = "email", .options = .{ .email = .{} } },
         .{ .id = "_username", .name = "username", .options = .{ .text = .{} } },
-        .{ .id = "_verified", .name = "verified", .options = .{ .@"bool" = .{} } },
+        .{ .id = "_verified", .name = "verified", .options = .{ .bool = .{} } },
         .{ .id = "f1", .name = "bio", .options = .{ .text = .{} } },
     };
     const injected_auth = schema.Collection{
@@ -1151,8 +1150,7 @@ test "emitSortUnion: visible scalars minus json/multi/file, plus system fields" 
     const out = w.items;
     // blogPosts: title(text) status(select) price(number) author(single rel) tags(multi rel)
     //            cover(file) created(user autodate, deduped into system fields)
-    try std.testing.expect(contains(out,
-        "export type PostSortField = \"title\" | \"status\" | \"price\" | \"author\" | \"id\" | \"created\" | \"updated\";"));
+    try std.testing.expect(contains(out, "export type PostSortField = \"title\" | \"status\" | \"price\" | \"author\" | \"id\" | \"created\" | \"updated\";"));
     try std.testing.expect(contains(out, "export type PostSort = SortExpr<PostSortField>;"));
     try std.testing.expect(!contains(out, "\"tags\"")); // multi-value excluded
     try std.testing.expect(!contains(out, "\"cover\"")); // file excluded
@@ -1173,11 +1171,9 @@ test "emitService: search/vector gating, narrowed sort, unconditional getAbiliti
     try emitService(a, &w, docs);
     const out = w.items;
     try std.testing.expect(contains(out, "search?: string;"));
-    try std.testing.expect(contains(out,
-        "vector?: { field: \"embedding\" | \"metadata\"; metric?: \"cosine\" | \"l2\"; values: number[] };"));
+    try std.testing.expect(contains(out, "vector?: { field: \"embedding\" | \"metadata\"; metric?: \"cosine\" | \"l2\"; values: number[] };"));
     try std.testing.expect(contains(out, "sort?: DocSort | DocSort[];"));
-    try std.testing.expect(contains(out,
-        "getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;"));
+    try std.testing.expect(contains(out, "getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;"));
     // vector appears ONLY in getList (one occurrence)
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "vector?:"));
     // search appears in all five list-ish blocks
@@ -1206,8 +1202,7 @@ test "emitService: abilities doc comment lists configured actions" {
     } } };
     var w: std.ArrayList(u8) = .empty;
     try emitService(a, &w, col);
-    try std.testing.expect(contains(w.items,
-        "/** Row abilities configured for: update, delete. Check per record via getAbilities(). */"));
+    try std.testing.expect(contains(w.items, "/** Row abilities configured for: update, delete. Check per record via getAbilities(). */"));
     _ = Abilities;
 }
 

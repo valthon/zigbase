@@ -208,10 +208,8 @@ test "render emits interface member, factory method, and named decls" {
     try std.testing.expect(std.mem.indexOf(u8, sec.decls, "export interface SearchIn {") != null);
 
     // Interface member: void input → no input arg; params object present; query route has input
-    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member,
-        "bookingsConfirm(params: { id: string }, opts?: SendOptions): Promise<ConfirmOut>;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member,
-        "search(input: SearchIn, opts?: SendOptions): Promise<unknown>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member, "bookingsConfirm(params: { id: string }, opts?: SendOptions): Promise<ConfirmOut>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member, "search(input: SearchIn, opts?: SendOptions): Promise<unknown>;") != null);
 
     // Factory: POST interpolates :id and sends body absent (void input); GET sends query
     try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "bookingsConfirm(params, opts) {") != null);
@@ -259,20 +257,15 @@ test "render handles params+non-void input and no-params+void input call shapes"
     defer a.free(sec.factory_member);
 
     // params + input: both appear in the signature
-    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member,
-        "abUpdate(params: { x: string; y: string }, input: UpdateIn, opts?: SendOptions): Promise<SomeStruct>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member, "abUpdate(params: { x: string; y: string }, input: UpdateIn, opts?: SendOptions): Promise<SomeStruct>;") != null);
     // factory interpolates both params
-    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member,
-        "${encodeURIComponent(String(params.x))}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member,
-        "${encodeURIComponent(String(params.y))}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "${encodeURIComponent(String(params.x))}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "${encodeURIComponent(String(params.y))}") != null);
 
     // no-params + void input: bare opts only
-    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member,
-        "ping(opts?: SendOptions): Promise<void>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member, "ping(opts?: SendOptions): Promise<void>;") != null);
     // factory calls send with bare opts (no body/query object)
-    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member,
-        "return base.send(\"GET\", `/api/ping`, opts);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "return base.send(\"GET\", `/api/ping`, opts);") != null);
 }
 
 test "render skips untyped routes (no typed RPC surface for raw-response handlers)" {

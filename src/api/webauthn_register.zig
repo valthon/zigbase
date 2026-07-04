@@ -274,7 +274,7 @@ test "webauthn_register begin: returns 200 with challenge + ceremonyId for authe
         }, &key);
     };
 
-    const params = [_]http.Param{ .{ .key = "col", .value = "wrusers1" } };
+    const params = [_]http.Param{.{ .key = "col", .value = "wrusers1" }};
     var ctx = env.ctx(a, .POST, "{}", &params);
     ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
 
@@ -296,7 +296,7 @@ test "webauthn_register begin: unauthenticated returns 401" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const params = [_]http.Param{ .{ .key = "col", .value = "wrusers2" } };
+    const params = [_]http.Param{.{ .key = "col", .value = "wrusers2" }};
     var ctx = env.ctx(a, .POST, "{}", &params);
     // No authorization header.
 
@@ -373,7 +373,8 @@ test "webauthn_register finish: stores credential and returns 204" {
     // Build clientDataJSON now that cid is known (challenge bytes are fixed above).
     const challenge_raw = [_]u8{0x33} ** 32;
     const challenge_b64 = try client_data.b64urlNoPad(a, &challenge_raw);
-    const cdj = try std.fmt.allocPrint(a,
+    const cdj = try std.fmt.allocPrint(
+        a,
         "{{\"type\":\"webauthn.create\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ challenge_b64, origin },
     );
@@ -381,12 +382,13 @@ test "webauthn_register finish: stores credential and returns 204" {
     const att_obj_b64 = try client_data.b64urlNoPad(a, att_obj_buf);
     const cdj_b64 = try client_data.b64urlNoPad(a, cdj);
 
-    const body_str = try std.fmt.allocPrint(a,
+    const body_str = try std.fmt.allocPrint(
+        a,
         "{{\"ceremonyId\":\"{s}\",\"attestationObject\":\"{s}\",\"clientDataJSON\":\"{s}\"}}",
         .{ cid, att_obj_b64, cdj_b64 },
     );
 
-    const params = [_]http.Param{ .{ .key = "col", .value = "wrusers3" } };
+    const params = [_]http.Param{.{ .key = "col", .value = "wrusers3" }};
     var ctx = env.ctx(a, .POST, body_str, &params);
     ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
 
@@ -479,7 +481,7 @@ test "webauthn_register begin: webauthn enabled but empty rp_id returns 500" {
     };
     // Writer released; begin() can now acquire it.
 
-    const params = [_]http.Param{ .{ .key = "col", .value = "wrusers_empty_rp" } };
+    const params = [_]http.Param{.{ .key = "col", .value = "wrusers_empty_rp" }};
     var ctx = env.ctx(a, .POST, "{}", &params);
     ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
 
@@ -555,19 +557,21 @@ test "webauthn_register finish: duplicate credentialId returns 409" {
 
     const challenge_raw = [_]u8{0x44} ** 32;
     const challenge_b64 = try client_data.b64urlNoPad(a, &challenge_raw);
-    const cdj = try std.fmt.allocPrint(a,
+    const cdj = try std.fmt.allocPrint(
+        a,
         "{{\"type\":\"webauthn.create\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ challenge_b64, origin },
     );
     const att_obj_b64 = try client_data.b64urlNoPad(a, att_obj_buf);
     const cdj_b64 = try client_data.b64urlNoPad(a, cdj);
 
-    const body_str = try std.fmt.allocPrint(a,
+    const body_str = try std.fmt.allocPrint(
+        a,
         "{{\"ceremonyId\":\"{s}\",\"attestationObject\":\"{s}\",\"clientDataJSON\":\"{s}\"}}",
         .{ cid, att_obj_b64, cdj_b64 },
     );
 
-    const params = [_]http.Param{ .{ .key = "col", .value = "wrusers4" } };
+    const params = [_]http.Param{.{ .key = "col", .value = "wrusers4" }};
     var ctx = env.ctx(a, .POST, body_str, &params);
     ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
 
@@ -584,11 +588,20 @@ fn buildEc2CoseKeyBytes(alloc: std.mem.Allocator, x: [32]u8, y: [32]u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
     try buf.append(alloc, 0xa5); // map(5)
-    try buf.append(alloc, 0x01); try buf.append(alloc, 0x02); // 1: 2 (kty=EC2)
-    try buf.append(alloc, 0x03); try buf.append(alloc, 0x26); // 3: -7 (alg=ES256)
-    try buf.append(alloc, 0x20); try buf.append(alloc, 0x01); // -1: 1 (crv=P-256)
-    try buf.append(alloc, 0x21); try buf.append(alloc, 0x58); try buf.append(alloc, 0x20); try buf.appendSlice(alloc, &x); // -2: x
-    try buf.append(alloc, 0x22); try buf.append(alloc, 0x58); try buf.append(alloc, 0x20); try buf.appendSlice(alloc, &y); // -3: y
+    try buf.append(alloc, 0x01);
+    try buf.append(alloc, 0x02); // 1: 2 (kty=EC2)
+    try buf.append(alloc, 0x03);
+    try buf.append(alloc, 0x26); // 3: -7 (alg=ES256)
+    try buf.append(alloc, 0x20);
+    try buf.append(alloc, 0x01); // -1: 1 (crv=P-256)
+    try buf.append(alloc, 0x21);
+    try buf.append(alloc, 0x58);
+    try buf.append(alloc, 0x20);
+    try buf.appendSlice(alloc, &x); // -2: x
+    try buf.append(alloc, 0x22);
+    try buf.append(alloc, 0x58);
+    try buf.append(alloc, 0x20);
+    try buf.appendSlice(alloc, &y); // -3: y
     return buf.toOwnedSlice(alloc);
 }
 
@@ -622,13 +635,17 @@ fn buildAttestationObj(alloc: std.mem.Allocator, auth_data: []const u8) ![]u8 {
     errdefer buf.deinit(alloc);
     try buf.append(alloc, 0xa3); // map(3)
     // "fmt": "none"
-    try buf.append(alloc, 0x63); try buf.appendSlice(alloc, "fmt");
-    try buf.append(alloc, 0x64); try buf.appendSlice(alloc, "none");
+    try buf.append(alloc, 0x63);
+    try buf.appendSlice(alloc, "fmt");
+    try buf.append(alloc, 0x64);
+    try buf.appendSlice(alloc, "none");
     // "attStmt": {}
-    try buf.append(alloc, 0x67); try buf.appendSlice(alloc, "attStmt");
+    try buf.append(alloc, 0x67);
+    try buf.appendSlice(alloc, "attStmt");
     try buf.append(alloc, 0xa0);
     // "authData": bstr
-    try buf.append(alloc, 0x68); try buf.appendSlice(alloc, "authData");
+    try buf.append(alloc, 0x68);
+    try buf.appendSlice(alloc, "authData");
     const ad_len = auth_data.len;
     if (ad_len <= 23) {
         try buf.append(alloc, 0x40 | @as(u8, @intCast(ad_len)));

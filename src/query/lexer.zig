@@ -27,22 +27,70 @@ pub fn lex(alloc: std.mem.Allocator, input: []const u8) LexError![]Token {
     var i: usize = 0;
     while (i < input.len) {
         const c = input[i];
-        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') { i += 1; continue; }
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            i += 1;
+            continue;
+        }
         switch (c) {
-            '(' => { try toks.append(alloc, .{ .kind = .lparen, .text = "(" }); i += 1; },
-            ')' => { try toks.append(alloc, .{ .kind = .rparen, .text = ")" }); i += 1; },
-            ',' => { try toks.append(alloc, .{ .kind = .comma, .text = "," }); i += 1; },
-            '=' => { try toks.append(alloc, .{ .kind = .eq, .text = "=" }); i += 1; },
-            '~' => { try toks.append(alloc, .{ .kind = .like, .text = "~" }); i += 1; },
-            '>' => { if (i + 1 < input.len and input[i + 1] == '=') { try toks.append(alloc, .{ .kind = .ge, .text = ">=" }); i += 2; } else { try toks.append(alloc, .{ .kind = .gt, .text = ">" }); i += 1; } },
-            '<' => { if (i + 1 < input.len and input[i + 1] == '=') { try toks.append(alloc, .{ .kind = .le, .text = "<=" }); i += 2; } else { try toks.append(alloc, .{ .kind = .lt, .text = "<" }); i += 1; } },
-            '!' => {
-                if (i + 1 < input.len and input[i + 1] == '=') { try toks.append(alloc, .{ .kind = .ne, .text = "!=" }); i += 2; }
-                else if (i + 1 < input.len and input[i + 1] == '~') { try toks.append(alloc, .{ .kind = .nlike, .text = "!~" }); i += 2; }
-                else return error.UnexpectedChar;
+            '(' => {
+                try toks.append(alloc, .{ .kind = .lparen, .text = "(" });
+                i += 1;
             },
-            '&' => { if (i + 1 < input.len and input[i + 1] == '&') { try toks.append(alloc, .{ .kind = .l_and, .text = "&&" }); i += 2; } else return error.UnexpectedChar; },
-            '|' => { if (i + 1 < input.len and input[i + 1] == '|') { try toks.append(alloc, .{ .kind = .l_or, .text = "||" }); i += 2; } else return error.UnexpectedChar; },
+            ')' => {
+                try toks.append(alloc, .{ .kind = .rparen, .text = ")" });
+                i += 1;
+            },
+            ',' => {
+                try toks.append(alloc, .{ .kind = .comma, .text = "," });
+                i += 1;
+            },
+            '=' => {
+                try toks.append(alloc, .{ .kind = .eq, .text = "=" });
+                i += 1;
+            },
+            '~' => {
+                try toks.append(alloc, .{ .kind = .like, .text = "~" });
+                i += 1;
+            },
+            '>' => {
+                if (i + 1 < input.len and input[i + 1] == '=') {
+                    try toks.append(alloc, .{ .kind = .ge, .text = ">=" });
+                    i += 2;
+                } else {
+                    try toks.append(alloc, .{ .kind = .gt, .text = ">" });
+                    i += 1;
+                }
+            },
+            '<' => {
+                if (i + 1 < input.len and input[i + 1] == '=') {
+                    try toks.append(alloc, .{ .kind = .le, .text = "<=" });
+                    i += 2;
+                } else {
+                    try toks.append(alloc, .{ .kind = .lt, .text = "<" });
+                    i += 1;
+                }
+            },
+            '!' => {
+                if (i + 1 < input.len and input[i + 1] == '=') {
+                    try toks.append(alloc, .{ .kind = .ne, .text = "!=" });
+                    i += 2;
+                } else if (i + 1 < input.len and input[i + 1] == '~') {
+                    try toks.append(alloc, .{ .kind = .nlike, .text = "!~" });
+                    i += 2;
+                } else return error.UnexpectedChar;
+            },
+            '&' => {
+                if (i + 1 < input.len and input[i + 1] == '&') {
+                    try toks.append(alloc, .{ .kind = .l_and, .text = "&&" });
+                    i += 2;
+                } else return error.UnexpectedChar;
+            },
+            '|' => {
+                if (i + 1 < input.len and input[i + 1] == '|') {
+                    try toks.append(alloc, .{ .kind = .l_or, .text = "||" });
+                    i += 2;
+                } else return error.UnexpectedChar;
+            },
             '"', '\'' => {
                 const quote = c;
                 const start = i + 1;
@@ -96,8 +144,12 @@ fn pointsInto(slice: []const u8, parent: []const u8) bool {
     return ptr >= start and ptr < start + parent.len;
 }
 
-fn isIdentStart(c: u8) bool { return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '@'; }
-fn isIdentChar(c: u8) bool { return isIdentStart(c) or (c >= '0' and c <= '9') or c == '.'; }
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '@';
+}
+fn isIdentChar(c: u8) bool {
+    return isIdentStart(c) or (c >= '0' and c <= '9') or c == '.';
+}
 
 /// Decode the backslash escapes in a quoted-string body into a freshly allocated
 /// buffer owned by `alloc`. `body` is the slice between the quotes and is known to

@@ -30,8 +30,14 @@ const Parser = struct {
     pos: usize = 0,
     depth: usize = 0,
 
-    fn peek(self: *Parser) lexer.TokKind { return self.toks[self.pos].kind; }
-    fn next(self: *Parser) lexer.Token { const t = self.toks[self.pos]; self.pos += 1; return t; }
+    fn peek(self: *Parser) lexer.TokKind {
+        return self.toks[self.pos].kind;
+    }
+    fn next(self: *Parser) lexer.Token {
+        const t = self.toks[self.pos];
+        self.pos += 1;
+        return t;
+    }
 
     fn parseOr(self: *Parser) ParseError!*Node {
         var left = try self.parseAnd();

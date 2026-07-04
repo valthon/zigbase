@@ -384,10 +384,7 @@ pub fn frameForDelivery(
     const obj = parsed.value.object;
     const av = obj.get("action") orelse return null;
     if (av != .string) return null;
-    const action: protocol.Action = if (std.mem.eql(u8, av.string, "create")) .create
-        else if (std.mem.eql(u8, av.string, "update")) .update
-        else if (std.mem.eql(u8, av.string, "delete")) .delete
-        else return null;
+    const action: protocol.Action = if (std.mem.eql(u8, av.string, "create")) .create else if (std.mem.eql(u8, av.string, "update")) .update else if (std.mem.eql(u8, av.string, "delete")) .delete else return null;
     const rv = obj.get("record") orelse return null;
     if (rv != .object) return null;
     const idv = rv.object.get("id") orelse return null;
@@ -890,7 +887,9 @@ test "frameForDelivery: viewRule deny -> null; @public + matching filter -> fram
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const pub_col = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "fitems", .fields = &[_]schema.Field{.{ .id = "f1", .name = "owner", .options = .{ .text = .{} } }},
+            .id = "",
+            .name = "fitems",
+            .fields = &[_]schema.Field{.{ .id = "f1", .name = "owner", .options = .{ .text = .{} } }},
             .viewRule = rules.public_sentinel,
         });
         var data: std.json.ObjectMap = .empty;
@@ -898,7 +897,10 @@ test "frameForDelivery: viewRule deny -> null; @public + matching filter -> fram
         rec_val = try records.create(a, std.testing.io, w, pub_col, .{ .object = data });
         rid = rec_val.object.get("id").?.string;
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "flocked", .fields = &.{}, .viewRule = null,
+            .id = "",
+            .name = "flocked",
+            .fields = &.{},
+            .viewRule = null,
         });
     }
     const ef = try buildEventFrames(a, "fitems", .create, rid, rec_val);
@@ -924,7 +926,9 @@ test "frameForDelivery: F4 delete snapshot authorizes, then is STRIPPED to an id
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         _ = try collections.create(a, std.testing.io, w, .{
-            .id = "", .name = "fnotes", .fields = &[_]schema.Field{.{ .id = "f1", .name = "owner", .options = .{ .text = .{} } }},
+            .id = "",
+            .name = "fnotes",
+            .fields = &[_]schema.Field{.{ .id = "f1", .name = "owner", .options = .{ .text = .{} } }},
             .viewRule = "owner = @request.auth.id",
         });
     }

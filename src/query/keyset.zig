@@ -60,7 +60,7 @@ fn jsonToParam(field: ?schema.Field, v: std.json.Value) KeysetError!compiler.Par
             if (v != .string) return error.BadCursor;
             return .{ .text = v.string };
         },
-        .@"bool" => {
+        .bool => {
             if (v != .bool) return error.BadCursor;
             return .{ .int = if (v.bool) 1 else 0 };
         },

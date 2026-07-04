@@ -33,9 +33,7 @@ pub fn checkOperatorNames(alloc: std.mem.Allocator, cols: []const schema.Collect
             const target = findByName(cols, f.options.relation.targetCollectionId) orelse continue;
             for (target.fields) |tf| {
                 if (isOperatorKey(tf.name)) {
-                    report.message = try std.fmt.allocPrint(alloc,
-                        "codegen: collection '{s}' field '{s}' relates to '{s}', which has a field '{s}' named like a where-operator — this makes the nested-relation where ambiguous. Rename '{s}.{s}'.",
-                        .{ c.name, f.name, target.name, tf.name, target.name, tf.name });
+                    report.message = try std.fmt.allocPrint(alloc, "codegen: collection '{s}' field '{s}' relates to '{s}', which has a field '{s}' named like a where-operator — this makes the nested-relation where ambiguous. Rename '{s}.{s}'.", .{ c.name, f.name, target.name, tf.name, target.name, tf.name });
                     return GuardError.OperatorNameClash;
                 }
             }

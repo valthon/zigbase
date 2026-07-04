@@ -32,10 +32,10 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-local
-          key: zig-local-build-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          key: zig-local-build-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
           restore-keys: |
-            zig-local-build-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
-            zig-local-build-${{ runner.os }}-zig0.16.0-
+            zig-local-build-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
+            zig-local-build-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
       - name: Cache npm downloads
         uses: actions/cache@v5
         with:
@@ -112,10 +112,12 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-local
-          key: zig-local-unit-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          key: zig-local-unit-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
           restore-keys: |
-            zig-local-unit-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
-            zig-local-unit-${{ runner.os }}-zig0.16.0-
+            zig-local-unit-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
+            zig-local-unit-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
+      - name: Formatting gate (zig fmt --check)
+        run: mise exec zig@0.16.0 -- zig fmt --check src build.zig
       - name: Unit tests
         run: mise exec zig@0.16.0 -- zig build test --summary all
       - name: "Unit tests (prod gate: -Ddev-clock=false)"
@@ -178,10 +180,10 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-local
-          key: zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          key: zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
           restore-keys: |
-            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
-            zig-local-postgres-${{ runner.os }}-zig0.16.0-
+            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
+            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
       # -Dvector=true so the live pgvector KNN parity + tenant/ability chokepoint tests run too
       # (sqlite-vec is also compiled in; the SQLite vector tests run alongside). The pgvector image
       # above makes `CREATE EXTENSION vector` succeed for the superuser test role.
@@ -213,10 +215,10 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-local
-          key: zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          key: zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
           restore-keys: |
-            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
-            zig-local-postgres-${{ runner.os }}-zig0.16.0-
+            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
+            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
       - name: Start PostgreSQL with server TLS + SCRAM
         run: |
           mkdir -p "$PWD/pgtls"
@@ -278,10 +280,10 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-local
-          key: zig-local-s3-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
+          key: zig-local-s3-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
           restore-keys: |
-            zig-local-s3-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
-            zig-local-s3-${{ runner.os }}-zig0.16.0-
+            zig-local-s3-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
+            zig-local-s3-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
       - name: Start MinIO + create bucket
         run: |
           docker run -d --name minio -p 9000:9000 \

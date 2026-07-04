@@ -1084,9 +1084,15 @@ test "R2-3: Gates assemble the built-in route table at comptime" {
     try std.testing.expect(hasRoute(full.routes, .POST, "/api/collections/:col/auth/webauthn/register/begin"));
 
     const lean = Server(.{
-        .admin = false, .analytics = false, .senders = false, .mail_webhook = false,
+        .admin = false,
+        .analytics = false,
+        .senders = false,
+        .mail_webhook = false,
         .mail_unsubscribe = false,
-        .tenancy = false, .webauthn = false, .magic_link = false, .oauth2 = false,
+        .tenancy = false,
+        .webauthn = false,
+        .magic_link = false,
+        .oauth2 = false,
     });
     // Core stays.
     try std.testing.expect(hasRoute(lean.routes, .GET, "/api/health"));

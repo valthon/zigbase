@@ -73,7 +73,7 @@ pub fn register(handle: *c.sqlite3) void {
             name.ptr,
             -1,
             c.SQLITE_UTF8,
-            @constCast(@ptrCast(name.ptr)),
+            @ptrCast(@constCast(name.ptr)),
             xFunc,
             null,
             null,
