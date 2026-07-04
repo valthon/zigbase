@@ -50,6 +50,7 @@ const assets = [_]Asset{
     mk("/_/assets/lib/ui.js", @embedFile("admin/lib/ui.js"), js_ctype),
     mk("/_/assets/views/collections.js", @embedFile("admin/views/collections.js"), js_ctype),
     mk("/_/assets/views/email.js", @embedFile("admin/views/email.js"), js_ctype),
+    mk("/_/assets/views/files.js", @embedFile("admin/views/files.js"), js_ctype),
     mk("/_/assets/views/features.js", @embedFile("admin/views/features.js"), js_ctype),
     mk("/_/assets/views/settings.js", @embedFile("admin/views/settings.js"), js_ctype),
     mk("/_/assets/views/users.js", @embedFile("admin/views/users.js"), js_ctype),

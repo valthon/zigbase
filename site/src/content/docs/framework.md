@@ -1412,16 +1412,24 @@ endpoint (above), or a custom route if you need a bespoke shape.
 ### Admin UI
 
 The embedded admin UI (`/_/`) covers **Collections** (schema editor), **Records**
-(browse/query/edit), **Users**, **Email** (senders, suppressions, batches, below),
-**Features** (flags & experiments, below), and **Settings** (raw KV, above). It
-ships as browser-native ES modules — no build step — and every asset is served
-with a CRC32 `ETag`.
+(browse/query/edit), **Users**, **Files** (browse/upload, below), **Email**
+(senders, suppressions, batches, below), **Features** (flags & experiments,
+below), and **Settings** (raw KV, above). It ships as browser-native ES modules —
+no build step — and every asset is served with a CRC32 `ETag`.
 
 **Users** (`/_/#/users`) manages both superusers and auth-collection users: list
 and search (filter-based) either, create/edit/delete records, an admin password
 reset (superuser `PATCH`), and a read-only OAuth-providers panel per auth
 collection. It composes the existing collections/records/auth REST API — no new
 endpoints ship for it. Per-device sessions are not yet exposed here.
+
+**Files** (`/_/#/files`) covers per-collection file-field browsing: a read-only
+storage-backend strip (local disk vs S3, from the new superuser `GET
+/api/files/config` — non-secret backend info only, never the S3 credentials), a
+collection picker limited to collections with at least one file field, a records
+browser with image thumbnails and download links, and a per-record file drawer to
+upload, replace, or remove a file's contents. It composes the existing records +
+file-serve API — see [API → Files](./api#files).
 
 **Email** (`/_/#/email`) covers the [email subsystem](#email-subsystem-154-templates-providers-verified-senders-suppression)
 for superusers, in three tabs plus a read-only policy strip:
