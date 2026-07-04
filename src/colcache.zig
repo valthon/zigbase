@@ -12,8 +12,12 @@
 //! refcounted — the map holds one ref, each borrower one. invalidate() bumps `generation`
 //! and detaches every entry under the lock, dropping the map refs outside it; the last
 //! releaser frees the entry arena, so in-flight requests keep their (now-stale) snapshot
-//! safely until they finish. The generation counter closes the load/invalidate race: a
-//! miss snapshots it BEFORE the DB read and only publishes on an unchanged generation.
+//! safely until they finish. The critical section is ALLOCATION-FREE: entries are threaded
+//! onto an intrusive `Entry.next` list (plain pointer writes) rather than pushed into a heap
+//! list, and both the entry arenas and the map keys (each entry owns its key) are freed only
+//! after the lock is released — so the spinlock never covers an allocator call. The
+//! generation counter closes the load/invalidate race: a miss snapshots it BEFORE the DB read
+//! and only publishes on an unchanged generation.
 //!
 //! INVALIDATION CONTRACT: every runtime collection-DDL path must call `invalidate()` —
 //! today that is exactly the three api/collections.zig handlers (create/update/delete).
@@ -31,6 +35,16 @@ pub const Entry = struct {
     arena: std.heap.ArenaAllocator,
     col: ?schema.Collection, // parsed from the entry's own arena; null = negative entry
     refs: std.atomic.Value(usize),
+    /// The map key this entry is published under (duped by `publish`). The entry OWNS it
+    /// and frees it when the last ref drops, so `invalidate()` can detach without touching
+    /// the allocator under the lock. Empty until published; an unpublished entry never
+    /// aliases a map key.
+    key: []const u8 = &.{},
+    /// Intrusive detach chain, threaded ONLY by `invalidate()` while it holds the mutex.
+    /// Once an entry is unlinked from the map its `next` is owned exclusively by the
+    /// invalidating thread (no other path reads or writes it), so the map-ref drop can
+    /// happen after the lock is released without any allocation inside the critical section.
+    next: ?*Entry = null,
 };
 
 pub const Cache = struct {
@@ -55,9 +69,10 @@ pub const Cache = struct {
         self.mutex.unlock();
     }
 
-    /// Drop the given reference; the LAST holder frees the entry.
+    /// Drop the given reference; the LAST holder frees the entry (arena + owned key).
     fn unref(self: *Cache, e: *Entry) void {
         if (e.refs.fetchSub(1, .acq_rel) == 1) {
+            if (e.key.len != 0) self.gpa.free(e.key);
             e.arena.deinit();
             self.gpa.destroy(e);
         }
@@ -65,23 +80,33 @@ pub const Cache = struct {
 
     /// Bump the generation and detach every entry. In-flight borrowers keep theirs
     /// alive via their own ref; the map's refs are dropped outside the lock.
+    ///
+    /// The critical section is allocation-free: entries are threaded onto an intrusive
+    /// list via `Entry.next` (plain pointer writes) instead of being pushed into a heap
+    /// ArrayList, and both the map keys and the entry arenas are freed only after the
+    /// lock is released. `clearRetainingCapacity` keeps the map's buckets, so publishing
+    /// after an invalidation never reallocates the table under the lock either. This
+    /// removes the alloc-under-spinlock latency/contention hazard and any risk of a
+    /// re-entrant allocator deadlocking while the cache lock is held.
     pub fn invalidate(self: *Cache) void {
-        var dropped: std.ArrayList(*Entry) = .empty;
-        defer dropped.deinit(self.gpa);
         self.lockC();
         self.generation +%= 1;
-        var it = self.map.iterator();
-        while (it.next()) |kv| {
-            self.gpa.free(kv.key_ptr.*);
-            dropped.append(self.gpa, kv.value_ptr.*) catch {
-                // OOM collecting the drop list: free this one under the lock instead.
-                self.unref(kv.value_ptr.*);
-                continue;
-            };
+        var detached: ?*Entry = null;
+        var it = self.map.valueIterator();
+        while (it.next()) |vp| {
+            const e = vp.*;
+            e.next = detached;
+            detached = e;
         }
         self.map.clearRetainingCapacity();
         self.unlockC();
-        for (dropped.items) |e| self.unref(e);
+        // Outside the lock: drop the map's ref on each detached entry. The last holder
+        // (here if there are no in-flight borrowers) frees the arena + key.
+        while (detached) |e| {
+            detached = e.next;
+            e.next = null;
+            self.unref(e);
+        }
     }
 
     /// Hit path: O(1) lookup + ref bump under the spinlock. null on miss.
@@ -106,6 +131,7 @@ pub const Cache = struct {
             self.gpa.free(key);
             return false;
         };
+        e.key = key; // the entry now owns the key buffer it is mapped under
         _ = e.refs.fetchAdd(1, .acq_rel); // the map's reference
         return true;
     }
@@ -236,6 +262,89 @@ test "colcache: a load that raced an invalidation is NOT published (generation g
     try testing.expect(!cache.publish(stale_gen, "posts", e));
     cache.unref(e);
     try testing.expect(cache.acquire("posts") == null); // nothing stale was cached
+}
+
+test "colcache: concurrent lease/invalidate/release stress (no UAF, no leak)" {
+    // N threads allocate/free THROUGH the cache concurrently (key dupes in publish, entry
+    // frees in unref). `std.testing.allocator` is a DebugAllocator whose `thread_safe`
+    // config defaults to `!single_threaded`, i.e. it is mutex-guarded in the (multi-threaded)
+    // test build — so this exercises the cache's OWN locking, not a racy allocator, while
+    // still catching leaks at scope exit and any use-after-free / double-free the cache
+    // might commit.
+    var cache = Cache.init(testing.allocator);
+    defer cache.deinit();
+
+    const n_threads = 8;
+
+    // Each thread gets its OWN sqlite connection (mirrors the production reader pool). Built
+    // single-threaded here so collection provisioning never races; the connections are then
+    // only READ concurrently.
+    var setup_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer setup_arena.deinit();
+    var dbs: [n_threads]db.Db = undefined;
+    var opened: usize = 0;
+    defer for (dbs[0..opened]) |*d| d.close();
+    while (opened < n_threads) : (opened += 1) dbs[opened] = try testDbWithPosts(setup_arena.allocator());
+
+    const Worker = struct {
+        cache: *Cache,
+        conn: *db.Db,
+        seed: u64,
+        failed: *std.atomic.Value(bool),
+
+        fn run(self: @This()) void {
+            var prng = std.Random.DefaultPrng.init(self.seed);
+            const rnd = prng.random();
+            var i: usize = 0;
+            while (i < 4000) : (i += 1) {
+                if (rnd.uintLessThan(u8, 8) == 0) {
+                    self.cache.invalidate();
+                    continue;
+                }
+                const want_posts = rnd.boolean();
+                const name: []const u8 = if (want_posts) "posts" else "nope";
+                // fallback_alloc is unused on the cached path (misses load into the entry's
+                // own arena, hits reuse it), so any allocator works here.
+                var l = lease(self.cache, self.conn, std.heap.page_allocator, name) catch {
+                    self.failed.store(true, .seq_cst);
+                    continue;
+                };
+                defer l.release();
+                // Touch the borrowed, immutable snapshot: a wrongly-freed/reused entry would
+                // surface here as a content mismatch (or a crash under a sanitizer).
+                if (want_posts) {
+                    if (l.col == null or !std.mem.eql(u8, l.col.?.name, "posts")) self.failed.store(true, .seq_cst);
+                } else {
+                    if (l.col != null) self.failed.store(true, .seq_cst);
+                }
+            }
+        }
+    };
+
+    var failed = std.atomic.Value(bool).init(false);
+    var threads: [n_threads]std.Thread = undefined;
+    var spawned: usize = 0;
+    while (spawned < n_threads) : (spawned += 1) {
+        threads[spawned] = try std.Thread.spawn(.{}, Worker.run, .{Worker{
+            .cache = &cache,
+            .conn = &dbs[spawned],
+            .seed = @as(u64, spawned) *% 0x9e3779b97f4a7c15 +% 1,
+            .failed = &failed,
+        }});
+    }
+    for (threads[0..spawned]) |t| t.join();
+    try testing.expect(!failed.load(.seq_cst));
+
+    // Deterministic invalidation-correctness check on the just-hammered cache: a lease taken
+    // AFTER an invalidate must observe a fresh entry (not the detached one). Holding `held`
+    // pins its address so the pointer comparison can't be fooled by an allocator reusing it.
+    var held = try lease(&cache, &dbs[0], std.heap.page_allocator, "posts");
+    cache.invalidate();
+    var fresh = try lease(&cache, &dbs[0], std.heap.page_allocator, "posts");
+    try testing.expect(fresh.entry.? != held.entry.?);
+    try testing.expectEqualStrings("posts", fresh.col.?.name);
+    fresh.release();
+    held.release();
 }
 
 test "colcache: null cache falls back to a direct uncached load" {
