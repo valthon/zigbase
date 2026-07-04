@@ -588,7 +588,8 @@ Key points:
   writes.
 - Job allocations can use `ev.app.allocator` (the long-lived gpa) since there is no request
   arena here; free anything large yourself if the job runs often.
-- Scheduling is **single-process, UTC, minute-granularity**; cron is numeric-only. See
+- Scheduling is **single-process, UTC, minute-granularity**; cron fields accept numbers and
+  case-insensitive 3-letter `JAN`..`DEC` / `SUN`..`SAT` names. See
   [Framework → Scheduled jobs](./framework#7-scheduled-jobs-cron--jobs) and its caveats.
 
 ---

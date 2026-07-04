@@ -16,11 +16,41 @@ pub fn periodSeconds(iv: Interval) i64 {
     };
 }
 
-/// Does a single cron field match `value`? Supports `*`, `a`, `a,b,c`, `a-b`, `*/n`.
-/// Numeric only (no JAN/MON names); evaluated in UTC. `min`/`max` are accepted for
-/// signature symmetry. Parsing is best-effort: a malformed numeric sub-part is silently
-/// skipped (catch continue) rather than rejecting the whole field, so a typo'd field may
-/// match unexpectedly.
+/// Case-insensitive 3-letter month (`JAN`..`DEC` = 1..12) and day-of-week
+/// (`SUN`..`SAT` = 0..6) names, mirroring Vixie cron. The month and day name sets do
+/// not overlap, so a single combined lookup is unambiguous. Returns null for anything else.
+fn cronNameToNum(tok: []const u8) ?u32 {
+    // Every alias is exactly 3 chars — reject anything else before the linear scan.
+    if (tok.len != 3) return null;
+    const names = [_]struct { name: []const u8, num: u32 }{
+        .{ .name = "JAN", .num = 1 },  .{ .name = "FEB", .num = 2 },  .{ .name = "MAR", .num = 3 },
+        .{ .name = "APR", .num = 4 },  .{ .name = "MAY", .num = 5 },  .{ .name = "JUN", .num = 6 },
+        .{ .name = "JUL", .num = 7 },  .{ .name = "AUG", .num = 8 },  .{ .name = "SEP", .num = 9 },
+        .{ .name = "OCT", .num = 10 }, .{ .name = "NOV", .num = 11 }, .{ .name = "DEC", .num = 12 },
+        .{ .name = "SUN", .num = 0 },  .{ .name = "MON", .num = 1 },  .{ .name = "TUE", .num = 2 },
+        .{ .name = "WED", .num = 3 },  .{ .name = "THU", .num = 4 },  .{ .name = "FRI", .num = 5 },
+        .{ .name = "SAT", .num = 6 },
+    };
+    for (names) |entry| {
+        if (std.ascii.eqlIgnoreCase(tok, entry.name)) return entry.num;
+    }
+    return null;
+}
+
+/// Parse a cron sub-token as either a decimal number or a 3-letter name alias; null if neither.
+/// Numbers are tried first: they are by far the common case, and `nextFire` evaluates a field
+/// up to ~532k times (minute-by-minute over ~370 days), so a numeric token must not pay for a
+/// scan of the 19 name aliases.
+fn parseCronNum(tok: []const u8) ?u32 {
+    return (std.fmt.parseInt(u32, tok, 10) catch null) orelse cronNameToNum(tok);
+}
+
+/// Does a single cron field match `value`? Supports `*`, `a`, `a,b,c`, `a-b`, `*/n`, plus
+/// case-insensitive 3-letter month (`JAN`..`DEC`) / day-of-week (`SUN`..`SAT`) names in the
+/// bare and range forms (steps stay numeric). Evaluated in UTC. `min`/`max` are accepted for
+/// signature symmetry. Parsing is best-effort: an unparseable sub-part is silently skipped
+/// (catch continue) rather than rejecting the whole field, so a typo'd field may match
+/// unexpectedly.
 pub fn cronFieldMatches(field: []const u8, value: u32, min: u32, max: u32) bool {
     _ = min;
     _ = max;
@@ -33,12 +63,12 @@ pub fn cronFieldMatches(field: []const u8, value: u32, min: u32, max: u32) bool 
             continue;
         }
         if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
-            const lo = std.fmt.parseInt(u32, part[0..dash], 10) catch continue;
-            const hi = std.fmt.parseInt(u32, part[dash + 1 ..], 10) catch continue;
+            const lo = parseCronNum(part[0..dash]) orelse continue;
+            const hi = parseCronNum(part[dash + 1 ..]) orelse continue;
             if (value >= lo and value <= hi) return true;
             continue;
         }
-        const n = std.fmt.parseInt(u32, part, 10) catch continue;
+        const n = parseCronNum(part) orelse continue;
         if (n == value) return true;
     }
     return false;
@@ -87,7 +117,8 @@ fn cronMatchesAt(expr: []const u8, t: i64) bool {
 /// - reactive: null (handler return drives the next fire)
 /// - cron: next whole UTC minute matching the expression (searched up to ~370 days); null if none/invalid.
 ///
-/// Cron expressions are numeric-only (no JAN/MON names) and evaluated in UTC. Day-of-month
+/// Cron expressions accept case-insensitive 3-letter month (`JAN`..`DEC`) and day-of-week
+/// (`SUN`..`SAT`) names as well as numbers, and are evaluated in UTC. Day-of-month
 /// and day-of-week are ANDed (both must match); this differs from Vixie cron, which ORs them
 /// when one is `*`.
 pub fn nextFire(sched: Schedule, after_unix: i64) ?i64 {
@@ -144,4 +175,48 @@ test "nextFire cron: daily at 03:00 UTC" {
 test "nextFire cron: weekly on a specific weekday (Mon 00:00 UTC)" {
     // 2021-01-04 is a Monday (dow=1). 2021-01-03 23:59:00 UTC = 1609718340 ; next "0 0 * * 1" = 1609718400.
     try std.testing.expectEqual(@as(?i64, 1609718400), nextFire(.{ .cron = "0 0 * * 1" }, 1609718340));
+}
+
+test "cron month name aliases" {
+    try std.testing.expect(cronFieldMatches("JAN", 1, 1, 12));
+    try std.testing.expect(cronFieldMatches("DEC", 12, 1, 12));
+    try std.testing.expect(!cronFieldMatches("JAN", 2, 1, 12));
+    // case-insensitive
+    try std.testing.expect(cronFieldMatches("jan", 1, 1, 12));
+    try std.testing.expect(cronFieldMatches("Feb", 2, 1, 12));
+}
+
+test "cron day-of-week name aliases" {
+    try std.testing.expect(cronFieldMatches("SUN", 0, 0, 6));
+    try std.testing.expect(cronFieldMatches("MON", 1, 0, 6));
+    try std.testing.expect(cronFieldMatches("SAT", 6, 0, 6));
+}
+
+test "cron name ranges and lists" {
+    // MON-FRI matches 1..5, not 0 or 6.
+    var v: u32 = 0;
+    while (v <= 6) : (v += 1) {
+        const expect_match = v >= 1 and v <= 5;
+        try std.testing.expectEqual(expect_match, cronFieldMatches("MON-FRI", v, 0, 6));
+    }
+    try std.testing.expect(cronFieldMatches("JAN,JUL", 7, 1, 12));
+}
+
+test "cron steps stay numeric and unknown tokens are skipped" {
+    try std.testing.expect(cronFieldMatches("*/2", 4, 0, 59));
+    try std.testing.expect(!cronFieldMatches("FOO", 3, 0, 59));
+}
+
+test "nextFire cron: name-based month equals numeric equivalent" {
+    // "0 0 1 JAN *" must fire on the same instant as "0 0 1 1 *".
+    const after: i64 = 1609459200; // 2021-01-01 00:00:00 UTC
+    try std.testing.expectEqual(
+        nextFire(.{ .cron = "0 0 1 1 *" }, after),
+        nextFire(.{ .cron = "0 0 1 JAN *" }, after),
+    );
+    // And a name-based dow expr matches its numeric equivalent.
+    try std.testing.expectEqual(
+        nextFire(.{ .cron = "0 0 * * 1" }, 1609718340),
+        nextFire(.{ .cron = "0 0 * * MON" }, 1609718340),
+    );
 }
