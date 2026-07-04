@@ -3088,7 +3088,12 @@ mode, each asset carries a precomputed CRC32 content `ETag` and zigbase handles
 `If-None-Match`/304 itself. In **dir** mode (`--serve-static` or comptime `.dir`),
 `ETag`/`Last-Modified` and conditional-request handling (`If-None-Match`/`If-Range`) are
 delegated to facil.io's `sendFile` — using its own exact-match `ETag` semantics (an
-unquoted base64 size^mtime tag), not RFC 7232 list/weak comparison. All modes add
+unquoted base64 size^mtime tag), not RFC 7232 list/weak comparison. The Range-normalization
+shim also neutralizes an inverted `If-Range` branch in the vendored facil.io so a matching
+`If-Range` correctly resumes (`206`) instead of forcing a full `200` (RFC 9110 §13.1.5); a
+mismatched `If-Range` in dir mode still resumes (`206`) because facil.io's process-local
+`ETag` cannot be recomputed to detect the mismatch — owned record-file and **embedded**
+serving are fully RFC-correct on that corner. All modes add
 `X-Content-Type-Options: nosniff` and emit `Cache-Control` (see the knob below).
 
 Pick a mode at comptime with `.static_files`:

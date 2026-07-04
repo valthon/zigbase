@@ -46,9 +46,18 @@ ZigBase v0.9.0 is an early release. The gaps below are known and tracked for fut
   servable (404). Encoded traversal (`%2e%2e`) stays a literal — and harmless — path
   segment for the same reason.
 - No on-the-fly compression; pre-compress at the CDN or reverse proxy if needed.
-- In **dir** mode, conditional requests (`If-None-Match`/`If-Range`) use facil.io's
-  exact-match ETag semantics (an unquoted base64 size^mtime tag), not RFC 7232
-  list/weak comparison — self-consistent, and kept as-is by design (facil.io-first).
+- In **dir** mode, conditional requests (`If-None-Match`/`If-Range`) are delegated to
+  facil.io's `sendFile`, which uses its own exact-match ETag semantics (an unquoted
+  base64 size^mtime tag), not RFC 7232 list/weak comparison. A ranged request with a
+  **matching** `If-Range` correctly resumes (`206`) — zigbase neutralizes an inverted
+  branch in the vendored facil.io that otherwise deleted the `Range` on a match and
+  forced a full `200` (RFC 9110 §13.1.5). The one residual: a ranged request with a
+  **stale/mismatched** `If-Range` still returns `206` rather than the RFC-mandated full
+  `200`, because facil.io's dir-mode ETag is seeded from process-local (ASLR'd)
+  addresses and so cannot be recomputed and compared in zigbase's layer. **Owned** file
+  serving is fully RFC-correct here: record-file downloads (`/api/files/…`) and
+  **embedded** static assets mint and strong-compare their own `ETag`, so a mismatched
+  `If-Range` there ignores the `Range` and returns `200`.
 
 ## Postgres backend
 - **`verify-full` hostname checks match DNS names only.** Dialing an IP literal under the default `sslmode=verify-full` generally fails hostname verification even when the certificate carries an iPAddress SAN — connect by DNS name, or use `sslmode=verify-ca` on an otherwise-trusted path. Client certificates (mTLS), CRL/OCSP, and SCRAM channel binding (`SCRAM-SHA-256-PLUS`) are not supported.
