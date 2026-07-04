@@ -16,7 +16,6 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
         return (ApiError{ .status = 403, .message = "Superuser only." }).toResponse(ctx.allocator);
 
     var root: std.json.ObjectMap = .empty;
-    defer root.deinit(ctx.allocator);
     try root.put(ctx.allocator, "connections", .{ .integer = @intCast(conn.connectionCount()) });
     try root.put(ctx.allocator, "max_connections", .{ .integer = @intCast(conn.MAX_CONNECTIONS) });
     try root.put(ctx.allocator, "max_subs", .{ .integer = @intCast(conn.MAX_SUBS) });
