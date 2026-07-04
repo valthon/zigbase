@@ -25,8 +25,12 @@ def _su_template_for(binary):
     tmpl = _su_templates.get(binary)
     if tmpl is None:
         tmpl = tempfile.mkdtemp(prefix="zb_tmpl_")
-        subprocess.run([binary, "superuser", "create", "--email", "admin@x.io",
-                        "--password", "adminpassword", "--data-dir", tmpl], check=True)
+        try:
+            subprocess.run([binary, "superuser", "create", "--email", "admin@x.io",
+                            "--password", "adminpassword", "--data-dir", tmpl], check=True)
+        except Exception:
+            shutil.rmtree(tmpl, ignore_errors=True)
+            raise
         _su_templates[binary] = tmpl
     return tmpl
 
