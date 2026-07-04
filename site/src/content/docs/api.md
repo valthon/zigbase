@@ -1090,6 +1090,11 @@ File-type fields hold uploaded files.
 - **Upload:** files are submitted via `multipart/form-data` on record create (`POST
   .../records`) or update (`PATCH .../records/:id`), alongside the other field values.
 - **Serve:** `GET /api/files/:col/:rec/:name`.
+- **Admin config:** `GET /api/files/config` — **superuser-only**, read-only
+  storage backend info for the admin UI: `{ "backend": "local" | "s3", ... }`
+  (S3 adds `bucket`/`region`/`endpoint`/`key_prefix`; local adds `dir`).
+  Non-secret only — never exposes the S3 access key id / secret. `401`
+  unauthenticated, `403` non-superuser.
 
 ### Access
 

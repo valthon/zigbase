@@ -250,6 +250,7 @@ test {
     _ = @import("api/sessions.zig");
     _ = @import("api/oauth.zig");
     _ = @import("api/files.zig");
+    _ = @import("api/files_config.zig");
     _ = @import("api/settings.zig");
     _ = @import("api/features.zig");
     _ = @import("api/state.zig");
@@ -276,6 +277,7 @@ test {
     _ = @import("files/naming.zig");
     _ = @import("files/mime.zig");
     _ = @import("files/storage.zig");
+    _ = @import("files/info.zig");
     _ = @import("files/plan.zig");
     _ = @import("files/multipart.zig");
     _ = @import("files/serve_file.zig");

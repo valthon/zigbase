@@ -50,4 +50,6 @@ export const API = {
   removeSuppression: (id) => api('DELETE', `/collections/_suppressions/records/${encodeURIComponent(id)}`),
   batches: (q) => api('GET', `/collections/_mail_batches/records?${q}`),
   batchRecipients: (q) => api('GET', `/collections/_mail_batch_recipients/records?${q}`),
+  filesConfig: () => api('GET', '/files/config'),
+  uploadFile: (col, id, formData) => api('PATCH', `/collections/${encodeURIComponent(col)}/records/${encodeURIComponent(id)}`, formData, true),
 };

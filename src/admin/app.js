@@ -3,6 +3,7 @@ import { API } from '/_/assets/lib/api.js';
 import { go } from '/_/assets/lib/ui.js';
 import { RecordsTable, SchemaEditor } from '/_/assets/views/collections.js';
 import { EmailView } from '/_/assets/views/email.js';
+import { FilesView } from '/_/assets/views/files.js';
 import { FeaturesView } from '/_/assets/views/features.js';
 import { SettingsView } from '/_/assets/views/settings.js';
 import { UsersView } from '/_/assets/views/users.js';
@@ -25,6 +26,7 @@ function parseRoute(hash) {
   if (seg[0] === 'features') return { name: 'features' };
   if (seg[0] === 'users') return { name: 'users' };
   if (seg[0] === 'email') return { name: 'email' };
+  if (seg[0] === 'files') return { name: 'files' };
   if (seg[0] === 'collections' && seg[1] && seg[2] === 'records') return { name: 'records', col: decodeURIComponent(seg[1]) };
   if (seg[0] === 'collections' && seg[1]) return { name: 'schema', col: decodeURIComponent(seg[1]) };
   return { name: 'collections' };
@@ -89,6 +91,7 @@ function Shell({ route }) {
         <div class="spacer"></div>
         <a class=${'navitem hide-collapsed' + (route.name === 'users' ? ' active' : '')} href="#/users" data-test="nav-users">👤 Users</a>
         <a class=${'navitem hide-collapsed' + (route.name === 'email' ? ' active' : '')} href="#/email" data-test="nav-email">📧 Email</a>
+        <a class=${'navitem hide-collapsed' + (route.name === 'files' ? ' active' : '')} href="#/files" data-test="nav-files">📁 Files</a>
         <a class=${'navitem hide-collapsed' + (route.name === 'features' ? ' active' : '')} href="#/features" data-test="nav-features">🚩 Features</a>
         <a class=${'navitem hide-collapsed' + (route.name === 'settings' ? ' active' : '')} href="#/settings" data-test="nav-settings">⚙ Settings</a>
         <a class="navitem hide-collapsed" href="#/collections" data-test="nav-collections">⚙ Collections</a>
@@ -97,6 +100,7 @@ function Shell({ route }) {
       <div class="main">
         ${route.name === 'users' ? html`<${UsersView}/>`
           : route.name === 'email' ? html`<${EmailView}/>`
+          : route.name === 'files' ? html`<${FilesView}/>`
           : route.name === 'features' ? html`<${FeaturesView}/>`
           : route.name === 'settings' ? html`<${SettingsView}/>`
           : route.name === 'records' ? html`<${RecordsTable} col=${route.col}/>`

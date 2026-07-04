@@ -18,6 +18,7 @@ const webauthn_register_api = @import("api/webauthn_register.zig");
 const oauth_api = @import("api/oauth.zig");
 const sessions_api = @import("api/sessions.zig");
 const files_api = @import("api/files.zig");
+const files_config_api = @import("api/files_config.zig");
 const settings_api = @import("api/settings.zig");
 const features_api = @import("api/features.zig");
 const state_api = @import("api/state.zig");
@@ -139,6 +140,7 @@ pub fn Server(comptime gates: Gates) type {
                 // (router.tryDispatch requires an exact method match) and 404s before the handler runs.
                 .{ .method = .HEAD, .pattern = "/api/files/:col/:rec/:name", .handler = files_api.serve },
                 .{ .method = .POST, .pattern = "/api/files/token", .handler = files_api.token },
+                .{ .method = .GET, .pattern = "/api/files/config", .handler = files_config_api.get },
                 // Realtime SSE uplink (#188): auth/subscribe/unsubscribe verbs for an EventSource stream.
                 // Always registered — realtime (WS + SSE) is not an optional gated subsystem; the clientId
                 // is a stream-delivered capability, so unknown/expired/closed ids 404 (non-oracle).
