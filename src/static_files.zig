@@ -479,20 +479,29 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
     if (!withinRoot(real_root, real_full)) return null;
     // §A.2 shim: normalize the Range header against the size of the file facil.io
     // WILL serve — mirroring its .gz sidecar probe (http.c:449-470: Accept-Encoding
-    // contains "gzip" -> stat "<path>.gz") — then keep delegating. If-Range ORDERING
-    // is preserved: the shim only edits the header VALUE — facil.io still compares
-    // If-Range against ITS OWN etag itself. NOTE (corrected, deferred from Task 4):
-    // the vendored facil.io deletes the Range header on an If-Range MATCH (http.c
-    // ~511-517) — itself non-RFC (RFC 9110 says honor Range on a match, ignore it on
-    // a mismatch) — not on a mismatch. Either way a REWRITE is always safe: on a match
-    // the Range header is dropped so our rewritten value never reaches facil.io's
-    // parser at all; on a mismatch (or when If-Range is absent) facil.io processes the
-    // Range value as usual, and that's the rewritten canonical form. Only the OWNED
-    // 416 is gated on If-Range being ABSENT: with one present we cannot know whether
-    // facil.io is about to drop the Range entirely (a match), so an unsatisfiable form
-    // then passes through untouched (facil.io's 200 — today's behavior for that corner).
+    // contains "gzip" -> stat "<path>.gz") — then keep delegating. The shim only edits
+    // request-header VALUES; facil.io still assembles the 206/Content-Range itself.
     const raw_range = ctx.header("range") orelse "";
     if (raw_range.len > 0) {
+        // #192 / RFC 9110 §13.1.5: the vendored facil.io If-Range branch is INVERTED
+        // (http.c ~511-517) — it DELETES the Range header (forcing a wrong full 200) when
+        // If-Range MATCHES the current ETag, and honors the Range (206) when it does NOT.
+        // RFC says the opposite: a MATCH honors the Range (resume the transfer, 206); a
+        // MISMATCH ignores it (the client's cached partial is stale, so 200). We cannot
+        // recompute facil.io's dir-mode ETag to do the strong comparison ourselves — it is
+        // seeded from ASLR'd function-pointer addresses (facil.io fio.h FIO_HASH_FN over
+        // &fiobj_each2/&fiobj_free_complex_object), so it is non-reproducible outside the
+        // process and even changes across restarts. Instead we BLANK If-Range before
+        // delegating, which forces facil.io down its "no If-Range" else-branch — the one
+        // that always HONORS a present Range. Net effect: the resume/MATCH case now
+        // correctly yields 206 (the reported bug); the MISMATCH case is byte-identical to
+        // today (facil.io already served 206 there). The residual RFC gap (a MISMATCH
+        // should suppress the Range -> full 200) is undetectable here for the same
+        // non-reproducible-ETag reason and is noted in KNOWN_LIMITATIONS; it IS fully
+        // correct on the OWNED paths (record files, embedded static) where zigbase mints
+        // and strong-compares its own ETag (files/serve_file.zig plan()).
+        const had_if_range = ctx.header("if-range") != null;
+        if (had_if_range) ctx.setRequestHeader("if-range", "");
         var size = st.size;
         if (ctx.header("accept-encoding")) |ae| {
             if (std.mem.indexOf(u8, ae, "gzip") != null and !std.mem.endsWith(u8, full, ".gz")) {
@@ -504,7 +513,12 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
         }
         if (try normalizeRange(ctx.allocator, raw_range, size)) |norm| switch (norm) {
             .rewrite => |v| ctx.setRequestHeader("range", v),
-            .unsatisfiable => if (ctx.header("if-range") == null) {
+            // If-Range originally ABSENT: facil.io is guaranteed to process the range, so
+            // answer the unsatisfiable form with the owned 416 it cannot emit itself. If
+            // If-Range was originally PRESENT (now blanked): keep today's behavior and let
+            // facil.io serve its 200 for the unsatisfiable form (the MISMATCH-should-be-200
+            // corner already yields a non-206 there — see the note above).
+            .unsatisfiable => if (!had_if_range) {
                 // Tiny owned response — the one static status facil.io cannot emit.
                 const hs416 = try ctx.allocator.dupe(http.Header, &.{
                     .{ .name = "Content-Range", .value = try std.fmt.allocPrint(ctx.allocator, "bytes */{d}", .{size}) },
@@ -883,7 +897,16 @@ test "dir shim: open-ended Range is rewritten via setRequestHeader; unsatisfiabl
         var value_buf: [64]u8 = undefined;
         var name: []const u8 = "";
         var value: []const u8 = "";
+        // #192: the shim now ALSO blanks an If-Range header — record its set separately so
+        // a later "range" rewrite in the same call doesn't clobber the observation.
+        var if_range_buf: [64]u8 = undefined;
+        var if_range_set: ?[]const u8 = null;
         fn set(_: *anyopaque, n: []const u8, v: []const u8) void {
+            if (std.ascii.eqlIgnoreCase(n, "if-range")) {
+                if_range_set = if_range_buf[0..v.len];
+                @memcpy(if_range_buf[0..v.len], v);
+                return;
+            }
             name = name_buf[0..n.len];
             @memcpy(name_buf[0..n.len], n);
             value = value_buf[0..v.len];
@@ -916,18 +939,21 @@ test "dir shim: open-ended Range is rewritten via setRequestHeader; unsatisfiabl
     try std.testing.expectEqualStrings("Content-Range", r416.extra_headers[0].name);
     try std.testing.expectEqualStrings("bytes */1000", r416.extra_headers[0].value);
 
-    // If-Range present but MISMATCHED ("whatever" is not this file's etag): the
-    // REWRITE still happens — facil.io only deletes the Range header on an If-Range
-    // MATCH (see the shim's doc comment above), so on a mismatch it falls through to
-    // parsing Range as usual, and that's the rewritten canonical form...
+    // #192 / RFC 9110 §13.1.5: with an If-Range present, the shim BLANKS it (facil.io's
+    // If-Range branch is inverted; blanking forces facil.io's honor-range else-branch so a
+    // resume/MATCH correctly yields 206 instead of a wrong full 200). The Range rewrite
+    // still happens too.
     Capture.name = "";
     Capture.value = "";
+    Capture.if_range_set = null;
     const rh_ifr = [_]http.Param{ .{ .key = "range", .value = "bytes=200-" }, .{ .key = "if-range", .value = "\"whatever\"" } };
     var ctx_ifr = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh_ifr, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
     _ = (try serve(std.testing.io, &ctx_ifr, src, .{})).?;
     try std.testing.expectEqualStrings("bytes=200-999", Capture.value);
-    // ...but an UNSATISFIABLE range with If-Range present is passed through untouched
-    // (no owned 416 — facil.io may be about to ignore the Range entirely).
+    try std.testing.expectEqualStrings("", Capture.if_range_set.?); // If-Range blanked
+    // An UNSATISFIABLE range with If-Range present is still passed through to facil.io (no
+    // owned 416): today's behavior is preserved for that corner (facil.io serves its 200;
+    // the MISMATCH-should-be-200 case can't be distinguished — see the shim's doc comment).
     const rh_ifr_bad = [_]http.Param{ .{ .key = "range", .value = "bytes=5000-" }, .{ .key = "if-range", .value = "\"whatever\"" } };
     var ctx_ifr_bad = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh_ifr_bad, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
     const r_ifr_bad = (try serve(std.testing.io, &ctx_ifr_bad, src, .{})).?;

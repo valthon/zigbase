@@ -3202,7 +3202,11 @@ conditional-request handling (`If-None-Match`/`If-Range`) are managed by the
 underlying facil.io `sendFile` — using its own exact-match `ETag` semantics (an
 unquoted base64 size^mtime tag), not RFC 7232 list/weak comparison; zigbase adds
 `X-Content-Type-Options: nosniff` and the Range-normalization shim described above.
-`Cache-Control` is covered next.
+The shim also neutralizes an inverted `If-Range` branch in the vendored facil.io so a
+matching `If-Range` correctly resumes (`206`) instead of forcing a full `200` (RFC 9110
+§13.1.5); a mismatched `If-Range` in dir mode still resumes (`206`) because facil.io's
+process-local `ETag` cannot be recomputed to detect the mismatch — owned record-file and
+**embedded** serving are fully RFC-correct on that corner. `Cache-Control` is covered next.
 
 A hardcoded or `--serve-static` directory that is missing or unreadable at startup is
 a **fatal startup error** naming the path.

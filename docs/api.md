@@ -1168,8 +1168,14 @@ file delivery, use [file storage](#files) instead.
   zigbase itself. In **dir** mode, `ETag`/`Last-Modified`/`If-None-Match`/`If-Range`
   handling is delegated to facil.io's `sendFile`, which uses its own exact-match
   `ETag` semantics (an unquoted base64 size^mtime tag) rather than RFC 7232
-  list/weak comparison — self-consistent, and intentionally left as-is
-  (facil.io-first).
+  list/weak comparison. A ranged request with a *matching* `If-Range` resumes
+  (`206`); zigbase neutralizes an inverted branch in the vendored facil.io that
+  otherwise deleted the `Range` on a match and forced a full `200` (RFC 9110
+  §13.1.5). A *stale/mismatched* `If-Range` in dir mode still returns `206` rather
+  than the RFC-mandated `200` — facil.io's dir-mode `ETag` is process-local and
+  cannot be recomputed to distinguish the two cases. Owned serving (record-file
+  downloads and **embedded** static) is fully RFC-correct: a mismatched `If-Range`
+  there ignores the `Range` and returns `200`.
 - **`.gz` sidecar negotiation (dir mode):** if the request sends `Accept-Encoding`
   containing `gzip` and a `<file>.gz` sibling exists next to the matched `<file>`,
   the sidecar's bytes are served instead with `Content-Encoding: gzip` (facil.io's

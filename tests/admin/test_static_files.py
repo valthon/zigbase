@@ -349,6 +349,52 @@ def test_dir_static_range_seek_forms():
             proc.terminate(); proc.wait(timeout=5)
 
 
+def test_dir_static_if_range_resume():
+    """#192 / RFC 9110 §13.1.5: a dir-mode ranged request with a MATCHING If-Range must
+    resume (206), not restart (200). facil.io's vendored If-Range branch is inverted
+    (deletes Range on a match); the shim blanks If-Range before delegating so facil.io
+    honors the range. The MISMATCH case can't be distinguished from a match in dir mode
+    (facil.io's ETag is non-reproducible), so it stays a 206 — documented in
+    KNOWN_LIMITATIONS; full If-Range correctness lives on the owned record-file path
+    (see tests/admin/test_file_range.py::test_record_file_range_matrix)."""
+    binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
+    with tempfile.TemporaryDirectory() as static, tempfile.TemporaryDirectory() as data:
+        blob = bytes(range(256)) * 4  # 1024 recognizable bytes
+        (pathlib.Path(static) / "clip.bin").write_bytes(blob)
+        port = _free_port()
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--http-port", str(port), "--data-dir", data,
+             "--serve-static", static],
+            env={**os.environ, "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"},
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            _wait_up(f"{base}/api/health")
+            url = f"{base}/clip.bin"
+
+            # obtain facil.io's current ETag (the validator a resuming client echoes)
+            st, hdr, _ = _get(url)
+            assert st == 200
+            etag = _hdr(hdr, "etag")
+            assert etag, "dir-mode response should carry facil.io's ETag"
+
+            # MATCH: resume the transfer -> 206 with the requested window (the #192 fix;
+            # previously facil.io deleted the Range and returned a full 200)
+            st, hdr, body = _get(url, {"Range": "bytes=200-399", "If-Range": etag})
+            assert st == 206, f"matching If-Range must resume (206), got {st}"
+            assert body == blob[200:400]
+            assert _hdr(hdr, "Content-Range") == "bytes 200-399/1024"
+
+            # MISMATCH: stays a 206 in dir mode (documented residual — cannot distinguish
+            # a match from a mismatch without facil.io's non-reproducible ETag). This must
+            # at minimum NOT regress into the old wrong-200-on-match behavior.
+            st, _, body = _get(url, {"Range": "bytes=200-399", "If-Range": '"stale-etag"'})
+            assert st == 206
+            assert body == blob[200:400]
+        finally:
+            proc.terminate(); proc.wait(timeout=5)
+
+
 def test_static_cache_control_knob_flag_env_and_default():
     """§C.2 pin: --static-cache-control / ZIGBASE_STATIC_CACHE_CONTROL / their
     precedence (flag > env > the stock facil.io default), single header on the wire."""
