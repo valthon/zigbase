@@ -12,10 +12,38 @@ def _free_port():
 def binary():
     return resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
 
+# `superuser create` hashes the password with argon2id (deliberately CPU-slow),
+# and every per-test server fixture used to pay it fresh. Instead seed ONE
+# template data dir per binary (a single `data.db` with the superuser row — no
+# WAL/lock/JWT files, since it's only ever created, never served against) and
+# copytree it into each test's tempdir. `serve` then provisions collections as
+# normal per test. Keyed by binary path (the zigbase and auth2 builds differ);
+# memoized per worker process (each xdist worker builds its own once).
+_su_templates = {}
+
+def _su_template_for(binary):
+    tmpl = _su_templates.get(binary)
+    if tmpl is None:
+        tmpl = tempfile.mkdtemp(prefix="zb_tmpl_")
+        try:
+            subprocess.run([binary, "superuser", "create", "--email", "admin@x.io",
+                            "--password", "adminpassword", "--data-dir", tmpl], check=True)
+        except Exception:
+            shutil.rmtree(tmpl, ignore_errors=True)
+            raise
+        _su_templates[binary] = tmpl
+    return tmpl
+
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_su_templates():
+    yield
+    for p in _su_templates.values():
+        shutil.rmtree(p, ignore_errors=True)
+
 @pytest.fixture()
 def server(binary, request):
     data = tempfile.mkdtemp(prefix="zb_admin_")
-    subprocess.run([binary, "superuser", "create", "--email", "admin@x.io", "--password", "adminpassword", "--data-dir", data], check=True)
+    shutil.copytree(_su_template_for(binary), data, dirs_exist_ok=True)
     port = _free_port()
     extra_env = getattr(request, "param", None) or {}
     env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port), **extra_env}
@@ -33,14 +61,28 @@ def server(binary, request):
     finally:
         proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
 
-@pytest.fixture()
-def page(server):
+# Launching Chromium (~0.5s) once per test dominated the wall time of the (now
+# parallel) suite. Reuse ONE browser process per test session — under pytest-xdist
+# each worker is a separate process, so this is one Chromium per worker. Each test
+# still gets a fresh, isolated browser context (cookies/storage) + page, which is
+# cheap (~ms) to create.
+@pytest.fixture(scope="session")
+def _playwright():
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        ctx = browser.new_context(base_url=server)
-        pg = ctx.new_page()
-        yield pg
-        ctx.close(); browser.close()
+        yield pw
+
+@pytest.fixture(scope="session")
+def _browser(_playwright):
+    browser = _playwright.chromium.launch()
+    yield browser
+    browser.close()
+
+@pytest.fixture()
+def page(_browser, server):
+    ctx = _browser.new_context(base_url=server)
+    pg = ctx.new_page()
+    yield pg
+    ctx.close()
 
 
 # ---------------------------------------------------------------------------
@@ -88,8 +130,7 @@ def _wait_reachable_or_fail(proc, port, log_path, timeout_s=5.0):
 def auth2_server(auth2_binary):
     """A live table-mode server with the beforeAuthSuccess fixture hook registered."""
     data = tempfile.mkdtemp(prefix="zb_auth2_")
-    subprocess.run([auth2_binary, "superuser", "create", "--email", "admin@x.io",
-                    "--password", "adminpassword", "--data-dir", data], check=True)
+    shutil.copytree(_su_template_for(auth2_binary), data, dirs_exist_ok=True)
     port = _free_port()
     env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
     log_path = os.path.join(data, "server.log")
@@ -107,13 +148,11 @@ def auth2_server(auth2_binary):
         proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
 
 @pytest.fixture()
-def auth2_page(auth2_server):
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        ctx = browser.new_context(base_url=auth2_server)
-        pg = ctx.new_page()
-        yield pg
-        ctx.close(); browser.close()
+def auth2_page(_browser, auth2_server):
+    ctx = _browser.new_context(base_url=auth2_server)
+    pg = ctx.new_page()
+    yield pg
+    ctx.close()
 
 
 def login(page):
