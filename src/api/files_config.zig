@@ -16,7 +16,6 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
 
     const si = app.storage_info;
     var root: std.json.ObjectMap = .empty;
-    defer root.deinit(ctx.allocator);
     try root.put(ctx.allocator, "backend", .{ .string = if (si.backend == .s3) "s3" else "local" });
     if (si.backend == .s3) {
         try root.put(ctx.allocator, "bucket", .{ .string = si.bucket });
