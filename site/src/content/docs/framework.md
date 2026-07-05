@@ -2182,7 +2182,7 @@ Each `cron` spec needs `.name`, `.schedule`, and `.handler` (missing/wrong-typed
 error). The three schedule modes (`zigbase.schedule.Schedule`):
 
 ```zig
-.{ .cron = "0 3 * * *" }              // 5-field cron, UTC, numeric-only
+.{ .cron = "0 3 * * *" }              // 5-field cron, UTC, JAN/MON names ok
 .{ .interval = .hourly }              // also .daily / .weekly
 .{ .interval = .{ .minutes = 15 } }   // every N minutes
 .reactive                             // handler decides its own next fire
@@ -2220,8 +2220,9 @@ The scheduler is intentionally simple (see [Known limitations](./known-limitatio
 
 - **Single-process** — no distributed coordination.
 - **UTC** — all cron/interval evaluation is in UTC.
-- **Numeric-only cron** — no `JAN`/`MON` names; supports `*`, `a`, `a,b,c`, `a-b`, `*/n`. A
-  malformed numeric sub-part is silently skipped rather than rejected, so a typo'd field may
+- **Cron** — UTC, minute-granularity; supports `*`, `a`, `a,b,c`, `a-b`, `*/n`, and
+  case-insensitive 3-letter month (`JAN`..`DEC`) / day-of-week (`SUN`..`SAT`) names (steps stay
+  numeric). A malformed sub-part is silently skipped rather than rejected, so a typo'd field may
   match unexpectedly.
 - **Day-of-month and day-of-week are ANDed** (not Vixie cron's OR semantics).
 - **Minute granularity** — the smallest schedule resolution is one minute.

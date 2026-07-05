@@ -79,8 +79,10 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 - **Single-process only** — jobs run in the serving process; there is no distributed
   coordination.
-- **Cron is UTC, numeric-only** (no `JAN`/`MON` names), **minute-granularity**, and **ANDs
-  day-of-month with day-of-week** (unlike Vixie cron, which ORs them when one is `*`).
+- **Cron is UTC, minute-granularity**, and **ANDs
+  day-of-month with day-of-week** (unlike Vixie cron, which ORs them when one is `*`). Fields
+  accept case-insensitive 3-letter month (`JAN`..`DEC`) and day-of-week (`SUN`..`SAT`) names as
+  well as numbers.
 - **Interval jobs fire measured from completion**, so a long-running interval job drifts from
   a fixed wall-clock cadence. Runs never overlap (single-flight).
 - **`app.submit` and memory-queue jobs run on a small bounded in-process worker pool**
