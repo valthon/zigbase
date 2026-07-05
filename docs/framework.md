@@ -116,6 +116,7 @@ error.**
 | `analytics` | Product analytics: `.{ .rollups = .{ … } }` declares rollup specs, each producing a scheduled `_rollup:<name>` aggregation job; also gates the analytics read API. `ctx.track` always captures to `_events` regardless. | excluded — the rollup jobs and analytics read API exist only when `.analytics` is set. |
 | `static_routes` | Tier-2 comptime static rewrites: a list of `.{ .match = "/…", .serve = "/…" }` entries mapping request paths to fixed served paths/files. | data-only — lowers to an empty list when unset. |
 | `enable_spa_marker` | Tier-1 `.spa` marker enablement for static serving (issue #183). Default: on when `.static_routes` is absent/empty (byte-identical to the shipped binary), off when routes are declared; an explicit bool always wins. | always — a bool feeding core static-serving logic, not an optional subsystem. |
+| `collections_frozen` | Assert that collections do not change after boot + migrations (default `false`, issue #234). When `true`: the collection-metadata cache runs on **all** backends — including Postgres, where it is otherwise skipped because a concurrent instance could `ALTER` collections unseen — and the runtime collection create/update/delete endpoints return **403** (schema then evolves only via `.migrations` + a redeploy). | always — a standalone bool feeding core collection-metadata caching and the collection-DDL endpoints, not an optional subsystem. |
 | `static_cache_control` | Comptime default `Cache-Control` for static responses (embedded + dir). Runtime `--static-cache-control` / `ZIGBASE_STATIC_CACHE_CONTROL` override it; unset → facil.io's stock `max-age=3600`. | data-only — a `?[]const u8` default feeding core static serving, not an optional subsystem. |
 | `admin` | `.admin = .disabled` removes the embedded admin SPA (route dispatch **and** the ~58 KiB of `@embedFile`-d assets) from your binary — useful for headless/embedded consumers. Default: served at `/_/`. | excluded, opt-**out** — the admin SPA ships by default; set `.admin = .disabled` to exclude it (the only key in this table where "unset" means *included*). |
 | `webhooks` | `.webhooks = true` registers the built-in `"webhook"` job kind, compiling in `ctx.webhook()`'s managed outbound delivery (`webhook.zig`, ~689 LOC). Default: off, so a consumer that never sends managed webhooks pays nothing for it. See [`ctx.webhook()`](#ctxwebhook--managed-outbound-webhooks-144). | excluded — off by default; `webhook.zig` is not compiled in unless `.webhooks = true`. |
@@ -3561,6 +3562,31 @@ never-served dotfile.
 
 See [examples/blog/](../examples/blog/) (runtime flag), [examples/golfsim/](../examples/golfsim/)
 (hardcoded dir), and [examples/plugins/](../examples/plugins/) (embedded).
+
+### `collections_frozen` — cache collection metadata on every backend
+
+`.collections_frozen = true` asserts that your collections do not change after boot +
+migrations. The framework parses each collection's schema/indexes/options JSON on the
+record and realtime paths; a small in-process cache (`colcache`) keeps the parsed
+`Collection` so those reads skip the re-parse. By default that cache is installed **only
+for SQLite** (a single process, so the DDL endpoints' in-process invalidation is
+complete). On Postgres it is skipped: a *second* instance could `ALTER` a collection
+without this process noticing, so reads stay direct rather than risk serving stale
+metadata.
+
+Freezing removes that hazard by contract. When set, ZigBase:
+
+- installs the collection-metadata cache on **every** backend, including Postgres — safe
+  because nothing mutates collections after boot: provisioning + `.migrations` run before
+  serving, and
+- rejects the runtime collection **create/update/delete** endpoints with **403** (they
+  never fire the cache's invalidation, so the snapshot stays coherent for the process
+  lifetime).
+
+Schema then evolves the way a frozen app expects: edit your comptime `.collections` /
+add a `.migrations` entry and **redeploy**. Reads (`GET` collection, `list`) are
+unaffected. Leave it `false` (the default) if you rely on the admin UI / API to change
+collections at runtime.
 
 ## 14. Test / dev-mode determinism seams
 

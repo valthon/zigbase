@@ -58,6 +58,15 @@ fn requireSuperuser(ctx: *http.RequestCtx) ?http.Response {
         ApiError.internal().toResponse(ctx.allocator) catch unreachable;
 }
 
+/// Frozen-collection-metadata mode (issue #234): when `app.collections_frozen` is set the
+/// runtime collection-DDL endpoints are categorically disabled (schema evolves via
+/// `.migrations` + a redeploy). Returns a 403 response to short-circuit; null when not frozen.
+fn rejectIfFrozen(ctx: *http.RequestCtx, app: *app_mod.App) ?http.Response {
+    if (!app.collections_frozen) return null;
+    return (ApiError{ .status = 403, .message = "Collections are frozen (`.collections_frozen`); schema changes require a migration and a redeploy." }).toResponse(ctx.allocator) catch
+        ApiError.internal().toResponse(ctx.allocator) catch unreachable;
+}
+
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     const verrs = collections.last_errors orelse &[_]schema.ValidationError{};
     const fes = try ctx.allocator.alloc(FieldError, verrs.len);
@@ -85,6 +94,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
 pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     if (requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
+    if (rejectIfFrozen(ctx, app)) |resp| return resp;
     const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
         return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
     // Fail-closed: can't create an encrypted field with no field key configured
@@ -119,6 +129,7 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
 pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     if (requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
+    if (rejectIfFrozen(ctx, app)) |resp| return resp;
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
         return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
@@ -143,6 +154,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     if (requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
+    if (rejectIfFrozen(ctx, app)) |resp| return resp;
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
@@ -224,6 +236,62 @@ test "create then get then list a collection over handlers" {
     try std.testing.expectEqual(@as(u16, 200), lres.status);
     try std.testing.expect(std.mem.startsWith(u8, lres.body, "{\"items\":["));
     try std.testing.expect(std.mem.indexOf(u8, lres.body, "\"posts\"") != null);
+}
+
+test "collections_frozen 403s the runtime DDL endpoints without mutating collections (#234)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+
+    // Seed a collection while NOT frozen — the default path is unchanged.
+    {
+        const body =
+            \\{"name":"posts","fields":[{"id":"","name":"title","type":"text","options":{}}]}
+        ;
+        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        cctx.authorization = auth_hdr;
+        try std.testing.expectEqual(@as(u16, 201), (try create(&cctx)).status);
+    }
+    const count_before = (try collections.list(a, env.pool.acquireWriter())).len;
+    env.pool.releaseWriter();
+
+    // Freeze: every runtime collection-DDL endpoint must now 403.
+    env.app.collections_frozen = true;
+
+    {
+        const body =
+            \\{"name":"comments","fields":[{"id":"","name":"body","type":"text","options":{}}]}
+        ;
+        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        cctx.authorization = auth_hdr;
+        const res = try create(&cctx);
+        try std.testing.expectEqual(@as(u16, 403), res.status);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, "collections_frozen") != null);
+    }
+    {
+        const body =
+            \\{"name":"posts","fields":[{"id":"","name":"title","type":"text","options":{}},{"id":"","name":"extra","type":"text","options":{}}]}
+        ;
+        var uctx = ctxFor(env, a, .PUT, "/api/collections/posts", body, &.{.{ .key = "idOrName", .value = "posts" }});
+        uctx.authorization = auth_hdr;
+        try std.testing.expectEqual(@as(u16, 403), (try update(&uctx)).status);
+    }
+    {
+        var dctx = ctxFor(env, a, .DELETE, "/api/collections/posts", "", &.{.{ .key = "idOrName", .value = "posts" }});
+        dctx.authorization = auth_hdr;
+        try std.testing.expectEqual(@as(u16, 403), (try delete(&dctx)).status);
+    }
+
+    // Nothing changed: same collection count, and reads (get/list) still work while frozen.
+    const count_after = (try collections.list(a, env.pool.acquireWriter())).len;
+    env.pool.releaseWriter();
+    try std.testing.expectEqual(count_before, count_after);
+    var gctx = ctxFor(env, a, .GET, "/api/collections/posts", "", &.{.{ .key = "idOrName", .value = "posts" }});
+    gctx.authorization = auth_hdr;
+    try std.testing.expectEqual(@as(u16, 200), (try get(&gctx)).status);
 }
 
 test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
