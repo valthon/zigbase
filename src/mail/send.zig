@@ -59,6 +59,11 @@ pub const MailMessage = struct {
     /// Set by the framework's bulk item handler (or via `ctx.mail().unsubscribeUrl` for
     /// hand-rolled list mail). Transactional mail must NOT carry it.
     list_unsubscribe: ?[]const u8 = null,
+    /// Optional file attachments (#219), lowered onto `Email.attachments`. `&.{}` (the default)
+    /// keeps the message single-part / `multipart/alternative` exactly as before. Each attachment's
+    /// `filename`/`content_type` is CRLF-checked by `validate`; the assembled size (base64-expanded)
+    /// is bounded by `.mail.max_message_bytes` at both `send` and `enqueue` (`error.MailTooLarge`).
+    attachments: []const mailer.Attachment = &.{},
 };
 
 pub const MailError = error{
@@ -69,6 +74,9 @@ pub const MailError = error{
     InvalidAddress,
     /// Neither `text` nor `html` was provided (an empty message has nothing to send).
     EmptyBody,
+    /// The assembled message (body + attachments at their base64-expanded size) would exceed the
+    /// configured `.mail.max_message_bytes` cap (#219). Checked at both `send` and `enqueue`.
+    MailTooLarge,
 };
 
 /// Reject control chars (CR/LF/NUL and the rest of 0x00–0x1F + 0x7F) — the same
@@ -110,6 +118,33 @@ pub fn validate(msg: MailMessage) MailError!void {
     if (msg.from) |fr| try validateAddress(fr);
     if (msg.account) |acct| try checkHeader(acct);
     if (msg.list_unsubscribe) |lu| try checkHeader(lu);
+    // Attachment metadata is header-bound (Content-Type / Content-Disposition) — CRLF-check it up
+    // front so a bad attachment fails at the call site, before a job is ever persisted.
+    for (msg.attachments) |att| {
+        try checkHeader(att.filename);
+        try checkHeader(att.content_type);
+    }
+}
+
+/// Conservatively estimate the assembled on-the-wire message size in bytes: the subject, both body
+/// parts, and every attachment at its BASE64-EXPANDED size (⌈len/3⌉·4) plus its header metadata.
+/// Used to enforce `.mail.max_message_bytes`. An over-estimate is fine — the cap is a guardrail, not
+/// an exact byte budget, and it must reject BEFORE a 13 MiB base64 blob is built or persisted.
+fn estimatedSize(msg: MailMessage) usize {
+    var n: usize = msg.subject.len;
+    if (msg.text) |t| n += t.len;
+    if (msg.html) |h| n += h.len;
+    for (msg.attachments) |att| {
+        n += att.filename.len + att.content_type.len + 128; // + a slack allowance for MIME headers
+        n += (att.data.len / 3 + 1) * 4; // base64 expansion
+    }
+    return n;
+}
+
+/// Reject a message whose estimated assembled size exceeds `max_bytes` (#219). Pure — so it guards
+/// both the synchronous `send` and `enqueue` before any bytes are built or a job is persisted.
+pub fn checkSize(msg: MailMessage, max_bytes: usize) MailError!void {
+    if (estimatedSize(msg) > max_bytes) return error.MailTooLarge;
 }
 
 /// Lower a validated `MailMessage` to a `mail.Email` (the backend wire type).
@@ -122,6 +157,7 @@ fn toEmail(msg: MailMessage) Email {
         .reply_to = msg.reply_to,
         .from = msg.from,
         .list_unsubscribe = msg.list_unsubscribe,
+        .attachments = msg.attachments,
     };
 }
 
@@ -156,6 +192,7 @@ fn enforce(app: *App, alloc: std.mem.Allocator, conn: *db.Db, msg: MailMessage) 
 /// A real backend failure propagates so it is never silently dropped.
 pub fn send(app: *App, alloc: std.mem.Allocator, msg: MailMessage) !void {
     try validate(msg);
+    try checkSize(msg, app.mail.max_message_bytes);
     if (msg.html) |h| {
         if (h.len > gmail_clip_warn_bytes) std.log.warn(
             "mail: html body to {s} is {d} bytes (>100KB); Gmail clips ~102KB — the message may be truncated for recipients",
@@ -345,6 +382,72 @@ test "send blocks a suppressed recipient when check_suppression is on (fail clos
     }));
     // A different recipient is fine (no mailer wired → log fallback, no error).
     try send(&env.app, std.testing.allocator, .{ .to = "ok@example.com", .subject = "Hi", .text = "body", .account = "acc1" });
+}
+
+test "validate rejects CRLF in an attachment filename/content_type (#219)" {
+    try testing.expectError(error.HeaderInjection, validate(.{
+        .to = "u@x.io",
+        .subject = "s",
+        .text = "b",
+        .attachments = &.{.{ .filename = "evil\r\nX: 1", .content_type = "text/plain", .data = "x" }},
+    }));
+    try testing.expectError(error.HeaderInjection, validate(.{
+        .to = "u@x.io",
+        .subject = "s",
+        .text = "b",
+        .attachments = &.{.{ .filename = "ok.txt", .content_type = "text/plain\x00", .data = "x" }},
+    }));
+}
+
+test "checkSize rejects an over-cap message and accepts one within the cap (#219)" {
+    // 9 bytes of data → 12 base64 bytes + ~128 header slack + subject/body — well over a 10-byte cap.
+    const big = MailMessage{ .to = "u@x.io", .subject = "s", .text = "b", .attachments = &.{.{ .filename = "a.bin", .content_type = "application/octet-stream", .data = "123456789" }} };
+    try testing.expectError(error.MailTooLarge, checkSize(big, 10));
+    // The default 10 MiB cap comfortably admits the same message.
+    try checkSize(big, 10 * 1024 * 1024);
+    // An attachment-free message under the cap is fine.
+    try checkSize(.{ .to = "u@x.io", .subject = "s", .text = "b" }, 1024);
+}
+
+test "toEmail carries attachments onto the backend Email (#219)" {
+    const e = toEmail(.{ .to = "u@x.io", .subject = "s", .text = "t", .attachments = &.{.{ .filename = "a.ics", .content_type = "text/calendar", .data = "X" }} });
+    try testing.expectEqual(@as(usize, 1), e.attachments.len);
+    try testing.expectEqualStrings("a.ics", e.attachments[0].filename);
+    // Default: no attachments.
+    const e2 = toEmail(.{ .to = "u@x.io", .subject = "s", .text = "t" });
+    try testing.expectEqual(@as(usize, 0), e2.attachments.len);
+}
+
+test "MailMessage JSON round-trip preserves attachments as base64 in the queue payload (#219)" {
+    const a = testing.allocator;
+    const msg = MailMessage{
+        .to = "user@example.com",
+        .subject = "Invite",
+        .text = "See attached.",
+        .attachments = &.{.{ .filename = "invite.ics", .content_type = "text/calendar", .data = "BEGIN\x00\xffEND" }},
+    };
+    const json = try std.json.Stringify.valueAlloc(a, msg, .{});
+    defer a.free(json);
+    // The durable row carries base64, not raw binary.
+    try testing.expect(std.mem.indexOf(u8, json, "\"data_b64\":\"") != null);
+
+    const parsed = try std.json.parseFromSlice(MailMessage, a, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.value.attachments.len);
+    try testing.expectEqualStrings("invite.ics", parsed.value.attachments[0].filename);
+    try testing.expectEqualStrings("text/calendar", parsed.value.attachments[0].content_type);
+    try testing.expectEqualStrings("BEGIN\x00\xffEND", parsed.value.attachments[0].data);
+}
+
+test "send rejects an over-cap message loudly (#219)" {
+    var env = try EnforceEnv.init(.{ .max_message_bytes = 32 });
+    defer env.deinit();
+    try testing.expectError(error.MailTooLarge, send(&env.app, std.testing.allocator, .{
+        .to = "user@example.com",
+        .subject = "Invite",
+        .text = "See attached.",
+        .attachments = &.{.{ .filename = "invite.ics", .content_type = "text/calendar", .data = "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n" }},
+    }));
 }
 
 test "an oversized html body warns but still sends (never an error)" {

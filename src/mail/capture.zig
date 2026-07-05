@@ -24,6 +24,13 @@ fn lockMutex(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
 }
 
+/// One captured attachment (owned copies of the fields, freed with its `Captured`).
+pub const CapturedAttachment = struct {
+    filename: []u8,
+    content_type: []u8,
+    data: []u8,
+};
+
 /// One captured outbound message (owned copies of the fields, freed in `deinit`).
 pub const Captured = struct {
     from: []u8,
@@ -33,6 +40,7 @@ pub const Captured = struct {
     html: ?[]u8,
     reply_to: ?[]u8,
     list_unsubscribe: ?[]u8,
+    attachments: []CapturedAttachment,
 };
 
 /// A `Mailer` backend that records messages in memory. NOT thread-safe across concurrent worker
@@ -47,16 +55,25 @@ pub const CaptureMailer = struct {
         return .{ .alloc = alloc };
     }
 
-    pub fn deinit(self: *CaptureMailer) void {
-        for (self.messages.items) |m| {
-            self.alloc.free(m.from);
-            self.alloc.free(m.to);
-            self.alloc.free(m.subject);
-            self.alloc.free(m.text);
-            if (m.html) |h| self.alloc.free(h);
-            if (m.reply_to) |rt| self.alloc.free(rt);
-            if (m.list_unsubscribe) |lu| self.alloc.free(lu);
+    /// Free every owned copy in a captured message (fields + attachments).
+    fn freeCaptured(self: *CaptureMailer, m: Captured) void {
+        self.alloc.free(m.from);
+        self.alloc.free(m.to);
+        self.alloc.free(m.subject);
+        self.alloc.free(m.text);
+        if (m.html) |h| self.alloc.free(h);
+        if (m.reply_to) |rt| self.alloc.free(rt);
+        if (m.list_unsubscribe) |lu| self.alloc.free(lu);
+        for (m.attachments) |att| {
+            self.alloc.free(att.filename);
+            self.alloc.free(att.content_type);
+            self.alloc.free(att.data);
         }
+        self.alloc.free(m.attachments);
+    }
+
+    pub fn deinit(self: *CaptureMailer) void {
+        for (self.messages.items) |m| self.freeCaptured(m);
         self.messages.deinit(self.alloc);
     }
 
@@ -92,6 +109,27 @@ pub const CaptureMailer = struct {
         errdefer if (reply_to_copy) |rt| self.alloc.free(rt);
         const list_unsubscribe_copy: ?[]u8 = if (email.list_unsubscribe) |lu| try self.alloc.dupe(u8, lu) else null;
         errdefer if (list_unsubscribe_copy) |lu| self.alloc.free(lu);
+        // Deep-copy attachments. On any partial failure, free the copies made so far (each of the
+        // three sub-slices per attachment, then the outer array) so `record` leaks nothing.
+        const atts = try self.alloc.alloc(CapturedAttachment, email.attachments.len);
+        var filled: usize = 0;
+        errdefer {
+            for (atts[0..filled]) |att| {
+                self.alloc.free(att.filename);
+                self.alloc.free(att.content_type);
+                self.alloc.free(att.data);
+            }
+            self.alloc.free(atts);
+        }
+        for (email.attachments, 0..) |src, i| {
+            const fn_copy = try self.alloc.dupe(u8, src.filename);
+            errdefer self.alloc.free(fn_copy);
+            const ct_copy = try self.alloc.dupe(u8, src.content_type);
+            errdefer self.alloc.free(ct_copy);
+            const data_copy = try self.alloc.dupe(u8, src.data);
+            atts[i] = .{ .filename = fn_copy, .content_type = ct_copy, .data = data_copy };
+            filled = i + 1;
+        }
         try self.messages.append(self.alloc, .{
             .from = from_copy,
             .to = to_copy,
@@ -100,6 +138,7 @@ pub const CaptureMailer = struct {
             .html = html_copy,
             .reply_to = reply_to_copy,
             .list_unsubscribe = list_unsubscribe_copy,
+            .attachments = atts,
         });
     }
 
@@ -141,15 +180,7 @@ pub const CaptureMailer = struct {
     pub fn clear(self: *CaptureMailer) void {
         lockMutex(&self.mutex);
         defer self.mutex.unlock();
-        for (self.messages.items) |m| {
-            self.alloc.free(m.from);
-            self.alloc.free(m.to);
-            self.alloc.free(m.subject);
-            self.alloc.free(m.text);
-            if (m.html) |h| self.alloc.free(h);
-            if (m.reply_to) |rt| self.alloc.free(rt);
-            if (m.list_unsubscribe) |lu| self.alloc.free(lu);
-        }
+        for (self.messages.items) |m| self.freeCaptured(m);
         self.messages.clearRetainingCapacity();
     }
 };
@@ -198,6 +229,7 @@ test "CaptureMailer records sends without a network and is assertable" {
         .html_body = "<b>hi</b>",
         .reply_to = "support@zigbase.dev",
         .list_unsubscribe = "https://app.example/u?t=1",
+        .attachments = &.{.{ .filename = "invite.ics", .content_type = "text/calendar", .data = "BEGIN:VCALENDAR" }},
     });
     try testing.expectEqual(@as(usize, 1), cap.count());
     const last = cap.last().?;
@@ -207,6 +239,10 @@ test "CaptureMailer records sends without a network and is assertable" {
     try testing.expectEqualStrings("<b>hi</b>", last.html.?);
     try testing.expectEqualStrings("support@zigbase.dev", last.reply_to.?);
     try testing.expectEqualStrings("https://app.example/u?t=1", last.list_unsubscribe.?);
+    try testing.expectEqual(@as(usize, 1), last.attachments.len);
+    try testing.expectEqualStrings("invite.ics", last.attachments[0].filename);
+    try testing.expectEqualStrings("text/calendar", last.attachments[0].content_type);
+    try testing.expectEqualStrings("BEGIN:VCALENDAR", last.attachments[0].data);
 
     try m.send(testing.io, testing.allocator, .{
         .to = "user2@example.com",
@@ -222,9 +258,10 @@ test "CaptureMailer records sends without a network and is assertable" {
     try testing.expectEqual(@as(usize, 2), cap.countTo("user@example.com"));
     try testing.expectEqual(@as(usize, 1), cap.countTo("user2@example.com"));
     try testing.expectEqual(@as(usize, 0), cap.countTo("nobody@example.com"));
-    // The freshly-added messages carry no reply_to/list_unsubscribe.
+    // The freshly-added messages carry no reply_to/list_unsubscribe/attachments.
     try testing.expect(cap.all()[1].reply_to == null);
     try testing.expect(cap.all()[1].list_unsubscribe == null);
+    try testing.expectEqual(@as(usize, 0), cap.all()[1].attachments.len);
 
     cap.clear();
     try testing.expectEqual(@as(usize, 0), cap.count());

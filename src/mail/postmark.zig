@@ -95,6 +95,25 @@ pub fn buildBody(alloc: std.mem.Allocator, from: []const u8, message_stream: []c
         try obj.put(a, "Headers", .{ .array = hdrs });
     }
 
+    if (email.attachments.len > 0) {
+        // Postmark's native attachment shape (#219): an `Attachments` array of
+        // `{ Name, Content: base64(data), ContentType }` — no raw-MIME round-trip needed.
+        var atts = std.json.Array.init(a);
+        for (email.attachments) |att| {
+            try mailer_mod.rejectControlChars(att.filename);
+            try mailer_mod.rejectControlChars(att.content_type);
+            const enc = std.base64.standard.Encoder;
+            const b64 = try a.alloc(u8, enc.calcSize(att.data.len));
+            _ = enc.encode(b64, att.data);
+            var o: std.json.ObjectMap = .empty;
+            try o.put(a, "Name", .{ .string = att.filename });
+            try o.put(a, "Content", .{ .string = b64 });
+            try o.put(a, "ContentType", .{ .string = att.content_type });
+            try atts.append(.{ .object = o });
+        }
+        try obj.put(a, "Attachments", .{ .array = atts });
+    }
+
     const json = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = obj }, .{});
     return alloc.dupe(u8, json);
 }
@@ -170,5 +189,45 @@ test "buildBody rejects CRLF in list_unsubscribe" {
         .subject = "S",
         .text_body = "b",
         .list_unsubscribe = "https://x/u?t=1\r\nBcc: e@v.io",
+    }));
+}
+
+test "buildBody emits an Attachments array with base64 Content when attachments are present (#219)" {
+    const a = testing.allocator;
+    const ics = "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n";
+    const body = try buildBody(a, "n@a.com", "", .{
+        .to = "u@x.io",
+        .subject = "Invite",
+        .text_body = "See attached.",
+        .attachments = &.{.{ .filename = "invite.ics", .content_type = "text/calendar", .data = ics }},
+    });
+    defer a.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Attachments\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Name\":\"invite.ics\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"ContentType\":\"text/calendar\"") != null);
+    // The Content is the base64 of the .ics bytes.
+    const enc = std.base64.standard.Encoder;
+    const expect_b64 = try a.alloc(u8, enc.calcSize(ics.len));
+    defer a.free(expect_b64);
+    _ = enc.encode(expect_b64, ics);
+    const needle = try std.fmt.allocPrint(a, "\"Content\":\"{s}\"", .{expect_b64});
+    defer a.free(needle);
+    try testing.expect(std.mem.indexOf(u8, body, needle) != null);
+}
+
+test "buildBody omits Attachments when there are none (byte-identical)" {
+    const a = testing.allocator;
+    const body = try buildBody(a, "n@a.com", "", .{ .to = "u@x.io", .subject = "S", .text_body = "b" });
+    defer a.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "Attachments") == null);
+}
+
+test "buildBody rejects CRLF in an attachment filename/content_type (#219)" {
+    const a = testing.allocator;
+    try testing.expectError(error.HeaderInjection, buildBody(a, "n@a.com", "", .{
+        .to = "u@x.io",
+        .subject = "S",
+        .text_body = "b",
+        .attachments = &.{.{ .filename = "evil\r\nX: 1", .content_type = "text/plain", .data = "x" }},
     }));
 }

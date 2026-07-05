@@ -32,6 +32,70 @@ pub const Email = struct {
     /// injection surface stays closed. Set automatically by the bulk item handler when
     /// `unsubscribe_base_url` is configured; transactional `send()` NEVER sets it.
     list_unsubscribe: ?[]const u8 = null,
+    /// Optional file attachments (#219). `&.{}` (the default) keeps existing callers byte-for-byte
+    /// unchanged: `buildMessage` emits exactly today's single-part / `multipart/alternative` body.
+    /// When non-empty, `buildMessage` wraps that body in a `multipart/mixed` and appends one
+    /// base64-encoded part per attachment (the SES/Postmark HTTP providers use their native
+    /// attachment shapes). Each `filename`/`content_type` is CRLF/control-char checked. NOT for
+    /// `cid:` inline images — these are download attachments (the canonical use is a `.ics` invite).
+    attachments: []const Attachment = &.{},
+};
+
+/// A single file attachment (#219). `data` is the RAW bytes (any content — text or binary); the
+/// builders base64-encode it for the wire. `filename`/`content_type` are header-bound and
+/// CRLF/control-char checked before they reach any backend.
+///
+/// The JSON wire form (used by the durable `"mail"` queue row) base64-encodes `data` so binary
+/// attachments survive a round-trip through a JSON string — the custom `jsonStringify`/`jsonParse`
+/// below emit/consume `{ "filename", "content_type", "data_b64" }`.
+pub const Attachment = struct {
+    filename: []const u8,
+    content_type: []const u8,
+    data: []const u8,
+
+    /// Serialize with `data` base64-encoded into a `data_b64` string. Streams the base64 straight
+    /// to the underlying writer in 3 KiB input chunks (a multiple of 3 → no mid-stream padding) so a
+    /// 10 MiB attachment never needs a 13 MiB scratch allocation. The base64 alphabet (A–Z a–z 0–9
+    /// + / =) needs no JSON escaping, so raw string emission is safe.
+    pub fn jsonStringify(self: Attachment, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("filename");
+        try jw.write(self.filename);
+        try jw.objectField("content_type");
+        try jw.write(self.content_type);
+        try jw.objectField("data_b64");
+        try jw.beginWriteRaw();
+        try jw.writer.writeAll("\"");
+        const enc = std.base64.standard.Encoder;
+        var out_buf: [4096]u8 = undefined; // 3072 in → 4096 out
+        var i: usize = 0;
+        while (i < self.data.len) {
+            const end = @min(i + 3072, self.data.len);
+            const encoded = enc.encode(out_buf[0..enc.calcSize(end - i)], self.data[i..end]);
+            try jw.writer.writeAll(encoded);
+            i = end;
+        }
+        try jw.writer.writeAll("\"");
+        jw.endWriteRaw();
+        try jw.endObject();
+    }
+
+    /// Parse the `{ filename, content_type, data_b64 }` wire form, base64-decoding `data_b64` back
+    /// into raw `data` on `allocator` (the parse arena). Decode failures surface as
+    /// `error.UnexpectedToken` (a `ParseError` member) so a corrupt row fails the job cleanly.
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Attachment {
+        const Wire = struct {
+            filename: []const u8,
+            content_type: []const u8,
+            data_b64: []const u8,
+        };
+        const w = try std.json.innerParse(Wire, allocator, source, options);
+        const dec = std.base64.standard.Decoder;
+        const n = dec.calcSizeForSlice(w.data_b64) catch return error.UnexpectedToken;
+        const out = try allocator.alloc(u8, n);
+        dec.decode(out, w.data_b64) catch return error.UnexpectedToken;
+        return .{ .filename = w.filename, .content_type = w.content_type, .data = out };
+    }
 };
 
 /// Pluggable, backend-agnostic mailer. Mirrors the `Storage` vtable pattern in
@@ -525,6 +589,12 @@ pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, emai
     try checkHeaderField(email.subject);
     if (email.reply_to) |rt| try checkHeaderField(rt);
     if (email.list_unsubscribe) |lu| try checkHeaderField(lu);
+    // Attachment metadata rides in headers (Content-Type / Content-Disposition), so CRLF-reject it
+    // like every other header-bound value — a newline in a filename would forge extra MIME headers.
+    for (email.attachments) |att| {
+        try checkHeaderField(att.filename);
+        try checkHeaderField(att.content_type);
+    }
     const date = rfc5322Date(now_unix);
 
     // Common headers shared by every body shape. `Reply-To` is emitted only when set.
@@ -546,22 +616,67 @@ pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, emai
     );
     defer alloc.free(head);
 
+    // The BODY PART — the `Content-Type: …\r\n\r\n<content>` block (text/plain, text/html, or the
+    // multipart/alternative), built once and reused whether or not attachments wrap it.
+    const body_part = try buildBodyPart(alloc, io, email);
+    defer alloc.free(body_part);
+
+    if (email.attachments.len == 0) {
+        // No attachments → head + body-part is EXACTLY the pre-#219 output (byte-for-byte).
+        return std.fmt.allocPrint(alloc, "{s}{s}", .{ head, body_part });
+    }
+
+    // Attachments → wrap the body-part in a multipart/mixed, then one base64 part per attachment.
+    // The OUTER boundary is independently RANDOM (96 bits via `io.random`) and carries a distinct
+    // `_mixed` suffix so it can never collide with the inner `_part` alternative boundary — a
+    // guessable/shared boundary would let a sender emit `--<boundary>` lines and forge MIME parts.
+    var rnd: [12]u8 = undefined;
+    io.random(&rnd);
+    const rhex = std.fmt.bytesToHex(rnd, .lower);
+    var bbuf: [48]u8 = undefined;
+    const outer = std.fmt.bufPrint(&bbuf, "=_zigbase_{s}_mixed", .{rhex}) catch unreachable;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    const opener = try std.fmt.allocPrint(
+        alloc,
+        "{s}Content-Type: multipart/mixed; boundary=\"{s}\"\r\n\r\n--{s}\r\n",
+        .{ head, outer, outer },
+    );
+    defer alloc.free(opener);
+    try out.appendSlice(alloc, opener);
+    try out.appendSlice(alloc, body_part);
+    try out.appendSlice(alloc, "\r\n");
+    for (email.attachments) |att| {
+        const part_hdr = try std.fmt.allocPrint(
+            alloc,
+            "--{s}\r\nContent-Type: {s}\r\nContent-Disposition: attachment; filename=\"{s}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n",
+            .{ outer, att.content_type, att.filename },
+        );
+        defer alloc.free(part_hdr);
+        try out.appendSlice(alloc, part_hdr);
+        try appendBase64Wrapped(&out, alloc, att.data);
+        try out.appendSlice(alloc, "\r\n");
+    }
+    const closing = try std.fmt.allocPrint(alloc, "--{s}--\r\n", .{outer});
+    defer alloc.free(closing);
+    try out.appendSlice(alloc, closing);
+    return out.toOwnedSlice(alloc);
+}
+
+/// Build the body-part block — `Content-Type: …\r\n\r\n<content>` — for the message body, in one of
+/// the three shapes (single text/plain, single text/html, or multipart/alternative). This is the
+/// exact byte sequence that used to follow `head` directly in `buildMessage`, factored out so it can
+/// either follow `head` as-is (no attachments) or be wrapped as the first multipart/mixed part.
+fn buildBodyPart(alloc: std.mem.Allocator, io: std.Io, email: Email) ![]u8 {
     const html = email.html_body;
     if (html == null) {
         // Original single-part text/plain form (byte-compatible with pre-#141 output).
-        return std.fmt.allocPrint(
-            alloc,
-            "{s}Content-Type: text/plain; charset=utf-8\r\n\r\n{s}",
-            .{ head, email.text_body },
-        );
+        return std.fmt.allocPrint(alloc, "Content-Type: text/plain; charset=utf-8\r\n\r\n{s}", .{email.text_body});
     }
     if (email.text_body.len == 0) {
         // HTML-only: a single text/html part.
-        return std.fmt.allocPrint(
-            alloc,
-            "{s}Content-Type: text/html; charset=utf-8\r\n\r\n{s}",
-            .{ head, html.? },
-        );
+        return std.fmt.allocPrint(alloc, "Content-Type: text/html; charset=utf-8\r\n\r\n{s}", .{html.?});
     }
     // Both parts: multipart/alternative, text first (least-rich), HTML last (most-rich),
     // per RFC 2046 §5.1.4 (clients render the LAST part they understand). The boundary is RANDOM
@@ -575,12 +690,29 @@ pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, emai
     const boundary = std.fmt.bufPrint(&bbuf, "=_zigbase_{s}_part", .{rhex}) catch unreachable;
     return std.fmt.allocPrint(
         alloc,
-        "{s}Content-Type: multipart/alternative; boundary=\"{s}\"\r\n\r\n" ++
+        "Content-Type: multipart/alternative; boundary=\"{s}\"\r\n\r\n" ++
             "--{s}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{s}\r\n" ++
             "--{s}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{s}\r\n" ++
             "--{s}--\r\n",
-        .{ head, boundary, boundary, email.text_body, boundary, html.?, boundary },
+        .{ boundary, boundary, email.text_body, boundary, html.?, boundary },
     );
+}
+
+/// Append `data` as base64, hard-wrapped at 76 columns with CRLF line endings (RFC 2045 §6.8). A
+/// final CRLF after the last line is the caller's job (it appends the part terminator). Encodes the
+/// whole payload once onto `alloc` (freed here) then slices it into 76-char lines.
+fn appendBase64Wrapped(out: *std.ArrayList(u8), alloc: std.mem.Allocator, data: []const u8) !void {
+    const enc = std.base64.standard.Encoder;
+    const buf = try alloc.alloc(u8, enc.calcSize(data.len));
+    defer alloc.free(buf);
+    _ = enc.encode(buf, data);
+    var i: usize = 0;
+    while (i < buf.len) {
+        const end = @min(i + 76, buf.len);
+        try out.appendSlice(alloc, buf[i..end]);
+        try out.appendSlice(alloc, "\r\n");
+        i = end;
+    }
 }
 
 const Rfc5322DateBuf = [31]u8;
@@ -751,6 +883,109 @@ test "buildMessage rejects CRLF in the list_unsubscribe URL (header injection)" 
     }, 0));
 }
 
+test "buildMessage with no attachments is byte-identical across all body shapes (regression)" {
+    // With `attachments = &.{}` (the default), the output must equal what the pre-#219 builder
+    // produced for each of the four shapes. We assert it against a freshly-built no-attachment
+    // message that pins the exact bytes (the boundary is random, so we compare structure the same
+    // way the existing tests do — but crucially the presence of the empty `attachments` field must
+    // NOT introduce multipart/mixed or change any byte of the single/alternative forms).
+    const a = std.testing.allocator;
+
+    // text/plain single part.
+    const plain = try buildMessage(a, std.testing.io, "n@a.io", .{ .to = "u@x.io", .subject = "S", .text_body = "body", .attachments = &.{} }, 1704067200);
+    defer a.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "multipart") == null);
+    try std.testing.expect(std.mem.endsWith(u8, plain, "\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nbody"));
+
+    // text/html single part.
+    const htmlonly = try buildMessage(a, std.testing.io, "n@a.io", .{ .to = "u@x.io", .subject = "S", .text_body = "", .html_body = "<p>x</p>" }, 0);
+    defer a.free(htmlonly);
+    try std.testing.expect(std.mem.indexOf(u8, htmlonly, "multipart") == null);
+    try std.testing.expect(std.mem.endsWith(u8, htmlonly, "\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>x</p>"));
+
+    // multipart/alternative — still ONLY alternative, no mixed wrapper.
+    const alt = try buildMessage(a, std.testing.io, "n@a.io", .{ .to = "u@x.io", .subject = "S", .text_body = "t", .html_body = "<b>h</b>" }, 0);
+    defer a.free(alt);
+    try std.testing.expect(std.mem.indexOf(u8, alt, "multipart/mixed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, alt, "multipart/alternative; boundary=\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, alt, "--\r\n"));
+}
+
+test "buildMessage wraps the body in multipart/mixed and appends a base64 .ics part" {
+    const a = std.testing.allocator;
+    const ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nSUMMARY:Tee time\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const msg = try buildMessage(a, std.testing.io, "n@a.io", .{
+        .to = "user@example.com",
+        .subject = "Your appointment",
+        .text_body = "See the invite.",
+        .html_body = "<p>See the invite.</p>",
+        .attachments = &.{.{ .filename = "appointment.ics", .content_type = "text/calendar; charset=utf-8; method=REQUEST", .data = ics }},
+    }, 1704067200);
+    defer a.free(msg);
+
+    // Outer multipart/mixed wraps an inner multipart/alternative.
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Content-Type: multipart/mixed; boundary=\"") != null);
+    const mixed_at = std.mem.indexOf(u8, msg, "multipart/mixed").?;
+    const alt_at = std.mem.indexOf(u8, msg, "multipart/alternative").?;
+    try std.testing.expect(mixed_at < alt_at);
+    // The attachment part carries the disposition + transfer-encoding headers.
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Content-Type: text/calendar; charset=utf-8; method=REQUEST\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Content-Disposition: attachment; filename=\"appointment.ics\"\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Content-Transfer-Encoding: base64\r\n") != null);
+
+    // The base64 payload must DECODE back to the exact .ics bytes. Extract the base64 block that
+    // follows the attachment part header (up to the next boundary line).
+    const after = std.mem.indexOf(u8, msg, "Content-Transfer-Encoding: base64\r\n\r\n").? + "Content-Transfer-Encoding: base64\r\n\r\n".len;
+    const rest = msg[after..];
+    const term = std.mem.indexOf(u8, rest, "\r\n--").?; // next boundary
+    // Strip the CRLF line wraps before decoding.
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(a);
+    var it = std.mem.splitSequence(u8, rest[0..term], "\r\n");
+    while (it.next()) |line| try joined.appendSlice(a, line);
+    const dec = std.base64.standard.Decoder;
+    const n = try dec.calcSizeForSlice(joined.items);
+    const decoded = try a.alloc(u8, n);
+    defer a.free(decoded);
+    try dec.decode(decoded, joined.items);
+    try std.testing.expectEqualStrings(ics, decoded);
+
+    // Closing boundary terminates the message.
+    try std.testing.expect(std.mem.endsWith(u8, msg, "_mixed--\r\n"));
+}
+
+test "buildMessage rejects CRLF/control chars in an attachment filename or content_type" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, std.testing.io, "n@a.io", .{
+        .to = "u@x.io",
+        .subject = "S",
+        .text_body = "b",
+        .attachments = &.{.{ .filename = "evil\r\nX-Injected: 1", .content_type = "text/plain", .data = "x" }},
+    }, 0));
+    try std.testing.expectError(error.HeaderInjection, buildMessage(a, std.testing.io, "n@a.io", .{
+        .to = "u@x.io",
+        .subject = "S",
+        .text_body = "b",
+        .attachments = &.{.{ .filename = "ok.txt", .content_type = "text/plain\r\nEvil: 1", .data = "x" }},
+    }, 0));
+}
+
+test "Attachment JSON wire form base64-encodes data and round-trips" {
+    const a = std.testing.allocator;
+    const att = Attachment{ .filename = "a.ics", .content_type = "text/calendar", .data = "hi\x00\xff there" };
+    const json = try std.json.Stringify.valueAlloc(a, att, .{});
+    defer a.free(json);
+    // Raw binary is NOT emitted verbatim — it is base64 under `data_b64`.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"data_b64\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"filename\":\"a.ics\"") != null);
+
+    const parsed = try std.json.parseFromSlice(Attachment, a, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a.ics", parsed.value.filename);
+    try std.testing.expectEqualStrings("text/calendar", parsed.value.content_type);
+    try std.testing.expectEqualStrings("hi\x00\xff there", parsed.value.data);
+}
+
 test "rfc5322Date formats a known epoch" {
     // 0 == Thu, 01 Jan 1970 00:00:00 +0000
     const d = rfc5322Date(0);
@@ -806,6 +1041,36 @@ test "CommandMailer pipes the serialized message to the child and accepts exit 0
     try std.testing.expect(std.mem.indexOf(u8, captured, "\r\nTo: user@example.com\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "\r\nSubject: Verify your email\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, captured, "\r\n\r\nYour token: abc123"));
+}
+
+test "CommandMailer pipes an attachment (multipart/mixed) verbatim — SMTP/Command inherit #219 free" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var rand_bytes: [8]u8 = undefined;
+    io.random(&rand_bytes);
+    var name_buf: [64]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&name_buf, "zb-cmdmailer-att-{x}.eml", .{std.mem.readInt(u64, &rand_bytes, .little)});
+    defer cwd.deleteFile(io, rel) catch {};
+    const script = try std.fmt.allocPrint(a, "cat > '{s}'", .{rel});
+    defer a.free(script);
+
+    var cm = CommandMailer.init(&.{ "/bin/sh", "-c", script }, "noreply@zigbase.dev");
+    const m = cm.mailer();
+    try m.send(io, a, .{
+        .to = "user@example.com",
+        .subject = "Invite",
+        .text_body = "See attached.",
+        .attachments = &.{.{ .filename = "appointment.ics", .content_type = "text/calendar", .data = "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n" }},
+    });
+
+    const captured = try cwd.readFileAlloc(io, rel, a, .limited(64 * 1024));
+    defer a.free(captured);
+    // The piped bytes ARE buildMessage's output — so the attachment part rides through unchanged.
+    try std.testing.expect(std.mem.indexOf(u8, captured, "Content-Type: multipart/mixed; boundary=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "Content-Disposition: attachment; filename=\"appointment.ics\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "Content-Transfer-Encoding: base64\r\n") != null);
 }
 
 test "CommandMailer surfaces a non-zero child exit as an error" {

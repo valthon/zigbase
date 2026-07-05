@@ -1211,8 +1211,8 @@ pub fn App(comptime cfg: anytype) type {
             for (std.meta.fields(MC)) |f| {
                 const ok = std.mem.eql(u8, f.name, "require_verified_sender") or
                     std.mem.eql(u8, f.name, "check_suppression") or std.mem.eql(u8, f.name, "webhook_secret") or
-                    std.mem.eql(u8, f.name, "unsubscribe_base_url");
-                if (!ok) @compileError(".mail: unknown key '." ++ f.name ++ "' (recognized: .require_verified_sender, .check_suppression, .webhook_secret, .unsubscribe_base_url)");
+                    std.mem.eql(u8, f.name, "unsubscribe_base_url") or std.mem.eql(u8, f.name, "max_message_bytes");
+                if (!ok) @compileError(".mail: unknown key '." ++ f.name ++ "' (recognized: .require_verified_sender, .check_suppression, .webhook_secret, .unsubscribe_base_url, .max_message_bytes)");
             }
             var rt = mail_cfg.Runtime{};
             if (@hasField(MC, "require_verified_sender")) rt.require_verified_sender = mc.require_verified_sender;
@@ -1227,6 +1227,10 @@ pub fn App(comptime cfg: anytype) type {
                         @compileError(".mail.unsubscribe_base_url must not contain whitespace or control characters");
                 }
                 rt.unsubscribe_base_url = u;
+            }
+            if (@hasField(MC, "max_message_bytes")) {
+                if (mc.max_message_bytes == 0) @compileError(".mail.max_message_bytes must be > 0");
+                rt.max_message_bytes = mc.max_message_bytes;
             }
             break :blk rt;
         };

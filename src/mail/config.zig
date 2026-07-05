@@ -29,6 +29,13 @@ pub const Runtime = struct {
     /// default-off pattern as `webhook_secret`). Set the comptime `.mail` key or the
     /// ZIGBASE_UNSUBSCRIBE_BASE_URL env var (env wins).
     unsubscribe_base_url: []const u8 = "",
+    /// Total-message size cap in bytes for a single outbound mail, INCLUDING attachments at their
+    /// base64-expanded size (#219). A `send`/`enqueue` whose assembled size would exceed this is
+    /// rejected loudly with `error.MailTooLarge` at the call site — never a silent truncation.
+    /// Default 10 MiB: comfortably above transactional mail plus a calendar invite, and at/under the
+    /// common provider hard limits (SES v2 and Postmark both cap a message near 10 MiB). Set the
+    /// comptime `.mail.max_message_bytes` key to raise or lower it.
+    max_message_bytes: usize = 10 * 1024 * 1024,
 
     /// True when any send-time enforcement (verified sender or suppression) is active. Lets the send
     /// path skip acquiring a reader entirely when nothing is enabled (zero-cost on the default path).
@@ -43,6 +50,7 @@ test "Runtime defaults are the fully-off back-compat path" {
     try std.testing.expect(!r.check_suppression);
     try std.testing.expectEqualStrings("", r.webhook_secret);
     try std.testing.expectEqualStrings("", r.unsubscribe_base_url);
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), r.max_message_bytes);
     try std.testing.expect(!r.enforces());
 }
 
