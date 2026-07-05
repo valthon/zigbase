@@ -134,6 +134,13 @@ pub const Config = struct {
     vapid_public_key: []const u8 = "",
     vapid_private_key: []const u8 = "",
 
+    // Twilio SMS (#224). When all three are set, the default SMS provider plugin resolves to
+    // TwilioSender; otherwise it resolves to LogSmsSender (logs the message — no network, no
+    // credentials needed for dev/CI). Secrets are ENV only (like SMTP), never comptime.
+    twilio_account_sid: []const u8 = "", // "" = use LogSmsSender; set (with token+from) = TwilioSender
+    twilio_auth_token: []const u8 = "",
+    twilio_from: []const u8 = "", // the Twilio sender number (E.164, e.g. +15551234567)
+
     // DEV-ONLY frozen clock (`ZIGBASE_FAKE_NOW`, an ISO-8601 UTC instant). Resolved to unix
     // seconds here so serveImpl can `clock.install` it. ALWAYS null on a production build —
     // `clock.resolveFromEnv` is comptime-gated off when the `dev_clock` build option is false,
@@ -210,6 +217,9 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_SENDMAIL_COMMAND")) |v| cfg.sendmail_command = v;
         if (getter.get("ZIGBASE_VAPID_PUBLIC_KEY")) |v| cfg.vapid_public_key = v;
         if (getter.get("ZIGBASE_VAPID_PRIVATE_KEY")) |v| cfg.vapid_private_key = v;
+        if (getter.get("ZIGBASE_TWILIO_ACCOUNT_SID")) |v| cfg.twilio_account_sid = v;
+        if (getter.get("ZIGBASE_TWILIO_AUTH_TOKEN")) |v| cfg.twilio_auth_token = v;
+        if (getter.get("ZIGBASE_TWILIO_FROM")) |v| cfg.twilio_from = v;
         // Dev-only frozen clock. resolveFromEnv is comptime-gated off on a prod build, so this
         // is always null there regardless of the env var.
         cfg.fake_now_unix = clock.resolveFromEnv(getter.get(clock.env_var));

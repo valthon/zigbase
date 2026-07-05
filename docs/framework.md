@@ -111,6 +111,8 @@ error.**
 | `tenancy` | Multi-tenant account scoping: `.{ .enabled = true, .auth_collection = "...", .resolver = ..., .roles = .{...} }`. | excluded — the account-activation endpoints and membership-scoping code exist only when `.tenancy.enabled = true`. |
 | `abilities` | Declarative relationship-based row abilities per collection: `.{ .<col> = .{ .view = <rule>, … } }`. Requires `.tenancy.enabled = true`. | data-only — the composition code is core policy plumbing that always runs; unset just means every collection's ability predicate is `null` (a no-op). |
 | `mail` | Email-subsystem policy knobs (`.require_verified_sender`, `.webhook_secret`, …) threaded into `app.mail`. Together with `.mailer`, enables the built-in `"mail"` job kind backing `ctx.mail().enqueue`. | excluded — the `senders` API and inbound bounce/complaint webhook exist only when `.mail` is set. |
+| `sms` | SMS-subsystem knobs threaded into `app.sms`: `.{ .default_region = .us, .queue = "default" }`. Setting `.sms` (or `.sms_provider`) enables the built-in `"sms"` job kind backing `ctx.sms().enqueue`. Default `.{}` = US default region. See [`ctx.sms()`](#ctxsms--transactional-sms-224). | excluded — the `"sms"` job kind is compiled in only when `.sms`/`.sms_provider` is set. |
+| `sms_provider` | SMS provider plugin TYPE (defaults to Twilio when the `ZIGBASE_TWILIO_*` env vars are set, else a logging no-op). Supply your own type implementing the `SmsSender` contract (`create`/`interface`/`deinit`) to swap providers. Also enables the built-in `"sms"` job kind. | excluded — like `.sms`, gates the `"sms"` job kind. |
 | `analytics` | Product analytics: `.{ .rollups = .{ … } }` declares rollup specs, each producing a scheduled `_rollup:<name>` aggregation job; also gates the analytics read API. `ctx.track` always captures to `_events` regardless. | excluded — the rollup jobs and analytics read API exist only when `.analytics` is set. |
 | `static_routes` | Tier-2 comptime static rewrites: a list of `.{ .match = "/…", .serve = "/…" }` entries mapping request paths to fixed served paths/files. | data-only — lowers to an empty list when unset. |
 | `enable_spa_marker` | Tier-1 `.spa` marker enablement for static serving (issue #183). Default: on when `.static_routes` is absent/empty (byte-identical to the shipped binary), off when routes are declared; an explicit bool always wins. | always — a bool feeding core static-serving logic, not an optional subsystem. |
@@ -869,6 +871,46 @@ footgun — worse than shipping no inlining at all. Regular **download** attachm
 invite) *are* supported via `MailMessage.attachments` (see above); only `cid:` **inline** images are
 left out — they need per-backend raw-MIME plumbing keyed by a Content-ID the HTML references, for a
 problem hosted images at absolute HTTPS URLs solve more simply.
+
+### `ctx.sms()` — transactional SMS (#224)
+
+`ctx.sms()` is the SMS analog of `ctx.mail()`: a framework-owned outbound text-message channel with
+a pluggable provider. **Twilio** is the first provider; when it is not configured the channel is a
+network-free **logging no-op**, so dev/CI/tests need no credentials.
+
+```zig
+// Synchronous send (delivers now, on the request path):
+try ctx.sms().send(.{ .to = "+15551234567", .body = "Reminder: tomorrow 10:00" });
+
+// Durable background send (retry/backoff on the queue engine):
+try ctx.sms().enqueue(.{ .to = "555-123-4567", .body = "Your code is 123456" }, .{});
+```
+
+**E.164 normalization is framework-owned** and runs BEFORE any byte reaches a provider or a durable
+queue row — a consumer never re-rolls it (mirroring how `ctx.mail()` owns recipient-address
+validation). Common separators (spaces, dashes, parens, dots) are stripped; a leading `+` is
+preserved; a national number with no `+` gets the `.sms.default_region` country code prefixed
+(US → `+1`, so `555-123-4567` → `+15551234567`). The result must be `+` followed by 1–15 digits with
+a non-zero first digit (the E.164 shape); anything else (letters, an embedded `+`, a leading `+0`,
+too many digits) is rejected with `error.InvalidPhoneNumber` at the call site — so a bad number never
+reaches the provider or the queue.
+
+**Provider selection.** The default provider plugin reads `ZIGBASE_TWILIO_ACCOUNT_SID`,
+`ZIGBASE_TWILIO_AUTH_TOKEN`, and `ZIGBASE_TWILIO_FROM` (secrets are ENV only, like SMTP): with all
+three set it delivers via Twilio's `Messages.json` HTTP API (HTTP Basic auth,
+`application/x-www-form-urlencoded` body — each value percent-encoded); otherwise it logs the message
+and performs no network I/O. Supply your own provider with `App(.{ .sms_provider = MyProvider })` —
+any type implementing the `SmsSender` contract (`create`/`interface`/`deinit`, like the mailer
+plugin).
+
+**Queued delivery.** `enqueue` rides the same background-queue engine as `ctx.mail().enqueue`: it
+registers a built-in `"sms"` job kind (compiled in only when `.sms` or `.sms_provider` is configured)
+and honors the queue's per-queue rate throttling, retry, and backoff. Pick a queue with
+`.{ .queue = "texts" }`.
+
+**Testing.** `CaptureSms` is an in-memory `SmsSender` test double: wire it via
+`App(.{ .sms_provider = ... })` (or call its `sender()` directly) and assert on the recorded messages
+(`to`/`body`/`from`) with no Twilio account and no network — the SMS analog of `CaptureMailer`.
 
 ### `ctx.http()` — outbound HTTP client
 

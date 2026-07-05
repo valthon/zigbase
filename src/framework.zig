@@ -35,6 +35,10 @@ const queue_memory = @import("queue/memory.zig");
 const mail_send = @import("mail/send.zig");
 const mail_bulk = @import("mail/bulk.zig");
 const mail_cfg = @import("mail/config.zig");
+const sms_mod = @import("sms/sender.zig");
+const sms_twilio = @import("sms/twilio.zig");
+const sms_send = @import("sms/send.zig");
+const sms_cfg = @import("sms/config.zig");
 const files_cfg = @import("files/config.zig");
 const webhook = @import("webhook.zig");
 const push_send = @import("push/send.zig");
@@ -215,6 +219,59 @@ pub const DefaultMailerPlugin = struct {
     }
 };
 
+/// Default SMS provider plugin (#224), config-driven with no code change to switch backends
+/// (the DefaultMailerPlugin precedent):
+///   1. `cfg.twilio_account_sid` + `twilio_auth_token` + `twilio_from` all set → `TwilioSender`.
+///   2. else → `LogSmsSender` (logs the message; the network-free dev/CI/test default so no
+///      Twilio credentials are needed).
+pub const DefaultSmsPlugin = struct {
+    log_backend: sms_mod.LogSmsSender = .{},
+    twilio_backend: ?sms_twilio.TwilioSender = null,
+
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !DefaultSmsPlugin {
+        _ = gpa;
+        _ = io;
+        if (cfg.twilio_account_sid.len > 0 and cfg.twilio_auth_token.len > 0 and cfg.twilio_from.len > 0) {
+            return .{ .twilio_backend = sms_twilio.TwilioSender.init(
+                cfg.twilio_account_sid,
+                cfg.twilio_auth_token,
+                cfg.twilio_from,
+            ) };
+        }
+        return .{};
+    }
+
+    pub fn interface(self: *DefaultSmsPlugin) sms_mod.SmsSender {
+        if (self.twilio_backend) |*t| return t.sender();
+        return self.log_backend.sender();
+    }
+
+    pub fn deinit(self: *DefaultSmsPlugin) void {
+        _ = self;
+    }
+};
+
+test "DefaultSmsPlugin selects Twilio when all env vars are set, else LogSmsSender" {
+    const a = std.testing.allocator;
+    // All three set → TwilioSender.
+    var p = try DefaultSmsPlugin.create(a, std.testing.io, .{
+        .twilio_account_sid = "ACxxx",
+        .twilio_auth_token = "tok",
+        .twilio_from = "+15550000000",
+    });
+    defer p.deinit();
+    try std.testing.expect(p.twilio_backend != null);
+
+    // Missing any one → LogSmsSender (no network default).
+    var p2 = try DefaultSmsPlugin.create(a, std.testing.io, .{ .twilio_account_sid = "ACxxx", .twilio_auth_token = "tok" });
+    defer p2.deinit();
+    try std.testing.expect(p2.twilio_backend == null);
+
+    var p3 = try DefaultSmsPlugin.create(a, std.testing.io, .{});
+    defer p3.deinit();
+    try std.testing.expect(p3.twilio_backend == null);
+}
+
 /// True iff a value of type `M` coerces to `[]const provision.Migration` — i.e. it is
 /// the slice itself or a pointer to an array of `Migration` (`&[_]Migration{ ... }`).
 /// A bare anonymous tuple (`.{ .{ ... } }`) does NOT, which is the footgun P2-b guards.
@@ -333,7 +390,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -506,13 +563,14 @@ pub fn App(comptime cfg: anytype) type {
             if (enable_mail_job) t = t ++ &[_]queue.JobReg{.{ .kind = mail_bulk.job_kind, .handler = mail_bulk.jobHandler }};
             if (enable_webhooks) t = t ++ &[_]queue.JobReg{.{ .kind = webhook.job_kind, .handler = webhook.webhookJobHandler }};
             if (enable_push_job) t = t ++ &[_]queue.JobReg{.{ .kind = push_send.job_kind, .handler = push_send.jobHandler }};
+            if (enable_sms_job) t = t ++ &[_]queue.JobReg{.{ .kind = "sms", .handler = sms_send.jobHandler }};
             break :blk t;
         };
 
         /// Reserved built-in kind names — reserved UNCONDITIONALLY (even when the
         /// built-in is gated off) so enabling a capability later never collides
         /// with a consumer job kind.
-        const reserved_job_kinds: []const []const u8 = &.{ "mail", "mail_batch_item", "webhook", "push" };
+        const reserved_job_kinds: []const []const u8 = &.{ "mail", "mail_batch_item", "webhook", "push", "sms" };
 
         /// Declared job-kind → handler registry: the built-in kinds followed by the consumer
         /// `.jobs` bindings (the legacy `.jobs.pool_size` key is a compile error — see
@@ -671,6 +729,12 @@ pub fn App(comptime cfg: anytype) type {
         /// configured. Unset → `push/send.zig`'s job handler is not compiled into the binary
         /// and `ctx.push().enqueue` fails at enqueue with `error.UnknownJobKind`.
         const enable_push_job: bool = @hasField(@TypeOf(cfg), "push");
+
+        /// The "sms" job kind (ctx.sms().enqueue) registers when SMS is configured — a
+        /// `.sms_provider` plugin or the `.sms` policy key (use `.sms = .{}` to enable background
+        /// delivery with the default env-configured provider). Unset → sms/send.zig's jobHandler is
+        /// not compiled in and ctx.sms().enqueue fails at enqueue time.
+        const enable_sms_job: bool = @hasField(@TypeOf(cfg), "sms_provider") or @hasField(@TypeOf(cfg), "sms");
 
         /// R2-2: `.admin = .disabled` removes the embedded admin SPA (route dispatch
         /// AND the @embedFile'd assets) from the binary. Default: served at /_/ .
@@ -831,6 +895,15 @@ pub fn App(comptime cfg: anytype) type {
         pub const MailerPlugin: type = blk: {
             const P = if (@hasField(@TypeOf(cfg), "mailer")) cfg.mailer else DefaultMailerPlugin;
             assertPluginContract(P, "mailer");
+            break :blk P;
+        };
+
+        /// Comptime-selected SMS provider plugin type (#224); defaults to `DefaultSmsPlugin`
+        /// (Twilio when the env vars are set, else LogSmsSender). A custom type missing a contract
+        /// method fails with a contract-specific message.
+        pub const SmsProviderPlugin: type = blk: {
+            const P = if (@hasField(@TypeOf(cfg), "sms_provider")) cfg.sms_provider else DefaultSmsPlugin;
+            assertPluginContract(P, "sms_provider");
             break :blk P;
         };
 
@@ -1243,6 +1316,24 @@ pub fn App(comptime cfg: anytype) type {
             break :blk rt;
         };
 
+        /// The comptime-lowered SMS-subsystem knobs (#224), threaded into `app.sms`. Validates
+        /// `.sms` keys with a loud `@compileError`; absent → `.{}` (US default region).
+        pub const sms_config: sms_cfg.Runtime = blk: {
+            if (!@hasField(@TypeOf(cfg), "sms")) break :blk .{};
+            const sc = cfg.sms;
+            const SC = @TypeOf(sc);
+            if (@typeInfo(SC) != .@"struct")
+                @compileError(".sms must be a struct, e.g. '.{ .default_region = .us, .queue = \"texts\" }'");
+            for (std.meta.fields(SC)) |f| {
+                const ok = std.mem.eql(u8, f.name, "default_region") or std.mem.eql(u8, f.name, "queue");
+                if (!ok) @compileError(".sms: unknown key '." ++ f.name ++ "' (recognized: .default_region, .queue)");
+            }
+            var rt = sms_cfg.Runtime{};
+            if (@hasField(SC, "default_region")) rt.default_region = sc.default_region;
+            if (@hasField(SC, "queue")) rt.queue = sc.queue;
+            break :blk rt;
+        };
+
         /// The comptime-lowered file-serving knobs, threaded into `app.files`. Validates the
         /// `.files` group's sub-keys with a loud `@compileError` (unknown key / bad ttl range);
         /// absent → `.{}` (proxy-only, back-compat).
@@ -1272,6 +1363,7 @@ pub fn App(comptime cfg: anytype) type {
         const Opts = ServeOpts{
             .StoragePlugin = StoragePlugin,
             .MailerPlugin = MailerPlugin,
+            .SmsProviderPlugin = SmsProviderPlugin,
             .auth_method_types = auth_method_types,
             .reader_pool_size = reader_pool_size,
             .job_stack_size = job_stack_size,
@@ -1293,6 +1385,7 @@ pub fn App(comptime cfg: anytype) type {
             .tenancy = tenancy_config,
             .role_ranking = role_ranking,
             .mail = mail_config,
+            .sms = sms_config,
             .files = files_config,
             .push = push_config,
             .static_cache_control = static_cache_control,
@@ -1401,6 +1494,8 @@ fn analyticsRollupRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
 pub const ServeOpts = struct {
     StoragePlugin: type,
     MailerPlugin: type,
+    /// Comptime-selected SMS provider plugin TYPE (#224); defaults to `DefaultSmsPlugin`.
+    SmsProviderPlugin: type = DefaultSmsPlugin,
     /// Comptime-assembled list of auth method types (built-ins ++ consumer types).
     /// Defaults to just PasswordMethod when absent. serveImpl uses this to
     /// instantiate the Registry via registry.build/deinit.
@@ -1458,6 +1553,8 @@ pub const ServeOpts = struct {
     /// Email-subsystem knobs (#154), threaded into `app.mail`. Default `.{}` is fully off
     /// (no verified-sender/suppression enforcement, webhook route disabled).
     mail: mail_cfg.Runtime = .{},
+    /// SMS-subsystem knobs (#224), threaded into `app.sms`. Default `.{}` = US default region.
+    sms: sms_cfg.Runtime = .{},
     /// File-serving knobs, threaded into `app.files`. Default `.{}` is proxy-only (presigned
     /// redirect off) — the byte-identical historical path.
     files: files_cfg.Runtime = .{},
@@ -1659,6 +1756,10 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  ZIGBASE_SMTP_INSECURE    Skip TLS cert verification (self-signed relays only). [default false]
         \\  ZIGBASE_SENDMAIL_COMMAND Pipe outbound mail to this command instead of SMTP; takes
         \\                           precedence over ZIGBASE_SMTP_HOST.
+        \\  ZIGBASE_TWILIO_ACCOUNT_SID  Twilio Account SID; set (with token+from) to send ctx.sms()
+        \\                           via Twilio instead of logging. [default: log]
+        \\  ZIGBASE_TWILIO_AUTH_TOKEN   Twilio auth token (HTTP Basic auth).
+        \\  ZIGBASE_TWILIO_FROM      Twilio sender number, E.164 (e.g. +15551234567).
         \\  ZIGBASE_S3_BUCKET        Opt-in S3-compatible storage (needs -Ds3=true build); non-empty
         \\                           selects S3 instead of local disk. [default: off]
         \\  ZIGBASE_S3_REGION        AWS region (SigV4 + default endpoint). [default us-east-1]
@@ -2232,6 +2333,10 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     defer mailer_inst.deinit();
     const mailer_iface = mailer_inst.interface();
 
+    var sms_inst = try opts.SmsProviderPlugin.create(allocator, io, cfg);
+    defer sms_inst.deinit();
+    const sms_iface = sms_inst.interface();
+
     // Instantiate the comptime-assembled auth method registry. `am_insts` and `am_views`
     // are serveImpl stack vars that outlive the server (like storage/mailer). The Registry
     // value points into `am_views`, so all three must remain in scope across srv.listen().
@@ -2374,6 +2479,8 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .tenancy = opts.tenancy,
         .role_ranking = opts.role_ranking,
         .mail = opts.mail,
+        .sms = opts.sms,
+        .sms_sender = &sms_iface,
         .files = opts.files,
         .push = opts.push,
         .storage = &storage_iface,
