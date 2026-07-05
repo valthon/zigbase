@@ -238,6 +238,8 @@ test {
     _ = @import("field_policy.zig");
     _ = @import("rewrap.zig");
     _ = @import("jwt.zig");
+    _ = @import("push/encrypt.zig");
+    _ = @import("push/vapid.zig");
     _ = @import("auth.zig");
     _ = @import("id.zig");
     _ = @import("admin.zig");
