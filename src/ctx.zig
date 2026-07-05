@@ -1056,6 +1056,7 @@ pub const MailApi = struct {
         }
         const scoped = self.withScope(msg);
         try mail_send.validate(scoped);
+        try mail_send.checkSize(scoped, self.ctx.app.mail.max_message_bytes);
         return self.ctx.enqueueByName(opts.queue, "mail", scoped);
     }
 
@@ -1074,6 +1075,7 @@ pub const MailApi = struct {
         if (opts.at != null and opts.delay_s != null) return error.ConflictingSchedule;
         const scoped = self.withScope(msg);
         try mail_send.validate(scoped);
+        try mail_send.checkSize(scoped, self.ctx.app.mail.max_message_bytes);
         const reg = queue_mod.registryFromApp(self.ctx.app) orelse return error.QueuesUnavailable;
         const q = reg.queueByName(opts.queue) orelse return error.UnknownQueue;
         if (q.backend != .durable) return error.ScheduleRequiresDurable;

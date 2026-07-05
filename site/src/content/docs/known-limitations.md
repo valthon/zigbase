@@ -51,10 +51,11 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   to the recipient. Handlers are otherwise idempotent (bulk redelivery of an already-`sent`/
   `suppressed`/`canceled` recipient row is a no-op) — this window is the one unavoidable
   exception.
-- **No CSS inliner or `cid:` inline attachments.** ZigBase does not inline `<style>` rules
+- **No CSS inliner or `cid:` inline images.** ZigBase does not inline `<style>` rules
   into `style="…"` attributes or support MIME `cid:`-referenced inline images — author inline
   styles directly (or run a build-time inliner over your template sources) and host images at
-  absolute HTTPS URLs; see "HTML that renders everywhere" in
+  absolute HTTPS URLs. (Regular **download** attachments — e.g. a `.ics` invite — *are* supported
+  via `MailMessage.attachments`.) See "HTML that renders everywhere" in
   [Framework](./framework#ctxmail--send-application-mail).
 
 ## Framework / hooks

@@ -41,7 +41,15 @@ pub const SesMailer = struct {
         const url = try std.fmt.allocPrint(alloc, "https://{s}{s}", .{ host, path });
         defer alloc.free(url);
 
-        const body = try buildBody(alloc, email.from orelse self.from, email);
+        // Simple content cannot carry attachments (#219) — with any, switch to Raw MIME: the full
+        // RFC822 message (built by `mailer.buildMessage`, incl. the multipart/mixed + base64 parts)
+        // base64-encoded into Content.Raw.Data. Without attachments, stay on the byte-identical
+        // Simple path (Subject/Body.Text/Html + optional unsubscribe Headers).
+        const from = email.from orelse self.from;
+        const body = if (email.attachments.len > 0)
+            try buildRawBody(alloc, io, from, email)
+        else
+            try buildBody(alloc, from, email);
         defer alloc.free(body);
 
         const amz_date = amzDate(clock.nowUnix(io));
@@ -173,6 +181,42 @@ pub fn buildBody(alloc: std.mem.Allocator, from: []const u8, email: Email) ![]u8
     return alloc.dupe(u8, json);
 }
 
+/// Build the SESv2 `SendEmail` JSON body using **Raw** content (#219) — the full RFC822 message,
+/// base64-encoded into `Content.Raw.Data`. Used when the message carries attachments (Simple content
+/// cannot). Header-bound fields are CRLF-rejected by `mailer.buildMessage`, which also emits any
+/// Reply-To / List-Unsubscribe headers inside the MIME, so no extra Simple-only Headers array is
+/// needed. `FromEmailAddress`/`Destination` remain the envelope override alongside the raw message.
+pub fn buildRawBody(alloc: std.mem.Allocator, io: std.Io, from: []const u8, email: Email) ![]u8 {
+    const mime = try mailer_mod.buildMessage(alloc, io, from, email, clock.nowUnix(io));
+    defer alloc.free(mime);
+    const enc = std.base64.standard.Encoder;
+    const raw_b64 = try alloc.alloc(u8, enc.calcSize(mime.len));
+    defer alloc.free(raw_b64);
+    _ = enc.encode(raw_b64, mime);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var root: std.json.ObjectMap = .empty;
+    try root.put(a, "FromEmailAddress", .{ .string = from });
+
+    var to_arr = std.json.Array.init(a);
+    try to_arr.append(.{ .string = email.to });
+    var dest: std.json.ObjectMap = .empty;
+    try dest.put(a, "ToAddresses", .{ .array = to_arr });
+    try root.put(a, "Destination", .{ .object = dest });
+
+    var raw: std.json.ObjectMap = .empty;
+    try raw.put(a, "Data", .{ .string = raw_b64 });
+    var content: std.json.ObjectMap = .empty;
+    try content.put(a, "Raw", .{ .object = raw });
+    try root.put(a, "Content", .{ .object = content });
+
+    const json = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = root }, .{});
+    return alloc.dupe(u8, json);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -242,4 +286,41 @@ test "buildBody rejects CRLF in list_unsubscribe" {
         .text_body = "b",
         .list_unsubscribe = "https://x/u?t=1\r\nBcc: e@v.io",
     }));
+}
+
+test "buildBody stays on Simple content when there are no attachments (byte-identical)" {
+    // The attachment-free path must NOT emit Raw content — it stays Simple.
+    const a = testing.allocator;
+    const body = try buildBody(a, "n@a.com", .{ .to = "u@x.io", .subject = "S", .text_body = "b" });
+    defer a.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Simple\":") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Raw\"") == null);
+}
+
+test "buildRawBody emits Content.Raw.Data as base64 MIME with the attachment (#219)" {
+    const a = testing.allocator;
+    const ics = "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n";
+    const body = try buildRawBody(a, testing.io, "noreply@app.com", .{
+        .to = "user@example.com",
+        .subject = "Invite",
+        .text_body = "See attached.",
+        .attachments = &.{.{ .filename = "invite.ics", .content_type = "text/calendar", .data = ics }},
+    });
+    defer a.free(body);
+    // Raw content, envelope preserved, and the base64 payload decodes to a MIME message that carries
+    // the multipart/mixed wrapper + the attachment disposition.
+    try testing.expect(std.mem.indexOf(u8, body, "\"Content\":{\"Raw\":{\"Data\":\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"Simple\"") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"FromEmailAddress\":\"noreply@app.com\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"ToAddresses\":[\"user@example.com\"]") != null);
+
+    const start = std.mem.indexOf(u8, body, "\"Data\":\"").? + "\"Data\":\"".len;
+    const end = std.mem.indexOfScalarPos(u8, body, start, '"').?;
+    const dec = std.base64.standard.Decoder;
+    const n = try dec.calcSizeForSlice(body[start..end]);
+    const mime = try a.alloc(u8, n);
+    defer a.free(mime);
+    try dec.decode(mime, body[start..end]);
+    try testing.expect(std.mem.indexOf(u8, mime, "multipart/mixed") != null);
+    try testing.expect(std.mem.indexOf(u8, mime, "Content-Disposition: attachment; filename=\"invite.ics\"") != null);
 }

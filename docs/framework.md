@@ -605,10 +605,36 @@ owns the security-critical parts so a consumer never re-rolls them: recipient (a
 `reply_to`) **address validation** and **CRLF / control-char header-injection rejection**
 in `to` / `subject` / `reply_to` happen before any byte reaches a backend or a queue row.
 
-A `MailMessage` is `{ to, subject, text?, html?, reply_to? }` — supply `text`, `html`, or
-both (at least one is required). When both are present the message is built as
+A `MailMessage` is `{ to, subject, text?, html?, reply_to?, attachments? }` — supply `text`,
+`html`, or both (at least one is required). When both are present the message is built as
 `multipart/alternative` (plain-text part first, HTML last) so capable clients render the
 HTML and the rest fall back to text.
+
+**File attachments (`attachments`).** Attach files — the canonical case is a `.ics` calendar
+invite — by setting `attachments` to a slice of `{ filename, content_type, data }` (raw bytes;
+the framework base64-encodes them). When present, the message body is wrapped in a
+`multipart/mixed` around the existing body, with one base64 part per attachment; when absent
+(the default `&.{}`) the message is byte-for-byte what it was before. `filename`/`content_type`
+are CRLF/control-char checked like every other header field. The total assembled size (body +
+attachments at their base64-expanded size) is bounded by `.mail.max_message_bytes` (default 10
+MiB) — an over-cap `send`/`enqueue` fails loudly at the call site with `error.MailTooLarge`,
+never a silent truncation. Attachments ride through every backend: SMTP and the `sendmail`/
+Command backend get the raw MIME directly, Amazon SES switches to **Raw** MIME content, and
+Postmark uses its native `Attachments` array. This is for **download** attachments only — there
+is no `cid:` inline-image support (see below).
+
+```zig
+try ctx.mail().send(.{
+    .to = "user@example.com",
+    .subject = "Your tee time is booked",
+    .text = "Calendar invite attached.",
+    .attachments = &.{.{
+        .filename = "appointment.ics",
+        .content_type = "text/calendar; charset=utf-8; method=REQUEST",
+        .data = ics_bytes, // raw .ics you rendered
+    }},
+});
+```
 
 ```zig
 // Synchronous: build + deliver through the configured mailer right now.
@@ -640,7 +666,7 @@ When no mailer is wired (CLI/tests), `send` logs a fallback line. `enqueue` vali
 message **up front**, so a malformed or injection-bearing message fails at the call site
 rather than later inside a worker; it requires a wired queue (see
 [§7b Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs)).
-Errors: `error.InvalidAddress`, `error.HeaderInjection`, `error.EmptyBody`.
+Errors: `error.InvalidAddress`, `error.HeaderInjection`, `error.EmptyBody`, `error.MailTooLarge`.
 
 #### Email subsystem (#154): templates, providers, verified senders, suppression
 
@@ -838,9 +864,10 @@ absolute HTTPS URLs — your app's file storage or static assets work well — r
 them. Keep a rendered HTML body under roughly 100 KB; `ctx.mail()` warns (never errors) above that,
 since Gmail clips messages around ~102 KB and hides the rest behind "[Message clipped]". CSS inlining
 is left out because a half-baked inliner without a real CSS selector engine is a wrong-styling
-footgun — worse than shipping no inlining at all; `cid:` attachments are left out because they need a
-raw-MIME rewrite on every backend (SMTP and both HTTP APIs) for a problem hosted images solve more
-simply.
+footgun — worse than shipping no inlining at all. Regular **download** attachments (e.g. a `.ics`
+invite) *are* supported via `MailMessage.attachments` (see above); only `cid:` **inline** images are
+left out — they need per-backend raw-MIME plumbing keyed by a Content-ID the HTML references, for a
+problem hosted images at absolute HTTPS URLs solve more simply.
 
 ### `ctx.http()` — outbound HTTP client
 
