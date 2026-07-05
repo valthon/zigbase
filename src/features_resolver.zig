@@ -103,6 +103,21 @@ pub fn resolveExperiment(
     def: ExperimentDef,
     subject: []const u8,
 ) ![]const u8 {
+    // Single-accessor path: no batched prefetch — a sticky miss reads on `sticky.read` first.
+    return resolveExperimentImpl(alloc, sticky, override_weights_json, def, subject, null);
+}
+
+/// Shared implementation of `resolveExperiment`; `batch` is `null` on the single-accessor path
+/// (reader-first per experiment) and set on `resolveAll`'s batched path (the sticky read already
+/// happened once, in `stickyBatchLookup`, so the prefetched hit is threaded straight through).
+fn resolveExperimentImpl(
+    alloc: std.mem.Allocator,
+    sticky: ?StickyConns,
+    override_weights_json: ?[]const u8,
+    def: ExperimentDef,
+    subject: []const u8,
+    batch: ?BatchState,
+) ![]const u8 {
     // An override parse dupes its own []u16 onto `alloc`; the declared weights are
     // static. Track + free the duped copy so the function is leak-free under a
     // general-purpose allocator (and a no-op under the arena it gets on the ctx path).
@@ -122,12 +137,28 @@ pub fn resolveExperiment(
     // is stable across weight changes. An empty subject always maps to variant 0 and is
     // never persisted; a non-sticky experiment always follows the live weights.
     if (def.sticky and subject.len > 0) {
-        if (sticky) |sc| return stickyVariant(alloc, sc, def, subject, weights);
+        if (sticky) |sc| {
+            // `batch` distinguishes the single-accessor path (reader-first, one SELECT per
+            // experiment) from `resolveAll`'s batched path (the sticky read already happened
+            // in one combined SELECT, so the prefetched hit — or a miss → persist — is used
+            // directly with NO per-experiment reader SELECT). Both share `stickyPersist`.
+            if (batch) |b| return stickyVariantBatched(alloc, sc, def, subject, weights, b.prefetched);
+            return stickyVariant(alloc, sc, def, subject, weights);
+        }
     }
 
     const idx = bucket(def.name, subject, weights);
     return def.variants[idx];
 }
+
+/// Carries a prefetched batched sticky hit (or a null miss) into `resolveExperimentImpl`, so
+/// `resolveAll` can resolve a sticky experiment against its batched read instead of issuing a
+/// per-experiment reader SELECT. `null` for `batch` means the single-accessor path (`stickyVariant`).
+const BatchState = struct { prefetched: ?[]const u8 };
+
+/// A batched sticky-assignment hit: an experiment name mapped to its stored, still-declared
+/// variant (already mapped back to the static `def.variants` slice, so it outlives the row buffer).
+const BatchHit = struct { name: []const u8, variant: []const u8 };
 
 /// Connections for **reader-first** sticky resolution. `read` is used for the assignment
 /// lookup (a pooled reader on the public/route/job path, or the bound writer inside a
@@ -151,8 +182,26 @@ pub const StickyConns = struct {
 fn stickyVariant(alloc: std.mem.Allocator, sc: StickyConns, def: ExperimentDef, subject: []const u8, weights: []const u16) ![]const u8 {
     // 1. Reader-first: a stored assignment short-circuits without touching the writer.
     if (try stickyLookup(alloc, sc.read, def, subject)) |hit| return hit;
+    // 2. Miss: persist + read back the authoritative variant on the writer.
+    return stickyPersist(alloc, sc, def, subject, weights);
+}
 
-    // 2. Miss: briefly take the writer (or reuse the bound writer) to persist + read back.
+/// Batched-path sticky resolution: the assignment read already happened once in
+/// `stickyBatchLookup`, so a prefetched hit is returned directly (NO per-experiment reader SELECT);
+/// a batch miss (`prefetched == null`) goes straight to `stickyPersist`. Behavior is identical to
+/// `stickyVariant` given the same underlying stored row — the batch read replaces the reader-first
+/// SELECT, and the miss/persist path is byte-for-byte the same helper.
+fn stickyVariantBatched(alloc: std.mem.Allocator, sc: StickyConns, def: ExperimentDef, subject: []const u8, weights: []const u16, prefetched: ?[]const u8) ![]const u8 {
+    if (prefetched) |hit| return hit;
+    return stickyPersist(alloc, sc, def, subject, weights);
+}
+
+/// The MISS/persist path shared by `stickyVariant` and `stickyVariantBatched`: briefly take the
+/// writer (`sc.pool.acquireWriter()`, or reuse the bound `sc.read` when `pool == null`),
+/// `INSERT OR IGNORE` the bucketed variant, then read the row BACK on the writer — so a concurrent
+/// winner that inserted first is honored — and release the writer. The returned slice is mapped
+/// back to the static `def.variants` so it outlives any row buffer.
+fn stickyPersist(alloc: std.mem.Allocator, sc: StickyConns, def: ExperimentDef, subject: []const u8, weights: []const u16) ![]const u8 {
     const writer = if (sc.pool) |p| p.acquireWriter() else sc.read;
     defer if (sc.pool) |p| p.releaseWriter();
 
@@ -203,6 +252,65 @@ fn stickyLookup(alloc: std.mem.Allocator, conn: *db.Db, def: ExperimentDef, subj
         // Stored variant no longer declared → treat as a miss and recompute.
     }
     return null;
+}
+
+/// ONE batched read of `_experiment_assignments` for `subject` over all declared sticky
+/// experiments, so `resolveAll` issues a constant 2 queries (the `_kv` scan + this) regardless of
+/// how many `.sticky` experiments an app declares — instead of one SELECT per sticky experiment.
+///
+/// Emits `SELECT "experiment","variant" FROM "_experiment_assignments" WHERE "subject"=?1 AND
+/// "experiment" IN (?2, ?3, …)` — the `IN (…)` placeholder list is built from `sticky_defs` (one
+/// `?N` per def), then dialect-ized (`?N` ⇄ `$n`) exactly like `stickyLookup`. Subject binds at 1;
+/// each def name binds at 2, 3, …. Each returned row's stored variant is mapped back to THAT
+/// experiment's `def.variants` — a stored variant no longer declared is dropped (treated as absent,
+/// exactly like `stickyLookup`), so only still-declared hits are returned. Pure read — safe on a
+/// pooled reader. Returns an owned slice the caller frees.
+fn stickyBatchLookup(alloc: std.mem.Allocator, conn: *db.Db, sticky_defs: []const ExperimentDef, subject: []const u8) ![]const BatchHit {
+    if (sticky_defs.len == 0) return &.{};
+    const dialect = db.dbDialect(conn);
+
+    // Build "…IN (?2, ?3, …)" — one numbered placeholder per sticky def, starting at ?2 (subject
+    // is ?1). The whole statement is renumbered as a unit (`?N` ⇄ `$n`) on the Postgres arm.
+    var sb: std.ArrayList(u8) = .empty;
+    defer sb.deinit(alloc);
+    try sb.appendSlice(alloc, "SELECT \"experiment\",\"variant\" FROM \"_experiment_assignments\" WHERE \"subject\" = ?1 AND \"experiment\" IN (");
+    var pbuf: [16]u8 = undefined;
+    for (sticky_defs, 0..) |_, i| {
+        if (i > 0) try sb.append(alloc, ',');
+        try sb.appendSlice(alloc, try std.fmt.bufPrint(&pbuf, "?{d}", .{i + 2}));
+    }
+    try sb.appendSlice(alloc, ");");
+    const raw = try sb.toOwnedSliceSentinel(alloc, 0);
+    defer alloc.free(raw);
+    const sql = try param_sink.renumberZ(alloc, dialect, raw);
+    defer if (dialect.kind == .postgres) alloc.free(sql); // SQLite returns the input slice
+
+    var st = try conn.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, subject);
+    for (sticky_defs, 0..) |def, i| {
+        try st.bindText(@intCast(i + 2), def.name);
+    }
+
+    var hits: std.ArrayList(BatchHit) = .empty;
+    errdefer hits.deinit(alloc);
+    while (try st.step()) {
+        const exp = st.columnText(0);
+        const stored = st.columnText(1);
+        // Map the stored variant back to its experiment's static `def.variants` (so it outlives
+        // the row buffer); an undeclared experiment/variant is dropped — a miss, per `stickyLookup`.
+        for (sticky_defs) |def| {
+            if (!std.mem.eql(u8, def.name, exp)) continue;
+            for (def.variants) |v| {
+                if (std.mem.eql(u8, v, stored)) {
+                    try hits.append(alloc, .{ .name = def.name, .variant = v });
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    return hits.toOwnedSlice(alloc);
 }
 
 /// Batch size for the sticky-assignment GC sweep: bound each DELETE so a large backlog
@@ -278,6 +386,27 @@ pub fn resolveAll(
         flags_out[i] = .{ .name = def.name, .value = resolveFlag(ov, def) };
     }
 
+    // Batched sticky pre-read: ONE SELECT over EVERY declared sticky experiment's assignment for
+    // `subject`, so resolveAll issues a constant 2 queries (this + the `_kv` scan) regardless of
+    // how many `.sticky` experiments are declared — instead of 1 + N (one reader SELECT each).
+    // Only meaningful with a sticky connection AND a live subject: `sticky == null` and the empty
+    // subject take the pure-hash path in `resolveExperimentImpl` and never touch the table, so the
+    // batched hits are simply unused there (no experiment reaches `stickyVariantBatched`).
+    var batch_hits: []const BatchHit = &.{};
+    defer if (batch_hits.len > 0) alloc.free(batch_hits);
+    if (sticky) |sc| {
+        if (subject.len > 0) {
+            var sticky_defs: std.ArrayList(ExperimentDef) = .empty;
+            defer sticky_defs.deinit(alloc);
+            for (reg.experiments) |def| {
+                if (def.sticky) try sticky_defs.append(alloc, def);
+            }
+            if (sticky_defs.items.len > 0) {
+                batch_hits = try stickyBatchLookup(alloc, sc.read, sticky_defs.items, subject);
+            }
+        }
+    }
+
     const exps_out = try alloc.alloc(ResolvedExperiment, reg.experiments.len);
     for (reg.experiments, 0..) |def, i| {
         const key = try std.fmt.allocPrint(alloc, "exp:{s}:weights", .{def.name});
@@ -289,11 +418,20 @@ pub fn resolveAll(
                 break;
             }
         }
-        // Sticky experiments honor their PERSISTED assignment (reader-first; only a miss
-        // briefly takes the writer), so the public `/api/state` projection agrees with the
-        // single-accessor `App.experiment`. Non-sticky experiments ignore `sticky` and
-        // resolve by pure hash. `sticky == null` forces the pure path for every experiment.
-        exps_out[i] = .{ .name = def.name, .variant = try resolveExperiment(alloc, sticky, ov, def, subject) };
+        // Thread the batched hit (or a null miss) for a sticky experiment straight through: a hit
+        // returns without any per-experiment read; a miss persists per-experiment (misses are
+        // once-per-subject by definition — the writes are NOT batched). Non-sticky experiments and
+        // the empty-subject / `sticky == null` cases take the pure-hash path and ignore `prefetched`.
+        var prefetched: ?[]const u8 = null;
+        if (def.sticky) {
+            for (batch_hits) |h| {
+                if (std.mem.eql(u8, h.name, def.name)) {
+                    prefetched = h.variant;
+                    break;
+                }
+            }
+        }
+        exps_out[i] = .{ .name = def.name, .variant = try resolveExperimentImpl(alloc, sticky, ov, def, subject, .{ .prefetched = prefetched }) };
     }
 
     return .{ .flags = flags_out, .experiments = exps_out };
@@ -597,6 +735,177 @@ test "resolveAll honors a sticky PERSISTED variant across a weight override (#12
     const forced = if (std.mem.eql(u8, persisted, "control")) "compact" else "control";
     const r3 = try resolveAll(a, reg, &entries, "newcomer-9", sc);
     try std.testing.expectEqualStrings(forced, r3.experiments[0].variant);
+}
+
+// ---------------------------------------------------------------------------
+// Batched sticky-read tests (#229) — resolveAll issues ONE assignment read over
+// every declared sticky experiment, not 1 + N. These pin BYTE-IDENTICAL variants
+// vs the single-accessor path and the miss/persist behavior.
+// ---------------------------------------------------------------------------
+
+fn assignmentRowCount(d: *db.Db) !i64 {
+    var st = try d.prepare("SELECT COUNT(*) FROM \"_experiment_assignments\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    return st.columnInt(0);
+}
+
+test "resolveAll batched sticky reads == per-experiment resolve (equivalence, #229)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(assignments_ddl);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const e1 = ExperimentDef{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true };
+    const e2 = ExperimentDef{ .name = "pricing", .variants = &.{ "a", "b", "c" }, .weights = &.{ 34, 33, 33 }, .sticky = true };
+    const e3 = ExperimentDef{ .name = "hero", .variants = &.{ "x", "y" }, .weights = &.{ 50, 50 }, .sticky = false };
+    const reg = Registry{ .flags = &.{}, .experiments = &.{ e1, e2, e3 } };
+    const sc = StickyConns{ .read = &d, .pool = null };
+    const subject = "user-42";
+
+    // Seed persisted assignments (declared variants) for the two sticky experiments.
+    try d.exec(
+        \\INSERT INTO "_experiment_assignments" ("experiment","subject","variant","created")
+        \\ VALUES ('checkout_layout','user-42','compact','2024-01-01T00:00:00Z'),
+        \\        ('pricing','user-42','c','2024-01-01T00:00:00Z');
+    );
+
+    // Single-accessor resolve per experiment (all sticky ones HIT the seeded rows → no writes).
+    const s1 = try resolveExperiment(a, sc, null, e1, subject);
+    const s2 = try resolveExperiment(a, sc, null, e2, subject);
+    const s3 = try resolveExperiment(a, sc, null, e3, subject);
+
+    // Batched resolveAll must produce byte-identical variants.
+    const r = try resolveAll(a, reg, &.{}, subject, sc);
+    try std.testing.expectEqualStrings(s1, r.experiments[0].variant);
+    try std.testing.expectEqualStrings(s2, r.experiments[1].variant);
+    try std.testing.expectEqualStrings(s3, r.experiments[2].variant);
+    // And specifically the seeded sticky variants (proves the batch mapped them back).
+    try std.testing.expectEqualStrings("compact", r.experiments[0].variant);
+    try std.testing.expectEqualStrings("c", r.experiments[1].variant);
+}
+
+test "resolveAll batched all-hits writes NO new rows (batch is actually used, #229)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(assignments_ddl);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const e1 = ExperimentDef{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true };
+    const e2 = ExperimentDef{ .name = "pricing", .variants = &.{ "a", "b", "c" }, .weights = &.{ 34, 33, 33 }, .sticky = true };
+    const reg = Registry{ .flags = &.{}, .experiments = &.{ e1, e2 } };
+    const sc = StickyConns{ .read = &d, .pool = null };
+
+    try d.exec(
+        \\INSERT INTO "_experiment_assignments" ("experiment","subject","variant","created")
+        \\ VALUES ('checkout_layout','user-42','compact','2024-01-01T00:00:00Z'),
+        \\        ('pricing','user-42','c','2024-01-01T00:00:00Z');
+    );
+    try std.testing.expectEqual(@as(i64, 2), try assignmentRowCount(&d));
+
+    // With every sticky assignment pre-seeded, resolveAll resolves all as HITs — the single
+    // batched SELECT satisfies them, so NO per-experiment read/persist runs. Forbid writes to
+    // prove it: any INSERT (a miss-path persist) would fail with SQLITE_READONLY.
+    try d.exec("PRAGMA query_only=ON;");
+    const r = try resolveAll(a, reg, &.{}, "user-42", sc);
+    try d.exec("PRAGMA query_only=OFF;");
+
+    try std.testing.expectEqualStrings("compact", r.experiments[0].variant);
+    try std.testing.expectEqualStrings("c", r.experiments[1].variant);
+    // Row count unchanged — the batch wrote nothing.
+    try std.testing.expectEqual(@as(i64, 2), try assignmentRowCount(&d));
+}
+
+test "resolveAll batched: a stored UNDECLARED variant is a MISS (recompute), like stickyLookup (#229)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(assignments_ddl);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const def = ExperimentDef{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true };
+    const reg = Registry{ .flags = &.{}, .experiments = &.{def} };
+    const sc = StickyConns{ .read = &d, .pool = null };
+
+    // Seed a variant that is no longer declared → must be treated as a miss (recomputed).
+    try d.exec(
+        \\INSERT INTO "_experiment_assignments" ("experiment","subject","variant","created")
+        \\ VALUES ('checkout_layout','user-42','legacy','2024-01-01T00:00:00Z');
+    );
+
+    // Batched resolveAll agrees with the single-accessor path, and returns a DECLARED variant
+    // (the recomputed bucket), never the stored 'legacy'.
+    const single = try resolveExperiment(a, sc, null, def, "user-42");
+    const r = try resolveAll(a, reg, &.{}, "user-42", sc);
+    try std.testing.expectEqualStrings(single, r.experiments[0].variant);
+    try std.testing.expect(std.mem.eql(u8, r.experiments[0].variant, "control") or std.mem.eql(u8, r.experiments[0].variant, "compact"));
+}
+
+test "resolveAll batched: a sticky MISS is bucketed + persisted, stable on re-resolve (#229)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec(assignments_ddl);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const def = ExperimentDef{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true };
+    const reg = Registry{ .flags = &.{}, .experiments = &.{def} };
+    const sc = StickyConns{ .read = &d, .pool = null };
+
+    // No seeded row → the batch misses → resolveAll persists the bucketed variant.
+    try std.testing.expectEqual(@as(i64, 0), try assignmentRowCount(&d));
+    const r1 = try resolveAll(a, reg, &.{}, "user-42", sc);
+    const v = r1.experiments[0].variant;
+    try std.testing.expectEqual(@as(i64, 1), try assignmentRowCount(&d));
+
+    // A second resolveAll returns the now-stored variant (a batch HIT) and writes no new row.
+    const r2 = try resolveAll(a, reg, &.{}, "user-42", sc);
+    try std.testing.expectEqualStrings(v, r2.experiments[0].variant);
+    try std.testing.expectEqual(@as(i64, 1), try assignmentRowCount(&d));
+}
+
+test "resolveAll issues NO assignment query when no experiment is sticky (#229)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    // Intentionally do NOT create `_experiment_assignments`: any read of it would error with
+    // "no such table", so a clean pure-hash resolve proves the batch read was skipped entirely.
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const def = ExperimentDef{ .name = "layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = false };
+    const reg = Registry{ .flags = &.{}, .experiments = &.{def} };
+    const sc = StickyConns{ .read = &d, .pool = null };
+
+    const r = try resolveAll(a, reg, &.{}, "user-1", sc);
+    // Pure-hash result matches the single-accessor pure path (no sticky connection needed).
+    const expect = try resolveExperiment(a, null, null, def, "user-1");
+    try std.testing.expectEqualStrings(expect, r.experiments[0].variant);
+}
+
+test "resolveAll with sticky==null takes the pure-hash path for a sticky experiment (#229)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A sticky experiment, but `sticky == null` → never touches the table (no db at all).
+    const def = ExperimentDef{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true };
+    const reg = Registry{ .flags = &.{}, .experiments = &.{def} };
+
+    const r = try resolveAll(a, reg, &.{}, "user-42", null);
+    const expect = try resolveExperiment(a, null, null, def, "user-42");
+    try std.testing.expectEqualStrings(expect, r.experiments[0].variant);
 }
 
 test "gcExpiredAssignments reaps rows older than the TTL and keeps newer ones" {
