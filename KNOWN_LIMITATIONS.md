@@ -72,7 +72,7 @@ ZigBase v0.10.0 is an early release. The gaps below are known and tracked for fu
 - **Spool cache disk usage + eviction approximates last-access LRU, not strict LRU.** The local spool cache (`ZIGBASE_S3_CACHE_DIR`, default `<data-dir>/storage_cache`) needs its own disk budget on top of the database; size it via `ZIGBASE_S3_CACHE_MAX_BYTES`. Eviction still sorts by file **mtime**, but mtime is now bumped on a cache **hit** as well as on the miss-fill that creates the entry, so eviction approximates **last-access** LRU — a frequently-read file survives over a rarely-read one. It is still not a strict LRU: there is no separate access-time bookkeeping or journaling, and the mtime touch is best-effort and coarse-grained.
 
 ## Other deferred work
-- Image thumbnails / transforms; `fields=` response projection; resumable/chunked uploads; realtime backfill/replay and per-event-guard load-tuning.
+- Image thumbnails / transforms; resumable/chunked uploads; realtime backfill/replay and per-event-guard load-tuning.
 
 ---
 These are tracked for upcoming releases. Contributions welcome.

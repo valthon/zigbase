@@ -267,6 +267,7 @@ test {
     _ = @import("query/sort.zig");
     _ = @import("query/keyset.zig");
     _ = @import("query/expand.zig");
+    _ = @import("query/fields.zig");
     _ = @import("pagination.zig");
     _ = @import("realtime/protocol.zig");
     _ = @import("realtime/connection.zig");

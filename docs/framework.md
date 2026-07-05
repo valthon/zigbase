@@ -589,6 +589,15 @@ const page = try ctx.records().list("posts", .{
 });
 ```
 
+**Response projection (`fields=`)** — the read endpoints (`list` and single-record `view`)
+also accept a `fields=` query param that narrows which keys are serialized: a comma-separated
+list of dot-paths (`fields=id,title,expand.author.name`), with `*` for all keys at a level and
+a leading `-` to exclude (`*,-secret`). It descends into `expand`ed relations (objects and
+arrays) and is **strict** — only listed paths appear, `id` is not auto-included. Projection is
+a pure output filter applied *after* expand and access rules, so it can only narrow a response,
+never reveal a field the record wouldn't otherwise return. Full semantics in
+[api.md → fields](api.md#fields).
+
 ### `ctx.mail()` — send application mail
 
 `ctx.mail()` sends outbound application email from any route, hook, or job. The framework

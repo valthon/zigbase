@@ -230,7 +230,7 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 
 ## Other deferred work
 
-- Image thumbnails / transforms; `fields=` response projection; resumable/chunked
+- Image thumbnails / transforms; resumable/chunked
   uploads; realtime backfill/replay and per-event-guard load-tuning.
 
 ---
