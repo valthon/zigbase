@@ -48,7 +48,7 @@ pub const TypegenArgs = struct {
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap, migrate_db };
+pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -61,6 +61,8 @@ pub const Command = union(enum) {
     typegen: TypegenArgs,
     rewrap: RewrapArgs,
     migrate_db: MigrateDbArgs,
+    /// `vapid-keygen` -> generate a fresh VAPID (Web Push) keypair, print it, and exit.
+    vapid_keygen: void,
 };
 
 /// True when an arg is a help flag (`--help` or `-h`).
@@ -125,6 +127,15 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             } else return ParseError.UnknownFlag;
         }
         return .{ .migrate = sa };
+    }
+    if (std.mem.eql(u8, args[0], "vapid-keygen")) {
+        // No flags; `--help`/`-h` routes to its help screen, anything else is unknown.
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (isHelpFlag(args[i])) return .{ .help = .vapid_keygen };
+            return ParseError.UnknownFlag;
+        }
+        return .{ .vapid_keygen = {} };
     }
     if (std.mem.eql(u8, args[0], "rewrap")) {
         var ra = RewrapArgs{};
@@ -324,6 +335,12 @@ test "migrate-db --help routes to its help topic" {
 test "migrate-db rejects unknown flags and missing values" {
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate-db", "--nope" }, .{}));
     try std.testing.expectError(ParseError.MissingValue, parse(&.{ "migrate-db", "--from" }, .{}));
+}
+
+test "vapid-keygen parses and routes --help to its topic" {
+    try std.testing.expectEqual(.vapid_keygen, std.meta.activeTag(try parse(&.{"vapid-keygen"}, .{})));
+    try std.testing.expectEqual(HelpTopic.vapid_keygen, (try parse(&.{ "vapid-keygen", "--help" }, .{})).help);
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "vapid-keygen", "--nope" }, .{}));
 }
 
 test "unknown command errors" {

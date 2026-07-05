@@ -1,0 +1,3 @@
+### Features
+
+- **Web Push notifications (`ctx.push()`, #223).** Send browser push notifications with RFC 8291 (`aes128gcm`) payload encryption and RFC 8292 VAPID authentication. `ctx.push().send(subscription, message)` returns a tri-state (`.delivered` / `.gone` / `.failed`) so a dead subscription (HTTP 404/410) is pruned and never retried; `ctx.push().enqueue(...)` delivers durably in the background via the built-in `"push"` job kind (registered when `.push` is configured). Enable with `App(.{ .push = .{ .subject = "mailto:ops@example.com" } })` plus a VAPID keypair in `ZIGBASE_VAPID_PUBLIC_KEY` / `ZIGBASE_VAPID_PRIVATE_KEY`; without the keys `ctx.push()` is a network-free logging no-op. New CLI subcommand `zigbase vapid-keygen` generates a keypair.

@@ -121,6 +121,7 @@ pub fn main(init: std.process.Init) !void {
 | `admin` | `.admin = .disabled` removes the embedded admin SPA (route dispatch **and** the ~58 KiB of `@embedFile`-d assets) from your binary — useful for headless/embedded consumers. Default: served at `/_/`. | excluded, opt-**out** — the admin SPA ships by default; set `.admin = .disabled` to exclude it (the only key in this table where "unset" means *included*). |
 | `webhooks` | `.webhooks = true` registers the built-in `"webhook"` job kind, compiling in `ctx.webhook()`'s managed outbound delivery (`webhook.zig`, ~689 LOC). Default: off, so a consumer that never sends managed webhooks pays nothing for it. See [`ctx.webhook()`](#ctxwebhook--managed-outbound-webhooks-144). | excluded — off by default; `webhook.zig` is not compiled in unless `.webhooks = true`. |
 | `files` | File-serving knobs threaded into `app.files`: `.{ .s3_presign_redirect = false, .s3_presign_ttl_s = 900 }`. With `.s3_presign_redirect = true` **and** the S3 backend active (`-Ds3` + `ZIGBASE_S3_*`), an authorized download is answered with a 302 redirect to a time-limited presigned GET URL (`s3_presign_ttl_s` seconds, `1..=604800`) instead of proxying the bytes. On any other backend (local disk, or a non-`-Ds3` build) it has no effect — the proxy path is taken. Default `.{}` = proxy-only. | data-only — always compiled; the redirect only engages at runtime when the S3 backend is present. |
+| `push` | Web Push config (`.{ .subject = "mailto:ops@example.com" }`) — the VAPID `sub` contact. Registers the built-in `"push"` job kind backing `ctx.push().enqueue`, compiling in `push/*.zig`'s encrypted delivery. The VAPID keypair itself comes from `ZIGBASE_VAPID_PUBLIC_KEY`/`_PRIVATE_KEY` at runtime; without them `ctx.push()` is a no-op. See [`ctx.push()`](#ctxpush--web-push-notifications-223). | excluded — off by default; `push/send.zig`'s job handler is not compiled in unless `.push` is set. |
 
 Route gating: the built-in `analytics`, `senders`/mail-webhook, and `tenancy` (account
 activation) endpoints exist only when their config key is set (`.analytics`, `.mail`,
@@ -872,6 +873,53 @@ at-least-once replay after a crash — reuses the same key, letting the receiver
 > `_queue_jobs.payload` column (your own DB). Prefer a `memory` queue, a short
 > `done_ttl_s`, or DB-at-rest encryption if that is a concern. TLS verification is always
 > on. Requires a wired queue (see [§7b Background jobs & queues](#7b-background-jobs--queues-queues--workers--jobs)).
+
+### `ctx.push()` — Web Push notifications (#223)
+
+`ctx.push()` sends a **browser Web Push notification** to a subscription your frontend
+obtained from `pushManager.subscribe(...)`. It composes an [RFC 8291](https://www.rfc-editor.org/rfc/rfc8291)
+`aes128gcm`-encrypted payload and an [RFC 8292](https://www.rfc-editor.org/rfc/rfc8292)
+VAPID `Authorization` header, then POSTs to the subscription's endpoint.
+
+> Requires `.push = .{ .subject = "mailto:ops@example.com" }` in your `App(.{...})` config
+> (the VAPID `sub` contact) **plus** a VAPID keypair in the environment. Generate one with
+> `zigbase vapid-keygen` and set `ZIGBASE_VAPID_PUBLIC_KEY` / `ZIGBASE_VAPID_PRIVATE_KEY`.
+> **Without the keys, `ctx.push()` is a network-free logging no-op** — dev and CI need no
+> keys, and the public key is also the browser's `applicationServerKey`.
+
+```zig
+const sub = zigbase.PushSubscription{
+    .endpoint = row.get("endpoint"),   // from pushManager.subscribe()
+    .p256dh   = row.get("p256dh"),      // base64url UA public key
+    .auth     = row.get("auth"),        // base64url UA auth secret
+};
+const result = try ctx.push().send(sub, .{
+    .title = "Booking confirmed",
+    .body  = "Tee time 09:20 is locked in.",
+    .data  = "{\"url\":\"/bookings/42\"}",  // opaque JSON passed to the service worker
+    .ttl_s = 120,                            // push-service TTL header
+});
+switch (result) {
+    .delivered => {},
+    .gone => try ctx.records().delete("push_subscriptions", row.id), // prune a dead endpoint
+    .failed => {}, // transient; try again later
+}
+```
+
+**Tri-state result — prune on `.gone`.** `send` returns `.delivered` (2xx), `.gone`
+(**404/410** — the subscription is dead: delete your stored row and never retry), or
+`.failed` (5xx / 429 / timeout / transport error — transient). A failing push **never
+throws into the request that triggered it**; only an un-decodable subscription key surfaces
+as a Zig `error` (a corrupt stored row — terminal).
+
+**Background delivery (`enqueue`).** `ctx.push().enqueue(sub, msg, .{ .queue = "push" })`
+hands the delivery to the built-in `"push"` job kind. On `.failed` the queue retries with
+back-off; on `.gone` it simply **stops retrying** (a queued job cannot reach back into your
+DB to prune the row — the synchronous `send` path is how you learn `.gone` to prune); on
+`.delivered` it completes.
+
+**`vapid-keygen`.** `zigbase vapid-keygen` prints a fresh base64url keypair. The public key
+doubles as the browser `applicationServerKey`; keep the private key secret.
 
 ### `ctx.verifyCaptcha()` — CAPTCHA verification (#140)
 

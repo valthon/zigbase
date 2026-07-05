@@ -115,6 +115,11 @@ pub const QueueRegistry = @import("queue/queue.zig").Registry;
 // Outbound webhooks (#144): `ctx.webhook(url, payload, .{…})` enqueues a managed,
 // retrying delivery via the built-in `"webhook"` job kind.
 pub const WebhookOpts = @import("webhook.zig").WebhookOpts;
+// Web Push (#223): `ctx.push().send`/`.enqueue`. A consumer names the subscription/message
+// shapes and the tri-state result via these re-exports.
+pub const PushSubscription = @import("push/sender.zig").PushSubscription;
+pub const PushMessage = @import("push/sender.zig").PushMessage;
+pub const PushResult = @import("push/sender.zig").PushResult;
 pub const WebhookHmac = @import("webhook.zig").Hmac;
 
 // ---- Multi-tenancy / authorization foundation (#156/#155) ------------------
@@ -240,6 +245,10 @@ test {
     _ = @import("jwt.zig");
     _ = @import("push/encrypt.zig");
     _ = @import("push/vapid.zig");
+    _ = @import("push/config.zig");
+    _ = @import("push/sender.zig");
+    _ = @import("push/send.zig");
+    _ = @import("push/capture.zig");
     _ = @import("auth.zig");
     _ = @import("id.zig");
     _ = @import("admin.zig");

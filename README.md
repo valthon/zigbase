@@ -178,6 +178,8 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_S3_KEY_PREFIX` | — | `""` | prefix prepended to every object key — namespace multiple apps in one bucket |
 | `ZIGBASE_S3_CACHE_DIR` | — | `""` | `""` → `<data-dir>/storage_cache`; local spool-cache directory downloads materialize through |
 | `ZIGBASE_S3_CACHE_MAX_BYTES` | — | `1073741824` (1 GiB) | spool-cache size cap; eviction reclaims down to a 3/4 low-water mark |
+| `ZIGBASE_VAPID_PUBLIC_KEY` | — | `""` | Web Push VAPID public key (base64url) for `ctx.push()`; also the browser `applicationServerKey`. Generate a pair with `zigbase vapid-keygen` |
+| `ZIGBASE_VAPID_PRIVATE_KEY` | — | `""` | Web Push VAPID private key (base64url) — **secret**. Both keys unset → `ctx.push()` is a no-op |
 
 > Email delivery: with `ZIGBASE_SMTP_HOST` set, verification and password-reset tokens
 > are **emailed** over the configured SMTP transport. Without it (the default), they are

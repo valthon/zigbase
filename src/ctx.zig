@@ -30,6 +30,7 @@ const mail_send = @import("mail/send.zig");
 const mail_bulk = @import("mail/bulk.zig");
 const mail_unsubscribe = @import("mail/unsubscribe.zig");
 const webhook_mod = @import("webhook.zig");
+const push_send = @import("push/send.zig");
 const analytics = @import("analytics/analytics.zig");
 
 pub const Ctx = struct {
@@ -323,6 +324,17 @@ pub const Ctx = struct {
             .timeout_ms = std.math.mul(u32, opts.timeout_s, 1000) catch std.math.maxInt(u32),
         };
         return self.enqueueByName(opts.queue orelse "default", webhook_mod.job_kind, job);
+    }
+
+    /// Returns the Web Push namespace (`ctx.push()`, #223): `send` (synchronous — returns the
+    /// tri-state `.delivered`/`.gone`/`.failed`, so the caller PRUNES its stored subscription on
+    /// `.gone`) and `enqueue` (durable/background delivery via the built-in `"push"` job kind,
+    /// which just stops retrying a dead endpoint). Composes an RFC 8291 encrypted body + an RFC
+    /// 8292 VAPID header. Push is a network-free logging no-op until VAPID keys are configured
+    /// (`ZIGBASE_VAPID_PUBLIC_KEY`/`_PRIVATE_KEY`); a failing push never throws into the
+    /// triggering request.
+    pub fn push(self: *Ctx) push_send.PushApi {
+        return .{ .ctx = self };
     }
 
     // -----------------------------------------------------------------------

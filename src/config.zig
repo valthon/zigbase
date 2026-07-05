@@ -127,6 +127,13 @@ pub const Config = struct {
     // "msmtp -t"); the From: header still comes from smtp_from.
     sendmail_command: []const u8 = "", // "" = off (use SMTP/Log); non-empty = CommandMailer
 
+    // Web Push VAPID keypair (#223), base64url. Both empty (default) = push is a logging no-op
+    // (`ctx.push().send` never touches the network). Set both to enable real delivery; generate
+    // a pair with `zigbase vapid-keygen`. The private key is SECRET (never logged). Env:
+    // ZIGBASE_VAPID_PUBLIC_KEY / ZIGBASE_VAPID_PRIVATE_KEY.
+    vapid_public_key: []const u8 = "",
+    vapid_private_key: []const u8 = "",
+
     // DEV-ONLY frozen clock (`ZIGBASE_FAKE_NOW`, an ISO-8601 UTC instant). Resolved to unix
     // seconds here so serveImpl can `clock.install` it. ALWAYS null on a production build —
     // `clock.resolveFromEnv` is comptime-gated off when the `dev_clock` build option is false,
@@ -201,6 +208,8 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_SMTP_INSECURE")) |v|
             cfg.smtp_insecure_skip_verify = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
         if (getter.get("ZIGBASE_SENDMAIL_COMMAND")) |v| cfg.sendmail_command = v;
+        if (getter.get("ZIGBASE_VAPID_PUBLIC_KEY")) |v| cfg.vapid_public_key = v;
+        if (getter.get("ZIGBASE_VAPID_PRIVATE_KEY")) |v| cfg.vapid_private_key = v;
         // Dev-only frozen clock. resolveFromEnv is comptime-gated off on a prod build, so this
         // is always null there regardless of the env var.
         cfg.fake_now_unix = clock.resolveFromEnv(getter.get(clock.env_var));
