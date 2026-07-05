@@ -332,6 +332,29 @@ pub const Client = struct {
         if (res.status != 200) return error.S3RequestFailed;
         return scanKeys(alloc, res.body);
     }
+
+    /// Presign a GET URL for `key` (SigV4 query-string signing). Builds the effective host +
+    /// request path exactly like every other op (path-style vs virtual-hosted addressing) and
+    /// delegates to `sigv4.presignGetUrl` with an `X-Amz-Date` of "now". Caller owns the returned
+    /// URL. NOT best-effort: a signing failure propagates (the serve path decides what to do).
+    pub fn presignGet(self: Client, io: std.Io, alloc: std.mem.Allocator, key: []const u8, expires_seconds: u32) ![]const u8 {
+        const path = try requestPath(alloc, self, key);
+        defer alloc.free(path);
+        const host = try effectiveHost(alloc, self);
+        defer alloc.free(host);
+        const amz = amzDate(clock.nowUnix(io));
+        return sigv4.presignGetUrl(alloc, .{
+            .access_key = self.access_key,
+            .secret_key = self.secret_key,
+            .region = self.region,
+            .service = "s3",
+            .host = host,
+            .path = path,
+            .amz_date = &amz,
+            .expires_seconds = expires_seconds,
+            .scheme = self.scheme, // http for a MinIO/dev endpoint; https otherwise
+        });
+    }
 };
 
 const AmzDateBuf = [16]u8; // "YYYYMMDDTHHMMSSZ" — 16 ASCII bytes
@@ -497,7 +520,18 @@ pub const S3Storage = struct {
         .fetch = fetchImpl,
         .delete = deleteImpl,
         .deleteRecord = deleteRecordImpl,
+        .presignGetUrl = presignGetUrlImpl,
     };
+
+    /// Presign a time-limited GET URL for the object so api/files.serve can 302-redirect instead of
+    /// spooling+streaming the bytes. Reuses the SigV4 query-string signer over the same object key
+    /// as `fetch`. Non-null on S3; a signing failure propagates (not best-effort).
+    fn presignGetUrlImpl(ctx: *anyopaque, io: std.Io, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8, expires_seconds: u32) anyerror!?[]const u8 {
+        const self: *S3Storage = @ptrCast(@alignCast(ctx));
+        const key = try self.client.objectKey(alloc, col, record_id, filename);
+        defer alloc.free(key);
+        return try self.client.presignGet(io, alloc, key, expires_seconds);
+    }
 
     /// PutObject with Content-Type from content sniffing (stored as object metadata).
     /// Runs inside the global write transaction — a failure errors into the existing
@@ -680,6 +714,65 @@ test "Client.init: explicit s3_force_path_style=false is respected with an endpo
     try testing.expectEqualStrings("minio.example.com", client.host);
     try testing.expectEqualStrings("https", client.scheme);
     try testing.expectEqual(false, client.path_style);
+}
+
+test "presignGet: virtual-hosted URL — host+path match addressing, https, has signature/expires" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cfg = config.Config{};
+    cfg.s3_bucket = "zbtest";
+    cfg.s3_region = "us-east-1";
+    cfg.s3_access_key_id = "AKID";
+    cfg.s3_secret_access_key = "SECRET";
+    var host_buf: [256]u8 = undefined;
+    const client = Client.init(cfg, &host_buf); // no endpoint => virtual-hosted
+    const key = try client.objectKey(a, "posts", "rec1", "a.png");
+    const url = try client.presignGet(std.testing.io, a, key, 900);
+    // Virtual-hosted: bucket rides the host, key is the path.
+    try std.testing.expect(std.mem.startsWith(u8, url, "https://zbtest.s3.us-east-1.amazonaws.com/posts/rec1/a.png?"));
+    try std.testing.expect(std.mem.indexOf(u8, url, "X-Amz-Signature=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "X-Amz-Expires=900") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "X-Amz-Credential=AKID") != null);
+}
+
+test "presignGet: path-style URL — bucket in the path, honors the endpoint host" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cfg = config.Config{};
+    cfg.s3_bucket = "zbtest";
+    cfg.s3_region = "us-east-1";
+    cfg.s3_endpoint = "https://minio.example.com"; // path-style by default with an endpoint
+    cfg.s3_access_key_id = "AKID";
+    cfg.s3_secret_access_key = "SECRET";
+    var host_buf: [256]u8 = undefined;
+    const client = Client.init(cfg, &host_buf);
+    const key = try client.objectKey(a, "posts", "rec1", "a.png");
+    const url = try client.presignGet(std.testing.io, a, key, 1800);
+    // Path-style: bucket is a path segment on the endpoint host.
+    try std.testing.expect(std.mem.startsWith(u8, url, "https://minio.example.com/zbtest/posts/rec1/a.png?"));
+    try std.testing.expect(std.mem.indexOf(u8, url, "X-Amz-Signature=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "X-Amz-Expires=1800") != null);
+}
+
+test "presignGet: an http endpoint yields an http presigned URL (scheme honored)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cfg = config.Config{};
+    cfg.s3_bucket = "zbtest";
+    cfg.s3_region = "us-east-1";
+    cfg.s3_endpoint = "http://minio.local:9000"; // dev MinIO over http
+    cfg.s3_access_key_id = "AKID";
+    cfg.s3_secret_access_key = "SECRET";
+    var host_buf: [256]u8 = undefined;
+    const client = Client.init(cfg, &host_buf);
+    const key = try client.objectKey(a, "posts", "rec1", "a.png");
+    const url = try client.presignGet(std.testing.io, a, key, 900);
+    // The presigned URL must match the endpoint scheme, or it is undialable.
+    try std.testing.expect(std.mem.startsWith(u8, url, "http://minio.local:9000/zbtest/posts/rec1/a.png?"));
+    try std.testing.expect(std.mem.indexOf(u8, url, "X-Amz-Signature=") != null);
 }
 
 fn testClient() Client {

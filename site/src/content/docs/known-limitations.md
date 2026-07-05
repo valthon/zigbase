@@ -210,8 +210,15 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
 - **Deletes are best-effort.** Exactly like local storage, a delete that fails partway
   can leave an orphaned object behind; there is no reconciliation job. Configure an S3
   lifecycle rule on the bucket/prefix as the mitigation.
-- **Proxy-only serving.** Downloads always flow through the server's spool cache — there
-  is no presigned-URL redirect mode yet.
+- **Proxy serving is the default; presigned-redirect is opt-in.** By default downloads
+  flow through the server's spool cache, consuming server bandwidth/CPU. An opt-in
+  presigned-redirect mode is available via `App(.{ .files = .{ .s3_presign_redirect = true
+  } })` (S3 backend only; default off = proxy): an authorized download is answered with a
+  302 to a time-limited presigned GET URL (`s3_presign_ttl_s`, default 900s) instead of
+  proxying the bytes. Per-request authorization still runs before the redirect, but the
+  issued URL is a **bearer capability** — valid for `s3_presign_ttl_s` and not bound to the
+  authorized requester, so anyone holding it can fetch the object until it expires. Keep
+  the TTL short.
 - **Single-`PUT` uploads only, capped at 5 GiB.** There is no S3 multipart upload;
   `ZIGBASE_MAX_UPLOAD_SIZE` above the 5 GiB single-`PUT` limit is refused at startup.
 - **Spool cache eviction approximates last-access LRU, not strict LRU.** Eviction still

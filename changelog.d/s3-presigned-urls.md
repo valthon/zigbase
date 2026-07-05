@@ -1,0 +1,2 @@
+### Features
+- Optional S3 presigned-URL serving: with the comptime `App(.{ .files = .{ .s3_presign_redirect = true } })` option, authorized file downloads on the S3 backend are served as a 302 redirect to a time-limited presigned GET URL (`s3_presign_ttl_s`, default 900s) instead of proxying the bytes through the server — offloading bandwidth/CPU. Default is unchanged (proxy). Authorization still runs per-request before the redirect; the issued URL is a bearer capability valid until it expires.

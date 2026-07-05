@@ -14,6 +14,13 @@ pub const Storage = struct {
         fetch: *const fn (ctx: *anyopaque, io: std.Io, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!?[]const u8,
         delete: *const fn (ctx: *anyopaque, io: std.Io, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!void,
         deleteRecord: *const fn (ctx: *anyopaque, io: std.Io, col: []const u8, record_id: []const u8) anyerror!void,
+        /// OPTIONAL: presign a time-limited GET URL for the object so an authorized download can be
+        /// served as a 302 redirect instead of proxying the bytes. `null` (the default) = the
+        /// backend cannot presign — the serve path falls back to `fetch`+stream. Returning null at
+        /// call time is also allowed (e.g. a backend that presigns only some objects). A signing
+        /// failure propagates as an error (the caller decides). Defaulting to null keeps existing
+        /// `VTable{ ... }` literals valid (backward-compatible for custom storage plugins).
+        presignGetUrl: ?*const fn (ctx: *anyopaque, io: std.Io, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8, expires_seconds: u32) anyerror!?[]const u8 = null,
     };
 
     pub fn put(self: Storage, io: std.Io, col: []const u8, record_id: []const u8, filename: []const u8, bytes: []const u8) anyerror!void {
@@ -27,6 +34,13 @@ pub const Storage = struct {
     }
     pub fn deleteRecord(self: Storage, io: std.Io, col: []const u8, record_id: []const u8) anyerror!void {
         return self.vtable.deleteRecord(self.ctx, io, col, record_id);
+    }
+    /// Presign a GET URL for the object, or `null` if the backend cannot presign (the vtable field
+    /// is null — e.g. local disk). The caller (api/files.serve) 302-redirects to a non-null URL and
+    /// otherwise falls back to the proxy path. A signing failure propagates as an error.
+    pub fn presignGetUrl(self: Storage, io: std.Io, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8, expires_seconds: u32) anyerror!?[]const u8 {
+        const f = self.vtable.presignGetUrl orelse return null;
+        return f(self.ctx, io, alloc, col, record_id, filename, expires_seconds);
     }
 };
 
@@ -117,4 +131,11 @@ test "LocalStorage put/fetch/read/delete/deleteRecord round-trip" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, dir2, a, .limited(16)));
 
     try st.delete(std.testing.io, "posts", "ghost", "none.txt"); // missing -> no-op
+}
+
+test "LocalStorage does not presign (wrapper returns null)" {
+    var local = LocalStorage.init("/tmp/root");
+    const st = local.storage();
+    const url = try st.presignGetUrl(std.testing.io, std.testing.allocator, "posts", "rec1", "a.png", 900);
+    try std.testing.expect(url == null);
 }

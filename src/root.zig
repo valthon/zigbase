@@ -61,6 +61,7 @@ pub const SesMailer = @import("mail/ses.zig").SesMailer;
 pub const PostmarkMailer = @import("mail/postmark.zig").PostmarkMailer;
 pub const CaptureMailer = @import("mail/capture.zig").CaptureMailer;
 pub const MailConfig = @import("mail/config.zig").Runtime;
+pub const FilesConfig = @import("files/config.zig").Runtime;
 pub const mail_template = @import("mail/template.zig");
 
 // Built-in plugins (for composition / overriding only one side of the pair).
@@ -281,6 +282,7 @@ test {
     _ = @import("files/plan.zig");
     _ = @import("files/multipart.zig");
     _ = @import("files/serve_file.zig");
+    _ = @import("files/config.zig");
     _ = @import("data.zig");
     _ = @import("events.zig");
     _ = @import("sentry.zig");

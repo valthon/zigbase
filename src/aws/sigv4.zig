@@ -91,6 +91,158 @@ pub fn uriEncodePath(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// RFC3986 encode one query component (key or value): unreserved chars
+/// (A-Z a-z 0-9 - . _ ~) verbatim, EVERYTHING else — INCLUDING '/' — percent-encoded
+/// uppercase-hex. This is the correct encoder for query keys/values, and in particular
+/// for `X-Amz-Credential` whose embedded '/' MUST become `%2F` (do NOT use
+/// `uriEncodePath`, which preserves '/').
+pub fn uriEncodeComponent(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (s) |c| {
+        const unreserved = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '-' or c == '.' or c == '_' or c == '~';
+        if (unreserved) {
+            try out.append(alloc, c);
+        } else {
+            try out.print(alloc, "%{X:0>2}", .{c});
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// The inputs to presign a GET URL (SigV4 query-string signing). `host`/`path` describe
+/// the object; `amz_date` is the `YYYYMMDDTHHMMSSZ` UTC stamp (`date` = `amz_date[0..8]`).
+pub const PresignInput = struct {
+    access_key: []const u8,
+    secret_key: []const u8,
+    region: []const u8,
+    service: []const u8, // "s3", ...
+    host: []const u8,
+    /// RAW object path ("/" prefixed); path-encoded (uriEncodePath, '/' preserved) into
+    /// the canonical URI.
+    path: []const u8,
+    /// `YYYYMMDDTHHMMSSZ` UTC timestamp (the X-Amz-Date value).
+    amz_date: []const u8,
+    /// Validity window in seconds (the X-Amz-Expires value).
+    expires_seconds: u32,
+    /// URL scheme for the returned URL. NOT part of the SigV4 signature (only host/path/query
+    /// are signed), so it purely selects the returned URL's prefix. Default "https"; an
+    /// http-endpoint backend (MinIO/dev) passes "http" so the presigned URL is dialable.
+    scheme: []const u8 = "https",
+    /// Additional query params to fold into the canonical query, ALREADY RFC3986-encoded
+    /// as `k=v&k=v`. "" (the common plain-GET case) contributes nothing. When present the
+    /// params are merged with the X-Amz-* set and the whole set is re-sorted by encoded key.
+    extra_query: []const u8 = "",
+};
+
+/// Produce a fully-signed presigned GET URL for `in` (SigV4 query-string signing).
+/// Signs `host` as the only header, an `UNSIGNED-PAYLOAD` body, and the sorted X-Amz-*
+/// query params; `X-Amz-Signature` is appended last (not part of the signed query).
+/// Caller owns the returned slice.
+///
+/// Reference: docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+/// ("Authenticating Requests: Using Query Parameters (AWS Signature Version 4)").
+pub fn presignGetUrl(alloc: std.mem.Allocator, in: PresignInput) ![]const u8 {
+    // `amz_date` must be the full `YYYYMMDDTHHMMSSZ` (16 chars); guard before slicing so a
+    // malformed caller value is a clean error, not an out-of-bounds panic.
+    if (in.amz_date.len < 16) return error.InvalidAmzDate;
+    const date = in.amz_date[0..8]; // YYYYMMDD
+
+    const scope = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}/aws4_request", .{ date, in.region, in.service });
+    defer alloc.free(scope);
+
+    // Build the canonical query as a list of already-encoded `key=value` pairs, sorted by
+    // encoded key. The fixed X-Amz-* keys are unreserved (encode to themselves); their
+    // values are RFC3986-encoded (X-Amz-Credential's '/' → %2F).
+    const Pair = struct { key: []const u8, kv: []const u8 };
+    var pairs: std.ArrayList(Pair) = .empty;
+    defer {
+        for (pairs.items) |p| alloc.free(p.kv);
+        pairs.deinit(alloc);
+    }
+
+    // Helper to append a fixed X-Amz-* param, encoding key + value.
+    const appendParam = struct {
+        fn call(a: std.mem.Allocator, list: *std.ArrayList(Pair), key: []const u8, value: []const u8) !void {
+            const ek = try uriEncodeComponent(a, key);
+            defer a.free(ek);
+            const ev = try uriEncodeComponent(a, value);
+            defer a.free(ev);
+            const kv = try std.fmt.allocPrint(a, "{s}={s}", .{ ek, ev });
+            errdefer a.free(kv);
+            // The stored key slice is a prefix of kv (up to '='); safe because kv outlives it.
+            try list.append(a, .{ .key = kv[0..ek.len], .kv = kv });
+        }
+    }.call;
+
+    const expires_str = try std.fmt.allocPrint(alloc, "{d}", .{in.expires_seconds});
+    defer alloc.free(expires_str);
+    const credential = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ in.access_key, scope });
+    defer alloc.free(credential);
+
+    try appendParam(alloc, &pairs, "X-Amz-Algorithm", algorithm);
+    try appendParam(alloc, &pairs, "X-Amz-Credential", credential);
+    try appendParam(alloc, &pairs, "X-Amz-Date", in.amz_date);
+    try appendParam(alloc, &pairs, "X-Amz-Expires", expires_str);
+    try appendParam(alloc, &pairs, "X-Amz-SignedHeaders", "host");
+
+    // Merge any already-encoded extra params (split on '&', key is the part before '=').
+    if (in.extra_query.len > 0) {
+        var it = std.mem.splitScalar(u8, in.extra_query, '&');
+        while (it.next()) |piece| {
+            if (piece.len == 0) continue;
+            const kv = try alloc.dupe(u8, piece);
+            errdefer alloc.free(kv);
+            const eq = std.mem.indexOfScalar(u8, kv, '=');
+            const key = if (eq) |i| kv[0..i] else kv;
+            try pairs.append(alloc, .{ .key = key, .kv = kv });
+        }
+    }
+
+    std.mem.sort(Pair, pairs.items, {}, struct {
+        fn lt(_: void, x: Pair, y: Pair) bool {
+            // AWS SigV4: sort by name, and by value when names are equal. `kv` is the encoded
+            // `key=value`, so comparing it breaks a key tie by value. (No X-Amz-* key repeats;
+            // this only matters for duplicate keys arriving via `extra_query`.)
+            if (std.mem.eql(u8, x.key, y.key)) return std.mem.lessThan(u8, x.kv, y.kv);
+            return std.mem.lessThan(u8, x.key, y.key);
+        }
+    }.lt);
+
+    var canonical_query: std.ArrayList(u8) = .empty;
+    defer canonical_query.deinit(alloc);
+    for (pairs.items, 0..) |p, i| {
+        if (i != 0) try canonical_query.append(alloc, '&');
+        try canonical_query.appendSlice(alloc, p.kv);
+    }
+
+    // Canonical request: host is the only signed header; body is the literal UNSIGNED-PAYLOAD.
+    const canonical_uri = try uriEncodePath(alloc, in.path);
+    defer alloc.free(canonical_uri);
+    const canonical_request = try std.fmt.allocPrint(
+        alloc,
+        "GET\n{s}\n{s}\nhost:{s}\n\nhost\nUNSIGNED-PAYLOAD",
+        .{ canonical_uri, canonical_query.items, in.host },
+    );
+    defer alloc.free(canonical_request);
+    const canonical_hash = try sha256Hex(alloc, canonical_request);
+    defer alloc.free(canonical_hash);
+
+    const string_to_sign = try std.fmt.allocPrint(alloc, "{s}\n{s}\n{s}\n{s}", .{ algorithm, in.amz_date, scope, canonical_hash });
+    defer alloc.free(string_to_sign);
+
+    const key = signingKey(in.secret_key, date, in.region, in.service);
+    const sig = hmac(&key, string_to_sign);
+    const sig_hex = std.fmt.bytesToHex(sig, .lower);
+
+    return std.fmt.allocPrint(
+        alloc,
+        "{s}://{s}{s}?{s}&X-Amz-Signature={s}",
+        .{ in.scheme, in.host, in.path, canonical_query.items, sig_hex },
+    );
+}
+
 /// Produce the `Authorization` header value for `in`. `host` and `x-amz-date` are
 /// always signed; `in.headers` are merged in and the canonical list is sorted by
 /// lowercase name (AWS requirement). Caller owns the returned slice.
@@ -341,4 +493,146 @@ test "signRequest: S3-shaped PUT vector (content-type + x-amz-content-sha256 sig
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=41f38683dd8281f8e069a3770076588a1ec766018b706c308b44acdee450ca5a",
         auth,
     );
+}
+
+test "uriEncodeComponent: RFC3986 query encoding ('/' -> %2F, uppercase hex)" {
+    const a = testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request", "AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request" },
+        .{ "a~b-c_d.e", "a~b-c_d.e" }, // unreserved verbatim
+        .{ "a b+c", "a%20b%2Bc" },
+        .{ "AWS4-HMAC-SHA256", "AWS4-HMAC-SHA256" }, // '-' is unreserved
+    };
+    for (cases) |c| {
+        const got = try uriEncodeComponent(a, c[0]);
+        defer a.free(got);
+        try testing.expectEqualStrings(c[1], got);
+    }
+}
+
+test "presignGetUrl: AWS documented presigned GET Object vector" {
+    // From docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html — the worked
+    // "Example: GET Object" presigned request. The exact canonical query and X-Amz-Signature
+    // below are copied verbatim from that AWS documentation page (not guessed/computed here).
+    const a = testing.allocator;
+    const url = try presignGetUrl(a, .{
+        .access_key = "AKIAIOSFODNN7EXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3",
+        .host = "examplebucket.s3.amazonaws.com",
+        .path = "/test.txt",
+        .amz_date = "20130524T000000Z",
+        .expires_seconds = 86400,
+    });
+    defer a.free(url);
+    try testing.expectEqualStrings(
+        "https://examplebucket.s3.amazonaws.com/test.txt?" ++
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&" ++
+            "X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&" ++
+            "X-Amz-Date=20130524T000000Z&" ++
+            "X-Amz-Expires=86400&" ++
+            "X-Amz-SignedHeaders=host&" ++
+            "X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404",
+        url,
+    );
+}
+
+test "presignGetUrl: X-Amz-Credential slashes encode as uppercase %2F" {
+    const a = testing.allocator;
+    const url = try presignGetUrl(a, .{
+        .access_key = "AKIAIOSFODNN7EXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3",
+        .host = "examplebucket.s3.amazonaws.com",
+        .path = "/test.txt",
+        .amz_date = "20130524T000000Z",
+        .expires_seconds = 86400,
+    });
+    defer a.free(url);
+    // Uppercase %2F present; lowercase %2f absent.
+    try testing.expect(std.mem.indexOf(u8, url, "AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request") != null);
+    try testing.expect(std.mem.indexOf(u8, url, "%2f") == null);
+}
+
+test "presignGetUrl: signature is appended last, after the canonical query" {
+    const a = testing.allocator;
+    const url = try presignGetUrl(a, .{
+        .access_key = "AKIDEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "eu-west-1",
+        .service = "s3",
+        .host = "bucket.s3.eu-west-1.amazonaws.com",
+        .path = "/dir/file.png",
+        .amz_date = "20240101T000000Z",
+        .expires_seconds = 3600,
+    });
+    defer a.free(url);
+    const marker = "&X-Amz-Signature=";
+    const idx = std.mem.indexOf(u8, url, marker).?;
+    const sig = url[idx + marker.len ..];
+    try testing.expectEqual(@as(usize, 64), sig.len);
+    for (sig) |c| try testing.expect(std.ascii.isHex(c));
+    // X-Amz-Signature must be the LAST param (no further '&' after it) and not appear in
+    // the signed canonical query (only once total, as the trailing param).
+    try testing.expect(std.mem.indexOfScalar(u8, sig, '&') == null);
+    try testing.expectEqual(idx, std.mem.lastIndexOf(u8, url, "X-Amz-Signature=").? - 1);
+}
+
+test "presignGetUrl: path-style host/path still signs (structural)" {
+    const a = testing.allocator;
+    const url = try presignGetUrl(a, .{
+        .access_key = "AKIAIOSFODNN7EXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3",
+        .host = "s3.amazonaws.com",
+        .path = "/examplebucket/test.txt",
+        .amz_date = "20130524T000000Z",
+        .expires_seconds = 86400,
+    });
+    defer a.free(url);
+    try testing.expect(std.mem.startsWith(u8, url, "https://s3.amazonaws.com/examplebucket/test.txt?"));
+    try testing.expect(std.mem.indexOf(u8, url, "X-Amz-Algorithm=AWS4-HMAC-SHA256") != null);
+    const marker = "&X-Amz-Signature=";
+    const idx = std.mem.indexOf(u8, url, marker).?;
+    try testing.expectEqual(@as(usize, 64), url[idx + marker.len ..].len);
+}
+
+test "presignGetUrl: duplicate extra_query keys sort by value (name-then-value)" {
+    const a = testing.allocator;
+    // Two params with the SAME key must appear value-sorted in the canonical query
+    // (AWS SigV4: sort by name, then by value). Without the value tiebreak the order
+    // would be undefined and the signature non-deterministic.
+    const url = try presignGetUrl(a, .{
+        .access_key = "AKID",
+        .secret_key = "SECRET",
+        .region = "us-east-1",
+        .service = "s3",
+        .host = "s3.amazonaws.com",
+        .path = "/b/k",
+        .amz_date = "20130524T000000Z",
+        .expires_seconds = 900,
+        .extra_query = "x=2&x=1",
+    });
+    defer a.free(url);
+    // "x=1" must precede "x=2".
+    const pos1 = std.mem.indexOf(u8, url, "x=1").?;
+    const pos2 = std.mem.indexOf(u8, url, "x=2").?;
+    try testing.expect(pos1 < pos2);
+}
+
+test "presignGetUrl: a too-short amz_date is a clean error, not a panic" {
+    const a = testing.allocator;
+    try testing.expectError(error.InvalidAmzDate, presignGetUrl(a, .{
+        .access_key = "AKID",
+        .secret_key = "SECRET",
+        .region = "us-east-1",
+        .service = "s3",
+        .host = "h",
+        .path = "/k",
+        .amz_date = "2013", // too short
+        .expires_seconds = 900,
+    }));
 }
