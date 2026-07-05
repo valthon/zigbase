@@ -225,6 +225,7 @@ The list endpoint supports two pagination styles: **offset** (`page`/`perPage`) 
 | `search` | — | Full-text search terms (alias `q`). Matches `searchable` fields; results are ranked by relevance (see [Search](#search)). |
 | `vector` | — | Nearest-neighbor search (opt-in `-Dvector` build only); `<field>[:cosine|:l2]:<json-embedding>` (see [Search](#search)). |
 | `expand` | — | Relation expansion (see [expand](#expand)). Works in both modes. |
+| `fields` | — | Response projection: comma-separated dot-paths select which keys are returned (see [fields](#fields)). Works in both modes; also on the single-record `view` endpoint. |
 
 The **offset** list response envelope:
 
@@ -409,6 +410,32 @@ expand=author,comments.user
 ```
 
 Expansion runs on both the list endpoint and the single-record `view` endpoint.
+
+### fields
+
+`fields=` narrows which keys of each returned record are serialized. It is a comma-separated
+list of dot-paths and runs on both the list endpoint and the single-record `view` endpoint.
+
+```text
+fields=id,title,expand.author.name
+```
+
+- **Segments** split on `.`: `expand.author.name` keeps top-level `expand`, then `author` inside
+  it, then only `name` inside that. Descent recurses arbitrarily deep (nested `expand` blocks);
+  when a descended value is a multi-relation **array**, the sub-projection is applied to each element.
+- **`*`** as a segment means "all keys at this level" — a lone `fields=*` returns the full record.
+- **Strict**: when `fields` is present, ONLY the listed paths appear. `id` is **not** auto-included
+  (list it, or cover it with `*`). The `expand` block appears only if an `expand…` path is listed.
+- **Exclusion**: a path beginning with `-` removes that path, applied *after* the includes, e.g.
+  `*,-secret` (all top-level except `secret`) or `expand.author.*,-expand.author.email`. Excluding a
+  non-present path is a no-op. `fields=-secret` alone means "everything but `secret`".
+- Unknown/non-present include paths are silently ignored (never an error).
+
+Projection is a **pure output filter** applied *after* `expand`, view-rule authorization, and any
+sensitive-field stripping — it can only **remove** keys, never read a new column, re-query, or add
+data. It therefore cannot widen access: a field the record wouldn't otherwise return can never appear
+via `fields=`. On the list endpoint it projects each record; the envelope (`page`/`perPage`/`items`/
+cursor fields) is never projected.
 
 ### Search
 

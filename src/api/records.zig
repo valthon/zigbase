@@ -11,6 +11,7 @@ const ApiError = @import("error.zig").ApiError;
 const FieldError = @import("error.zig").FieldError;
 const params_mod = @import("../query/params.zig");
 const expand_mod = @import("../query/expand.zig");
+const fields_mod = @import("../query/fields.zig");
 const policy = @import("../policy.zig");
 const tenancy = @import("../tenancy/tenancy.zig");
 const request = @import("../request.zig");
@@ -197,6 +198,14 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     var rec = (try records.get(ctx.allocator, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
     const qp = try params_mod.parse(ctx.allocator, ctx.query);
     if (qp.get("expand")) |exp| if (exp.len > 0) try expand_mod.expand(ctx.allocator, &r, col, &rec, exp, 0, &rctx);
+    // `fields=` response projection: a PURE OUTPUT FILTER applied AFTER expand + authorization —
+    // it can only narrow the record, never reveal a field it wouldn't otherwise return.
+    if (qp.get("fields")) |f| if (f.len > 0) {
+        // Attacker-controlled — cap length like filter/sort (records.max_filter_len) to bound
+        // parse/projection cost before doing any work.
+        if (f.len > records.max_filter_len) return ApiError.badRequest("`fields` is too long.").toResponse(ctx.allocator);
+        try fields_mod.project(ctx.allocator, &rec, try fields_mod.parse(ctx.allocator, f));
+    };
     return jsonResponse(ctx, 200, rec);
 }
 
@@ -750,6 +759,16 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         for (result.items) |*item| try expand_mod.expand(ctx.allocator, &r, col, item, exp, 0, &rctx);
     };
 
+    // `fields=` response projection: parse ONCE, apply to EACH record (never the envelope). It is a
+    // pure output filter applied after expand — it can only narrow each record, never widen access.
+    if (qp.get("fields")) |f| if (f.len > 0) {
+        // Attacker-controlled — cap length like filter/sort (records.max_filter_len). A list can
+        // return many records, so an unbounded spec amplifies parse/projection cost per item.
+        if (f.len > records.max_filter_len) return ApiError.badRequest("`fields` is too long.").toResponse(ctx.allocator);
+        const spec = try fields_mod.parse(ctx.allocator, f);
+        for (result.items) |*item| try fields_mod.project(ctx.allocator, item, spec);
+    };
+
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator, "page", .{ .integer = @intCast(result.page) });
     try root.put(ctx.allocator, "perPage", .{ .integer = @intCast(result.perPage) });
@@ -879,6 +898,96 @@ test "list handler returns the page envelope" {
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"totalItems\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"page\":1") != null);
+}
+
+test "fields= projection on view narrows a record to the listed keys" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    const cres = try create(&cctx);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, cres.body, .{});
+    const rid = parsed.value.object.get("id").?.string;
+
+    const view_params = [_]http.Param{ .{ .key = "col", .value = "posts" }, .{ .key = "id", .value = rid } };
+    var vctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "fields=id", .allocator = a, .app = &env.app, .params = &view_params };
+    const vres = try view(&vctx);
+    try std.testing.expectEqual(@as(u16, 200), vres.status);
+    const pv = (try std.json.parseFromSlice(std.json.Value, a, vres.body, .{})).value;
+    try std.testing.expect(pv.object.get("id") != null);
+    try std.testing.expect(pv.object.get("title") == null); // narrowed away
+}
+
+test "fields= over the length cap is rejected 400 (DoS guard)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    const cres = try create(&cctx);
+    const rid = (try std.json.parseFromSlice(std.json.Value, a, cres.body, .{})).value.object.get("id").?.string;
+
+    // A spec longer than records.max_filter_len must 400 before any parse/projection work.
+    const big = try a.alloc(u8, records.max_filter_len + 1);
+    @memset(big, 'a');
+    const query = try std.fmt.allocPrint(a, "fields={s}", .{big});
+    const view_params = [_]http.Param{ .{ .key = "col", .value = "posts" }, .{ .key = "id", .value = rid } };
+    var vctx = http.RequestCtx{ .method = .GET, .path = "/", .query = query, .allocator = a, .app = &env.app, .params = &view_params };
+    const vres = try view(&vctx);
+    try std.testing.expectEqual(@as(u16, 400), vres.status);
+}
+
+test "fields= projection cannot widen access to an absent field" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    const cres = try create(&cctx);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, cres.body, .{});
+    const rid = parsed.value.object.get("id").?.string;
+
+    // `secret` is not a field on `posts`, so the built record never contained it. Requesting it
+    // via `fields=` must NOT conjure it — projection can only remove keys, never add one.
+    const view_params = [_]http.Param{ .{ .key = "col", .value = "posts" }, .{ .key = "id", .value = rid } };
+    var vctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "fields=id,secret", .allocator = a, .app = &env.app, .params = &view_params };
+    const vres = try view(&vctx);
+    try std.testing.expectEqual(@as(u16, 200), vres.status);
+    const pv = (try std.json.parseFromSlice(std.json.Value, a, vres.body, .{})).value;
+    try std.testing.expect(pv.object.get("id") != null);
+    try std.testing.expect(pv.object.get("secret") == null); // never revealed
+    try std.testing.expect(std.mem.indexOf(u8, vres.body, "secret") == null);
+}
+
+test "fields= projection on list narrows each item but keeps the envelope" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+    var c1 = ctxFor(env, a, .POST, "{\"title\":\"a\"}", &col_param);
+    _ = try create(&c1);
+
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "fields=title", .allocator = a, .app = &env.app, .params = &col_param };
+    const res = try list(&lctx);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    const root = (try std.json.parseFromSlice(std.json.Value, a, res.body, .{})).value;
+    // Envelope keys are untouched by projection.
+    try std.testing.expect(root.object.get("page") != null);
+    try std.testing.expect(root.object.get("perPage") != null);
+    const items = root.object.get("items").?.array;
+    try std.testing.expectEqual(@as(usize, 1), items.items.len);
+    const item = items.items[0];
+    try std.testing.expect(item.object.get("title") != null);
+    try std.testing.expect(item.object.get("id") == null); // narrowed
 }
 
 test "list handler clamps an oversized perPage to the 500 cap (F9 DoS)" {
