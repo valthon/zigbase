@@ -234,6 +234,7 @@ test {
     _ = @import("schema.zig");
     _ = @import("collections.zig");
     _ = @import("colcache.zig");
+    _ = @import("feature_cache.zig");
     _ = @import("records.zig");
     _ = @import("values.zig");
     _ = @import("ddl.zig");
