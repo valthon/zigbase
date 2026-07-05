@@ -2992,9 +2992,120 @@ fn renameTitle(m: *zigbase.Migrator) anyerror!void {
 }
 ```
 
-Each migration has an `.id` (used for the once-only record) and an `.up` function `fn
-(m: *zigbase.Migrator) anyerror!void` run inside a transaction (rolled back on error).
-Use migrations for renames, drops, type changes, and data backfills.
+Each migration has an `.id` (used for the once-only record) and a forward step. Use
+migrations for renames, drops, type changes, and data backfills. The full shape:
+
+```zig
+pub const Migration = struct {
+    id: []const u8,
+    /// Auto-reversible forward change (Rails-style). Written once with the DSL; the same body
+    /// inverts for rollback. Set EXACTLY ONE of `change` or `up`.
+    change: ?*const fn (m: *zigbase.Migrator) anyerror!void = null,
+    /// Explicit forward step — use when the change isn't auto-reversible (raw SQL, data transforms).
+    up: ?*const fn (m: *zigbase.Migrator) anyerror!void = null,
+    /// Explicit reverse step for rollback. Pairs with `up`. (Rollback CLI lands in a follow-up.)
+    down: ?*const fn (m: *zigbase.Migrator) anyerror!void = null,
+    /// Per-migration transactional opt-out (default `true`) for DDL that can't run in a transaction.
+    transactional: bool = true,
+};
+```
+
+Exactly one of `change`/`up` is required (comptime-enforced); `down` needs a forward step.
+
+#### The schema DSL & auto-reversible `change`
+
+A `change` migration describes the forward schema edit **once**, using a dialect-aware DSL,
+and ZigBase derives the inverse for rollback (Rails' `change`). The DSL emits backend-correct
+SQL on SQLite **and** Postgres, so you don't hand-write `ALTER TABLE` per dialect:
+
+```zig
+.migrations = .{
+    .{ .id = "0002_add_comments", .change = addComments },
+},
+fn addComments(m: *zigbase.Migrator) anyerror!void {
+    try m.createTable("comments", &.{
+        .{ .name = "id", .type = .integer, .pk = true, .null = false },
+        .{ .name = "post_id", .type = .integer, .null = false },
+        .{ .name = "body", .type = .text },
+        .{ .name = "created", .type = .timestamp },
+    });
+    try m.addColumn("posts", .{ .name = "comment_count", .type = .integer, .null = false, .default = "0" });
+    try m.addIndex("comments", &.{"post_id"}, .{});
+}
+```
+
+Applied forward, that creates the table, adds the column, and builds the index. A future
+rollback re-runs the **same** function in reverse (`m.direction == .reverse`), where each op
+emits its inverse in reverse op-order: drop the index, drop the column, drop the table.
+
+The v1 op set (each `m.<op>(...) anyerror!void`):
+
+| Op | Forward | Auto-inverse |
+| --- | --- | --- |
+| `createTable(name, cols)` | `CREATE TABLE` | `DROP TABLE` |
+| `dropTable(name, .{ .was = cols })` | `DROP TABLE` | re-`CREATE` from `.was` |
+| `addColumn(table, col)` | `ADD COLUMN` | `DROP COLUMN` |
+| `dropColumn(table, name, .{ .was = col })` | `DROP COLUMN` | re-`ADD` from `.was` |
+| `addIndex(table, cols, .{ .name?, .unique? })` | `CREATE [UNIQUE] INDEX` | `DROP INDEX` (same derived name) |
+| `dropIndex(name, .{ .was = .{ table, cols, unique } })` | `DROP INDEX` | re-`CREATE` from `.was` |
+| `renameTable(from, to)` | `RENAME TO` | rename back (self-inverse) |
+| `renameColumn(table, from, to)` | `RENAME COLUMN` | rename back (self-inverse) |
+| `addForeignKey(table, col, ref_table, .{ .ref_column?, .on_delete_cascade?, .name? })` | `ADD CONSTRAINT … FOREIGN KEY` (**Postgres only**) | `DROP CONSTRAINT` (same derived name) |
+
+`Col` is `.{ .name, .type, .null = true, .pk = false, .default = null }` and `ColType` is one of
+`.text` / `.integer` / `.real` / `.boolean` / `.blob` / `.timestamp` (mapped to the backend-native
+keyword). An index/FK name defaults deterministically (`idx_<table>_<cols…>`,
+`fk_<table>_<col>`) so the inverse can name the object it created.
+
+**Auto-reversibility rule.** An op is auto-reversible when its inverse is unambiguous. The
+*drop* ops (`dropTable`/`dropColumn`/`dropIndex`) need a `.was` snapshot to rebuild from —
+**without `.was` they are irreversible** and a reverse pass fails loudly
+(`error.MigrationNotReversible`). Raw SQL (`m.raw`/`m.rawFor`/`m.exec`) and data transforms
+(`m.records()`, below) have no general inverse and are likewise irreversible in reverse mode.
+`addForeignKey` is **Postgres-only** (SQLite has no `ALTER TABLE ADD CONSTRAINT`; it returns
+`error.WrongBackend` — declare the FK inline in `createTable`, or use `m.raw`). Whenever a
+step is irreversible, write it as an explicit `up` and supply your own `down`.
+
+#### Data transforms (`m.records()`)
+
+`m.records()` is a records-aware facade for **data** migrations (backfills, reshapes) that
+routes through the SAME engine primitives the HTTP API uses — so encrypted fields decrypt on
+read and re-encrypt on write, and typed fields coerce exactly as a normal write would (no
+re-implemented crypto/coercion):
+
+```zig
+.migrations = .{
+    .{ .id = "0003_slugify", .up = slugify, .down = unslugify },
+},
+fn slugify(m: *zigbase.Migrator) anyerror!void {
+    const r = try m.records();
+    for (try r.all("posts")) |rec| {
+        const id = rec.object.get("id").?.string;
+        const title = rec.object.get("title").?.string;
+        var patch: std.json.ObjectMap = .empty;
+        try patch.put(m.arena, "slug", .{ .string = try slugFrom(m.arena, title) });
+        _ = try r.update("posts", id, .{ .object = patch });
+    }
+}
+```
+
+`r.all(collection)` reads every row (unscoped) through the engine; `r.get(collection, id)` and
+`r.update(collection, id, patch)` (partial merge) do single-row I/O. Data transforms are
+**irreversible** — `m.records()` returns `error.MigrationNotReversible` in reverse mode, so pair
+a data-transform `change` with an explicit `down` (or write it as `up`/`down`, as above).
+
+#### Transactions & the `.transactional` opt-out
+
+Each migration's forward step + its `_migrations` bookkeeping run inside **one transaction** —
+a failure rolls the whole thing back and the migration stays un-applied (re-runnable), never
+half-done. Some statements can't run inside a transaction (e.g. SQLite `VACUUM`, Postgres
+`CREATE INDEX CONCURRENTLY`); set `.transactional = false` on that migration and it runs
+**without** a wrapping transaction (it owns its own atomicity; it is recorded only after it
+succeeds).
+
+> **Rollback & status CLI** (running a migration's inverse `change`/`down`, listing applied vs
+> pending) and a **schema dump** are coming in follow-up work. Piece A delivers the DSL, the
+> forward apply path, and the reverse machinery each op is built on.
 
 #### Cross-backend migrations (SQLite **and** Postgres)
 

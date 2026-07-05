@@ -732,7 +732,15 @@ fn stableFieldId(comptime col: []const u8, comptime name: []const u8) []const u8
 /// it in state that outlives the call; use a separate long-lived allocator for persistent data.
 pub const Migration = struct {
     id: []const u8,
-    up: *const fn (m: *Migrator) anyerror!void,
+    /// Auto-reversible forward change (Rails `change`). Applied with the Migrator in
+    /// forward mode; Piece B rolls it back by re-running with direction = .reverse.
+    change: ?*const fn (m: *Migrator) anyerror!void = null,
+    /// Explicit forward step (use when the change isn't auto-reversible).
+    up: ?*const fn (m: *Migrator) anyerror!void = null,
+    /// Explicit reverse step for rollback (Piece B). Pairs with `up`, or overrides `change`.
+    down: ?*const fn (m: *Migrator) anyerror!void = null,
+    /// Per-migration transactional opt-out (default true) for DDL that can't run in a tx.
+    transactional: bool = true,
 };
 
 // ---------------------------------------------------------------------------
@@ -1102,11 +1110,28 @@ pub fn runMigrations(
     for (migs) |m| {
         const name = try std.fmt.allocPrint(a, "prov:{s}", .{m.id});
         if (try migrationApplied(&mig, name)) continue;
-        try w.begin();
-        errdefer w.rollback() catch {};
-        try m.up(&mig);
-        try recordMigration(&mig, name);
-        try w.commit();
+        // Piece A applies migrations FORWARD only (Piece B adds the reverse/rollback pass). Set the
+        // direction explicitly per migration so a `change`'s DSL ops emit their forward SQL.
+        mig.direction = .forward;
+        // A `change` (auto-reversible) or an explicit `up` — exactly one is present (comptime-checked
+        // in framework.zig's `.migrations` lowering, so `m.up.?` is safe here).
+        const fwd = m.change orelse m.up.?;
+        if (m.transactional) {
+            // Default: the migration's DDL/DML + its `_migrations` bookkeeping commit atomically;
+            // any failure rolls the whole thing back (nothing recorded).
+            try w.begin();
+            errdefer w.rollback() catch {};
+            try fwd(&mig);
+            try recordMigration(&mig, name);
+            try w.commit();
+        } else {
+            // Opt-out: statements that cannot run inside a transaction (e.g. VACUUM, some CREATE
+            // INDEX CONCURRENTLY on Postgres). No wrapping tx and no rollback — the migration owns
+            // its own atomicity. Record only after it succeeds so a failure leaves it un-applied
+            // (and re-runnable) rather than falsely marked done.
+            try fwd(&mig);
+            try recordMigration(&mig, name);
+        }
         std.log.info("provision: applied migration '{s}'", .{m.id});
     }
 }
@@ -1654,6 +1679,82 @@ test "runMigrations runs each explicit migration once (idempotent)" {
     try runMigrations(a, std.testing.io, &d, &migs);
     try runMigrations(a, std.testing.io, &d, &migs);
     try std.testing.expectEqual(@as(usize, 1), M.calls);
+}
+
+test "runMigrations applies a change-migration forward (schema effect present)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        fn change(m: *Migrator) anyerror!void {
+            // Runs in FORWARD mode → createTable creates (not drops).
+            try std.testing.expectEqual(Migrator.Direction.forward, m.direction);
+            try m.createTable("widgets", &[_]Migrator.Col{
+                .{ .name = "id", .type = .integer, .pk = true, .null = false },
+                .{ .name = "name", .type = .text },
+            });
+        }
+    };
+    const migs = [_]Migration{.{ .id = "0001_widgets", .change = M.change }};
+    try runMigrations(a, std.testing.io, &d, &migs);
+
+    // The forward change created the table.
+    var st = try d.prepare("SELECT 1 FROM \"widgets\" LIMIT 0;");
+    st.finalize();
+}
+
+test "runMigrations honors .transactional = false (no wrapping tx)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // VACUUM cannot run inside a transaction. It succeeds ONLY because a `.transactional = false`
+    // migration is applied without the wrapping BEGIN/COMMIT.
+    const M = struct {
+        fn up(m: *Migrator) anyerror!void {
+            try m.exec("VACUUM;");
+        }
+    };
+    try runMigrations(a, std.testing.io, &d, &[_]Migration{.{ .id = "0001_vac", .up = M.up, .transactional = false }});
+
+    // The SAME op as a default (transactional) migration fails: VACUUM inside a tx is rejected —
+    // proving the opt-out is what let it run above.
+    if (runMigrations(a, std.testing.io, &d, &[_]Migration{.{ .id = "0002_vac", .up = M.up }})) |_| {
+        return error.TestExpectedTxVacuumToFail;
+    } else |_| {}
+}
+
+test "runMigrations: legacy { id, up } is unaffected (backward-compat)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        var calls: usize = 0;
+        fn up(m: *Migrator) anyerror!void {
+            calls += 1;
+            try m.execLowered("CREATE TABLE IF NOT EXISTS \"legacy_demo\" (\"x\" TEXT);");
+        }
+    };
+    M.calls = 0;
+    // A default (transactional=true) up-only migration applies once, inside a wrapping tx, exactly
+    // as before the change/down/transactional fields existed.
+    const migs = [_]Migration{.{ .id = "0001_legacy", .up = M.up }};
+    try runMigrations(a, std.testing.io, &d, &migs);
+    try runMigrations(a, std.testing.io, &d, &migs);
+    try std.testing.expectEqual(@as(usize, 1), M.calls);
+    var st = try d.prepare("SELECT 1 FROM \"legacy_demo\" LIMIT 0;");
+    st.finalize();
 }
 
 test "buildCollection lowers .auth.methods into collection options" {

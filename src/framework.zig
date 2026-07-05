@@ -289,6 +289,15 @@ fn migrationsCoerce(comptime M: type) bool {
     return false;
 }
 
+/// Comptime-validate a migration's forward/reverse-step shape: exactly one of `.change`
+/// or `.up` (a `.change` is auto-reversible; an `.up` is explicit-forward), and a `.down`
+/// (explicit reverse) requires a forward step to pair with. `id` is threaded only for the
+/// error message. Shared by the bare-tuple lowering and the typed-slice branch.
+fn validateMigration(comptime id: []const u8, comptime has_change: bool, comptime has_up: bool, comptime has_down: bool) void {
+    if (has_change == has_up) @compileError("migration '" ++ id ++ "': set exactly one of .change or .up");
+    if (has_down and !has_up and !has_change) @compileError("migration '" ++ id ++ "': .down needs a forward step");
+}
+
 /// §C.2: one rule for the comptime default AND the runtime override — non-empty,
 /// <= 256 bytes, CR/LF-free (header-injection guard; the value goes on the wire
 /// verbatim as the Cache-Control header value).
@@ -1208,15 +1217,34 @@ pub fn App(comptime cfg: anytype) type {
         pub const provision_migrations: []const provision.Migration = blk: {
             if (!@hasField(@TypeOf(cfg), "migrations")) break :blk &.{};
             const raw = cfg.migrations;
-            if (migrationsCoerce(@TypeOf(raw))) break :blk raw; // typed slice / array ptr
+            if (migrationsCoerce(@TypeOf(raw))) {
+                // Typed slice / array ptr — no lowering, but run the same forward-step
+                // validation (exactly one of .change/.up; .down needs a forward step).
+                for (raw) |entry| validateMigration(entry.id, entry.change != null, entry.up != null, entry.down != null);
+                break :blk raw;
+            }
             // Bare-tuple form (E1): lower each entry to a Migration, mirroring .static_routes.
             const RT = @TypeOf(raw);
             const info = @typeInfo(RT);
             if (info != .@"struct" or !info.@"struct".is_tuple)
-                @compileError("'.migrations' must be a tuple of '.{ .id = \"...\", .up = fn }' entries or a typed slice '&[_]zigbase.Migration{ ... }'; got '" ++ @typeName(RT) ++ "'");
+                @compileError("'.migrations' must be a tuple of '.{ .id = \"...\", .change = fn }' (or '.up = fn') entries or a typed slice '&[_]zigbase.Migration{ ... }'; got '" ++ @typeName(RT) ++ "'");
             const n = std.meta.fields(RT).len;
             var out: [n]provision.Migration = undefined;
-            for (0..n) |i| out[i] = provision.Migration{ .id = raw[i].id, .up = raw[i].up };
+            for (0..n) |i| {
+                const entry = raw[i];
+                const ET = @TypeOf(entry);
+                const has_change = @hasField(ET, "change");
+                const has_up = @hasField(ET, "up");
+                const has_down = @hasField(ET, "down");
+                validateMigration(entry.id, has_change, has_up, has_down);
+                out[i] = provision.Migration{
+                    .id = entry.id,
+                    .change = if (has_change) entry.change else null,
+                    .up = if (has_up) entry.up else null,
+                    .down = if (has_down) entry.down else null,
+                    .transactional = if (@hasField(ET, "transactional")) entry.transactional else true,
+                };
+            }
             const final = out;
             break :blk &final;
         };
@@ -3092,6 +3120,23 @@ test "E1: .migrations accepts a bare tuple (lowered like .static_routes)" {
         .{ .id = "0001_slice_form", .up = M.up },
     } });
     try std.testing.expectEqual(@as(usize, 1), B.provision_migrations.len);
+}
+
+test "migrations: change/up/transactional fields resolve (bare tuple + typed)" {
+    const H = struct {
+        fn ch(m: *migrator.Migrator) anyerror!void {
+            _ = m;
+        }
+    };
+    // bare-tuple form with the new fields
+    const A = App(.{ .migrations = .{.{ .id = "0001_x", .change = H.ch }} });
+    try std.testing.expectEqual(@as(usize, 1), A.provision_migrations.len);
+    try std.testing.expect(A.provision_migrations[0].change != null);
+    try std.testing.expect(A.provision_migrations[0].transactional); // default true
+    // legacy up-only still lowers
+    const B = App(.{ .migrations = .{.{ .id = "0001_y", .up = H.ch }} });
+    try std.testing.expect(B.provision_migrations[0].up != null);
+    try std.testing.expect(B.provision_migrations[0].change == null);
 }
 
 test "App(cfg) lowers .flags/.experiments into the registry + generated enums (#128/#129/#130)" {
