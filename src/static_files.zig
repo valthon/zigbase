@@ -93,25 +93,80 @@ pub fn normalizeRange(alloc: std.mem.Allocator, raw: []const u8, size: u64) !?Ra
     };
 }
 
+/// Value of an ASCII hex digit, or null if `c` is not `[0-9A-Fa-f]`.
+fn hexVal(c: u8) ?u4 {
+    return switch (c) {
+        '0'...'9' => @intCast(c - '0'),
+        'a'...'f' => @intCast(c - 'a' + 10),
+        'A'...'F' => @intCast(c - 'A' + 10),
+        else => null,
+    };
+}
+
+/// In-house, SINGLE-PASS percent-decoder for request paths. `%XX` (two ASCII hex
+/// digits) decodes to the byte; a `%` NOT followed by two hex digits is emitted
+/// literally (so `%2`, `%zz`, a trailing `%` yield a literal `%` — a filename that
+/// won't exist, i.e. 404, fail-closed — never an error). `+` is NOT decoded to space
+/// (that is query-string, not path, semantics). Single-pass by construction: the
+/// output byte is never re-examined, so `%252e` -> the literal `%2e` (never `.`),
+/// which is what stops double-encoding from smuggling a `..` past sanitize()'s
+/// traversal checks. Caller owns the returned slice.
+fn percentDecode(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, s.len);
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        // `i + 2 < s.len` guarantees s[i+1] and s[i+2] are both valid indices.
+        if (c == '%' and i + 2 < s.len) {
+            const hi = hexVal(s[i + 1]);
+            const lo = hexVal(s[i + 2]);
+            if (hi != null and lo != null) {
+                out.appendAssumeCapacity((@as(u8, hi.?) << 4) | @as(u8, lo.?));
+                i += 3;
+                continue;
+            }
+        }
+        out.appendAssumeCapacity(c);
+        i += 1;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 /// Normalize a request path into a root-relative, '/'-separated file path.
 /// Returns null for unsafe paths (no leading '/', NUL, backslash, "..").
 /// "" means "the root" (callers resolve it to index.html). Caller owns the slice.
 pub fn sanitize(alloc: std.mem.Allocator, path: []const u8) !?[]const u8 {
-    // NOTE (audited): the HTTP layer does NOT percent-decode this path. facil.io's http1
-    // parser stores the request path raw, zap passes it through untouched, and facil.io's
-    // http_decode_path only ever runs inside http_sendfile2 on its `encoded` argument —
-    // which zap calls with NULL. So an encoded traversal like "%2e%2e" reaches this check
-    // as a LITERAL "%2e%2e" segment: it never becomes ".." and dir mode stat()s a file
-    // literally named "%2e%2e" (404, fail-closed). The flip side: files whose names need
-    // percent-encoding ("my file.pdf" -> /my%20file.pdf) are not servable. If that is ever
-    // wanted, decode BEFORE sanitize() so the ".." check sees decoded bytes (facil.io's
-    // http_decode_path is already extern'd in zap's fio.zig).
-    if (path.len == 0 or path[0] != '/') return null;
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
-    if (std.mem.indexOfScalar(u8, path, '\\') != null) return null;
+    // NOTE (audited): the request path arrives raw (facil.io's http1 parser stores it
+    // un-decoded, zap passes it through untouched, and facil.io's http_decode_path only
+    // runs inside http_sendfile2 on an `encoded` arg that zap calls with NULL). We
+    // percent-decode it HERE — SINGLE-PASS, in-house (see percentDecode) — BEFORE every
+    // traversal check, so all the checks below see the DECODED bytes:
+    //   * "%2e%2e" -> ".." -> caught (the per-segment ".." check).
+    //   * "%2f" -> "/" -> a real segment boundary, and each segment is still ".."-checked,
+    //     so "foo%2f%2e%2e%2fbar" -> "foo/../bar" -> the ".." segment is caught.
+    //   * "%00" -> NUL -> caught; "%5c" -> backslash -> caught.
+    //   * Double-encoding is NOT recursively decoded: "%252e" -> the literal "%2e"
+    //     (never "."), so "%252e%252e" is the harmless segment "%2e%2e", not "..".
+    //   * A malformed escape ("%2", "%zz", trailing "%") stays a literal "%": a filename
+    //     that won't exist -> 404, fail-closed.
+    // Net effect: percent-encoded filenames ("my file.pdf" -> /my%20file.pdf) are now
+    // servable, while encoded traversal is decoded and then rejected fail-closed. The F10
+    // symlink guard (a separate runtime realpath check on the resolved path) is unchanged
+    // and still runs after these lexical checks.
+    // Fast path: the vast majority of requests carry no `%`, and with no percent-escape the
+    // decoded bytes are identical to `path` — so skip the decode allocation entirely and run
+    // the checks on `path` directly. Only allocate a decoded buffer when a `%` is present.
+    const needs_decode = std.mem.indexOfScalar(u8, path, '%') != null;
+    const decoded = if (needs_decode) try percentDecode(alloc, path) else path;
+    defer if (needs_decode) alloc.free(decoded);
+    if (decoded.len == 0 or decoded[0] != '/') return null;
+    if (std.mem.indexOfScalar(u8, decoded, 0) != null) return null;
+    if (std.mem.indexOfScalar(u8, decoded, '\\') != null) return null;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    var it = std.mem.splitScalar(u8, path, '/');
+    var it = std.mem.splitScalar(u8, decoded, '/');
     while (it.next()) |seg| {
         if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
         if (std.mem.eql(u8, seg, "..")) {
@@ -688,6 +743,84 @@ test "sanitize: traversal and junk are rejected" {
     try std.testing.expect((try sanitize(a, "/a\\b")) == null);
     try std.testing.expect((try sanitize(a, "/a\x00b")) == null);
     try std.testing.expect((try sanitize(a, "no-leading-slash")) == null);
+}
+
+test "sanitize: percent-decoded filenames are servable" {
+    const a = std.testing.allocator;
+    const s1 = (try sanitize(a, "/my%20file.pdf")).?;
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("my file.pdf", s1);
+    // UTF-8 encoded filename decodes to its raw bytes.
+    const s2 = (try sanitize(a, "/caf%C3%A9.txt")).?;
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("café.txt", s2);
+    // Encoded separator becomes a real segment boundary; neither segment is "..".
+    const s3 = (try sanitize(a, "/a%2fb")).?;
+    defer a.free(s3);
+    try std.testing.expectEqualStrings("a/b", s3);
+    // Uppercase hex works too.
+    const s4 = (try sanitize(a, "/my%2Ofile")).?; // %2O is malformed (O is not hex) -> literal
+    defer a.free(s4);
+    try std.testing.expectEqualStrings("my%2Ofile", s4);
+}
+
+test "sanitize: encoded traversal is decoded then rejected fail-closed" {
+    const a = std.testing.allocator;
+    // %2e%2e -> ".." caught.
+    try std.testing.expect((try sanitize(a, "/%2e%2e/secret")) == null);
+    try std.testing.expect((try sanitize(a, "/foo/%2e%2e/bar")) == null);
+    // %2f decodes to a separator, exposing the ".." segment.
+    try std.testing.expect((try sanitize(a, "/%2e%2e%2fetc/passwd")) == null);
+    try std.testing.expect((try sanitize(a, "/foo%2f%2e%2e%2fbar")) == null);
+    // Encoded NUL and backslash are caught.
+    try std.testing.expect((try sanitize(a, "/%00")) == null);
+    try std.testing.expect((try sanitize(a, "/a%5cb")) == null);
+    // Mixed-case hex still decodes and is caught.
+    try std.testing.expect((try sanitize(a, "/%2E%2E/x")) == null);
+}
+
+test "sanitize: percent-decoding is single-pass (no recursive decode)" {
+    const a = std.testing.allocator;
+    // %25 -> '%', so %252e -> "%2e" (a literal, NOT "."). Double-encoding cannot
+    // smuggle a "..": the decoded segment is "%2e%2e", which is not "..".
+    const s = (try sanitize(a, "/%252e%252e")).?;
+    defer a.free(s);
+    try std.testing.expectEqualStrings("%2e%2e", s);
+}
+
+test "sanitize: malformed escapes are tolerated as literals" {
+    const a = std.testing.allocator;
+    // '%' not followed by two hex digits -> literal '%'.
+    const s1 = (try sanitize(a, "/foo%2")).?;
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("foo%2", s1);
+    const s2 = (try sanitize(a, "/foo%zz")).?;
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("foo%zz", s2);
+    // Trailing '%'.
+    const s3 = (try sanitize(a, "/foo%")).?;
+    defer a.free(s3);
+    try std.testing.expectEqualStrings("foo%", s3);
+}
+
+test "percentDecode: single-pass byte decoding" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "my%20file.pdf", .out = "my file.pdf" },
+        .{ .in = "plain", .out = "plain" },
+        .{ .in = "%2e%2e", .out = ".." },
+        .{ .in = "%252e", .out = "%2e" }, // single pass: %25 -> '%', then "2e" literal
+        .{ .in = "a+b", .out = "a+b" }, // '+' is NOT decoded to space (path semantics)
+        .{ .in = "%2", .out = "%2" }, // truncated escape -> literal
+        .{ .in = "%zz", .out = "%zz" }, // non-hex -> literal
+        .{ .in = "%", .out = "%" }, // trailing '%'
+        .{ .in = "%C3%A9", .out = "café"[3..] }, // the two UTF-8 bytes of é
+    };
+    for (cases) |c| {
+        const got = try percentDecode(a, c.in);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c.out, got);
+    }
 }
 
 const fixture = [_]StaticFile{
