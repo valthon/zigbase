@@ -565,10 +565,21 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
         if (rt.method != ctx.method) continue;
         if (try router.matchPath(ctx.allocator, rt.pattern, ctx.path)) |params| {
             ctx.params = params;
-            // Resolve auth on a fresh read-only connection (never the writer lock).
-            var reader = app.pool.acquireReader() catch return try ApiError.internal().toResponse(ctx.allocator);
-            defer app.pool.releaseReader(&reader);
-            const authed = auth.authenticate(app.io, ctx.allocator, app, ctx, &reader) catch null;
+            // Resolve auth on a fresh read-only connection (never the writer lock) — but ONLY
+            // when a credential is actually present. `authenticate` returns null on its first
+            // line (`bearer orelse cookie orelse return null`) when neither a bearer header nor a
+            // `zb_auth` cookie is set, so a credential-less request — the common anonymous/public
+            // shape — can skip the pool acquire entirely, removing a guaranteed reader round-trip
+            // (and its contention) from the framework's per-request floor on anonymous traffic
+            // (#231). `authed == null` whenever `reader == null`, so the invariant "authed implies
+            // reader" holds below.
+            const has_creds = ctx.bearerToken() != null or ctx.cookie("zb_auth") != null;
+            var reader: ?@import("db.zig").Db = if (has_creds)
+                (app.pool.acquireReader() catch return try ApiError.internal().toResponse(ctx.allocator))
+            else
+                null;
+            defer if (reader) |*r| app.pool.releaseReader(r);
+            const authed = if (reader) |*r| (auth.authenticate(app.io, ctx.allocator, app, ctx, r) catch null) else null;
             switch (rt.auth) {
                 .public => {},
                 .authed => if (authed == null) return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator),
@@ -591,7 +602,8 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
             // `role_ranking` copied (an unresolved, fail-closed scope), matching an
             // anonymous REST request.
             if (authed) |a| {
-                tenancy.resolveRequest(ctx, &reader, app, a, &rctx);
+                // `authed` is non-null only when `reader` was acquired (see above), so `.?` is safe.
+                tenancy.resolveRequest(ctx, &reader.?, app, a, &rctx);
             } else {
                 rctx.tenancy_enabled = app.tenancy.enabled;
                 rctx.role_ranking = app.role_ranking;
@@ -691,6 +703,50 @@ test "dispatchCustom: deliberate 4xx is NOT reported to onError; genuine 5xx is"
     const boom = (try dispatchCustom(&boom_ctx)).?;
     try std.testing.expectEqual(@as(u16, 500), boom.status);
     try std.testing.expectEqual(@as(usize, 1), H.on_error_calls);
+}
+
+test "dispatchCustom: a credential-less public request resolves without acquiring a reader (#231)" {
+    const db = @import("db.zig");
+    const App = app_mod.App;
+
+    const H = struct {
+        fn ok(cx: *Ctx) anyerror!http.Response {
+            _ = cx;
+            return .{ .status = 200, .body = "ok" };
+        }
+    };
+    const ga = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+    defer ga.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/t.db", .{dir_path}, 0);
+    defer ga.free(db_path);
+    var pool = try db.Pool.init(ga, std.testing.io, db_path);
+    defer pool.deinit();
+    var arena = std.heap.ArenaAllocator.init(ga);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const route_table = [_]events.RuntimeRoute{
+        .{ .method = .GET, .pattern = "/api/ok", .handler = H.ok, .auth = .public },
+    };
+    const dispatch = events.Dispatch{ .routes = &route_table };
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &pool, .dispatch = &dispatch };
+
+    // No bearer header and no zb_auth cookie: the auth resolve (and its pooled reader acquire)
+    // is skipped entirely, and the public handler still runs with an anonymous context.
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/ok", .allocator = a, .app = &app };
+    const resp = (try dispatchCustom(&ctx)).?;
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("ok", resp.body);
+    // A credential-less `.authed` route still 401s with no reader needed to reject it.
+    const guarded = [_]events.RuntimeRoute{.{ .method = .GET, .pattern = "/api/priv", .handler = H.ok, .auth = .authed }};
+    const d2 = events.Dispatch{ .routes = &guarded };
+    var app2 = App{ .allocator = a, .io = std.testing.io, .pool = &pool, .dispatch = &d2 };
+    var ctx2 = http.RequestCtx{ .method = .GET, .path = "/api/priv", .allocator = a, .app = &app2 };
+    const resp2 = (try dispatchCustom(&ctx2)).?;
+    try std.testing.expectEqual(@as(u16, 401), resp2.status);
 }
 
 test "dispatchCustom merges ctx.setCookie/addHeader on success AND error paths (non-exclusive)" {
