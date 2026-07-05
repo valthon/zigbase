@@ -212,10 +212,12 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   is no presigned-URL redirect mode yet.
 - **Single-`PUT` uploads only, capped at 5 GiB.** There is no S3 multipart upload;
   `ZIGBASE_MAX_UPLOAD_SIZE` above the 5 GiB single-`PUT` limit is refused at startup.
-- **Spool cache eviction is create-time, not true LRU.** Eviction sorts by file mtime,
-  which is only set on a cache miss (the download that fills the entry) — a cache hit
-  does not bump it, so a frequently-read file fetched once long ago can be evicted
-  before a rarely-read file fetched more recently.
+- **Spool cache eviction approximates last-access LRU, not strict LRU.** Eviction still
+  sorts by file mtime, but mtime is now bumped on a cache hit as well as on the miss-fill
+  that creates the entry, so eviction approximates last-access LRU — a frequently-read
+  file survives over a rarely-read one. It is still not a strict LRU: there is no separate
+  access-time bookkeeping or journaling, and the mtime touch is best-effort and
+  coarse-grained.
 
 ## Other deferred work
 
