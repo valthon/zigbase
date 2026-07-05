@@ -29,6 +29,7 @@ const queue_durable = @import("queue/durable.zig");
 const mail_send = @import("mail/send.zig");
 const mail_bulk = @import("mail/bulk.zig");
 const mail_unsubscribe = @import("mail/unsubscribe.zig");
+const sms_send = @import("sms/send.zig");
 const webhook_mod = @import("webhook.zig");
 const push_send = @import("push/send.zig");
 const analytics = @import("analytics/analytics.zig");
@@ -288,6 +289,13 @@ pub const Ctx = struct {
     /// background delivery via the built-in `"mail"` job kind). The framework owns CRLF
     /// header-injection rejection + recipient address validation — see `MailApi`.
     pub fn mail(self: *Ctx) MailApi {
+        return .{ .ctx = self };
+    }
+
+    /// Returns the outbound-SMS namespace (`ctx.sms()`, #224): `send` (synchronous, via the
+    /// configured SMS provider) and `enqueue` (durable/memory background delivery via the built-in
+    /// `"sms"` job kind). The framework owns E.164 normalization/rejection — see `SmsApi`.
+    pub fn sms(self: *Ctx) SmsApi {
         return .{ .ctx = self };
     }
 
@@ -1152,6 +1160,55 @@ pub const MailApi = struct {
         const base = self.ctx.app.mail.unsubscribe_base_url;
         if (base.len == 0) return error.UnsubscribeNotConfigured;
         return mail_unsubscribe.buildUrl(self.ctx.arena, base, self.ctx.app.jwt_secret, account, list, recipient);
+    }
+};
+
+/// Outbound-SMS namespace (`ctx.sms()`, #224). The SMS analog of `MailApi`.
+///
+/// SECURITY: the framework owns E.164 normalization/rejection here (in `sms/send.zig`) — a
+/// consumer never re-rolls it. Both `send` and `enqueue` normalize BEFORE any byte reaches a
+/// provider or a durable queue row, so a malformed number fails fast at the call site.
+///
+/// - `send`    — normalize + deliver synchronously via the configured provider (log fallback when
+///               none is wired, so tests/CLI need no credentials).
+/// - `enqueue` — hand the message to the background queue (built-in `"sms"` job kind) for
+///               durable/memory delivery with the queue's retry/backoff; pick the queue via
+///               `.{ .queue = "…" }`.
+pub const SmsApi = struct {
+    ctx: *Ctx,
+
+    /// The consumer-facing message shape (`{ to, body, from? }`). Re-exported from `sms/send.zig`.
+    pub const Message = sms_send.SmsMessage;
+
+    /// Options for the background-delivery verb. `queue` routes the "sms" job; `null` (the
+    /// default) uses the configured `.sms.queue` (itself defaulting to the always-present
+    /// `"default"` queue), so a caller opts in per-call only when overriding it.
+    pub const EnqueueOpts = struct {
+        queue: ?[]const u8 = null,
+    };
+
+    /// Normalize + deliver `msg` synchronously through the configured provider (log fallback when
+    /// none is wired). Errors: `error.InvalidPhoneNumber` / `error.EmptyBody` on a bad message, or a
+    /// backend failure.
+    pub fn send(self: SmsApi, msg: Message) !void {
+        return sms_send.send(self.ctx.app, self.ctx.arena, msg);
+    }
+
+    /// Normalize `msg`, then enqueue it as a background `"sms"` job on `opts.queue`. Normalizing
+    /// BEFORE enqueue means a malformed number fails fast at the call site, not later in a worker —
+    /// and never persists to a queue row. Requires `.sms` / `.sms_provider` in the App config
+    /// (without one the "sms" kind is not compiled in and this fails with `error.UnknownJobKind`)
+    /// and a wired queue registry (`error.QueuesUnavailable` otherwise).
+    pub fn enqueue(self: SmsApi, msg: Message, opts: EnqueueOpts) !void {
+        const normalized = try sms_send.normalize(self.ctx.arena, msg, self.ctx.app.sms.default_region);
+        // Explicit per-call queue wins; otherwise the configured `.sms.queue` default.
+        const queue = opts.queue orelse self.ctx.app.sms.queue;
+        return self.ctx.enqueueByName(queue, "sms", normalized);
+    }
+
+    /// Alias for `enqueue` reading as the intent ("deliver this later, off the request path").
+    pub fn deliverLater(self: SmsApi, msg: Message, opts: EnqueueOpts) !void {
+        return self.enqueue(msg, opts);
     }
 };
 

@@ -64,6 +64,18 @@ pub const MailConfig = @import("mail/config.zig").Runtime;
 pub const FilesConfig = @import("files/config.zig").Runtime;
 pub const mail_template = @import("mail/template.zig");
 
+// Outbound transactional SMS (#224): `ctx.sms().send`/`.enqueue` take an `SmsMessage`. A custom
+// SMS provider plugin's `interface()` returns `SmsSender`, whose `send` is handed an `Sms`.
+pub const SmsSender = @import("sms/sender.zig").SmsSender;
+pub const Sms = @import("sms/sender.zig").Sms;
+pub const LogSmsSender = @import("sms/sender.zig").LogSmsSender;
+pub const TwilioSender = @import("sms/twilio.zig").TwilioSender;
+pub const CaptureSms = @import("sms/capture.zig").CaptureSms;
+pub const SmsMessage = @import("sms/send.zig").SmsMessage;
+pub const SmsConfig = @import("sms/config.zig").Runtime;
+pub const SmsRegion = @import("sms/e164.zig").Region;
+pub const normalizeE164 = @import("sms/e164.zig").normalizeE164;
+
 // Built-in plugins (for composition / overriding only one side of the pair).
 pub const DefaultStoragePlugin = @import("framework.zig").DefaultStoragePlugin;
 pub const DefaultMailerPlugin = @import("framework.zig").DefaultMailerPlugin;
@@ -318,6 +330,12 @@ test {
     _ = @import("mail/suppression.zig");
     _ = @import("mail/inbound.zig");
     _ = @import("mail/unsubscribe.zig");
+    _ = @import("sms/sender.zig");
+    _ = @import("sms/e164.zig");
+    _ = @import("sms/twilio.zig");
+    _ = @import("sms/capture.zig");
+    _ = @import("sms/send.zig");
+    _ = @import("sms/config.zig");
     _ = @import("api/senders.zig");
     _ = @import("api/mail_unsubscribe.zig");
     _ = @import("api/mail_config.zig");

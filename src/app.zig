@@ -84,6 +84,13 @@ pub const App = struct {
     /// route is 404 until a `webhook_secret` is configured. So an app that only calls the existing
     /// mailer is completely unaffected by this subsystem.
     mail: @import("mail/config.zig").Runtime = .{},
+    /// Pluggable SMS sender (#224), resolved from the comptime sms provider plugin in serveImpl.
+    /// Default = LogSmsSender (logs, no network); set the Twilio env vars to upgrade to
+    /// TwilioSender. null in tests/CLI where no sender was wired (callers fall back to logging).
+    sms_sender: ?*const @import("sms/sender.zig").SmsSender = null,
+    /// SMS-subsystem runtime knobs (#224), threaded from the comptime `App(.{ .sms = ... })` config
+    /// in serveImpl. Default `.{}` = US default region, background delivery on the "default" queue.
+    sms: @import("sms/config.zig").Runtime = .{},
     /// File-serving runtime knobs, threaded from the comptime `App(.{ .files = ... })` config in
     /// serveImpl. Default `.{}` = the byte-identical proxy-only path: authorized downloads are
     /// fetched (and, for S3, spool-cached) by the server and streamed to the client. With
