@@ -127,6 +127,24 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     };
 
     const storage = app.storage orelse return ApiError.internal().toResponse(ctx.allocator);
+
+    // Presigned-redirect mode (opt-in via `App(.{ .files = .{ .s3_presign_redirect = true } })`,
+    // S3-only). Authorization above has ALREADY run per-request; here we offload the byte transfer
+    // to the object store by 302-redirecting to a time-limited presigned GET URL instead of
+    // proxying/spooling the bytes. SECURITY: unlike the proxy path (each byte flows through an
+    // authorized request), the issued URL is a BEARER capability valid until it expires
+    // (`presign_ttl_s`) and is NOT bound to the authorized requester — anyone holding the URL can
+    // fetch it, and it does not vary by requester privilege. Authorization still gates *issuance*;
+    // keep the TTL short. `presignGetUrl` returns null on backends without presigning (local disk,
+    // or a build without -Ds3), so we fall through to the unchanged proxy path. A HEAD is honored
+    // too — the 302 carries no body. A signing failure propagates (→ 500), not a silent fallback.
+    if (app.files.presign_redirect) {
+        if (try storage.presignGetUrl(app.io, ctx.allocator, col.name, rid, name, app.files.presign_ttl_s)) |url| {
+            const hs = try ctx.allocator.dupe(http.Header, &.{.{ .name = "Location", .value = url }});
+            return .{ .status = 302, .body = "", .content_type = "text/plain", .extra_headers = hs };
+        }
+    }
+
     // §D.5: null = the DB references an object the backend has lost — hide existence
     // (404) but SCREAM in the logs; a transport/backend error (post retry-once inside
     // the backend) = transient -> 500.
@@ -428,6 +446,102 @@ test "serve: header emission — exactly one Cache-Control, ETag, Accept-Ranges;
         got_cl = true;
     };
     try std.testing.expect(got_cl);
+}
+
+// A minimal Storage stub for the presign-redirect serve test: `fetch` returns a real on-disk path
+// (so the proxy fallback yields 200) and `presignGetUrl` yields a canned URL (so the redirect path
+// yields a 302 without touching a real S3). put/delete/deleteRecord are unused no-ops here.
+const PresignStubStorage = struct {
+    root: []const u8,
+    const canned = "https://example-bucket.s3.us-east-1.amazonaws.com/docs/r1/a_0000000000.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=900&X-Amz-Signature=deadbeef";
+
+    fn putImpl(_: *anyopaque, _: std.Io, _: []const u8, _: []const u8, _: []const u8, _: []const u8) anyerror!void {}
+    fn fetchImpl(ctx: *anyopaque, _: std.Io, alloc: std.mem.Allocator, col: []const u8, rid: []const u8, name: []const u8) anyerror!?[]const u8 {
+        const self: *PresignStubStorage = @ptrCast(@alignCast(ctx));
+        return try std.fs.path.join(alloc, &.{ self.root, col, rid, name });
+    }
+    fn deleteImpl(_: *anyopaque, _: std.Io, _: []const u8, _: []const u8, _: []const u8) anyerror!void {}
+    fn deleteRecordImpl(_: *anyopaque, _: std.Io, _: []const u8, _: []const u8) anyerror!void {}
+    fn presignImpl(_: *anyopaque, _: std.Io, alloc: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: u32) anyerror!?[]const u8 {
+        return try alloc.dupe(u8, canned);
+    }
+    const vtable = @import("../files/storage.zig").Storage.VTable{
+        .put = putImpl,
+        .fetch = fetchImpl,
+        .delete = deleteImpl,
+        .deleteRecord = deleteRecordImpl,
+        .presignGetUrl = presignImpl,
+    };
+    fn storage(self: *PresignStubStorage) @import("../files/storage.zig").Storage {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
+
+test "serve: presign_redirect issues a 302 Location; default (off) still proxies" {
+    const migrations = @import("../migrations.zig");
+    const files_storage = @import("../files/storage.zig");
+    const app_mod = @import("../app.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ga = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(ga);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/test.db", .{dir_path}, 0);
+    var pool = try db.Pool.init(ga, std.testing.io, db_path);
+    defer pool.deinit();
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try migrations.run(w);
+        _ = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "docs", .viewRule = "@public", .fields = &[_]schema.Field{
+            .{ .id = "d1", .name = "file", .options = .{ .file = .{ .maxSelect = 1 } } },
+        } });
+        try w.exec("INSERT INTO docs (id,created,updated,file) VALUES ('r1','t','t','a_0000000000.png');");
+    }
+    // A real on-disk object so the proxy fallback can succeed (200); the stub's fetch returns its path.
+    var local = files_storage.LocalStorage.init(dir_path);
+    try local.storage().put(std.testing.io, "docs", "r1", "a_0000000000.png", "x" ** 100);
+
+    var stub = PresignStubStorage{ .root = dir_path };
+    const storage_iface = stub.storage();
+
+    const params = [_]http.Param{
+        .{ .key = "col", .value = "docs" }, .{ .key = "rec", .value = "r1" }, .{ .key = "name", .value = "a_0000000000.png" },
+    };
+
+    // presign_redirect = true → 302 to the presigned URL (authorization ran first).
+    {
+        var app = app_mod.App{ .allocator = ga, .io = std.testing.io, .pool = &pool, .storage = &storage_iface, .files = .{ .presign_redirect = true, .presign_ttl_s = 900 } };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params };
+        const r = try serve(&ctx);
+        try std.testing.expectEqual(@as(u16, 302), r.status);
+        try std.testing.expect(r.file == null);
+        var loc: []const u8 = "";
+        for (r.extra_headers) |h| if (std.mem.eql(u8, h.name, "Location")) {
+            loc = h.value;
+        };
+        try std.testing.expectEqualStrings(PresignStubStorage.canned, loc);
+    }
+
+    // A HEAD in presign mode still 302s (the redirect carries no body).
+    {
+        var app = app_mod.App{ .allocator = ga, .io = std.testing.io, .pool = &pool, .storage = &storage_iface, .files = .{ .presign_redirect = true } };
+        var ctxh = http.RequestCtx{ .method = .HEAD, .path = "/", .allocator = a, .app = &app, .params = &params };
+        const rh = try serve(&ctxh);
+        try std.testing.expectEqual(@as(u16, 302), rh.status);
+    }
+
+    // Default (presign_redirect = false) → the unchanged proxy path: 200 with an owned file ref, no Location.
+    {
+        var app = app_mod.App{ .allocator = ga, .io = std.testing.io, .pool = &pool, .storage = &storage_iface };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params };
+        const r = try serve(&ctx);
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expect(r.file != null);
+        for (r.extra_headers) |h| try std.testing.expect(!std.mem.eql(u8, h.name, "Location"));
+    }
 }
 
 /// POST /api/files/token — authenticated; mints a short-lived file-access token.

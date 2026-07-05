@@ -126,6 +126,10 @@ pub const PresignInput = struct {
     amz_date: []const u8,
     /// Validity window in seconds (the X-Amz-Expires value).
     expires_seconds: u32,
+    /// URL scheme for the returned URL. NOT part of the SigV4 signature (only host/path/query
+    /// are signed), so it purely selects the returned URL's prefix. Default "https"; an
+    /// http-endpoint backend (MinIO/dev) passes "http" so the presigned URL is dialable.
+    scheme: []const u8 = "https",
     /// Additional query params to fold into the canonical query, ALREADY RFC3986-encoded
     /// as `k=v&k=v`. "" (the common plain-GET case) contributes nothing. When present the
     /// params are merged with the X-Amz-* set and the whole set is re-sorted by encoded key.
@@ -140,6 +144,9 @@ pub const PresignInput = struct {
 /// Reference: docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
 /// ("Authenticating Requests: Using Query Parameters (AWS Signature Version 4)").
 pub fn presignGetUrl(alloc: std.mem.Allocator, in: PresignInput) ![]const u8 {
+    // `amz_date` must be the full `YYYYMMDDTHHMMSSZ` (16 chars); guard before slicing so a
+    // malformed caller value is a clean error, not an out-of-bounds panic.
+    if (in.amz_date.len < 16) return error.InvalidAmzDate;
     const date = in.amz_date[0..8]; // YYYYMMDD
 
     const scope = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}/aws4_request", .{ date, in.region, in.service });
@@ -195,6 +202,10 @@ pub fn presignGetUrl(alloc: std.mem.Allocator, in: PresignInput) ![]const u8 {
 
     std.mem.sort(Pair, pairs.items, {}, struct {
         fn lt(_: void, x: Pair, y: Pair) bool {
+            // AWS SigV4: sort by name, and by value when names are equal. `kv` is the encoded
+            // `key=value`, so comparing it breaks a key tie by value. (No X-Amz-* key repeats;
+            // this only matters for duplicate keys arriving via `extra_query`.)
+            if (std.mem.eql(u8, x.key, y.key)) return std.mem.lessThan(u8, x.kv, y.kv);
             return std.mem.lessThan(u8, x.key, y.key);
         }
     }.lt);
@@ -227,8 +238,8 @@ pub fn presignGetUrl(alloc: std.mem.Allocator, in: PresignInput) ![]const u8 {
 
     return std.fmt.allocPrint(
         alloc,
-        "https://{s}{s}?{s}&X-Amz-Signature={s}",
-        .{ in.host, in.path, canonical_query.items, sig_hex },
+        "{s}://{s}{s}?{s}&X-Amz-Signature={s}",
+        .{ in.scheme, in.host, in.path, canonical_query.items, sig_hex },
     );
 }
 
@@ -587,4 +598,41 @@ test "presignGetUrl: path-style host/path still signs (structural)" {
     const marker = "&X-Amz-Signature=";
     const idx = std.mem.indexOf(u8, url, marker).?;
     try testing.expectEqual(@as(usize, 64), url[idx + marker.len ..].len);
+}
+
+test "presignGetUrl: duplicate extra_query keys sort by value (name-then-value)" {
+    const a = testing.allocator;
+    // Two params with the SAME key must appear value-sorted in the canonical query
+    // (AWS SigV4: sort by name, then by value). Without the value tiebreak the order
+    // would be undefined and the signature non-deterministic.
+    const url = try presignGetUrl(a, .{
+        .access_key = "AKID",
+        .secret_key = "SECRET",
+        .region = "us-east-1",
+        .service = "s3",
+        .host = "s3.amazonaws.com",
+        .path = "/b/k",
+        .amz_date = "20130524T000000Z",
+        .expires_seconds = 900,
+        .extra_query = "x=2&x=1",
+    });
+    defer a.free(url);
+    // "x=1" must precede "x=2".
+    const pos1 = std.mem.indexOf(u8, url, "x=1").?;
+    const pos2 = std.mem.indexOf(u8, url, "x=2").?;
+    try testing.expect(pos1 < pos2);
+}
+
+test "presignGetUrl: a too-short amz_date is a clean error, not a panic" {
+    const a = testing.allocator;
+    try testing.expectError(error.InvalidAmzDate, presignGetUrl(a, .{
+        .access_key = "AKID",
+        .secret_key = "SECRET",
+        .region = "us-east-1",
+        .service = "s3",
+        .host = "h",
+        .path = "/k",
+        .amz_date = "2013", // too short
+        .expires_seconds = 900,
+    }));
 }

@@ -120,6 +120,7 @@ pub fn main(init: std.process.Init) !void {
 | `static_cache_control` | Comptime default `Cache-Control` for static responses (embedded + dir). Runtime `--static-cache-control` / `ZIGBASE_STATIC_CACHE_CONTROL` override it; unset → facil.io's stock `max-age=3600`. | data-only — a `?[]const u8` default feeding core static serving, not an optional subsystem. |
 | `admin` | `.admin = .disabled` removes the embedded admin SPA (route dispatch **and** the ~58 KiB of `@embedFile`-d assets) from your binary — useful for headless/embedded consumers. Default: served at `/_/`. | excluded, opt-**out** — the admin SPA ships by default; set `.admin = .disabled` to exclude it (the only key in this table where "unset" means *included*). |
 | `webhooks` | `.webhooks = true` registers the built-in `"webhook"` job kind, compiling in `ctx.webhook()`'s managed outbound delivery (`webhook.zig`, ~689 LOC). Default: off, so a consumer that never sends managed webhooks pays nothing for it. See [`ctx.webhook()`](#ctxwebhook--managed-outbound-webhooks-144). | excluded — off by default; `webhook.zig` is not compiled in unless `.webhooks = true`. |
+| `files` | File-serving knobs threaded into `app.files`: `.{ .s3_presign_redirect = false, .s3_presign_ttl_s = 900 }`. With `.s3_presign_redirect = true` **and** the S3 backend active (`-Ds3` + `ZIGBASE_S3_*`), an authorized download is answered with a 302 redirect to a time-limited presigned GET URL (`s3_presign_ttl_s` seconds, `1..=604800`) instead of proxying the bytes. On any other backend (local disk, or a non-`-Ds3` build) it has no effect — the proxy path is taken. Default `.{}` = proxy-only. | data-only — always compiled; the redirect only engages at runtime when the S3 backend is present. |
 
 Route gating: the built-in `analytics`, `senders`/mail-webhook, and `tenancy` (account
 activation) endpoints exist only when their config key is set (`.analytics`, `.mail`,
@@ -3004,13 +3005,27 @@ zigbase.App(.{ .mailer = AuditMailer }).runCli(init);
 
 A custom storage plugin follows the same shape, returning a `zigbase.Storage` view from
 `interface()`. The `zigbase.Storage` vtable backs file storage (the default
-`zigbase.DefaultStoragePlugin` wraps `zigbase.LocalStorage`) with **four** methods —
-`put` / `fetch` / `delete` / `deleteRecord`. `fetch(ctx, io, alloc, col, record_id,
-filename)` returns a local filesystem path whose contents ARE the file, materializing it
-locally first if necessary (a remote backend spools to a local cache); `null` means the
-backend has no such object. *(0.10.0: `localPath(ctx, alloc, …)` → `fetch(ctx, io, alloc,
-…)` — rename + one new parameter; return a local path, materializing the file locally if
-necessary; `null` = object missing.)* The `zigbase.Mailer` vtable — a single `send(io,
+`zigbase.DefaultStoragePlugin` wraps `zigbase.LocalStorage`) with **four** required
+methods — `put` / `fetch` / `delete` / `deleteRecord` — plus one **optional**
+`presignGetUrl` (defaults to `null`, so existing four-method backends stay valid).
+`fetch(ctx, io, alloc, col, record_id, filename)` returns a local filesystem path whose
+contents ARE the file, materializing it locally first if necessary (a remote backend
+spools to a local cache); `null` means the backend has no such object. *(0.10.0:
+`localPath(ctx, alloc, …)` → `fetch(ctx, io, alloc, …)` — rename + one new parameter;
+return a local path, materializing the file locally if necessary; `null` = object
+missing.)*
+
+By default every download is *proxied* (the server `fetch`es and streams the bytes). With
+`App(.{ .files = .{ .s3_presign_redirect = true } })` and the S3 backend active (`-Ds3` +
+`ZIGBASE_S3_*`), an authorized download is instead answered with a **302 redirect** to a
+time-limited presigned GET URL (`s3_presign_ttl_s`, default 900s), offloading the byte
+transfer to the object store. The optional `presignGetUrl` vtable method backs this; local
+disk and non-`-Ds3` builds return `null` and keep the unchanged proxy path. Authorization
+still runs per-request before the redirect is issued, but the issued URL is a **bearer
+capability** valid until it expires and not bound to the authorized requester — keep the
+TTL short.
+
+The `zigbase.Mailer` vtable — a single `send(io,
 alloc, zigbase.Email)` — backs mail (the default `zigbase.DefaultMailerPlugin` selects
 `zigbase.LogMailer` or `zigbase.SmtpMailer` from config). See the [plugins
 example](../examples/plugins) for the full, compiling custom-mailer plugin.

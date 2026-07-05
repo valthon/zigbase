@@ -35,6 +35,7 @@ const queue_memory = @import("queue/memory.zig");
 const mail_send = @import("mail/send.zig");
 const mail_bulk = @import("mail/bulk.zig");
 const mail_cfg = @import("mail/config.zig");
+const files_cfg = @import("files/config.zig");
 const webhook = @import("webhook.zig");
 const captcha = @import("captcha.zig");
 const tenancy = @import("tenancy/tenancy.zig");
@@ -330,7 +331,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -1230,6 +1231,12 @@ pub fn App(comptime cfg: anytype) type {
             break :blk rt;
         };
 
+        /// The comptime-lowered file-serving knobs, threaded into `app.files`. Validates the
+        /// `.files` group's sub-keys with a loud `@compileError` (unknown key / bad ttl range);
+        /// absent → `.{}` (proxy-only, back-compat).
+        pub const files_config: files_cfg.Runtime =
+            if (@hasField(@TypeOf(cfg), "files")) files_cfg.lower(cfg.files) else .{};
+
         /// Bundle of comptime-resolved knobs threaded into the serve path: the
         /// selected storage/mailer plugin TYPES, the auth method type list,
         /// and the reader-pool cap.
@@ -1257,6 +1264,7 @@ pub fn App(comptime cfg: anytype) type {
             .tenancy = tenancy_config,
             .role_ranking = role_ranking,
             .mail = mail_config,
+            .files = files_config,
             .static_cache_control = static_cache_control,
             .gates = route_gates,
         };
@@ -1420,6 +1428,9 @@ pub const ServeOpts = struct {
     /// Email-subsystem knobs (#154), threaded into `app.mail`. Default `.{}` is fully off
     /// (no verified-sender/suppression enforcement, webhook route disabled).
     mail: mail_cfg.Runtime = .{},
+    /// File-serving knobs, threaded into `app.files`. Default `.{}` is proxy-only (presigned
+    /// redirect off) — the byte-identical historical path.
+    files: files_cfg.Runtime = .{},
     /// §C.2: comptime default for the static Cache-Control knob; runtime flag/env override it.
     static_cache_control: ?[]const u8 = null,
     /// Comptime route gates (R2-2/R2-3): which optional built-in route groups + the admin
@@ -2304,6 +2315,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .tenancy = opts.tenancy,
         .role_ranking = opts.role_ranking,
         .mail = opts.mail,
+        .files = opts.files,
         .storage = &storage_iface,
         .storage_info = .{
             .backend = if (comptime build_options.s3) (if (cfg.s3_bucket.len > 0) .s3 else .local) else .local,

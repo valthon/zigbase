@@ -458,6 +458,13 @@ operator responsibilities.
       Locked to superusers (F3).
 - [x] **Static symlink escapes — now refused** (served files are canonicalized and must remain
       within the static root) (F10). Planting such a symlink is no longer a leak.
+- [ ] **S3 presigned-redirect serving is opt-in and off by default.** Enabling
+      `App(.{ .files = .{ .s3_presign_redirect = true } })` serves authorized downloads as a 302 to
+      a presigned GET URL. Per-request authorization still runs **before** the URL is issued, but the
+      issued URL is a **time-limited bearer capability**: valid for `s3_presign_ttl_s` (default 900s)
+      and **not** bound to the authorized requester, so anyone the URL is shared with can fetch the
+      object until it expires. Keep the TTL short; leave this off if per-request authorization on
+      every byte is required.
 - [ ] Set a Sentry DSN if you want errors captured off-box; error responses to clients are already
       generic (no stack traces / SQL leaked — verified in `src/api/error.zig`).
 

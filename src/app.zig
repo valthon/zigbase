@@ -84,6 +84,12 @@ pub const App = struct {
     /// route is 404 until a `webhook_secret` is configured. So an app that only calls the existing
     /// mailer is completely unaffected by this subsystem.
     mail: @import("mail/config.zig").Runtime = .{},
+    /// File-serving runtime knobs, threaded from the comptime `App(.{ .files = ... })` config in
+    /// serveImpl. Default `.{}` = the byte-identical proxy-only path: authorized downloads are
+    /// fetched (and, for S3, spool-cached) by the server and streamed to the client. With
+    /// `.presign_redirect = true` on an S3 backend, an authorized download is instead answered with
+    /// a 302 to a time-limited presigned GET URL (`.presign_ttl_s`), offloading the byte transfer.
+    files: @import("files/config.zig").Runtime = .{},
     /// Resolved pagination knobs (offset/cursor enablement + cursor token format), threaded from
     /// the comptime `App(.{ .pagination = ... })` config in framework.serveImpl. Defaults match
     /// the stock binary: both modes enabled, stateless tokens.
