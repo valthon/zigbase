@@ -766,6 +766,17 @@ pub fn App(comptime cfg: anytype) type {
             break :blk if (@hasField(@TypeOf(auth_session_cfg), "gc_cron")) auth_session_cfg.gc_cron else "0 * * * *";
         };
 
+        // Force analysis of `session_gc_cron` so its misuse `@compileError` (setting
+        // `.auth.session.gc_cron` without `.auth.session.store = .table`) actually fires. It
+        // is otherwise a lazy `pub const` referenced only by the conditionally-installed
+        // `_session_gc` job (see `session_gc_jobs`), which is absent in `.epoch` mode — exactly
+        // the misuse case — so the const was never analyzed and the guard was silently dead.
+        // Referencing it here makes the guard live on every `App(...)`; the valid default and
+        // `.store = .table` cases resolve to their cron string with no error.
+        comptime {
+            _ = session_gc_cron;
+        }
+
         /// Cadence for the framework-internal TTL garbage-collection sweep (`_ttl_gc`), which
         /// reaps rows whose `.ttl_field` timestamp has passed. Default `.{ .minutes = 5 }`;
         /// override with `.ttl_gc_interval = .hourly` (or any `schedule.Interval`). Only
