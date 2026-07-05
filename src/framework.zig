@@ -391,7 +391,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -1031,6 +1031,20 @@ pub fn App(comptime cfg: anytype) type {
             break :blk static_routes.len == 0;
         };
 
+        /// Frozen-collection-metadata mode (issue #234). When true the app asserts its
+        /// collections do not change after boot + migrations: the collection-metadata cache
+        /// runs on ALL backends (incl. Postgres, otherwise skipped for cross-instance-DDL
+        /// safety) and the runtime collection create/update/delete endpoints return 403.
+        /// Schema then evolves only via `.migrations` + a redeploy. Default: false.
+        pub const collections_frozen: bool = blk: {
+            if (@hasField(@TypeOf(cfg), "collections_frozen")) {
+                if (@TypeOf(cfg.collections_frozen) != bool)
+                    @compileError(".collections_frozen must be a bool; got '" ++ @typeName(@TypeOf(cfg.collections_frozen)) ++ "'");
+                break :blk cfg.collections_frozen;
+            }
+            break :blk false;
+        };
+
         /// Comptime-lowered collection specs from `.collections` (empty when absent).
         /// Relation fields carry their target collection BY NAME in `targetCollectionId`;
         /// `provision.applySpecs` resolves names -> ids at startup. When empty, no
@@ -1372,6 +1386,7 @@ pub fn App(comptime cfg: anytype) type {
             .static_mode = static_mode,
             .static_routes = static_routes,
             .enable_spa_marker = enable_spa_marker,
+            .collections_frozen = collections_frozen,
             .pagination = pagination_config,
             .session_store = session_store_config,
             .enable_typegen = enable_typegen,
@@ -1512,6 +1527,10 @@ pub const ServeOpts = struct {
     /// Tier-1 `.spa` marker gate (issue #183); false skips the startup scan entirely
     /// (a `.spa` file is then just another never-served dotfile).
     enable_spa_marker: bool = true,
+    /// Frozen-collection-metadata mode (issue #234); threaded into `app.collections_frozen`.
+    /// Installs the collection-metadata cache on ALL backends and 403s the runtime
+    /// collection-DDL endpoints.
+    collections_frozen: bool = false,
     pagination: pagination.Config = .{},
     /// Selected session-management model (#99); threaded into `App.session_store`.
     session_store: app_mod.SessionStore = .epoch,
@@ -2472,6 +2491,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .static_cache_control = static_cc,
         .spa_roots = spa_roots,
         .spa_marker_enabled = opts.enable_spa_marker,
+        .collections_frozen = opts.collections_frozen,
         .pagination = .{
             .offset_enabled = opts.pagination.offset,
             .cursor_enabled = opts.pagination.cursor,
@@ -2509,12 +2529,15 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         // the global default. (null only in tests/CLI that construct App directly.)
         .rate_limiter = &rate_limiter,
     };
-    // Collection-metadata cache (R1-4): SQLite only — single-process, so the in-process
-    // invalidation on the admin DDL endpoints is complete. Postgres multi-instance
-    // deployments skip it (another instance's DDL would be unseen, so reads stay direct).
-    // Declared here (before mem_pool/scheduler) so LIFO tears it down LAST — realtime and
-    // record handlers borrow leases from it until zap stops.
-    var col_cache_inst: ?colcache.Cache = if (db.poolDialect(&pool).kind == .sqlite)
+    // Collection-metadata cache (R1-4): installed for SQLite (single-process, so the in-process
+    // invalidation on the admin DDL endpoints is complete) OR when `collections_frozen` is set.
+    // Frozen mode asserts collections never change after boot + migrations, so the cache is
+    // coherent for the process lifetime on ANY backend (incl. Postgres): no invalidation ever
+    // fires (the DDL endpoints 403), and provisioning/migrations run before serving. Without
+    // freeze, Postgres multi-instance deployments skip it (another instance's DDL would be
+    // unseen, so reads stay direct). Declared here (before mem_pool/scheduler) so LIFO tears it
+    // down LAST — realtime and record handlers borrow leases from it until zap stops.
+    var col_cache_inst: ?colcache.Cache = if (db.poolDialect(&pool).kind == .sqlite or opts.collections_frozen)
         colcache.Cache.init(allocator)
     else
         null;
@@ -3341,6 +3364,15 @@ test "App(cfg) enable_spa_marker default: true without routes, false with routes
         .enable_spa_marker = true,
     });
     try std.testing.expect(Explicit.enable_spa_marker); // explicit always wins
+}
+
+test "App(cfg) collections_frozen: default false, explicit true resolves (#234)" {
+    try std.testing.expect(!App(.{}).collections_frozen);
+    try std.testing.expect(App(.{ .collections_frozen = true }).collections_frozen);
+    try std.testing.expect(!App(.{ .collections_frozen = false }).collections_frozen);
+    // The comptime const threads into the ServeOpts bundle unchanged, so the value that
+    // reaches serveImpl (and thence `app.collections_frozen`) matches the config.
+    try std.testing.expect(App(.{ .collections_frozen = true }).Opts.collections_frozen);
 }
 
 test "App exposes route metadata for codegen" {

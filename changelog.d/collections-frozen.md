@@ -1,0 +1,2 @@
+### Features
+- New `App(.{ .collections_frozen = true })` config key asserts that collections do not change after boot + migrations. Frozen apps get the parsed-collection-metadata cache on **every** backend — including Postgres, where it is otherwise skipped because a concurrent instance could `ALTER` collections unseen — and the runtime collection create/update/delete endpoints return `403` (schema then evolves via `.migrations` + a redeploy). Default `false` leaves today's behavior unchanged (cache SQLite-only, DDL endpoints live).

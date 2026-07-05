@@ -168,6 +168,12 @@ pub const App = struct {
     /// on Postgres another instance could run DDL unseen, so reads stay direct). null =
     /// uncached (tests/CLI/Postgres) — colcache.lease falls back to a direct load.
     col_cache: ?*@import("colcache.zig").Cache = null,
+    /// Frozen-collection-metadata mode (issue #234), mirrors comptime `collections_frozen`.
+    /// When true the app asserts its collections do not change after boot + migrations: the
+    /// collection-metadata cache (`col_cache`) is installed on ALL backends (incl. Postgres,
+    /// where it is otherwise skipped for cross-instance-DDL safety) and the runtime collection
+    /// create/update/delete endpoints return 403 (schema evolves via `.migrations` + redeploy).
+    collections_frozen: bool = false,
     /// The feature-flag / experiment override cache (feature_cache.zig), installed by
     /// serveImpl for BOTH backends (#230). Unlike col_cache, it is safe on Postgres:
     /// same-instance override writes invalidate it instantly and a snapshot self-heals
