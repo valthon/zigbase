@@ -37,6 +37,8 @@ const mail_bulk = @import("mail/bulk.zig");
 const mail_cfg = @import("mail/config.zig");
 const files_cfg = @import("files/config.zig");
 const webhook = @import("webhook.zig");
+const push_send = @import("push/send.zig");
+const push_cfg = @import("push/config.zig");
 const captcha = @import("captcha.zig");
 const tenancy = @import("tenancy/tenancy.zig");
 const roles = @import("tenancy/roles.zig");
@@ -331,7 +333,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -503,13 +505,14 @@ pub fn App(comptime cfg: anytype) type {
             if (enable_mail_job) t = t ++ &[_]queue.JobReg{.{ .kind = "mail", .handler = mail_send.jobHandler }};
             if (enable_mail_job) t = t ++ &[_]queue.JobReg{.{ .kind = mail_bulk.job_kind, .handler = mail_bulk.jobHandler }};
             if (enable_webhooks) t = t ++ &[_]queue.JobReg{.{ .kind = webhook.job_kind, .handler = webhook.webhookJobHandler }};
+            if (enable_push_job) t = t ++ &[_]queue.JobReg{.{ .kind = push_send.job_kind, .handler = push_send.jobHandler }};
             break :blk t;
         };
 
         /// Reserved built-in kind names — reserved UNCONDITIONALLY (even when the
         /// built-in is gated off) so enabling a capability later never collides
         /// with a consumer job kind.
-        const reserved_job_kinds: []const []const u8 = &.{ "mail", "mail_batch_item", "webhook" };
+        const reserved_job_kinds: []const []const u8 = &.{ "mail", "mail_batch_item", "webhook", "push" };
 
         /// Declared job-kind → handler registry: the built-in kinds followed by the consumer
         /// `.jobs` bindings (the legacy `.jobs.pool_size` key is a compile error — see
@@ -663,6 +666,11 @@ pub fn App(comptime cfg: anytype) type {
         /// configured — a `.mailer` plugin or the `.mail` policy key (use `.mail = .{}`
         /// to enable background delivery with the default env-configured mailer).
         const enable_mail_job: bool = @hasField(@TypeOf(cfg), "mailer") or @hasField(@TypeOf(cfg), "mail");
+
+        /// #223: the "push" job kind (`ctx.push().enqueue`) registers when `.push` is
+        /// configured. Unset → `push/send.zig`'s job handler is not compiled into the binary
+        /// and `ctx.push().enqueue` fails at enqueue with `error.UnknownJobKind`.
+        const enable_push_job: bool = @hasField(@TypeOf(cfg), "push");
 
         /// R2-2: `.admin = .disabled` removes the embedded admin SPA (route dispatch
         /// AND the @embedFile'd assets) from the binary. Default: served at /_/ .
@@ -1241,6 +1249,23 @@ pub fn App(comptime cfg: anytype) type {
         pub const files_config: files_cfg.Runtime =
             if (@hasField(@TypeOf(cfg), "files")) files_cfg.lower(cfg.files) else .{};
 
+        /// The comptime-lowered Web Push config (#223), threaded into `app.push`. Carries the
+        /// VAPID `subject` (the `.push.subject` key); the VAPID KEYPAIR is resolved from env at
+        /// startup in serveImpl (`configured` stays false here). Validates the `.push` sub-keys
+        /// with a loud `@compileError`; absent → `.{}` (push is a no-op until keys are set).
+        pub const push_config: push_cfg.Runtime = blk: {
+            if (!@hasField(@TypeOf(cfg), "push")) break :blk .{};
+            const pc = cfg.push;
+            const PC = @TypeOf(pc);
+            for (std.meta.fields(PC)) |f| {
+                if (!std.mem.eql(u8, f.name, "subject"))
+                    @compileError(".push: unknown key '." ++ f.name ++ "' (recognized: .subject)");
+            }
+            var rt = push_cfg.Runtime{};
+            if (@hasField(PC, "subject")) rt.subject = pc.subject;
+            break :blk rt;
+        };
+
         /// Bundle of comptime-resolved knobs threaded into the serve path: the
         /// selected storage/mailer plugin TYPES, the auth method type list,
         /// and the reader-pool cap.
@@ -1269,6 +1294,7 @@ pub fn App(comptime cfg: anytype) type {
             .role_ranking = role_ranking,
             .mail = mail_config,
             .files = files_config,
+            .push = push_config,
             .static_cache_control = static_cache_control,
             .gates = route_gates,
         };
@@ -1435,6 +1461,9 @@ pub const ServeOpts = struct {
     /// File-serving knobs, threaded into `app.files`. Default `.{}` is proxy-only (presigned
     /// redirect off) — the byte-identical historical path.
     files: files_cfg.Runtime = .{},
+    /// Web Push config (#223), threaded into `app.push`. Carries the VAPID `subject`; the VAPID
+    /// keypair is resolved from env in serveImpl. Default `.{}` = push is a no-op.
+    push: push_cfg.Runtime = .{},
     /// §C.2: comptime default for the static Cache-Control knob; runtime flag/env override it.
     static_cache_control: ?[]const u8 = null,
     /// Comptime route gates (R2-2/R2-3): which optional built-in route groups + the admin
@@ -1471,6 +1500,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .superuser_create => printSuperuserUsage(init.io, std.Io.File.stdout()),
             .typegen => printTypegenUsage(init.io, std.Io.File.stdout()),
             .migrate_db => printMigrateDbUsage(init.io, std.Io.File.stdout()),
+            .vapid_keygen => printVapidKeygenUsage(init.io, std.Io.File.stdout()),
         },
         .version => printVersion(init.io, std.Io.File.stdout()),
         .serve => |sa| {
@@ -1481,6 +1511,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
+        .vapid_keygen => try vapidKeygenImpl(allocator, init.io),
         .typegen => |ta| {
             if (opts.enable_typegen) {
                 const tgen = @import("codegen/typegen_cli.zig");
@@ -1541,6 +1572,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
         \\  superuser create    Create an admin (superuser) account.
+        \\  vapid-keygen        Generate a VAPID (Web Push) keypair for ctx.push().
         \\  help                Show this help. Also: --help, -h, or no arguments.
         \\  version             Print version + build provenance. Also: --version, -V.
         \\
@@ -1637,6 +1669,10 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  ZIGBASE_S3_KEY_PREFIX    Prefix prepended to every object key (namespace one bucket).
         \\  ZIGBASE_S3_CACHE_DIR     Local spool-cache dir; empty → <data-dir>/storage_cache.
         \\  ZIGBASE_S3_CACHE_MAX_BYTES   Spool-cache size cap, bytes. [default 1073741824 = 1 GiB]
+        \\  ZIGBASE_VAPID_PUBLIC_KEY  Web Push VAPID public key (base64url) for ctx.push(); also the
+        \\                           browser applicationServerKey. Generate with `zigbase vapid-keygen`.
+        \\  ZIGBASE_VAPID_PRIVATE_KEY Web Push VAPID private key (base64url) — SECRET. Both keys unset
+        \\                           → ctx.push() is a no-op. [default: off]
         \\
         \\EXAMPLES:
         \\  # Create the first superuser (admin) account:
@@ -1799,6 +1835,25 @@ fn printSuperuserUsage(io: std.Io, file: std.Io.File) void {
         \\
         \\EXAMPLE:
         \\  zigbase superuser create --email you@example.com --password "<a strong password>" --data-dir ./zb_data
+        \\
+    , .{});
+}
+
+fn printVapidKeygenUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase vapid-keygen — generate a VAPID (Web Push) keypair.
+        \\
+        \\USAGE:
+        \\  zigbase vapid-keygen
+        \\
+        \\Prints a fresh P-256 keypair (base64url). Wire it into the server environment to
+        \\enable ctx.push():
+        \\
+        \\  ZIGBASE_VAPID_PUBLIC_KEY   the application-server public key (also the browser's
+        \\                             applicationServerKey for pushManager.subscribe).
+        \\  ZIGBASE_VAPID_PRIVATE_KEY  the signing private key — SECRET; never commit or log it.
+        \\
+        \\Without both keys configured, ctx.push() is a network-free logging no-op.
         \\
     , .{});
 }
@@ -2320,6 +2375,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .role_ranking = opts.role_ranking,
         .mail = opts.mail,
         .files = opts.files,
+        .push = opts.push,
         .storage = &storage_iface,
         .storage_info = .{
             .backend = if (comptime build_options.s3) (if (cfg.s3_bucket.len > 0) .s3 else .local) else .local,
@@ -2377,6 +2433,17 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             return error.InvalidUnsubscribeBaseUrl;
         }
     }
+    // Web Push (#223): resolve the VAPID keypair from env (base64url). Absent → push stays a
+    // network-free logging no-op (`configured = false`, the default). Present-but-invalid or
+    // half-configured fails fast at boot with an actionable error — never silently minting
+    // invalid VAPID headers post-boot.
+    if (cfg.vapid_public_key.len > 0 or cfg.vapid_private_key.len > 0) {
+        app.push = push_cfg.resolve(app.push.subject, cfg.vapid_public_key, cfg.vapid_private_key) catch |e| {
+            std.log.err("refusing to start: invalid VAPID keys ({s}) — generate a matched pair with `zigbase vapid-keygen` and set ZIGBASE_VAPID_PUBLIC_KEY/ZIGBASE_VAPID_PRIVATE_KEY", .{@errorName(e)});
+            return e;
+        };
+        std.log.info("web push: VAPID keys configured; ctx.push() will deliver notifications", .{});
+    }
     const Ctx = @import("ctx.zig").Ctx;
     // Each lifecycle hook gets a per-invocation arena owning any ctx.records()
     // results, declared before cx so its deinit runs last (LIFO).
@@ -2426,6 +2493,26 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         s.deinit();
     };
     try srv.listen();
+}
+
+/// `zigbase vapid-keygen` — generate a fresh VAPID (Web Push) keypair and print both keys
+/// base64url, with a hint to wire them via env. The private key is a SECRET; the public key is
+/// the browser's `applicationServerKey`.
+fn vapidKeygenImpl(allocator: std.mem.Allocator, io: std.Io) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const kp = try push_cfg.generateKeypair(arena.allocator(), io);
+    emit(io, std.Io.File.stdout(),
+        \\Generated a fresh VAPID (Web Push) keypair.
+        \\
+        \\  ZIGBASE_VAPID_PUBLIC_KEY={s}
+        \\  ZIGBASE_VAPID_PRIVATE_KEY={s}
+        \\
+        \\Set both in the server's environment to enable ctx.push(). The PUBLIC key is also the
+        \\browser's applicationServerKey (pass it to pushManager.subscribe). Keep the PRIVATE key
+        \\secret — anyone with it can send notifications as you.
+        \\
+    , .{ kp.public_b64, kp.private_b64 });
 }
 
 fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.SuperuserArgs) !void {

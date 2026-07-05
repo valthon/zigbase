@@ -90,6 +90,10 @@ pub const App = struct {
     /// `.presign_redirect = true` on an S3 backend, an authorized download is instead answered with
     /// a 302 to a time-limited presigned GET URL (`.presign_ttl_s`), offloading the byte transfer.
     files: @import("files/config.zig").Runtime = .{},
+    /// Web Push runtime config (#223), threaded from the comptime `App(.{ .push = ... })` key
+    /// (the VAPID `subject`) plus the env-resolved VAPID keypair. Default `.{}` = `configured =
+    /// false`: `ctx.push().send` is a network-free logging no-op. See `push/config.zig`.
+    push: @import("push/config.zig").Runtime = .{},
     /// Resolved pagination knobs (offset/cursor enablement + cursor token format), threaded from
     /// the comptime `App(.{ .pagination = ... })` config in framework.serveImpl. Defaults match
     /// the stock binary: both modes enabled, stateless tokens.
