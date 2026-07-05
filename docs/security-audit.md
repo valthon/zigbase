@@ -55,7 +55,10 @@ collection (with a prominent startup warning for every one).
 Items deliberately re-assessed as **not exploitable**: rule **parse errors fail *closed*** (a
 malformed rule yields a 500, the write never runs — see F3 notes); `expand` **does** re-apply the
 target collection's `viewRule` per record; relation-path traversal is type-checked; multipart
-filenames are sanitized; the static root rejects `..`/backslash/NUL lexically.
+filenames are sanitized; the static root percent-decodes the request path single-pass (in-house,
+never recursively — so double-encoding cannot smuggle a `..`) **before** rejecting `..`/backslash/NUL
+lexically, so encoded traversal (`%2e%2e`/`%2f`/`%00`/`%5c`) decodes and is then rejected fail-closed
+while percent-encoded filenames stay servable; the F10 symlink guard runs afterward on the resolved path.
 
 ---
 

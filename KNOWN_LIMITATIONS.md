@@ -38,13 +38,13 @@ ZigBase v0.10.0 is an early release. The gaps below are known and tracked for fu
   apply to the static root; use file storage for access-controlled delivery.
 - No directory listings; directories resolve to `index.html` or 404.
 - Path safety is lexical (`..`, backslashes, and NUL bytes are rejected) **and**
-  symlink-aware: a served file is canonicalized and refused if its real path escapes
-  the configured static root, so a symlink inside the root pointing outside it is not
-  followed out (F10).
-- Percent-encoded file names are not decoded: the request path reaches the static layer
-  raw, so a file whose URL requires encoding (`my file.pdf` → `/my%20file.pdf`) is not
-  servable (404). Encoded traversal (`%2e%2e`) stays a literal — and harmless — path
-  segment for the same reason.
+  symlink-aware: the request path is percent-decoded (single-pass, in-house) **before**
+  those lexical checks — so files whose names need encoding (`my file.pdf` →
+  `/my%20file.pdf`) are servable, while encoded traversal (`%2e%2e`, `%2f`, `%00`, `%5c`)
+  is decoded and then rejected fail-closed, and double-encoding is never recursively
+  decoded (`%252e` → the literal `%2e`, not `.`). A served file is additionally
+  canonicalized and refused if its real path escapes the configured static root, so a
+  symlink inside the root pointing outside it is not followed out (F10).
 - No on-the-fly compression; pre-compress at the CDN or reverse proxy if needed.
 - In **dir** mode, conditional requests (`If-None-Match`/`If-Range`) are delegated to
   facil.io's `sendFile`, which uses its own exact-match ETag semantics (an unquoted
