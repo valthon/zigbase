@@ -50,6 +50,7 @@ const abilities_mod = @import("authz/abilities.zig");
 const analytics = @import("analytics/analytics.zig");
 const analytics_config = @import("analytics/config.zig");
 const colcache = @import("colcache.zig");
+const feature_cache = @import("feature_cache.zig");
 // Opt-in S3-compatible storage backend (`-Ds3`; §D). A stub type when off — the
 // db.zig:27 postgres pattern — so `DefaultStoragePlugin` below always compiles, and
 // only `-Ds3=true` makes `s3mod.S3Storage` a real, constructible type.
@@ -2519,6 +2520,14 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         null;
     defer if (col_cache_inst) |*c| c.deinit();
     if (col_cache_inst) |*c| app.col_cache = c;
+    // Feature-override cache (#230): installed on BOTH backends. Same-instance override
+    // writes invalidate it instantly (the ctx/settings write sites call `invalidate()`,
+    // NOT gated on the realtime reactor); a Postgres cross-instance write self-heals within
+    // the snapshot TTL (≤5s). The two caches are independent, so teardown order between them
+    // does not matter (this defer, declared after col_cache's, runs first by LIFO).
+    var feature_cache_inst = feature_cache.FeatureOverrideCache.init(allocator);
+    defer feature_cache_inst.deinit();
+    app.feature_cache = &feature_cache_inst;
     // Loud startup warning for the captcha dev-bypass: a configured provider with an empty
     // secret silently passes EVERY verifyCaptcha (the dev-bypass), a prod footgun. Mirrors
     // the `@public`-rule startup warning so operators catch it before deploying.

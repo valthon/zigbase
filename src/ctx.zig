@@ -19,6 +19,7 @@ const api_auth = @import("api/auth.zig");
 const session = @import("session.zig");
 const features = @import("features.zig");
 const features_resolver = @import("features_resolver.zig");
+const feature_cache = @import("feature_cache.zig");
 const realtime_ws = @import("realtime/ws.zig");
 const crypto = @import("crypto.zig");
 const query_params = @import("query/params.zig");
@@ -48,6 +49,12 @@ pub const Ctx = struct {
     /// The raw HTTP request context. Non-null for route handlers; null for job/hook contexts
     /// where there is no HTTP request. Required by `issueSession`.
     request: ?*http_mod.RequestCtx = null,
+    /// Set when a feature-override write (`writeFlagOverride`) ran on this Ctx's BOUND
+    /// (in-transaction) connection. `ctx.tx` re-invalidates the feature cache AFTER the
+    /// commit for such writes: the in-site `invalidate()` fires pre-commit (the write is
+    /// not yet visible to pooled readers), so a post-commit bump is what makes the newly
+    /// committed override visible to the next resolution on this instance. See #230.
+    wrote_feature_override: bool = false,
 
     // --- Wave 2 ergonomics (#138/#137): deferred response mutation + builders -------------
     // These are a SELF-CONTAINED section (fields + methods + tests) so sibling Wave-2 PRs
@@ -182,11 +189,24 @@ pub const Ctx = struct {
         const conn = self.connForRead() catch return def.default;
         const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena };
         const key = std.fmt.allocPrint(self.arena, "flag:{s}", .{def.name}) catch return def.default;
-        const ov = data.kvGet(key) catch return def.default;
+        const ov = self.readOverride(data, key) catch return def.default;
         const value = features_resolver.resolveFlag(ov, def);
         // Notify-only exposure seam (zero-cost when no .onFeatureExposure handler).
         events.dispatchFlagExposure(self.app, self.app.dispatch, def.name, value);
         return value;
+    }
+
+    /// Read a single `flag:*`/`exp:*:weights` override value from the feature-override
+    /// cache (#230) when one is installed AND this is a pooled-reader read; else a direct
+    /// `_kv` read. A BOUND (in-transaction) read bypasses the cache so it sees its own
+    /// uncommitted writes and never publishes uncommitted state into the shared snapshot.
+    /// Degrade-safe: a cache error falls back to a direct read (never fails resolution).
+    fn readOverride(self: *Ctx, data: Data, key: []const u8) !?[]const u8 {
+        if (self.bound_conn == null) {
+            if (self.app.feature_cache) |fc|
+                return fc.get(self.app.io, data, key) catch data.kvGet(key);
+        }
+        return data.kvGet(key);
     }
 
     /// Connections for **reader-first** sticky experiment resolution (#129). Inside a
@@ -211,7 +231,7 @@ pub const Ctx = struct {
         // The weight-override read uses the sticky read conn when present (else a reader).
         const read_conn = if (sc) |s| s.read else try self.connForRead();
         const data = Data{ .app = self.app, .conn = read_conn, .io = self.app.io, .alloc = self.arena };
-        const ov = try data.kvGet(key);
+        const ov = try self.readOverride(data, key);
         const variant = try features_resolver.resolveExperiment(self.arena, sc, ov, def, subject);
         // Notify-only exposure seam, fired on the RESOLVED variant (after the reader-first
         // sticky lookup). Zero-cost when no .onFeatureExposure handler is registered.
@@ -224,6 +244,13 @@ pub const Ctx = struct {
     pub fn writeFlagOverride(self: *Ctx, name: []const u8, enabled: bool) !void {
         const key = try std.fmt.allocPrint(self.arena, "flag:{s}", .{name});
         try self.kv().set(key, if (enabled) "true" else "false");
+        // Invalidate the feature-override cache (#230) so the next resolution on THIS
+        // instance re-scans and sees the write. Called unconditionally — NOT gated on the
+        // realtime reactor — and BEFORE the reactor signal below. On the non-bound path
+        // `kv().set` autocommits, so this is a post-commit bump. On the BOUND path the
+        // write is still in-flight: flag it so `ctx.tx` re-invalidates AFTER the commit.
+        if (self.app.feature_cache) |fc| fc.invalidate();
+        if (self.bound_conn != null) self.wrote_feature_override = true;
         // Signal-only realtime push: tell subscribers to re-GET /api/state. No-op when
         // the reactor isn't running (tests/CLI). Cross-instance on Postgres (#188 theme).
         realtime_ws.broadcastFeaturesChanged(self.app);
@@ -276,6 +303,10 @@ pub const Ctx = struct {
             conn.rollback() catch {};
             return e;
         };
+        // #230: if a feature-override write ran inside this transaction, its in-site
+        // `invalidate()` fired PRE-commit (invisible to pooled readers then). Re-invalidate
+        // now that it is committed so the next resolution re-scans and sees it.
+        if (t.inner.wrote_feature_override) if (self.app.feature_cache) |fc| fc.invalidate();
         return result;
     }
 
@@ -1000,10 +1031,19 @@ pub const FlagsApi = struct {
         // variant (only a first-time miss briefly borrows the writer).
         const sc = try self.ctx.stickyConns();
         const data = Data{ .app = self.ctx.app, .conn = sc.read, .io = self.ctx.app.io, .alloc = self.ctx.arena };
-        const entries = try data.kvScanPrefix(&.{ "flag:", "exp:" });
-        const pairs = try self.ctx.arena.alloc(features_resolver.KvPair, entries.len);
-        for (entries, 0..) |e, i| pairs[i] = .{ .key = e.key, .value = e.value };
+        // Serve the `flag:*`/`exp:*` override set from the feature cache (#230) on the
+        // pooled-reader path; a BOUND (in-tx) read or a cache scan error falls back to a
+        // direct scan (byte-identical to the pre-cache path). The snapshot is held only
+        // long enough to copy the pairs onto the ctx arena, then released.
+        const pairs = try self.overridePairs(data);
         return features_resolver.resolveAll(self.ctx.arena, reg.*, pairs, subject, sc);
+    }
+
+    /// Build the `flag:*`/`exp:*` override pairs for `resolveAll`, from the feature cache
+    /// when available (pooled-reader path), else a direct `_kv` scan. Copies key/value onto
+    /// the ctx arena so the result outlives any released snapshot.
+    fn overridePairs(self: FlagsApi, data: Data) ![]features_resolver.KvPair {
+        return feature_cache.overridePairs(self.ctx.arena, self.ctx.app.io, self.ctx.app.feature_cache, self.ctx.bound_conn != null, data);
     }
 };
 
@@ -1593,6 +1633,55 @@ test "ctx flags: declared default returned when unset; override wins; flagByName
     // An undeclared name resolves to null (escape hatch), and setFlag errors.
     try std.testing.expect(ctx.flagByName("never_declared") == null);
     try std.testing.expectError(error.UndeclaredFlag, ctx.setFlag("never_declared", true));
+}
+
+test "#230 ctx feature cache: setFlag is instantly visible; flagByName/resolveAll match direct-read" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    env.app.features = &flag_test_registry;
+    var cache = feature_cache.FeatureOverrideCache.init(std.testing.allocator);
+    defer cache.deinit();
+    env.app.feature_cache = &cache; // install the cache on the pooled-reader path
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    // Cache-served defaults (byte-identical to the direct-read path).
+    try std.testing.expect(!(ctx.flagByName("beta").?)); // declared default off
+    try std.testing.expect(ctx.flagByName("default_on").?); // #128 kill-switch default on
+
+    // setFlag invalidates → the NEXT resolution sees the write on THIS instance immediately
+    // (no TTL wait). This is the anti-incident guarantee for the override cache.
+    try ctx.setFlag("beta", true);
+    try std.testing.expect(ctx.flagByName("beta").?);
+    try ctx.setFlag("default_on", false); // flip the kill switch OFF
+    try std.testing.expect(!(ctx.flagByName("default_on").?));
+
+    // resolveAll (also cache-served) agrees with the resolved state above.
+    const resolved = try ctx.flags().resolveAll("user-7");
+    try std.testing.expectEqual(@as(usize, 3), resolved.flags.len);
+    for (resolved.flags) |rf| {
+        if (std.mem.eql(u8, rf.name, "beta")) try std.testing.expect(rf.value);
+        if (std.mem.eql(u8, rf.name, "default_on")) try std.testing.expect(!rf.value);
+        if (std.mem.eql(u8, rf.name, "intx")) try std.testing.expect(!rf.value);
+    }
+}
+
+test "#230 ctx feature cache: setFlag inside ctx.tx is visible after commit (post-commit invalidate)" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    env.app.features = &flag_test_registry;
+    var cache = feature_cache.FeatureOverrideCache.init(std.testing.allocator);
+    defer cache.deinit();
+    env.app.feature_cache = &cache;
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    // Warm the cache (snapshot published) so a stale entry would otherwise mask the write.
+    try std.testing.expect(!(ctx.flagByName("intx").?));
+    // A bound-conn (in-transaction) setFlag: the in-site invalidate fires pre-commit; the
+    // post-commit re-invalidate in ctx.tx makes the committed override visible next read.
+    try ctx.tx(void, txnSetFlag);
+    try std.testing.expect(ctx.flagByName("intx").?); // committed + visible via the cache
 }
 
 test "ctx.flags().resolveAll returns all declared flags + experiments via the batched scan" {

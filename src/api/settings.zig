@@ -99,8 +99,13 @@ pub fn put(ctx: *http.RequestCtx) anyerror!http.Response {
     const d = dataOnWriter(ctx);
     defer app.pool.releaseWriter();
     try d.kvSet(key, parsed.value.value);
-    // Signal-only realtime push on a feature-override change (no-op if the key isn't one).
-    if (isFeatureOverrideKey(key)) realtime_ws.broadcastFeaturesChanged(app);
+    // Feature-override change: invalidate the in-process override cache (#230) so the next
+    // resolution re-scans (called unconditionally, NOT gated on the reactor; the write is
+    // already committed on the writer) and signal subscribers to re-GET /api/state.
+    if (isFeatureOverrideKey(key)) {
+        if (app.feature_cache) |fc| fc.invalidate();
+        realtime_ws.broadcastFeaturesChanged(app);
+    }
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, try entryJsonKeyValue(ctx.allocator, key, parsed.value.value), .{});
     return .{ .status = 200, .body = body };
 }
@@ -113,8 +118,12 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     const d = dataOnWriter(ctx);
     defer app.pool.releaseWriter();
     if (!(try d.kvDelete(key))) return ApiError.notFound().toResponse(ctx.allocator);
-    // Clearing a feature override reverts to the declared default; signal subscribers.
-    if (isFeatureOverrideKey(key)) realtime_ws.broadcastFeaturesChanged(app);
+    // Clearing a feature override reverts to the declared default: invalidate the override
+    // cache (#230, unconditional / not reactor-gated; the delete is committed) and signal.
+    if (isFeatureOverrideKey(key)) {
+        if (app.feature_cache) |fc| fc.invalidate();
+        realtime_ws.broadcastFeaturesChanged(app);
+    }
     return .{ .status = 204, .body = "" };
 }
 

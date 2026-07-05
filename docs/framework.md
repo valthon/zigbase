@@ -1468,9 +1468,18 @@ Setting `.experiment_assignment_ttl` without any `.sticky` experiment is a `@com
 
 ```zig
 const on = ctx.flagByName("checkout_enabled"); // ?bool — null when the name is undeclared
-const all = try ctx.flags().resolveAll(user_id); // every declared flag + experiment, one _kv scan
+const all = try ctx.flags().resolveAll(user_id); // every declared flag + experiment
 // all.flags: []{ name, value: bool }   all.experiments: []{ name, variant: []const u8 }
 ```
+
+**Zero-DB steady-state resolution.** Flag/experiment resolution (`App.flag`,
+`ctx.flagByName`, `ctx.flags().resolveAll`, the `exp:*:weights` override read, and the
+`/api/state` projection) is served from an **in-process override cache** of the
+`flag:*` / `exp:*:weights` `_kv` entries — so a hot request costs **no `_kv` reads**. A
+same-instance override write (`App.setFlag`, the admin settings verbs) invalidates the
+cache instantly, so a kill-switch flip takes effect on the very next request. On Postgres,
+another instance's override write self-heals within a **5 s** staleness bound. (The sticky
+`_experiment_assignments` reads are separate and remain reader-first + batched.)
 
 **Public read plane (`GET /api/state`).** A built-in, **unauthenticated** projection
 returns every declared flag + experiment resolved for a caller-supplied `subject`:

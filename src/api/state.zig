@@ -7,6 +7,7 @@ const Data = @import("../data.zig").Data;
 const params_mod = @import("../query/params.zig");
 const features = @import("../features.zig");
 const features_resolver = @import("../features_resolver.zig");
+const feature_cache = @import("../feature_cache.zig");
 
 // Public, UNAUTHENTICATED feature-state projection (#130).
 //
@@ -45,9 +46,10 @@ pub fn handle(ctx: *http.RequestCtx) anyerror!http.Response {
         var conn = try app.pool.acquireReader();
         defer app.pool.releaseReader(&conn);
         const data = Data{ .app = app, .conn = &conn, .io = app.io, .alloc = ctx.allocator };
-        const entries = try data.kvScanPrefix(&.{ "flag:", "exp:" });
-        const pairs = try ctx.allocator.alloc(features_resolver.KvPair, entries.len);
-        for (entries, 0..) |e, i| pairs[i] = .{ .key = e.key, .value = e.value };
+        // Route the override read through the #230 cache — `/api/state` is the motivating hot
+        // path (every SPA polls it on boot). Always a pooled-reader read here (no bound tx),
+        // so `bound = false`; degrade-safe to a direct scan inside the helper.
+        const pairs = try feature_cache.overridePairs(ctx.allocator, app.io, app.feature_cache, false, data);
         // Reader-first sticky resolution (#129): `/api/state` is UNAUTHENTICATED with a
         // caller-supplied subject, so a sticky HIT must NOT take the global writer. Reads
         // run on the pooled reader; only a first-time MISS briefly borrows the pool writer
@@ -192,4 +194,38 @@ test "GET /api/state: static mount 404s when remapped to a custom path" {
     // The static "/api/state" entry must NOT serve when the mount moved elsewhere.
     var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "", .allocator = arena.allocator(), .app = &env.app };
     try std.testing.expectEqual(@as(u16, 404), (try handle(&ctx)).status);
+}
+
+test "GET /api/state: served from the #230 override cache (out-of-band _kv change hidden until invalidate)" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var fc = feature_cache.FeatureOverrideCache.init(std.testing.allocator);
+    fc.ttl_ms = 60_000; // large so the TTL cannot expire mid-test — isolate the cache-hit behavior
+    defer fc.deinit();
+    env.app.feature_cache = &fc;
+
+    try env.setKv("flag:new_dashboard", "true");
+
+    const H = struct {
+        fn hit(app: *app_mod.App, a: std.mem.Allocator) ![]const u8 {
+            var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "subject=u", .allocator = a, .app = app };
+            return (try handle(&ctx)).body;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // First hit loads the cache snapshot → sees the override.
+    try std.testing.expect(std.mem.indexOf(u8, try H.hit(&env.app, a), "\"new_dashboard\":true") != null);
+
+    // Change _kv OUT OF BAND (a raw kvSet, NOT via ctx.setFlag → no invalidate()), like another
+    // instance's write. Within the TTL and with no invalidation, /api/state must still serve the
+    // CACHED value — proving the projection is served from the cache, not re-scanned per request.
+    try env.setKv("flag:new_dashboard", "false");
+    try std.testing.expect(std.mem.indexOf(u8, try H.hit(&env.app, a), "\"new_dashboard\":true") != null);
+
+    // An explicit invalidate (what a same-instance override write does) → next hit re-scans → fresh.
+    fc.invalidate();
+    try std.testing.expect(std.mem.indexOf(u8, try H.hit(&env.app, a), "\"new_dashboard\":false") != null);
 }

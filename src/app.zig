@@ -168,6 +168,12 @@ pub const App = struct {
     /// on Postgres another instance could run DDL unseen, so reads stay direct). null =
     /// uncached (tests/CLI/Postgres) — colcache.lease falls back to a direct load.
     col_cache: ?*@import("colcache.zig").Cache = null,
+    /// The feature-flag / experiment override cache (feature_cache.zig), installed by
+    /// serveImpl for BOTH backends (#230). Unlike col_cache, it is safe on Postgres:
+    /// same-instance override writes invalidate it instantly and a snapshot self-heals
+    /// to a cross-instance write within its TTL (≤5s). null = uncached (tests/CLI) —
+    /// the ctx read paths fall back to direct `_kv` reads, byte-identical to pre-cache.
+    feature_cache: ?*@import("feature_cache.zig").FeatureOverrideCache = null,
 
     /// Submit an ad-hoc job task for async execution on the bounded background pool
     /// (queue/memory.zig Pool — shared with memory-queue jobs). Set by Pool.install in
