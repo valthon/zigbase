@@ -585,6 +585,32 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 .authed => if (authed == null) return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator),
                 .superuser => if (authed == null or !authed.?.is_superuser) return try forbiddenResp(ctx),
             }
+            // #243: collection-scoped `.authed` gate. A non-null `authed_collection` implies the
+            // route was lowered to `.authed`, so the switch above already required a token (else
+            // we returned 401 — `authed.?` is safe here). The principal is accepted ONLY if it
+            // has a non-empty id AND (belongs to the gated collection OR is a superuser with the
+            // gate opted into `allow_superuser`). Every other case — a token from a different
+            // collection, an empty-id principal (superuser or not), or a superuser without
+            // opt-in — gets the SAME fail-closed 401 as no token at all (no oracle, no
+            // distinguishing response).
+            if (rt.authed_collection) |gate| {
+                // Self-contained fail-closed: lowering guarantees `authed_collection != null` ⇒
+                // `auth == .authed` (so the no-token 401 already fired above), but `RuntimeRoute`
+                // is public — a hand-built route pairing `.authed_collection` with a non-`.authed`
+                // level must deny, not panic on a null principal. Reuse the SAME 401 (no oracle).
+                const u = authed orelse return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+                const uid: []const u8 = switch (u.record) {
+                    .object => |o| if (o.get("id")) |v| (switch (v) {
+                        .string => |sv| sv,
+                        else => "",
+                    }) else "",
+                    else => "",
+                };
+                const collection_ok = std.mem.eql(u8, u.collection, gate.collection) and uid.len > 0;
+                const super_ok = u.is_superuser and gate.allow_superuser and uid.len > 0;
+                if (!(collection_ok or super_ok))
+                    return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+            }
             var rctx = request.RequestContext{
                 .auth = if (authed) |a| a.record else null,
                 .is_superuser = if (authed) |a| a.is_superuser else false,
@@ -747,6 +773,100 @@ test "dispatchCustom: a credential-less public request resolves without acquirin
     var ctx2 = http.RequestCtx{ .method = .GET, .path = "/api/priv", .allocator = a, .app = &app2 };
     const resp2 = (try dispatchCustom(&ctx2)).?;
     try std.testing.expectEqual(@as(u16, 401), resp2.status);
+}
+
+test "dispatchCustom: .auth = .{ .authed = collection } gate is fail-closed (#243)" {
+    const App = app_mod.App;
+    const jwt = @import("jwt.zig");
+    const collections = @import("collections.zig");
+    const schema = @import("schema.zig");
+
+    const H = struct {
+        fn ok(cx: *Ctx) anyerror!http.Response {
+            _ = cx;
+            return .{ .status = 200, .body = "ok" };
+        }
+    };
+
+    var env = try GuardEnv.init(true); // migrations -> _collections, _superusers, token_epoch
+    defer env.deinit();
+    const a = env.arena.allocator();
+
+    // Seed two auth collections (each with a token-bearing row), an empty-id customer row (the
+    // defensive case), and a superuser row — all on the pool writer so the reader sees them.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        inline for (.{ "customers", "operators" }) |name| {
+            _ = try collections.create(a, std.testing.io, w, .{
+                .id = "",
+                .name = name,
+                .type = .auth,
+                .fields = &[_]schema.Field{},
+                .listRule = "",
+                .viewRule = "",
+                .createRule = "",
+                .updateRule = "",
+                .deleteRule = "",
+            });
+        }
+        try w.exec("INSERT INTO \"customers\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('c1','','','c@x.io','ck',1);");
+        try w.exec("INSERT INTO \"customers\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('','','','e@x.io','ek',1);");
+        try w.exec("INSERT INTO \"operators\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('o1','','','o@x.io','ok',1);");
+        try w.exec("INSERT INTO \"_superusers\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('su1','','','a@b.c','sk',1);");
+        try w.exec("INSERT INTO \"_superusers\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('','','','empty-su@b.c','sk2',1);");
+    }
+
+    const app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    // jwt_secret defaults to "" here; deriveKey uses it identically for sign and verify.
+    const ck = crypto.deriveKey(app.jwt_secret, "ck");
+    const ek = crypto.deriveKey(app.jwt_secret, "ek");
+    const ok_key = crypto.deriveKey(app.jwt_secret, "ok");
+    const sk = crypto.deriveKey(app.jwt_secret, "sk");
+    const sk2 = crypto.deriveKey(app.jwt_secret, "sk2");
+    const cust_tok = try jwt.sign(a, .{ .id = "c1", .collection = "customers", .type = .auth, .iat = 0, .exp = 9999999999 }, &ck);
+    const empty_tok = try jwt.sign(a, .{ .id = "", .collection = "customers", .type = .auth, .iat = 0, .exp = 9999999999 }, &ek);
+    const ops_tok = try jwt.sign(a, .{ .id = "o1", .collection = "operators", .type = .auth, .iat = 0, .exp = 9999999999 }, &ok_key);
+    const su_tok = try jwt.sign(a, .{ .id = "su1", .collection = "_superusers", .type = .auth, .iat = 0, .exp = 9999999999 }, &sk);
+    // Empty-id superuser: same defensive shape as `empty_tok` above, but for the `_superusers`
+    // collection — regression coverage for the `super_ok` path missing the `uid.len > 0` check.
+    const su_empty_tok = try jwt.sign(a, .{ .id = "", .collection = "_superusers", .type = .auth, .iat = 0, .exp = 9999999999 }, &sk2);
+
+    // Route tables (hand-built RuntimeRoutes; buildRoutes' comptime lowering is exercised in events.zig).
+    const gated_customers = [_]events.RuntimeRoute{.{ .method = .GET, .pattern = "/api/portal/me", .handler = H.ok, .auth = .authed, .authed_collection = .{ .collection = "customers" } }};
+    const gated_ops = [_]events.RuntimeRoute{.{ .method = .GET, .pattern = "/api/ops/x", .handler = H.ok, .auth = .authed, .authed_collection = .{ .collection = "operators" } }};
+    const gated_ops_super = [_]events.RuntimeRoute{.{ .method = .GET, .pattern = "/api/ops/x", .handler = H.ok, .auth = .authed, .authed_collection = .{ .collection = "operators", .allow_superuser = true } }};
+    const plain_authed = [_]events.RuntimeRoute{.{ .method = .GET, .pattern = "/api/any", .handler = H.ok, .auth = .authed }};
+
+    const Run = struct {
+        fn call(alloc: std.mem.Allocator, pool: *@import("db.zig").Pool, routes: []const events.RuntimeRoute, path: []const u8, token: ?[]const u8) !u16 {
+            var app2 = App{ .allocator = alloc, .io = std.testing.io, .pool = pool };
+            const dispatch = events.Dispatch{ .routes = routes };
+            app2.dispatch = &dispatch;
+            var ctx = http.RequestCtx{ .method = .GET, .path = path, .allocator = alloc, .app = &app2 };
+            if (token) |t| ctx.authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{t});
+            const resp = (try dispatchCustom(&ctx)).?;
+            return resp.status;
+        }
+    };
+
+    // 1. Token from the gated collection → handler runs (200).
+    try std.testing.expectEqual(@as(u16, 200), try Run.call(a, &env.pool, &gated_customers, "/api/portal/me", cust_tok));
+    // 2. Token from a DIFFERENT collection → 401 (same as no token, no oracle).
+    try std.testing.expectEqual(@as(u16, 401), try Run.call(a, &env.pool, &gated_customers, "/api/portal/me", ops_tok));
+    // 3. Superuser token, gate WITHOUT allow_superuser → 401.
+    try std.testing.expectEqual(@as(u16, 401), try Run.call(a, &env.pool, &gated_ops, "/api/ops/x", su_tok));
+    // 4. Superuser token, gate WITH allow_superuser → allowed (200).
+    try std.testing.expectEqual(@as(u16, 200), try Run.call(a, &env.pool, &gated_ops_super, "/api/ops/x", su_tok));
+    // 5. No token on a gated route → 401.
+    try std.testing.expectEqual(@as(u16, 401), try Run.call(a, &env.pool, &gated_customers, "/api/portal/me", null));
+    // 6. Empty-id principal from the right collection → 401 (defensive).
+    try std.testing.expectEqual(@as(u16, 401), try Run.call(a, &env.pool, &gated_customers, "/api/portal/me", empty_tok));
+    // 7. Back-compat: a plain `.authed` route accepts a principal from ANY collection → 200.
+    try std.testing.expectEqual(@as(u16, 200), try Run.call(a, &env.pool, &plain_authed, "/api/any", ops_tok));
+    // 8. Empty-id SUPERUSER token, gate WITH allow_superuser → 401 (not 200): an empty principal
+    // id must fail closed on the `super_ok` path exactly like it does on `collection_ok` (case 6).
+    try std.testing.expectEqual(@as(u16, 401), try Run.call(a, &env.pool, &gated_ops_super, "/api/ops/x", su_empty_tok));
 }
 
 test "dispatchCustom merges ctx.setCookie/addHeader on success AND error paths (non-exclusive)" {

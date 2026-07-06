@@ -462,7 +462,13 @@ pub fn App(comptime cfg: anytype) type {
             var d = events.Dispatch{};
             if (@hasField(@TypeOf(cfg), "hooks")) d.record = events.buildRecordDispatcher(cfg.hooks);
             if (@hasField(@TypeOf(cfg), "onError")) d.on_error = cfg.onError;
-            if (@hasField(@TypeOf(cfg), "routes")) d.routes = events.buildRoutes(cfg.routes);
+            if (@hasField(@TypeOf(cfg), "routes")) {
+                d.routes = events.buildRoutes(cfg.routes);
+                // #243: every route with a `.auth = .{ .authed = "<col>" }` gate must name a
+                // DECLARED auth collection (exists + `.type = .auth`). buildRoutes can't check this
+                // (it never sees the collections); `collections` is the lowered set for this App.
+                events.assertAuthedCollectionRoutes(d.routes, collections);
+            }
             if (@hasField(@TypeOf(cfg), "onAuth")) d.on_auth = cfg.onAuth;
             if (@hasField(@TypeOf(cfg), "beforeAuthSuccess")) d.before_auth_success = cfg.beforeAuthSuccess;
             // Only install the lifecycle dispatcher when `.auth.hooks` has ≥1 hook — an
@@ -2900,6 +2906,36 @@ test "App(cfg) assembles custom routes onto dispatch" {
     const A = App(.{ .routes = .{.{ .method = .GET, .path = "/api/x", .handler = H.h, .auth = .public }} });
     try std.testing.expectEqual(@as(usize, 1), A.dispatch.routes.len);
     try std.testing.expectEqualStrings("/api/x", A.dispatch.routes[0].pattern);
+}
+
+test "App(cfg): .auth = .{ .authed = collection } gate assembles + comptime-validates (#243)" {
+    const route_types = @import("route_types.zig");
+    const H = struct {
+        fn me(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
+        }
+    };
+    // A declared `customers` auth collection + a route gated to it assembles cleanly and the
+    // lowered `authed_collection` gate rides on the RuntimeRoute with `.auth = .authed`.
+    const A = App(.{
+        .collections = .{ .customers = .{ .type = .auth, .fields = .{.{ .name = "name", .type = .text }} } },
+        .routes = .{
+            .{ .method = .GET, .path = "/api/portal/me", .handler = H.me, .auth = .{ .authed = "customers" } },
+            .{ .method = .GET, .path = "/api/ops/x", .handler = H.me, .auth = .{ .authed = "customers", .allow_superuser = true } },
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 2), A.dispatch.routes.len);
+    try std.testing.expectEqual(events.AuthLevel.authed, A.dispatch.routes[0].auth);
+    try std.testing.expect(A.dispatch.routes[0].authed_collection != null);
+    try std.testing.expectEqualStrings("customers", A.dispatch.routes[0].authed_collection.?.collection);
+    try std.testing.expect(!A.dispatch.routes[0].authed_collection.?.allow_superuser);
+    try std.testing.expect(A.dispatch.routes[1].authed_collection.?.allow_superuser);
+
+    // NOTE: a negative case cannot be an inline test (it would fail the build). The following
+    // would each be a loud `@compileError` if uncommented:
+    //   compile-error: .auth = .{ .authed = "nope" }        // unknown/undeclared collection
+    //   compile-error: .auth = .{ .authed = "posts" }       // exists but .type != .auth
+    //   compile-error: .auth = .{ .authed = "customers", .bogus = true }  // unknown sibling key
 }
 
 test "App(.{}) has no routes and null lifecycle/auth/file handlers" {
