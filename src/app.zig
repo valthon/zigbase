@@ -83,6 +83,12 @@ pub const App = struct {
     /// is set, else LogReporter). null only in un-booted test/CLI apps, where `dispatchError`
     /// falls back to today's log format.
     reporter: ?*const @import("report/reporter.zig").Reporter = null,
+    /// Error-report TTL dedup state (#244 stage 2). null = disabled (`.reporter_dedup = .off`):
+    /// `dispatchError` reports every swallowed error. Non-null = installed by serveImpl with the
+    /// configured window (default 60s); `dispatchError` suppresses a repeat `(message, phase)`
+    /// seen within it. Comptime-gated: when off, no map is ever allocated and the dedup check is
+    /// a single null-pointer branch.
+    report_dedup: ?*@import("report/dedup.zig").Dedup = null,
     /// Email-subsystem runtime knobs (#154), threaded from the comptime `App(.{ .mail = ... })`
     /// config in serveImpl. Default `.{}` is the fully-off, byte-identical-to-pre-#154 path:
     /// verified-sender + suppression enforcement are disabled and the bounce/complaint webhook

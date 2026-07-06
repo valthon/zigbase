@@ -7,6 +7,8 @@ const Data = @import("data.zig").Data;
 const db = @import("db.zig");
 const report_reporter = @import("report/reporter.zig");
 const report_log = @import("report/log.zig");
+const report_send = @import("report/send.zig");
+const report_dedup = @import("report/dedup.zig");
 const http = @import("http.zig");
 const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
@@ -1143,11 +1145,23 @@ test "before hook error aborts (propagates) and unrelated collection is skipped"
     try std.testing.expectError(error.HookRejected, dispatch(&ctx, &ev));
 }
 
-/// Route a framework-caught error: run the consumer onError handler (if any), then the
-/// pluggable error reporter (the terminal backstop). Never propagates — a reporter that
-/// errors is logged and swallowed. A booted app always has a reporter wired (SentryReporter
-/// when a DSN is set, else LogReporter); the null branch is the log fallback for un-booted
-/// test/CLI apps, preserving today's log-only behavior.
+/// Route a framework-caught error: run the consumer onError handler (if any), then hand the
+/// report to the pluggable error reporter (the terminal backstop). Never propagates.
+///
+/// Delivery is NON-BLOCKING (#244 stage 2): instead of calling `app.reporter.report(...)`
+/// inline (a `SentryReporter` would do a synchronous HTTPS POST on the erroring thread), the
+/// report is enqueued as a `"report"` job on the MEMORY queue and delivered on a pool worker
+/// (`report/send.zig`) — off the erroring thread, never touching the DB writer. With no pool
+/// installed (unit tests / CLI) the handler runs inline, deterministically.
+///
+/// Optional TTL DEDUP (#244 stage 2): when `app.report_dedup` is installed (the default; the
+/// `.reporter_dedup` comptime knob), an identical `(message, phase)` seen within the window is
+/// suppressed — one delivery per window instead of a flood. When `.off`, `app.report_dedup`
+/// is null and this is a single null-pointer branch (no map, no cost).
+///
+/// A booted app always has a reporter wired (SentryReporter when a DSN is set, else
+/// LogReporter); the null-reporter branch is the log fallback for un-booted test/CLI apps,
+/// preserving today's log-only behavior.
 pub fn dispatchError(app: *App, dispatch: ?*const Dispatch, ev: *ErrorEvent) void {
     if (dispatch) |d| {
         if (d.on_error) |h| h(ev);
@@ -1157,10 +1171,16 @@ pub fn dispatchError(app: *App, dispatch: ?*const Dispatch, ev: *ErrorEvent) voi
         .err_name = @errorName(ev.err),
         .phase = @tagName(ev.phase),
     };
-    if (app.reporter) |rep| {
-        rep.report(app.io, app.allocator, r) catch |e|
-            std.log.warn("error reporter failed: {s}", .{@errorName(e)});
+    // TTL dedup: suppress a repeat of the same (message, phase) within the window. Comptime-
+    // gated to zero cost when `.reporter_dedup = .off` (app.report_dedup stays null).
+    if (app.report_dedup) |dd| {
+        if (!dd.shouldReport(app.io, r.message, r.phase)) return;
+    }
+    if (app.reporter != null) {
+        // Non-blocking: hand off to the memory queue; the "report" job POSTs on a worker.
+        report_send.enqueueReport(app, r);
     } else {
+        // Un-booted app (no reporter wired) — preserve the log-only backstop.
         report_log.emit(r);
     }
 }
@@ -1203,6 +1223,7 @@ test "dispatchError runs consumer handler before the backstop" {
     var app: App = undefined;
     app.allocator = std.testing.allocator;
     app.reporter = null; // un-booted app -> dispatchError takes the log fallback path
+    app.report_dedup = null; // dedup disabled for this test
     // Route the log-mode fallback into our sink so it is observable and does not
     // emit a real std.log.err (which Zig's test runner would count as a failure).
     report_log.log_sink = H.sink;
@@ -1215,6 +1236,49 @@ test "dispatchError runs consumer handler before the backstop" {
     try std.testing.expectEqual(@as(usize, 2), H.seq.items.len);
     try std.testing.expectEqualStrings("handler", H.seq.items[0]);
     try std.testing.expectEqualStrings("backstop", H.seq.items[1]);
+}
+
+test "dispatchError dedup: identical errors within the window report once; .off reports each" {
+    // A lightweight counting reporter; report delivery runs inline (no memory pool) so each
+    // non-suppressed dispatchError increments the counter synchronously.
+    const R = struct {
+        var count: usize = 0;
+        fn report(ptr: *anyopaque, io: std.Io, alloc: std.mem.Allocator, r: report_reporter.Report) anyerror!void {
+            _ = ptr;
+            _ = io;
+            _ = alloc;
+            _ = r;
+            count += 1;
+        }
+        const vt = report_reporter.Reporter.VTable{ .report = report };
+    };
+    R.count = 0;
+    var rep_ctx: u8 = 0;
+    var iface = report_reporter.Reporter{ .ptr = &rep_ctx, .vtable = &R.vt };
+
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
+    app.reporter = &iface;
+
+    // Dedup ON (60s window): a repeat (message,phase) within the window is suppressed.
+    var dd = report_dedup.Dedup.init(std.testing.allocator, 60);
+    defer dd.deinit();
+    app.report_dedup = &dd;
+
+    var ev1 = ErrorEvent{ .app = &app, .ctx = null, .err = error.Boom, .phase = .request, .message = "same" };
+    dispatchError(&app, null, &ev1);
+    dispatchError(&app, null, &ev1); // identical, within window → suppressed
+    try std.testing.expectEqual(@as(usize, 1), R.count);
+
+    var ev2 = ErrorEvent{ .app = &app, .ctx = null, .err = error.Boom, .phase = .request, .message = "different" };
+    dispatchError(&app, null, &ev2); // distinct message → reports
+    try std.testing.expectEqual(@as(usize, 2), R.count);
+
+    // Dedup OFF (app.report_dedup == null) → EVERY error reports, even identical ones.
+    app.report_dedup = null;
+    R.count = 0;
+    dispatchError(&app, null, &ev1);
+    dispatchError(&app, null, &ev1);
+    try std.testing.expectEqual(@as(usize, 2), R.count);
 }
 
 test "dispatch*Exposure fires the handler with the right fields and is zero-cost when unset" {

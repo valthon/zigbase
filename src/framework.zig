@@ -20,6 +20,8 @@ const mail = @import("mail/mailer.zig");
 const report_reporter = @import("report/reporter.zig");
 const report_log = @import("report/log.zig");
 const report_sentry = @import("report/sentry.zig");
+const report_dedup = @import("report/dedup.zig");
+const report_send = @import("report/send.zig");
 const provision = @import("provision.zig");
 const oauth_client = @import("oauth/client.zig");
 const migrator = @import("migrator.zig");
@@ -440,7 +442,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -624,6 +626,12 @@ pub fn App(comptime cfg: anytype) type {
         /// unconfigured built-in's code does not get pulled into the binary.
         const builtin_job_regs: []const queue.JobReg = blk: {
             var t: []const queue.JobReg = &.{};
+            // "report" (#244 stage 2) backs non-blocking error-report delivery. Registered
+            // UNCONDITIONALLY — a reporter is always wired (SentryReporter or LogReporter) —
+            // and reserved below so a consumer job can never collide. `dispatchError` enqueues
+            // it on the memory backend directly (bypassing the registry) so reports never hit
+            // the DB writer; the registration reserves the kind + keeps mail/push parity.
+            t = t ++ &[_]queue.JobReg{.{ .kind = report_send.job_kind, .handler = report_send.jobHandler }};
             if (enable_mail_job) t = t ++ &[_]queue.JobReg{.{ .kind = "mail", .handler = mail_send.jobHandler }};
             if (enable_mail_job) t = t ++ &[_]queue.JobReg{.{ .kind = mail_bulk.job_kind, .handler = mail_bulk.jobHandler }};
             if (enable_webhooks) t = t ++ &[_]queue.JobReg{.{ .kind = webhook.job_kind, .handler = webhook.webhookJobHandler }};
@@ -635,7 +643,7 @@ pub fn App(comptime cfg: anytype) type {
         /// Reserved built-in kind names — reserved UNCONDITIONALLY (even when the
         /// built-in is gated off) so enabling a capability later never collides
         /// with a consumer job kind.
-        const reserved_job_kinds: []const []const u8 = &.{ "mail", "mail_batch_item", "webhook", "push", "sms" };
+        const reserved_job_kinds: []const []const u8 = &.{ "report", "mail", "mail_batch_item", "webhook", "push", "sms" };
 
         /// Declared job-kind → handler registry: the built-in kinds followed by the consumer
         /// `.jobs` bindings (the legacy `.jobs.pool_size` key is a compile error — see
@@ -970,6 +978,34 @@ pub fn App(comptime cfg: anytype) type {
             const P = if (@hasField(@TypeOf(cfg), "reporter")) cfg.reporter else DefaultReporterPlugin;
             assertPluginContract(P, "reporter");
             break :blk P;
+        };
+
+        /// #244 stage 2 — error-report TTL dedup window, in SECONDS. 0 = disabled
+        /// (`.reporter_dedup = .off`). Key omitted → the default (`report_dedup.default_window_s`,
+        /// 60s): dedup is ON by default. `.reporter_dedup = .{ .window_s = N }` sets a custom
+        /// window. Loud `@compileError` on a bad literal/shape/non-positive window. Threaded onto
+        /// `ServeOpts.report_dedup_window_s`; serveImpl installs the dedup map only when > 0, so
+        /// `.off` compiles out to no map / a single null-pointer branch in `dispatchError`.
+        pub const report_dedup_window_s: i64 = blk: {
+            if (!@hasField(@TypeOf(cfg), "reporter_dedup")) break :blk report_dedup.default_window_s;
+            const rd = cfg.reporter_dedup;
+            const T = @TypeOf(rd);
+            if (T == @TypeOf(.enum_literal)) {
+                if (rd == .off) break :blk 0;
+                @compileError(".reporter_dedup: unknown value '." ++ @tagName(rd) ++
+                    "'; expected .off or .{ .window_s = N } (seconds)");
+            }
+            if (@typeInfo(T) != .@"struct")
+                @compileError(".reporter_dedup must be .off or .{ .window_s = N } (seconds)");
+            for (std.meta.fields(T)) |f| {
+                if (!std.mem.eql(u8, f.name, "window_s"))
+                    @compileError(".reporter_dedup: unknown key '." ++ f.name ++ "' (recognized: .window_s)");
+            }
+            if (!@hasField(T, "window_s"))
+                @compileError(".reporter_dedup struct must have a .window_s field (seconds), or use .off");
+            const w: i64 = rd.window_s;
+            if (w <= 0) @compileError(".reporter_dedup.window_s must be > 0 (use .off to disable dedup)");
+            break :blk w;
         };
 
         /// Comptime-selected SMS provider plugin type (#224); defaults to `DefaultSmsPlugin`
@@ -1472,6 +1508,7 @@ pub fn App(comptime cfg: anytype) type {
             .StoragePlugin = StoragePlugin,
             .MailerPlugin = MailerPlugin,
             .ReporterPlugin = ReporterPlugin,
+            .report_dedup_window_s = report_dedup_window_s,
             .SmsProviderPlugin = SmsProviderPlugin,
             .auth_method_types = auth_method_types,
             .reader_pool_size = reader_pool_size,
@@ -1640,6 +1677,9 @@ pub const ServeOpts = struct {
     ReporterPlugin: type = DefaultReporterPlugin,
     /// Comptime-selected SMS provider plugin TYPE (#224); defaults to `DefaultSmsPlugin`.
     SmsProviderPlugin: type = DefaultSmsPlugin,
+    /// #244 stage 2 — error-report TTL dedup window in seconds; 0 = disabled. serveImpl
+    /// installs the dedup map (on `app.report_dedup`) only when > 0. Default: 60s (on).
+    report_dedup_window_s: i64 = report_dedup.default_window_s,
     /// Comptime-assembled list of auth method types (built-ins ++ consumer types).
     /// Defaults to just PasswordMethod when absent. serveImpl uses this to
     /// instantiate the Registry via registry.build/deinit.
@@ -2413,6 +2453,10 @@ fn BootedApp(comptime opts: ServeOpts) type {
         mailer_iface: mail.Mailer,
         reporter_inst: opts.ReporterPlugin,
         reporter_iface: report_reporter.Reporter,
+        /// #244 stage 2 — error-report TTL dedup. Always declared (a `Dedup` with an empty map
+        /// costs no heap until used); `app.report_dedup` is pointed here ONLY when the configured
+        /// window is > 0, so `.off` never allocates a map and leaves the pointer null.
+        report_dedup_inst: report_dedup.Dedup,
         sms_inst: opts.SmsProviderPlugin,
         sms_iface: SmsSender,
         /// Registry storage: `am_registry.methods` points into `am_views`, which is built
@@ -2430,6 +2474,7 @@ fn BootedApp(comptime opts: ServeOpts) type {
         app: app_mod.App,
 
         pub fn deinit(self: *Self) void {
+            self.report_dedup_inst.deinit();
             self.feature_cache_inst.deinit();
             if (self.col_cache_inst) |*c| c.deinit();
             static_files.freeSpaRoots(self.allocator, self.spa_roots);
@@ -2822,6 +2867,16 @@ fn bootApp(
     holder.feature_cache_inst = feature_cache.FeatureOverrideCache.init(allocator);
     errdefer holder.feature_cache_inst.deinit();
     app.feature_cache = &holder.feature_cache_inst;
+    // #244 stage 2 — error-report TTL dedup. Always CONSTRUCT the holder value (an empty map,
+    // no heap), but point `app.report_dedup` at it ONLY when the comptime window is > 0. When
+    // `.reporter_dedup = .off`, `opts.report_dedup_window_s == 0` folds this branch away, the
+    // pointer stays null, and `dispatchError` skips dedup entirely (no map ever allocated). The
+    // `deinit()` on an untouched empty map is a no-op, so unconditional construction is safe.
+    holder.report_dedup_inst = report_dedup.Dedup.init(
+        allocator,
+        if (opts.report_dedup_window_s > 0) opts.report_dedup_window_s else report_dedup.default_window_s,
+    );
+    if (comptime opts.report_dedup_window_s > 0) app.report_dedup = &holder.report_dedup_inst;
     // Loud startup warning for the captcha dev-bypass: a configured provider with an empty
     // secret silently passes EVERY verifyCaptcha (the dev-bypass), a prod footgun. Mirrors
     // the `@public`-rule startup warning so operators catch it before deploying.
@@ -3054,13 +3109,15 @@ test "App(cfg) lowers .queues/.workers/.jobs and installs durable poller + GC jo
         .jobs = .{ .send = qTestHandler },
     });
     try std.testing.expect(A.has_durable_queue);
-    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144, all
-    // enabled here via R2-5's .mail/.webhooks gates) ++ consumer kinds; built-ins first.
-    try std.testing.expectEqual(@as(usize, 4), A.job_regs.len);
-    try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
-    try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[1].kind);
-    try std.testing.expectEqualStrings("webhook", A.job_regs[2].kind);
-    try std.testing.expectEqualStrings("send", A.job_regs[3].kind);
+    // job_regs = built-ins "report" (#244, always) + "mail" (#141) + "mail_batch_item" (#154r2)
+    // + "webhook" (#144, all enabled here via R2-5's .mail/.webhooks gates) ++ consumer kinds;
+    // built-ins first.
+    try std.testing.expectEqual(@as(usize, 5), A.job_regs.len);
+    try std.testing.expectEqualStrings("report", A.job_regs[0].kind);
+    try std.testing.expectEqualStrings("mail", A.job_regs[1].kind);
+    try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[2].kind);
+    try std.testing.expectEqualStrings("webhook", A.job_regs[3].kind);
+    try std.testing.expectEqualStrings("send", A.job_regs[4].kind);
     try std.testing.expectEqualStrings("send", @tagName(@as(A.Job, .send)));
     try std.testing.expectEqualStrings("emails", @tagName(@as(A.Queue, .emails)));
 
@@ -3079,31 +3136,38 @@ test "App(cfg) sets the scheduler pool size via .pools.jobs alongside the job re
     // must NOT become a job kind.
     const A = App(.{ .jobs = .{ .resize = qTestHandler }, .pools = .{ .jobs = 3 }, .mail = .{}, .webhooks = true });
     try std.testing.expectEqual(@as(usize, 3), A.job_pool_size);
-    // job_regs = built-ins "mail" (#141) + "mail_batch_item" (#154r2) + "webhook" (#144, all
-    // enabled here via R2-5's .mail/.webhooks gates) ++ consumer "resize"; pool_size is skipped.
-    try std.testing.expectEqual(@as(usize, 4), A.job_regs.len);
-    try std.testing.expectEqualStrings("mail", A.job_regs[0].kind);
-    try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[1].kind);
-    try std.testing.expectEqualStrings("webhook", A.job_regs[2].kind);
-    try std.testing.expectEqualStrings("resize", A.job_regs[3].kind);
+    // job_regs = built-ins "report" (#244, always) + "mail" (#141) + "mail_batch_item" (#154r2)
+    // + "webhook" (#144, all enabled here via R2-5's .mail/.webhooks gates) ++ consumer "resize";
+    // pool_size is skipped.
+    try std.testing.expectEqual(@as(usize, 5), A.job_regs.len);
+    try std.testing.expectEqualStrings("report", A.job_regs[0].kind);
+    try std.testing.expectEqualStrings("mail", A.job_regs[1].kind);
+    try std.testing.expectEqualStrings("mail_batch_item", A.job_regs[2].kind);
+    try std.testing.expectEqualStrings("webhook", A.job_regs[3].kind);
+    try std.testing.expectEqualStrings("resize", A.job_regs[4].kind);
     // The compile-checked Job enum still reflects ONLY the consumer kinds (mail is a
     // built-in reached via ctx.mail().enqueue / ctx.enqueueByName, not the typed enum).
     try std.testing.expectEqual(@as(usize, 1), std.meta.fields(A.Job).len);
 }
 
 test "R2-5: built-in job kinds register only when their capability is configured" {
+    // "report" (#244) is ALWAYS registered (a reporter is always wired), so every app has it
+    // first; the capability-gated built-ins follow only when their config is present.
     const Bare = App(.{});
-    try std.testing.expectEqual(@as(usize, 0), Bare.job_regs.len);
+    try std.testing.expectEqual(@as(usize, 1), Bare.job_regs.len);
+    try std.testing.expectEqualStrings("report", Bare.job_regs[0].kind);
 
     const WithMail = App(.{ .mail = .{} });
-    // The mail gate pulls in both "mail" and its bulk sibling "mail_batch_item" (#154r2).
-    try std.testing.expectEqual(@as(usize, 2), WithMail.job_regs.len);
-    try std.testing.expectEqualStrings("mail", WithMail.job_regs[0].kind);
-    try std.testing.expectEqualStrings("mail_batch_item", WithMail.job_regs[1].kind);
+    // report ++ the mail gate's "mail" + its bulk sibling "mail_batch_item" (#154r2).
+    try std.testing.expectEqual(@as(usize, 3), WithMail.job_regs.len);
+    try std.testing.expectEqualStrings("report", WithMail.job_regs[0].kind);
+    try std.testing.expectEqualStrings("mail", WithMail.job_regs[1].kind);
+    try std.testing.expectEqualStrings("mail_batch_item", WithMail.job_regs[2].kind);
 
     const WithHooks = App(.{ .webhooks = true });
-    try std.testing.expectEqual(@as(usize, 1), WithHooks.job_regs.len);
-    try std.testing.expectEqualStrings("webhook", WithHooks.job_regs[0].kind);
+    try std.testing.expectEqual(@as(usize, 2), WithHooks.job_regs.len);
+    try std.testing.expectEqualStrings("report", WithHooks.job_regs[0].kind);
+    try std.testing.expectEqualStrings("webhook", WithHooks.job_regs[1].kind);
 }
 
 test "R2-5: mail/webhook kind names stay reserved even when unregistered" {

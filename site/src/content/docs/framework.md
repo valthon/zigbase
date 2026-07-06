@@ -102,6 +102,7 @@ pub fn main(init: std.process.Init) !void {
 | `storage` | Storage plugin TYPE (defaults to local-disk storage). | always — you always get a storage plugin, default or custom. |
 | `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). | always — you always get a mailer plugin, default or custom. Together with `.mail`, also enables the built-in `"mail"` job kind (see `.mail` below). |
 | `reporter` | Error-reporter plugin TYPE — the terminal backstop every framework-swallowed error routes through (defaults to `SentryReporter` when `ZIGBASE_SENTRY_DSN` is set, else `LogReporter`). | always — you always get a reporter plugin, default or custom. |
+| `reporter_dedup` | Error-report TTL dedup window: `.{ .window_s = N }` (seconds) suppresses a repeat of the same `(message, phase)` within `N`, or `.off` to report every swallowed error. Default (omitted): **on**, `60`s. | always — dedup is on by default; `.off` compiles the dedup map out entirely (a single null-pointer branch, no allocation). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
@@ -3645,8 +3646,29 @@ blog example uses `.cursor_token = .signed`; golfsim shows the explicit stateles
 When the framework catches an error, your `onError` handler (if any) runs **first**, then a
 built-in backstop reports the error to Sentry when `ZIGBASE_SENTRY_DSN` is set, otherwise
 logs it. `ErrorEvent` carries `app`, `ctx` (optional), `err`, `phase` (`request` /
-`before_hook` / `after_hook` / `cron` / `job` / `file_serve`), and `message`. The backstop
-never propagates.
+`before_hook` / `after_hook` / `cron` / `job` / `file_serve` / `webhook`), and `message`. The
+backstop never propagates.
+
+**Delivery is non-blocking and best-effort.** The Sentry backstop does an HTTPS POST, so the
+framework never runs it inline on the thread that just swallowed the error (an HTTP worker, the
+scheduler, a queue worker). Instead it enqueues an internal `"report"` job on the in-process
+**memory** queue and performs the POST on a pool worker — it never touches the DB writer and
+never blocks the erroring path. A failed delivery is logged and dropped (never retried into a
+loop); the reporter is the terminal backstop, so its own failures never re-report.
+
+**TTL dedup (`.reporter_dedup`).** By default the backstop suppresses a repeat of the same
+`(message, phase)` seen within a rolling window, so a hot error path reports once per window
+instead of flooding Sentry:
+
+```zig
+.reporter_dedup = .{ .window_s = 60 }, // the default when the key is omitted
+.reporter_dedup = .off,                // report EVERY swallowed error (no suppression)
+```
+
+Dedup is **on by default with a 60-second window**. The window is a comptime knob: with `.off`,
+no dedup map is ever allocated and the check compiles down to a single null-pointer branch. The
+suppression cache is in-process and bounded (best-effort — a different process instance dedups
+independently).
 
 ## 12. The worked example
 

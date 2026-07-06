@@ -340,6 +340,8 @@ test {
     _ = @import("report/reporter.zig");
     _ = @import("report/log.zig");
     _ = @import("report/sentry.zig");
+    _ = @import("report/dedup.zig");
+    _ = @import("report/send.zig");
     _ = @import("framework.zig");
     _ = @import("provision.zig");
     _ = @import("dumpload.zig");
