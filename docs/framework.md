@@ -98,6 +98,8 @@ error.**
 | `static_files` | Comptime static-file mode: absent (default flag), `.disabled`, `.{ .dir = "..." }`, `.{ .embedded = ... }`. | always — static serving is core; this key only selects its mode. |
 | `storage` | Storage plugin TYPE (defaults to local-disk storage). | always — you always get a storage plugin, default or custom. |
 | `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). | always — you always get a mailer plugin, default or custom. Together with `.mail`, also enables the built-in `"mail"` job kind (see `.mail` below). |
+| `reporter` | Error-reporter plugin TYPE — the terminal backstop every framework-swallowed error routes through (defaults to `SentryReporter` when `ZIGBASE_SENTRY_DSN` is set, else `LogReporter`). | always — you always get a reporter plugin, default or custom. |
+| `reporter_dedup` | Error-report TTL dedup window: `.{ .window_s = N }` (seconds) suppresses a repeat of the same `(message, phase)` within `N`, or `.off` to report every swallowed error. Default (omitted): **on**, `60`s. | always — dedup is on by default; `.off` compiles the dedup map out entirely (a single null-pointer branch, no allocation). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
@@ -3800,9 +3802,54 @@ blog example uses `.cursor_token = .signed`; golfsim shows the explicit stateles
 
 When the framework catches an error, your `onError` handler (if any) runs
 **first**, then a built-in backstop reports the error to Sentry when
-`ZIGBASE_SENTRY_DSN` is set, otherwise logs it. `ErrorEvent` carries `app`,
+`ZIGBASE_SENTRY_DSN` is set, otherwise logs a structured line
+(`[phase] err_name: message`). `ErrorEvent` carries `app`,
 `ctx` (optional), `err`, `phase` (`request` / `before_hook` / `after_hook` /
-`cron` / `job` / `file_serve`), and `message`. The backstop never propagates.
+`cron` / `job` / `file_serve` / `webhook` / `app`), and `message`. The backstop never propagates.
+
+**Report your own errors: `ctx.reportError`.** Route a swallowed-but-notable error
+from your own code — a hook, job, cron, or handler — through the *same* backstop the
+framework uses for its own caught errors:
+
+```zig
+ctx.reportError(err, "sync of order {s} failed", .{order_id});
+```
+
+It runs your `onError` handler first, then the configured reporter (Sentry or the log
+backstop), carrying the same TTL dedup and non-blocking queued delivery. The report is
+tagged with the `app` phase so a reporter can tell an app-reported error from a
+framework-caught one. It is **best-effort and non-failing**: it returns `void`, never
+blocks, and swallows even its own message-formatting allocation failure (falling back to
+the error name), so it can never fail or abort the caller.
+
+**Delivery is non-blocking and best-effort.** The Sentry backstop does an HTTPS
+POST, so the framework never runs it inline on the thread that just swallowed the
+error (an HTTP worker, the scheduler, a queue worker). Instead it enqueues an
+internal `"report"` job on the in-process **memory** queue and performs the POST on
+a pool worker — it never touches the DB writer and never blocks the erroring path.
+A failed delivery is logged and dropped (never retried into a loop); the reporter is
+the terminal backstop, so its own failures never re-report.
+
+**TTL dedup (`.reporter_dedup`).** By default the backstop suppresses a repeat of the
+same `(message, phase)` seen within a rolling window, so a hot error path reports once
+per window instead of flooding Sentry:
+
+```zig
+.reporter_dedup = .{ .window_s = 60 }, // the default when the key is omitted
+.reporter_dedup = .off,                // report EVERY swallowed error (no suppression)
+```
+
+Dedup is **on by default with a 60-second window**. The window is a comptime knob: with
+`.off`, no dedup map is ever allocated and the check compiles down to a single
+null-pointer branch. The suppression cache is in-process and bounded (best-effort — a
+different process instance dedups independently).
+
+Dedup gates **reporter delivery only** — your `onError` handler still fires on *every*
+error (it is cheap and in-process; the reporter, which ships over the network, is the
+flood risk). And because delivery rides the shared memory-queue worker pool, a sustained
+error storm — or a slow/hung reporter endpoint — drops reports (the ring is bounded)
+rather than delaying the request path: error reporting is a best-effort backstop, never a
+guarantee.
 
 ## 12. The worked example
 

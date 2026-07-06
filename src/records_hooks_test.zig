@@ -5,7 +5,7 @@ const collections = @import("collections.zig");
 const migrations = @import("migrations.zig");
 const events = @import("events.zig");
 const request = @import("request.zig");
-const sentry = @import("sentry.zig");
+const report_log = @import("report/log.zig");
 const App = @import("app.zig").App;
 const records_api = @import("api/records.zig");
 
@@ -98,14 +98,14 @@ test "emitRecord after_create swallows hook errors" {
         .record = events.buildRecordDispatcher(.{ .posts = .{ .afterCreate = Hooks.boom } }),
     };
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined, .dispatch = &dispatch };
-    app.sentry_dsn = "";
-    // Route the log-mode backstop into a no-op so the swallowed error does not
+    app.reporter = null; // un-booted app -> dispatchError takes the log fallback path
+    // Route the log-mode fallback into a no-op so the swallowed error does not
     // emit a real std.log.err (which the test runner would count as a failure).
     const Sink = struct {
         fn noop(_: []const u8) void {}
     };
-    sentry.log_sink = Sink.noop;
-    defer sentry.log_sink = null;
+    report_log.log_sink = Sink.noop;
+    defer report_log.log_sink = null;
 
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);

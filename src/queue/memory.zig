@@ -272,7 +272,7 @@ fn randomU64(io: std.Io) u64 {
 
 const testing = std.testing;
 const db = @import("../db.zig");
-const sentry = @import("../sentry.zig");
+const report_log = @import("../report/log.zig");
 
 fn noopSink(_: []const u8) void {}
 
@@ -328,8 +328,8 @@ test "memory runWithRetry exhausts attempts -> failed + onError" {
     m_runs.store(0, .monotonic);
     m_err = 0;
     m_fail_until = 100; // always fail
-    sentry.log_sink = noopSink; // swallow the intentional terminal-failure log
-    defer sentry.log_sink = null;
+    report_log.log_sink = noopSink; // swallow the intentional terminal-failure log
+    defer report_log.log_sink = null;
     var app = testApp();
     var dispatch = events.Dispatch{ .on_error = onErrM };
     app.dispatch = &dispatch;
