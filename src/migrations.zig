@@ -619,6 +619,21 @@ pub const all = [_]Migration{
     .{ .name = "0021_rt_broadcasts", .up = init_0021_rt_broadcasts },
 };
 
+/// Create the `_migrations` ledger table if it is absent (idempotent). The auto-increment PK
+/// keyword diverges per backend (AUTOINCREMENT vs IDENTITY), so it is composed via the dialect
+/// rather than lowered textually. Shared by `run` (which then applies the system migrations) and
+/// by the `migrate status` CLI path, which reads the ledger without applying anything.
+pub fn ensureLedger(w: *db.Db) db.DbError!void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = arena.allocator(), .io = undefined };
+    try m.execf(
+        \\CREATE TABLE IF NOT EXISTS "_migrations" (
+        \\  "id" {[pk]s}, "name" TEXT UNIQUE NOT NULL, "applied_at" TEXT NOT NULL
+        \\);
+    , .{ .pk = m.dialect.autoIncPk() });
+}
+
 pub fn run(w: *db.Db) db.DbError!void {
     // One-shot startup arena backing the Migrator's SQL lowering; freed when `run` returns.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -626,13 +641,7 @@ pub fn run(w: *db.Db) db.DbError!void {
     // The system migrations never read `io`; it is provided only on the consumer-migration path.
     var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = arena.allocator(), .io = undefined };
 
-    // The `_migrations` ledger: the auto-increment PK keyword diverges per backend (AUTOINCREMENT
-    // vs IDENTITY), so it is composed via the dialect rather than lowered textually.
-    try m.execf(
-        \\CREATE TABLE IF NOT EXISTS "_migrations" (
-        \\  "id" {[pk]s}, "name" TEXT UNIQUE NOT NULL, "applied_at" TEXT NOT NULL
-        \\);
-    , .{ .pk = m.dialect.autoIncPk() });
+    try ensureLedger(w);
 
     for (all) |mig| {
         if (try isApplied(&m, mig.name)) continue;

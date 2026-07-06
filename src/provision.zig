@@ -1151,6 +1151,246 @@ fn recordMigration(m: *Migrator, name: []const u8) db.DbError!void {
     _ = try st.step();
 }
 
+// ---------------------------------------------------------------------------
+// Migration status (CLI `migrate status`, Piece B stage B1)
+// ---------------------------------------------------------------------------
+
+/// One applied consumer-migration ledger row (`prov:`-prefixed name + its `applied_at`).
+pub const AppliedMigration = struct { name: []const u8, applied_at: []const u8 };
+
+/// Strip the `prov:` ledger prefix a consumer migration is recorded under; returns the bare id.
+fn stripProv(name: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, name, "prov:")) name[5..] else name;
+}
+
+/// Read the applied CONSUMER migrations from the `_migrations` ledger, in apply order
+/// (`id` ascending). Names retain the `prov:` prefix. Mirrors `migrationApplied`'s dialect-aware
+/// `m.prepare` (placeholder renumbering, harmless here — the query is placeholder-free) so it
+/// works on SQLite and Postgres. Everything is duped from `alloc` (pass an arena; caller owns it).
+pub fn appliedConsumerMigrations(alloc: std.mem.Allocator, w: *db.Db) ![]AppliedMigration {
+    var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = alloc, .io = undefined };
+    var st = try m.prepare("SELECT \"name\", \"applied_at\" FROM \"_migrations\" WHERE \"name\" LIKE 'prov:%' ORDER BY \"id\";");
+    defer st.finalize();
+    var list: std.ArrayList(AppliedMigration) = .empty;
+    while (try st.step()) {
+        const name = try alloc.dupe(u8, st.columnText(0));
+        const at = try alloc.dupe(u8, st.columnText(1));
+        try list.append(alloc, .{ .name = name, .applied_at = at });
+    }
+    return try list.toOwnedSlice(alloc);
+}
+
+/// One declared consumer migration cross-referenced against the ledger: `applied_at` is set
+/// (the ledger timestamp) when applied, `null` when pending.
+pub const StatusEntry = struct { id: []const u8, applied_at: ?[]const u8 };
+
+/// The result of cross-referencing the compiled-in `.migrations` against the ledger.
+///   - `declared`: every compiled-in migration, in DECLARED order, applied-or-pending.
+///   - `orphaned`: applied `prov:` rows whose id is NOT compiled in (migration deleted from
+///     source). `.name` here is the bare id (prefix stripped).
+pub const MigrationStatus = struct {
+    declared: []StatusEntry,
+    orphaned: []AppliedMigration,
+    applied_count: usize,
+    pending_count: usize,
+};
+
+/// Compute the applied/pending/orphaned buckets by cross-referencing the compiled-in migrations
+/// (`migs`, in declared order) against the ledger. Allocates from `alloc` (pass an arena).
+pub fn migrationStatus(alloc: std.mem.Allocator, w: *db.Db, migs: []const Migration) !MigrationStatus {
+    const applied = try appliedConsumerMigrations(alloc, w);
+
+    const declared = try alloc.alloc(StatusEntry, migs.len);
+    var applied_count: usize = 0;
+    for (migs, 0..) |mig, i| {
+        var at: ?[]const u8 = null;
+        for (applied) |ar| {
+            if (std.mem.eql(u8, stripProv(ar.name), mig.id)) {
+                at = ar.applied_at;
+                break;
+            }
+        }
+        if (at != null) applied_count += 1;
+        declared[i] = .{ .id = mig.id, .applied_at = at };
+    }
+
+    var orphans: std.ArrayList(AppliedMigration) = .empty;
+    for (applied) |ar| {
+        const id = stripProv(ar.name);
+        var known = false;
+        for (migs) |mig| if (std.mem.eql(u8, mig.id, id)) {
+            known = true;
+            break;
+        };
+        if (!known) try orphans.append(alloc, .{ .name = id, .applied_at = ar.applied_at });
+    }
+
+    return .{
+        .declared = declared,
+        .orphaned = try orphans.toOwnedSlice(alloc),
+        .applied_count = applied_count,
+        .pending_count = migs.len - applied_count,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Migration rollback (CLI `migrate rollback [N]`, Piece B stage B2)
+// ---------------------------------------------------------------------------
+
+/// Read the N most-recently-applied CONSUMER migrations, NEWEST FIRST (`id` descending). Mirrors
+/// `appliedConsumerMigrations` but bounded + reversed so a rollback reverses the last-applied
+/// migrations first. Dialect-aware via `m.prepare` (SQLite `?1` → Postgres `$1`); the bound `LIMIT`
+/// is portable across both backends. Everything is duped from `alloc` (pass an arena; caller owns).
+pub fn recentConsumerMigrations(alloc: std.mem.Allocator, w: *db.Db, limit: usize) ![]AppliedMigration {
+    var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = alloc, .io = undefined };
+    var st = try m.prepare("SELECT \"name\", \"applied_at\" FROM \"_migrations\" WHERE \"name\" LIKE 'prov:%' ORDER BY \"id\" DESC LIMIT ?1;");
+    defer st.finalize();
+    // Clamp rather than @intCast: a hostile N (e.g. u64 max from the CLI) must cap the LIMIT, not
+    // panic on overflow (safe build) / bind a negative LIMIT (release). Mirrors the queryAs cast fix.
+    try st.bindInt(1, std.math.cast(i64, limit) orelse std.math.maxInt(i64));
+    var list: std.ArrayList(AppliedMigration) = .empty;
+    while (try st.step()) {
+        const name = try alloc.dupe(u8, st.columnText(0));
+        const at = try alloc.dupe(u8, st.columnText(1));
+        try list.append(alloc, .{ .name = name, .applied_at = at });
+    }
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Delete one consumer-migration ledger row by its full (`prov:`-prefixed) name. The inverse of
+/// `recordMigration`; called inside the same transaction as a migration's reverse body so the two
+/// commit or roll back atomically. Dialect-aware via `m.prepare`.
+fn deleteConsumerMigration(m: *Migrator, name: []const u8) db.DbError!void {
+    var st = try m.prepare("DELETE FROM \"_migrations\" WHERE \"name\" = ?1;");
+    defer st.finalize();
+    try st.bindText(1, name);
+    _ = try st.step();
+}
+
+/// Find a compiled-in migration by its bare id (no `prov:` prefix).
+fn findMigration(migs: []const Migration, id: []const u8) ?Migration {
+    for (migs) |m| if (std.mem.eql(u8, m.id, id)) return m;
+    return null;
+}
+
+/// The outcome of a `rollbackMigrations` run. DB/IO failures still propagate as Zig errors; the
+/// refusal cases below carry the offending migration's bare id so the CLI can name it.
+///   - `ok`: the bare ids reversed, NEWEST FIRST (may be shorter than the requested N when fewer
+///     consumer migrations are applied — PocketBase-style `min(N, applied)`).
+///   - `irreversible`: a selected migration has no usable reverse (a lone `up`; a non-transactional
+///     migration reversed via a `change`; or a `change` whose reverse hit an irreversible op such as
+///     `records()`/`raw`/a `.was`-less drop, or `addForeignKey` on SQLite). `reversed` lists the
+///     ids that WERE reversed+committed (newest-first) BEFORE the offender — empty for a pre-flight
+///     refusal (which touches nothing), or non-empty when a cleanly-reversible NEWER migration
+///     committed before a mid-batch offender hit (whose own partial reverse its tx rolled back).
+///   - `orphaned`: a selected `prov:` ledger row whose migration is no longer compiled in; it cannot
+///     be reversed and its ledger row is left intact. Pre-flight-only (`reversed` is always empty),
+///     so it never partially executes.
+pub const RollbackOutcome = union(enum) {
+    ok: [][]const u8,
+    irreversible: struct { reversed: [][]const u8, id: []const u8 },
+    orphaned: struct { reversed: [][]const u8, id: []const u8 },
+};
+
+/// Reverse the `n` most-recently-applied CONSUMER migrations, newest first. The reverse of a
+/// migration is `down orelse change` (spec §3): an explicit `down` runs in FORWARD semantics; a bare
+/// `change` runs with `direction = .reverse` (each DSL op emits its inverse). A migration with only
+/// an `up` has NO reverse. The ledger row is deleted in the SAME transaction as the reverse body,
+/// mirroring the forward apply's tx wrapping (`transactional = false` runs both bare, no tx).
+///
+/// Fails LOUDLY, changing nothing it cannot undo: a full PRE-FLIGHT pass refuses the whole batch
+/// (touching nothing) when any selected migration is orphaned, a lone `up`, or a non-transactional
+/// `change` (no tx to undo a partial reverse). Only a transactional `change` whose irreversibility is
+/// unknowable without running reaches execution — and its per-migration tx undoes the partial work
+/// before the run reports it. `alloc` backs an internal arena; the returned ids are duped from it.
+pub fn rollbackMigrations(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    w: *db.Db,
+    migs: []const Migration,
+    n: usize,
+) !RollbackOutcome {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const selected = try recentConsumerMigrations(a, w, n);
+
+    // The ids reversed+committed so far, newest-first. Reported on every outcome so a partial
+    // mid-batch stop tells the user exactly what WAS undone (pre-flight refusals leave it empty).
+    // Every id is duped from `alloc` (the caller-owned allocator, not the arena), so an error path
+    // that never returns the list would leak it — the function-scoped errdefer frees it. On the
+    // return paths `toOwnedSlice` clears `reversed` first, so this errdefer then sees an empty list
+    // (no double-free) and the returned slice is owned by the caller.
+    var reversed: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (reversed.items) |id| alloc.free(id);
+        reversed.deinit(alloc);
+    }
+
+    // Pre-flight: refuse the WHOLE batch up front (changing nothing) on any cheaply-knowable
+    // irreversibility — an orphaned row, a lone `up`, or a non-transactional `change` (which would
+    // have no tx to undo a partial reverse). Newest-first, so the first refusal names the newest.
+    for (selected) |row| {
+        const id = stripProv(row.name);
+        const m = findMigration(migs, id) orelse return .{ .orphaned = .{ .reversed = &.{}, .id = try alloc.dupe(u8, id) } };
+        if (m.down == null and m.change == null) {
+            std.log.warn("migrate rollback: '{s}' has only an `up` and no reverse; add a `down` to make it reversible", .{id});
+            return .{ .irreversible = .{ .reversed = &.{}, .id = try alloc.dupe(u8, id) } };
+        }
+        if (!m.transactional and m.down == null) {
+            std.log.warn("migrate rollback: '{s}' is `transactional = false` and reverses via a `change`; add an explicit `down` (an auto-reversed `change` needs a transaction to undo a partial reverse)", .{id});
+            return .{ .irreversible = .{ .reversed = &.{}, .id = try alloc.dupe(u8, id) } };
+        }
+    }
+
+    var mig = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = a, .io = io };
+
+    for (selected) |row| {
+        const id = stripProv(row.name);
+        const m = findMigration(migs, id).?; // pre-flight established it exists
+        // Reverse fn selection (spec §3): explicit `down` runs FORWARD; a bare `change` runs REVERSE.
+        const reverse_fn = m.down orelse m.change.?;
+        mig.direction = if (m.down != null) .forward else .reverse;
+
+        if (m.transactional) try w.begin();
+        reverse_fn(&mig) catch |e| {
+            if (m.transactional) w.rollback() catch {};
+            // A `change` reversed into an irreversible op (records/raw/.was-less drop → NotReversible;
+            // addForeignKey on SQLite → WrongBackend): the tx undid the partial reverse. Report the
+            // ids already reversed+committed (newest-first) BEFORE this offender, then name it. Dupe
+            // the id FIRST (guarded) so if it OOMs the function-scoped errdefer still frees `reversed`;
+            // once `toOwnedSlice` succeeds `reversed` is empty, so that errdefer becomes a no-op.
+            if (e == error.MigrationNotReversible or e == error.WrongBackend) {
+                const duped_id = try alloc.dupe(u8, id);
+                errdefer alloc.free(duped_id);
+                const reversed_slice = try reversed.toOwnedSlice(alloc);
+                return .{ .irreversible = .{ .reversed = reversed_slice, .id = duped_id } };
+            }
+            return e; // a genuine DB/IO error — propagate (errdefer frees `reversed`).
+        };
+        deleteConsumerMigration(&mig, row.name) catch |e| {
+            if (m.transactional) w.rollback() catch {};
+            return e;
+        };
+        if (m.transactional) {
+            // Match the forward path: undo the open tx if the commit itself fails, so a commit
+            // error never leaves a dangling transaction on the pooled writer.
+            errdefer w.rollback() catch {};
+            try w.commit();
+        }
+
+        std.log.info("migrate rollback: reversed migration '{s}'", .{id});
+        // Dupe into a guarded local BEFORE appending, so a failing `append` frees the dupe rather
+        // than leaking it (the function-scoped errdefer only covers ids already in `reversed`).
+        const duped_id = try alloc.dupe(u8, id);
+        errdefer alloc.free(duped_id);
+        try reversed.append(alloc, duped_id);
+    }
+
+    return .{ .ok = try reversed.toOwnedSlice(alloc) };
+}
+
 // --- helpers ---
 
 fn nameInSpecs(specs: []const schema.Collection, name: []const u8) bool {
@@ -1755,6 +1995,387 @@ test "runMigrations: legacy { id, up } is unaffected (backward-compat)" {
     try std.testing.expectEqual(@as(usize, 1), M.calls);
     var st = try d.prepare("SELECT 1 FROM \"legacy_demo\" LIMIT 0;");
     st.finalize();
+}
+
+test "appliedConsumerMigrations returns applied prov: rows in apply (id) order" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        fn up(m: *Migrator) anyerror!void {
+            try m.execLowered("SELECT 1;"); // trivial, effect-free
+        }
+    };
+    // Apply three in order; the ledger's autoinc id preserves apply order regardless of name.
+    const migs = [_]Migration{
+        .{ .id = "0003_c", .up = M.up },
+        .{ .id = "0001_a", .up = M.up },
+        .{ .id = "0002_b", .up = M.up },
+    };
+    try runMigrations(a, std.testing.io, &d, &migs);
+
+    const applied = try appliedConsumerMigrations(a, &d);
+    try std.testing.expectEqual(@as(usize, 3), applied.len);
+    // Apply order, NOT declared/alphabetical: 0003_c was recorded first.
+    try std.testing.expectEqualStrings("prov:0003_c", applied[0].name);
+    try std.testing.expectEqualStrings("prov:0001_a", applied[1].name);
+    try std.testing.expectEqualStrings("prov:0002_b", applied[2].name);
+    try std.testing.expect(applied[0].applied_at.len > 0);
+}
+
+test "migrationStatus computes applied / pending / orphaned buckets" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        fn up(m: *Migrator) anyerror!void {
+            try m.execLowered("SELECT 1;");
+        }
+    };
+    // Apply only the first of two declared migrations.
+    try runMigrations(a, std.testing.io, &d, &[_]Migration{.{ .id = "0001_a", .up = M.up }});
+    // Inject an orphaned ledger row: a prov: migration NOT in the compiled-in set.
+    try d.exec("INSERT INTO \"_migrations\" (\"name\",\"applied_at\") VALUES ('prov:9999_gone', datetime('now'));");
+
+    // Declared set: 0001_a (applied) + 0002_b (pending). 9999_gone is orphaned.
+    const declared = [_]Migration{
+        .{ .id = "0001_a", .up = M.up },
+        .{ .id = "0002_b", .up = M.up },
+    };
+    const status = try migrationStatus(a, &d, &declared);
+
+    try std.testing.expectEqual(@as(usize, 1), status.applied_count);
+    try std.testing.expectEqual(@as(usize, 1), status.pending_count);
+    try std.testing.expectEqual(@as(usize, 2), status.declared.len);
+    // Declared order preserved: [0] applied, [1] pending.
+    try std.testing.expectEqualStrings("0001_a", status.declared[0].id);
+    try std.testing.expect(status.declared[0].applied_at != null);
+    try std.testing.expectEqualStrings("0002_b", status.declared[1].id);
+    try std.testing.expect(status.declared[1].applied_at == null);
+    // The orphan is bucketed separately, with its bare id (prov: stripped).
+    try std.testing.expectEqual(@as(usize, 1), status.orphaned.len);
+    try std.testing.expectEqualStrings("9999_gone", status.orphaned[0].name);
+}
+
+test "migrationStatus: empty declared set with no ledger rows is all-zero" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const status = try migrationStatus(arena.allocator(), &d, &[_]Migration{});
+    try std.testing.expectEqual(@as(usize, 0), status.applied_count);
+    try std.testing.expectEqual(@as(usize, 0), status.pending_count);
+    try std.testing.expectEqual(@as(usize, 0), status.orphaned.len);
+    try std.testing.expectEqual(@as(usize, 0), status.declared.len);
+}
+
+// --- rollback (B2) test helpers ---
+
+fn tableExistsDb(d: *db.Db, alloc: std.mem.Allocator, name: []const u8) !bool {
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\" LIMIT 0;", .{name}, 0);
+    var st = d.prepare(sql) catch return false;
+    st.finalize();
+    return true;
+}
+
+fn ledgerHas(d: *db.Db, alloc: std.mem.Allocator, name: []const u8) !bool {
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"_migrations\" WHERE \"name\" = '{s}';", .{name}, 0);
+    var st = try d.prepare(sql);
+    defer st.finalize();
+    return try st.step();
+}
+
+test "rollbackMigrations: reverses createTable + a separate addColumn (newest-first); ledger cleared; re-applies" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two migrations: create the table, then add a column in a LATER migration. Rolling both back
+    // newest-first reverses the addColumn (dropColumn) before the createTable (dropTable) — the
+    // correct order comes from processing migrations newest-first (intra-change op order is NOT
+    // reversed by the DSL, so dependent ops live in separate migrations).
+    const M = struct {
+        fn createT(m: *Migrator) anyerror!void {
+            try m.createTable("gadgets", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+        }
+        fn addCol(m: *Migrator) anyerror!void {
+            try m.addColumn("gadgets", .{ .name = "label", .type = .text });
+        }
+    };
+    const migs = [_]Migration{
+        .{ .id = "0001_gadgets", .change = M.createT },
+        .{ .id = "0002_label", .change = M.addCol },
+    };
+    try runMigrations(a, std.testing.io, &d, &migs);
+    try std.testing.expect(try tableExistsDb(&d, a, "gadgets"));
+    try std.testing.expect(try ledgerHas(&d, a, "prov:0002_label"));
+
+    const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 2);
+    try std.testing.expect(outcome == .ok);
+    try std.testing.expectEqual(@as(usize, 2), outcome.ok.len);
+    try std.testing.expectEqualStrings("0002_label", outcome.ok[0]);
+    try std.testing.expectEqualStrings("0001_gadgets", outcome.ok[1]);
+    // Table gone, both ledger rows gone.
+    try std.testing.expect(!try tableExistsDb(&d, a, "gadgets"));
+    try std.testing.expect(!try ledgerHas(&d, a, "prov:0001_gadgets"));
+    try std.testing.expect(!try ledgerHas(&d, a, "prov:0002_label"));
+
+    // Forward-apply again works (idempotent ledger): the table comes back.
+    try runMigrations(a, std.testing.io, &d, &migs);
+    try std.testing.expect(try tableExistsDb(&d, a, "gadgets"));
+}
+
+test "rollbackMigrations: rollback N reverses the N newest, newest-first; the rest remain" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        fn a_(m: *Migrator) anyerror!void {
+            try m.createTable("t_a", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+        }
+        fn b_(m: *Migrator) anyerror!void {
+            try m.createTable("t_b", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+        }
+        fn c_(m: *Migrator) anyerror!void {
+            try m.createTable("t_c", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+        }
+    };
+    const migs = [_]Migration{
+        .{ .id = "0001_a", .change = M.a_ },
+        .{ .id = "0002_b", .change = M.b_ },
+        .{ .id = "0003_c", .change = M.c_ },
+    };
+    try runMigrations(a, std.testing.io, &d, &migs);
+
+    const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 2);
+    try std.testing.expect(outcome == .ok);
+    // Newest first: 0003_c then 0002_b.
+    try std.testing.expectEqual(@as(usize, 2), outcome.ok.len);
+    try std.testing.expectEqualStrings("0003_c", outcome.ok[0]);
+    try std.testing.expectEqualStrings("0002_b", outcome.ok[1]);
+    // The two newest tables are gone; the oldest remains.
+    try std.testing.expect(try tableExistsDb(&d, a, "t_a"));
+    try std.testing.expect(!try tableExistsDb(&d, a, "t_b"));
+    try std.testing.expect(!try tableExistsDb(&d, a, "t_c"));
+    // Ledger reflects only 0001_a still applied.
+    try std.testing.expect(try ledgerHas(&d, a, "prov:0001_a"));
+    try std.testing.expect(!try ledgerHas(&d, a, "prov:0002_b"));
+    try std.testing.expect(!try ledgerHas(&d, a, "prov:0003_c"));
+}
+
+test "rollbackMigrations: N exceeding applied count rolls back all applied (min(N, applied))" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        fn change(m: *Migrator) anyerror!void {
+            try m.createTable("solo", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+        }
+    };
+    const migs = [_]Migration{.{ .id = "0001_solo", .change = M.change }};
+    try runMigrations(a, std.testing.io, &d, &migs);
+
+    const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 99);
+    try std.testing.expect(outcome == .ok);
+    try std.testing.expectEqual(@as(usize, 1), outcome.ok.len);
+    try std.testing.expect(!try tableExistsDb(&d, a, "solo"));
+}
+
+test "rollbackMigrations: a lone `up` migration is refused up front, changing nothing" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        fn up(m: *Migrator) anyerror!void {
+            try m.execLowered("CREATE TABLE \"only_up\" (\"x\" TEXT);");
+        }
+    };
+    const migs = [_]Migration{.{ .id = "0001_only_up", .up = M.up }};
+    try runMigrations(a, std.testing.io, &d, &migs);
+
+    const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 1);
+    try std.testing.expect(outcome == .irreversible);
+    try std.testing.expectEqualStrings("0001_only_up", outcome.irreversible.id);
+    // Pre-flight refusal: nothing was reversed before the offender.
+    try std.testing.expectEqual(@as(usize, 0), outcome.irreversible.reversed.len);
+    // Nothing changed: table intact, ledger row intact.
+    try std.testing.expect(try tableExistsDb(&d, a, "only_up"));
+    try std.testing.expect(try ledgerHas(&d, a, "prov:0001_only_up"));
+}
+
+test "rollbackMigrations: a `change` reversing into raw() is refused; its tx undoes the partial reverse" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Forward: create a table, then a raw statement. Reverse re-runs the change inverted — it drops
+    // the table (partial) then hits raw(), which has no inverse → the tx must restore the table.
+    const M = struct {
+        fn change(m: *Migrator) anyerror!void {
+            try m.createTable("mixed", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+            try m.raw(.{ .sqlite = "SELECT 1;", .postgres = "SELECT 1;" });
+        }
+    };
+    const migs = [_]Migration{.{ .id = "0001_mixed", .change = M.change }};
+    try runMigrations(a, std.testing.io, &d, &migs);
+
+    const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 1);
+    try std.testing.expect(outcome == .irreversible);
+    try std.testing.expectEqualStrings("0001_mixed", outcome.irreversible.id);
+    // The offender is the only (and newest) migration, so nothing was reversed before it.
+    try std.testing.expectEqual(@as(usize, 0), outcome.irreversible.reversed.len);
+    // Tx rolled the partial reverse back: table and ledger row survive.
+    try std.testing.expect(try tableExistsDb(&d, a, "mixed"));
+    try std.testing.expect(try ledgerHas(&d, a, "prov:0001_mixed"));
+}
+
+test "rollbackMigrations: an orphaned ledger row is refused and its row left intact" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        fn change(m: *Migrator) anyerror!void {
+            try m.createTable("orphan_t", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+        }
+    };
+    // Apply under one id, then attempt rollback with a compiled-in set that no longer contains it.
+    try runMigrations(a, std.testing.io, &d, &[_]Migration{.{ .id = "0001_gone", .change = M.change }});
+    const now_declared = [_]Migration{}; // the migration was deleted from source
+    const outcome = try rollbackMigrations(a, std.testing.io, &d, &now_declared, 1);
+    try std.testing.expect(outcome == .orphaned);
+    try std.testing.expectEqualStrings("0001_gone", outcome.orphaned.id);
+    // Orphan is a pre-flight refusal: nothing was reversed.
+    try std.testing.expectEqual(@as(usize, 0), outcome.orphaned.reversed.len);
+    // The orphaned ledger row is NOT deleted.
+    try std.testing.expect(try ledgerHas(&d, a, "prov:0001_gone"));
+}
+
+test "rollbackMigrations: a mid-batch irreversible commits the newer reversal, reports it, and stops" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Three migrations. The NEWEST (0003) reverses cleanly (createTable → dropTable). An OLDER one
+    // (0002) reverses into raw() — irreversible, only knowable by running. `rollback 3` must:
+    //   - reverse+commit 0003 (its table + ledger row gone),
+    //   - hit 0002, roll its partial reverse back via the tx, and stop,
+    //   - report .irreversible naming 0002 AND listing 0003 as already reversed,
+    //   - leave 0002 and 0001 untouched.
+    const M = struct {
+        fn one(m: *Migrator) anyerror!void {
+            try m.createTable("mb_one", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+        }
+        fn two(m: *Migrator) anyerror!void {
+            try m.createTable("mb_two", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+            try m.raw(.{ .sqlite = "SELECT 1;", .postgres = "SELECT 1;" });
+        }
+        fn three(m: *Migrator) anyerror!void {
+            try m.createTable("mb_three", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+        }
+    };
+    const migs = [_]Migration{
+        .{ .id = "0001_one", .change = M.one },
+        .{ .id = "0002_two", .change = M.two },
+        .{ .id = "0003_three", .change = M.three },
+    };
+    try runMigrations(a, std.testing.io, &d, &migs);
+
+    const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 3);
+    try std.testing.expect(outcome == .irreversible);
+    try std.testing.expectEqualStrings("0002_two", outcome.irreversible.id);
+    // The newest was reversed+committed BEFORE the offender — and it is reported.
+    try std.testing.expectEqual(@as(usize, 1), outcome.irreversible.reversed.len);
+    try std.testing.expectEqualStrings("0003_three", outcome.irreversible.reversed[0]);
+    // 0003 is really gone (table + ledger row).
+    try std.testing.expect(!try tableExistsDb(&d, a, "mb_three"));
+    try std.testing.expect(!try ledgerHas(&d, a, "prov:0003_three"));
+    // The offender (0002) and the older (0001) are untouched: tables + ledger rows intact.
+    try std.testing.expect(try tableExistsDb(&d, a, "mb_two"));
+    try std.testing.expect(try ledgerHas(&d, a, "prov:0002_two"));
+    try std.testing.expect(try tableExistsDb(&d, a, "mb_one"));
+    try std.testing.expect(try ledgerHas(&d, a, "prov:0001_one"));
+}
+
+test "rollbackMigrations: system migrations are never touched" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Count system (non-prov) ledger rows before.
+    var count_st = try d.prepare("SELECT count(*) FROM \"_migrations\" WHERE \"name\" NOT LIKE 'prov:%';");
+    try std.testing.expect(try count_st.step());
+    const sys_before = count_st.columnInt(0);
+    count_st.finalize();
+    try std.testing.expect(sys_before > 0);
+
+    const M = struct {
+        fn change(m: *Migrator) anyerror!void {
+            try m.createTable("consumer_t", &[_]Migrator.Col{.{ .name = "id", .type = .integer, .pk = true, .null = false }});
+        }
+    };
+    const migs = [_]Migration{.{ .id = "0001_consumer", .change = M.change }};
+    try runMigrations(a, std.testing.io, &d, &migs);
+
+    // Rolling back "everything" (huge N) reverses only the consumer migration.
+    const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 1000);
+    try std.testing.expect(outcome == .ok);
+    try std.testing.expectEqual(@as(usize, 1), outcome.ok.len);
+
+    var count_after = try d.prepare("SELECT count(*) FROM \"_migrations\" WHERE \"name\" NOT LIKE 'prov:%';");
+    try std.testing.expect(try count_after.step());
+    try std.testing.expectEqual(sys_before, count_after.columnInt(0));
+    count_after.finalize();
+    // No prov rows remain.
+    try std.testing.expect(!try ledgerHas(&d, a, "prov:0001_consumer"));
+}
+
+test "rollbackMigrations: nothing applied rolls back nothing (empty ok)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const outcome = try rollbackMigrations(a, std.testing.io, &d, &[_]Migration{}, 1);
+    try std.testing.expect(outcome == .ok);
+    try std.testing.expectEqual(@as(usize, 0), outcome.ok.len);
 }
 
 test "buildCollection lowers .auth.methods into collection options" {
