@@ -125,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
 | `webhooks` | `.webhooks = true` registers the built-in `"webhook"` job kind, compiling in `ctx.webhook()`'s managed outbound delivery (`webhook.zig`, ~689 LOC). Default: off, so a consumer that never sends managed webhooks pays nothing for it. See [`ctx.webhook()`](#ctxwebhook--managed-outbound-webhooks-144). | excluded — off by default; `webhook.zig` is not compiled in unless `.webhooks = true`. |
 | `files` | File-serving knobs threaded into `app.files`: `.{ .s3_presign_redirect = false, .s3_presign_ttl_s = 900 }`. With `.s3_presign_redirect = true` **and** the S3 backend active (`-Ds3` + `ZIGBASE_S3_*`), an authorized download is answered with a 302 redirect to a time-limited presigned GET URL (`s3_presign_ttl_s` seconds, `1..=604800`) instead of proxying the bytes. On any other backend (local disk, or a non-`-Ds3` build) it has no effect — the proxy path is taken. Default `.{}` = proxy-only. | data-only — always compiled; the redirect only engages at runtime when the S3 backend is present. |
 | `push` | Web Push config (`.{ .subject = "mailto:ops@example.com" }`) — the VAPID `sub` contact. Registers the built-in `"push"` job kind backing `ctx.push().enqueue`, compiling in `push/*.zig`'s encrypted delivery. The VAPID keypair itself comes from `ZIGBASE_VAPID_PUBLIC_KEY`/`_PRIVATE_KEY` at runtime; without them `ctx.push()` is a no-op. See [`ctx.push()`](#ctxpush--web-push-notifications-223). | excluded — off by default; `push/send.zig`'s job handler is not compiled in unless `.push` is set. |
+| `app_context` | A **type** naming a consumer-owned app-scoped context struct. Set the handle once in `onBootstrap` (`try ctx.setAppData(T, &value)`) and read it anywhere via `ctx.appData(T)` (a `*T`). Declaring it makes setting it a boot contract: the server refuses to start if `onBootstrap` never calls `ctx.setAppData`. See [App-scoped context](#app-scoped-context-app_context--ctxappdata). | data-only — two `?*anyopaque`/`?[]const u8` fields on `App`; apps that don't declare it pay nothing. |
 
 Route gating: the built-in `analytics`, `senders`/mail-webhook, and `tenancy` (account
 activation) endpoints exist only when their config key is set (`.analytics`, `.mail`,
@@ -1355,6 +1356,85 @@ The same primitive is on the curated `Data` facade as `data.kvGet` / `data.kvSet
 > access-rule system. To expose a value publicly, write a custom route that returns exactly
 > what you intend (see feature flags below).
 
+### App-scoped context (`.app_context` / `ctx.appData`)
+
+`ctx.kv()` is for *persisted, mutable* settings. When what you need instead is **in-memory,
+process-lifetime state** — parsed config, a preloaded content bundle, a shared client
+handle, a lookup table computed once at boot — reach for the app-scoped context. It
+replaces the "module-level `var` globals + a bootstrap setter ritual" pattern with **one
+explicit, typed handle** that every handler, hook, job, and cron reads the same way.
+
+Declare the context **type** at comptime, set it **once** in `onBootstrap`, and read it
+anywhere as a `*T`:
+
+```zig
+const AppData = struct { cfg: Config, content: SiteContent };
+
+// 1. Declare the type on the App config:
+pub const App = zigbase.App(.{
+    .app_context = AppData,
+    .onBootstrap = boot,
+    // ... your other keys
+});
+
+// 2. Build the value and install the handle ONCE, in onBootstrap.
+//    `app_data` must outlive the app. A clean, safe pattern is to allocate it on
+//    the heap with `ctx.app.allocator` (process lifetime) — no module-global state,
+//    no dangling pointer from a stack local.
+fn boot(ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) anyerror!void {
+    _ = ev;
+    const gpa = ctx.app.allocator;
+    const app_data = try gpa.create(AppData);
+    app_data.* = .{ .cfg = try loadConfig(gpa), .content = try loadContent(gpa) };
+    try ctx.setAppData(AppData, app_data);
+}
+
+// 3. Read it from any handler / hook / job / cron.
+fn handler(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const d = ctx.appData(AppData); // *AppData
+    return ctx.json(.{ .site = d.content.title });
+}
+```
+
+> **Caution — allocate for process lifetime, not from `ctx.arena`.** The `ctx.arena`
+> inside a lifecycle hook is a per-invocation arena the framework frees the instant the
+> hook returns (before any request is served). The `app_data` pointer above survives
+> because it's heap-allocated via `ctx.app.allocator`, not a stack local or a `ctx.arena`
+> allocation. Allocate everything the handle transitively owns (config strings,
+> `content.title`, …) from `ctx.app.allocator` too (the App allocator, which lives for the
+> process) — or make `AppData` fully by-value/static. Anything allocated from `ctx.arena`
+> becomes a dangling read on the first request. The pointer **and everything it reaches**
+> must outlive the app.
+
+**Semantics**
+
+- **Single-set.** `setAppData` installs the handle exactly once. A second call returns
+  `error.AppContextAlreadySet` and overwrites nothing — the first value stays live.
+- **Startup contract (fail-fast).** Declaring `.app_context = T` makes setting it
+  mandatory: if `onBootstrap` returns without calling `ctx.setAppData`, the server
+  **refuses to start** with an actionable error (it never boots into a state where the
+  first `ctx.appData` read would fault). Apps that don't declare `.app_context` pay
+  nothing — the two `App` fields default to null and nothing enforces anything.
+- **Lifetime is yours.** The framework stores only a type-erased pointer; the value must
+  outlive the running app — heap-allocate it via `ctx.app.allocator` (as in the example
+  above), not a stack local (destroyed the moment `onBootstrap` returns) or ad hoc
+  module-global state. The handle is read-shared across request threads — guard interior
+  mutability yourself if you mutate it after boot.
+- **`onBootstrap` returns `anyerror!void`,** so `try ctx.setAppData(...)` composes
+  naturally (as do the sibling `onBeforeServe`/`onBeforeTerminate` lifecycle hooks — an
+  error from `onBootstrap`/`onBeforeServe` fails the boot; an `onBeforeTerminate` error is
+  logged during shutdown).
+
+**Type-guard tradeoff.** `App` is a concrete (non-cfg-parameterized) struct and `Ctx`
+lives in a separate file, so `ctx.appData(T)` cannot perform a cross-file *comptime* check
+of `T` against the declared `.app_context` type. Instead it enforces the type at **runtime**:
+`setAppData` records `@typeName(T)`, and `appData` asserts the stored name matches the `T`
+you ask for. Calling `appData` with the wrong `T` (or before it is set) trips a loud
+`std.debug.assert` in safe builds. This is a deliberate choice — it keeps the shared
+`Ctx`/`App` types uncontorted; the comptime `.app_context = T` declaration must *be* a type
+(a non-type value is a `@compileError`), and the boot contract catches the declared-but-unset
+case before any request runs.
+
 ### Feature flags + experiments (declared)
 
 > **Breaking in 0.8.0.** Flags are now **declared-only**: you list them in the `App(cfg)`
@@ -1626,9 +1706,9 @@ One handler each, registered by the matching config key:
 | `auth.hooks` | struct of `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerror!void` | before/after `register`/`logout`/`refresh`/`password-change` (under the `.auth` config group). See [Auth lifecycle hooks](#auth-lifecycle-hooks-register--logout--refresh--password-change). |
 | `onFileServe` | `fn (ev: *zigbase.events.FileEvent) anyerror!void` | Before serving a download; **return an error to deny** (framework → `404`). |
 | `onFileUpload` | `fn (ev: *zigbase.events.FileEvent) void` | After a successful upload. |
-| `onBootstrap` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | After bootstrap. |
-| `onBeforeServe` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | Just before serving starts. |
-| `onBeforeTerminate` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void` | Just before shutdown. |
+| `onBootstrap` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) anyerror!void` | After bootstrap. An error fails the boot. Typical home of `try ctx.setAppData(...)` (see [App-scoped context](#app-scoped-context-app_context--ctxappdata)). |
+| `onBeforeServe` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) anyerror!void` | Just before serving starts. An error fails the boot. |
+| `onBeforeTerminate` | `fn (ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) anyerror!void` | Just before shutdown. An error is logged (it fires in a shutdown defer). |
 | `onFeatureExposure` | `fn (ev: *zigbase.ExposureEvent) void` | Notify-only, each time a declared flag/experiment is resolved. Zero-cost when unset. See [Exposure events](#exposure-events-onfeatureexposure). |
 
 `AuthEvent` carries `app`, `ctx`, `collection`, `record: ?std.json.Value`, and `method`

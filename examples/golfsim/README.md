@@ -314,9 +314,9 @@ startup by the `onBootstrap` handler from the `GOLFSIM_BOOKING_WEBHOOK_URL` env 
 
 ```zig
 // onBootstrap: the WRITE side of the KV store from app code (routes only read it).
-fn seedConfig(ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void {
+fn seedConfig(ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) anyerror!void {
     const raw = std.c.getenv("GOLFSIM_BOOKING_WEBHOOK_URL") orelse return;
-    ctx.kv().set("booking_webhook_url", std.mem.span(raw)) catch return;
+    try ctx.kv().set("booking_webhook_url", std.mem.span(raw));
 }
 ```
 

@@ -170,6 +170,47 @@ pub const Ctx = struct {
     }
 
     // -----------------------------------------------------------------------
+    // App-scoped context (#245): one explicit typed app-scoped handle, replacing
+    // the "module-level globals + bootstrap setter rituals" pattern.
+    //
+    // A consumer declares `App(.{ .app_context = MyAppData })`, sets it ONCE in
+    // `onBootstrap` (`try ctx.setAppData(MyAppData, &value)`), and reads it from any
+    // handler/hook/job/cron (`const d = ctx.appData(MyAppData)`, a `*MyAppData`).
+    //
+    // Type safety: `App` is a concrete (non-cfg-parameterized) struct and `Ctx` lives in
+    // a separate file, so a cross-file *comptime* check of `T` against the declared
+    // `.app_context` type is not cleanly reachable from `appData`. The runtime `@typeName`
+    // guard below IS the safety net — a wrong `T` (or a read before it is set) trips a loud
+    // `std.debug.assert` in safe builds. This is a deliberate tradeoff: it keeps the shared
+    // `Ctx`/`App` types uncontorted. The declared-but-never-set case is caught earlier, at
+    // boot (framework.zig fails fast right after onBootstrap runs).
+    // -----------------------------------------------------------------------
+
+    /// Store the app-scoped context handle (single-set). Call ONCE from `onBootstrap`.
+    /// Returns `error.AppContextAlreadySet` if a value is already installed (the caller
+    /// keeps ownership of `ptr`; nothing is overwritten). The lifetime of `ptr` must
+    /// outlive the app (typically a `var` owned by the consumer's boot scope / a global).
+    ///
+    /// NOTE: this is NOT thread-safe. It must be called only during single-threaded init
+    /// (e.g. inside `onBootstrap`, before the server starts serving requests). Calling it
+    /// concurrently from request handlers is a data race / UB.
+    pub fn setAppData(self: *Ctx, comptime T: type, ptr: *T) error{AppContextAlreadySet}!void {
+        if (self.app.app_context != null) return error.AppContextAlreadySet;
+        self.app.app_context = @ptrCast(ptr);
+        self.app.app_context_type = @typeName(T);
+    }
+
+    /// Read the app-scoped context handle as a `*T`. Asserts (safe builds) that a value
+    /// of exactly `T` was installed via `setAppData` — a mismatched `T` or a read before
+    /// any `setAppData` trips the assert loudly. The declared-but-unset case never reaches
+    /// here in a running server: the boot contract fails fast first.
+    pub fn appData(self: *Ctx, comptime T: type) *T {
+        std.debug.assert(self.app.app_context_type != null and
+            std.mem.eql(u8, self.app.app_context_type.?, @typeName(T)));
+        return @ptrCast(@alignCast(self.app.app_context.?));
+    }
+
+    // -----------------------------------------------------------------------
     // Feature flags + experiments (#128/#129/#130).
     //
     // Flags are DECLARED in the `App(.{ .flags = … })` literal. The typed,
@@ -1409,6 +1450,56 @@ const CtxTestEnv = struct {
         ga.destroy(env);
     }
 };
+
+test "ctx.setAppData/appData round-trips a typed app-scoped handle (#245)" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const AppData = struct { count: u32, label: []const u8 };
+    var data = AppData{ .count = 7, .label = "hello" };
+    var cx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer cx.deinit();
+
+    try cx.setAppData(AppData, &data);
+    // The guard key is the value's @typeName — proves appData compares the right key.
+    try std.testing.expect(env.app.app_context_type != null);
+    try std.testing.expectEqualStrings(@typeName(AppData), env.app.app_context_type.?);
+
+    // appData returns a pointer to the SAME value.
+    const got = cx.appData(AppData);
+    try std.testing.expectEqual(@as(u32, 7), got.count);
+    try std.testing.expectEqualStrings("hello", got.label);
+
+    // Mutations through the handle are visible via the original var and a fresh read.
+    got.count = 99;
+    try std.testing.expectEqual(@as(u32, 99), data.count);
+    try std.testing.expectEqual(@as(u32, 99), cx.appData(AppData).count);
+    // wrong T → assert trips at runtime (a failed std.debug.assert panics and cannot be
+    // caught in a Zig unit test, so it is intentionally not exercised here).
+}
+
+test "ctx.setAppData is single-set: a second call errors (#245)" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const AppData = struct { n: u8 };
+    var first = AppData{ .n = 1 };
+    var second = AppData{ .n = 2 };
+    var cx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer cx.deinit();
+
+    try cx.setAppData(AppData, &first);
+    try std.testing.expectError(error.AppContextAlreadySet, cx.setAppData(AppData, &second));
+    // The first value is untouched — the second set overwrote nothing.
+    try std.testing.expectEqual(@as(u8, 1), cx.appData(AppData).n);
+}
+
+test "App defaults app_context to null when unset — construct is unaffected (#245)" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    try std.testing.expect(env.app.app_context == null);
+    try std.testing.expect(env.app.app_context_type == null);
+    // The declared-but-never-set fail-fast (error.AppContextNotSet) is enforced at boot by
+    // framework.zig's `checkAppContextInitialized`, unit-tested directly there.
+}
 
 test "ctx.user() reflects the resolved auth identity; anonymous is null" {
     const env = try CtxTestEnv.init();

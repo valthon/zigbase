@@ -161,6 +161,15 @@ pub const App = struct {
     /// set by `Pool.install` in serveImpl; null = not serving (tests/CLI). Memory-backend
     /// `ctx.enqueue` jobs AND `app.submit` tasks run on this bounded, shutdown-joined pool.
     memory_pool: ?*anyopaque = null,
+    /// #245 app-scoped context: type-erased pointer to the consumer's app-scoped value,
+    /// declared via comptime `.app_context = T` and set ONCE in `onBootstrap` with
+    /// `ctx.setAppData(T, &val)`; read anywhere via `ctx.appData(T)`. null until set.
+    /// Stored opaque (App is a concrete, non-cfg-parameterized struct) — the paired
+    /// `app_context_type` name is the runtime type-guard. See ctx.setAppData/appData.
+    app_context: ?*anyopaque = null,
+    /// `@typeName(T)` of the value stored in `app_context`, recorded by `ctx.setAppData`
+    /// and checked by `ctx.appData` (loud assert on a mismatched `T` in safe builds).
+    app_context_type: ?[]const u8 = null,
     /// Submit an ad-hoc job task for async execution; set by `queue/memory.zig` Pool.install.
     submit_fn: ?*const fn (ctx: *anyopaque, name: []const u8, task: @import("events.zig").JobTask) anyerror!void = null,
     /// The collection-metadata cache (colcache.zig), installed by serveImpl for the

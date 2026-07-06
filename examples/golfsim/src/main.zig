@@ -794,16 +794,13 @@ fn logout(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 /// as the `booking_webhook_url` setting — the WRITE side of the KV store from app code (the
 /// flag/confirm routes only READ it). Routes then read the URL via `ctx.kv().get(...)`, so an
 /// operator can also change it live through the superuser settings API without a redeploy.
-fn seedConfig(ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) void {
+fn seedConfig(ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) anyerror!void {
     _ = ev;
     // golfsim links libc (build.zig: link_libc = true), so std.c.getenv is available.
     const raw = std.c.getenv("GOLFSIM_BOOKING_WEBHOOK_URL") orelse return;
     const url = std.mem.span(raw);
     if (url.len == 0) return;
-    ctx.kv().set("booking_webhook_url", url) catch |e| {
-        std.log.warn("seedConfig: could not persist booking_webhook_url: {s}", .{@errorName(e)});
-        return;
-    };
+    try ctx.kv().set("booking_webhook_url", url);
     std.log.info("seedConfig: booking webhook configured", .{});
 }
 

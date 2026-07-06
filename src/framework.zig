@@ -400,7 +400,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -474,6 +474,15 @@ pub fn App(comptime cfg: anytype) type {
             if (@hasField(@TypeOf(cfg), "onFileServe")) d.on_file_serve = cfg.onFileServe;
             if (@hasField(@TypeOf(cfg), "onFileUpload")) d.on_file_upload = cfg.onFileUpload;
             if (@hasField(@TypeOf(cfg), "onBootstrap")) d.on_bootstrap = cfg.onBootstrap;
+            // #245 app-scoped context: `.app_context = T` declares a typed handle the
+            // consumer sets once in onBootstrap (`ctx.setAppData`) and reads via
+            // `ctx.appData(T)`. Validate it is a TYPE at comptime; record its @typeName so
+            // serveImpl can fail fast at boot if it was declared but never set.
+            if (@hasField(@TypeOf(cfg), "app_context")) {
+                if (@TypeOf(cfg.app_context) != type)
+                    @compileError("`.app_context` must be a type (e.g. `.app_context = MyAppData`), got a value of type " ++ @typeName(@TypeOf(cfg.app_context)));
+                d.app_context_type = @typeName(cfg.app_context);
+            }
             if (@hasField(@TypeOf(cfg), "onBeforeServe")) d.on_before_serve = cfg.onBeforeServe;
             if (@hasField(@TypeOf(cfg), "onBeforeTerminate")) d.on_before_terminate = cfg.onBeforeTerminate;
             if (@hasField(@TypeOf(cfg), "onFeatureExposure")) d.on_feature_exposure = cfg.onFeatureExposure;
@@ -2252,6 +2261,28 @@ fn resolveJwtSecret(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config
     return secret;
 }
 
+/// #245 app-scoped context boot contract (pure). When the App declared `.app_context = T`
+/// (`declared_type` = its `@typeName`, else null), `onBootstrap` MUST have installed the
+/// handle (`context_ptr` non-null) via `ctx.setAppData`. A declared-but-null handle returns
+/// `error.AppContextNotSet` (serveImpl logs the actionable message + fails startup); an
+/// undeclared context (null `declared_type`) is always ok. Kept pure (no logging) so the
+/// contract is unit-testable without a full server boot or captured log noise.
+fn checkAppContextInitialized(declared_type: ?[]const u8, context_ptr: ?*anyopaque) error{AppContextNotSet}!void {
+    if (declared_type != null and context_ptr == null) return error.AppContextNotSet;
+}
+
+test "checkAppContextInitialized enforces the app-context boot contract (#245)" {
+    var payload: u32 = 0;
+    const ptr: *anyopaque = @ptrCast(&payload);
+    // Declared + a handle installed → ok.
+    try checkAppContextInitialized("AppData", ptr);
+    // Declared but never set (null handle) → the headline "refuses to start" guarantee.
+    try std.testing.expectError(error.AppContextNotSet, checkAppContextInitialized("AppData", null));
+    // Undeclared (null type) → always ok, whether or not a stray ptr is present.
+    try checkAppContextInitialized(null, null);
+    try checkAppContextInitialized(null, ptr);
+}
+
 fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts, environ: *const std.process.Environ.Map) !void {
     var cfg = cfg_in;
     const jwt_secret = try resolveJwtSecret(allocator, io, cfg);
@@ -2620,15 +2651,28 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         defer arena.deinit();
         var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
-        h(&cx, &ev);
+        h(&cx, &ev) catch |e| {
+            std.log.err("refusing to start: onBootstrap hook failed: {s}", .{@errorName(e)});
+            return e;
+        };
     }
+    // #245: a config that DECLARES `.app_context = T` MUST install the handle in onBootstrap
+    // (`ctx.setAppData`). Enforce the contract at boot — fail fast with an actionable error,
+    // never post-boot (a null handle would only surface as an assert on the first appData read).
+    checkAppContextInitialized(dispatch.app_context_type, app.app_context) catch |e| {
+        std.log.err("refusing to start: config declared `.app_context = {s}` but `ctx.setAppData` was never called — set it in your `onBootstrap` hook", .{dispatch.app_context_type.?});
+        return e;
+    };
     if (dispatch.on_before_serve) |h| {
         var ev = events.LifecycleEvent{ .app = &app };
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
-        h(&cx, &ev);
+        h(&cx, &ev) catch |e| {
+            std.log.err("refusing to start: onBeforeServe hook failed: {s}", .{@errorName(e)});
+            return e;
+        };
     }
     // before_terminate fires when listen() returns (graceful shutdown / error).
     defer if (dispatch.on_before_terminate) |h| {
@@ -2637,7 +2681,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         defer arena.deinit();
         var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
-        h(&cx, &ev);
+        h(&cx, &ev) catch |e| std.log.err("onBeforeTerminate hook failed: {s}", .{@errorName(e)});
     };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
