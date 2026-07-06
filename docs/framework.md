@@ -3989,6 +3989,152 @@ You can also force the prod-safe behavior explicitly: `zig build -Ddev-clock=fal
 
 CI runs both passes: the default `Debug` pass (dev features on, prod-gate assertions skipped) and a `-Ddev-clock=false` prod-gate pass (dev features off, prod-gate assertions executed) to verify the compiled-out guarantee.
 
+## 15. Testing your app (`zigbase.testing`)
+
+`zigbase.testing` is an **in-process test harness**: it boots your `App(.{...})` against a
+throwaway data directory and injects requests through the **real** pipeline — the same router,
+access rules, auth, hooks, and custom routes the socket server runs — with **no socket, no port,
+and no background threads**. Assertions run against genuine `http` responses, so a test exercises
+end-to-end behavior (rule evaluation, auth gating, record writes) that a pure-handler unit test
+cannot reach, without the cost of standing up a real server.
+
+### `start` / `deinit`
+
+```zig
+const std = @import("std");
+const zigbase = @import("zigbase");
+
+const MyApp = zigbase.App(.{
+    .routes = .{
+        .{ .method = .GET, .path = "/api/ping", .handler = ping, .auth = .public },
+    },
+    .collections = .{
+        .things = .{
+            .fields = .{ .{ .name = "name", .type = .text } },
+            .rules = .{ .list = "@public", .view = "@public", .create = "@public" },
+        },
+    },
+});
+
+test "ping" {
+    var t = try zigbase.testing.start(MyApp, .{}); // migrations run + onBootstrap fires
+    defer t.deinit();                              // tears down the app + removes the tempdir
+
+    const r = try t.request(.GET, "/api/ping", .{});
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+}
+```
+
+`start(comptime AppType, opts)` boots `AppType` (the type returned by `zigbase.App(.{...})`) into
+a `Harness`. Migrations and comptime provisioning run, and the `onBootstrap` hook fires, before it
+returns. `StartOptions` (all defaulted, so `.{}` works):
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `data_dir` | `null` | Data dir to boot against. `null` mints a fresh tempdir that `deinit` removes; a supplied dir is used as-is and left in place. |
+| `allocator` | `std.testing.allocator` | Allocator backing the harness — the leak-checking default fails a test on any leak across boot → requests → deinit. |
+| `io` | `std.testing.io` | Async/IO handle threaded into the app. |
+| `fake_now_unix` | `null` | Freeze the dev clock (unix seconds) — token expiry, TTLs, and `datetime('now')` all read it (see §14). |
+| `fake_seed` | `null` | Seed the dev PRNG for reproducible IDs/tokens (see §14). |
+
+`deinit` tears down the booted app, every request arena, the optional capture mailer, and the
+tempdir. The harness uses an **on-disk tempdir**, never `:memory:` — the multi-connection reader
+pool needs a shared file.
+
+### `request` and `Response`
+
+```zig
+const r = try t.request(.POST, "/api/collections/things/records", .{ .json = .{ .name = "widget" } });
+try std.testing.expectEqual(@as(u16, 201), r.status);
+const rec = try r.json(struct { id: []const u8, name: []const u8 }); // arena-owned parse
+```
+
+`request(method, path, opts)` builds an `http.RequestCtx` and runs it through the full
+routing/fallback chain. `opts` is an anonymous struct — every field is optional, so pass `.{}` for
+a bare request. An **unrecognized key is a compile error** (a typo like `.jsn` can never silently
+send an empty body):
+
+| Field | Type | Effect |
+| --- | --- | --- |
+| `json` | anytype | Serialized to the body as JSON; sets `Content-Type: application/json`. |
+| `body` | `[]const u8` | Raw request body (ignored when `json` is present). A `multipart/form-data` body (set `content_type`) is pre-parsed into `ctx.form_fields`/`ctx.files`, exactly as on-socket — file-upload handlers work through the harness. |
+| `auth` | `[]const u8` | The `Authorization` header value — pass what an auth helper returns (`"Bearer <tok>"`). Wins over an `Authorization` entry in `headers`. |
+| `headers` | `[]const [2][]const u8` | Extra request headers as `.{ name, value }` pairs. They feed the generic `ctx.headers` list (the route-guard `.header` source) **and**, for the well-known names the real pipeline reads from dedicated `RequestCtx` fields — `Cookie`, `If-None-Match`, `User-Agent`, `X-CSRF-Token`, `Content-Type`, `Authorization` — the matching field. |
+| `query` | `[]const u8` | Raw query string (no leading `?`); overrides a `?...` embedded in the path. |
+| `content_type` | `[]const u8` | Overrides the request content-type. |
+| `cookie` | `[]const u8` | The `Cookie` request header (e.g. `"zb_auth=<tok>"`) — the only way to send a request cookie, so cookie-based auth / token refresh / logout / CSRF double-submit flows are testable. |
+
+> **The `.json` ergonomics.** Because a struct field cannot itself be `anytype`, `request` takes
+> the options as `anytype` and introspects the literal. That makes `.json` a true optional-anytype:
+> `.{ .json = .{ .name = "x" } }` when present, simply absent otherwise — no sentinel, no separate
+> method. Any serializable value works as the body.
+
+The returned `Response` is owned by the harness request arena (freed at `deinit`), so it outlives
+the call:
+
+- `.status: u16`, `.body: []const u8`, `.content_type: []const u8`
+- `.header(name) ?[]const u8` — case-insensitive; `"content-type"` resolves to the response type.
+- `.cookie(name) ?[]const u8` — a `Set-Cookie` value by name.
+- `json(comptime T) !T` — parse the body into `T` (unknown fields ignored), into the request arena.
+
+### Auth helpers — mint vs. real login
+
+Two ways to obtain an `Authorization` value, both returning `"Bearer <tok>"`:
+
+```zig
+// (1) Direct JWT mint — deterministic, no HTTP. Reads the record's tokenKey and signs an
+//     `.auth` token. The default for the epoch session store.
+const sess = try t.mintSession("users", user_id);
+
+// (2) The REAL auth-with-password endpoint in-process — full fidelity (rate limiter, argon2,
+//     verification gate, beforeAuthSuccess/onAuth hooks).
+const admin = try t.loginSuperuser("admin@example.com", "password123");
+const user  = try t.loginPassword("users", "user@example.com", "hunter2xx");
+
+const r = try t.request(.GET, "/api/collections", .{ .auth = admin });
+```
+
+`mintSession` is the deterministic default; use `loginPassword` / `loginSuperuser` when a test must
+exercise the login endpoint itself (or under `.session_store = .table`, which needs a real
+`_sessions` row).
+
+### Seeding
+
+```zig
+const su_id = try t.createSuperuser("admin@example.com", "password123"); // returns the record id
+const rec   = try t.createRecord("things", .{ .name = "seeded" });       // via the Data facade
+```
+
+`createSuperuser` provisions a superuser exactly as `zigbase superuser create` does (argon2id hash
++ random `tokenKey`), so `loginSuperuser` works against it. `createRecord` takes any value
+serializable to a JSON object and creates through the same `Data` facade hooks and routes use —
+auth collections get a generated `tokenKey` and a hashed `password`.
+
+### Composing the mail + clock seams
+
+Swap in a `CaptureMailer` to assert on outbound mail with no SMTP, and freeze the clock for
+deterministic tokens/TTLs:
+
+```zig
+test "verification email is sent" {
+    var t = try zigbase.testing.start(MyApp, .{ .fake_now_unix = 1_800_000_000 });
+    defer t.deinit();
+
+    const mail = try t.captureMail(); // installs an in-memory mailer; harness owns it
+
+    _ = try t.request(.POST, "/api/collections/users/request-verification",
+        .{ .json = .{ .email = "user@example.com" } });
+
+    try std.testing.expectEqual(@as(usize, 1), mail.messages.items.len);
+    try std.testing.expectEqualStrings("user@example.com", mail.messages.items[0].to);
+}
+```
+
+`captureMail` is idempotent (repeated calls return the same instance) and the captured messages
+carry owned copies of every field (subject, recipient, both body parts, attachments). The
+`fake_now_unix` / `fake_seed` options drive the same dev-clock and seeded-entropy seams described
+in §14, so token `exp`, TTL math, and generated IDs are reproducible across runs.
+
 ## Compile-time build flags
 
 `zig build`/`zig build -Dname=value` accepts these consumer-facing flags. Each folds its gated
@@ -4044,6 +4190,9 @@ The public surface (from `src/root.zig`):
 - `zigbase.AuthMethod` — the auth plugin vtable type.
 - `zigbase.AuthCtx` — the per-request auth context passed to plugin phases.
 - `zigbase.auth.Resolution` / `zigbase.auth.InitiateResult` — the phase return types.
+- `zigbase.testing` — the in-process test harness (`testing.start(App, .{})` →
+  `Harness` with `request` / `mintSession` / `loginSuperuser` / `createRecord` /
+  `captureMail`). See [§15](#15-testing-your-app-zigbasetesting).
 
 ---
 

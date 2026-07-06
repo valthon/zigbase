@@ -226,6 +226,59 @@ pub fn Server(comptime gates: Gates) type {
             zap.start(.{ .threads = 4, .workers = 1 });
         }
 
+        /// Socketless routing seam (#239 stage 2). Given a fully-constructed `*http.RequestCtx`
+        /// (built by `onRequest`, or by the `zigbase.testing` harness in Stage 3), run the COMPLETE
+        /// dispatch/fallback chain and produce the `http.Response`. The order is byte-for-byte the
+        /// historical `onRequest` chain — admin `/_/` → built-in routes → remapped feature-state →
+        /// custom routes → static files → 404 — and is security-sensitive: do not reorder or relax
+        /// any guard. Nothing socket-specific is touched; runtime config is reached via `ctx.app`,
+        /// the built-in route table via `Self.routes` (this is a method of `Server(gates)`), and the
+        /// admin gate via the comptime `gates`. The rare OOM-while-building-an-error-`Response`
+        /// paths propagate as an error; `onRequest` writes the raw 500 envelope for them, exactly as
+        /// the historical inline `catch { sendRawEnvelope(...); return; }` sites did.
+        pub fn route(ctx: *http.RequestCtx) anyerror!http.Response {
+            const app = ctx.app.?;
+            if (comptime gates.admin) {
+                if (std.mem.startsWith(u8, ctx.path, "/_/") or std.mem.eql(u8, ctx.path, "/_"))
+                    return admin.serve(ctx);
+            }
+            // Built-in API routes win over custom routes.
+            const builtin = router.tryDispatch(routes, ctx) catch {
+                return try ApiError.internal().toResponse(ctx.allocator);
+            };
+            if (builtin) |hit| return hit;
+            // Public feature-state projection at a CUSTOM-configured path. The default
+            // "/api/state" is already in the static table above; this covers a remapped
+            // `.features = .{ .public_route = "/custom" }`. Reserved ahead of custom routes
+            // so a consumer route cannot shadow it. Disabled (null) → skipped entirely.
+            if (app.features_public_route) |fp| {
+                if ((ctx.method == .GET or ctx.method == .HEAD) and
+                    !std.mem.eql(u8, fp, "/api/state") and
+                    std.mem.eql(u8, ctx.path, fp))
+                {
+                    return state_api.handle(ctx) catch try ApiError.internal().toResponse(ctx.allocator);
+                }
+            }
+            if (dispatchCustom(ctx) catch null) |hit| return hit;
+            // The whole /api namespace stays JSON — including the bare "/api" path
+            // (mirrors the exact-"/_" handling in the admin guard above).
+            if (std.meta.activeTag(app.static_source) != .none and
+                (ctx.method == .GET or ctx.method == .HEAD) and
+                !std.mem.startsWith(u8, ctx.path, "/api/") and
+                !std.mem.eql(u8, ctx.path, "/api"))
+            {
+                if (static_files.serve(app.io, ctx, app.static_source, .{
+                    .routes = app.static_routes,
+                    .spa_roots = app.spa_roots,
+                    .spa_marker_enabled = app.spa_marker_enabled,
+                    .cache_control = app.static_cache_control,
+                }) catch null) |hit| return hit;
+                // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.
+                return http.Response{ .status = 404, .body = "not found", .content_type = "text/plain; charset=utf-8" };
+            }
+            return try ApiError.notFound().toResponse(ctx.allocator);
+        }
+
         fn onRequest(r: zap.Request) !void {
             const self = Self.instance.?;
             var arena = std.heap.ArenaAllocator.init(self.app.allocator);
@@ -257,51 +310,10 @@ pub fn Server(comptime gates: Gates) type {
             const multipart_err = try applyMultipart(&ctx);
             const resp = blk: {
                 if (multipart_err) |er| break :blk er;
-                if (comptime gates.admin) {
-                    if (std.mem.startsWith(u8, ctx.path, "/_/") or std.mem.eql(u8, ctx.path, "/_"))
-                        break :blk admin.serve(&ctx);
-                }
-                // Built-in API routes win over custom routes.
-                const builtin = router.tryDispatch(routes, &ctx) catch {
-                    break :blk ApiError.internal().toResponse(arena.allocator()) catch {
-                        sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
-                        return;
-                    };
-                };
-                if (builtin) |hit| break :blk hit;
-                // Public feature-state projection at a CUSTOM-configured path. The default
-                // "/api/state" is already in the static table above; this covers a remapped
-                // `.features = .{ .public_route = "/custom" }`. Reserved ahead of custom routes
-                // so a consumer route cannot shadow it. Disabled (null) → skipped entirely.
-                if (self.app.features_public_route) |fp| {
-                    if ((ctx.method == .GET or ctx.method == .HEAD) and
-                        !std.mem.eql(u8, fp, "/api/state") and
-                        std.mem.eql(u8, ctx.path, fp))
-                    {
-                        break :blk state_api.handle(&ctx) catch ApiError.internal().toResponse(arena.allocator()) catch {
-                            sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
-                            return;
-                        };
-                    }
-                }
-                if (dispatchCustom(&ctx) catch null) |hit| break :blk hit;
-                // The whole /api namespace stays JSON — including the bare "/api" path
-                // (mirrors the exact-"/_" handling in the admin guard above).
-                if (std.meta.activeTag(self.app.static_source) != .none and
-                    (ctx.method == .GET or ctx.method == .HEAD) and
-                    !std.mem.startsWith(u8, ctx.path, "/api/") and
-                    !std.mem.eql(u8, ctx.path, "/api"))
-                {
-                    if (static_files.serve(self.app.io, &ctx, self.app.static_source, .{
-                        .routes = self.app.static_routes,
-                        .spa_roots = self.app.spa_roots,
-                        .spa_marker_enabled = self.app.spa_marker_enabled,
-                        .cache_control = self.app.static_cache_control,
-                    }) catch null) |hit| break :blk hit;
-                    // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.
-                    break :blk http.Response{ .status = 404, .body = "not found", .content_type = "text/plain; charset=utf-8" };
-                }
-                break :blk ApiError.notFound().toResponse(arena.allocator()) catch {
+                // The full routing/fallback chain lives in the socketless `route` seam (#239
+                // stage 2). Its only escaping errors are the OOM-while-building-an-error-Response
+                // paths that historically wrote this exact raw 500 envelope inline and returned.
+                break :blk route(&ctx) catch {
                     sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
                     return;
                 };
@@ -775,6 +787,53 @@ test "dispatchCustom: a credential-less public request resolves without acquirin
     try std.testing.expectEqual(@as(u16, 401), resp2.status);
 }
 
+test "route: socketless seam dispatches a custom-route hit and falls back to 404 (#239 stage 2)" {
+    const db = @import("db.zig");
+    const App = app_mod.App;
+
+    const H = struct {
+        fn ok(cx: *Ctx) anyerror!http.Response {
+            _ = cx;
+            return .{ .status = 200, .body = "ok" };
+        }
+    };
+    const ga = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+    defer ga.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/t.db", .{dir_path}, 0);
+    defer ga.free(db_path);
+    var pool = try db.Pool.init(ga, std.testing.io, db_path);
+    defer pool.deinit();
+    var arena = std.heap.ArenaAllocator.init(ga);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // One public custom route + a default-gates server whose built-in table never matches
+    // these paths, so `route` falls through to the custom dispatcher / 404 fallback.
+    const route_table = [_]events.RuntimeRoute{
+        .{ .method = .GET, .pattern = "/api/ok", .handler = H.ok, .auth = .public },
+    };
+    const dispatch = events.Dispatch{ .routes = &route_table };
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &pool, .dispatch = &dispatch };
+    const R = Server(.{});
+
+    // (a) Custom-route hit → the handler's own Response (proves the seam threads ctx.app's
+    // dispatch table through the full built-in-miss → custom chain).
+    var hit_ctx = http.RequestCtx{ .method = .GET, .path = "/api/ok", .allocator = a, .app = &app };
+    const hit = try R.route(&hit_ctx);
+    try std.testing.expectEqual(@as(u16, 200), hit.status);
+    try std.testing.expectEqualStrings("ok", hit.body);
+
+    // (b) Unknown path (no built-in, no custom, static disabled) → JSON 404 fallback.
+    var miss_ctx = http.RequestCtx{ .method = .GET, .path = "/api/does-not-exist", .allocator = a, .app = &app };
+    const miss = try R.route(&miss_ctx);
+    try std.testing.expectEqual(@as(u16, 404), miss.status);
+    // Built-in records/auth-path dispatch through `route()` is exercised end-to-end by the
+    // Stage 3 harness (and the live browser suite); here we prove only the seam + fallback.
+}
+
 test "dispatchCustom: .auth = .{ .authed = collection } gate is fail-closed (#243)" {
     const App = app_mod.App;
     const jwt = @import("jwt.zig");
@@ -934,7 +993,11 @@ test "dispatchCustom merges ctx.setCookie/addHeader on success AND error paths (
 /// gets the same clear error instead of falling through to the JSON parser's
 /// misleading "Invalid JSON body.". OutOfMemory propagates; it must never
 /// masquerade as a client error.
-fn applyMultipart(ctx: *http.RequestCtx) error{OutOfMemory}!?http.Response {
+///
+/// `pub` so the `zigbase.testing` harness (#239) runs the SAME multipart pre-parse the
+/// socket `onRequest` does before `route()`, giving off-socket file-upload requests the
+/// real `ctx.form_fields`/`ctx.files` (and the identical malformed-body 400).
+pub fn applyMultipart(ctx: *http.RequestCtx) error{OutOfMemory}!?http.Response {
     if (!std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) return null;
     // Hand-rolled parser over the raw body: facil.io's param parsing type-guesses
     // multipart values (text "123" -> int), so it must never see this body.
