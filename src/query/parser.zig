@@ -7,6 +7,9 @@ pub const Operand = union(enum) {
     num: []const u8,
     boolean: bool,
     nul,
+    /// A `?` bound-value placeholder. The payload is the 0-based, left-to-right index of the
+    /// caller-supplied `filter_args` value the compiler binds here (never re-parsed as grammar).
+    placeholder: usize,
     /// The right-hand side of `in (…)` — a parenthesized list of scalar/macro operands.
     list: []const Operand,
     /// The right-hand side of `in @request.*.ids` — a list-valued macro path.
@@ -29,6 +32,10 @@ const Parser = struct {
     toks: []const lexer.Token,
     pos: usize = 0,
     depth: usize = 0,
+    /// Running count of `?` placeholders seen so far; each placeholder operand captures the
+    /// current value as its 0-based index, then this increments. The final value is the total
+    /// placeholder count the compiler validates against `filter_args.len`.
+    ph_count: usize = 0,
 
     fn peek(self: *Parser) lexer.TokKind {
         return self.toks[self.pos].kind;
@@ -111,6 +118,11 @@ const Parser = struct {
         return switch (t.kind) {
             .string => .{ .str = t.text },
             .number => .{ .num = t.text },
+            .placeholder => blk: {
+                const idx = self.ph_count;
+                self.ph_count += 1;
+                break :blk Operand{ .placeholder = idx };
+            },
             .ident => if (std.mem.eql(u8, t.text, "true")) .{ .boolean = true } else if (std.mem.eql(u8, t.text, "false")) .{ .boolean = false } else if (std.mem.eql(u8, t.text, "null")) .nul else .{ .path = t.text },
             else => error.BadOperand,
         };
@@ -202,6 +214,18 @@ test "parse rejects pathologically deep nesting (no stack overflow)" {
     for (0..100) |_| try buf.append(a, ')');
     const toks = try lexer.lex(a, buf.items);
     try std.testing.expectError(error.TooDeep, parse(a, toks));
+}
+
+test "parse assigns `?` placeholders sequential 0-based indices left-to-right" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const toks = try lexer.lex(a, "a = ? && b = ? || c = ?");
+    const root = try parse(a, toks);
+    // ((a = ?0) AND (b = ?1)) OR (c = ?2)
+    try std.testing.expectEqual(@as(usize, 0), root.logic.l.logic.l.cmp.rhs.placeholder);
+    try std.testing.expectEqual(@as(usize, 1), root.logic.l.logic.r.cmp.rhs.placeholder);
+    try std.testing.expectEqual(@as(usize, 2), root.logic.r.cmp.rhs.placeholder);
 }
 
 test "parse still accepts moderate nesting (depth 5)" {

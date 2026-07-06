@@ -597,11 +597,41 @@ Available `Records` methods:
 
 | Method | Notes |
 | --- | --- |
-| `list(col, opts) !ListResult` | `opts`: `filter`, `sort`, `page`, `perPage`, `limit`, `cursor`, `expand` |
+| `list(col, opts) !ListResult` | `opts`: `filter`, `filter_args`, `sort`, `page`, `perPage`, `limit`, `cursor`, `expand` |
 | `get(col, id, opts) !?Value` | `opts`: `expand`; returns `null` for a missing record |
 | `create(col, value) !Value` | acquires + releases the pool writer |
 | `update(col, id, value) !?Value` | acquires + releases the pool writer |
 | `delete(col, id) !bool` | acquires + releases the pool writer |
+
+**Binding runtime values (`filter_args`)** — to splice a runtime value into a filter, do **not**
+string-concatenate it into the `filter` text (a value containing a quote, `||`, `(`, etc. would be
+re-parsed as grammar). Instead put a `?` placeholder in `filter` and pass the value in
+`.filter_args`. Each `?` binds its value as a literal SQL parameter — exactly like a SQL bind
+parameter — and is **never** re-parsed as filter grammar, so it is the injection-safe way to bind
+untrusted input:
+
+```zig
+// find posts whose title is EXACTLY this (attacker-controlled) string
+const page = try ctx.records().list("posts", .{
+    .filter = "author = ? && title = ?",
+    .filter_args = &.{ .{ .string = user_id }, .{ .string = untrusted_title } },
+});
+```
+
+`FilterArg` is a `union(enum)` of `.string`, `.int`, `.float`, `.bool`, and `.null` (`.null` binds
+SQL `NULL`, so `col = ?` with a null arg matches nothing, per SQL three-valued logic — **identical**
+to writing the inline literal `col = null`, which also binds SQL `NULL` regardless of the field
+type). A null has no text representation, so a null operand in a `LIKE`/`~` term (inline `col ~ null`
+or a `.null` arg) is rejected with a loud `error.BadValue` rather than matching everything. A placeholder
+binds a value **exactly as if you had written it inline as a literal on that field** — the same
+field-type coercion applies, so `price = ?` with `.{ .float = 5.0 }` scales to the same stored value
+as the inline literal `price = 5.00` (no need to pre-convert to storage form). An arg whose kind is
+incompatible with a typed field (e.g. a `.string` for a numeric column, or a number for a bool
+column) is a loud `error.BadValue`, just as the equivalent inline literal would be. Placeholders
+bind **0-based, left-to-right**, and the number of `?` in `filter` **must equal**
+`filter_args.len` — a mismatch is a loud `error.BadFilter`, never a silent misbind. (The REST
+`?filter=` query string supplies no `filter_args`, so a `?` there also fails closed with the same
+count-mismatch error — it can never smuggle an unbound placeholder.)
 
 **Expanding relations** — pass `.expand` in opts to inline related records under an `"expand"` key:
 

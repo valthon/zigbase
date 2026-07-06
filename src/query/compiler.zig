@@ -9,30 +9,87 @@ const request = @import("../request.zig");
 const dialect_mod = @import("../sql/dialect.zig");
 const Dialect = dialect_mod.Dialect;
 
-pub const Param = union(enum) { text: []const u8, int: i64, double: f64 };
+pub const Param = union(enum) { text: []const u8, int: i64, double: f64, null };
 pub const CompileError = error{ BadFilter, BadValue } || joiner.JoinError || values.ValueError;
 
 pub const Compiled = struct { where_sql: []const u8, params: []const Param };
+
+/// A bound value supplied via `filter_args` for a `?` placeholder in a filter string. Unlike a
+/// grammar literal, a `FilterArg` is NEVER re-parsed as filter grammar — it is bound as a literal
+/// SQL parameter (exactly like a SQL bind parameter), so a value containing filter metacharacters
+/// (quotes, `||`, `(`, …) is compared as its literal bytes. Field-type coercion still applies (via
+/// `coerceScalar`), so a placeholder for field F binds identically to writing the value inline as a
+/// literal on F (e.g. `.float = 5.0` on a `fixed` scale-2 column scales to the same int as `5.00`).
+/// `.null` binds SQL NULL regardless of field type (so `col = ?` with a null arg matches nothing,
+/// per SQL three-valued logic — mirrors `values.bindValue`).
+pub const FilterArg = union(enum) {
+    string: []const u8,
+    int: i64,
+    float: f64,
+    bool: bool,
+    null,
+};
+
+/// Bind a placeholder's `FilterArg` through the SAME field-type coercion the grammar-literal path
+/// uses (`coerceScalar`), so the two can never diverge. Numeric args (`.int`/`.float`) are rendered
+/// to a decimal string and funneled through the identical scale/parse logic as a `.num` literal;
+/// `.null` short-circuits to SQL NULL. The result is always a bound param, never SQL text.
+fn filterArgToParam(alloc: std.mem.Allocator, field: ?schema.Field, arg: FilterArg) CompileError!Param {
+    return switch (arg) {
+        .null => .null, // SQL NULL regardless of the field's type (unchanged).
+        .string => |s| coerceScalar(field, .{ .text = s }),
+        .bool => |b| coerceScalar(field, .{ .boolean = b }),
+        // Render the native number to a decimal string so it flows through the exact same
+        // scale/parse path (`values.decimalToScaledInt`/`parseFloat`) as an inline numeric literal.
+        .int => |n| coerceScalar(field, .{ .num = try std.fmt.allocPrint(alloc, "{d}", .{n}) }),
+        .float => |f| coerceScalar(field, .{ .num = try std.fmt.allocPrint(alloc, "{d}", .{f}) }),
+    };
+}
+
+/// Total number of `?` placeholder operands in the AST — used to validate that the count of
+/// supplied `filter_args` matches exactly (a mismatch is a loud `error.BadFilter`).
+fn countPlaceholders(node: *const parser.Node) usize {
+    return switch (node.*) {
+        .logic => |lg| countPlaceholders(lg.l) + countPlaceholders(lg.r),
+        .cmp => |c| countOperandPlaceholders(c.lhs) + countOperandPlaceholders(c.rhs),
+    };
+}
+
+fn countOperandPlaceholders(op: parser.Operand) usize {
+    return switch (op) {
+        .placeholder => 1,
+        .list => |items| blk: {
+            var n: usize = 0;
+            for (items) |it| n += countOperandPlaceholders(it);
+            break :blk n;
+        },
+        else => 0,
+    };
+}
 
 /// Compile a filter/rule AST into a parameter-bound WHERE fragment. `dialect` selects the
 /// case-insensitive `LIKE` spelling (SQLite `LIKE` is ASCII-case-insensitive; Postgres needs
 /// `ILIKE` to match) — every other operator is portable. Placeholders are still emitted as the
 /// anonymous `?`; the `$n` renumber happens once at the prepare boundary (`sql/param_sink.zig`).
-pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, rctx: ?*const request.RequestContext, dialect: Dialect) CompileError!Compiled {
+pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, rctx: ?*const request.RequestContext, dialect: Dialect, filter_args: []const FilterArg) CompileError!Compiled {
+    // Arg-count validation is a LOUD, fail-closed error: the number of `?` placeholders MUST
+    // equal filter_args.len. This also means a filter STRING that smuggles a `?` on the REST path
+    // (which supplies no filter_args) fails safely here rather than binding an unbound placeholder.
+    if (countPlaceholders(node) != filter_args.len) return error.BadFilter;
     var params: std.ArrayList(Param) = .empty;
-    const sql = try emit(alloc, j, node, &params, rctx, dialect);
+    const sql = try emit(alloc, j, node, &params, rctx, dialect, filter_args);
     return .{ .where_sql = sql, .params = try params.toOwnedSlice(alloc) };
 }
 
-fn emit(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect) CompileError![]u8 {
+fn emit(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect, filter_args: []const FilterArg) CompileError![]u8 {
     switch (node.*) {
         .logic => |lg| {
-            const l = try emit(alloc, j, lg.l, params, rctx, dialect);
-            const r = try emit(alloc, j, lg.r, params, rctx, dialect);
+            const l = try emit(alloc, j, lg.l, params, rctx, dialect, filter_args);
+            const r = try emit(alloc, j, lg.r, params, rctx, dialect, filter_args);
             const conj = if (lg.op == .l_and) "AND" else "OR";
             return std.fmt.allocPrint(alloc, "({s} {s} {s})", .{ l, conj, r });
         },
-        .cmp => |c| return emitCmp(alloc, j, c, params, rctx, dialect),
+        .cmp => |c| return emitCmp(alloc, j, c, params, rctx, dialect, filter_args),
     }
 }
 
@@ -76,7 +133,7 @@ fn isColPath(op: parser.Operand) bool {
     return op == .path and (op.path.len == 0 or op.path[0] != '@');
 }
 
-fn operandToText(op: parser.Operand, rctx: ?*const request.RequestContext) CompileError![]const u8 {
+fn operandToText(op: parser.Operand, rctx: ?*const request.RequestContext, filter_args: []const FilterArg) CompileError![]const u8 {
     switch (op) {
         .path => |p| {
             if (p.len > 0 and p[0] == '@') {
@@ -85,11 +142,16 @@ fn operandToText(op: parser.Operand, rctx: ?*const request.RequestContext) Compi
             }
             return error.BadFilter;
         },
+        // A placeholder used where TEXT is required (e.g. a LIKE term) must be a string arg.
+        .placeholder => |idx| return switch (filter_args[idx]) {
+            .string => |s| s,
+            else => error.BadValue,
+        },
         else => return literalToText(op),
     }
 }
 
-fn operandToParam(field: ?schema.Field, op: parser.Operand, rctx: ?*const request.RequestContext) CompileError!Param {
+fn operandToParam(alloc: std.mem.Allocator, field: ?schema.Field, op: parser.Operand, rctx: ?*const request.RequestContext, filter_args: []const FilterArg) CompileError!Param {
     switch (op) {
         .path => |p| {
             if (p.len > 0 and p[0] == '@') {
@@ -98,12 +160,16 @@ fn operandToParam(field: ?schema.Field, op: parser.Operand, rctx: ?*const reques
             }
             return error.BadFilter;
         },
+        // A `?` placeholder binds the caller's value through the SAME field-type coercion a literal
+        // gets (so it behaves identically to writing the value inline), and is NEVER re-parsed as
+        // grammar — the injection-safe SQL-bind-parameter contract.
+        .placeholder => |idx| return filterArgToParam(alloc, field, filter_args[idx]),
         else => return literalToParam(field, op),
     }
 }
 
-fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect) CompileError![]u8 {
-    if (c.op == .in) return emitIn(alloc, j, c, params, rctx, dialect);
+fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect, filter_args: []const FilterArg) CompileError![]u8 {
+    if (c.op == .in) return emitIn(alloc, j, c, params, rctx, dialect, filter_args);
 
     const l_col = isColPath(c.lhs);
     const r_col = isColPath(c.rhs);
@@ -124,11 +190,11 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
         const val_op = if (l_col) c.rhs else c.lhs;
         if (c.op == .like or c.op == .nlike) {
             if (!likeAllowed(col.field)) return error.BadValue;
-            const term = try operandToText(val_op, rctx);
+            const term = try operandToText(val_op, rctx, filter_args);
             try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{term}) });
             return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op, dialect) });
         }
-        try params.append(alloc, try operandToParam(col.field, val_op, rctx));
+        try params.append(alloc, try operandToParam(alloc, col.field, val_op, rctx, filter_args));
         // Case-insensitive equality against a `.nocase` column: lower the column AND the placeholder
         // so it uses the `lower()` functional index and agrees with uniqueness (PG only; SQLite
         // returns the operand unchanged, keeping the SQL byte-identical) (#159).
@@ -141,14 +207,14 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
 
     // neither side is a column: both are macros/literals -> bind both as text
     if (c.op == .like or c.op == .nlike) {
-        const lt = try operandToText(c.lhs, rctx);
-        const rt = try operandToText(c.rhs, rctx);
+        const lt = try operandToText(c.lhs, rctx, filter_args);
+        const rt = try operandToText(c.rhs, rctx, filter_args);
         try params.append(alloc, .{ .text = lt });
         try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{rt}) });
         return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op, dialect)});
     }
-    try params.append(alloc, .{ .text = try operandToText(c.lhs, rctx) });
-    try params.append(alloc, .{ .text = try operandToText(c.rhs, rctx) });
+    try params.append(alloc, .{ .text = try operandToText(c.lhs, rctx, filter_args) });
+    try params.append(alloc, .{ .text = try operandToText(c.rhs, rctx, filter_args) });
     return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op, dialect)});
 }
 
@@ -157,13 +223,13 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
 /// (`("a","b")`) or a list-valued macro (`@request.account.ids`), whose elements are read from the
 /// request context. An EMPTY list (`()` or an empty membership set) compiles to the constant-false
 /// predicate `0` — fail-closed, and avoids SQLite's `IN ()` syntax error.
-fn emitIn(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect) CompileError![]u8 {
+fn emitIn(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect, filter_args: []const FilterArg) CompileError![]u8 {
     if (!isColPath(c.lhs)) return error.BadFilter; // `<literal> in (...)` is meaningless
     const col = try j.resolve(c.lhs.path);
     var n: usize = 0;
     switch (c.rhs) {
         .list => |items| for (items) |it| {
-            try params.append(alloc, try operandToParam(col.field, it, rctx));
+            try params.append(alloc, try operandToParam(alloc, col.field, it, rctx, filter_args));
             n += 1;
         },
         .list_macro => |m| {
@@ -201,28 +267,74 @@ fn literalToText(op: parser.Operand) CompileError![]const u8 {
         .str => op.str,
         .num => op.num,
         .boolean => |b| if (b) "true" else "false",
-        .nul => "",
-        .path, .list, .list_macro => error.BadFilter,
+        // NULL has no TEXT representation. In a text context (a LIKE term, or a literal-vs-literal
+        // text bind) a null operand must FAIL CLOSED — binding `""` would make `col ~ null` a
+        // match-everything `"%%"` term (fail-open). Reject with the same `error.BadValue` the LIKE
+        // path already uses for a non-string placeholder there. (A column `= null` never reaches
+        // here — it binds SQL NULL via coerceScalar.)
+        .nul => error.BadValue,
+        // A placeholder is bound by operandToText/operandToParam before reaching here.
+        .path, .list, .list_macro, .placeholder => error.BadFilter,
+    };
+}
+
+/// A scalar value normalized out of its source syntax (a grammar literal token or a bound
+/// `FilterArg`), before field-type coercion. Both paths converge here so `coerceScalar` is the
+/// single place that maps a value to its stored `Param` shape — the literal and placeholder paths
+/// can never diverge on how a value binds for a given field.
+const Scalar = union(enum) {
+    /// A numeric value as a decimal string (e.g. "5.00", "5", "-3.2"); scaled by the field scale.
+    num: []const u8,
+    /// A text value bound as-is for text-family fields (and the generic non-typed fallback).
+    text: []const u8,
+    boolean: bool,
+    nul,
+};
+
+/// Field-aware value coercion shared by the grammar-literal path and the `?` placeholder path.
+/// Numeric fields scale/parse the decimal string exactly as before; a bool field maps to 0/1; any
+/// non-typed field binds the value's textual form. A value whose kind is incompatible with a typed
+/// field (e.g. a text value for a numeric column, a number for a bool column) is a loud
+/// `error.BadValue` — never a silent misbind. Injection-safe: always returns a bound param.
+fn coerceScalar(field: ?schema.Field, s: Scalar) CompileError!Param {
+    // An inline `= null` literal binds SQL NULL regardless of the field type, IDENTICALLY to a
+    // bound `FilterArg.null` (`filterArgToParam` short-circuits the same way). Under SQL's
+    // three-valued logic this matches nothing — never the empty string, and never a typed-field
+    // BadValue. Short-circuit BEFORE the field switch so a null on a number/bool column is SQL
+    // NULL, not a coercion error.
+    if (s == .nul) return .null;
+    if (field) |f| switch (f.options) {
+        .number => |o| {
+            if (s != .num) return error.BadValue;
+            return switch (o.mode) {
+                .float => .{ .double = std.fmt.parseFloat(f64, s.num) catch return error.BadValue },
+                .int => .{ .int = try values.decimalToScaledInt(s.num, 0) },
+                .fixed => .{ .int = try values.decimalToScaledInt(s.num, o.scale orelse 0) },
+            };
+        },
+        .bool => {
+            if (s != .boolean) return error.BadValue;
+            return .{ .int = if (s.boolean) 1 else 0 };
+        },
+        else => {},
+    };
+    return switch (s) {
+        .num => |n| .{ .text = n },
+        .text => |t| .{ .text = t },
+        .boolean => |b| .{ .text = if (b) "true" else "false" },
+        .nul => unreachable, // handled by the early SQL-NULL short-circuit above
     };
 }
 
 fn literalToParam(field: ?schema.Field, op: parser.Operand) CompileError!Param {
-    if (field) |f| switch (f.options) {
-        .number => |o| switch (o.mode) {
-            .float => if (op == .num) return .{ .double = std.fmt.parseFloat(f64, op.num) catch return error.BadValue } else return error.BadValue,
-            .int => if (op == .num) return .{ .int = try values.decimalToScaledInt(op.num, 0) } else return error.BadValue,
-            .fixed => if (op == .num) return .{ .int = try values.decimalToScaledInt(op.num, o.scale orelse 0) } else return error.BadValue,
-        },
-        .bool => if (op == .boolean) return .{ .int = if (op.boolean) 1 else 0 } else return error.BadValue,
-        else => {},
+    const s: Scalar = switch (op) {
+        .str => |v| .{ .text = v },
+        .num => |v| .{ .num = v },
+        .boolean => |b| .{ .boolean = b },
+        .nul => .nul,
+        .path, .list, .list_macro, .placeholder => return error.BadFilter,
     };
-    return switch (op) {
-        .str => .{ .text = op.str },
-        .num => .{ .text = op.num },
-        .boolean => |b| .{ .text = if (b) "true" else "false" },
-        .nul => .{ .text = "" },
-        .path, .list, .list_macro => error.BadFilter,
-    };
+    return coerceScalar(field, s);
 }
 
 fn setup(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
@@ -234,6 +346,7 @@ fn setup(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
         .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
         .{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } },
+        .{ .id = "f4", .name = "active", .options = .{ .bool = .{} } },
     };
     return collections.create(a, std.testing.io, d, .{ .id = "", .name = "posts", .fields = &pf });
 }
@@ -243,7 +356,14 @@ fn compileFilter(a: std.mem.Allocator, d: *db.Db, posts: schema.Collection, filt
     _ = posts;
     const toks = try lexer.lex(a, filter);
     const ast = try parser.parse(a, toks);
-    return compile(a, j, ast, null, Dialect.sqlite);
+    return compile(a, j, ast, null, Dialect.sqlite, &.{});
+}
+
+/// Like `compileFilter` but with bound `?` placeholder values.
+fn compileFilterArgs(a: std.mem.Allocator, filter: []const u8, j: *joiner.Joiner, filter_args: []const FilterArg) !Compiled {
+    const toks = try lexer.lex(a, filter);
+    const ast = try parser.parse(a, toks);
+    return compile(a, j, ast, null, Dialect.sqlite, filter_args);
 }
 
 test "compile text equality binds the literal" {
@@ -299,7 +419,7 @@ test "compile makes a .nocase column equality/IN case-insensitive on BOTH backen
         const toks = try lexer.lex(a, cs.filter);
         const ast = try parser.parse(a, toks);
         var j = joiner.Joiner.init(a, &d, people);
-        const c = try compile(a, &j, ast, null, cs.dia);
+        const c = try compile(a, &j, ast, null, cs.dia, &.{});
         try std.testing.expectEqualStrings(cs.want, c.where_sql);
     }
 }
@@ -435,7 +555,7 @@ test "compile a macro rule binds the auth id as a param" {
     const toks = try lexer.lex(a, "title = @request.auth.id");
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
-    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite);
+    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite, &.{});
     try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
     try std.testing.expectEqualStrings("u1", c.params[0].text);
 }
@@ -450,7 +570,7 @@ test "compile @ path without a context errors" {
     const toks = try lexer.lex(a, "title = @request.auth.id");
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
-    try std.testing.expectError(error.BadFilter, compile(a, &j, ast, null, Dialect.sqlite));
+    try std.testing.expectError(error.BadFilter, compile(a, &j, ast, null, Dialect.sqlite, &.{}));
 }
 
 test "compile `in` with a literal list emits placeholders and binds each element" {
@@ -494,7 +614,7 @@ test "compile `in @request.account.ids` binds each membership id" {
     const toks = try lexer.lex(a, "author in @request.account.ids");
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
-    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite);
+    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite, &.{});
     try std.testing.expectEqualStrings("\"posts\".\"author\" IN (?,?)", c.where_sql);
     try std.testing.expectEqualStrings("acc1", c.params[0].text);
     try std.testing.expectEqualStrings("acc2", c.params[1].text);
@@ -517,7 +637,7 @@ test "compile `in` with an empty set is a constant-false predicate (fail-closed)
     const toks = try lexer.lex(a, "author in @request.account.ids");
     const ast = try parser.parse(a, toks);
     var j2 = joiner.Joiner.init(a, &d, posts);
-    const c2 = try compile(a, &j2, ast, &rctx, Dialect.sqlite);
+    const c2 = try compile(a, &j2, ast, &rctx, Dialect.sqlite, &.{});
     try std.testing.expectEqualStrings("0", c2.where_sql);
 }
 
@@ -535,7 +655,7 @@ test "compile a relation-path macro rule (account.owner_user = @request.auth.id)
     const toks = try lexer.lex(a, "author.name = @request.auth.id");
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
-    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite);
+    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite, &.{});
     try std.testing.expectEqual(@as(usize, 1), j.joins.items.len);
     try std.testing.expectEqualStrings("j1.\"name\" = ?", c.where_sql);
     try std.testing.expectEqualStrings("u1", c.params[0].text);
@@ -552,8 +672,258 @@ test "compile a method-vs-literal rule binds both as text" {
     const toks = try lexer.lex(a, "@request.method = \"GET\"");
     const ast = try parser.parse(a, toks);
     var j = joiner.Joiner.init(a, &d, posts);
-    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite);
+    const c = try compile(a, &j, ast, &rctx, Dialect.sqlite, &.{});
     try std.testing.expectEqualStrings("? = ?", c.where_sql);
     try std.testing.expectEqualStrings("GET", c.params[0].text);
     try std.testing.expectEqualStrings("GET", c.params[1].text);
+}
+
+test "filter_args: a `?` placeholder binds each scalar arg type, coerced to the field's type" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a); // title:text, price:fixed(2), active:bool
+
+    // string on a text field -> bound as text
+    {
+        var j = joiner.Joiner.init(a, &d, posts);
+        const c = try compileFilterArgs(a, "title = ?", &j, &.{.{ .string = "hello" }});
+        try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
+        try std.testing.expectEqual(@as(usize, 1), c.params.len);
+        try std.testing.expectEqualStrings("hello", c.params[0].text);
+    }
+    // int on a fixed(scale=2) column -> scaled int (5 -> 500), same as the literal path
+    {
+        var j = joiner.Joiner.init(a, &d, posts);
+        const c = try compileFilterArgs(a, "price = ?", &j, &.{.{ .int = 5 }});
+        try std.testing.expectEqual(@as(i64, 500), c.params[0].int);
+    }
+    // float on a fixed(scale=2) column -> scaled int (3.5 -> 350)
+    {
+        var j = joiner.Joiner.init(a, &d, posts);
+        const c = try compileFilterArgs(a, "price = ?", &j, &.{.{ .float = 3.5 }});
+        try std.testing.expectEqual(@as(i64, 350), c.params[0].int);
+    }
+    // bool on a bool field -> 0/1 int
+    {
+        var j = joiner.Joiner.init(a, &d, posts);
+        const c = try compileFilterArgs(a, "active = ?", &j, &.{.{ .bool = true }});
+        try std.testing.expectEqual(@as(i64, 1), c.params[0].int);
+        var j2 = joiner.Joiner.init(a, &d, posts);
+        const c2 = try compileFilterArgs(a, "active = ?", &j2, &.{.{ .bool = false }});
+        try std.testing.expectEqual(@as(i64, 0), c2.params[0].int);
+    }
+    // null -> SQL NULL param regardless of field type
+    {
+        var j = joiner.Joiner.init(a, &d, posts);
+        const c = try compileFilterArgs(a, "title = ?", &j, &.{.null});
+        try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
+        try std.testing.expect(c.params[0] == .null);
+    }
+}
+
+test "filter_args: a placeholder coerces by field type identically to an inline literal" {
+    // Regression for the silent-empty-result footgun: `price = ?` with a numeric arg must produce
+    // the SAME scaled-int param as the inline literal `price = 5.00`, not a raw unscaled value.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a); // price is fixed(scale=2)
+
+    var jl = joiner.Joiner.init(a, &d, posts);
+    const lit = try compileFilter(a, &d, posts, "price = 5.00", &jl);
+    try std.testing.expectEqual(@as(i64, 500), lit.params[0].int);
+
+    // float arg matches the inline literal
+    var jf = joiner.Joiner.init(a, &d, posts);
+    const cf = try compileFilterArgs(a, "price = ?", &jf, &.{.{ .float = 5.0 }});
+    try std.testing.expectEqual(lit.params[0].int, cf.params[0].int);
+
+    // int arg matches too
+    var ji = joiner.Joiner.init(a, &d, posts);
+    const ci = try compileFilterArgs(a, "price = ?", &ji, &.{.{ .int = 5 }});
+    try std.testing.expectEqual(lit.params[0].int, ci.params[0].int);
+}
+
+test "filter_args: an incompatible arg/field pairing is a loud BadValue" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    // A non-numeric arg for a numeric column errors (never silently binds garbage) — mirrors the
+    // literal path (`price = "x"` also errors). A number for a bool column likewise errors.
+    var j1 = joiner.Joiner.init(a, &d, posts);
+    try std.testing.expectError(error.BadValue, compileFilterArgs(a, "price = ?", &j1, &.{.{ .string = "5.00" }}));
+    var j2 = joiner.Joiner.init(a, &d, posts);
+    try std.testing.expectError(error.BadValue, compileFilterArgs(a, "active = ?", &j2, &.{.{ .int = 1 }}));
+}
+
+test "filter_args: a bound string with filter metacharacters stays literal (injection-safe)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    // The value is full of filter grammar: quotes, `||`, `(`, `--`, a stray `?`. NONE of it is
+    // re-lexed — the whole string is bound verbatim as the single param.
+    const dangerous = "a\" || 1=1 -- ) ? (";
+    const c = try compileFilterArgs(a, "title = ?", &j, &.{.{ .string = dangerous }});
+    try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
+    try std.testing.expectEqual(@as(usize, 1), c.params.len);
+    try std.testing.expectEqualStrings(dangerous, c.params[0].text);
+}
+
+test "filter_args: multiple placeholders bind left-to-right by index" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compileFilterArgs(a, "title = ? && price >= ?", &j, &.{
+        .{ .string = "first" },
+        .{ .int = 100 },
+    });
+    try std.testing.expectEqualStrings("(\"posts\".\"title\" = ? AND \"posts\".\"price\" >= ?)", c.where_sql);
+    try std.testing.expectEqual(@as(usize, 2), c.params.len);
+    try std.testing.expectEqualStrings("first", c.params[0].text);
+    // price is fixed(scale=2): the int arg 100 scales to 10000 (same as the literal `price >= 100`).
+    try std.testing.expectEqual(@as(i64, 10000), c.params[1].int);
+}
+
+test "filter_args: placeholders work inside an `in (...)` list" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compileFilterArgs(a, "title in (?, ?)", &j, &.{
+        .{ .string = "x" },
+        .{ .string = "y" },
+    });
+    try std.testing.expectEqualStrings("\"posts\".\"title\" IN (?,?)", c.where_sql);
+    try std.testing.expectEqualStrings("x", c.params[0].text);
+    try std.testing.expectEqualStrings("y", c.params[1].text);
+}
+
+test "filter_args: a bound string is usable as a LIKE term" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compileFilterArgs(a, "title ~ ?", &j, &.{.{ .string = "ab" }});
+    try std.testing.expectEqualStrings("\"posts\".\"title\" LIKE ?", c.where_sql);
+    try std.testing.expectEqualStrings("%ab%", c.params[0].text);
+}
+
+test "filter_args: a non-string arg in a LIKE term is a loud BadValue" {
+    // LIKE needs a text term; a placeholder there must be a string arg (non-string is rejected,
+    // never coerced into a `%…%` pattern).
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    try std.testing.expectError(error.BadValue, compileFilterArgs(a, "title ~ ?", &j, &.{.{ .int = 5 }}));
+}
+
+test "filter_args: arg-count mismatch is a loud BadFilter (both directions)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    // Two placeholders, one arg.
+    var j1 = joiner.Joiner.init(a, &d, posts);
+    try std.testing.expectError(error.BadFilter, compileFilterArgs(a, "title = ? && price = ?", &j1, &.{.{ .int = 1 }}));
+    // Zero placeholders, one arg.
+    var j2 = joiner.Joiner.init(a, &d, posts);
+    try std.testing.expectError(error.BadFilter, compileFilterArgs(a, "price = 1", &j2, &.{.{ .int = 1 }}));
+    // One placeholder, zero args.
+    var j3 = joiner.Joiner.init(a, &d, posts);
+    try std.testing.expectError(error.BadFilter, compileFilterArgs(a, "title = ?", &j3, &.{}));
+}
+
+test "filter_args: REST safety — a `?` in the filter with no filter_args fails closed" {
+    // The REST `?filter=` path supplies NO filter_args, so a filter string containing a `?`
+    // cannot smuggle an unbound placeholder — it hits the same count-mismatch guard.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    try std.testing.expectError(error.BadFilter, compileFilter(a, &d, posts, "title = ?", &j));
+}
+
+test "filter_args: back-compat — a filter with no `?` and no args compiles unchanged" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compileFilterArgs(a, "title = \"hi\"", &j, &.{});
+    try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
+    try std.testing.expectEqualStrings("hi", c.params[0].text);
+}
+
+test "inline `= null` binds SQL NULL, identical to a bound FilterArg.null" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+
+    // Inline literal `title = null` -> a bound `.null` param (SQL NULL), NOT the empty string.
+    var j = joiner.Joiner.init(a, &d, posts);
+    const c = try compileFilterArgs(a, "title = null", &j, &.{});
+    try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
+    try std.testing.expect(c.params[0] == .null);
+
+    // A null literal on a TYPED (numeric) column also binds SQL NULL — not a coercion BadValue.
+    var jn = joiner.Joiner.init(a, &d, posts);
+    const cn = try compileFilterArgs(a, "price = null", &jn, &.{});
+    try std.testing.expect(cn.params[0] == .null);
+
+    // The bound-placeholder path (`title = ?` + FilterArg.null) produces the identical param.
+    var jp = joiner.Joiner.init(a, &d, posts);
+    const cp = try compileFilterArgs(a, "title = ?", &jp, &.{.null});
+    try std.testing.expect(cp.params[0] == .null);
+}
+
+test "LIKE with a null operand is rejected (fail closed), never a match-everything %% term" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const posts = try setup(&d, a);
+    // Inline `title ~ null`: a null has no TEXT representation, so it must be a loud BadValue rather
+    // than binding `"%%"` (which would match every row).
+    var j1 = joiner.Joiner.init(a, &d, posts);
+    try std.testing.expectError(error.BadValue, compileFilterArgs(a, "title ~ null", &j1, &.{}));
+    // Bound `title ~ ?` + FilterArg.null is likewise rejected (a non-string placeholder in a LIKE).
+    var j2 = joiner.Joiner.init(a, &d, posts);
+    try std.testing.expectError(error.BadValue, compileFilterArgs(a, "title ~ ?", &j2, &.{.null}));
 }
