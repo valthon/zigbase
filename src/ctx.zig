@@ -715,6 +715,11 @@ fn isWellFormedSubject(v: []const u8) bool {
 pub const GetOptions = struct { expand: ?[]const u8 = null };
 pub const ListOptions = struct {
     filter: ?[]const u8 = null,
+    /// Bound values for `?` placeholders in `filter` (0-based, left-to-right). Each `?` binds its
+    /// value as a literal SQL parameter — never re-parsed as filter grammar — so this is the
+    /// injection-safe way to splice a runtime value into a filter. The number of `?` MUST equal
+    /// `filter_args.len` or `list` returns `error.BadFilter`.
+    filter_args: []const records_engine.FilterArg = &.{},
     sort: ?[]const u8 = null,
     page: u32 = 1,
     perPage: u32 = 30,
@@ -740,6 +745,7 @@ pub const Records = struct {
     pub fn list(self: Records, collection: []const u8, opts: ListOptions) !records_engine.ListResult {
         const q = records_engine.ListQuery{
             .filter = opts.filter,
+            .filter_args = opts.filter_args,
             .sort = opts.sort,
             .page = opts.page,
             .perPage = opts.perPage,

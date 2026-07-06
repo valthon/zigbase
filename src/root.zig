@@ -164,6 +164,10 @@ pub const Tx = @import("ctx.zig").Tx;
 pub const QueryParams = @import("query/params.zig").Params;
 /// Options for `ctx.subjectCookie(name, opts)` (read-or-mint opaque visitor id, #137).
 pub const SubjectCookieOpts = @import("ctx.zig").SubjectCookieOpts;
+/// A bound value for a `?` placeholder in a `ctx.records().list(...)` filter (`.filter_args`).
+/// Binds as a literal SQL parameter (never re-parsed as filter grammar) — the injection-safe way
+/// to splice a runtime value into a filter. See the `ctx.records()` section of docs/framework.md.
+pub const FilterArg = @import("records.zig").FilterArg;
 
 // ---- General outbound HTTP client -----------------------------------------
 // HttpMethod/HttpHeader use the Http-prefix to avoid collision with http.zig's

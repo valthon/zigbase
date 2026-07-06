@@ -1130,6 +1130,22 @@ test "list clamps pagination bounds" {
     }
 }
 
+test "list: filter_args with an empty/absent filter is a loud BadFilter (never silently ignored)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+
+    // filter == null but args supplied -> 0 placeholders vs 1 arg is a mismatch.
+    try std.testing.expectError(error.BadFilter, list(a, &d, col, .{ .filter_args = &.{.{ .string = "x" }} }));
+    // filter == "" (empty) but args supplied -> same mismatch.
+    try std.testing.expectError(error.BadFilter, list(a, &d, col, .{ .filter = "", .filter_args = &.{.{ .string = "x" }} }));
+    // Sanity: empty filter with NO args stays a clean full list (the guard only fires on args).
+    _ = try list(a, &d, col, .{ .filter = "" });
+}
+
 test "delete removes the row; 404 on missing" {
     var d = try db.Db.openMemory();
     defer d.close();
@@ -1163,10 +1179,20 @@ test "createInTxn inserts without opening its own transaction" {
     try std.testing.expect((try get(a, &conn, col, rec.object.get("id").?.string)) == null);
 }
 
+/// Re-export so `ListQuery`/`ListOptions` consumers can name the bound-arg type without reaching
+/// into `query/compiler.zig`.
+pub const FilterArg = compiler.FilterArg;
+
 pub const ListMode = enum { offset, cursor };
 
 pub const ListQuery = struct {
     filter: ?[]const u8 = null,
+    /// Bound values for `?` placeholders in `filter` (0-based, left-to-right). Each `?` binds its
+    /// value as a literal SQL parameter — NEVER re-parsed as filter grammar (the injection-safe way
+    /// to bind a runtime value). The placeholder count MUST equal `filter_args.len` or `list`
+    /// returns `error.BadFilter`. The REST path supplies none, so a `?` in a `?filter=` query fails
+    /// closed here. See `compiler.FilterArg`.
+    filter_args: []const compiler.FilterArg = &.{},
     sort: ?[]const u8 = null,
     page: u32 = 1,
     perPage: u32 = 30,
@@ -1849,10 +1875,17 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         vector_param = v.param;
     };
 
+    // The per-compile placeholder/arg count check lives inside `compiler.compile`, which only runs
+    // for a NON-empty filter below. Guard the empty/absent-filter case here so a caller who supplies
+    // `filter_args` but no (or an empty) filter gets the documented loud `error.BadFilter` instead of
+    // silently ignored args. Net invariant: placeholder_count MUST always equal filter_args.len — and
+    // an empty filter has zero placeholders, so any supplied args are a mismatch.
+    if ((q.filter == null or q.filter.?.len == 0) and q.filter_args.len > 0) return error.BadFilter;
+
     if (q.filter) |fstr| if (fstr.len > 0) {
         const toks = try lexer.lex(alloc, fstr);
         const ast = try parser.parse(alloc, toks);
-        const compiled = try compiler.compile(alloc, &j, ast, null, dialect);
+        const compiled = try compiler.compile(alloc, &j, ast, null, dialect, q.filter_args);
         // AND-compose onto any prior clause (the FTS `MATCH` / vector predicate set above) and
         // APPEND params — never assign, which would clobber the search predicate AND drop its bound
         // term, so `?search=X&filter=Y` would silently ignore the search. Mirrors the rule block.
@@ -1868,7 +1901,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     if (q.rule) |rstr| if (rstr.len > 0) {
         const rtoks = try lexer.lex(alloc, rstr);
         const rast = try parser.parse(alloc, rtoks);
-        const rc = try compiler.compile(alloc, &j, rast, q.rctx, dialect);
+        const rc = try compiler.compile(alloc, &j, rast, q.rctx, dialect, &.{});
         if (where_sql.len > 0) {
             where_sql = try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, rc.where_sql });
         } else {
@@ -2124,6 +2157,7 @@ pub fn bindParams(st: *db.Stmt, params: []const compiler.Param, start: c_int) !c
             .text => |t| try st.bindText(idx, t),
             .int => |n| try st.bindInt(idx, n),
             .double => |dv| try st.bindDouble(idx, dv),
+            .null => try st.bindNull(idx),
         }
         idx += 1;
     }

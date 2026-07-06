@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const TokKind = enum { ident, string, number, eq, ne, gt, ge, lt, le, like, nlike, in, l_and, l_or, lparen, rparen, comma, eof };
+pub const TokKind = enum { ident, string, number, placeholder, eq, ne, gt, ge, lt, le, like, nlike, in, l_and, l_or, lparen, rparen, comma, eof };
 pub const Token = struct { kind: TokKind, text: []const u8 };
 pub const LexError = error{ UnexpectedChar, UnterminatedString, InvalidEscape } || std.mem.Allocator.Error;
 
@@ -42,6 +42,12 @@ pub fn lex(alloc: std.mem.Allocator, input: []const u8) LexError![]Token {
             },
             ',' => {
                 try toks.append(alloc, .{ .kind = .comma, .text = "," });
+                i += 1;
+            },
+            '?' => {
+                // A `?` is a bound-value placeholder (`filter_args`); the parser assigns it a
+                // 0-based, left-to-right index and the compiler binds the caller-supplied value.
+                try toks.append(alloc, .{ .kind = .placeholder, .text = "?" });
                 i += 1;
             },
             '=' => {
@@ -302,6 +308,15 @@ test "lex the `in` operator, a list, and a list macro" {
     try std.testing.expectEqualStrings("internal", toks2[0].text);
     try std.testing.expectEqual(TokKind.ident, toks2[4].kind);
     try std.testing.expectEqualStrings("index", toks2[4].text);
+}
+
+test "lex a `?` bound-value placeholder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const toks = try lex(arena.allocator(), "name = ? && age >= ?");
+    const kinds = [_]TokKind{ .ident, .eq, .placeholder, .l_and, .ident, .ge, .placeholder, .eof };
+    try std.testing.expectEqual(kinds.len, toks.len);
+    for (kinds, 0..) |k, i| try std.testing.expectEqual(k, toks[i].kind);
 }
 
 test "lex an @request macro path" {
