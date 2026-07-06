@@ -288,14 +288,41 @@ pub const Ctx = struct {
     /// Run `f` inside an IMMEDIATE transaction on the writer connection.
     /// All Records writes inside `f` reuse the bound connection — no deadlock.
     /// Returns error.NestedTransaction when called from an already-bound Ctx.
+    ///
+    /// A plain function pointer has no closure, so a callback that needs request
+    /// data has nowhere to get it from — see `txWith` to thread data in directly
+    /// instead of smuggling it through a `threadlocal`.
     pub fn tx(self: *Ctx, comptime T: type, f: *const fn (t: *Tx) anyerror!T) !T {
+        const Adapter = struct {
+            fn call(t: *Tx, inner_f: *const fn (t: *Tx) anyerror!T) anyerror!T {
+                return inner_f(t);
+            }
+        };
+        return self.txWith(T, f, Adapter.call);
+    }
+
+    /// Same as `tx`, but threads a caller-supplied `payload` into the callback —
+    /// the closure-free escape hatch for a transaction that needs request data
+    /// without smuggling it through a `threadlocal` global. `payload` is typically
+    /// a pointer to a stack struct built in the handler; it only needs to stay
+    /// valid for the (synchronous) duration of this call.
+    ///
+    /// Same semantics as `tx`: IMMEDIATE transaction on the writer, commit on
+    /// success/rollback on error, `error.NestedTransaction` when the Ctx is
+    /// already bound, and the #230 post-commit feature-cache re-invalidation.
+    pub fn txWith(
+        self: *Ctx,
+        comptime T: type,
+        payload: anytype,
+        f: *const fn (t: *Tx, payload: @TypeOf(payload)) anyerror!T,
+    ) !T {
         if (self.bound_conn != null) return error.NestedTransaction;
         const conn = self.app.pool.acquireWriter();
         defer self.app.pool.releaseWriter();
         try conn.beginImmediate();
         var t = Tx{ .inner = .{ .app = self.app, .arena = self.arena, .rctx = self.rctx, .bound_conn = conn } };
         defer t.inner.deinit();
-        const result = f(&t) catch |e| {
+        const result = f(&t, payload) catch |e| {
             conn.rollback() catch {};
             return e;
         };
@@ -1980,6 +2007,63 @@ test "ctx.tx rolls back on error and rejects nesting" {
     try std.testing.expectEqual(@as(usize, 0), page.items.len); // rolled back
 
     try std.testing.expectError(error.NestedTransaction, ctx.tx(void, txnNested));
+}
+
+const TxWithPayload = struct { title: []const u8 };
+
+fn txnInsertFromPayload(t: *Tx, payload: *const TxWithPayload) anyerror!void {
+    const a = t.arena();
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "title", .{ .string = payload.title });
+    _ = try t.records().create("posts", .{ .object = o });
+}
+
+test "#237 ctx.txWith threads a payload into the callback; the write commits and is readable" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    const payload = TxWithPayload{ .title = "from-payload" };
+    try ctx.txWith(void, &payload, txnInsertFromPayload);
+
+    const page = try ctx.records().list("posts", .{});
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqualStrings("from-payload", page.items[0].object.get("title").?.string);
+}
+
+fn txnInsertFromPayloadThenFail(t: *Tx, payload: *const TxWithPayload) anyerror!void {
+    const a = t.arena();
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "title", .{ .string = payload.title });
+    _ = try t.records().create("posts", .{ .object = o });
+    return error.Boom;
+}
+
+test "#237 ctx.txWith rolls back on error; the payload-sourced write is not visible" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    const payload = TxWithPayload{ .title = "doomed" };
+    try std.testing.expectError(error.Boom, ctx.txWith(void, &payload, txnInsertFromPayloadThenFail));
+    const page = try ctx.records().list("posts", .{});
+    try std.testing.expectEqual(@as(usize, 0), page.items.len); // rolled back
+}
+
+fn txnWithNested(t: *Tx, payload: *const TxWithPayload) anyerror!void {
+    return t.inner.txWith(void, payload, txnInsertFromPayloadThenFail);
+}
+
+test "#237 ctx.txWith rejects nesting" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    defer ctx.deinit();
+
+    const payload = TxWithPayload{ .title = "x" };
+    try std.testing.expectError(error.NestedTransaction, ctx.txWith(void, &payload, txnWithNested));
 }
 
 // ---------------------------------------------------------------------------
