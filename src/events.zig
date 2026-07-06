@@ -514,8 +514,11 @@ pub const LifecycleEvent = struct {
 };
 /// Lifecycle handlers (onBootstrap/onBeforeServe/onBeforeTerminate) receive a
 /// `*Ctx` (built by the framework from `app`, anonymous rctx, no request) plus
-/// the event. DB access goes through `ctx.records()`.
-pub const LifecycleHandler = *const fn (ctx: *Ctx, ev: *LifecycleEvent) void;
+/// the event. DB access goes through `ctx.records()`. Returns an error union so a
+/// handler can `try` (e.g. `try ctx.setAppData(...)`, #245); an error from
+/// onBootstrap/onBeforeServe fails the boot (fail-fast), an onBeforeTerminate error
+/// is logged (it fires in a shutdown defer).
+pub const LifecycleHandler = *const fn (ctx: *Ctx, ev: *LifecycleEvent) anyerror!void;
 
 pub const JobEvent = struct {
     app: *App,
@@ -866,6 +869,11 @@ pub const Dispatch = struct {
     /// Consumer realtime subscribe guard (#143), from `.realtime = .{ .canSubscribe = fn }`.
     /// null = custom topics are PUBLIC signal channels (the historical `__features` default).
     realtime_can_subscribe: ?RealtimeCanSubscribeFn = null,
+    /// #245 app-scoped context: `@typeName(cfg.app_context)` when the App declared
+    /// `.app_context = T`, else null. Non-null activates the boot contract — `serveImpl`
+    /// fails fast if `onBootstrap` never called `ctx.setAppData` (app.app_context stays null).
+    /// Only used for the declared-but-unset diagnostic; the live handle lives on `App`.
+    app_context_type: ?[]const u8 = null,
 };
 
 /// Map a comptime RecordPhase to its hook-config field name.
