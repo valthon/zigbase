@@ -109,6 +109,25 @@ pub const Stmt = struct {
         return self.colBytes(idx) orelse "";
     }
 
+    /// Number of result columns. Postgres only knows the row description AFTER the query
+    /// has run, so this returns 0 until the first `step()` populates `self.result`; a
+    /// name-mapped decoder (`data.queryAs`) steps once before reading column metadata.
+    pub fn columnCount(self: *Stmt) c_int {
+        const res = self.result orelse return 0;
+        return @intCast(res.columns.len);
+    }
+
+    /// The result column's name (respecting any `AS` alias) at 0-based `idx`, or "" if out
+    /// of range / before the first `step()`. Backed by the RowDescription copied into
+    /// `result_arena`, so it stays valid until the statement is reset/finalized.
+    pub fn columnName(self: *Stmt, idx: c_int) []const u8 {
+        const res = self.result orelse return "";
+        if (idx < 0) return "";
+        const i: usize = @intCast(idx);
+        if (i >= res.columns.len) return "";
+        return res.columns[i].name;
+    }
+
     /// The PG type OID of column `idx`, or null if out of range / no row description.
     fn oidOf(self: *Stmt, idx: c_int) ?u32 {
         const res = self.result orelse return null;

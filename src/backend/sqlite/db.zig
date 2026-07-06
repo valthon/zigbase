@@ -159,6 +159,21 @@ pub const Stmt = struct {
         return ptr[0..len];
     }
 
+    /// Number of result columns in the prepared statement. Valid any time after
+    /// `prepare` (does not require a `step`); used by name-mapped decoders (`data.queryAs`).
+    pub fn columnCount(self: *Stmt) c_int {
+        return c.sqlite3_column_count(self.handle);
+    }
+
+    /// The result column's name (respecting any `AS` alias) at 0-based `idx`, or "" if out
+    /// of range. Valid any time after `prepare`. The returned slice borrows SQLite-owned
+    /// memory that stays valid until the statement is finalized (or re-prepared).
+    pub fn columnName(self: *Stmt, idx: c_int) []const u8 {
+        const ptr = c.sqlite3_column_name(self.handle, idx);
+        if (ptr == null) return "";
+        return std.mem.span(ptr);
+    }
+
     pub fn columnInt(self: *Stmt, idx: c_int) i64 {
         return c.sqlite3_column_int64(self.handle, idx);
     }
