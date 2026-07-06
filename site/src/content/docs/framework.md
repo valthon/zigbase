@@ -3645,9 +3645,24 @@ blog example uses `.cursor_token = .signed`; golfsim shows the explicit stateles
 
 When the framework catches an error, your `onError` handler (if any) runs **first**, then a
 built-in backstop reports the error to Sentry when `ZIGBASE_SENTRY_DSN` is set, otherwise
-logs it. `ErrorEvent` carries `app`, `ctx` (optional), `err`, `phase` (`request` /
-`before_hook` / `after_hook` / `cron` / `job` / `file_serve` / `webhook`), and `message`. The
-backstop never propagates.
+logs a structured line (`[phase] err_name: message`). `ErrorEvent` carries `app`, `ctx`
+(optional), `err`, `phase` (`request` / `before_hook` / `after_hook` / `cron` / `job` /
+`file_serve` / `webhook` / `app`), and `message`. The backstop never propagates.
+
+**Report your own errors: `ctx.reportError`.** Route a swallowed-but-notable error from your
+own code — a hook, job, cron, or handler — through the *same* backstop the framework uses for
+its own caught errors:
+
+```zig
+ctx.reportError(err, "sync of order {s} failed", .{order_id});
+```
+
+It runs your `onError` handler first, then the configured reporter (Sentry or the log
+backstop), carrying the same TTL dedup and non-blocking queued delivery. The report is tagged
+with the `app` phase so a reporter can tell an app-reported error from a framework-caught one.
+It is **best-effort and non-failing**: it returns `void`, never blocks, and swallows even its
+own message-formatting allocation failure (falling back to the error name), so it can never
+fail or abort the caller.
 
 **Delivery is non-blocking and best-effort.** The Sentry backstop does an HTTPS POST, so the
 framework never runs it inline on the thread that just swallowed the error (an HTTP worker, the
@@ -3669,6 +3684,12 @@ Dedup is **on by default with a 60-second window**. The window is a comptime kno
 no dedup map is ever allocated and the check compiles down to a single null-pointer branch. The
 suppression cache is in-process and bounded (best-effort — a different process instance dedups
 independently).
+
+Dedup gates **reporter delivery only** — your `onError` handler still fires on *every* error
+(it is cheap and in-process; the reporter, which ships over the network, is the flood risk). And
+because delivery rides the shared memory-queue worker pool, a sustained error storm — or a
+slow/hung reporter endpoint — drops reports (the ring is bounded) rather than delaying the
+request path: error reporting is a best-effort backstop, never a guarantee.
 
 ## 12. The worked example
 

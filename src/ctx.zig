@@ -35,6 +35,7 @@ const sms_send = @import("sms/send.zig");
 const webhook_mod = @import("webhook.zig");
 const push_send = @import("push/send.zig");
 const analytics = @import("analytics/analytics.zig");
+const report_reporter = @import("report/reporter.zig");
 
 pub const Ctx = struct {
     app: *App,
@@ -627,6 +628,37 @@ pub const Ctx = struct {
         };
         return ae.toResponse(self.arena) catch
             error_mod.ApiError.internal().toResponse(self.arena) catch unreachable;
+    }
+
+    // -----------------------------------------------------------------------
+    // Error reporting (#244). SELF-CONTAINED section so sibling PRs that also
+    // append to ctx.zig rebase cleanly.
+    //
+    // `reportError` routes a swallowed-but-notable error through the SAME backstop
+    // the framework uses for its own caught errors (`events.dispatchError`): the
+    // consumer `onError` handler runs first, then the pluggable reporter (Sentry or
+    // the log backstop), carrying the Stage-2 TTL dedup + non-blocking queued
+    // delivery. Tagged with the `.app` phase so a reporter can distinguish an
+    // app-reported error from a framework-caught one.
+    // -----------------------------------------------------------------------
+
+    /// Report a swallowed-but-notable error to the configured reporter (and `onError`),
+    /// tagged with the `.app` phase. Best-effort and NON-FAILING — it never blocks or
+    /// fails the caller (delivery is queued off-thread, per #244). Usable from a route
+    /// handler, hook, job, or cron via the same `*Ctx`. Its own allocation failure is
+    /// swallowed (the message falls back to `@errorName(err)`), so it can never throw.
+    pub fn reportError(self: *Ctx, err: anyerror, comptime fmt: []const u8, args: anytype) void {
+        const msg = std.fmt.allocPrint(self.arena, fmt, args) catch @errorName(err);
+        var ev = events.ErrorEvent{
+            .app = self.app,
+            // Attach the request identity only when there IS a request (route handler);
+            // a job/hook/cron context has no meaningful request context.
+            .ctx = if (self.request) |_| &self.rctx else null,
+            .err = err,
+            .phase = .app,
+            .message = msg,
+        };
+        events.dispatchError(self.app, self.app.dispatch, &ev);
     }
 
     // =======================================================================
@@ -2786,4 +2818,85 @@ test "#143 ctx.realtime(): signal + broadcast serialize and are safe no-ops when
     cx.realtime().signal("availability");
     // Serialization happens at the call site; the publish itself is a no-op (inactive reactor).
     try cx.realtime().broadcast("orders", .{ .kind = "order.shipped", .id = "r1" });
+}
+
+// ---------------------------------------------------------------------------
+// #244: ctx.reportError routes a consumer-swallowed error through the same
+// pluggable backstop the framework uses, tagged with the `.app` phase.
+// ---------------------------------------------------------------------------
+
+// Capturing reporter for the reportError tests: copies the delivered report's phase +
+// message into static buffers so they can be asserted after the (inline) job arena is freed.
+const ReportCapture = struct {
+    var phase_buf: [32]u8 = undefined;
+    var msg_buf: [256]u8 = undefined;
+    var phase: []const u8 = "";
+    var msg: []const u8 = "";
+    var count: usize = 0;
+
+    fn reset() void {
+        phase = "";
+        msg = "";
+        count = 0;
+    }
+    fn report(ptr: *anyopaque, io: std.Io, alloc: std.mem.Allocator, r: report_reporter.Report) anyerror!void {
+        _ = ptr;
+        _ = io;
+        _ = alloc;
+        // Bounded copy: truncate rather than panic/OOB if a future phase/message exceeds
+        // the fixed-size capture buffers (test helper only — not on any production path).
+        const phase_n = @min(r.phase.len, phase_buf.len);
+        @memcpy(phase_buf[0..phase_n], r.phase[0..phase_n]);
+        phase = phase_buf[0..phase_n];
+        const msg_n = @min(r.message.len, msg_buf.len);
+        @memcpy(msg_buf[0..msg_n], r.message[0..msg_n]);
+        msg = msg_buf[0..msg_n];
+        count += 1;
+    }
+    const vtable = report_reporter.Reporter.VTable{ .report = report };
+};
+
+test "#244 ctx.reportError routes through dispatchError to the reporter tagged .app" {
+    ReportCapture.reset();
+    var rep_ctx: u8 = 0;
+    var iface = report_reporter.Reporter{ .ptr = &rep_ctx, .vtable = &ReportCapture.vtable };
+
+    // No memory pool → dispatchError's enqueue runs the "report" job INLINE (deterministic).
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
+    app.reporter = &iface;
+    app.report_dedup = null;
+    app.memory_pool = null;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+    defer cx.deinit();
+
+    cx.reportError(error.WidgetExploded, "widget {d} failed: {s}", .{ 7, "overheat" });
+
+    try std.testing.expectEqual(@as(usize, 1), ReportCapture.count);
+    try std.testing.expectEqualStrings("app", ReportCapture.phase); // the .app phase tag is carried
+    try std.testing.expectEqualStrings("widget 7 failed: overheat", ReportCapture.msg);
+}
+
+test "#244 ctx.reportError never fails even on a pathological/failing arena (falls back to @errorName)" {
+    ReportCapture.reset();
+    var rep_ctx: u8 = 0;
+    var iface = report_reporter.Reporter{ .ptr = &rep_ctx, .vtable = &ReportCapture.vtable };
+
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
+    app.reporter = &iface;
+    app.report_dedup = null;
+    app.memory_pool = null;
+
+    // A failing arena makes the message allocPrint fail; reportError must swallow it and
+    // fall back to @errorName(err) rather than propagate — it returns void and cannot throw.
+    var cx = Ctx{ .app = &app, .arena = std.testing.failing_allocator, .rctx = .{}, .request = null, .bound_conn = null };
+    defer cx.deinit();
+
+    cx.reportError(error.Boom, "this needs {d} allocation(s)", .{42});
+
+    try std.testing.expectEqual(@as(usize, 1), ReportCapture.count);
+    try std.testing.expectEqualStrings("app", ReportCapture.phase);
+    try std.testing.expectEqualStrings("Boom", ReportCapture.msg); // fell back to @errorName
 }

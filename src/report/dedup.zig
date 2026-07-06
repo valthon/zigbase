@@ -92,7 +92,14 @@ pub const Dedup = struct {
             // Within the window → a duplicate. Do NOT slide `last`: a steady stream of the
             // same error still reports exactly once per window rather than being suppressed
             // forever.
-            if (now - last < self.window_s) return false;
+            //
+            // Guard `now < last` explicitly before subtracting: if the wall clock jumps
+            // BACKWARD (e.g. an NTP correction), `now - last` would be negative and always
+            // `< window_s`, silently suppressing the report until wall time catches back up.
+            // Dedup is fail-OPEN/best-effort — a clock going backward must never cause a
+            // drop, so treat it as a fresh sighting (report, and the code below refreshes
+            // the stored timestamp to `now`).
+            if (now >= last and now - last < self.window_s) return false;
         }
         // Bound growth: on overflow, coarsely clear. Cheaper than per-entry sweeping and
         // acceptable for a best-effort cache (worst case: a few dupes slip right after).
@@ -147,6 +154,24 @@ test "dedup: key distinguishes message vs phase boundary" {
     try testing.expect(Dedup.key("ab", "c") != Dedup.key("a", "bc"));
     // Identical inputs hash equal.
     try testing.expectEqual(Dedup.key("x", "request"), Dedup.key("x", "request"));
+}
+
+test "dedup: backward clock skew never suppresses (fail-open, no drop)" {
+    var dd = Dedup.init(testing.allocator, 60);
+    defer dd.deinit();
+
+    // Establish the key at t=100_000.
+    try testing.expect(dd.shouldReportAt(100_000, "boom", "request"));
+    // Normal in-window repeat is suppressed, as usual.
+    try testing.expect(!dd.shouldReportAt(100_010, "boom", "request"));
+
+    // Clock jumps far BACKWARD (e.g. an NTP correction) — `now < last`. Must NOT be
+    // suppressed: a naive `now - last < window_s` would underflow-negative and always
+    // read as "within window", dropping the report forever until wall time caught up.
+    try testing.expect(dd.shouldReportAt(1_000, "boom", "request"));
+    // The timestamp is refreshed to the new (earlier) `now`, so an immediate repeat at
+    // that same clock reading is suppressed again — dedup resumes normally post-skew.
+    try testing.expect(!dd.shouldReportAt(1_000, "boom", "request"));
 }
 
 test "dedup: overflow clears the map (bounded) without false-suppressing new keys" {

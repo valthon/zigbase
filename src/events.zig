@@ -107,7 +107,7 @@ pub const RecordEvent = struct {
     // connection — so a before-hook's side-write commits/rolls back atomically with it.
 };
 
-pub const ErrorPhase = enum { request, before_hook, after_hook, cron, job, file_serve, webhook };
+pub const ErrorPhase = enum { request, before_hook, after_hook, cron, job, file_serve, webhook, app };
 
 pub const ErrorEvent = struct {
     app: *App,
@@ -1161,7 +1161,8 @@ test "before hook error aborts (propagates) and unrelated collection is skipped"
 ///
 /// A booted app always has a reporter wired (SentryReporter when a DSN is set, else
 /// LogReporter); the null-reporter branch is the log fallback for un-booted test/CLI apps,
-/// preserving today's log-only behavior.
+/// emitting the same structured backstop line `[phase] err_name: message` (see
+/// `report_log.formatLine`).
 pub fn dispatchError(app: *App, dispatch: ?*const Dispatch, ev: *ErrorEvent) void {
     if (dispatch) |d| {
         if (d.on_error) |h| h(ev);

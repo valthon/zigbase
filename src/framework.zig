@@ -228,8 +228,8 @@ pub const DefaultMailerPlugin = struct {
 /// Default error-reporter plugin (#244), config-driven with no code change to switch backends
 /// (the DefaultMailerPlugin precedent):
 ///   1. `cfg.sentry_dsn` non-empty → `SentryReporter` (POSTs a Sentry envelope).
-///   2. else                       → `LogReporter` (logs the report; dev/CI + no-Sentry default,
-///      preserving the pre-plugin log-only backstop exactly).
+///   2. else                       → `LogReporter` (the dev/CI + no-Sentry default; logs a
+///      structured backstop line `[phase] err_name: message` — see `report_log.formatLine`).
 pub const DefaultReporterPlugin = struct {
     log_backend: report_log.LogReporter = .{},
     sentry_backend: ?report_sentry.SentryReporter = null,
@@ -259,7 +259,7 @@ test "DefaultReporterPlugin selects Sentry when a DSN is set, else LogReporter" 
 
     var p2 = try DefaultReporterPlugin.create(a, std.testing.io, .{});
     defer p2.deinit();
-    try std.testing.expect(p2.sentry_backend == null); // log-only, exactly as before
+    try std.testing.expect(p2.sentry_backend == null); // log-only (structured backstop line)
 }
 
 /// Default SMS provider plugin (#224), config-driven with no code change to switch backends
