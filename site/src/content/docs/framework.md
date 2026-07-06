@@ -1372,15 +1372,47 @@ Attempting to call `ctx.tx` from a callback that is already running inside a
 transaction returns `error.NestedTransaction` immediately (without beginning a
 new transaction).
 
-> **Do not perform long network calls (`ctx.http()`) inside a `tx` callback.**
-> The writer connection is held for the entire duration of the callback. Long
-> I/O stalls all other writes on the server — complete any external HTTP calls
-> before or after the `ctx.tx` block.
+> **Do not perform long network calls (`ctx.http()`) inside a `ctx.tx` /
+> `ctx.txWith` callback.** The writer connection is held for the entire duration
+> of the callback. Long I/O stalls all other writes on the server — complete any
+> external HTTP calls before or after the transaction block.
 
 > **In a `before*` hook**, `ctx.records()` is bound to the hook's in-transaction
 > connection and never acquires from the pool, so side-writes commit atomically with the
 > triggering write. In route and job handlers `ctx.records()` lazily checks out a pooled
 > connection that the framework releases on ctx teardown.
+
+#### `ctx.txWith()` — threading request data into a transaction (#237)
+
+`ctx.tx`'s callback is a bare `*const fn(*Tx) anyerror!T` — Zig has no closures, so a
+callback that needs data computed in the handler (an id, a validated input struct, a
+priced total) has nowhere to get it from. Reaching for a `threadlocal` to smuggle it in
+works but is a footgun: a stale value from a previous request, a name collision between
+two routes, and an easy-to-forget set/`defer`-clear ritual around every call site.
+
+`ctx.txWith` is the same transaction scope with one addition: a caller-supplied
+`payload` threaded straight into the callback as its second argument — no globals:
+
+```zig
+const ConvertParams = struct { hold_id: []const u8, booking: std.json.Value };
+
+fn convertHoldTxn(t: *zigbase.Tx, p: *const ConvertParams) anyerror!std.json.Value {
+    const created = try t.records().create("bookings", p.booking);
+    if (!try t.records().delete("holds", p.hold_id)) return error.HoldVanished;
+    return created;
+}
+
+// in the route handler:
+const params = ConvertParams{ .hold_id = id, .booking = booking_value };
+return try ctx.txWith(std.json.Value, &params, convertHoldTxn);
+```
+
+`payload` is typically a pointer to a stack struct built right before the call — it
+only needs to stay valid for the (synchronous) duration of `txWith`. Everything else
+matches `ctx.tx`: an IMMEDIATE transaction on the writer, commit on success, automatic
+rollback on any callback error, and `error.NestedTransaction` if the Ctx is already
+bound. Reach for `ctx.tx` when the callback needs no external data; reach for
+`ctx.txWith` the moment it does.
 
 ### `ctx.kv()` — built-in key/value settings store
 

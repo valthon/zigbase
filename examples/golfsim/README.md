@@ -244,25 +244,25 @@ fn revokeDevice(req: *zigbase.Req(void)) zigbase.RouteError!RevokeOut {
 
 ---
 
-### 8. Atomic multi-write — `ctx.tx()` (hold → booking convert)
+### 8. Atomic multi-write — `ctx.txWith()` (hold → booking convert)
 
 `POST /api/holds/:id/convert` promotes a guest's soft `hold` into a real `booking`. The
 booking INSERT and the hold DELETE **must commit or roll back together** — never a
 booking with a live hold (double reservation), never a deleted hold with no booking
-(lost slot). That is exactly what `ctx.tx()` is for:
+(lost slot). That is exactly what `ctx.txWith()` is for:
 
 ```zig
-// ctx.tx takes a bare `*const fn(*Tx)` that cannot capture, so dynamic inputs travel
-// through a thread-local (safe: one request per worker thread at a time).
-fn convertHoldTxn(t: *zigbase.Tx) anyerror!std.json.Value {
-    const p = convert_params orelse return error.MissingTxnParams;
+// ctx.tx takes a bare `*const fn(*Tx)` that cannot capture; ctx.txWith (#237) threads a
+// caller-supplied payload straight into the callback instead — no thread-local needed.
+fn convertHoldTxn(t: *zigbase.Tx, p: *const ConvertParams) anyerror!std.json.Value {
     const created = try t.records().create("bookings", p.booking);
     if (!try t.records().delete("holds", p.hold_id)) return error.HoldVanished; // rolls back the booking
     return created;
 }
 
 // in the route handler, after validating + pricing the booking:
-return req.ctx.tx(std.json.Value, convertHoldTxn) catch return error.RouteFailed;
+const params = ConvertParams{ .hold_id = id, .booking = .{ .object = b } };
+return req.ctx.txWith(std.json.Value, &params, convertHoldTxn) catch return error.RouteFailed;
 ```
 
 > Note: record `beforeCreate` hooks (like `prepareBooking`) do **not** fire on the

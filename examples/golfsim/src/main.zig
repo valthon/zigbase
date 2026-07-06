@@ -319,21 +319,19 @@ fn listingAvailability(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Valu
 //    reservation), never a deleted hold with no booking (a lost slot). If either write
 //    fails the whole transaction rolls back.
 //
-//    `ctx.tx` takes a bare `*const fn(*Tx)` callback that cannot capture, so the dynamic
-//    inputs (the hold id + the prepared booking object) travel to the callback through a
-//    thread-local. That is safe here because each facil.io worker thread handles one
-//    request at a time, and we set/read/clear it within this single call.
+//    `ctx.tx` takes a bare `*const fn(*Tx)` callback that cannot capture, so a plain `ctx.tx`
+//    callback has no way to see the dynamic inputs (the hold id + the prepared booking
+//    object). `ctx.txWith` (#237) threads them in directly as a payload — no thread-local
+//    smuggling needed.
 // ---------------------------------------------------------------------------
 const ConvertIn = struct { starts_at: []const u8, ends_at: []const u8 };
 
-/// Inputs handed to `convertHoldTxn` (see the thread-local note above).
+/// Inputs handed to `convertHoldTxn` via `ctx.txWith`'s payload parameter.
 const ConvertParams = struct { hold_id: []const u8, booking: std.json.Value };
-threadlocal var convert_params: ?*const ConvertParams = null;
 
-/// The atomic unit run by `ctx.tx`: create the booking AND delete the hold on ONE
+/// The atomic unit run by `ctx.txWith`: create the booking AND delete the hold on ONE
 /// in-transaction connection. Returning any error rolls BOTH writes back.
-fn convertHoldTxn(t: *zigbase.Tx) anyerror!std.json.Value {
-    const p = convert_params orelse return error.MissingTxnParams;
+fn convertHoldTxn(t: *zigbase.Tx, p: *const ConvertParams) anyerror!std.json.Value {
     const created = try t.records().create("bookings", p.booking);
     // A hold that vanished mid-flight (e.g. TTL-reaped) means we must NOT keep the booking
     // we just inserted — returning an error rolls it back.
@@ -380,11 +378,9 @@ fn convertHold(req: *zigbase.Req(ConvertIn)) zigbase.RouteError!std.json.Value {
     b.put(a, "status", .{ .string = "pending" }) catch return error.RouteFailed;
 
     const params = ConvertParams{ .hold_id = id, .booking = .{ .object = b } };
-    convert_params = &params;
-    defer convert_params = null;
 
     // Atomic booking-create + hold-delete. NestedTransaction can't happen here (route ctx).
-    return req.ctx.tx(std.json.Value, convertHoldTxn) catch return error.RouteFailed;
+    return req.ctx.txWith(std.json.Value, &params, convertHoldTxn) catch return error.RouteFailed;
 }
 
 // ---------------------------------------------------------------------------
