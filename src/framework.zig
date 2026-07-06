@@ -25,6 +25,7 @@ const report_send = @import("report/send.zig");
 const provision = @import("provision.zig");
 const oauth_client = @import("oauth/client.zig");
 const migrator = @import("migrator.zig");
+const schema_dump = @import("schema_dump.zig");
 const schema = @import("schema.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
@@ -1796,6 +1797,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .apply => try migrateImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .status => try migrateStatusImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .rollback => try migrateRollbackImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
+            .dump => try migrateDumpImpl(allocator, init.io, init.environ_map, ma),
         },
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
@@ -1857,7 +1859,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\
         \\COMMANDS:
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
-        \\  migrate             Apply database migrations, then exit. `migrate status` reports; `migrate rollback [N]` reverses.
+        \\  migrate             Apply database migrations, then exit. `status` reports; `rollback [N]` reverses; `dump` dumps the live schema.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
         \\  superuser create    Create an admin (superuser) account.
@@ -2064,9 +2066,11 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\  zigbase migrate [--data-dir PATH]           Apply pending migrations (default).
         \\  zigbase migrate status [--data-dir PATH]    Report applied/pending migrations; apply nothing.
         \\  zigbase migrate rollback [N] [--data-dir P]  Reverse the N most-recent migrations (default 1).
+        \\  zigbase migrate dump [--out FILE]           Dump the live DB structure as SQL (stdout by default).
         \\
         \\FLAGS:
         \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\  --out FILE       (dump only) Write the SQL to FILE instead of stdout; parent dirs are created.
         \\
         \\WHAT IT DOES:
         \\  `migrate` applies pending SYSTEM migrations and then the app's comptime `.migrations`
@@ -2080,6 +2084,12 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\  changes nothing it cannot undo: a migration with only an `up`, or one whose `change`
         \\  reverses into an irreversible op (records()/raw/a `.was`-less drop), or an ORPHANED
         \\  ledger row, is refused and named.
+        \\  `migrate dump` introspects the LIVE database and writes a canonical, dialect-native
+        \\  `structure.sql` (SQLite reads the exact stored DDL; Postgres reconstructs it from the
+        \\  system catalogs — NO external pg_dump). The output is deterministic (no timestamps), so
+        \\  it diffs cleanly, and it re-runs to recreate the schema for a fast test DB. It is a
+        \\  snapshot for inspection/diffing/test-setup — NOT a schema source (that is `.collections`),
+        \\  and it is never loaded at boot.
         \\
         \\Note: `zigbase serve` also runs migrations on startup; use `migrate` to apply
         \\them ahead of time (e.g. in a deploy step) without starting the server.
@@ -2089,6 +2099,8 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\  zigbase migrate status --data-dir ./zb_data
         \\  zigbase migrate rollback --data-dir ./zb_data
         \\  zigbase migrate rollback 3 --data-dir ./zb_data
+        \\  zigbase migrate dump --data-dir ./zb_data
+        \\  zigbase migrate dump --out db/structure.sql --data-dir ./zb_data
         \\
     , .{});
 }
@@ -2274,6 +2286,33 @@ fn migrateStatusImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const s
         for (status.orphaned) |o| emit(io, out, "  {s}  applied (at {s})\n", .{ o.name, o.applied_at });
     }
     emit(io, out, "\n{d} applied, {d} pending, {d} orphaned\n", .{ status.applied_count, status.pending_count, status.orphaned.len });
+}
+
+/// `zigbase migrate dump [--out <file>]`: introspect the LIVE database and write a canonical,
+/// dialect-native `structure.sql` — for inspection, review-diffing, and fast test-DB setup. It is
+/// NOT a schema source and is never loaded at boot (that is `.collections`). Output goes to stdout by
+/// default; `--out <path>` creates/overwrites a file (parent dirs are created). Mirrors
+/// `migrateStatusImpl`'s read-only pool-open; it does not need the ledger table to exist.
+fn migrateDumpImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, ma: cli.MigrateArgs) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = ma.data_dir });
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
+    defer pool.deinit();
+    const w = pool.acquireWriter();
+    defer pool.releaseWriter();
+
+    const sql = try schema_dump.schemaDump(allocator, w, db.dbDialect(w));
+    defer allocator.free(sql);
+
+    if (ma.out) |path| {
+        if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = sql });
+        std.log.info("schema dumped to {s} ({d} bytes)", .{ path, sql.len });
+    } else {
+        var buf: [4096]u8 = undefined;
+        var wr = std.Io.File.stdout().writer(io, &buf);
+        try wr.interface.writeAll(sql);
+        try wr.interface.flush();
+    }
 }
 
 /// `zigbase migrate rollback [N]`: reverse the N most-recently-applied consumer migrations (newest

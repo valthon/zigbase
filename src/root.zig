@@ -267,6 +267,7 @@ test {
     _ = @import("ddl.zig");
     _ = @import("migrations.zig");
     _ = @import("migrator.zig");
+    _ = @import("schema_dump.zig");
     _ = @import("rules.zig");
     _ = @import("policy.zig");
     _ = @import("tenancy/roles.zig");

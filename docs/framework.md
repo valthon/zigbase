@@ -3430,7 +3430,7 @@ half-done. Some statements can't run inside a transaction (e.g. SQLite `VACUUM`,
 **without** a wrapping transaction (it owns its own atomicity; it is recorded only after it
 succeeds).
 
-#### The `migrate` CLI (apply + status + rollback)
+#### The `migrate` CLI (apply + status + rollback + dump)
 
 `zigbase migrate` applies pending SYSTEM migrations, then the app's comptime `.migrations`, and
 exits — so a deploy step can migrate ahead of starting the server. It does **not** provision the
@@ -3495,7 +3495,36 @@ Rollback **fails loudly and changes nothing it cannot undo**:
 `N` larger than the number of applied consumer migrations rolls back **all** of them
 (`min(N, applied)`).
 
-> A **schema dump** is still coming in follow-up work.
+`zigbase migrate dump [--out <file>]` introspects the **live database** and writes a canonical,
+dialect-native `structure.sql`. Output goes to **stdout** by default; `--out <path>` writes it to a
+file (parent directories are created):
+
+```sh
+# Print the live schema to stdout.
+zigbase migrate dump --data-dir ./zb_data
+# Or write it to a file for review / test-DB setup.
+zigbase migrate dump --out db/structure.sql --data-dir ./zb_data
+```
+
+It dumps the **true live structure** of both the system tables and any collection/migration-created
+tables — on **SQLite** it emits the exact stored DDL from `sqlite_master`; on **Postgres** it
+reconstructs the DDL from the system catalogs (`information_schema`, `pg_get_constraintdef`,
+`pg_indexes`) — **no external `pg_dump` binary is ever invoked**. Tables come first, then
+constraints (as `ALTER TABLE … ADD CONSTRAINT`, so foreign-key ordering never breaks), then indexes;
+finally the applied-migration ledger is emitted as a single `INSERT INTO "_migrations" …` so a
+restored dump lands at the same migration state. The output is **deterministic** — deterministic
+ordering and no dump-time timestamps or other volatile data — so it diffs cleanly across runs and in
+review, and it **re-runs** to recreate the schema (handy for a fast test database).
+
+The dump is a **snapshot for inspection, review-diffing, and test-DB setup — it is NOT a schema
+source** (that is your comptime `.collections`) and it is **never loaded at boot**. Treat it as
+generated output, not authoritative configuration.
+
+> **Replay scope.** The dump reconstructs tables, constraints, and indexes for ZigBase-shaped
+> schemas (text ids, IDENTITY keys); it does **not** emit `CREATE SEQUENCE`/`CREATE TYPE`/`CREATE
+> EXTENSION` (Postgres) or views/triggers/FTS virtual tables (SQLite). ZigBase's own schema replays
+> cleanly, but a hand-rolled schema using `serial`/`enum`/extension columns or those SQLite objects
+> may not re-run into a bare database.
 
 #### Cross-backend migrations (SQLite **and** Postgres)
 
