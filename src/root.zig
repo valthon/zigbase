@@ -186,6 +186,13 @@ pub const HttpPostOptions = @import("http_client.zig").PostOptions;
 // of any release build (`testcapture.enabled == false`), so production is unaffected.
 pub const testcapture = @import("testcapture.zig");
 
+// ---- In-process test harness (#239) ---------------------------------------
+// Boot an `App(.{...})` against a tempdir data dir and inject requests through the REAL
+// pipeline (router + rules + auth + hooks + custom routes) with NO socket. Auth helpers
+// (`mintSession` direct-JWT, `loginSuperuser`/`loginPassword` real-endpoint), record/superuser
+// seeding, and a swappable `CaptureMailer`. See `docs/framework.md` — "Testing your app".
+pub const testing = @import("testing.zig");
+
 // ---- Auth helper surface (consumer-facing magic-link building blocks) ------
 pub const auth = @import("auth_helpers.zig");
 
@@ -392,6 +399,7 @@ test {
     _ = @import("session.zig");
     _ = @import("http_client.zig");
     _ = @import("testcapture.zig");
+    _ = @import("testing.zig");
     _ = @import("captcha.zig");
     _ = @import("webhook.zig");
     // Opt-in pure-Zig PostgreSQL backend (#159). The `build_options.postgres` condition is

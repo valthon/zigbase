@@ -993,7 +993,11 @@ test "dispatchCustom merges ctx.setCookie/addHeader on success AND error paths (
 /// gets the same clear error instead of falling through to the JSON parser's
 /// misleading "Invalid JSON body.". OutOfMemory propagates; it must never
 /// masquerade as a client error.
-fn applyMultipart(ctx: *http.RequestCtx) error{OutOfMemory}!?http.Response {
+///
+/// `pub` so the `zigbase.testing` harness (#239) runs the SAME multipart pre-parse the
+/// socket `onRequest` does before `route()`, giving off-socket file-upload requests the
+/// real `ctx.form_fields`/`ctx.files` (and the identical malformed-body 400).
+pub fn applyMultipart(ctx: *http.RequestCtx) error{OutOfMemory}!?http.Response {
     if (!std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) return null;
     // Hand-rolled parser over the raw body: facil.io's param parsing type-guesses
     // multipart values (text "123" -> int), so it must never see this body.

@@ -1417,8 +1417,9 @@ pub fn App(comptime cfg: anytype) type {
 
         /// Bundle of comptime-resolved knobs threaded into the serve path: the
         /// selected storage/mailer plugin TYPES, the auth method type list,
-        /// and the reader-pool cap.
-        const Opts = ServeOpts{
+        /// and the reader-pool cap. Public so the `zigbase.testing` in-process
+        /// harness (#239) can name the booted-holder type (`Booted`) it owns.
+        pub const Opts = ServeOpts{
             .StoragePlugin = StoragePlugin,
             .MailerPlugin = MailerPlugin,
             .SmsProviderPlugin = SmsProviderPlugin,
@@ -1460,6 +1461,38 @@ pub fn App(comptime cfg: anytype) type {
         /// Start the HTTP server directly with an explicit config (no CLI parsing).
         pub fn run(init: std.process.Init, cfg_runtime: config.Config) !void {
             return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts, init.environ_map);
+        }
+
+        // ---- In-process test harness seams (#239 stage 3) ----------------------------
+        // These expose the socketless boot + route seams for `zigbase.testing`. They are
+        // `pub` (part of the App's public surface) but analyzed only when referenced, so a
+        // production consumer that never touches `zigbase.testing` pays nothing for them.
+
+        /// The heap-allocated holder type returned by `bootForTest`, parameterized by THIS
+        /// app's comptime `Opts` (storage/mailer/sms plugin types + auth-method registry).
+        /// `zigbase.testing.Harness` owns a `*Booted` and calls `Booted.deinit()` on teardown.
+        pub const Booted = BootedApp(Opts);
+
+        /// Boot the full application against `cfg` WITHOUT binding a socket — runs migrations,
+        /// comptime provisioning, and fires `onBootstrap` — returning an owned `*Booted`. The
+        /// caller (the `zigbase.testing` harness) must eventually call `holder.deinit()`.
+        /// `onBeforeServe` / `onBeforeTerminate` and the scheduler/memory-pool are NOT started;
+        /// those belong to the "serve" half. Deterministic-clock/entropy overrides are taken
+        /// from `cfg.fake_now_unix` / `cfg.fake_seed`.
+        pub fn bootForTest(
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            cfg_runtime: config.Config,
+            environ: *const std.process.Environ.Map,
+        ) !*Booted {
+            return bootApp(allocator, io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts, environ);
+        }
+
+        /// Run the COMPLETE socketless routing/fallback chain (Stage 2's `Server(gates).route`)
+        /// for a request context whose `ctx.app` points at a `bootForTest` App. Bound to THIS
+        /// app's comptime `route_gates`, so admin/optional route groups match the real binary.
+        pub fn routeForTest(ctx: *@import("http.zig").RequestCtx) anyerror!@import("http.zig").Response {
+            return server.Server(route_gates).route(ctx);
         }
     };
 }
