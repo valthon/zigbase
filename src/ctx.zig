@@ -3,7 +3,8 @@ const App = @import("app.zig").App;
 const db = @import("db.zig");
 const request = @import("request.zig");
 const events = @import("events.zig");
-const Data = @import("data.zig").Data;
+const data_mod = @import("data.zig");
+const Data = data_mod.Data;
 const records_engine = @import("records.zig");
 const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
@@ -878,6 +879,18 @@ pub const Records = struct {
     /// Fetch a record by id parsed into `T`, or `null` if the collection/record is missing.
     pub fn getAs(self: Records, comptime T: type, collection: []const u8, id: []const u8) !?T {
         return (try self.dataRead()).getAs(T, collection, id);
+    }
+
+    /// Run raw `sql` (with positionally-bound `args`) and decode each result row into a struct
+    /// `T`, mapping fields to result columns BY NAME (#240). The escape hatch for complex reads
+    /// (joins/aggregates/window scans) that outgrow the collection query API, without the
+    /// positional-`columnText(n)` fragility. Uses a pooled reader + the invocation arena, so
+    /// the returned `[]T` (and its string fields) live for the request/job. Bound to the ctx's
+    /// active connection inside a `ctx.tx` / before-hook write. See `data.queryAs` for the full
+    /// type-mapping and NULL contract.
+    pub fn queryAs(self: Records, comptime T: type, sql: [:0]const u8, args: anytype) ![]T {
+        const conn = if (self.ctx.bound_conn) |c| c else try self.ctx.connForRead();
+        return data_mod.queryAs(T, conn, self.ctx.arena, sql, args);
     }
 
     /// Patch a record with an anon-struct literal of the changed fields and return it as `T`

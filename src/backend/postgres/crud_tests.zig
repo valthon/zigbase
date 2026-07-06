@@ -18,6 +18,7 @@ const pg = @import("postgres.zig");
 const root = @import("../../root.zig");
 const dbm = @import("../../db.zig");
 const records = @import("../../records.zig");
+const data_mod = @import("../../data.zig");
 const collections = @import("../../collections.zig");
 const migrations = @import("../../migrations.zig");
 const schema = @import("../../schema.zig");
@@ -372,6 +373,47 @@ test "pg: boolean round-trip + filter on a bool column" {
     const res = try records.list(al, &d, col, .{ .filter = "on = true", .sort = "label", .perPage = 50 });
     try std.testing.expectEqual(@as(usize, 2), res.items.len);
     try std.testing.expectEqual(true, res.items[0].object.get("on").?.bool);
+}
+
+test "pg: data.queryAs name-maps result columns + binds args on the Postgres column-name path" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var d = (try openOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer d.close();
+    const sname = try enterTempSchema(al, &d);
+    defer dropTempSchema(al, &d, sname);
+
+    // Raw table (queryAs is backend-neutral raw SQL). `?N` placeholders are renumbered to
+    // `$N` by the same chokepoint the rest of the stack uses. Postgres exposes result-column
+    // names via the RowDescription (only after the first step, which queryAs forces).
+    try d.exec("CREATE TABLE orders (id BIGINT PRIMARY KEY, total DOUBLE PRECISION, note TEXT);");
+    try d.exec("INSERT INTO orders (id, total, note) VALUES (1, 10.5, 'a'), (2, 99.0, NULL);");
+
+    // Field order differs from the SELECT; `label` maps to an AS alias; `note` is optional.
+    const Row = struct { note: ?[]const u8, id: i64, label: []const u8, total: f64 };
+    const rows = try data_mod.queryAs(Row, &d, al, "SELECT id, total, note, CAST('lbl' AS TEXT) AS label FROM orders WHERE total > ?1 ORDER BY id;", .{@as(f64, 6.0)});
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].id);
+    try std.testing.expectEqual(@as(f64, 10.5), rows[0].total);
+    try std.testing.expectEqualStrings("lbl", rows[0].label);
+    try std.testing.expectEqualStrings("a", rows[0].note.?);
+    try std.testing.expect(rows[1].note == null); // SQL NULL → null in an optional field
+
+    // Postgres only knows the result-column names AFTER the first step()— so exercise both
+    // zero-row hazards on the PG path specifically. (1) A zero-row query whose struct fields
+    // all match returns an empty slice (no phantom row). (2) A zero-row query into a struct
+    // with a NON-optional field that has NO matching column still trips the missing-column
+    // error, because the RowDescription arrives even for an empty result.
+    const AllMatch = struct { id: i64, total: f64 };
+    const none = try data_mod.queryAs(AllMatch, &d, al, "SELECT id, total FROM orders WHERE id = ?1;", .{@as(i64, -999)});
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+
+    const Missing = struct { id: i64, absent: []const u8 };
+    try std.testing.expectError(error.ColumnNotFound, data_mod.queryAs(Missing, &d, al, "SELECT id, total FROM orders WHERE id = ?1;", .{@as(i64, -999)}));
 }
 
 test "pg: empty-set IN () is the constant-false predicate → 0 rows (fail closed)" {
