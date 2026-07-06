@@ -14,11 +14,13 @@ pub const ServeArgs = struct {
     realtime_outbound_hwm: ?u32 = null, // --realtime-outbound-hwm N => slow-consumer disconnect bound in frames (0 disables); issue #203
 };
 
-/// `migrate` runs one of three actions: `apply` (the default — apply pending system + consumer
+/// `migrate` runs one of four actions: `apply` (the default — apply pending system + consumer
 /// migrations), `status` (`migrate status` — read the ledger and report applied/pending/orphaned
-/// consumer migrations without changing anything), or `rollback` (`migrate rollback [N]` — reverse
-/// the N most-recently-applied consumer migrations, newest first; N defaults to 1).
-pub const MigrateAction = enum { apply, status, rollback };
+/// consumer migrations without changing anything), `rollback` (`migrate rollback [N]` — reverse
+/// the N most-recently-applied consumer migrations, newest first; N defaults to 1), or `dump`
+/// (`migrate dump [--out <file>]` — introspect the LIVE database and write a canonical, dialect-native
+/// `structure.sql` for inspection/diffing/test-setup; NOT a schema source, never loaded at boot).
+pub const MigrateAction = enum { apply, status, rollback, dump };
 
 pub const MigrateArgs = struct {
     data_dir: ?[]const u8 = null,
@@ -26,6 +28,8 @@ pub const MigrateArgs = struct {
     /// Number of consumer migrations to reverse for `.rollback` (positional; default 1). Ignored by
     /// the other actions.
     rollback_count: usize = 1,
+    /// Output path for `.dump` (`--out <path>`). `null` = write to stdout. Ignored by the other actions.
+    out: ?[]const u8 = null,
 };
 
 pub const SuperuserArgs = struct {
@@ -145,6 +149,9 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                     ma.rollback_count = std.fmt.parseInt(usize, args[i], 10) catch return ParseError.BadValue;
                     i += 1;
                 }
+            } else if (std.mem.eql(u8, args[i], "dump")) {
+                ma.action = .dump;
+                i += 1;
             } else return ParseError.UnknownCommand;
         }
         while (i < args.len) : (i += 1) {
@@ -155,6 +162,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 ma.data_dir = args[i];
+            } else if (ma.action == .dump and std.mem.eql(u8, a, "--out")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ma.out = args[i];
             } else return ParseError.UnknownFlag;
         }
         return .{ .migrate = ma };
@@ -370,6 +381,37 @@ test "migrate rollback rejects a non-integer or negative count" {
     // Non-integer → BadValue; negative (leading `-`) is treated as a flag → UnknownFlag. Both reject.
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "migrate", "rollback", "abc" }, .{}));
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "rollback", "-3" }, .{}));
+}
+
+test "migrate dump parses to the dump action (default out = stdout/null)" {
+    const bare = try parse(&.{ "migrate", "dump" }, .{});
+    try std.testing.expectEqual(MigrateAction.dump, bare.migrate.action);
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.migrate.out);
+    const with_dir = try parse(&.{ "migrate", "dump", "--data-dir", "/tmp/zb" }, .{});
+    try std.testing.expectEqual(MigrateAction.dump, with_dir.migrate.action);
+    try std.testing.expectEqualStrings("/tmp/zb", with_dir.migrate.data_dir.?);
+}
+
+test "migrate dump --out parses the output path" {
+    const cmd = try parse(&.{ "migrate", "dump", "--out", "db/structure.sql" }, .{});
+    try std.testing.expectEqual(MigrateAction.dump, cmd.migrate.action);
+    try std.testing.expectEqualStrings("db/structure.sql", cmd.migrate.out.?);
+    // --out combines with --data-dir.
+    const both = try parse(&.{ "migrate", "dump", "--out", "s.sql", "--data-dir", "/tmp/zb" }, .{});
+    try std.testing.expectEqualStrings("s.sql", both.migrate.out.?);
+    try std.testing.expectEqualStrings("/tmp/zb", both.migrate.data_dir.?);
+}
+
+test "migrate dump rejects unknown flags and a missing --out value" {
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "dump", "--nope" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "migrate", "dump", "--out" }, .{}));
+    // --out is only valid for `dump`, not for `status`/`apply`.
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "status", "--out", "x" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "--out", "x" }, .{}));
+}
+
+test "migrate dump --help routes to the migrate help topic" {
+    try std.testing.expectEqual(HelpTopic.migrate, (try parse(&.{ "migrate", "dump", "--help" }, .{})).help);
 }
 
 test "migrate rollback --help routes to the migrate help topic" {

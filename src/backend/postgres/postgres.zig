@@ -92,4 +92,7 @@ test {
     _ = @import("vector_pg_test.zig");
     // SP3-A: live TLS-verification coverage. Skips without ZIGBASE_PG_TLS_CA / ZIGBASE_PG_PLAINTEXT.
     _ = @import("tls_pg_test.zig");
+    // Migrations Piece C: live `migrate dump` catalog reconstruction (CREATE TABLE / ADD CONSTRAINT
+    // / CREATE INDEX, deterministic, no pg_dump). Skips if no PG.
+    _ = @import("schema_dump_pg_test.zig");
 }
