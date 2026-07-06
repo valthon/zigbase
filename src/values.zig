@@ -327,7 +327,7 @@ test "bindValue on the raw GPA path: numeric-as-number writes free their allocPr
     // roundTrip's other callers all pass an arena, which reclaims the `allocPrint`
     // temporaries in bindValue's `.int`-mode `.float` arm and the `.fixed`-mode
     // `.integer`/`.float` arms whether or not they're individually freed — masking a
-    // leak on the real GPA path (`ev.writer()`/`ev.reader()` bind `alloc` to the gpa).
+    // leak whenever `alloc` is not an arena (e.g. a `Data` built directly on a plain GPA).
     // `std.testing.allocator` here fails the test on any unfreed byte.
     const a = std.testing.allocator;
 

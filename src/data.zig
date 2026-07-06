@@ -217,8 +217,10 @@ pub fn queryAs(comptime T: type, conn: *db.Db, alloc: std.mem.Allocator, sql: [:
 /// - `ctx.records()` binds `alloc` to the per-request/per-invocation arena, so
 ///   results are freed automatically when the invocation ends (no manual cleanup).
 /// - The lower-level `ev.writer()`/`ev.reader()` handle accessors (WriterData /
-///   ReaderData) bind `alloc` to `app.allocator` (the gpa). Results from THAT
-///   path are NOT arena-freed — callers must manage their lifetimes explicitly.
+///   ReaderData) bind `alloc` to an arena OWNED BY THE HANDLE (see events.zig),
+///   so results — and all internal scratch (collection metadata, SQL buffers) —
+///   are freed together when the handle's `deinit()` runs. Results are valid until
+///   `deinit()`; a caller that must outlive the handle copies them first.
 ///
 /// ATOMICITY: `before*` record hooks run INSIDE the triggering write's transaction
 /// (folded in by the A2 change). The handler opens `BEGIN IMMEDIATE` before the
@@ -571,6 +573,52 @@ test "Data.create then findById round-trips a record" {
 
     const found = (try d.findById("posts", id)).?;
     try std.testing.expectEqualStrings("hello", found.object.get("title").?.string);
+}
+
+test "Data record methods round-trip create/findById/update/list/delete" {
+    // Functional coverage on an arena for all five record methods (the leak-clean GPA-path
+    // regression for these lives in events.zig, driven through a WriterData handle).
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("PRAGMA foreign_keys=ON;");
+    try migrations.run(&conn);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "qty", .options = .{ .number = .{ .mode = .int } } },
+    };
+    _ = try collections.create(a, io, &conn, .{ .id = "", .name = "posts", .fields = &fields });
+
+    var app = App{ .allocator = a, .io = io, .pool = undefined };
+    const d = Data{ .app = &app, .conn = &conn, .io = io, .alloc = a };
+
+    var input: std.json.ObjectMap = .empty;
+    try input.put(a, "title", .{ .string = "hello" });
+    try input.put(a, "qty", .{ .integer = 7 });
+    const created = try d.create("posts", .{ .object = input });
+    try std.testing.expectEqualStrings("hello", created.object.get("title").?.string);
+    const id = created.object.get("id").?.string;
+
+    const found = (try d.findById("posts", id)).?;
+    try std.testing.expectEqualStrings("hello", found.object.get("title").?.string);
+
+    var patch: std.json.ObjectMap = .empty;
+    try patch.put(a, "qty", .{ .integer = 99 });
+    const updated = (try d.update("posts", id, .{ .object = patch })).?;
+    try std.testing.expectEqualStrings("99", updated.object.get("qty").?.string); // int mode → string
+    try std.testing.expectEqualStrings("hello", updated.object.get("title").?.string); // untouched
+
+    const res = try d.list("posts", .{});
+    try std.testing.expectEqual(@as(usize, 1), res.items.len);
+    try std.testing.expectEqualStrings("hello", res.items[0].object.get("title").?.string);
+
+    try std.testing.expect(try d.delete("posts", id));
+    try std.testing.expect((try d.findById("posts", id)) == null);
 }
 
 test "Data typed I/O: createAs/getAs/updateAs round-trip through T" {

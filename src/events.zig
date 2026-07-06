@@ -43,14 +43,26 @@ pub const WriterData = struct {
     app: *App,
     pool: *db.Pool,
     conn: *db.Db,
+    /// Arena that backs the `Data` this handle yields, created lazily on the first
+    /// `data()` call over `app.allocator` (the long-lived process GPA). Everything a
+    /// record op allocates through this handle — the collection metadata, the SQL
+    /// scratch, AND the returned records — lives on it and is freed together by
+    /// `deinit()`, instead of being orphaned on the GPA. `ctx.records()` does NOT use
+    /// this (it has its own per-request arena); this is for the standalone RAII path.
+    arena: ?std.heap.ArenaAllocator = null,
 
-    /// A `Data` bound to the acquired writer connection. Valid until `deinit()`.
+    /// A `Data` bound to the acquired writer connection, allocating on this handle's
+    /// arena. Results are valid until `deinit()`; a caller that must outlive the handle
+    /// copies them first.
     pub fn data(self: *WriterData) Data {
-        return .{ .app = self.app, .conn = self.conn, .io = self.app.io, .alloc = self.app.allocator };
+        if (self.arena == null) self.arena = std.heap.ArenaAllocator.init(self.app.allocator);
+        return .{ .app = self.app, .conn = self.conn, .io = self.app.io, .alloc = self.arena.?.allocator() };
     }
 
-    /// Release the writer back to the pool. Call exactly once (use `defer`).
+    /// Release the writer back to the pool and free this handle's arena (and everything
+    /// its `data()` allocated). Call exactly once (use `defer`).
     pub fn deinit(self: *WriterData) void {
+        if (self.arena) |*a| a.deinit();
         self.pool.releaseWriter();
     }
 };
@@ -62,17 +74,22 @@ pub const ReaderData = struct {
     app: *App,
     pool: *db.Pool,
     conn: db.Db,
+    /// See `WriterData.arena`: the handle-owned arena backing `data()`, freed by `deinit()`.
+    arena: ?std.heap.ArenaAllocator = null,
 
-    /// A `Data` bound to this reader connection. Takes `*ReaderData` so the
-    /// returned `Data.conn` points at this handle's own (stable) `conn` field
-    /// rather than a dangling stack copy; the handle must outlive the `Data`.
+    /// A `Data` bound to this reader connection, allocating on this handle's arena. Takes
+    /// `*ReaderData` so the returned `Data.conn` points at this handle's own (stable) `conn`
+    /// field rather than a dangling stack copy; the handle must outlive the `Data`. Results
+    /// are valid until `deinit()`.
     pub fn data(self: *ReaderData) Data {
-        return .{ .app = self.app, .conn = &self.conn, .io = self.app.io, .alloc = self.app.allocator };
+        if (self.arena == null) self.arena = std.heap.ArenaAllocator.init(self.app.allocator);
+        return .{ .app = self.app, .conn = &self.conn, .io = self.app.io, .alloc = self.arena.?.allocator() };
     }
 
-    /// Return the connection to the pool's warm reader set. Call exactly once
-    /// (use `defer`). Passes `&self.conn` to match `Pool.releaseReader`.
+    /// Return the connection to the pool's warm reader set and free this handle's arena.
+    /// Call exactly once (use `defer`). Passes `&self.conn` to match `Pool.releaseReader`.
     pub fn deinit(self: *ReaderData) void {
+        if (self.arena) |*a| a.deinit();
         self.pool.releaseReader(&self.conn);
     }
 };
@@ -1554,6 +1571,54 @@ test "WriterData create round-trips and releases the writer (no leak)" {
 
     // Prove deinit released the writer: re-acquiring it directly must not
     // deadlock (the spinlock would hang forever if still held).
+    {
+        const w2 = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        _ = w2;
+    }
+}
+
+test "WriterData record ops free col + scratch + results on deinit (no leak on a raw-GPA app)" {
+    // The GPA-path leak regression: a WriterData whose `app.allocator` is the RAW
+    // `std.testing.allocator` (a leak-checking GPA — NOT an arena). Everything the five record
+    // methods allocate through the handle — the fully-owned collection metadata `collections.get`
+    // dupes, the record engine's SQL scratch, and the returned records — must be freed by the
+    // handle's arena on `deinit()`. Pre-fix (`data()` bound `Data.alloc` straight to the process
+    // GPA with no arena) every op orphaned all of that on the GPA → this test leaks; post-fix the
+    // handle-owned arena reclaims it → clean.
+    const env = try TestEnv.init();
+    defer env.deinit();
+
+    // A raw-GPA app (NOT env.arena) so the handle's arena is a direct child of the leak checker.
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = &env.pool };
+
+    {
+        var w: WriterData = .{ .app = &app, .pool = &env.pool, .conn = env.pool.acquireWriter() };
+        defer w.deinit(); // frees the handle arena (col + scratch + results) AND releases the writer
+        const d = w.data(); // one Data over the handle's arena; conn + alloc are stable across calls
+
+        var obj: std.json.ObjectMap = .empty;
+        try obj.put(d.alloc, "title", .{ .string = "hello" });
+        const created = try d.create("posts", .{ .object = obj });
+        const id = created.object.get("id").?.string;
+        try std.testing.expectEqualStrings("hello", created.object.get("title").?.string);
+
+        const found = (try d.findById("posts", id)).?;
+        try std.testing.expectEqualStrings("hello", found.object.get("title").?.string);
+
+        var patch: std.json.ObjectMap = .empty;
+        try patch.put(d.alloc, "title", .{ .string = "world" });
+        const updated = (try d.update("posts", id, .{ .object = patch })).?;
+        try std.testing.expectEqualStrings("world", updated.object.get("title").?.string);
+
+        const res = try d.list("posts", .{});
+        try std.testing.expectEqual(@as(usize, 1), res.items.len);
+
+        try std.testing.expect(try d.delete("posts", id));
+        try std.testing.expect((try d.findById("posts", id)) == null);
+    }
+
+    // deinit released the writer: re-acquiring directly must not deadlock.
     {
         const w2 = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
