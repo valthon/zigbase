@@ -135,12 +135,43 @@ pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
                 try stmt.bindDouble(idx, f);
             },
             .int => {
-                if (v != .string) return error.TypeMismatch;
-                try stmt.bindInt(idx, try decimalToScaledInt(v.string, 0));
+                // Symmetric with reads (which RETURN `.string`): accept a JSON string
+                // (the canonical form), a JSON integer (bind directly), or a JSON float
+                // (rendered to a decimal string — a fractional float then errors via
+                // decimalToScaledInt(str, 0), which is the correct rejection for an int field).
+                switch (v) {
+                    .string => try stmt.bindInt(idx, try decimalToScaledInt(v.string, 0)),
+                    .integer => try stmt.bindInt(idx, v.integer),
+                    .float => {
+                        const str = try std.fmt.allocPrint(alloc, "{d}", .{v.float});
+                        defer alloc.free(str);
+                        try stmt.bindInt(idx, try decimalToScaledInt(str, 0));
+                    },
+                    else => return error.TypeMismatch,
+                }
             },
             .fixed => {
-                if (v != .string) return error.TypeMismatch;
-                try stmt.bindInt(idx, try decimalToScaledInt(v.string, o.scale orelse 0));
+                // Symmetric with reads: accept a JSON string (canonical) or a JSON number.
+                // A number is rendered to a decimal string and scaled through the SAME
+                // render→scale path as the string form, so `.float = 5.0` on a fixed(scale=2)
+                // field scales to 500, identically to the string "5.0"/"5.00". `v.string` is
+                // BORROWED (not owned) — only the two allocPrint arms allocate, so only those
+                // get freed.
+                var allocated: ?[]u8 = null;
+                const str = switch (v) {
+                    .string => v.string,
+                    .integer => blk: {
+                        allocated = try std.fmt.allocPrint(alloc, "{d}", .{v.integer});
+                        break :blk allocated.?;
+                    },
+                    .float => blk: {
+                        allocated = try std.fmt.allocPrint(alloc, "{d}", .{v.float});
+                        break :blk allocated.?;
+                    },
+                    else => return error.TypeMismatch,
+                };
+                defer if (allocated) |s| alloc.free(s);
+                try stmt.bindInt(idx, try decimalToScaledInt(str, o.scale orelse 0));
             },
         },
         .json => {
@@ -198,6 +229,7 @@ fn roundTrip(a: std.mem.Allocator, field: schema.Field, sql_type: []const u8, in
     var d = try db.Db.openMemory();
     defer d.close();
     const create = try std.fmt.allocPrintSentinel(a, "CREATE TABLE t (v {s});", .{sql_type}, 0);
+    defer a.free(create); // a build-time temporary, not the returned value — free regardless of allocator
     try d.exec(create);
     var ins = try d.prepare("INSERT INTO t (v) VALUES (?1);");
     try bindValue(a, &ins, 1, field, in);
@@ -252,6 +284,77 @@ test "int number round-trips as a string" {
     const f = schema.Field{ .id = "f", .name = "n", .options = .{ .number = .{ .mode = .int } } };
     const out = try roundTrip(a, f, "INTEGER", .{ .string = "9007199254740993" });
     try std.testing.expectEqualStrings("9007199254740993", out.string);
+}
+
+test "int number accepts a JSON integer on write (symmetric with reads)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = schema.Field{ .id = "f", .name = "n", .options = .{ .number = .{ .mode = .int } } };
+    // Passed AS a number, not a string.
+    const out = try roundTrip(a, f, "INTEGER", .{ .integer = 42 });
+    try std.testing.expectEqualStrings("42", out.string);
+    // Back-compat: the string form still works.
+    const out_s = try roundTrip(a, f, "INTEGER", .{ .string = "42" });
+    try std.testing.expectEqualStrings("42", out_s.string);
+}
+
+test "int number rejects a fractional float on write" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = schema.Field{ .id = "f", .name = "n", .options = .{ .number = .{ .mode = .int } } };
+    try std.testing.expectError(error.TooPrecise, roundTrip(a, f, "INTEGER", .{ .float = 4.2 }));
+}
+
+test "fixed number accepts JSON integer/float and scales identically to the string form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = schema.Field{ .id = "f", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } };
+    // `.float = 5.0` scales to 500, then reads back as "5.00" — identical to the string forms.
+    const out_f = try roundTrip(a, f, "INTEGER", .{ .float = 5.0 });
+    try std.testing.expectEqualStrings("5.00", out_f.string);
+    const out_i = try roundTrip(a, f, "INTEGER", .{ .integer = 5 });
+    try std.testing.expectEqualStrings("5.00", out_i.string);
+    const out_s = try roundTrip(a, f, "INTEGER", .{ .string = "5.0" });
+    try std.testing.expectEqualStrings("5.00", out_s.string);
+    const out_s2 = try roundTrip(a, f, "INTEGER", .{ .string = "5.00" });
+    try std.testing.expectEqualStrings("5.00", out_s2.string);
+}
+
+test "bindValue on the raw GPA path: numeric-as-number writes free their allocPrint temporaries" {
+    // roundTrip's other callers all pass an arena, which reclaims the `allocPrint`
+    // temporaries in bindValue's `.int`-mode `.float` arm and the `.fixed`-mode
+    // `.integer`/`.float` arms whether or not they're individually freed — masking a
+    // leak on the real GPA path (`ev.writer()`/`ev.reader()` bind `alloc` to the gpa).
+    // `std.testing.allocator` here fails the test on any unfreed byte.
+    const a = std.testing.allocator;
+
+    // `.int`-mode field written with a JSON float: exercises the allocPrint'd `str` in
+    // the `.float` arm of the `.int` mode switch.
+    const int_field = schema.Field{ .id = "f", .name = "n", .options = .{ .number = .{ .mode = .int } } };
+    const out_int = try roundTrip(a, int_field, "INTEGER", .{ .float = 42.0 });
+    a.free(out_int.string); // readValue's scaledIntToDecimal-allocated return value
+
+    // `.fixed`-mode field written with a JSON integer: exercises the allocPrint'd `str`
+    // in the `.fixed` mode's `.integer` arm.
+    const fixed_field = schema.Field{ .id = "f", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } };
+    const out_fixed_int = try roundTrip(a, fixed_field, "INTEGER", .{ .integer = 5 });
+    try std.testing.expectEqualStrings("5.00", out_fixed_int.string);
+    a.free(out_fixed_int.string);
+
+    // `.fixed`-mode field written with a JSON float: exercises the allocPrint'd `str`
+    // in the `.fixed` mode's `.float` arm.
+    const out_fixed_float = try roundTrip(a, fixed_field, "INTEGER", .{ .float = 5.0 });
+    try std.testing.expectEqualStrings("5.00", out_fixed_float.string);
+    a.free(out_fixed_float.string);
+
+    // `.fixed`-mode field written with a JSON string (the borrowed, non-allocated arm):
+    // must NOT be freed by bindValue, and the read-back value is still freed by us.
+    const out_fixed_str = try roundTrip(a, fixed_field, "INTEGER", .{ .string = "5.00" });
+    try std.testing.expectEqualStrings("5.00", out_fixed_str.string);
+    a.free(out_fixed_str.string);
 }
 
 test "multi-select round-trips as an array" {

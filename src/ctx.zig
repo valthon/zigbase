@@ -858,6 +858,38 @@ pub const Records = struct {
         return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).delete(collection, id);
     }
 
+    // --- Typed record I/O (#238) -------------------------------------------
+    // Thin wrappers over the `Data.*As` methods: reflect an anon-struct literal
+    // of writable fields into the write, and parse the resulting record into `T`.
+    // Struct↔schema mapping is by name; optionals map to nullable/absent fields;
+    // every literal field is comptime-verified to exist on `T`. The `std.json.Value`
+    // methods above remain for dynamic callers. `getAs` takes no opts — expand /
+    // projection over typed reads is a future addition.
+
+    /// Create a record from an anon-struct literal of writable fields and return it as `T`.
+    pub fn createAs(self: Records, comptime T: type, collection: []const u8, input: anytype) !T {
+        if (self.ctx.bound_conn) |c|
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).createAs(T, collection, input);
+        const c = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).createAs(T, collection, input);
+    }
+
+    /// Fetch a record by id parsed into `T`, or `null` if the collection/record is missing.
+    pub fn getAs(self: Records, comptime T: type, collection: []const u8, id: []const u8) !?T {
+        return (try self.dataRead()).getAs(T, collection, id);
+    }
+
+    /// Patch a record with an anon-struct literal of the changed fields and return it as `T`
+    /// (or `null` if missing).
+    pub fn updateAs(self: Records, comptime T: type, collection: []const u8, id: []const u8, patch: anytype) !?T {
+        if (self.ctx.bound_conn) |c|
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).updateAs(T, collection, id, patch);
+        const c = self.ctx.app.pool.acquireWriter();
+        defer self.ctx.app.pool.releaseWriter();
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).updateAs(T, collection, id, patch);
+    }
+
     /// Resolve the collection and run expand on `rec` in-place.
     /// CRUD operations in Records bypass collection rules (matching Data behaviour);
     /// expand applies the *target* collection's viewRule under the Ctx identity.

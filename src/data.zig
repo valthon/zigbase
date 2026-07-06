@@ -22,6 +22,17 @@ fn prep(alloc: std.mem.Allocator, conn: *db.Db, sql: [:0]const u8) !db.Stmt {
     return conn.prepare(sql_p);
 }
 
+/// Comptime-verify every field of `Input` (an anon-struct literal's type) exists as a
+/// field of `T`, so a typo'd key in a `createAs`/`updateAs` literal fails the build rather
+/// than silently no-op'ing at runtime. `who` names the calling method for the error.
+fn assertFieldsExist(comptime T: type, comptime Input: type, comptime who: []const u8) void {
+    inline for (std.meta.fields(Input)) |f| {
+        if (!@hasField(T, f.name)) {
+            @compileError(who ++ ": field '" ++ f.name ++ "' is not a field of " ++ @typeName(T));
+        }
+    }
+}
+
 /// Connection-bound, curated record operations. Hooks, custom routes, and jobs
 /// receive a `Data` rather than a raw connection. Ops run on the passed `conn`
 /// and allocate their returned results on `alloc` — the caller picks the lifetime:
@@ -90,6 +101,63 @@ pub const Data = struct {
     pub fn list(self: Data, col_name: []const u8, q: records.ListQuery) !records.ListResult {
         const col = (try collections.get(self.alloc, self.conn, col_name)) orelse return error.UnknownCollection;
         return records.list(self.alloc, self.conn, col, q);
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed record I/O (#238). Thin, reflective wrappers over the `std.json.Value`
+    // methods above; the Value API stays for dynamic callers. The struct↔collection
+    // field mapping is BY NAME: an `input`/`patch`/`T` field is matched to the
+    // collection column of the same name. Optional `T` fields map to nullable/absent
+    // columns; nested/optional shapes are handled by std.json. Because binding number
+    // fields now accepts numeric JSON (#238 Part 1), a `T` field like `price_cents: i64`
+    // stringifies to a JSON integer and binds correctly.
+    //
+    // The comptime guard on `createAs`/`updateAs` only verifies that every input/patch
+    // field EXISTS on `T` (typo protection). It does NOT verify the field exists on the
+    // COLLECTION — the collection is named at runtime, so a `T` field the collection
+    // doesn't declare surfaces as the existing runtime schema-validation error.
+    // -----------------------------------------------------------------------
+
+    /// Reflect an anon-struct literal of writable fields into a `std.json.Value` object
+    /// via stringify→parse. Nested/optional/number shapes are handled by std.json. Returns
+    /// the `Parsed` wrapper (rather than just `.value`) so the caller can `deinit()` the
+    /// backing arena the parse allocated — the `.value` itself is only a transient input
+    /// to `create`/`update`, never the returned value, so it must not leak on the GPA path.
+    fn valueFromStruct(self: Data, input: anytype) !std.json.Parsed(std.json.Value) {
+        const bytes = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(bytes);
+        return std.json.parseFromSlice(std.json.Value, self.alloc, bytes, .{});
+    }
+
+    /// Create a record from an anon-struct literal of the WRITABLE fields and return the
+    /// full created record parsed into `T`. `input` is an anon literal, e.g.
+    /// `.{ .title = "hi", .price_cents = 500, .confirmed = true }`; every field of it must
+    /// exist on `T` (checked at comptime). `T` may be a subset of the record's columns —
+    /// id/autodate columns `T` doesn't name are ignored on the read back.
+    pub fn createAs(self: Data, comptime T: type, col_name: []const u8, input: anytype) !T {
+        comptime assertFieldsExist(T, @TypeOf(input), "createAs");
+        var parsed_value = try self.valueFromStruct(input);
+        defer parsed_value.deinit();
+        const created = try self.create(col_name, parsed_value.value);
+        return try std.json.parseFromValueLeaky(T, self.alloc, created, .{ .ignore_unknown_fields = true });
+    }
+
+    /// Fetch a record by id, parsed into `T`, or `null` if the collection or record is
+    /// not found. No opts arg — expand/projection is a future addition.
+    pub fn getAs(self: Data, comptime T: type, col_name: []const u8, id: []const u8) !?T {
+        const found = (try self.findById(col_name, id)) orelse return null;
+        return try std.json.parseFromValueLeaky(T, self.alloc, found, .{ .ignore_unknown_fields = true });
+    }
+
+    /// Patch a record with an anon-struct literal of just the CHANGED fields and return the
+    /// updated record parsed into `T` (or `null` if the record is missing). Every field of
+    /// `patch` must exist on `T` (checked at comptime).
+    pub fn updateAs(self: Data, comptime T: type, col_name: []const u8, id: []const u8, patch: anytype) !?T {
+        comptime assertFieldsExist(T, @TypeOf(patch), "updateAs");
+        var parsed_value = try self.valueFromStruct(patch);
+        defer parsed_value.deinit();
+        const updated = (try self.update(col_name, id, parsed_value.value)) orelse return null;
+        return try std.json.parseFromValueLeaky(T, self.alloc, updated, .{ .ignore_unknown_fields = true });
     }
 
     // -----------------------------------------------------------------------
@@ -327,6 +395,139 @@ test "Data.create then findById round-trips a record" {
     const found = (try d.findById("posts", id)).?;
     try std.testing.expectEqualStrings("hello", found.object.get("title").?.string);
 }
+
+test "Data typed I/O: createAs/getAs/updateAs round-trip through T" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("PRAGMA foreign_keys=ON;");
+    try migrations.run(&conn);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "qty", .options = .{ .number = .{ .mode = .int } } },
+        .{ .id = "f3", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
+        .{ .id = "f4", .name = "confirmed", .options = .{ .bool = .{} } },
+        .{ .id = "f5", .name = "note", .options = .{ .text = .{} } },
+    };
+    _ = try collections.create(a, io, &conn, .{ .id = "", .name = "widgets", .fields = &fields });
+
+    var app = App{ .allocator = a, .io = io, .pool = undefined };
+    const d = Data{ .app = &app, .conn = &conn, .io = io, .alloc = a };
+
+    // `.int`-mode fields map to a Zig integer (parseFromValue parses the numeric string
+    // back into `i64`); `.fixed`-mode fields read back as DECIMAL STRINGS (values.zig
+    // contract) and so must stay `[]const u8` in `T`. An optional field maps to a
+    // nullable/absent column.
+    const Widget = struct {
+        id: []const u8,
+        title: []const u8,
+        qty: i64,
+        price: []const u8,
+        confirmed: bool,
+        note: ?[]const u8,
+    };
+
+    // createAs: a numeric field is passed AS A NUMBER (proves Part 1 + Part 2 compose);
+    // `note` is omitted (optional → null).
+    const created = try d.createAs(Widget, "widgets", .{
+        .title = "hello",
+        .qty = 7,
+        .price = 5.0,
+        .confirmed = true,
+    });
+    try std.testing.expectEqualStrings("hello", created.title);
+    try std.testing.expectEqual(@as(i64, 7), created.qty);
+    try std.testing.expectEqualStrings("5.00", created.price); // 5.0 scaled to fixed(2)
+    try std.testing.expectEqual(true, created.confirmed);
+    try std.testing.expect(created.note == null);
+
+    // getAs: fetch the same record as Widget.
+    const got = (try d.getAs(Widget, "widgets", created.id)).?;
+    try std.testing.expectEqualStrings("hello", got.title);
+    try std.testing.expectEqual(@as(i64, 7), got.qty);
+    try std.testing.expectEqualStrings("5.00", got.price);
+    try std.testing.expect(got.note == null);
+
+    // getAs on a missing id → null.
+    try std.testing.expect((try d.getAs(Widget, "widgets", "nonexistent")) == null);
+
+    // updateAs: change one field; the rest stay intact; the optional round-trips a value.
+    const updated = (try d.updateAs(Widget, "widgets", created.id, .{ .qty = 99, .note = "restocked" })).?;
+    try std.testing.expectEqual(@as(i64, 99), updated.qty);
+    try std.testing.expectEqualStrings("hello", updated.title); // untouched
+    try std.testing.expectEqualStrings("5.00", updated.price); // untouched
+    try std.testing.expectEqual(true, updated.confirmed); // untouched
+    try std.testing.expectEqualStrings("restocked", updated.note.?);
+
+    // updateAs on a missing id → null.
+    try std.testing.expect((try d.updateAs(Widget, "widgets", "nonexistent", .{ .qty = 1 })) == null);
+}
+
+test "Data typed I/O on the raw GPA path: valueFromStruct and parseFromValueLeaky do not leak" {
+    // `ev.writer()`/`ev.reader()` bind `Data.alloc` to `app.allocator` (a real GPA), NOT an
+    // arena — so the intermediate `bytes`/`Parsed(Value)` temporaries in `valueFromStruct`
+    // and the `parseFromValue` wrapper `createAs`/`getAs`/`updateAs` used to return (rather
+    // than `parseFromValueLeaky`) are real, permanent leaks on that path; an arena masks
+    // them by reclaiming everything at once. `std.testing.allocator` fails the test on any
+    // unfreed byte, so it catches exactly this class of bug. (Schema/collection setup below
+    // stays on a throwaway arena — GPA leak-checking that is orthogonal to this PR's fix.)
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("PRAGMA foreign_keys=ON;");
+    try migrations.run(&conn);
+
+    var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup_arena.deinit();
+    const sa = setup_arena.allocator();
+    const io = std.testing.io;
+
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
+    };
+    _ = try collections.create(sa, io, &conn, .{ .id = "", .name = "gadgets", .fields = &fields });
+
+    // `valueFromStruct` on its own, GPA-backed: must not leak the intermediate `bytes` (the
+    // fix adds `defer self.alloc.free(bytes)`), and returns a `Parsed(Value)` the caller
+    // deinits (rather than the old bare `.value`, which discarded — and leaked — the parse
+    // tree's backing arena).
+    var app = App{ .allocator = std.testing.allocator, .io = io, .pool = undefined };
+    const gpa_data = Data{ .app = &app, .conn = &conn, .io = io, .alloc = std.testing.allocator };
+    {
+        var parsed = try gpa_data.valueFromStruct(.{ .title = "hi", .price = 5.0 });
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("hi", parsed.value.object.get("title").?.string);
+    }
+
+    // The `parseFromValueLeaky` swap in `createAs`/`getAs`/`updateAs`: parse a manually-built
+    // `std.json.Value` (on a throwaway arena — irrelevant to what's under test) into `T` on
+    // the GPA, then free exactly the fields `T` owns. Before the fix this used
+    // `parseFromValue` and threw away (leaked) the `Parsed(T)` wrapper's arena on every call.
+    const Gadget = struct { title: []const u8, price: []const u8, note: ?[]const u8 };
+    var src_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer src_arena.deinit();
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(src_arena.allocator(), "title", .{ .string = "hi" });
+    try obj.put(src_arena.allocator(), "price", .{ .string = "5.00" });
+    try obj.put(src_arena.allocator(), "note", .null);
+    const g = try std.json.parseFromValueLeaky(Gadget, std.testing.allocator, .{ .object = obj }, .{ .ignore_unknown_fields = true });
+    defer {
+        std.testing.allocator.free(g.title);
+        std.testing.allocator.free(g.price);
+    }
+    try std.testing.expectEqualStrings("hi", g.title);
+    try std.testing.expectEqualStrings("5.00", g.price);
+    try std.testing.expect(g.note == null);
+}
+
+// compile-error: `d.createAs(Widget, "widgets", .{ .titel = "x" })` (typo) fails the build
+// with "createAs: field 'titel' is not a field of ...Widget" via assertFieldsExist. This
+// cannot be an executable test (a @compileError would fail the whole build), so it is a note.
 
 test "Data.create on an unknown collection errors; findById collapses to null" {
     var conn = try db.Db.openMemory();
