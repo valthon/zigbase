@@ -1151,6 +1151,88 @@ fn recordMigration(m: *Migrator, name: []const u8) db.DbError!void {
     _ = try st.step();
 }
 
+// ---------------------------------------------------------------------------
+// Migration status (CLI `migrate status`, Piece B stage B1)
+// ---------------------------------------------------------------------------
+
+/// One applied consumer-migration ledger row (`prov:`-prefixed name + its `applied_at`).
+pub const AppliedMigration = struct { name: []const u8, applied_at: []const u8 };
+
+/// Strip the `prov:` ledger prefix a consumer migration is recorded under; returns the bare id.
+fn stripProv(name: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, name, "prov:")) name[5..] else name;
+}
+
+/// Read the applied CONSUMER migrations from the `_migrations` ledger, in apply order
+/// (`id` ascending). Names retain the `prov:` prefix. Mirrors `migrationApplied`'s dialect-aware
+/// `m.prepare` (placeholder renumbering, harmless here — the query is placeholder-free) so it
+/// works on SQLite and Postgres. Everything is duped from `alloc` (pass an arena; caller owns it).
+pub fn appliedConsumerMigrations(alloc: std.mem.Allocator, w: *db.Db) ![]AppliedMigration {
+    var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = alloc, .io = undefined };
+    var st = try m.prepare("SELECT \"name\", \"applied_at\" FROM \"_migrations\" WHERE \"name\" LIKE 'prov:%' ORDER BY \"id\";");
+    defer st.finalize();
+    var list: std.ArrayList(AppliedMigration) = .empty;
+    while (try st.step()) {
+        const name = try alloc.dupe(u8, st.columnText(0));
+        const at = try alloc.dupe(u8, st.columnText(1));
+        try list.append(alloc, .{ .name = name, .applied_at = at });
+    }
+    return try list.toOwnedSlice(alloc);
+}
+
+/// One declared consumer migration cross-referenced against the ledger: `applied_at` is set
+/// (the ledger timestamp) when applied, `null` when pending.
+pub const StatusEntry = struct { id: []const u8, applied_at: ?[]const u8 };
+
+/// The result of cross-referencing the compiled-in `.migrations` against the ledger.
+///   - `declared`: every compiled-in migration, in DECLARED order, applied-or-pending.
+///   - `orphaned`: applied `prov:` rows whose id is NOT compiled in (migration deleted from
+///     source). `.name` here is the bare id (prefix stripped).
+pub const MigrationStatus = struct {
+    declared: []StatusEntry,
+    orphaned: []AppliedMigration,
+    applied_count: usize,
+    pending_count: usize,
+};
+
+/// Compute the applied/pending/orphaned buckets by cross-referencing the compiled-in migrations
+/// (`migs`, in declared order) against the ledger. Allocates from `alloc` (pass an arena).
+pub fn migrationStatus(alloc: std.mem.Allocator, w: *db.Db, migs: []const Migration) !MigrationStatus {
+    const applied = try appliedConsumerMigrations(alloc, w);
+
+    const declared = try alloc.alloc(StatusEntry, migs.len);
+    var applied_count: usize = 0;
+    for (migs, 0..) |mig, i| {
+        var at: ?[]const u8 = null;
+        for (applied) |ar| {
+            if (std.mem.eql(u8, stripProv(ar.name), mig.id)) {
+                at = ar.applied_at;
+                break;
+            }
+        }
+        if (at != null) applied_count += 1;
+        declared[i] = .{ .id = mig.id, .applied_at = at };
+    }
+
+    var orphans: std.ArrayList(AppliedMigration) = .empty;
+    for (applied) |ar| {
+        const id = stripProv(ar.name);
+        var known = false;
+        for (migs) |mig| if (std.mem.eql(u8, mig.id, id)) {
+            known = true;
+            break;
+        };
+        if (!known) try orphans.append(alloc, .{ .name = id, .applied_at = ar.applied_at });
+    }
+
+    return .{
+        .declared = declared,
+        .orphaned = try orphans.toOwnedSlice(alloc),
+        .applied_count = applied_count,
+        .pending_count = migs.len - applied_count,
+    };
+}
+
 // --- helpers ---
 
 fn nameInSpecs(specs: []const schema.Collection, name: []const u8) bool {
@@ -1755,6 +1837,87 @@ test "runMigrations: legacy { id, up } is unaffected (backward-compat)" {
     try std.testing.expectEqual(@as(usize, 1), M.calls);
     var st = try d.prepare("SELECT 1 FROM \"legacy_demo\" LIMIT 0;");
     st.finalize();
+}
+
+test "appliedConsumerMigrations returns applied prov: rows in apply (id) order" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        fn up(m: *Migrator) anyerror!void {
+            try m.execLowered("SELECT 1;"); // trivial, effect-free
+        }
+    };
+    // Apply three in order; the ledger's autoinc id preserves apply order regardless of name.
+    const migs = [_]Migration{
+        .{ .id = "0003_c", .up = M.up },
+        .{ .id = "0001_a", .up = M.up },
+        .{ .id = "0002_b", .up = M.up },
+    };
+    try runMigrations(a, std.testing.io, &d, &migs);
+
+    const applied = try appliedConsumerMigrations(a, &d);
+    try std.testing.expectEqual(@as(usize, 3), applied.len);
+    // Apply order, NOT declared/alphabetical: 0003_c was recorded first.
+    try std.testing.expectEqualStrings("prov:0003_c", applied[0].name);
+    try std.testing.expectEqualStrings("prov:0001_a", applied[1].name);
+    try std.testing.expectEqualStrings("prov:0002_b", applied[2].name);
+    try std.testing.expect(applied[0].applied_at.len > 0);
+}
+
+test "migrationStatus computes applied / pending / orphaned buckets" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const M = struct {
+        fn up(m: *Migrator) anyerror!void {
+            try m.execLowered("SELECT 1;");
+        }
+    };
+    // Apply only the first of two declared migrations.
+    try runMigrations(a, std.testing.io, &d, &[_]Migration{.{ .id = "0001_a", .up = M.up }});
+    // Inject an orphaned ledger row: a prov: migration NOT in the compiled-in set.
+    try d.exec("INSERT INTO \"_migrations\" (\"name\",\"applied_at\") VALUES ('prov:9999_gone', datetime('now'));");
+
+    // Declared set: 0001_a (applied) + 0002_b (pending). 9999_gone is orphaned.
+    const declared = [_]Migration{
+        .{ .id = "0001_a", .up = M.up },
+        .{ .id = "0002_b", .up = M.up },
+    };
+    const status = try migrationStatus(a, &d, &declared);
+
+    try std.testing.expectEqual(@as(usize, 1), status.applied_count);
+    try std.testing.expectEqual(@as(usize, 1), status.pending_count);
+    try std.testing.expectEqual(@as(usize, 2), status.declared.len);
+    // Declared order preserved: [0] applied, [1] pending.
+    try std.testing.expectEqualStrings("0001_a", status.declared[0].id);
+    try std.testing.expect(status.declared[0].applied_at != null);
+    try std.testing.expectEqualStrings("0002_b", status.declared[1].id);
+    try std.testing.expect(status.declared[1].applied_at == null);
+    // The orphan is bucketed separately, with its bare id (prov: stripped).
+    try std.testing.expectEqual(@as(usize, 1), status.orphaned.len);
+    try std.testing.expectEqualStrings("9999_gone", status.orphaned[0].name);
+}
+
+test "migrationStatus: empty declared set with no ledger rows is all-zero" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const status = try migrationStatus(arena.allocator(), &d, &[_]Migration{});
+    try std.testing.expectEqual(@as(usize, 0), status.applied_count);
+    try std.testing.expectEqual(@as(usize, 0), status.pending_count);
+    try std.testing.expectEqual(@as(usize, 0), status.orphaned.len);
+    try std.testing.expectEqual(@as(usize, 0), status.declared.len);
 }
 
 test "buildCollection lowers .auth.methods into collection options" {

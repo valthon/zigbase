@@ -1700,7 +1700,10 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             const cfg = try loadCfg(init.environ_map, sa);
             try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map);
         },
-        .migrate => |sa| try migrateImpl(allocator, init.io, init.environ_map, sa),
+        .migrate => |ma| switch (ma.action) {
+            .apply => try migrateImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
+            .status => try migrateStatusImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
+        },
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
@@ -1761,7 +1764,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\
         \\COMMANDS:
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
-        \\  migrate             Apply database migrations, then exit.
+        \\  migrate             Apply database migrations, then exit. `migrate status` reports without applying.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
         \\  superuser create    Create an admin (superuser) account.
@@ -1965,16 +1968,25 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\zigbase migrate — apply pending database migrations, then exit.
         \\
         \\USAGE:
-        \\  zigbase migrate [--data-dir PATH]
+        \\  zigbase migrate [--data-dir PATH]         Apply pending migrations (default).
+        \\  zigbase migrate status [--data-dir PATH]  Report applied/pending migrations; apply nothing.
         \\
         \\FLAGS:
         \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
         \\
+        \\WHAT IT DOES:
+        \\  `migrate` applies pending SYSTEM migrations and then the app's comptime `.migrations`
+        \\  (the same forward pass `serve` runs at boot), recording each in the `_migrations`
+        \\  ledger so it runs exactly once. `migrate status` reads that ledger and lists the
+        \\  compiled-in migrations as applied or pending (in declared order), flagging any
+        \\  ORPHANED rows (applied migrations no longer present in the binary). It changes nothing.
+        \\
         \\Note: `zigbase serve` also runs migrations on startup; use `migrate` to apply
         \\them ahead of time (e.g. in a deploy step) without starting the server.
         \\
-        \\EXAMPLE:
+        \\EXAMPLES:
         \\  zigbase migrate --data-dir ./zb_data
+        \\  zigbase migrate status --data-dir ./zb_data
         \\
     , .{});
 }
@@ -2113,14 +2125,53 @@ fn openPoolSelect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, 
     }
 }
 
-fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !void {
-    const cfg = try loadCfg(environ, sa);
+/// `zigbase migrate`: apply pending SYSTEM migrations, then the consumer `.migrations` (the same
+/// forward pass `serve` runs at boot — `provision.runMigrations`), then exit. Idempotent: an
+/// already-applied migration is skipped via its `_migrations` ledger row. Threading
+/// `schema_migrations` (the compiled-in `.migrations`) makes the CLI coherent with `migrate status`.
+fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, ma: cli.MigrateArgs, schema_migrations: []const provision.Migration) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = ma.data_dir });
     var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
     try migrations.run(w);
+    if (schema_migrations.len > 0) {
+        try provision.runMigrations(allocator, io, w, schema_migrations);
+    }
     std.log.info("migrations applied", .{});
+}
+
+/// `zigbase migrate status`: read the `_migrations` ledger and report the compiled-in consumer
+/// `.migrations` as applied/pending (in DECLARED order), plus any ORPHANED ledger rows (applied
+/// `prov:` rows whose migration was deleted from the binary). Does not apply anything — it only
+/// ensures the ledger table exists so the read succeeds on a fresh database.
+fn migrateStatusImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, ma: cli.MigrateArgs, schema_migrations: []const provision.Migration) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = ma.data_dir });
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
+    defer pool.deinit();
+    const w = pool.acquireWriter();
+    defer pool.releaseWriter();
+    try migrations.ensureLedger(w);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const status = try provision.migrationStatus(arena.allocator(), w, schema_migrations);
+
+    const out = std.Io.File.stdout();
+    emit(io, out, "Consumer migrations ({d} declared):\n", .{schema_migrations.len});
+    if (schema_migrations.len == 0) emit(io, out, "  (none declared)\n", .{});
+    for (status.declared) |e| {
+        if (e.applied_at) |at|
+            emit(io, out, "  {s}  applied (at {s})\n", .{ e.id, at })
+        else
+            emit(io, out, "  {s}  pending\n", .{e.id});
+    }
+    if (status.orphaned.len > 0) {
+        emit(io, out, "\nOrphaned (in ledger, not in binary):\n", .{});
+        for (status.orphaned) |o| emit(io, out, "  {s}  applied (at {s})\n", .{ o.name, o.applied_at });
+    }
+    emit(io, out, "\n{d} applied, {d} pending, {d} orphaned\n", .{ status.applied_count, status.pending_count, status.orphaned.len });
 }
 
 /// `zigbase rewrap`: re-encrypt every `.encrypted` cell under the PRIMARY key

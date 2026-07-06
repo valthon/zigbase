@@ -3378,9 +3378,40 @@ half-done. Some statements can't run inside a transaction (e.g. SQLite `VACUUM`,
 **without** a wrapping transaction (it owns its own atomicity; it is recorded only after it
 succeeds).
 
-> **Rollback & status CLI** (running a migration's inverse `change`/`down`, listing applied vs
-> pending) and a **schema dump** are coming in follow-up work. Piece A delivers the DSL, the
-> forward apply path, and the reverse machinery each op is built on.
+#### The `migrate` CLI (apply + status)
+
+`zigbase migrate` applies pending migrations and exits — the same forward pass `serve` runs at
+boot, so a deploy step can migrate ahead of starting the server:
+
+```sh
+# Apply pending SYSTEM migrations, then the app's comptime `.migrations`, then exit.
+zigbase migrate --data-dir ./zb_data
+```
+
+Each applied migration is recorded once in the `_migrations` ledger (system migrations by name,
+consumer `.migrations` under a `prov:<id>` name), so `migrate` is idempotent: already-applied
+migrations are skipped.
+
+`zigbase migrate status` reads that ledger and reports your comptime `.migrations`, in **declared
+order**, as `applied (at <ts>)` or `pending` — without applying anything:
+
+```text
+$ zigbase migrate status --data-dir ./zb_data
+Consumer migrations (2 declared):
+  0001_widgets  applied (at 2026-07-06 12:00:00)
+  0002_slugify  pending
+
+1 applied, 1 pending, 0 orphaned
+```
+
+An **orphaned** row — an applied `prov:` migration whose id is no longer compiled into the binary
+(you deleted it from `.migrations`) — is listed separately under "Orphaned (in ledger, not in
+binary)" and counted in the summary, so a divergence between the ledger and the source is visible
+at a glance.
+
+> **Rollback** (running a migration's inverse `change`/`down`) and a **schema dump** are coming in
+> follow-up work. The reverse machinery each op is built on already ships; `migrate rollback` is
+> the next stage.
 
 #### Cross-backend migrations (SQLite **and** Postgres)
 

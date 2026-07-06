@@ -14,6 +14,16 @@ pub const ServeArgs = struct {
     realtime_outbound_hwm: ?u32 = null, // --realtime-outbound-hwm N => slow-consumer disconnect bound in frames (0 disables); issue #203
 };
 
+/// `migrate` runs one of two actions: `apply` (the default — apply pending system + consumer
+/// migrations) or `status` (`migrate status` — read the ledger and report applied/pending/orphaned
+/// consumer migrations without changing anything).
+pub const MigrateAction = enum { apply, status };
+
+pub const MigrateArgs = struct {
+    data_dir: ?[]const u8 = null,
+    action: MigrateAction = .apply,
+};
+
 pub const SuperuserArgs = struct {
     data_dir: ?[]const u8 = null,
     email: ?[]const u8 = null,
@@ -56,7 +66,7 @@ pub const Command = union(enum) {
     /// `version`/`--version`/`-V` -> print build provenance and exit.
     version: void,
     serve: ServeArgs,
-    migrate: ServeArgs,
+    migrate: MigrateArgs,
     superuser_create: SuperuserArgs,
     typegen: TypegenArgs,
     rewrap: RewrapArgs,
@@ -114,8 +124,15 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         return .{ .migrate_db = ma };
     }
     if (std.mem.eql(u8, args[0], "migrate")) {
-        var sa = ServeArgs{};
+        var ma = MigrateArgs{};
         var i: usize = 1;
+        // Optional leading subcommand: `migrate status`. Anything else non-flag is unknown.
+        if (i < args.len and !std.mem.startsWith(u8, args[i], "-")) {
+            if (std.mem.eql(u8, args[i], "status")) {
+                ma.action = .status;
+                i += 1;
+            } else return ParseError.UnknownCommand;
+        }
         while (i < args.len) : (i += 1) {
             const a = args[i];
             if (isHelpFlag(a)) {
@@ -123,10 +140,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             } else if (std.mem.eql(u8, a, "--data-dir")) {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
-                sa.data_dir = args[i];
+                ma.data_dir = args[i];
             } else return ParseError.UnknownFlag;
         }
-        return .{ .migrate = sa };
+        return .{ .migrate = ma };
     }
     if (std.mem.eql(u8, args[0], "vapid-keygen")) {
         // No flags; `--help`/`-h` routes to its help screen, anything else is unknown.
@@ -300,9 +317,28 @@ test "serve with all three flags" {
     try std.testing.expectEqualStrings("/tmp/zb", cmd.serve.data_dir.?);
 }
 
-test "migrate command parses --data-dir" {
+test "migrate command parses --data-dir (default action = apply)" {
     const cmd = try parse(&.{ "migrate", "--data-dir", "/tmp/zb" }, .{});
     try std.testing.expectEqualStrings("/tmp/zb", cmd.migrate.data_dir.?);
+    try std.testing.expectEqual(MigrateAction.apply, cmd.migrate.action);
+}
+
+test "migrate status parses to the status action (+ optional --data-dir)" {
+    const bare = try parse(&.{ "migrate", "status" }, .{});
+    try std.testing.expectEqual(MigrateAction.status, bare.migrate.action);
+    const with_dir = try parse(&.{ "migrate", "status", "--data-dir", "/tmp/zb" }, .{});
+    try std.testing.expectEqual(MigrateAction.status, with_dir.migrate.action);
+    try std.testing.expectEqualStrings("/tmp/zb", with_dir.migrate.data_dir.?);
+}
+
+test "migrate rejects an unknown subcommand and unknown flags" {
+    try std.testing.expectError(ParseError.UnknownCommand, parse(&.{ "migrate", "bogus" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "--nope" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "status", "--nope" }, .{}));
+}
+
+test "migrate status --help routes to the migrate help topic" {
+    try std.testing.expectEqual(HelpTopic.migrate, (try parse(&.{ "migrate", "status", "--help" }, .{})).help);
 }
 
 test "rewrap parses --data-dir and --dry-run" {
