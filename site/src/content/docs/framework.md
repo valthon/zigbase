@@ -479,6 +479,64 @@ defer ctx.app.pool.releaseWriter();
 try w.exec("INSERT INTO plugin_audit_log(note) VALUES('...');");
 ```
 
+#### Name-mapped raw reads — `data.queryAs`
+
+A complex read (join, aggregate, window scan) that outgrows the collection query API
+drops to raw SQL, where the row layer is **positional** — `st.columnText(28)` — which
+silently corrupts the moment a column is inserted into the `SELECT`. `data.queryAs`
+decodes each result row into a struct `T` by matching every field to the result column
+of the **same name** (respecting `AS` aliases), not by position:
+
+```zig
+const OrderRow = struct {
+    id: i64,
+    total: f64,
+    customer_email: []const u8,   // ← maps to the `AS customer_email` column
+    note: ?[]const u8,            // ← optional over a nullable column
+};
+
+// Ergonomic wrapper — pooled reader + invocation arena supplied for you:
+const rows = try ctx.records().queryAs(OrderRow,
+    \\SELECT o.*, c.email AS customer_email
+    \\FROM "orders" o JOIN "customers" c ON c.id = o.customer_id
+    \\WHERE o.total > ?1
+, .{min_total}); // []OrderRow — rows + string fields live on the invocation arena
+
+// Or the free function with an explicit connection (raw writes / migration-owned tables):
+const conn = try ctx.connForRead();                 // *db.Db reader
+// const conn = ctx.app.pool.acquireWriter();       // …or the writer for a raw write
+const also = try zigbase.data.queryAs(OrderRow, conn, ctx.arena, sql, .{min_total});
+```
+
+Contract:
+
+- **Args bind positionally** — tuple element `i` binds to placeholder `?{i+1}` (rewritten
+  to `$n` on Postgres by the same chokepoint the rest of the stack uses). Supported arg
+  types: `[]const u8` (including string literals), any integer, any float, `bool`, `?T`
+  (binds the payload or SQL `NULL`), and `null`.
+- **Fields decode by Zig type** — `[]const u8` (duped onto the allocator), any integer,
+  any float, `bool`, and `?T` over a nullable column (SQL `NULL` → `null`, else the value).
+- **Optionals ↔ nullable/absent** — an optional field maps to a nullable column; a `NULL`
+  value decodes to `null`. An optional field with **no matching result column at all** also
+  decodes to `null`.
+- **Missing non-optional column is an error** — a non-optional `T` field with no matching
+  result column returns `error.ColumnNotFound` (the field name is logged, since a Zig error
+  value can't carry text). This fires off the column description, so it surfaces even for an
+  empty result.
+- **A SQL `NULL` in a non-optional field is coerced** to the type's zero value (`""` / `0` /
+  `0.0` / `false`), matching the raw column accessors. Make the field `?T` if you need to
+  distinguish `NULL`.
+- **Extra result columns are ignored** — the common `SELECT o.*, …` case just works; only the
+  columns named by `T` are read.
+- **Use an arena on the free-function path** — if a decode fails partway through a run given a
+  non-arena (GPA) allocator, the per-row string dups already made are not individually freed;
+  pass an arena so a mid-decode error reclaims them wholesale. The `ctx.records().queryAs`
+  wrapper already uses the invocation arena, so this only concerns the raw free function.
+
+Get a `conn` for the free function from `ctx.connForRead()` (a pooled reader) or
+`ctx.app.pool.acquireWriter()` (for a raw write); inside a `ctx.tx` / `before*` hook the
+`ctx.records().queryAs` wrapper binds the active transaction connection automatically.
+
 > **Auth collections:** `ctx.records().create(collection, fields)` on an auth collection runs
 > the same credential transforms as the HTTP layer (generates the per-record `tokenKey`,
 > forces `verified=false`, and hashes `password` if one is supplied). A `password` is

@@ -169,6 +169,13 @@ pub const SubjectCookieOpts = @import("ctx.zig").SubjectCookieOpts;
 /// to splice a runtime value into a filter. See the `ctx.records()` section of docs/framework.md.
 pub const FilterArg = @import("records.zig").FilterArg;
 
+/// The `data` facade module. Holds `data.queryAs(T, conn, alloc, sql, args)` — name-mapped
+/// raw-SQL row decoding (#240): each result row is decoded into a struct `T` by matching fields
+/// to result columns BY NAME (not position), so a reordered/inserted SELECT column can't misalign.
+/// Get a `conn` from `ctx.connForRead()` (reader) or `ctx.app.pool.acquireWriter()`; the ergonomic
+/// wrapper is `ctx.records().queryAs(T, sql, args)`. See docs/framework.md.
+pub const data = @import("data.zig");
+
 // ---- General outbound HTTP client -----------------------------------------
 // HttpMethod/HttpHeader use the Http-prefix to avoid collision with http.zig's
 // Method/Header enums (which are already accessible via `zigbase.http.Method`).

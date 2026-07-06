@@ -33,6 +33,183 @@ fn assertFieldsExist(comptime T: type, comptime Input: type, comptime who: []con
     }
 }
 
+// ===========================================================================
+// queryAs — name-mapped raw-SQL row decoding (#240)
+// ===========================================================================
+//
+// Complex reads (joins, aggregates, window scans) drop below the collection API to
+// raw SQL, where the row layer is POSITIONAL — `st.columnText(28)` — which silently
+// corrupts the moment a column is inserted into the SELECT. `queryAs` decodes each
+// result row into a struct `T` by matching every field to the result column of the
+// SAME NAME (via the statement's column name, respecting `AS` aliases), not by
+// position, so reordering / inserting SELECT columns can never misalign a field.
+//
+//   const rows = try data.queryAs(OrderRow, conn, arena,
+//       "SELECT o.*, c.\"email\" AS customer_email FROM \"orders\" o " ++
+//       "JOIN \"customers\" c ON c.id = o.customer_id WHERE o.total > ?1",
+//       .{ min_total });   // []OrderRow, strings owned by `arena`
+//
+// - Get a `conn` (`*db.Db`) from `ctx.connForRead()` (a pooled reader) in a hook/route/job,
+//   or `ctx.app.pool.acquireWriter()` for a raw write. `ctx.records().queryAs(T, sql, args)`
+//   is the ergonomic wrapper (reader + invocation arena supplied for you).
+// - Args bind POSITIONALLY: tuple element `i` → placeholder `?{i+1}` (`$` on Postgres via
+//   the same `$n` renumber chokepoint used everywhere). Supported arg types: `[]const u8`
+//   (incl. string literals), integers, floats, `bool`, `?T` (payload or NULL), and `null`.
+// - Field decoding is by Zig type: `[]const u8` (duped onto `alloc`), any integer, any float,
+//   `bool`, and `?T` over a nullable column (SQL NULL → `null`, else the payload).
+// - A NON-optional `T` field with NO matching result column is a hard error
+//   (`error.ColumnNotFound`, the field named in a log line — Zig errors can't carry text).
+//   An OPTIONAL field with no matching column decodes to `null` (absent ⇒ null).
+// - A SQL NULL landing in a NON-optional field is COERCED to the type's zero value
+//   (`""` / `0` / `0.0` / `false`), matching the raw column accessors' NULL behavior — make
+//   the field `?T` if you need to distinguish NULL. Wrap it optional to observe NULL.
+// - EXTRA result columns not present in `T` are ignored (the common `SELECT o.*, …` case).
+//   A strict "error on unmapped column" mode is a possible future addition; there is no opts
+//   arg in v1.
+
+/// Bind one positional arg `val` at 1-based `idx`, dispatched on its Zig type. Unsupported
+/// types are a `@compileError` (the type is comptime-known, so the switch is a comptime switch
+/// and only the taken prong is analyzed).
+fn bindArg(st: *db.Stmt, idx: c_int, val: anytype) !void {
+    const VT = @TypeOf(val);
+    switch (@typeInfo(VT)) {
+        // `std.math.cast` returns null (never panics) when the value doesn't fit i64 — the real
+        // edge is a `u64`/`usize`/`u128` id above i64 max. Fail loudly instead of a panic; the
+        // value is logged at `.warn` (the ColumnNotFound precedent — a Zig error can't carry it).
+        .int, .comptime_int => {
+            const v64 = std.math.cast(i64, val) orelse {
+                std.log.warn("queryAs: integer arg {d} at ?{d} exceeds the i64 bind range", .{ val, idx });
+                return error.IntegerArgTooLarge;
+            };
+            try st.bindInt(idx, v64);
+        },
+        .float, .comptime_float => try st.bindDouble(idx, @floatCast(val)),
+        .bool => try st.bindInt(idx, if (val) 1 else 0),
+        .null => try st.bindNull(idx),
+        .optional => {
+            if (val) |v| try bindArg(st, idx, v) else try st.bindNull(idx);
+        },
+        .pointer => |p| switch (p.size) {
+            // []const u8 slice.
+            .slice => if (p.child == u8) {
+                try st.bindText(idx, val);
+            } else @compileError("queryAs: unsupported arg type " ++ @typeName(VT)),
+            // *const [N:0]u8 — a string literal; coerces to []const u8 for bindText.
+            .one => {
+                const ci = @typeInfo(p.child);
+                if (ci == .array and ci.array.child == u8) {
+                    try st.bindText(idx, val);
+                } else @compileError("queryAs: unsupported arg type " ++ @typeName(VT));
+            },
+            else => @compileError("queryAs: unsupported arg type " ++ @typeName(VT)),
+        },
+        else => @compileError("queryAs: unsupported arg type " ++ @typeName(VT)),
+    }
+}
+
+/// Decode a scalar (non-optional) field of type `FT` from result column `idx`. A SQL NULL is
+/// coerced to the type's zero value (via the raw accessors: text→"", int→0, double→0.0).
+fn decodeScalar(comptime FT: type, st: *db.Stmt, idx: c_int, alloc: std.mem.Allocator) !FT {
+    switch (@typeInfo(FT)) {
+        // `FT` can be any integer width/signedness (u8/i32/usize/…), while `columnInt` returns
+        // i64 from external DB data — a plain `@intCast` PANICS in Safe builds if the value is
+        // out of `FT`'s range (or negative into an unsigned FT). `std.math.cast` makes that a
+        // loud error instead (value logged at `.warn`, the ColumnNotFound/IntegerArgTooLarge
+        // precedent so the expectError test doesn't trip the runner's `.err` gate). `FT == i64`
+        // always succeeds — no regression for i64 fields.
+        .int => {
+            const val = st.columnInt(idx);
+            return std.math.cast(FT, val) orelse {
+                std.log.warn("queryAs: column value {d} does not fit field type {s}", .{ val, @typeName(FT) });
+                return error.IntegerOverflow;
+            };
+        },
+        .float => return @floatCast(st.columnDouble(idx)),
+        .bool => return st.columnInt(idx) != 0,
+        .pointer => |p| {
+            if (p.size == .slice and p.child == u8) return try alloc.dupe(u8, st.columnText(idx));
+            @compileError("queryAs: unsupported field type " ++ @typeName(FT));
+        },
+        else => @compileError("queryAs: unsupported field type " ++ @typeName(FT)),
+    }
+}
+
+/// Decode field `FT` from resolved column `idx` (`idx < 0` = no matching column, only ever
+/// passed for an optional field → `null`). Optionals decode NULL/absent to `null`.
+fn decodeField(comptime FT: type, st: *db.Stmt, idx: c_int, alloc: std.mem.Allocator) !FT {
+    switch (@typeInfo(FT)) {
+        .optional => |o| {
+            if (idx < 0) return null; // field has no matching result column
+            if (st.isNull(idx)) return null;
+            return try decodeScalar(o.child, st, idx, alloc);
+        },
+        else => return try decodeScalar(FT, st, idx, alloc),
+    }
+}
+
+/// Run `sql` (with positionally-bound `args`) and decode every result row into a `T`, mapping
+/// struct fields to result columns BY NAME. Returns `[]T` allocated on `alloc`; each `[]const u8`
+/// field is duped onto `alloc`, so on the ctx path (arena) they live as long as the invocation.
+///
+/// Errors: `error.ColumnNotFound` if a non-optional `T` field has no matching result column
+/// (the field is named in a log line); plus any DB error from prepare/bind/step. See the
+/// module-level comment above for the full type-mapping and NULL contract.
+pub fn queryAs(comptime T: type, conn: *db.Db, alloc: std.mem.Allocator, sql: [:0]const u8, args: anytype) ![]T {
+    if (@typeInfo(T) != .@"struct") @compileError("queryAs: T must be a struct, got " ++ @typeName(T));
+
+    var st = try prep(alloc, conn, sql);
+    defer st.finalize();
+
+    // Bind args positionally (SQLite/PG placeholder binds are 1-based).
+    inline for (std.meta.fields(@TypeOf(args)), 0..) |f, i| {
+        try bindArg(&st, @intCast(i + 1), @field(args, f.name));
+    }
+
+    // Force execution + expose column metadata. SQLite knows the column names right after
+    // prepare; Postgres only after the row description arrives with the first step(). Stepping
+    // once here populates the column map on BOTH backends (and gives us the first row, if any).
+    var has_row = try st.step();
+
+    // Resolve each field of T to a result-column index BY NAME, once. A non-optional field
+    // with no matching column is a hard error (named in the log); an optional one resolves
+    // to -1 and decodes to null.
+    const fields = std.meta.fields(T);
+    var col_of: [fields.len]c_int = undefined;
+    const ncols = st.columnCount();
+    inline for (fields, 0..) |f, fi| {
+        var found: c_int = -1;
+        var ci: c_int = 0;
+        while (ci < ncols) : (ci += 1) {
+            if (std.mem.eql(u8, st.columnName(ci), f.name)) {
+                found = ci;
+                break;
+            }
+        }
+        if (found < 0 and @typeInfo(f.type) != .optional) {
+            // Named here because a Zig error value can't carry the field name. Logged at
+            // `.warn`, not `.err`: unit tests exercise this via `expectError` and an
+            // `.err`-level log trips the Zig test runner's "logged N errors" gate (same
+            // precedent as `migrator.notReversible` / `provision.injectOAuthSecrets`). The
+            // returned error still surfaces loudly to the caller.
+            std.log.warn("queryAs: no result column named '{s}' for non-optional field {s}.{s}", .{ f.name, @typeName(T), f.name });
+            return error.ColumnNotFound;
+        }
+        col_of[fi] = found;
+    }
+
+    var list: std.ArrayList(T) = .empty;
+    errdefer list.deinit(alloc);
+    while (has_row) {
+        var row: T = undefined;
+        inline for (fields, 0..) |f, fi| {
+            @field(row, f.name) = try decodeField(f.type, &st, col_of[fi], alloc);
+        }
+        try list.append(alloc, row);
+        has_row = try st.step();
+    }
+    return list.toOwnedSlice(alloc);
+}
+
 /// Connection-bound, curated record operations. Hooks, custom routes, and jobs
 /// receive a `Data` rather than a raw connection. Ops run on the passed `conn`
 /// and allocate their returned results on `alloc` — the caller picks the lifetime:
@@ -549,4 +726,198 @@ test "Data.create on an unknown collection errors; findById collapses to null" {
 
     // findById intentionally collapses unknown-collection and missing-record to null.
     try std.testing.expect((try d.findById("nope", "x")) == null);
+}
+
+// --- queryAs (#240) --------------------------------------------------------
+
+test "queryAs maps result columns to struct fields BY NAME, not position" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, total REAL, note TEXT, paid INTEGER);");
+    try conn.exec(
+        \\INSERT INTO orders (id, total, note, paid) VALUES
+        \\ (1, 10.5, 'first', 1), (2, 99.0, 'second', 0), (3, 4.0, 'third', 1);
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Field order is DELIBERATELY unlike the SELECT column order, and `label` maps to an
+    // `AS`-aliased column — so a correct result proves name-mapping, not position. `descr`
+    // is an extra SELECT column NOT in the struct (must be ignored). The `WHERE total > ?1`
+    // proves positional float-arg binding.
+    const Row = struct {
+        paid: bool,
+        label: []const u8,
+        total: f64,
+        id: i64,
+    };
+    const rows = try queryAs(Row, &conn, a, "SELECT id, total, note AS label, paid, note AS descr FROM orders WHERE total > ?1 ORDER BY id;", .{@as(f64, 6.0)});
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].id);
+    try std.testing.expectEqualStrings("first", rows[0].label);
+    try std.testing.expectEqual(@as(f64, 10.5), rows[0].total);
+    try std.testing.expectEqual(true, rows[0].paid);
+    try std.testing.expectEqual(@as(i64, 2), rows[1].id);
+    try std.testing.expectEqualStrings("second", rows[1].label);
+    try std.testing.expectEqual(false, rows[1].paid); // paid=0 → bool false
+}
+
+test "queryAs optional field: NULL → null, present → value" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT);");
+    try conn.exec("INSERT INTO t (id, note) VALUES (1, 'has'), (2, NULL);");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Row = struct { id: i64, note: ?[]const u8 };
+    const rows = try queryAs(Row, &conn, a, "SELECT id, note FROM t ORDER BY id;", .{});
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("has", rows[0].note.?);
+    try std.testing.expect(rows[1].note == null);
+}
+
+test "queryAs optional field with NO matching column decodes to null" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY);");
+    try conn.exec("INSERT INTO t (id) VALUES (7);");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `missing` has no column in the SELECT; being optional, it resolves to null (not an error).
+    const Row = struct { id: i64, missing: ?[]const u8 };
+    const rows = try queryAs(Row, &conn, a, "SELECT id FROM t;", .{});
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 7), rows[0].id);
+    try std.testing.expect(rows[0].missing == null);
+}
+
+test "queryAs: a non-optional field with no matching column errors (even with zero rows)" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);");
+    // No rows inserted — the missing-column check still fires off the column description.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Row = struct { id: i64, absent: []const u8 };
+    try std.testing.expectError(error.ColumnNotFound, queryAs(Row, &conn, a, "SELECT id, name FROM t;", .{}));
+}
+
+test "queryAs binds positional args of each supported type (text/int/float/bool)" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER, price REAL, active INTEGER);");
+    try conn.exec(
+        \\INSERT INTO t (id, name, qty, price, active) VALUES
+        \\ (1, 'keep', 5, 2.50, 1), (2, 'skip', 5, 2.50, 1), (3, 'keep', 9, 9.99, 0);
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Row = struct { id: i64, name: []const u8 };
+    // text ?1, int ?2, float ?3, bool ?4 — all four bound positionally in one query.
+    const rows = try queryAs(Row, &conn, a, "SELECT id, name FROM t WHERE name = ?1 AND qty = ?2 AND price = ?3 AND active = ?4;", .{ @as([]const u8, "keep"), @as(i64, 5), @as(f64, 2.50), true });
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].id);
+    try std.testing.expectEqualStrings("keep", rows[0].name);
+}
+
+test "queryAs: string-literal and optional args bind correctly" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);");
+    try conn.exec("INSERT INTO t (id, name) VALUES (1, 'ada'), (2, 'grace');");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Row = struct { id: i64, name: []const u8 };
+    // A bare string literal (`*const [3:0]u8`) coerces to bound TEXT.
+    const rows = try queryAs(Row, &conn, a, "SELECT id, name FROM t WHERE name = ?1;", .{"ada"});
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("ada", rows[0].name);
+
+    // An optional arg: Some binds the payload…
+    const some: ?i64 = 2;
+    const r2 = try queryAs(Row, &conn, a, "SELECT id, name FROM t WHERE id = ?1;", .{some});
+    try std.testing.expectEqual(@as(usize, 1), r2.len);
+    try std.testing.expectEqualStrings("grace", r2[0].name);
+
+    // …and null binds SQL NULL (matches no row here).
+    const none: ?i64 = null;
+    const r3 = try queryAs(Row, &conn, a, "SELECT id, name FROM t WHERE id = ?1;", .{none});
+    try std.testing.expectEqual(@as(usize, 0), r3.len);
+}
+
+test "queryAs: a JOIN with an aliased column across tables decodes by name" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE customers (id INTEGER PRIMARY KEY, email TEXT);");
+    try conn.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, total REAL);");
+    try conn.exec("INSERT INTO customers (id, email) VALUES (10, 'a@x.io');");
+    try conn.exec("INSERT INTO orders (id, customer_id, total) VALUES (1, 10, 42.0);");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const OrderRow = struct { id: i64, total: f64, customer_email: []const u8 };
+    const rows = try queryAs(OrderRow, &conn, a,
+        \\SELECT o.id, o.total, c.email AS customer_email
+        \\FROM orders o JOIN customers c ON c.id = o.customer_id;
+    , .{});
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].id);
+    try std.testing.expectEqual(@as(f64, 42.0), rows[0].total);
+    try std.testing.expectEqualStrings("a@x.io", rows[0].customer_email);
+}
+
+test "queryAs: a u64 arg above i64 max errors instead of panicking" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY);");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Row = struct { id: i64 };
+    // A u64 beyond i64 max would `@intCast`-panic; `std.math.cast` makes it a loud error.
+    const too_big: u64 = @as(u64, std.math.maxInt(i64)) + 1;
+    try std.testing.expectError(error.IntegerArgTooLarge, queryAs(Row, &conn, a, "SELECT id FROM t WHERE id = ?1;", .{too_big}));
+
+    // A u64 that DOES fit i64 binds fine (proves the cast, not a blanket reject).
+    const fits: u64 = 7;
+    _ = try queryAs(Row, &conn, a, "SELECT id FROM t WHERE id = ?1;", .{fits});
+}
+
+test "queryAs: a column value that overflows a narrow/unsigned field errors instead of panicking" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, small INTEGER);");
+    // n=300 overflows a u8; small=-5 is negative into an unsigned field.
+    try conn.exec("INSERT INTO t (id, n, small) VALUES (1, 300, -5), (2, 42, 7);");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Reading 300 into a u8 field would `@intCast`-panic in a Safe build; the checked cast
+    // makes it a loud, recoverable error.
+    const Narrow = struct { id: i64, n: u8 };
+    try std.testing.expectError(error.IntegerOverflow, queryAs(Narrow, &conn, a, "SELECT id, n FROM t WHERE id = ?1;", .{@as(i64, 1)}));
+
+    // A negative value into an unsigned field also errors, not panics.
+    const Unsigned = struct { id: i64, small: u32 };
+    try std.testing.expectError(error.IntegerOverflow, queryAs(Unsigned, &conn, a, "SELECT id, small FROM t WHERE id = ?1;", .{@as(i64, 1)}));
+
+    // A value that FITS the narrow field decodes correctly (proves it's a real cast, not a reject).
+    const rows = try queryAs(Narrow, &conn, a, "SELECT id, n FROM t WHERE id = ?1;", .{@as(i64, 2)});
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(u8, 42), rows[0].n);
 }

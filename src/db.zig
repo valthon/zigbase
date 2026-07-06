@@ -170,6 +170,23 @@ pub const Stmt = if (build_options.postgres) union(Backend) {
             inline else => |*s| return s.columnText(idx),
         }
     }
+    /// Number of result columns. On Postgres this is only known after the first `step()`
+    /// (the row description arrives with the result); on SQLite it is valid right after
+    /// `prepare`. Name-mapped decoders (`data.queryAs`) step once before reading it so the
+    /// count is populated on both backends.
+    pub fn columnCount(self: *Stmt) c_int {
+        switch (self.*) {
+            inline else => |*s| return s.columnCount(),
+        }
+    }
+    /// The name of result column `idx` (respecting `AS` aliases). Empty if out of range —
+    /// or, on Postgres, before the first `step()`. Both backends expose result-column names
+    /// (sqlite: `sqlite3_column_name`; postgres: the RowDescription `name`).
+    pub fn columnName(self: *Stmt, idx: c_int) []const u8 {
+        switch (self.*) {
+            inline else => |*s| return s.columnName(idx),
+        }
+    }
     pub fn columnInt(self: *Stmt, idx: c_int) i64 {
         switch (self.*) {
             inline else => |*s| return s.columnInt(idx),
