@@ -299,8 +299,33 @@ wrong-typed handler is a compile error). `.auth` is optional and **defaults to
 `.superuser`** (the safe default) when omitted. The three auth levels are:
 
 - `.public` — anyone (anonymous identity still provided).
-- `.authed` — any authenticated user.
+- `.authed` — any authenticated principal (a token from **any** auth collection).
 - `.superuser` — superusers only.
+
+**Collection-scoped `.authed` (`#243`).** With more than one auth collection, a bare `.authed`
+accepts a principal from *any* of them. To require the principal belong to a **specific** auth
+collection, pass a struct instead of the bare enum:
+
+```zig
+// Only principals whose token was minted for the `customers` collection may reach this route.
+.{ .method = .GET, .path = "/api/portal/me", .handler = portal.me,
+   .auth = .{ .authed = "customers" } },
+
+// `operators` principals OR a superuser (opt-in via .allow_superuser).
+.{ .method = .GET, .path = "/api/ops/x", .handler = ops.x,
+   .auth = .{ .authed = "operators", .allow_superuser = true } },
+```
+
+- **Fail-closed, no oracle.** A valid token from **any other** collection — and a superuser, unless
+  `.allow_superuser = true` — is rejected with the **same `401 "Not authenticated."`** as no token
+  at all. The response never distinguishes "wrong collection" from "no token", so a caller can't
+  probe which collection a route belongs to. An empty principal id is likewise rejected.
+- **`.allow_superuser`** (optional, default `false`) — additionally accept a superuser token.
+- **Comptime-validated.** The named collection must be **declared** in `.collections` **and** be of
+  `.type = .auth`; a typo, an undeclared name, or a non-auth collection is a **`@compileError`** at
+  build time (fail-fast), as is an unknown sibling key or a non-string `.authed`/non-bool
+  `.allow_superuser`.
+- A plain `.authed` (bare enum) is **unchanged** — it still accepts any authenticated principal.
 
 The handler signature is:
 

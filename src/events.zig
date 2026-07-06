@@ -192,6 +192,19 @@ pub const RouteAuthGuard = union(enum) {
     path_secret: PathSecretGuard,
 };
 
+/// A collection-scoped `.authed` gate (#243). `.auth = .{ .authed = "<collection>" }` requires a
+/// valid token whose principal belongs to `<collection>`; a token from any OTHER collection — and a
+/// superuser, UNLESS `.allow_superuser = true` — is rejected with the SAME 401 as no token at all
+/// (fail-closed, no oracle). Enforced in `server.zig dispatchCustom` AFTER the `.authed` token check.
+/// The referenced collection is comptime-validated (exists + is `.type = .auth`) by
+/// `assertAuthedCollectionRoutes`, which the `App(cfg)` builder calls with the declared collections.
+pub const AuthedCollection = struct {
+    /// The auth collection a principal must belong to for the route to run.
+    collection: []const u8,
+    /// When true, a superuser token is additionally accepted (defaults to superusers-denied).
+    allow_superuser: bool = false,
+};
+
 /// App-supplied key function for a per-route rate-limit bucket (#142). Returns the string to
 /// key the bucket on (e.g. an API key or resolved user id); returning null falls back to the
 /// trust_proxy-honored client IP. Receives the request-bound `*Ctx`.
@@ -214,6 +227,11 @@ pub const RuntimeRoute = struct {
     auth: AuthLevel,
     /// Optional declarative auth guard applied AFTER the AuthLevel check (#139). Null = none.
     auth_guard: ?RouteAuthGuard = null,
+    /// Optional collection-scoped `.authed` gate (#243). Non-null ⇒ `auth` is `.authed` (a token is
+    /// required) AND the principal must belong to `collection` (or be a superuser when
+    /// `allow_superuser`). Null = the plain `.authed`/`.public`/`.superuser` semantics (a plain
+    /// `.authed` accepts ANY authenticated principal). Enforced in `server.zig dispatchCustom`.
+    authed_collection: ?AuthedCollection = null,
     /// Per-route rate limit (#142). `.default`/`.off` ⇒ no per-route bucket (routes are
     /// unthrottled by default); `.custom` ⇒ a dedicated bucket of max/window_s.
     rate_limit: schema.RateLimitOpt = .default,
@@ -282,19 +300,107 @@ fn authIsLevel(comptime A: type) bool {
     return A == AuthLevel or A == @TypeOf(.enum_literal);
 }
 
-/// The effective AuthLevel for a route spec: the literal when `.auth` is an AuthLevel, else
-/// `.public` (a guard-gated route is public at the AuthLevel layer — the guard is the gate),
-/// defaulting to `.superuser` (safe default) when `.auth` is omitted.
-fn routeAuthLevel(comptime s: anytype) AuthLevel {
-    if (!@hasField(@TypeOf(s), "auth")) return .superuser;
-    return if (authIsLevel(@TypeOf(s.auth))) s.auth else .public;
+/// True iff `.auth` is a collection-scoped `.authed` gate struct — `.{ .authed = "..." }` (with an
+/// optional `.allow_superuser`) — as opposed to an AuthLevel literal or a `.path_secret` guard. The
+/// discriminator is the `.authed` field name (the `.path_secret` guard carries a `.path_secret` field).
+fn authIsAuthedCollection(comptime A: type) bool {
+    return @typeInfo(A) == .@"struct" and @hasField(A, "authed");
 }
 
-/// The lowered `RouteAuthGuard` for a route spec, or null when `.auth` is an AuthLevel/omitted.
+/// True iff `T` is a string type (`[]const u8` slice or a `*const [N:0]u8` string literal).
+fn authValueIsString(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .pointer) return false;
+    const p = info.pointer;
+    if (p.size == .slice) return p.child == u8;
+    if (p.size == .one) {
+        const c = @typeInfo(p.child);
+        return c == .array and c.array.child == u8;
+    }
+    return false;
+}
+
+/// Lower a `.auth = .{ .authed = "<collection>" }` gate struct into an `AuthedCollection`. Loud
+/// `@compileError` on an unknown sibling key (anything other than `.authed`/`.allow_superuser`), a
+/// non-string `.authed`, or a non-bool `.allow_superuser`. The collection NAME is validated
+/// separately by `assertAuthedCollectionRoutes` (which knows the declared collection set).
+fn lowerAuthedCollection(comptime a: anytype, comptime path: []const u8) AuthedCollection {
+    const A = @TypeOf(a);
+    if (A == AuthedCollection) return a;
+    if (@typeInfo(A) != .@"struct")
+        @compileError("route '" ++ path ++ "': .auth collection gate must be a struct .{ .authed = \"<collection>\" } (optionally .allow_superuser = true)");
+    for (std.meta.fields(A)) |f| {
+        const ok = std.mem.eql(u8, f.name, "authed") or std.mem.eql(u8, f.name, "allow_superuser");
+        if (!ok) @compileError("route '" ++ path ++ "': unknown key '." ++ f.name ++ "' on the .auth gate (recognized: .authed, .allow_superuser)");
+    }
+    if (!@hasField(A, "authed"))
+        @compileError("route '" ++ path ++ "': .auth gate struct must have an .authed = \"<collection>\" field");
+    if (!authValueIsString(@TypeOf(a.authed)))
+        @compileError("route '" ++ path ++ "': .auth.authed must be a string collection name, e.g. .{ .authed = \"customers\" }");
+    var gate = AuthedCollection{ .collection = a.authed };
+    if (@hasField(A, "allow_superuser")) {
+        if (@TypeOf(a.allow_superuser) != bool)
+            @compileError("route '" ++ path ++ "': .auth.allow_superuser must be a bool (true/false)");
+        gate.allow_superuser = a.allow_superuser;
+    }
+    return gate;
+}
+
+/// The effective AuthLevel for a route spec: the literal when `.auth` is an AuthLevel; `.authed`
+/// when `.auth` is a `.{ .authed = "..." }` collection gate (the token check runs first, the
+/// collection check after); else `.public` (a `.path_secret` guard-gated route is public at the
+/// AuthLevel layer — the guard is the gate), defaulting to `.superuser` (safe default) when omitted.
+fn routeAuthLevel(comptime s: anytype) AuthLevel {
+    if (!@hasField(@TypeOf(s), "auth")) return .superuser;
+    if (authIsLevel(@TypeOf(s.auth))) return s.auth;
+    if (authIsAuthedCollection(@TypeOf(s.auth))) return .authed;
+    return .public;
+}
+
+/// The lowered `RouteAuthGuard` for a route spec, or null when `.auth` is an AuthLevel, a
+/// `.{ .authed = "..." }` collection gate, or omitted.
 fn routeAuthGuard(comptime s: anytype) ?RouteAuthGuard {
     if (!@hasField(@TypeOf(s), "auth")) return null;
     if (authIsLevel(@TypeOf(s.auth))) return null;
+    if (authIsAuthedCollection(@TypeOf(s.auth))) return null;
     return lowerRouteAuthGuard(s.auth, s.path);
+}
+
+/// The lowered collection-scoped `.authed` gate for a route spec, or null when `.auth` isn't a
+/// `.{ .authed = "..." }` struct. See `AuthedCollection`.
+fn routeAuthedCollection(comptime s: anytype) ?AuthedCollection {
+    if (!@hasField(@TypeOf(s), "auth")) return null;
+    if (authIsLevel(@TypeOf(s.auth))) return null;
+    if (!authIsAuthedCollection(@TypeOf(s.auth))) return null;
+    return lowerAuthedCollection(s.auth, s.path);
+}
+
+/// Comptime-validate that every route carrying a collection-scoped `.authed` gate (#243) names a
+/// collection that is DECLARED in `.collections` AND is of `.type = .auth`. A typo, an absent
+/// collection, or a non-auth (`.base`/`.view`) collection is a loud `@compileError` at build time
+/// (fail-fast). Called from the `App(cfg)` builder, which threads in the lowered collection set —
+/// `buildRoutes` alone can't do this (it never sees the collections). Zero runtime effect.
+pub fn assertAuthedCollectionRoutes(comptime routes: []const RuntimeRoute, comptime cols: []const schema.Collection) void {
+    comptime {
+        for (routes) |rt| {
+            const gate = rt.authed_collection orelse continue;
+            var found_any = false;
+            var found_auth = false;
+            for (cols) |c| {
+                if (std.mem.eql(u8, c.name, gate.collection)) {
+                    found_any = true;
+                    if (c.type == .auth) found_auth = true;
+                }
+            }
+            if (!found_auth) {
+                if (found_any)
+                    @compileError("route '" ++ rt.pattern ++ "': .auth.authed references collection '" ++
+                        gate.collection ++ "' which is not an auth collection (its .type must be .auth)");
+                @compileError("route '" ++ rt.pattern ++ "': .auth.authed references unknown auth collection '" ++
+                    gate.collection ++ "'; declare it in .collections with .type = .auth");
+            }
+        }
+    }
 }
 
 /// Which flow minted (or is about to mint) the session. `.refresh` (new in 0.10.0) tags
@@ -728,6 +834,7 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
                     .handler = handler,
                     .auth = auth,
                     .auth_guard = routeAuthGuard(s),
+                    .authed_collection = routeAuthedCollection(s),
                     .rate_limit = rate_limit,
                     .rate_limit_key = rate_limit_key,
                 };
