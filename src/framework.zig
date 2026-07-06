@@ -2289,11 +2289,121 @@ test "checkAppContextInitialized enforces the app-context boot contract (#245)" 
     try checkAppContextInitialized(null, ptr);
 }
 
-fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts, environ: *const std.process.Environ.Map) !void {
+/// Owned holder for a fully-booted `App` and every instance the App holds an INTERIOR
+/// POINTER into. Heap-allocated by `bootApp` and filled IN PLACE so `&holder.pool`,
+/// `&holder.storage_iface`, `&holder.am_registry`, `&holder.rate_limiter`, … all have
+/// STABLE addresses that outlive the boot function — the App's `.pool` / `.storage` /
+/// `.mailer` / `.sms_sender` / `.auth_methods` / `.rate_limiter` / `.col_cache` /
+/// `.feature_cache` fields point straight at these sibling fields. Nothing here may be
+/// a stack local (that is precisely the dangling-pointer bug this refactor exists to avoid).
+///
+/// The type is parameterized by the comptime `opts` because the storage/mailer/sms plugin
+/// instances and the auth-method registry storage are comptime-selected types.
+///
+/// `deinit` tears everything down in the reverse order the fields were initialized (mirroring
+/// the `defer` LIFO the monolithic `serveImpl` used), then frees the owned jwt secret and
+/// finally destroys the heap box. The scheduler and background memory pool are NOT owned here
+/// — they live in `serveImpl` (the "serve" half) and must be stopped/joined BEFORE `deinit`
+/// runs, because their worker threads touch `pool`/`storage`.
+fn BootedApp(comptime opts: ServeOpts) type {
+    const am_types = opts.auth_method_types;
+    const AuthMethod = @import("auth/method.zig").AuthMethod;
+    const SmsSender = @import("sms/sender.zig").SmsSender;
+    return struct {
+        const Self = @This();
+
+        allocator: std.mem.Allocator,
+        /// Resolved config (jwt_secret already stamped). String slices still borrow the
+        /// caller-owned backing exactly as the App fields do; this copy is a convenience so
+        /// `serveImpl` can read http_host/http_port after boot.
+        cfg: config.Config,
+        /// Owned by the holder (freed last, after pool). The App's `.jwt_secret` borrows it.
+        jwt_secret: []const u8,
+        pool: db.Pool,
+        /// Only meaningful when `cfg.field_key.len > 0`; the pool holds a pointer into it.
+        field_cipher: field_policy.Cipher,
+        storage_inst: opts.StoragePlugin,
+        storage_iface: files_storage.Storage,
+        mailer_inst: opts.MailerPlugin,
+        mailer_iface: mail.Mailer,
+        sms_inst: opts.SmsProviderPlugin,
+        sms_iface: SmsSender,
+        /// Registry storage: `am_registry.methods` points into `am_views`, which is built
+        /// from `am_insts`. All three must keep stable addresses across the App's lifetime.
+        am_insts: registry.Instances(am_types),
+        am_views: [am_types.len]AuthMethod,
+        am_registry: registry.Registry,
+        rate_limiter: ratelimit.RateLimiter,
+        /// Heap-allocated root set (embedded mode) or empty; freed by `freeSpaRoots`.
+        spa_roots: []const []const u8,
+        col_cache_inst: ?colcache.Cache,
+        feature_cache_inst: feature_cache.FeatureOverrideCache,
+        /// The fully-assembled application. Interior pointers reference the sibling fields
+        /// above. `serveImpl` takes `&self.app` for the server/scheduler/mem-pool.
+        app: app_mod.App,
+
+        pub fn deinit(self: *Self) void {
+            self.feature_cache_inst.deinit();
+            if (self.col_cache_inst) |*c| c.deinit();
+            static_files.freeSpaRoots(self.allocator, self.spa_roots);
+            self.rate_limiter.deinit();
+            registry.deinit(am_types, &self.am_insts);
+            self.sms_inst.deinit();
+            self.mailer_inst.deinit();
+            self.storage_inst.deinit();
+            self.pool.deinit();
+            self.allocator.free(self.jwt_secret);
+            const alloc = self.allocator;
+            alloc.destroy(self);
+        }
+    };
+}
+
+/// Boot the full application WITHOUT binding a socket, returning an owned `*BootedApp(opts)`.
+///
+/// This is the reusable seam extracted out of `serveImpl` (Stage 1 of the in-process test
+/// harness, #239): it runs everything the monolithic serve path did before `srv.listen()` —
+/// jwt resolution, dev clock/entropy install, pool open, field-cipher resolution, migrations +
+/// comptime provisioning, startup GC sweeps, storage/mailer/sms plugin creation, the auth-method
+/// registry, the rate limiter, static-source resolution, and the App assembly (+ metadata /
+/// feature caches and the captcha/unsubscribe/VAPID validations) — in the SAME order.
+///
+/// It ALSO fires `onBootstrap` (bootstrap is part of "boot" — the harness will want it to have
+/// run) and enforces the app-context boot contract. It does NOT fire `onBeforeServe` /
+/// `onBeforeTerminate`, nor start the scheduler / memory pool — those are the "serve" half and
+/// stay in `serveImpl` (or, in Stage 3, the harness) after `bootApp` returns a ready App.
+///
+/// The holder is heap-allocated and every field is filled IN PLACE so the App's interior
+/// pointers reference stable sibling fields (never a stack local). On any failure the errdefers
+/// unwind exactly the resources initialized so far; on success ownership transfers to the caller,
+/// who must eventually call `holder.deinit()`.
+fn bootApp(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg_in: config.Config,
+    dispatch: *const events.Dispatch,
+    jobs: []const scheduler.RuntimeJob,
+    pool_size: usize,
+    schema_collections: []const schema.Collection,
+    schema_migrations: []const provision.Migration,
+    comptime opts: ServeOpts,
+    environ: *const std.process.Environ.Map,
+) !*BootedApp(opts) {
+    // jobs / pool_size are consumed by the scheduler (the "serve" half in serveImpl); they are
+    // accepted here only to keep the boot entry point's signature stable for the Stage-3 harness.
+    _ = jobs;
+    _ = pool_size;
+
+    const Holder = BootedApp(opts);
+    const holder = try allocator.create(Holder);
+    errdefer allocator.destroy(holder);
+    holder.allocator = allocator;
+
     var cfg = cfg_in;
     const jwt_secret = try resolveJwtSecret(allocator, io, cfg);
-    defer allocator.free(jwt_secret);
+    errdefer allocator.free(jwt_secret);
     cfg.jwt_secret = jwt_secret;
+    holder.jwt_secret = jwt_secret;
     // Install the dev-only frozen clock (ZIGBASE_FAKE_NOW) so every framework "now" — token
     // expiry, scheduling, challenge/cursor TTLs — reads the override. No-op + null on a prod
     // build (the gate is comptime-off; see clock.zig).
@@ -2312,20 +2422,19 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         std.log.err("refusing to start: ZIGBASE_SSE_HEARTBEAT_SECONDS/--sse-heartbeat-seconds must be 0 (inherit) or 1..=255, got {d}", .{cfg.sse_heartbeat_seconds});
         return error.InvalidSseHeartbeat;
     }
-    var pool = try openPoolSelect(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib }, environ);
-    defer pool.deinit();
+    holder.pool = try openPoolSelect(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib }, environ);
+    errdefer holder.pool.deinit();
     // Transparent at-rest field encryption (Theme B1). Resolve the cipher ONCE from
     // ZIGBASE_FIELD_KEY and stamp it onto the pool so every acquired connection carries
     // it (db.zig). FAIL-CLOSED: if any collection declares an `.encrypted` field but no
     // key is configured, refuse to start rather than silently storing plaintext. The
-    // cipher is a serveImpl stack var that outlives srv.listen(); pool points at it.
-    var field_cipher: field_policy.Cipher = undefined;
+    // cipher lives in the holder (stable address); the pool points at it.
     if (cfg.field_key.len > 0) {
-        field_cipher = field_policy.Cipher.resolve(io, config.EnvGetter{ .environ = environ }, cfg.field_key, cfg.field_key_generation) catch |e| {
+        holder.field_cipher = field_policy.Cipher.resolve(io, config.EnvGetter{ .environ = environ }, cfg.field_key, cfg.field_key_generation) catch |e| {
             std.log.err("refusing to start: invalid field-encryption key config ({s}); see ZIGBASE_FIELD_KEY_GENERATION / ZIGBASE_FIELD_KEY_V<n>", .{@errorName(e)});
             return e;
         };
-        db.poolSetFieldCipher(&pool, @ptrCast(&field_cipher));
+        db.poolSetFieldCipher(&holder.pool, @ptrCast(&holder.field_cipher));
         if (cfg.field_key_generation != 1)
             std.log.info("field encryption: primary generation v{d} (writes); older generations read from ZIGBASE_FIELD_KEY_V<n>. Run `zigbase rewrap` to migrate old data forward.", .{cfg.field_key_generation});
     } else if (anyEncryptedField(schema_collections)) {
@@ -2333,8 +2442,8 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         return error.FieldKeyRequired;
     }
     {
-        const w = pool.acquireWriter();
-        defer pool.releaseWriter();
+        const w = holder.pool.acquireWriter();
+        defer holder.pool.releaseWriter();
         try migrations.run(w);
         // Comptime-schema provisioning. When `.collections`/`.migrations` are absent
         // both slices are empty, so this whole block is a no-op and the binary behaves
@@ -2382,7 +2491,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         // schema whose ciphertext can never be read. (The value layer also fails closed on
         // read/write, so plaintext never leaks; this just turns a silent half-broken server
         // into a loud startup refusal.)
-        if (db.poolFieldCipher(&pool) == null) {
+        if (db.poolFieldCipher(&holder.pool) == null) {
             var scan_arena = std.heap.ArenaAllocator.init(allocator);
             defer scan_arena.deinit();
             if (try liveEncryptedCollection(scan_arena.allocator(), w)) |cname| {
@@ -2407,34 +2516,33 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             _ = @import("records.zig").gcExpiredRecords(ttl_arena.allocator(), w) catch |e| std.log.warn("TTL GC at startup failed: {s}", .{@errorName(e)});
         }
     }
-    // Instantiate the comptime-selected storage + mailer plugins. The instances are
-    // serveImpl stack vars that outlive the server (srv.listen() runs to shutdown),
-    // and the vtable handles below point at them.
-    var storage_inst = try opts.StoragePlugin.create(allocator, io, cfg);
-    defer storage_inst.deinit();
-    const storage_iface = storage_inst.interface();
+    // Instantiate the comptime-selected storage + mailer plugins into the holder (stable
+    // addresses that outlive boot), and build the vtable handles pointing at them.
+    holder.storage_inst = try opts.StoragePlugin.create(allocator, io, cfg);
+    errdefer holder.storage_inst.deinit();
+    holder.storage_iface = holder.storage_inst.interface();
 
-    var mailer_inst = try opts.MailerPlugin.create(allocator, io, cfg);
-    defer mailer_inst.deinit();
-    const mailer_iface = mailer_inst.interface();
+    holder.mailer_inst = try opts.MailerPlugin.create(allocator, io, cfg);
+    errdefer holder.mailer_inst.deinit();
+    holder.mailer_iface = holder.mailer_inst.interface();
 
-    var sms_inst = try opts.SmsProviderPlugin.create(allocator, io, cfg);
-    defer sms_inst.deinit();
-    const sms_iface = sms_inst.interface();
+    holder.sms_inst = try opts.SmsProviderPlugin.create(allocator, io, cfg);
+    errdefer holder.sms_inst.deinit();
+    holder.sms_iface = holder.sms_inst.interface();
 
-    // Instantiate the comptime-assembled auth method registry. `am_insts` and `am_views`
-    // are serveImpl stack vars that outlive the server (like storage/mailer). The Registry
-    // value points into `am_views`, so all three must remain in scope across srv.listen().
+    // Instantiate the comptime-assembled auth method registry. `am_insts` and `am_views` live
+    // in the holder (stable addresses that outlive boot). The Registry value points into
+    // `am_views`, so all three must remain valid for the App's lifetime.
     const am_types = comptime opts.auth_method_types;
-    var am_insts: registry.Instances(am_types) = undefined;
-    var am_views: [am_types.len]@import("auth/method.zig").AuthMethod = undefined;
-    var am_registry = try registry.build(am_types, &am_insts, &am_views, allocator, io, cfg);
-    defer registry.deinit(am_types, &am_insts);
+    holder.am_insts = undefined;
+    holder.am_views = undefined;
+    holder.am_registry = try registry.build(am_types, &holder.am_insts, &holder.am_views, allocator, io, cfg);
+    errdefer registry.deinit(am_types, &holder.am_insts);
 
-    // In-memory rate limiter for sensitive auth endpoints. A serveImpl stack var that
-    // outlives the server (like storage/mailer); skipped entirely when disabled.
-    var rate_limiter = ratelimit.RateLimiter.init(allocator, cfg.rate_limit_max, cfg.rate_limit_window_s);
-    defer rate_limiter.deinit();
+    // In-memory rate limiter for sensitive auth endpoints; lives in the holder (stable
+    // address); no-ops when disabled.
+    holder.rate_limiter = ratelimit.RateLimiter.init(allocator, cfg.rate_limit_max, cfg.rate_limit_window_s);
+    errdefer holder.rate_limiter.deinit();
 
     // Resolve the static-file source from the comptime mode (+ --serve-static in
     // default mode). A configured-but-missing dir is a fatal startup error.
@@ -2501,7 +2609,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     //   as the shell); an unreadable subdirectory is skipped with a warning, exactly
     //   like dir-mode serving already treats an unreadable file as if it doesn't exist.
     var spa_validate_failure: static_files.SpaValidateFailure = undefined;
-    const spa_roots: []const []const u8 = if (opts.enable_spa_marker) blk: {
+    holder.spa_roots = if (opts.enable_spa_marker) blk: {
         switch (static_source) {
             .embedded => |files| break :blk try static_files.deriveEmbeddedSpaRoots(allocator, files),
             .dir => |dir_path| {
@@ -2529,12 +2637,12 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             .none => break :blk &.{},
         }
     } else &.{};
-    defer static_files.freeSpaRoots(allocator, spa_roots);
+    errdefer static_files.freeSpaRoots(allocator, holder.spa_roots);
 
-    var app = app_mod.App{
+    holder.app = app_mod.App{
         .allocator = allocator,
         .io = io,
-        .pool = &pool,
+        .pool = &holder.pool,
         .jwt_secret = cfg.jwt_secret,
         .public_url = cfg.public_url,
         .cookie_secure = cfg.cookie_secure,
@@ -2554,7 +2662,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .static_source = static_source,
         .static_routes = opts.static_routes,
         .static_cache_control = static_cc,
-        .spa_roots = spa_roots,
+        .spa_roots = holder.spa_roots,
         .spa_marker_enabled = opts.enable_spa_marker,
         .collections_frozen = opts.collections_frozen,
         .pagination = .{
@@ -2566,10 +2674,10 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         .role_ranking = opts.role_ranking,
         .mail = opts.mail,
         .sms = opts.sms,
-        .sms_sender = &sms_iface,
+        .sms_sender = &holder.sms_iface,
         .files = opts.files,
         .push = opts.push,
-        .storage = &storage_iface,
+        .storage = &holder.storage_iface,
         .storage_info = .{
             .backend = if (comptime build_options.s3) (if (cfg.s3_bucket.len > 0) .s3 else .local) else .local,
             .dir = "storage",
@@ -2578,8 +2686,8 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
             .endpoint = cfg.s3_endpoint,
             .key_prefix = cfg.s3_key_prefix,
         },
-        .mailer = &mailer_iface,
-        .auth_methods = @ptrCast(&am_registry),
+        .mailer = &holder.mailer_iface,
+        .auth_methods = @ptrCast(&holder.am_registry),
         .dispatch = dispatch,
         .features = opts.features,
         .experiment_assignment_ttl = opts.experiment_assignment_ttl,
@@ -2592,30 +2700,31 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         // rate_limit_max==0 (RateLimiter.allow returns true for max==0), but a configured
         // per-method custom limit must still be honored against this store regardless of
         // the global default. (null only in tests/CLI that construct App directly.)
-        .rate_limiter = &rate_limiter,
+        .rate_limiter = &holder.rate_limiter,
     };
+    const app = &holder.app;
     // Collection-metadata cache (R1-4): installed for SQLite (single-process, so the in-process
     // invalidation on the admin DDL endpoints is complete) OR when `collections_frozen` is set.
     // Frozen mode asserts collections never change after boot + migrations, so the cache is
     // coherent for the process lifetime on ANY backend (incl. Postgres): no invalidation ever
     // fires (the DDL endpoints 403), and provisioning/migrations run before serving. Without
     // freeze, Postgres multi-instance deployments skip it (another instance's DDL would be
-    // unseen, so reads stay direct). Declared here (before mem_pool/scheduler) so LIFO tears it
-    // down LAST — realtime and record handlers borrow leases from it until zap stops.
-    var col_cache_inst: ?colcache.Cache = if (db.poolDialect(&pool).kind == .sqlite or opts.collections_frozen)
+    // unseen, so reads stay direct). Held in the holder so LIFO teardown (deinit) tears it down
+    // LAST — realtime and record handlers borrow leases from it until zap stops.
+    holder.col_cache_inst = if (db.poolDialect(&holder.pool).kind == .sqlite or opts.collections_frozen)
         colcache.Cache.init(allocator)
     else
         null;
-    defer if (col_cache_inst) |*c| c.deinit();
-    if (col_cache_inst) |*c| app.col_cache = c;
+    errdefer if (holder.col_cache_inst) |*c| c.deinit();
+    if (holder.col_cache_inst) |*c| app.col_cache = c;
     // Feature-override cache (#230): installed on BOTH backends. Same-instance override
     // writes invalidate it instantly (the ctx/settings write sites call `invalidate()`,
     // NOT gated on the realtime reactor); a Postgres cross-instance write self-heals within
     // the snapshot TTL (≤5s). The two caches are independent, so teardown order between them
-    // does not matter (this defer, declared after col_cache's, runs first by LIFO).
-    var feature_cache_inst = feature_cache.FeatureOverrideCache.init(allocator);
-    defer feature_cache_inst.deinit();
-    app.feature_cache = &feature_cache_inst;
+    // does not matter.
+    holder.feature_cache_inst = feature_cache.FeatureOverrideCache.init(allocator);
+    errdefer holder.feature_cache_inst.deinit();
+    app.feature_cache = &holder.feature_cache_inst;
     // Loud startup warning for the captcha dev-bypass: a configured provider with an empty
     // secret silently passes EVERY verifyCaptcha (the dev-bypass), a prod footgun. Mirrors
     // the `@public`-rule startup warning so operators catch it before deploying.
@@ -2649,13 +2758,15 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         std.log.info("web push: VAPID keys configured; ctx.push() will deliver notifications", .{});
     }
     const Ctx = @import("ctx.zig").Ctx;
-    // Each lifecycle hook gets a per-invocation arena owning any ctx.records()
-    // results, declared before cx so its deinit runs last (LIFO).
+    // onBootstrap is part of "boot": it runs here (inside bootApp) so a booted App — including
+    // the in-process test harness in Stage 3 — is fully bootstrapped before use. Each lifecycle
+    // hook gets a per-invocation arena owning any ctx.records() results, declared before cx so
+    // its deinit runs last (LIFO).
     if (dispatch.on_bootstrap) |h| {
-        var ev = events.LifecycleEvent{ .app = &app };
+        var ev = events.LifecycleEvent{ .app = app };
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        var cx = Ctx{ .app = app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
         h(&cx, &ev) catch |e| {
             std.log.err("refusing to start: onBootstrap hook failed: {s}", .{@errorName(e)});
@@ -2669,41 +2780,60 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         std.log.err("refusing to start: config declared `.app_context = {s}` but `ctx.setAppData` was never called — set it in your `onBootstrap` hook", .{dispatch.app_context_type.?});
         return e;
     };
+
+    // Persist the resolved cfg (with jwt_secret stamped) so serveImpl can read host/port.
+    holder.cfg = cfg;
+    return holder;
+}
+
+fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts, environ: *const std.process.Environ.Map) !void {
+    // Boot the full application (everything before the socket bind), then fire onBeforeServe,
+    // start the scheduler + background pool, and listen. `holder` OWNS the pool / storage /
+    // mailer / registry / caches the App points into; its deinit runs LAST (LIFO), after the
+    // scheduler and memory pool have been stopped and joined below.
+    const holder = try bootApp(allocator, io, cfg_in, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, environ);
+    defer holder.deinit();
+    const app = &holder.app;
+    const cfg = holder.cfg;
+
+    const Ctx = @import("ctx.zig").Ctx;
     if (dispatch.on_before_serve) |h| {
-        var ev = events.LifecycleEvent{ .app = &app };
+        var ev = events.LifecycleEvent{ .app = app };
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        var cx = Ctx{ .app = app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
         h(&cx, &ev) catch |e| {
             std.log.err("refusing to start: onBeforeServe hook failed: {s}", .{@errorName(e)});
             return e;
         };
     }
-    // before_terminate fires when listen() returns (graceful shutdown / error).
+    // before_terminate fires when listen() returns (graceful shutdown / error). Declared after
+    // holder.deinit's defer, so (LIFO) it runs BEFORE the holder is torn down — the hook may
+    // still touch app.pool / records.
     defer if (dispatch.on_before_terminate) |h| {
-        var ev = events.LifecycleEvent{ .app = &app };
+        var ev = events.LifecycleEvent{ .app = app };
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        var cx = Ctx{ .app = app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
         h(&cx, &ev) catch |e| std.log.err("onBeforeTerminate hook failed: {s}", .{@errorName(e)});
     };
     const host_z = try allocator.dupeZ(u8, cfg.http_host);
     defer allocator.free(host_z);
     const Srv = server.Server(opts.gates);
-    var srv = Srv{ .app = &app, .host = host_z, .port = cfg.http_port };
+    var srv = Srv{ .app = app, .host = host_z, .port = cfg.http_port };
     // Bounded background pool for memory-queue jobs + app.submit (R1-2). Worker threads
     // spawn lazily on first use (zero overhead when unused) and stop() drains + joins.
     // Its defer is registered BEFORE the scheduler's, so (LIFO) the scheduler stops FIRST
     // — a cron handler may still enqueue/submit during its final run.
-    var mem_pool = queue_memory.Pool.init(&app);
-    mem_pool.install(&app);
+    var mem_pool = queue_memory.Pool.init(app);
+    mem_pool.install(app);
     defer mem_pool.stop();
     // Start the scheduler only when jobs are configured. Registered LAST among the teardown
     // defers, so (LIFO) its stop()+deinit() runs FIRST on return — joining worker threads
-    // before pool.deinit()/storage_inst go out of scope, since workers touch app.pool/storage.
-    var sched: ?scheduler.Scheduler = if (jobs.len > 0) try scheduler.Scheduler.initSized(allocator, &app, jobs, pool_size, opts.job_stack_size) else null;
+    // before holder.deinit() frees pool/storage, since workers touch app.pool/storage.
+    var sched: ?scheduler.Scheduler = if (jobs.len > 0) try scheduler.Scheduler.initSized(allocator, app, jobs, pool_size, opts.job_stack_size) else null;
     if (sched) |*s| try s.start();
     defer if (sched) |*s| {
         s.stop();
