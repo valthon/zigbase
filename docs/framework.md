@@ -3318,7 +3318,8 @@ pub const Migration = struct {
     change: ?*const fn (m: *zigbase.Migrator) anyerror!void = null,
     /// Explicit forward step — use when the change isn't auto-reversible (raw SQL, data transforms).
     up: ?*const fn (m: *zigbase.Migrator) anyerror!void = null,
-    /// Explicit reverse step for rollback. Pairs with `up`. (Rollback CLI lands in a follow-up.)
+    /// Explicit reverse step for rollback (`migrate rollback`). Pairs with `up`, or overrides a
+    /// `change`'s auto-derived inverse.
     down: ?*const fn (m: *zigbase.Migrator) anyerror!void = null,
     /// Per-migration transactional opt-out (default `true`) for DDL that can't run in a transaction.
     transactional: bool = true,
@@ -3349,9 +3350,18 @@ fn addComments(m: *zigbase.Migrator) anyerror!void {
 }
 ```
 
-Applied forward, that creates the table, adds the column, and builds the index. A future
-rollback re-runs the **same** function in reverse (`m.direction == .reverse`), where each op
-emits its inverse in reverse op-order: drop the index, drop the column, drop the table.
+Applied forward, that creates the table, adds the column, and builds the index. A rollback
+(`migrate rollback`) re-runs the **same** function with `m.direction == .reverse`, where each op
+emits its inverse.
+
+> **Sharp edge — ops do NOT reorder within a `change`.** Reverse re-runs the body top-to-bottom,
+> inverting each op *in place* (the DSL emits SQL eagerly — there is no recorded op list to replay
+> backwards). So a single `change` that does `createTable("t", …)` then a dependent
+> `addColumn("t", …)` reverses as `DROP TABLE t` **then** `DROP COLUMN t.…` — and the second step
+> fails because the table is already gone. Put a `createTable` and a dependent `addColumn` (or any
+> op that depends on an earlier op in the same body) in **separate migrations**: rollback processes
+> migrations newest-first, so the dependent one unwinds before its dependency. Independent ops in
+> one `change` (e.g. touching different tables) are fine.
 
 The v1 op set (each `m.<op>(...) anyerror!void`):
 
@@ -3418,10 +3428,11 @@ half-done. Some statements can't run inside a transaction (e.g. SQLite `VACUUM`,
 **without** a wrapping transaction (it owns its own atomicity; it is recorded only after it
 succeeds).
 
-#### The `migrate` CLI (apply + status)
+#### The `migrate` CLI (apply + status + rollback)
 
-`zigbase migrate` applies pending migrations and exits — the same forward pass `serve` runs at
-boot, so a deploy step can migrate ahead of starting the server:
+`zigbase migrate` applies pending SYSTEM migrations, then the app's comptime `.migrations`, and
+exits — so a deploy step can migrate ahead of starting the server. It does **not** provision the
+`.collections` tables; those are created when the server starts (`serve`), not by `migrate`:
 
 ```sh
 # Apply pending SYSTEM migrations, then the app's comptime `.migrations`, then exit.
@@ -3449,9 +3460,40 @@ An **orphaned** row — an applied `prov:` migration whose id is no longer compi
 binary)" and counted in the summary, so a divergence between the ledger and the source is visible
 at a glance.
 
-> **Rollback** (running a migration's inverse `change`/`down`) and a **schema dump** are coming in
-> follow-up work. The reverse machinery each op is built on already ships; `migrate rollback` is
-> the next stage.
+`zigbase migrate rollback [N]` reverses the **N most-recently-applied consumer migrations**, newest
+first (`N` is a positional integer, default `1`); system migrations are never touched:
+
+```sh
+# Reverse the single most-recent consumer migration.
+zigbase migrate rollback --data-dir ./zb_data
+# Reverse the three most-recent, newest first.
+zigbase migrate rollback 3 --data-dir ./zb_data
+```
+
+**The reverse of a migration is `down orelse change`** (the mirror of the forward `change orelse
+up`): an explicit `down` runs as-is; otherwise the `change` re-runs with `m.direction == .reverse`,
+each op emitting its inverse. A migration with only an `up` (and no `down`/`change`) has **no
+reverse** and is refused. Each migration's reverse body **and** its `_migrations` ledger delete
+commit in **one transaction** (honoring `.transactional`), so a rollback is atomic per migration and
+re-applying afterwards works (the ledger row is gone). Reversing across migrations is newest-first,
+so dependent ops split across separate migrations unwind in the right order.
+
+Rollback **fails loudly and changes nothing it cannot undo**:
+
+- A **lone-`up`** migration (no `down`, no `change`), or a **non-transactional** migration that
+  would reverse via a `change` (no transaction to undo a partial reverse), is refused **up front**
+  before anything is touched — supply an explicit `down`.
+- A `change` whose inverse hits an **irreversible op** (`m.raw`/`m.records()`, a `.was`-less
+  `dropTable`/`dropColumn`/`dropIndex`, or `addForeignKey` on SQLite) is only knowable by running:
+  its per-migration transaction rolls the partial reverse back, then the run fails, **naming** the
+  offending migration.
+- An **orphaned** ledger row (an applied `prov:` migration no longer compiled into the binary)
+  cannot be reversed — it is named and the run fails, leaving the ledger row intact.
+
+`N` larger than the number of applied consumer migrations rolls back **all** of them
+(`min(N, applied)`).
+
+> A **schema dump** is still coming in follow-up work.
 
 #### Cross-backend migrations (SQLite **and** Postgres)
 

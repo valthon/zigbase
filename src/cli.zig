@@ -14,14 +14,18 @@ pub const ServeArgs = struct {
     realtime_outbound_hwm: ?u32 = null, // --realtime-outbound-hwm N => slow-consumer disconnect bound in frames (0 disables); issue #203
 };
 
-/// `migrate` runs one of two actions: `apply` (the default — apply pending system + consumer
-/// migrations) or `status` (`migrate status` — read the ledger and report applied/pending/orphaned
-/// consumer migrations without changing anything).
-pub const MigrateAction = enum { apply, status };
+/// `migrate` runs one of three actions: `apply` (the default — apply pending system + consumer
+/// migrations), `status` (`migrate status` — read the ledger and report applied/pending/orphaned
+/// consumer migrations without changing anything), or `rollback` (`migrate rollback [N]` — reverse
+/// the N most-recently-applied consumer migrations, newest first; N defaults to 1).
+pub const MigrateAction = enum { apply, status, rollback };
 
 pub const MigrateArgs = struct {
     data_dir: ?[]const u8 = null,
     action: MigrateAction = .apply,
+    /// Number of consumer migrations to reverse for `.rollback` (positional; default 1). Ignored by
+    /// the other actions.
+    rollback_count: usize = 1,
 };
 
 pub const SuperuserArgs = struct {
@@ -126,11 +130,21 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
     if (std.mem.eql(u8, args[0], "migrate")) {
         var ma = MigrateArgs{};
         var i: usize = 1;
-        // Optional leading subcommand: `migrate status`. Anything else non-flag is unknown.
+        // Optional leading subcommand: `migrate status` or `migrate rollback [N]`. Anything else
+        // non-flag is unknown.
         if (i < args.len and !std.mem.startsWith(u8, args[i], "-")) {
             if (std.mem.eql(u8, args[i], "status")) {
                 ma.action = .status;
                 i += 1;
+            } else if (std.mem.eql(u8, args[i], "rollback")) {
+                ma.action = .rollback;
+                i += 1;
+                // Optional positional N (default 1). A bare integer only — a flag or another
+                // non-integer word after `rollback` is not the count.
+                if (i < args.len and !std.mem.startsWith(u8, args[i], "-")) {
+                    ma.rollback_count = std.fmt.parseInt(usize, args[i], 10) catch return ParseError.BadValue;
+                    i += 1;
+                }
             } else return ParseError.UnknownCommand;
         }
         while (i < args.len) : (i += 1) {
@@ -335,6 +349,31 @@ test "migrate rejects an unknown subcommand and unknown flags" {
     try std.testing.expectError(ParseError.UnknownCommand, parse(&.{ "migrate", "bogus" }, .{}));
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "--nope" }, .{}));
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "status", "--nope" }, .{}));
+}
+
+test "migrate rollback parses to the rollback action (default N = 1)" {
+    const bare = try parse(&.{ "migrate", "rollback" }, .{});
+    try std.testing.expectEqual(MigrateAction.rollback, bare.migrate.action);
+    try std.testing.expectEqual(@as(usize, 1), bare.migrate.rollback_count);
+}
+
+test "migrate rollback N parses the positional count (+ optional --data-dir)" {
+    const three = try parse(&.{ "migrate", "rollback", "3" }, .{});
+    try std.testing.expectEqual(MigrateAction.rollback, three.migrate.action);
+    try std.testing.expectEqual(@as(usize, 3), three.migrate.rollback_count);
+    const with_dir = try parse(&.{ "migrate", "rollback", "2", "--data-dir", "/tmp/zb" }, .{});
+    try std.testing.expectEqual(@as(usize, 2), with_dir.migrate.rollback_count);
+    try std.testing.expectEqualStrings("/tmp/zb", with_dir.migrate.data_dir.?);
+}
+
+test "migrate rollback rejects a non-integer or negative count" {
+    // Non-integer → BadValue; negative (leading `-`) is treated as a flag → UnknownFlag. Both reject.
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "migrate", "rollback", "abc" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "rollback", "-3" }, .{}));
+}
+
+test "migrate rollback --help routes to the migrate help topic" {
+    try std.testing.expectEqual(HelpTopic.migrate, (try parse(&.{ "migrate", "rollback", "--help" }, .{})).help);
 }
 
 test "migrate status --help routes to the migrate help topic" {

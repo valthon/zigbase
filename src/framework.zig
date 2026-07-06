@@ -1703,6 +1703,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         .migrate => |ma| switch (ma.action) {
             .apply => try migrateImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .status => try migrateStatusImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
+            .rollback => try migrateRollbackImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
         },
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
@@ -1764,7 +1765,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\
         \\COMMANDS:
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
-        \\  migrate             Apply database migrations, then exit. `migrate status` reports without applying.
+        \\  migrate             Apply database migrations, then exit. `migrate status` reports; `migrate rollback [N]` reverses.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
         \\  superuser create    Create an admin (superuser) account.
@@ -1968,8 +1969,9 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\zigbase migrate — apply pending database migrations, then exit.
         \\
         \\USAGE:
-        \\  zigbase migrate [--data-dir PATH]         Apply pending migrations (default).
-        \\  zigbase migrate status [--data-dir PATH]  Report applied/pending migrations; apply nothing.
+        \\  zigbase migrate [--data-dir PATH]           Apply pending migrations (default).
+        \\  zigbase migrate status [--data-dir PATH]    Report applied/pending migrations; apply nothing.
+        \\  zigbase migrate rollback [N] [--data-dir P]  Reverse the N most-recent migrations (default 1).
         \\
         \\FLAGS:
         \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
@@ -1980,6 +1982,12 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\  ledger so it runs exactly once. `migrate status` reads that ledger and lists the
         \\  compiled-in migrations as applied or pending (in declared order), flagging any
         \\  ORPHANED rows (applied migrations no longer present in the binary). It changes nothing.
+        \\  `migrate rollback [N]` reverses the N most-recently-applied consumer migrations,
+        \\  newest first (N defaults to 1). The reverse of a migration is `down orelse change`
+        \\  (an explicit `down` runs; otherwise a `change` re-runs inverted). It fails loudly and
+        \\  changes nothing it cannot undo: a migration with only an `up`, or one whose `change`
+        \\  reverses into an irreversible op (records()/raw/a `.was`-less drop), or an ORPHANED
+        \\  ledger row, is refused and named.
         \\
         \\Note: `zigbase serve` also runs migrations on startup; use `migrate` to apply
         \\them ahead of time (e.g. in a deploy step) without starting the server.
@@ -1987,6 +1995,8 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\EXAMPLES:
         \\  zigbase migrate --data-dir ./zb_data
         \\  zigbase migrate status --data-dir ./zb_data
+        \\  zigbase migrate rollback --data-dir ./zb_data
+        \\  zigbase migrate rollback 3 --data-dir ./zb_data
         \\
     , .{});
 }
@@ -2172,6 +2182,64 @@ fn migrateStatusImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const s
         for (status.orphaned) |o| emit(io, out, "  {s}  applied (at {s})\n", .{ o.name, o.applied_at });
     }
     emit(io, out, "\n{d} applied, {d} pending, {d} orphaned\n", .{ status.applied_count, status.pending_count, status.orphaned.len });
+}
+
+/// `zigbase migrate rollback [N]`: reverse the N most-recently-applied consumer migrations (newest
+/// first; N defaults to 1). The reverse of a migration is `down orelse change` (an explicit `down`
+/// runs forward; a bare `change` runs inverted). Each migration's reverse body + its ledger-row
+/// delete commit atomically. Fails loudly and changes nothing it cannot undo: an orphaned row, a
+/// lone-`up` migration, or a non-transactional `change` is refused up front; a transactional
+/// `change` that reverses into an irreversible op is rolled back by its tx and named. `N` exceeding
+/// the applied count rolls back all applied consumer migrations (PocketBase-style `min(N, applied)`).
+fn migrateRollbackImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, ma: cli.MigrateArgs, schema_migrations: []const provision.Migration) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = ma.data_dir });
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
+    defer pool.deinit();
+    const w = pool.acquireWriter();
+    defer pool.releaseWriter();
+    try migrations.ensureLedger(w);
+
+    const out = std.Io.File.stdout();
+    const outcome = try provision.rollbackMigrations(allocator, io, w, schema_migrations, ma.rollback_count);
+    switch (outcome) {
+        .ok => |reversed| {
+            if (reversed.len == 0) {
+                emit(io, out, "No consumer migrations to roll back.\n", .{});
+            } else {
+                emit(io, out, "Rolled back {d} migration(s), newest first:\n", .{reversed.len});
+                for (reversed) |id| emit(io, out, "  {s}\n", .{id});
+            }
+            freeIdList(allocator, reversed);
+        },
+        .irreversible => |r| {
+            // Report what WAS reversed+committed before the offender (per-migration atomicity holds,
+            // but the stop point must be honest — earlier NEWER migrations may already be undone).
+            reportPartialRollback(io, out, r.reversed);
+            std.log.err("migrate rollback: '{s}' is not reversible — stopped ({d} rolled back). Add a `down`, or avoid records()/raw/.was-less drops in a `change`.", .{ r.id, r.reversed.len });
+            freeIdList(allocator, r.reversed);
+            allocator.free(r.id);
+            return error.MigrationNotReversible;
+        },
+        .orphaned => |r| {
+            reportPartialRollback(io, out, r.reversed); // always empty (orphan is pre-flight), kept for symmetry
+            std.log.err("migrate rollback: '{s}' is applied but no longer compiled into the binary — cannot reverse it; rolled back nothing.", .{r.id});
+            freeIdList(allocator, r.reversed);
+            allocator.free(r.id);
+            return error.OrphanedMigration;
+        },
+    }
+}
+
+/// Print the ids reversed+committed before a mid-batch stop, so a partial rollback is never silent.
+fn reportPartialRollback(io: std.Io, out: std.Io.File, reversed: [][]const u8) void {
+    if (reversed.len == 0) return;
+    emit(io, out, "Rolled back {d} migration(s), newest first:\n", .{reversed.len});
+    for (reversed) |id| emit(io, out, "  {s}\n", .{id});
+}
+
+fn freeIdList(allocator: std.mem.Allocator, ids: [][]const u8) void {
+    for (ids) |id| allocator.free(id);
+    allocator.free(ids);
 }
 
 /// `zigbase rewrap`: re-encrypt every `.encrypted` cell under the PRIMARY key
