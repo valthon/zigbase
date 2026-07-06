@@ -78,6 +78,11 @@ pub const App = struct {
     /// Default = LogMailer (logs); set SMTP config to upgrade to SmtpMailer. null in
     /// tests/CLI where no mailer was wired (callers must fall back to logging).
     mailer: ?*const @import("mail/mailer.zig").Mailer = null,
+    /// Pluggable error reporter (#244), resolved from the comptime reporter plugin in serveImpl.
+    /// Default in a booted app = DefaultReporterPlugin's view (SentryReporter when `sentry_dsn`
+    /// is set, else LogReporter). null only in un-booted test/CLI apps, where `dispatchError`
+    /// falls back to today's log format.
+    reporter: ?*const @import("report/reporter.zig").Reporter = null,
     /// Email-subsystem runtime knobs (#154), threaded from the comptime `App(.{ .mail = ... })`
     /// config in serveImpl. Default `.{}` is the fully-off, byte-identical-to-pre-#154 path:
     /// verified-sender + suppression enforcement are disabled and the bounce/complaint webhook

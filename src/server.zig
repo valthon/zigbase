@@ -679,7 +679,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
 test "dispatchCustom: deliberate 4xx is NOT reported to onError; genuine 5xx is" {
     const db = @import("db.zig");
     const App = app_mod.App;
-    const sentry = @import("sentry.zig");
+    const report_log = @import("report/log.zig");
 
     const H = struct {
         var on_error_calls: usize = 0;
@@ -723,12 +723,13 @@ test "dispatchCustom: deliberate 4xx is NOT reported to onError; genuine 5xx is"
     const dispatch = events.Dispatch{ .routes = &route_table, .on_error = H.onErr };
     var app = App{ .allocator = a, .io = std.testing.io, .pool = &pool, .dispatch = &dispatch };
 
-    // DSN-less backstop logs via std.log.err (which the test runner would count as a
-    // failure); route it to a no-op sink so dispatchError stays observable-but-silent.
-    sentry.log_sink = struct {
+    // The un-booted app has no reporter wired, so dispatchError's log fallback emits via
+    // std.log.err (which the test runner would count as a failure); route it to a no-op sink
+    // so dispatchError stays observable-but-silent.
+    report_log.log_sink = struct {
         fn sink(_: []const u8) void {}
     }.sink;
-    defer sentry.log_sink = null;
+    defer report_log.log_sink = null;
 
     // 1. Deliberate 4xx: 404 response, onError NOT fired.
     var nf_ctx = http.RequestCtx{ .method = .GET, .path = "/api/nf", .allocator = a, .app = &app };

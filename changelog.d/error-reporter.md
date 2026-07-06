@@ -1,0 +1,3 @@
+### Features
+
+- Pluggable error reporter: the terminal backstop every framework-swallowed error routes through is now a swappable plugin selected via `App(.{ .reporter = MyReporterPlugin })`, mirroring `.storage`/`.mailer`. The default picks `SentryReporter` when `ZIGBASE_SENTRY_DSN` is set (POSTs a Sentry envelope, unchanged from before) and `LogReporter` otherwise (logs the error, exactly the previous no-Sentry behavior). A custom plugin implements `create`/`interface`/`deinit` and returns a `Reporter` whose `report` receives a `Report{ .message, .err_name, .phase, .level }`. The `Reporter`, `Report`, `LogReporter`, `SentryReporter`, and `DefaultReporterPlugin` types are re-exported for composition.

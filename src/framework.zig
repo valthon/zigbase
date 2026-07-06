@@ -17,6 +17,9 @@ const schedule = @import("schedule.zig");
 const clock = @import("clock.zig");
 const entropy_mod = @import("entropy.zig");
 const mail = @import("mail/mailer.zig");
+const report_reporter = @import("report/reporter.zig");
+const report_log = @import("report/log.zig");
+const report_sentry = @import("report/sentry.zig");
 const provision = @import("provision.zig");
 const oauth_client = @import("oauth/client.zig");
 const migrator = @import("migrator.zig");
@@ -220,6 +223,43 @@ pub const DefaultMailerPlugin = struct {
     }
 };
 
+/// Default error-reporter plugin (#244), config-driven with no code change to switch backends
+/// (the DefaultMailerPlugin precedent):
+///   1. `cfg.sentry_dsn` non-empty → `SentryReporter` (POSTs a Sentry envelope).
+///   2. else                       → `LogReporter` (logs the report; dev/CI + no-Sentry default,
+///      preserving the pre-plugin log-only backstop exactly).
+pub const DefaultReporterPlugin = struct {
+    log_backend: report_log.LogReporter = .{},
+    sentry_backend: ?report_sentry.SentryReporter = null,
+
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !DefaultReporterPlugin {
+        if (cfg.sentry_dsn.len > 0) {
+            return .{ .sentry_backend = try report_sentry.SentryReporter.create(gpa, io, cfg) };
+        }
+        return .{};
+    }
+
+    pub fn interface(self: *DefaultReporterPlugin) report_reporter.Reporter {
+        if (self.sentry_backend) |*s| return s.interface();
+        return self.log_backend.interface();
+    }
+
+    pub fn deinit(self: *DefaultReporterPlugin) void {
+        if (self.sentry_backend) |*s| s.deinit();
+    }
+};
+
+test "DefaultReporterPlugin selects Sentry when a DSN is set, else LogReporter" {
+    const a = std.testing.allocator;
+    var p = try DefaultReporterPlugin.create(a, std.testing.io, .{ .sentry_dsn = "https://pub@o1.ingest.sentry.io/42" });
+    defer p.deinit();
+    try std.testing.expect(p.sentry_backend != null);
+
+    var p2 = try DefaultReporterPlugin.create(a, std.testing.io, .{});
+    defer p2.deinit();
+    try std.testing.expect(p2.sentry_backend == null); // log-only, exactly as before
+}
+
 /// Default SMS provider plugin (#224), config-driven with no code change to switch backends
 /// (the DefaultMailerPlugin precedent):
 ///   1. `cfg.twilio_account_sid` + `twilio_auth_token` + `twilio_from` all set → `TwilioSender`.
@@ -400,7 +440,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
+            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -923,6 +963,15 @@ pub fn App(comptime cfg: anytype) type {
             break :blk P;
         };
 
+        /// Comptime-selected error-reporter plugin type (#244; defaults to `DefaultReporterPlugin`,
+        /// which picks `SentryReporter` when a DSN is set, else `LogReporter`). A custom type
+        /// missing a contract method fails with a contract-specific message.
+        pub const ReporterPlugin: type = blk: {
+            const P = if (@hasField(@TypeOf(cfg), "reporter")) cfg.reporter else DefaultReporterPlugin;
+            assertPluginContract(P, "reporter");
+            break :blk P;
+        };
+
         /// Comptime-selected SMS provider plugin type (#224); defaults to `DefaultSmsPlugin`
         /// (Twilio when the env vars are set, else LogSmsSender). A custom type missing a contract
         /// method fails with a contract-specific message.
@@ -1422,6 +1471,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const Opts = ServeOpts{
             .StoragePlugin = StoragePlugin,
             .MailerPlugin = MailerPlugin,
+            .ReporterPlugin = ReporterPlugin,
             .SmsProviderPlugin = SmsProviderPlugin,
             .auth_method_types = auth_method_types,
             .reader_pool_size = reader_pool_size,
@@ -1586,6 +1636,8 @@ fn analyticsRollupRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
 pub const ServeOpts = struct {
     StoragePlugin: type,
     MailerPlugin: type,
+    /// Comptime-selected error-reporter plugin TYPE (#244); defaults to `DefaultReporterPlugin`.
+    ReporterPlugin: type = DefaultReporterPlugin,
     /// Comptime-selected SMS provider plugin TYPE (#224); defaults to `DefaultSmsPlugin`.
     SmsProviderPlugin: type = DefaultSmsPlugin,
     /// Comptime-assembled list of auth method types (built-ins ++ consumer types).
@@ -2359,6 +2411,8 @@ fn BootedApp(comptime opts: ServeOpts) type {
         storage_iface: files_storage.Storage,
         mailer_inst: opts.MailerPlugin,
         mailer_iface: mail.Mailer,
+        reporter_inst: opts.ReporterPlugin,
+        reporter_iface: report_reporter.Reporter,
         sms_inst: opts.SmsProviderPlugin,
         sms_iface: SmsSender,
         /// Registry storage: `am_registry.methods` points into `am_views`, which is built
@@ -2382,6 +2436,7 @@ fn BootedApp(comptime opts: ServeOpts) type {
             self.rate_limiter.deinit();
             registry.deinit(am_types, &self.am_insts);
             self.sms_inst.deinit();
+            self.reporter_inst.deinit();
             self.mailer_inst.deinit();
             self.storage_inst.deinit();
             self.pool.deinit();
@@ -2559,6 +2614,14 @@ fn bootApp(
     errdefer holder.mailer_inst.deinit();
     holder.mailer_iface = holder.mailer_inst.interface();
 
+    // Error-reporter plugin (#244): the terminal backstop `dispatchError` routes every
+    // framework-swallowed error through. Instantiated INTO the holder (stable address that
+    // outlives boot) so `reporter_iface` captures `&holder.reporter_inst` at its final
+    // location — exactly like storage/mailer.
+    holder.reporter_inst = try opts.ReporterPlugin.create(allocator, io, cfg);
+    errdefer holder.reporter_inst.deinit();
+    holder.reporter_iface = holder.reporter_inst.interface();
+
     holder.sms_inst = try opts.SmsProviderPlugin.create(allocator, io, cfg);
     errdefer holder.sms_inst.deinit();
     holder.sms_iface = holder.sms_inst.interface();
@@ -2720,6 +2783,7 @@ fn bootApp(
             .key_prefix = cfg.s3_key_prefix,
         },
         .mailer = &holder.mailer_iface,
+        .reporter = &holder.reporter_iface,
         .auth_methods = @ptrCast(&holder.am_registry),
         .dispatch = dispatch,
         .features = opts.features,

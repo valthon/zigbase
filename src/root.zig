@@ -76,9 +76,18 @@ pub const SmsConfig = @import("sms/config.zig").Runtime;
 pub const SmsRegion = @import("sms/e164.zig").Region;
 pub const normalizeE164 = @import("sms/e164.zig").normalizeE164;
 
+// Error-reporter plugin (#244): a custom reporter plugin's `interface()` returns `Reporter`,
+// whose `report` is handed a `Report`. ZigBase ships `LogReporter` (the default when no Sentry
+// DSN is set) and `SentryReporter` (POSTs a Sentry envelope when `ZIGBASE_SENTRY_DSN` is set).
+pub const Reporter = @import("report/reporter.zig").Reporter;
+pub const Report = @import("report/reporter.zig").Report;
+pub const LogReporter = @import("report/log.zig").LogReporter;
+pub const SentryReporter = @import("report/sentry.zig").SentryReporter;
+
 // Built-in plugins (for composition / overriding only one side of the pair).
 pub const DefaultStoragePlugin = @import("framework.zig").DefaultStoragePlugin;
 pub const DefaultMailerPlugin = @import("framework.zig").DefaultMailerPlugin;
+pub const DefaultReporterPlugin = @import("framework.zig").DefaultReporterPlugin;
 
 // Migration: the `up` fn for an explicit migration receives a `*Migrator` carrying the active
 // SQL dialect (so raw SQL can branch per backend); the `.migrations` config is a list of
@@ -328,7 +337,9 @@ test {
     _ = @import("files/config.zig");
     _ = @import("data.zig");
     _ = @import("events.zig");
-    _ = @import("sentry.zig");
+    _ = @import("report/reporter.zig");
+    _ = @import("report/log.zig");
+    _ = @import("report/sentry.zig");
     _ = @import("framework.zig");
     _ = @import("provision.zig");
     _ = @import("dumpload.zig");

@@ -401,7 +401,7 @@ const testing = std.testing;
 const collections = @import("../collections.zig");
 const schema = @import("../schema.zig");
 const migrations = @import("../migrations.zig");
-const sentry = @import("../sentry.zig");
+const report_log = @import("../report/log.zig");
 
 fn noopSink(_: []const u8) void {}
 
@@ -710,8 +710,8 @@ test "pollOnce: retry then terminal failure fires .onError" {
     th_runs = 0;
     th_err_count = 0;
     th_fail_until = 100; // always fail
-    sentry.log_sink = noopSink; // swallow the intentional terminal-failure log
-    defer sentry.log_sink = null;
+    report_log.log_sink = noopSink; // swallow the intentional terminal-failure log
+    defer report_log.log_sink = null;
     var dispatch = events.Dispatch{ .on_error = onErr };
     env.app.dispatch = &dispatch;
     const reg = Registry{

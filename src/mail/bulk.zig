@@ -909,8 +909,8 @@ test "backend error: attempts mirrored, error propagates, terminal attempt marks
     defer env.deinit();
     const fm = FailMailer.mailer();
     env.app.mailer = &fm;
-    sentry.log_sink = noopLogSink; // swallow the intentional terminal-failure .err log
-    defer sentry.log_sink = null;
+    report_log.log_sink = noopLogSink; // swallow the intentional terminal-failure .err log
+    defer report_log.log_sink = null;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1049,5 +1049,5 @@ test "tenancy: unverified sender rejected at submit (nothing persisted); verifie
     try testing.expectEqualStrings("sent", r.status);
 }
 
-const sentry = @import("../sentry.zig");
+const report_log = @import("../report/log.zig");
 fn noopLogSink(_: []const u8) void {}

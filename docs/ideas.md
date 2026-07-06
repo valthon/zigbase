@@ -58,7 +58,7 @@ What exists in `src/` right now:
 - **Reader-connection pool** (`db.zig`): warm read-only SQLite connections kept for reuse
   (the perf commit cites ~2.5× list rps, p50 2.4ms→0.95ms). Writes remain serialized.
 - **Embedded admin SPA** (`src/admin/`, preact+htm) served under `/_/`.
-- **Sentry** error reporting (`sentry.zig`) gated by `ZIGBASE_SENTRY_DSN`.
+- **Sentry** error reporting (`report/sentry.zig`) gated by `ZIGBASE_SENTRY_DSN`.
 - **Config** is a flat struct (`config.zig`) overridden by env/flags; `App` (`app.zig`) is the
   shared runtime handle (allocator, `std.Io`, `db.Pool`, secrets, optional `*Storage`,
   optional `*Mailer`).
@@ -505,7 +505,7 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   mailer's `LogMailer` intentionally logs message bodies/tokens in dev — structured logging should be
   able to redact/level those out for prod.)
 - **How it fits:** A thin logging module wrapping `std.log` with a JSON formatter; assign a request id
-  in the `api` layer and thread it through. Complements the existing Sentry integration (`sentry.zig`).
+  in the `api` layer and thread it through. Complements the existing Sentry integration (`report/sentry.zig`).
 - **Risk:** Low.
 - **Depends on / ordering:** Early; feeds D4 and E2.
 

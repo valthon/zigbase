@@ -1,5 +1,8 @@
 const std = @import("std");
-const App = @import("app.zig").App;
+const reporter = @import("reporter.zig");
+const config = @import("../config.zig");
+const Reporter = reporter.Reporter;
+const Report = reporter.Report;
 
 pub const Envelope = struct {
     url: []const u8,
@@ -62,56 +65,69 @@ pub fn buildEnvelope(
     return .{ .url = url, .auth_header = auth_header, .body = body };
 }
 
-/// Test-only sink: when non-null, the log-mode backstop routes the message here
-/// instead of `std.log.err`. Production leaves this null (real logging). It exists
-/// because Zig's test runner counts every `std.log.err` as a test failure, so a
-/// test exercising the DSN-less backstop needs a way to observe it without logging.
-pub var log_sink: ?*const fn (message: []const u8) void = null;
+/// Sentry error reporter plugin. Captures the DSN at `create` and POSTs a Sentry envelope
+/// per report. Selected by `DefaultReporterPlugin` only when a DSN is configured, so `dsn`
+/// is non-empty in practice (the empty-DSN guard in `report` is a defensive no-op).
+///
+/// Stage 1 keeps today's BLOCKING `std.http.Client` POST (unchanged delivery semantics);
+/// Stage 2 replaces it with a queued/non-blocking HttpClient POST + TTL dedup.
+pub const SentryReporter = struct {
+    dsn: []const u8,
 
-/// Default error backstop: report to Sentry if a DSN is set, else log. Always swallows.
-pub fn backstop(app: *App, message: []const u8) void {
-    if (app.sentry_dsn.len == 0) {
-        if (log_sink) |sink| sink(message) else std.log.err("zigbase error: {s}", .{message});
-        return;
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !SentryReporter {
+        _ = gpa;
+        _ = io;
+        return .{ .dsn = cfg.sentry_dsn };
     }
-    report(app, message) catch |e| {
-        std.log.err("zigbase error (sentry report failed: {s}): {s}", .{ @errorName(e), message });
-    };
-}
 
-/// POST a single event to Sentry's envelope endpoint. Mirrors src/oauth/client.zig's
-/// std.http.Client usage. Bounds and discards the response. Network errors propagate.
-fn report(app: *App, message: []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(app.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    pub fn interface(self: *SentryReporter) Reporter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
 
-    const env = try buildEnvelope(a, app.sentry_dsn, message, "error");
+    pub fn deinit(self: *SentryReporter) void {
+        _ = self;
+    }
 
-    var client = std.http.Client{ .allocator = a, .io = app.io };
-    defer client.deinit();
+    const vtable = Reporter.VTable{ .report = report };
 
-    const extra = [_]std.http.Header{
-        .{ .name = "content-type", .value = "application/x-sentry-envelope" },
-        .{ .name = "x-sentry-auth", .value = env.auth_header },
-    };
+    /// POST a single event to Sentry's envelope endpoint. Mirrors src/oauth/client.zig's
+    /// std.http.Client usage. Bounds and discards the response. Network errors propagate
+    /// (dispatchError logs them). A no-op when the DSN is empty (never selected in that case).
+    fn report(ptr: *anyopaque, io: std.Io, alloc: std.mem.Allocator, r: Report) anyerror!void {
+        const self: *SentryReporter = @ptrCast(@alignCast(ptr));
+        if (self.dsn.len == 0) return;
 
-    const MAX_RESP = 1 << 16; // 64 KiB; we discard it anyway
-    const resp_buf = try a.alloc(u8, MAX_RESP);
-    var fw = std.Io.Writer.fixed(resp_buf);
-    _ = client.fetch(.{
-        .location = .{ .url = env.url },
-        .method = .POST,
-        .payload = env.body,
-        .extra_headers = &extra,
-        .response_writer = &fw,
-    }) catch |e| {
-        // A response exceeding the fixed buffer surfaces as WriteFailed; ignore it
-        // (delivery succeeded; we just couldn't capture the whole body).
-        if (e == error.WriteFailed) return;
-        return e;
-    };
-}
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const env = try buildEnvelope(a, self.dsn, r.message, r.level);
+
+        var client = std.http.Client{ .allocator = a, .io = io };
+        defer client.deinit();
+
+        const extra = [_]std.http.Header{
+            .{ .name = "content-type", .value = "application/x-sentry-envelope" },
+            .{ .name = "x-sentry-auth", .value = env.auth_header },
+        };
+
+        const MAX_RESP = 1 << 16; // 64 KiB; we discard it anyway
+        const resp_buf = try a.alloc(u8, MAX_RESP);
+        var fw = std.Io.Writer.fixed(resp_buf);
+        _ = client.fetch(.{
+            .location = .{ .url = env.url },
+            .method = .POST,
+            .payload = env.body,
+            .extra_headers = &extra,
+            .response_writer = &fw,
+        }) catch |e| {
+            // A response exceeding the fixed buffer surfaces as WriteFailed; ignore it
+            // (delivery succeeded; we just couldn't capture the whole body).
+            if (e == error.WriteFailed) return;
+            return e;
+        };
+    }
+};
 
 test "buildEnvelope produces a valid Sentry envelope with the message" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -127,4 +143,16 @@ test "buildEnvelope produces a valid Sentry envelope with the message" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "boom: error.HookRejected") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"level\":\"error\"") != null);
     try std.testing.expectEqualStrings("https://o1.ingest.sentry.io/api/42/envelope/", out.url);
+}
+
+test "SentryReporter captures the DSN and no-ops on an empty DSN" {
+    var sr = try SentryReporter.create(std.testing.allocator, std.testing.io, .{ .sentry_dsn = "https://pub@o1.ingest.sentry.io/42" });
+    defer sr.deinit();
+    try std.testing.expectEqualStrings("https://pub@o1.ingest.sentry.io/42", sr.dsn);
+
+    // Empty DSN → report is a no-op (no network attempt), returns without error.
+    var empty = try SentryReporter.create(std.testing.allocator, std.testing.io, .{});
+    defer empty.deinit();
+    const rep = empty.interface();
+    try rep.report(std.testing.io, std.testing.allocator, .{ .message = "x", .phase = "app" });
 }

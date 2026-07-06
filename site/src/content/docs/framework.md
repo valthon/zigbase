@@ -101,6 +101,7 @@ pub fn main(init: std.process.Init) !void {
 | `static_files` | Comptime static-file mode: absent (default flag), `.disabled`, `.{ .dir = "..." }`, `.{ .embedded = ... }`. | always — static serving is core; this key only selects its mode. |
 | `storage` | Storage plugin TYPE (defaults to local-disk storage). | always — you always get a storage plugin, default or custom. |
 | `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). | always — you always get a mailer plugin, default or custom. Together with `.mail`, also enables the built-in `"mail"` job kind (see `.mail` below). |
+| `reporter` | Error-reporter plugin TYPE — the terminal backstop every framework-swallowed error routes through (defaults to `SentryReporter` when `ZIGBASE_SENTRY_DSN` is set, else `LogReporter`). | always — you always get a reporter plugin, default or custom. |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |

@@ -248,7 +248,7 @@ fn randomU64(io: std.Io) u64 {
 
 const testing = std.testing;
 const App = @import("app.zig").App;
-const sentry = @import("sentry.zig");
+const report_log = @import("report/log.zig");
 
 fn noopSink(_: []const u8) void {}
 
@@ -516,8 +516,8 @@ test "deliver: 2xx on first attempt succeeds, no onError, sends idempotency key"
 
 test "deliver: 5xx retried then terminal fires .onError(.webhook)" {
     wh_err_count = 0;
-    sentry.log_sink = noopSink;
-    defer sentry.log_sink = null;
+    report_log.log_sink = noopSink;
+    defer report_log.log_sink = null;
     var rec = Recorder{ .alloc = testing.allocator, .statuses = &.{503}, .retry_after = "" };
     defer deinitRecorder(&rec);
     var server = try WebhookTestServer.start(&rec);
@@ -542,8 +542,8 @@ test "deliver: 5xx retried then terminal fires .onError(.webhook)" {
 
 test "deliver: 4xx is immediately terminal (no retry)" {
     wh_err_count = 0;
-    sentry.log_sink = noopSink;
-    defer sentry.log_sink = null;
+    report_log.log_sink = noopSink;
+    defer report_log.log_sink = null;
     var rec = Recorder{ .alloc = testing.allocator, .statuses = &.{404}, .retry_after = "" };
     defer deinitRecorder(&rec);
     var server = try WebhookTestServer.start(&rec);
@@ -678,8 +678,8 @@ test "webhookJobHandler parses the JSON payload and delivers" {
 
 test "webhookJobHandler: a malformed payload fires .onError(.webhook), no throw" {
     wh_err_count = 0;
-    sentry.log_sink = noopSink;
-    defer sentry.log_sink = null;
+    report_log.log_sink = noopSink;
+    defer report_log.log_sink = null;
     var env = DeliverEnv.init();
     defer env.deinit();
     var cx = env.ctx();

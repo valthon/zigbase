@@ -5,7 +5,8 @@ const request = @import("request.zig");
 const Ctx = @import("ctx.zig").Ctx;
 const Data = @import("data.zig").Data;
 const db = @import("db.zig");
-const sentry = @import("sentry.zig");
+const report_reporter = @import("report/reporter.zig");
+const report_log = @import("report/log.zig");
 const http = @import("http.zig");
 const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
@@ -1142,13 +1143,26 @@ test "before hook error aborts (propagates) and unrelated collection is skipped"
     try std.testing.expectError(error.HookRejected, dispatch(&ctx, &ev));
 }
 
-/// Route a framework-caught error: run the consumer onError handler (if any),
-/// then the built-in Sentry-or-log backstop. Never propagates.
+/// Route a framework-caught error: run the consumer onError handler (if any), then the
+/// pluggable error reporter (the terminal backstop). Never propagates — a reporter that
+/// errors is logged and swallowed. A booted app always has a reporter wired (SentryReporter
+/// when a DSN is set, else LogReporter); the null branch is the log fallback for un-booted
+/// test/CLI apps, preserving today's log-only behavior.
 pub fn dispatchError(app: *App, dispatch: ?*const Dispatch, ev: *ErrorEvent) void {
     if (dispatch) |d| {
         if (d.on_error) |h| h(ev);
     }
-    sentry.backstop(app, ev.message);
+    const r = report_reporter.Report{
+        .message = ev.message,
+        .err_name = @errorName(ev.err),
+        .phase = @tagName(ev.phase),
+    };
+    if (app.reporter) |rep| {
+        rep.report(app.io, app.allocator, r) catch |e|
+            std.log.warn("error reporter failed: {s}", .{@errorName(e)});
+    } else {
+        report_log.emit(r);
+    }
 }
 
 /// Fire the feature-exposure hook for a resolved FLAG, but ONLY when a handler is
@@ -1188,11 +1202,11 @@ test "dispatchError runs consumer handler before the backstop" {
 
     var app: App = undefined;
     app.allocator = std.testing.allocator;
-    app.sentry_dsn = ""; // DSN-less -> backstop takes the log path
-    // Route the log-mode backstop into our sink so it is observable and does not
+    app.reporter = null; // un-booted app -> dispatchError takes the log fallback path
+    // Route the log-mode fallback into our sink so it is observable and does not
     // emit a real std.log.err (which Zig's test runner would count as a failure).
-    sentry.log_sink = H.sink;
-    defer sentry.log_sink = null;
+    report_log.log_sink = H.sink;
+    defer report_log.log_sink = null;
 
     var d = Dispatch{ .on_error = H.onErr };
     var ev = ErrorEvent{ .app = &app, .ctx = null, .err = error.Boom, .phase = .after_hook, .message = "x" };
