@@ -576,6 +576,56 @@ Available `Records` methods:
 | `create(col, value) !Value` | acquires + releases the pool writer |
 | `update(col, id, value) !?Value` | acquires + releases the pool writer |
 | `delete(col, id) !bool` | acquires + releases the pool writer |
+| `createAs(T, col, input) !T` | typed create; `input` is an anon literal of writable fields |
+| `getAs(T, col, id) !?T` | typed read; parses the record into `T`, `null` if missing |
+| `updateAs(T, col, id, patch) !?T` | typed patch; `patch` is an anon literal of the changed fields |
+
+**Numeric fields accept numbers on write.** Reads of an `.int`/`.fixed`-mode `.number`
+field return a JSON string (to preserve precision beyond f64), and on write those modes now
+accept a JSON **number** as well as the string form — symmetric with reads. `price_cents = 500`
+(an integer) and `price = 5.0` (a float on a `fixed(scale=2)` field, scaled to `500` exactly as
+the string `"5.0"` would be) both bind correctly. A fractional float on an `.int` field is still
+rejected. This removes the previous surprise where passing a number *as a number* failed
+validation.
+
+**Typed record I/O (`createAs` / `getAs` / `updateAs`).** These layer over the
+`std.json.Value` methods (which remain for dynamic callers) so a handler can speak plain
+structs instead of hand-assembling `ObjectMap`s and unwrapping union tags:
+
+```zig
+const Order = struct {
+    id: []const u8,
+    ref: []const u8,
+    price_cents: i64, // an `.int` number field — written and read back as an i64
+    confirmed: bool,
+    note: ?[]const u8, // optional ↔ a nullable/absent column
+};
+
+// create from an anon literal of the writable fields; returns the full created record as Order
+const created = try ctx.records().createAs(Order, "orders", .{
+    .ref = "A-1", .price_cents = 500, .confirmed = true,
+});
+
+// read it back (null if the collection or record is missing)
+const order: ?Order = try ctx.records().getAs(Order, "orders", created.id);
+
+// patch just the changed fields
+const updated = try ctx.records().updateAs(Order, "orders", created.id, .{ .confirmed = false });
+```
+
+- **Struct ↔ schema mapping is by name**: an `input`/`patch`/`T` field maps to the collection
+  column of the same name.
+- **Optionals** in `T` map to nullable/absent columns (`null` round-trips as `null`).
+- **`.int`-mode fields map to Zig integers** (e.g. `price_cents: i64` above); **`.fixed`-mode
+  fields must be `[]const u8` (or `f64`)** in `T`, since they round-trip as decimal strings
+  (e.g. `"5.00"`) — parsing that string into an integer field errors.
+- **`T` may be a subset** of the record's columns — id/autodate columns `T` doesn't name are
+  skipped on the read back (`ignore_unknown_fields`).
+- **Comptime field-subset guard**: every field of a `createAs`/`updateAs` literal is verified to
+  exist on `T` at compile time, so a typo'd key is a build error, not a silent runtime no-op.
+  (The mapping to the *collection* is checked at runtime — the collection is named at runtime —
+  so a `T` field the collection doesn't declare surfaces as the usual schema-validation error.)
+- `getAs` takes no opts; expand/projection over typed reads is a future addition.
 
 **Expanding relations** — pass `.expand` in opts to inline related records under an `"expand"` key:
 
