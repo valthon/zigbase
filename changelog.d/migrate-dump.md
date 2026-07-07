@@ -1,3 +1,0 @@
-### Features
-
-- `zigbase migrate dump [--out <file>]` introspects the **live database** and writes a canonical, dialect-native `structure.sql` (stdout by default; `--out` writes a file). SQLite emits the exact stored DDL; Postgres reconstructs it from the system catalogs — **no external `pg_dump`**. The output is deterministic (no timestamps) so it diffs cleanly and re-runs to recreate the schema for a fast test DB; it also emits the applied-migration ledger so a restore lands at the same migration state. It is a snapshot for inspection/diffing/test-setup, NOT a schema source (that is `.collections`), and is never loaded at boot. This completes the `migrate` CLI trio alongside `status` and `rollback`.

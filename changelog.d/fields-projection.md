@@ -1,2 +1,0 @@
-### Features
-- Record read endpoints (`GET` list and get-one) accept a `fields=` query param for response projection: a comma-separated list of dot-paths selects which keys are returned (e.g. `fields=id,title,expand.author.name`), with `*` for all keys at a level and a leading `-` to exclude. Projection descends into `expand`ed relations (objects and arrays) and is a pure output filter applied after expand and access rules — it can only narrow a response, never reveal a field the record wouldn't otherwise return.

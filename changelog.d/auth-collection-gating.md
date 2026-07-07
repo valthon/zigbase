@@ -1,3 +1,0 @@
-### Features
-
-- Route-level auth-collection gating: `.auth = .{ .authed = "<collection>" }` requires a route's principal to belong to a specific auth collection (with an optional `.allow_superuser = true` to additionally admit superusers). The gate is **fail-closed** — a token from any other collection, a superuser without opt-in, or an empty-id principal is rejected with the same `401` as no token at all (no oracle) — and **comptime-validated**: the named collection must be declared in `.collections` and be of `.type = .auth`, else the build fails. Plain `.authed` still accepts any authenticated principal.
