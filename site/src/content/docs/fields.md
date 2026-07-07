@@ -248,6 +248,10 @@ An arbitrary JSON value, stored as TEXT.
 { "name": "metadata", "type": "json", "options": { "maxSize": 4096 } }
 ```
 
+The admin record editor renders `json` fields with a monospace code editor that
+validates on input, offers a **Format** button, and **blocks Save while the JSON is
+invalid**.
+
 ### select
 
 A single- or multi-value enumerated column.

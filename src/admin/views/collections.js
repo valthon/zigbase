@@ -1,6 +1,7 @@
 import { html, useState, useEffect } from '/_/assets/preact.js';
 import { api, API } from '/_/assets/lib/api.js';
 import { useLiveCollection } from '/_/assets/lib/ui.js';
+import { JsonEditor } from '/_/assets/lib/editor.js';
 
 export function RecordsTable({ col }) {
   const [data, setData] = useState(null);
@@ -246,6 +247,9 @@ function RecordDrawer({ col, record, schema, onClose, onSaved }) {
   const [removals, setRemovals] = useState({}); // field -> [filenames]
   const [err, setErr] = useState('');
   const [fieldErrs, setFieldErrs] = useState({});
+  const [invalid, setInvalid] = useState({}); // field name -> true when unparseable
+  const anyInvalid = Object.values(invalid).some(Boolean);
+  const onValidity = (n, ok) => setInvalid(m => ({ ...m, [n]: !ok }));
   const editable = schema.filter(f => !['id','created','updated','passwordHash','tokenKey'].includes(f.name) && f.type !== 'autodate');
 
   function set(name, v) { setVals({ ...vals, [name]: v }); }
@@ -286,21 +290,23 @@ function RecordDrawer({ col, record, schema, onClose, onSaved }) {
       ${err && html`<div class="error" data-test="record-error">${err}</div>`}
       ${editable.map(f => html`<div class="field" key=${f.name}>
         <label>${f.name} <span class="muted">(${f.type})</span></label>
-        ${control(f, vals[f.name], v => set(f.name, v), files, setFiles, removals, setRemovals)}
+        ${control(f, vals[f.name], v => set(f.name, v), files, setFiles, removals, setRemovals, onValidity)}
         ${fieldErrs[f.name] && html`<div class="error" data-test=${'err-'+f.name}>${fieldErrs[f.name].message}</div>`}
       </div>`)}
       <div class="row" style="margin-top:14px">
-        <button data-test="record-save" onClick=${save}>Save</button>
+        <button data-test="record-save" onClick=${save} disabled=${anyInvalid}>Save</button>
+        ${anyInvalid && html`<span class="error" data-test="save-blocked">Fix invalid JSON to save</span>`}
         ${!isNew && html`<button class="ghost" data-test="record-delete" onClick=${del}>Delete</button>`}
       </div>
     </div>`;
 }
 
-function control(f, value, set, files, setFiles, removals, setRemovals) {
+function control(f, value, set, files, setFiles, removals, setRemovals, onValidity) {
   const t = f.type, o = f.options || {};
   if (t === 'bool') return html`<input type="checkbox" style="width:auto" data-test=${'in-'+f.name} checked=${!!value} onChange=${e => set(e.target.checked)}/>`;
   if (t === 'number') return html`<input type="text" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
-  if (t === 'editor' || t === 'json') return html`<textarea rows="4" data-test=${'in-'+f.name} value=${typeof value === 'object' ? JSON.stringify(value, null, 2) : (value ?? '')} onInput=${e => set(t === 'json' ? safeJson(e.target.value) : e.target.value)}></textarea>`;
+  if (t === 'json') return html`<${JsonEditor} value=${value} onChange=${set} onValidity=${onValidity} name=${f.name}/>`;
+  if (t === 'editor') return html`<textarea rows="4" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}></textarea>`;
   if (t === 'date') return html`<input type="text" placeholder="YYYY-MM-DD" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
   if (t === 'select') return html`<select data-test=${'in-'+f.name} value=${value ?? ''} onChange=${e => set(e.target.value)}><option value="">—</option>${(o.values||[]).map(v => html`<option key=${v} value=${v}>${v}</option>`)}</select>`;
   if (t === 'relation') return html`<${RelationPicker} target=${o.targetCollectionId} value=${value} onChange=${set} name=${f.name}/>`;
@@ -313,7 +319,6 @@ function control(f, value, set, files, setFiles, removals, setRemovals) {
   }
   return html`<input type="text" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
 }
-function safeJson(s) { try { return JSON.parse(s); } catch (_) { return s; } }
 
 function RelationPicker({ target, value, onChange, name }) {
   const [opts, setOpts] = useState([]);

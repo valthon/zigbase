@@ -28,3 +28,4 @@ tbody tr:hover { background:rgba(255,255,255,.03); cursor:pointer; }
 .toolbar .grow { flex:1; }
 .muted { color:var(--muted); }
 .pager { margin-top:12px; display:flex; gap:8px; align-items:center; color:var(--muted); }
+.code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px; white-space:pre; tab-size:2; }
