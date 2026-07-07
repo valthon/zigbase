@@ -30,7 +30,7 @@ ZigBase v0.10.0 is an early release. The gaps below are known and tracked for fu
 
 ## Platform & UI
 - **No Windows build** — Linux and macOS only (the embedded HTTP server depends on facil.io/zap). The official Docker image (`ghcr.io/valthon/zigbase`, see [docs/docker.md](docs/docker.md)) is the supported path on Windows hosts.
-- **Admin UI:** the record editor uses a plain textarea for `editor`- and `json`-type fields (no WYSIWYG rich-text editor), deferred. The Logs & realtime view is capability-gated — it appears only when the app enables `.analytics` (so it's hidden on the stock `zigbase serve` binary).
+- **Admin UI:** The Logs & realtime view is capability-gated — it appears only when the app enables `.analytics` (so it's hidden on the stock `zigbase serve` binary).
 
 ## Static file serving
 

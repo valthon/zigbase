@@ -48,6 +48,7 @@ const assets = [_]Asset{
     mk("/_/assets/style.css", style_css, "text/css"),
     mk("/_/assets/lib/api.js", @embedFile("admin/lib/api.js"), js_ctype),
     mk("/_/assets/lib/ui.js", @embedFile("admin/lib/ui.js"), js_ctype),
+    mk("/_/assets/lib/editor.js", @embedFile("admin/lib/editor.js"), js_ctype),
     mk("/_/assets/views/collections.js", @embedFile("admin/views/collections.js"), js_ctype),
     mk("/_/assets/views/email.js", @embedFile("admin/views/email.js"), js_ctype),
     mk("/_/assets/views/files.js", @embedFile("admin/views/files.js"), js_ctype),
@@ -98,6 +99,8 @@ test "serve returns assets with correct content types + nosniff" {
     try std.testing.expectEqualStrings("text/css", serve(&css).content_type);
     var pj = http.RequestCtx{ .method = .GET, .path = "/_/assets/preact.js", .allocator = std.testing.allocator };
     try std.testing.expectEqualStrings("application/javascript", serve(&pj).content_type);
+    var ed = http.RequestCtx{ .method = .GET, .path = "/_/assets/lib/editor.js", .allocator = std.testing.allocator };
+    try std.testing.expectEqualStrings("application/javascript", serve(&ed).content_type);
     var unknown = http.RequestCtx{ .method = .GET, .path = "/_/assets/nope.js", .allocator = std.testing.allocator };
     try std.testing.expectEqual(@as(u16, 404), serve(&unknown).status);
 }
