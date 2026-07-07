@@ -1,3 +1,0 @@
-### Features
-
-- Programmatic list filters accept bound placeholder values: put `?` tokens in `filter` and pass a parallel `filter_args` slice (`ctx.records().list(...)`). Each `?` binds its value (`.string`/`.int`/`.float`/`.bool`/`.null`) as a literal SQL parameter that is never re-parsed as filter grammar — the injection-safe way to splice a runtime value into a filter. A placeholder is coerced by the target field's type exactly as an inline literal would be (so `price = ?` with `.{ .float = 5.0 }` matches the same rows as `price = 5.00`). Placeholders bind 0-based left-to-right; a placeholder-count vs. `filter_args.len` mismatch is a loud `error.BadFilter` (so a stray `?` on the REST `?filter=` path fails closed).
