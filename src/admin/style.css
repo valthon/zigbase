@@ -29,3 +29,12 @@ tbody tr:hover { background:rgba(255,255,255,.03); cursor:pointer; }
 .muted { color:var(--muted); }
 .pager { margin-top:12px; display:flex; gap:8px; align-items:center; color:var(--muted); }
 .code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px; white-space:pre; tab-size:2; }
+.rte-wrap { border:1px solid var(--line); border-radius:6px; overflow:hidden; background:#101014; }
+.rte-toolbar { display:flex; flex-wrap:wrap; gap:2px; padding:4px; border-bottom:1px solid var(--line); background:var(--panel); }
+.rte-btn { background:transparent; border:1px solid transparent; border-radius:4px; padding:3px 7px; color:var(--fg); cursor:pointer; min-width:26px; line-height:1.2; }
+.rte-btn:hover { border-color:var(--line); background:#101014; }
+.rte { min-height:120px; max-height:340px; overflow:auto; padding:8px 10px; outline:none; }
+.rte h1,.rte h2,.rte h3 { margin:.4em 0; }
+.rte blockquote { border-left:3px solid var(--line); margin:.4em 0; padding-left:10px; color:var(--muted); }
+.rte code { background:#101014; padding:1px 4px; border-radius:4px; font-family:ui-monospace,monospace; }
+.rte:empty:before { content:attr(data-placeholder); color:var(--muted); }

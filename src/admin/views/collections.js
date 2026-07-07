@@ -1,7 +1,7 @@
 import { html, useState, useEffect } from '/_/assets/preact.js';
 import { api, API } from '/_/assets/lib/api.js';
 import { useLiveCollection } from '/_/assets/lib/ui.js';
-import { JsonEditor } from '/_/assets/lib/editor.js';
+import { RichTextEditor, JsonEditor, stripTags } from '/_/assets/lib/editor.js';
 
 export function RecordsTable({ col }) {
   const [data, setData] = useState(null);
@@ -36,6 +36,7 @@ export function RecordsTable({ col }) {
   });
   const items = data ? data.items : [];
   const columns = items.length ? Object.keys(items[0]).filter(k => k !== 'collectionId' && k !== 'collectionName') : ['id', 'created', 'updated'];
+  const typeOf = Object.fromEntries((schema || []).map(f => [f.name, f.type]));
   return html`
     <div data-test="records-view">
       <div class="toolbar">
@@ -49,7 +50,7 @@ export function RecordsTable({ col }) {
       <table>
         <thead><tr>${columns.map(c => html`<th key=${c} onClick=${() => setSort(sort === c ? '-' + c : c)} style="cursor:pointer">${c}${sort === c ? ' ▲' : sort === '-' + c ? ' ▼' : ''}</th>`)}</tr></thead>
         <tbody data-test="rows">
-          ${items.map(r => html`<tr key=${r.id} data-test="row" style="cursor:pointer" onClick=${() => setEditing(r)}>${columns.map(c => html`<td key=${c}>${fmt(r[c])}</td>`)}</tr>`)}
+          ${items.map(r => html`<tr key=${r.id} data-test="row" style="cursor:pointer" onClick=${() => setEditing(r)}>${columns.map(c => html`<td key=${c}>${fmt(r[c], typeOf[c])}</td>`)}</tr>`)}
         </tbody>
       </table>
       ${data && data.totalItems === 0 && html`<p class="muted" data-test="empty">No records.</p>`}
@@ -62,8 +63,9 @@ export function RecordsTable({ col }) {
     </div>`;
 }
 
-function fmt(v) {
+function fmt(v, type) {
   if (v == null) return '';
+  if (type === 'editor' && typeof v === 'string') { const t = stripTags(v); return t.length > 80 ? t.slice(0, 80) + '…' : t; }
   if (Array.isArray(v)) return v.join(', ');
   if (typeof v === 'object') return JSON.stringify(v);
   return String(v);
@@ -306,7 +308,7 @@ function control(f, value, set, files, setFiles, removals, setRemovals, onValidi
   if (t === 'bool') return html`<input type="checkbox" style="width:auto" data-test=${'in-'+f.name} checked=${!!value} onChange=${e => set(e.target.checked)}/>`;
   if (t === 'number') return html`<input type="text" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
   if (t === 'json') return html`<${JsonEditor} value=${value} onChange=${set} onValidity=${onValidity} name=${f.name}/>`;
-  if (t === 'editor') return html`<textarea rows="4" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}></textarea>`;
+  if (t === 'editor') return html`<${RichTextEditor} value=${value} onChange=${set} name=${f.name}/>`;
   if (t === 'date') return html`<input type="text" placeholder="YYYY-MM-DD" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
   if (t === 'select') return html`<select data-test=${'in-'+f.name} value=${value ?? ''} onChange=${e => set(e.target.value)}><option value="">—</option>${(o.values||[]).map(v => html`<option key=${v} value=${v}>${v}</option>`)}</select>`;
   if (t === 'relation') return html`<${RelationPicker} target=${o.targetCollectionId} value=${value} onChange=${set} name=${f.name}/>`;

@@ -147,6 +147,20 @@ hint to clients/admin UI.)
 { "name": "body", "type": "editor", "options": {} }
 ```
 
+The admin record editor renders `editor` fields with a toolbar-driven WYSIWYG
+rich-text editor (bold, italic, underline, strikethrough, headings, lists,
+blockquote, inline code, links). Every write — on input, paste, and toolbar
+action — is passed through a sanitizer that allowlists a fixed tag set (`p`,
+`br`, `strong`/`b`, `em`/`i`, `u`, `s`, `h1`-`h3`, `ul`, `ol`, `li`,
+`blockquote`, `code`, `pre`, `a[href]`) and strips everything else (scripts,
+event-handler attributes, images, iframes, and any other markup), only
+allowing `http:`, `https:`, and `mailto:` link targets. **Content is stored as
+raw HTML** — consumer frontends that render an `editor` field's value must
+sanitize it themselves before injecting it into the DOM; the admin sanitizer
+only protects the admin UI's own editing surface. The editor relies on the
+browser's (deprecated but universally supported) `execCommand` API and
+degrades to plain contenteditable formatting on browsers that drop it.
+
 ### `date`
 
 A date/time string column.
