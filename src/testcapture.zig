@@ -12,7 +12,7 @@
 //!   matches the URL, returns a canned response with no network at all.
 //!
 //! ## Production gate (hard requirement)
-//! Everything here is gated by the `dev_clock` build option (the same flag that gates the
+//! Everything here is gated by the `dev_mode` build option (the same flag that gates the
 //! test clock — on in `Debug`, forced off by the release script's cross-compiles). When
 //! `enabled` is `comptime false`, every call site (`if (testcapture.enabled) { … }`) is
 //! comptime-dead and dead-code-eliminated, so a production binary is byte-for-byte
@@ -28,12 +28,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
+const dev = @import("dev.zig");
 const http_client = @import("http_client.zig");
 
-/// Comptime gate. True only on a `dev_clock`-enabled build (Debug by default; never a
+/// Comptime gate. True only on a `dev_mode`-enabled build (Debug by default; never a
 /// release/prod build). When false every capture branch is comptime-dead.
-pub const enabled = build_options.dev_clock;
+pub const enabled = dev.enabled;
 
 /// Spin-acquire `m` (matches the `std.atomic.Mutex` idiom used elsewhere, e.g. ratelimit.zig).
 /// Contention is near-zero here — this is a dev-only, single-suite facility.
@@ -482,8 +482,8 @@ test "http: not capturing returns passthrough" {
     try std.testing.expectEqual(Outcome.passthrough, oc);
 }
 
-test "prod gate: capture is comptime-eliminated when dev_clock is off" {
-    if (enabled) return error.SkipZigTest; // only meaningful when built with -Ddev-clock=false
+test "prod gate: capture is comptime-eliminated when dev_mode is off" {
+    if (enabled) return error.SkipZigTest; // only meaningful when built with -Ddev-mode=false
     // Even when a test tries to enable capture, the gate refuses: every op is a no-op.
     mail.enable(true);
     mail.record("f", "t", "s", "b");

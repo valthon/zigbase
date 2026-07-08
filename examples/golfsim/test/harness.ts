@@ -94,7 +94,7 @@ async function waitForHealth(url: string, timeoutMs = 20_000): Promise<void> {
  * `env` injects extra environment variables into the spawned server process — used by the
  * determinism e2e to freeze time (`ZIGBASE_FAKE_NOW`) and point the booking webhook at a
  * loopback capture server (`GOLFSIM_BOOKING_WEBHOOK_URL`). The determinism seam is compiled
- * in only on a dev-clock build (the default Debug build used here).
+ * in only on a dev-mode build (the default Debug build used here).
  */
 export interface StartOptions {
   env?: Record<string, string>;

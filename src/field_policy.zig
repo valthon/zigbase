@@ -1,6 +1,23 @@
 const std = @import("std");
 const aead = @import("aead.zig");
 const schema = @import("schema.zig");
+const dev = @import("dev.zig");
+
+/// Field-crypto mode. `.real` = AES-GCM envelopes (production). `.fake` = a dev-only,
+/// build-gated readable passthrough (`fake:<key>:<value>`) for debugging/testing.
+pub const Mode = enum { real, fake };
+
+/// Env var selecting the mode (dev builds only): `ZIGBASE_FIELD_CRYPTO=fake`.
+pub const env_var = "ZIGBASE_FIELD_CRYPTO";
+
+/// Resolve the mode from the env, gated by `dev.enabled`. On a prod build this is
+/// comptime `.real` — the env var is never consulted, so fake crypto can't be selected.
+pub fn resolveModeFromEnv(raw: ?[]const u8) Mode {
+    if (!dev.enabled) return .real;
+    const s = raw orelse return .real;
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    return if (std.mem.eql(u8, t, "fake")) .fake else .real;
+}
 
 // ---------------------------------------------------------------------------
 // Field policy pipeline.
@@ -65,6 +82,10 @@ pub const Cipher = struct {
     /// The generation used for all writes; `keys[primary_gen]` is always set.
     primary_gen: u16 = 1,
     io: std.Io,
+    /// Field-crypto mode. `.real` uses the key-ring below; `.fake` uses `fake_key`.
+    mode: Mode = .real,
+    /// Fake-mode label: embedded in the readable envelope and required on open.
+    fake_key: []const u8 = "",
 
     /// Single-generation cipher (generation 1) from the raw `ZIGBASE_FIELD_KEY`.
     /// Backward-compatible shorthand used by tests and the single-key path.
@@ -72,6 +93,12 @@ pub const Cipher = struct {
         var c = Cipher{ .io = io, .primary_gen = 1 };
         c.keys[1] = deriveGeneration(field_key, 1);
         return c;
+    }
+
+    /// Dev-only fake cipher: `seal` writes readable `fake:<key>:<value>`. Callers must
+    /// gate construction on `dev.enabled` (the boot path does). `key` is the label.
+    pub fn fake(io: std.Io, key: []const u8) Cipher {
+        return .{ .io = io, .mode = .fake, .fake_key = key };
     }
 
     /// Resolve the full key-ring from config: the primary key (`field_key`) at
@@ -117,8 +144,14 @@ pub const Cipher = struct {
 
     /// Seal a storage string into a `v<primary>:` envelope under the primary key.
     pub fn seal(self: *const Cipher, alloc: std.mem.Allocator, plaintext: []const u8) std.mem.Allocator.Error![]u8 {
-        const key = self.keys[self.primary_gen].?;
-        return aead.seal(self.io, alloc, key, self.primary_gen, plaintext);
+        switch (self.mode) {
+            .real => {
+                const key = self.keys[self.primary_gen].?;
+                return aead.seal(self.io, alloc, key, self.primary_gen, plaintext);
+            },
+            // Readable, self-labeling, deterministic. Dev-only (construction is gated).
+            .fake => return std.fmt.allocPrint(alloc, "fake:{s}:{s}", .{ self.fake_key, plaintext }),
+        }
     }
 
     /// Open a stored value back to its plaintext storage string. STRICT /
@@ -129,10 +162,24 @@ pub const Cipher = struct {
     /// plaintext therefore requires an explicit `zigbase rewrap` first; there is
     /// no silent plaintext passthrough.
     pub fn open(self: *const Cipher, alloc: std.mem.Allocator, stored: []const u8) aead.Error![]u8 {
-        const ver = aead.parseVersion(stored) orelse return error.BadEnvelope;
-        if (ver < 1 or ver > MAX_GENERATION) return error.BadEnvelope;
-        const key = self.keys[ver] orelse return error.BadEnvelope;
-        return aead.open(alloc, key, stored);
+        switch (self.mode) {
+            .real => {
+                const ver = aead.parseVersion(stored) orelse return error.BadEnvelope;
+                if (ver < 1 or ver > MAX_GENERATION) return error.BadEnvelope;
+                const key = self.keys[ver] orelse return error.BadEnvelope;
+                return aead.open(alloc, key, stored);
+            },
+            .fake => {
+                // Require the exact `fake:<fake_key>:` prefix (prefix-walk tolerates a ':'
+                // inside the key). A different label, or a real `v<N>:` envelope, fails closed.
+                if (!std.mem.startsWith(u8, stored, "fake:")) return error.BadEnvelope;
+                const rest = stored["fake:".len..];
+                if (!std.mem.startsWith(u8, rest, self.fake_key)) return error.BadEnvelope;
+                const after = rest[self.fake_key.len..];
+                if (after.len == 0 or after[0] != ':') return error.BadEnvelope;
+                return alloc.dupe(u8, after[1..]);
+            },
+        }
     }
 };
 
@@ -234,4 +281,45 @@ test "isEncryptableType allows only text/editor/json" {
     try std.testing.expect(!isEncryptableType(.number));
     try std.testing.expect(!isEncryptableType(.relation));
     try std.testing.expect(!isEncryptableType(.bool));
+}
+
+test "fake mode: seal is readable and self-labeling; open round-trips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cph = Cipher.fake(std.testing.io, "@test@");
+    const blob = try cph.seal(a, "John Doe loves cheese");
+    try std.testing.expectEqualStrings("fake:@test@:John Doe loves cheese", blob);
+    try std.testing.expect(!aead.isEnvelope(blob)); // not a v<N>: envelope
+    try std.testing.expectEqualStrings("John Doe loves cheese", try cph.open(a, blob));
+}
+
+test "fake mode: a different label fails closed (verifies which key)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const blob = try Cipher.fake(std.testing.io, "k1").seal(a, "x");
+    try std.testing.expectError(error.BadEnvelope, Cipher.fake(std.testing.io, "k2").open(a, blob));
+}
+
+test "fake and real envelopes are mutually unreadable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const real = Cipher.fromEnv(std.testing.io, "operator-key");
+    const fake_c = Cipher.fake(std.testing.io, "@test@");
+    const real_blob = try real.seal(a, "s");
+    const fake_blob = try fake_c.seal(a, "s");
+    try std.testing.expectError(error.BadEnvelope, real.open(a, fake_blob)); // prod can't read fake
+    try std.testing.expectError(error.BadEnvelope, fake_c.open(a, real_blob)); // fake can't read real
+}
+
+test "resolveModeFromEnv is gated by the dev build" {
+    if (dev.enabled) {
+        try std.testing.expectEqual(Mode.fake, resolveModeFromEnv("fake"));
+        try std.testing.expectEqual(Mode.real, resolveModeFromEnv("real"));
+        try std.testing.expectEqual(Mode.real, resolveModeFromEnv(null));
+    } else {
+        try std.testing.expectEqual(Mode.real, resolveModeFromEnv("fake")); // comptime-off on prod
+    }
 }

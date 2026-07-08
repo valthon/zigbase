@@ -14,7 +14,7 @@
 //! runs with the same seed produce byte-for-byte identical IDs and tokens.
 //!
 //! ## Production gate (hard requirement)
-//! The seeded PRNG is compiled in ONLY when `clock.enabled` is true (i.e. the `dev_clock`
+//! The seeded PRNG is compiled in ONLY when `clock.enabled` is true (i.e. the `dev_mode`
 //! build option is on — default in `Debug`, forced off by the release script in all
 //! release/prod builds). On a prod build `enabled` is `comptime false`, every override
 //! branch is dead code, and `entropy.fill` degrades to a straight `io.random(buf)` call.
@@ -31,9 +31,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const clock = @import("clock.zig");
 
-/// Comptime gate. True only on a `dev_clock`-enabled build (Debug by default; never a
+/// Comptime gate. True only on a `dev_mode`-enabled build (Debug by default; never a
 /// release/prod build). Reuses the same build option as the clock seam — a single
-/// `-Ddev-clock` flag enables the full deterministic-test-mode surface (frozen time +
+/// `-Ddev-mode` flag enables the full deterministic-test-mode surface (frozen time +
 /// seeded entropy). When false, every seeded-PRNG branch below is comptime-dead.
 pub const enabled = clock.enabled;
 
@@ -188,7 +188,7 @@ test "without a seed: fill produces real (non-seeded) entropy" {
 }
 
 test "PROD GATE: a non-dev build never activates the seeded PRNG" {
-    if (enabled) return error.SkipZigTest; // only meaningful when compiled with -Ddev-clock=false
+    if (enabled) return error.SkipZigTest; // only meaningful when compiled with -Ddev-mode=false
     // install() is a no-op on prod; setForTest calls install() internally.
     install(42);
     try std.testing.expect(!isActive()); // gate refuses it

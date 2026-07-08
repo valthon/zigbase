@@ -1,6 +1,6 @@
 //! Tests for the dev-only injectable clock (`clock.zig`). They exercise the seam through
 //! a real in-memory SQLite connection and through the JWT expiry path, and assert the
-//! production gate's hard contract: when `dev_clock` is off, time can NOT be frozen.
+//! production gate's hard contract: when `dev_mode` is off, time can NOT be frozen.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -65,7 +65,7 @@ test "token expiry is deterministic against the frozen clock (dev build only)" {
 }
 
 test "PROD GATE: a non-dev build can never freeze time" {
-    if (clock.enabled) return error.SkipZigTest; // only meaningful when compiled with -Ddev-clock=false
+    if (clock.enabled) return error.SkipZigTest; // only meaningful when compiled with -Ddev-mode=false
     // Even if a test tries to force an override, the gate refuses it and now stays wall-clock.
     clock.setForTest(frozen_unix);
     defer clock.resetForTest();

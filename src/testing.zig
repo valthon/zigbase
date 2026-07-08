@@ -43,6 +43,8 @@ const data_mod = @import("data.zig");
 const api_auth = @import("api/auth.zig");
 const mail = @import("mail/mailer.zig");
 const capture_mod = @import("mail/capture.zig");
+const dev = @import("dev.zig");
+const field_policy = @import("field_policy.zig");
 
 /// The runtime application-context type (what `ctx.app` / `t.app()` point at).
 pub const Runtime = app_mod.App;
@@ -80,12 +82,20 @@ pub const StartOptions = struct {
     allocator: ?std.mem.Allocator = null,
     /// Async/IO handle threaded into the app. Defaults to `std.testing.io`.
     io: ?std.Io = null,
-    /// Deterministic frozen clock (unix seconds), via the dev-clock override — token expiry,
-    /// TTLs, and `datetime('now')` all read it. `null` = wall clock. Requires a dev-clock build
+    /// Deterministic frozen clock (unix seconds), via the dev-mode override — token expiry,
+    /// TTLs, and `datetime('now')` all read it. `null` = wall clock. Requires a dev-mode build
     /// (Debug/`zig build test`); a no-op on a prod build.
     fake_now_unix: ?i64 = null,
     /// Deterministic PRNG seed for id/token generation (reproducible snapshots). `null` = CSPRNG.
     fake_seed: ?u64 = null,
+    /// Field-encryption key. When set, boots REAL AES-GCM at-rest crypto (full fidelity),
+    /// closing #260 for encrypted-field apps. When null, an `.encrypted`-field app defaults
+    /// to fake-encrypt (below).
+    field_key: ?[]const u8 = null,
+    /// Field-crypto mode. `null` = infer: `.real` when `field_key` is set, else `.fake`.
+    /// `.fake` stores readable `fake:<label>:<value>` at rest (label = `field_key` or `@test@`);
+    /// requires a dev-mode build (`zig build test`). `.real` requires `field_key`.
+    field_crypto: ?field_policy.Mode = null,
 };
 
 /// Boot `AppType` (a `zigbase.App(.{...})` builder result type) into an in-process `Harness`.
@@ -119,12 +129,18 @@ pub fn start(comptime AppType: type, opts: StartOptions) !Harness(AppType) {
     errdefer allocator.free(h.data_dir);
     errdefer if (h.owns_tmp) h.tmp.cleanup();
 
+    const fc_mode: field_policy.Mode = opts.field_crypto orelse
+        (if (opts.field_key != null) .real else .fake);
+    const fc_key: []const u8 = opts.field_key orelse (if (fc_mode == .fake) "@test@" else "");
+
     const cfg = config.Config{
         .data_dir = h.data_dir,
         // Plain-HTTP in-process: cookies must not be Secure-only or the harness can't read them.
         .cookie_secure = false,
         .fake_now_unix = opts.fake_now_unix,
         .fake_seed = opts.fake_seed,
+        .field_crypto = fc_mode,
+        .field_key = fc_key,
     };
 
     // bootForTest only READS the environ during boot (backend select, field-key resolve); it is
@@ -562,6 +578,44 @@ const HarnessTestApp = framework.App(.{
         },
     },
 });
+
+/// App with an `.encrypted` field, for the field-crypto harness tests (#260).
+const EncryptedTestApp = framework.App(.{
+    .collections = .{
+        .notes = .{
+            .fields = .{
+                .{ .name = "title", .type = .text, .max = 100 },
+                .{ .name = "body", .type = .text, .encrypted = true },
+            },
+            .rules = .{ .list = "@public", .view = "@public", .create = "@public" },
+        },
+    },
+});
+
+test "harness: encrypted-field app boots via fake-encrypt default (#260)" {
+    if (!dev.enabled) return error.SkipZigTest; // fake mode is dev-only (build-gated)
+    // No crypto opts -> fake-encrypt, label "@test@". Booting AT ALL proves fake engaged:
+    // real mode with no key would fail closed (error.FieldKeyRequired).
+    var t = try start(EncryptedTestApp, .{});
+    defer t.deinit();
+    const created = try t.request(.POST, "/api/collections/notes/records", .{ .json = .{ .title = "t", .body = "John Doe loves cheese" } });
+    try std.testing.expectEqual(@as(u16, 201), created.status);
+    const listed = try t.request(.GET, "/api/collections/notes/records", .{});
+    const page = try listed.json(struct { items: []struct { body: []const u8 } });
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqualStrings("John Doe loves cheese", page.items[0].body); // plaintext round-trips
+}
+
+test "harness: encrypted-field app boots with a real field_key" {
+    // Real AES-GCM is not build-gated, so this runs in both gate states.
+    var t = try start(EncryptedTestApp, .{ .field_key = "test-operator-key" });
+    defer t.deinit();
+    const created = try t.request(.POST, "/api/collections/notes/records", .{ .json = .{ .title = "t", .body = "secret" } });
+    try std.testing.expectEqual(@as(u16, 201), created.status);
+    const listed = try t.request(.GET, "/api/collections/notes/records", .{});
+    const page = try listed.json(struct { items: []struct { body: []const u8 } });
+    try std.testing.expectEqualStrings("secret", page.items[0].body);
+}
 
 test "harness: custom route round-trip + json() parse" {
     var t = try start(HarnessTestApp, .{});

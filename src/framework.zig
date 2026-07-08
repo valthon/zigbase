@@ -16,6 +16,7 @@ const scheduler = @import("scheduler.zig");
 const schedule = @import("schedule.zig");
 const clock = @import("clock.zig");
 const entropy_mod = @import("entropy.zig");
+const dev = @import("dev.zig");
 const mail = @import("mail/mailer.zig");
 const report_reporter = @import("report/reporter.zig");
 const report_log = @import("report/log.zig");
@@ -1933,6 +1934,9 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  ZIGBASE_FIELD_KEY_GENERATION  Generation of the primary key = envelope version written
         \\                           (v<N>:). Bump to rotate; then run `zigbase rewrap`. [default 1]
         \\  ZIGBASE_FIELD_KEY_V<n>    Older read-only key for generation <n> (decrypts existing v<n>: data).
+        \\  ZIGBASE_FIELD_CRYPTO     DEV BUILDS ONLY (-Ddev-mode): set "fake" to store .encrypted fields
+        \\                           as readable fake:<key>:<value> instead of AES-GCM. Compiled out of
+        \\                           release binaries; never read there.       [default real]
         \\  ZIGBASE_PUBLIC_URL       Public base URL for user-facing links (magic-link emails).
         \\  ZIGBASE_UNSUBSCRIBE_BASE_URL Public base URL for the RFC 8058 one-click unsubscribe
         \\                           endpoint. Empty disables the feature. [default: off]
@@ -2654,7 +2658,7 @@ fn BootedApp(comptime opts: ServeOpts) type {
 ///
 /// This is the reusable seam extracted out of `serveImpl` (Stage 1 of the in-process test
 /// harness, #239): it runs everything the monolithic serve path did before `srv.listen()` —
-/// jwt resolution, dev clock/entropy install, pool open, field-cipher resolution, migrations +
+/// jwt resolution, dev-mode clock/entropy install, pool open, field-cipher resolution, migrations +
 /// comptime provisioning, startup GC sweeps, storage/mailer/sms plugin creation, the auth-method
 /// registry, the rate limiter, static-source resolution, and the App assembly (+ metadata /
 /// feature caches and the captcha/unsubscribe/VAPID validations) — in the SAME order.
@@ -2720,7 +2724,16 @@ fn bootApp(
     // it (db.zig). FAIL-CLOSED: if any collection declares an `.encrypted` field but no
     // key is configured, refuse to start rather than silently storing plaintext. The
     // cipher lives in the holder (stable address); the pool points at it.
-    if (cfg.field_key.len > 0) {
+    if (dev.enabled and cfg.field_crypto == .fake) {
+        // Dev-only readable at-rest crypto (build-gated: dead on a release binary).
+        const label = if (cfg.field_key.len > 0) cfg.field_key else "@test@";
+        holder.field_cipher = field_policy.Cipher.fake(io, label);
+        db.poolSetFieldCipher(&holder.pool, @ptrCast(&holder.field_cipher));
+        // Only shout when the app actually declares an `.encrypted` field — otherwise the
+        // stamped cipher is inert and the notice would be pure noise (e.g. every harness test).
+        if (anyEncryptedField(schema_collections))
+            std.log.warn("FAKE FIELD CRYPTO ACTIVE (ZIGBASE_FIELD_CRYPTO=fake, label \"{s}\") — .encrypted values are stored READABLE as `fake:<label>:<plaintext>`. This must NEVER appear on a production build.", .{label});
+    } else if (cfg.field_key.len > 0) {
         holder.field_cipher = field_policy.Cipher.resolve(io, config.EnvGetter{ .environ = environ }, cfg.field_key, cfg.field_key_generation) catch |e| {
             std.log.err("refusing to start: invalid field-encryption key config ({s}); see ZIGBASE_FIELD_KEY_GENERATION / ZIGBASE_FIELD_KEY_V<n>", .{@errorName(e)});
             return e;

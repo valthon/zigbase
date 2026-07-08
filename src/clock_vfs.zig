@@ -18,7 +18,7 @@
 //!
 //! ## Production gate (hard requirement)
 //! `vfsName()` begins with `if (comptime !clock.enabled) return null;`. `clock.enabled` is
-//! the comptime `dev_clock` build option (off in every release build), so on a prod build
+//! the comptime `dev_mode` build option (off in every release build), so on a prod build
 //! `vfsName()` folds to `null` and `sqlite3_open_v2` is called with `zVfs = null` — the OS
 //! default VFS, byte-for-byte unchanged. The wrapper struct, `ensureInstalled`, and both
 //! callbacks are comptime-dead and eliminated; no custom VFS is ever registered.
@@ -176,7 +176,7 @@ test "no freeze: CURRENT_TIMESTAMP tracks the real wall clock (delegation, dev b
 }
 
 test "PROD GATE: no wrapper VFS installed and CURRENT_TIMESTAMP stays on the wall clock" {
-    if (clock.enabled) return error.SkipZigTest; // only meaningful with -Ddev-clock=false
+    if (clock.enabled) return error.SkipZigTest; // only meaningful with -Ddev-mode=false
     clock.setForTest(frozen_unix); // gate refuses the freeze
     defer clock.resetForTest();
     // vfsName() comptime-folds to null; the wrapper is never registered.

@@ -368,6 +368,28 @@ match — don't reference encrypted fields in rules. Key rotation (multiple gene
 `ZIGBASE_FIELD_KEY_V<n>`) and the `zigbase rewrap` command are covered in
 [Framework → Field encryption at rest](./framework#field-encryption-at-rest-encrypted).
 
+### Dev-only fake-encrypt mode
+
+Set `ZIGBASE_FIELD_CRYPTO=fake` (or, in `zigbase.testing`, boot with no `field_key` — see
+[Framework → Encrypted-field apps (#260)](./framework#encrypted-field-apps-260)) to swap the real
+AES-GCM envelope for a **readable** one: an `.encrypted` value is stored as `fake:<key>:<value>`
+— the plaintext, visible verbatim, prefixed with the label instead of a version tag. This is for
+debugging/testing an `.encrypted`-field app without managing a real key, and for the
+`zigbase.testing` harness to boot such an app at all (previously impossible — a real boot fails
+closed with no key configured).
+
+- **Dev-build-only, never on a production binary.** Fake mode is gated by the same `dev_mode`
+  build option as the frozen clock and seeded entropy (`-Ddev-mode`, on by default in `Debug`,
+  off in every release build — see
+  [Framework §14](./framework#14-test--dev-mode-determinism-seams)). On a release binary the
+  `ZIGBASE_FIELD_CRYPTO` env var is never even read; the mode is always `.real`.
+- **Fail-closed across modes.** A fake envelope and a real `v<N>:` envelope are mutually
+  unreadable: a real binary can never read fake-encrypted data (it isn't a valid envelope), and
+  fake mode can never read real ciphertext. A database seeded with fake-encrypt data can never
+  accidentally be served as if it were really encrypted.
+- **Label-scoped.** `open` requires the exact `fake:<key>:` prefix; a different label fails
+  closed, same as a wrong real key would.
+
 ## Row expiry (`ttl_field`) — a collection option
 
 `ttl_field` is a **collection-level** option (not a field option): it names an existing

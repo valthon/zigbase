@@ -12,7 +12,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 # EXACT matches only — a prefix rule would silently swallow real vars (e.g. a
 # "ZIGBASE_OAUTH_" prefix rule would hide ZIGBASE_OAUTH_STATE_SERVER, the E11 var!).
 ENV_ALLOWLIST = {
-    "ZIGBASE_FAKE_NOW", "ZIGBASE_FAKE_SEED",          # -Ddev-clock builds only
+    "ZIGBASE_FAKE_NOW", "ZIGBASE_FAKE_SEED",          # -Ddev-mode builds only
     "ZIGBASE_TEST_BINARY", "ZIGBASE_FEATURES_BINARY", # test harness only
     "ZIGBASE_PG_TEST_URL",                            # postgres test-suite harness only
     "ZIGBASE_PG_TLS_CA", "ZIGBASE_PG_PLAINTEXT",      # postgres live-TLS test harness only (tls_pg_test.zig)

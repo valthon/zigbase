@@ -25,13 +25,14 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
     build_options.addOption([]const u8, "commit", gitCommit(b));
-    // Dev-only injectable clock (ZIGBASE_FAKE_NOW). Compiled in ONLY when this is true so
-    // a production binary can never freeze time. Defaults to on in Debug, off in any
-    // release/optimized build; the release script cross-compiles ReleaseFast/ReleaseSafe,
-    // so shipped binaries get `false` and the override code folds to comptime-dead. Override
-    // with -Ddev-clock=true to build a debuggable binary that still honors the env (e2e dev).
-    const dev_clock = b.option(bool, "dev-clock", "Compile in the dev-only ZIGBASE_FAKE_NOW test clock (default: on in Debug, off in release)") orelse (optimize == .Debug);
-    build_options.addOption(bool, "dev_clock", dev_clock);
+    // Dev-only seams (injectable clock, seeded entropy, test-capture, fake field-crypto).
+    // Compiled in ONLY when this is true so a production binary can never use any of them.
+    // Defaults to on in Debug, off in any release/optimized build; the release script
+    // cross-compiles ReleaseFast/ReleaseSafe, so shipped binaries get `false` and the
+    // override code folds to comptime-dead. Override with -Ddev-mode=true to build a
+    // debuggable binary that still honors the dev-only env vars (e2e dev).
+    const dev_mode = b.option(bool, "dev-mode", "Compile in the dev-only, never-in-prod seams: ZIGBASE_FAKE_NOW clock, ZIGBASE_FAKE_SEED entropy, test-capture, and ZIGBASE_FIELD_CRYPTO fake crypto (default: on in Debug, off in release)") orelse (optimize == .Debug);
+    build_options.addOption(bool, "dev_mode", dev_mode);
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
     // comptime-dead — the shipped binary is byte-for-byte unaffected. `-Dvector=true` enables vector

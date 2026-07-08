@@ -32,7 +32,7 @@
 //!
 //! ## Production gate (hard requirement)
 //! `install` begins with `if (comptime !clock.enabled) return;`. `clock.enabled` is the comptime
-//! `dev_clock` build option (off in every release build), so on a prod build the entire body is
+//! `dev_mode` build option (off in every release build), so on a prod build the entire body is
 //! comptime-dead and eliminated: no schema, no function, no search_path change — the connection
 //! is byte-for-byte unchanged and `ZIGBASE_FAKE_NOW` is never consulted. Even on a dev build, the
 //! override is installed ONLY while a freeze is actually active (`frozenUnix()` non-null);

@@ -30,7 +30,7 @@ pub const Outcome = enum { done, failed };
 /// `policy.max_attempts`. Each attempt gets a fresh per-attempt arena + Ctx (no HTTP
 /// request, anonymous identity — like a scheduler job). On the final failure the error
 /// is reported via `.onError` (phase `.job`) and `.failed` is returned. Between attempts
-/// it sleeps `backoffMs` (honoring the dev clock via `io.sleep`).
+/// it sleeps `backoffMs` (honoring the frozen dev-mode clock via `io.sleep`).
 pub fn runWithRetry(app: *App, handler: queue.JobHandler, payload: []const u8, policy: RetryPolicy) Outcome {
     var attempt: u32 = 1;
     const max: u32 = if (policy.max_attempts == 0) 1 else policy.max_attempts;

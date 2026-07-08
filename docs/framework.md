@@ -1373,7 +1373,7 @@ For deterministic e2e/integration tests, the framework can capture what it *sent
 in-memory mail **outbox** and a record of every outbound `ctx.http()` call — and inject
 **canned HTTP responses** instead of hitting the network. It mirrors the determinism seam
 (`ZIGBASE_FAKE_NOW`) and shares the **same comptime gate**: it is compiled in only on a
-`dev_clock` build (on in `Debug`, off in any release build), so a production binary is
+`dev_mode` build (on in `Debug`, off in any release build), so a production binary is
 byte-for-byte unaffected — `zigbase.testcapture.enabled` is `comptime false` there, the
 seams fold away, and there is no runtime branch or perf cost. Every API below is a no-op /
 returns empty when the gate is off.
@@ -4125,8 +4125,9 @@ collections at runtime.
 
 ## 14. Test / dev-mode determinism seams
 
-Two env vars (dev builds only) make a test suite reproducible. Both are compiled out
-entirely in production — a release binary never reads either var.
+Three env vars (dev builds only) make a test suite reproducible and encrypted-field
+apps debuggable. All three are compiled out entirely in production — a release binary
+never reads any of them.
 
 ### Freezing time: `ZIGBASE_FAKE_NOW`
 
@@ -4157,7 +4158,7 @@ registration or VFS on a remote server): when a freeze is active, every connecti
 session-level `now()` override — a `zigbase_frozen.now()` wrapper returning the frozen instant,
 placed on the connection's `search_path` ahead of `pg_catalog` (`src/backend/postgres/clock.zig`).
 Because the framework and any consumer raw SQL both call `now()`, this freezes record autodate
-stamps, KV/metadata timestamps, and a consumer's own `now()` alike. Same comptime `dev_clock`
+stamps, KV/metadata timestamps, and a consumer's own `now()` alike. Same comptime `dev_mode`
 gate, so a production Postgres binary is unaffected.
 
 ```sh
@@ -4183,18 +4184,35 @@ The seam routes through `src/id.generate`, covering:
 Other randomness (AEAD nonces, OTP digits, WebAuthn challenges) is **not** routed
 through this seam — those are security-critical at runtime and seeding them is unsafe.
 
+### Fake field-crypto: `ZIGBASE_FIELD_CRYPTO`
+
+Set `ZIGBASE_FIELD_CRYPTO=fake` to store `.encrypted` fields as a readable,
+self-labeling `fake:<key>:<value>` envelope instead of real AES-GCM ciphertext, so you
+can eyeball encrypted values right in the database while debugging (the label defaults
+to `@test@`, or `ZIGBASE_FIELD_KEY` if set). Fake and real envelopes are mutually
+unreadable, so a fake-encrypted database fails closed on a real binary. The in-process
+test harness (§15) exposes the same behavior via `StartOptions.field_crypto` /
+`field_key` (this is how a `.encrypted`-field app is booted under test). See
+[Fields → Encryption at rest](./fields) for the field-level details.
+
+```sh
+ZIGBASE_FIELD_CRYPTO=fake ./zigbase serve --insecure-cookies ...
+```
+
 ### Production gate
 
-Both seams are compiled in ONLY when the `dev_clock` build option is `true` (the
-default in `Debug` builds). The release script forces `-Ddev-clock=false` for all
+All three seams are compiled in ONLY when the `dev_mode` build option is `true` (the
+default in `Debug` builds). The release script forces `-Ddev-mode=false` for all
 shipped binaries, so a production binary has the override code comptime-eliminated:
 
 - `ZIGBASE_FAKE_NOW` is never read; the clock always returns wall time.
 - `ZIGBASE_FAKE_SEED` is never read; ID/token generation always uses the OS CSPRNG.
+- `ZIGBASE_FIELD_CRYPTO` is never read; `.encrypted` fields always use real AES-GCM —
+  fake mode is impossible on a release binary, and a fake-encrypted DB is unreadable.
 
-You can also force the prod-safe behavior explicitly: `zig build -Ddev-clock=false`.
+You can also force the prod-safe behavior explicitly: `zig build -Ddev-mode=false`.
 
-CI runs both passes: the default `Debug` pass (dev features on, prod-gate assertions skipped) and a `-Ddev-clock=false` prod-gate pass (dev features off, prod-gate assertions executed) to verify the compiled-out guarantee.
+CI runs both passes: the default `Debug` pass (dev features on, prod-gate assertions skipped) and a `-Ddev-mode=false` prod-gate pass (dev features off, prod-gate assertions executed) to verify the compiled-out guarantee.
 
 ## 15. Testing your app (`zigbase.testing`)
 
@@ -4243,6 +4261,8 @@ returns. `StartOptions` (all defaulted, so `.{}` works):
 | `io` | `std.testing.io` | Async/IO handle threaded into the app. |
 | `fake_now_unix` | `null` | Freeze the dev clock (unix seconds) — token expiry, TTLs, and `datetime('now')` all read it (see §14). |
 | `fake_seed` | `null` | Seed the dev PRNG for reproducible IDs/tokens (see §14). |
+| `field_key` | `null` | Real AES-GCM field-encryption key for an app with `.encrypted` fields — closes #260 (see below). `null` and no `field_crypto` override defaults the app to fake-encrypt instead of failing closed. |
+| `field_crypto` | `null` (infer) | `.real` or `.fake` (`field_policy.Mode`). `null` infers `.real` when `field_key` is set, else `.fake`. `.fake` requires a dev-mode build (see below). |
 
 `deinit` tears down the booted app, every request arena, the optional capture mailer, and the
 tempdir. The harness uses an **on-disk tempdir**, never `:memory:` — the multi-connection reader
@@ -4339,8 +4359,33 @@ test "verification email is sent" {
 
 `captureMail` is idempotent (repeated calls return the same instance) and the captured messages
 carry owned copies of every field (subject, recipient, both body parts, attachments). The
-`fake_now_unix` / `fake_seed` options drive the same dev-clock and seeded-entropy seams described
+`fake_now_unix` / `fake_seed` options drive the same dev-mode clock and seeded-entropy seams described
 in §14, so token `exp`, TTL math, and generated IDs are reproducible across runs.
+
+### Encrypted-field apps (#260)
+
+An app whose comptime `.collections` declare an `.encrypted` field (see
+[docs/fields.md](./fields.md#encryption-at-rest)) used to be impossible to boot through the
+harness at all: production boot fails closed with `error.FieldKeyRequired` when no
+`ZIGBASE_FIELD_KEY` is configured, and the harness had no way to set one. `StartOptions` now
+offers two ways to boot such an app:
+
+```zig
+// (1) Real AES-GCM — full fidelity, exercises the actual envelope format.
+var t = try zigbase.testing.start(MyApp, .{ .field_key = "test-operator-key" });
+
+// (2) Fake-encrypt (the default when field_key is omitted) — dev-mode only.
+var t = try zigbase.testing.start(MyApp, .{});
+```
+
+With no `field_key` and no `field_crypto` override, the harness defaults to **fake-encrypt**:
+`.encrypted` values are stored as the plaintext-visible `fake:<label>:<value>` (label
+`"@test@"`, or `field_key` if you set one without forcing `.field_crypto = .real`) instead of a
+real AES-GCM envelope, so assertions can compare against the plaintext directly. Fake-encrypt is
+compiled in only on a dev-mode build (`zig build test`, the default harness build) — see
+[§14](#14-test--dev-mode-determinism-seams) and [docs/fields.md](./fields.md#dev-only-fake-encrypt-mode)
+for the production-safety gate. Pass `.field_key` to boot with real crypto instead (works in every
+build; not gated), e.g. to test key-rotation or envelope-format behavior end-to-end.
 
 ## Compile-time build flags
 
@@ -4352,7 +4397,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dfts5` | **on** | SQLite full-text search (FTS5). `-Dfts5=false` drops `-DSQLITE_ENABLE_FTS5` from the SQLite build (~250-400 KB smaller) for lean binaries with no `.searchable` field; `?search=` then 400s and the server refuses to start over a `.searchable` SQLite schema. Postgres full-text search is unaffected. → [docs/search.md](./search.md#build-requirement--dfts5-default-on) |
 | `-Dvector` | off | Opt-in nearest-neighbor `?vector=` KNN search — sqlite-vec on SQLite, pgvector on Postgres. → [docs/search.md](./search.md#vector-search-opt-in) |
 | `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres.md](./postgres.md) |
-| `-Ddev-clock` | on in `Debug`, off in release | The `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` dev-only test seams (§14 above); the release script forces it off for shipped binaries. |
+| `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
 
 ## Exported names reference
