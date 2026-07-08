@@ -6,9 +6,10 @@
 # contains one or more `### <Section>` headings (each with bullet lines); a single fragment
 # may populate multiple sections. At release this script aggregates the bullets per section
 # across ALL fragments, emits each non-empty section (in canonical order) under one new
-# `## [<version>] - <date>` block, inserts it (above the first released version, below
-# `## [Unreleased]`) into BOTH the canonical CHANGELOG.md and its published mirror
-# site/src/content/docs/changelog.md, and deletes the consumed fragments.
+# `## [<version>] - <date>` block, inserts it into CHANGELOG.md (above the first released
+# version, below `## [Unreleased]`), and deletes the consumed fragments. The published
+# site mirror is regenerated from CHANGELOG.md at build time by
+# site/scripts/gen-docs-mirror.mjs — this script no longer touches it directly.
 #
 # Usage: scripts/assemble-changelog.sh [<version> [<date>]] [--dry-run]
 #   <version>  defaults to build.zig.zon's .version (the single source of truth).
@@ -30,7 +31,6 @@ VERSION="${ARGS[0]:-$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | c
 DATE="${ARGS[1]:-$(date -u +%Y-%m-%d)}"
 FRAG_DIR="changelog.d"
 CANONICAL="CHANGELOG.md"
-MIRROR="site/src/content/docs/changelog.md"
 
 # Canonical sections, in the order they are emitted. Empty ones are omitted at assembly.
 # The consumer-facing sections come first; Internal (contributor-facing) renders last.
@@ -147,7 +147,6 @@ insert_into() {
 }
 
 insert_into "$CANONICAL"
-insert_into "$MIRROR"
 
 # Remove the consumed fragments (git rm when tracked, plain rm otherwise so the script
 # works on an untracked sample copy too).
