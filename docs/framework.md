@@ -4387,6 +4387,36 @@ compiled in only on a dev-mode build (`zig build test`, the default harness buil
 for the production-safety gate. Pass `.field_key` to boot with real crypto instead (works in every
 build; not gated), e.g. to test key-rotation or envelope-format behavior end-to-end.
 
+### Troubleshooting: `zig build test` prints `failed command: …--listen=-`
+
+If `zig build test` in your project reports a failed step like `failed command:
+…/test …--listen=-` **but the same test binary run standalone passes** (`All N tests
+passed`, exit 0), the failure is not in your app or the harness — it is an upstream
+race in **Zig 0.16's build runner**, not zigbase. `zig build test` runs the test
+binary in server mode (`--listen=-`) and the runner polls the child's stdout/stderr;
+the harness boots a real app (a few tens of ms of sqlite/migrations/provisioning), and
+the process's exit-time output can land in a window where the runner mis-reads the
+child's normal EOF as a crash and restarts it — printing that line, and occasionally
+failing (exit 1) under CPU load. It is intermittent by nature (it often silently
+retries to exit 0 when the machine is idle).
+
+**Workaround — use a `.simple`-mode test runner** so the build system checks the
+child's exit code instead of the server-protocol stdio stream:
+
+```zig
+// build.zig — copy Zig 0.16's lib/compiler/test_runner.zig into your project as
+// e.g. simple_runner.zig, then wire the test artifact with it in .simple mode:
+const t = b.addTest(.{
+    .root_module = mod,
+    .test_runner = .{ .path = b.path("simple_runner.zig"), .mode = .simple },
+});
+b.step("test", "run tests").dependOn(&b.addRunArtifact(t).step);
+```
+
+This still fails the build on a genuine test failure (it rides the exit code) and
+sidesteps the runner race entirely. Tracked upstream against Zig's build runner;
+revisit if a future Zig release fixes the `--listen` protocol path.
+
 ## Compile-time build flags
 
 `zig build`/`zig build -Dname=value` accepts these consumer-facing flags. Each folds its gated
