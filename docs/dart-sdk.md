@@ -5,9 +5,10 @@ API ([docs/api.md](api.md)) in an ergonomic surface: auth + stores, records, off
 pagination, files, realtime subscriptions, and a high-level **live store**. It runs on the Dart
 VM, Flutter (iOS, Android, desktop), and Flutter web.
 
-Unlike the [TypeScript SDK](typescript-sdk.md), there is currently only **one** tier — a
-hand-written dynamic client. There is no comptime/runtime code generator for Dart yet (see
-[Not yet](#not-yet) below).
+Like the [TypeScript SDK](typescript-sdk.md), it comes in two tiers: the hand-written **dynamic
+client** documented below, and a generated **[typed tier](#typed-tier)** — concrete record
+classes and typed services emitted from your schema by `zigbase typegen --lang dart` /
+`zig build gen-client`.
 
 ## Install
 
@@ -667,26 +668,138 @@ tempdir data directory and `--insecure-cookies`, seeds a superuser via the `supe
 CLI subcommand, polls `/api/health` for readiness (retrying on a fresh port if a bind race
 kills the child), and `SIGTERM`s + removes the tempdir on teardown.
 
+## Typed tier
+
+Beyond the dynamic base client, ZigBase's code generator can emit a **typed Dart client** from
+your schema: concrete record classes with typed fields, one typed service per collection, a
+fluent filter builder, typed expand, and int/fixed numeric coercion. It is the Dart counterpart
+of the [TypeScript typed client](typescript-sdk.md#typed-client--zigbaseclienttyped).
+
+### Generate
+
+The same generator that emits the TypeScript client emits Dart — pass `--lang dart`:
+
+```bash
+# Runtime introspection (no Zig source; reads a provisioned data dir or a live server):
+myserver typegen --data-dir ./zb_data --out lib/zbase.gen.dart --lang dart
+myserver typegen --url https://api.example.com --admin-email admin@x.io --admin-password '…' \
+  --out lib/zbase.gen.dart --lang dart
+
+# Comptime (reads your Zig schema) via a build step wired with genClientStep's `lang: "dart"`:
+zig build gen-client   # when the consumer's step passes .lang = "dart"
+```
+
+The generated file imports the base SDK barrel and the typed runtime
+(`package:zigbase_client/typed.dart`, shipped in `zigbase_client`), so the emitted code stays
+thin. Regenerate and re-run `dart format` on the output (it is committed `dart format`-clean).
+
+### Create a typed client
+
+```dart
+import 'zbase.gen.dart' as api;
+
+final zb = api.createClient('http://127.0.0.1:8090');
+// authCollection defaults to your auth collection; pass an AuthStore for persistence.
+```
+
+The client exposes one accessor per collection (`zb.posts`, `zb.users`, …) and a matching
+realtime accessor (`zb.postsRealtime`). `zb.raw` is the underlying `ZigbaseClient` for anything
+the typed surface doesn't wrap; `zb.close()` tears it down.
+
+### Typed records + CRUD
+
+Every read returns a concrete class with typed fields; writes take a typed `Create`/`Update`:
+
+```dart
+final post = await zb.posts.getOne('REC123');
+post.title;        // String
+post.status;       // PostStatus? (a generated enum from the select field)
+
+final created = await zb.posts.create(api.PostCreate(title: 'Hello', status: api.PostStatus.draft));
+final page = await zb.posts.getList(page: 1, perPage: 20);   // TypedList<Post>
+final cursorPage = await zb.posts.getPage(limit: 20);        // TypedCursorPage<Post> (nextCursor/hasNext)
+await for (final p in zb.posts.iterate()) { /* … */ }        // Stream<Post>
+```
+
+### Typed filters — the fluent builder
+
+`where:` takes a callback over a generated `<Rec>Fields` builder and compiles to a server filter
+string (injection-safe, via the same escaping the base SDK uses):
+
+```dart
+// scalar + enum + and/or:
+await zb.posts.getList(where: (p) => p.status.eq(api.PostStatus.published).and(p.price.gte(10)));
+// native `in (...)`:
+await zb.posts.getList(where: (p) => p.status.inList([api.PostStatus.draft, api.PostStatus.published]));
+// one level of nested-relation filtering (author.name ~ 'A'):
+await zb.posts.getList(where: (p) => p.author.rel((a) => a.name.like('A')));
+```
+
+Operators: `eq`/`neq` (all fields), `gt`/`gte`/`lt`/`lte` (numbers, dates, strings), `like`/`nlike`
+(strings), `inList`. `sort:` accepts a field string or a list (`'-created'`, `['-age', 'name']`).
+
+### Typed expand
+
+Every generated record carries a typed, nullable `expand` accessor; request it with `expand:`
+and read the related record(s) off it:
+
+```dart
+final withAuthor = await zb.posts.getOne('REC123', expand: ['author']);
+withAuthor.expand.author;   // User? (populated when requested)
+final withTags = await zb.posts.getOne('REC123', expand: ['tags']);
+withTags.expand.tags;       // List<Tag>
+```
+
+Dart has no way to statically prove "this call requested `author`", so `expand` members are
+nullable/empty by design.
+
+### Typed realtime + files
+
+```dart
+final off = await zb.postsRealtime.subscribe((e) {
+  e.action;        // 'create' | 'update' | 'delete'
+  e.record.title;  // typed Post
+}, where: (p) => p.status.eq(api.PostStatus.published));
+await off();
+
+// File URLs: the field is a generated enum of the collection's single-value file fields.
+final url = zb.posts.fileUrl(post, field: api.PostFileField.cover, token: token);
+```
+
+### int/fixed numbers
+
+ZigBase `number` fields can be integer or fixed-point. To preserve full i64 precision they travel
+as **decimal strings** on the wire; the typed layer coerces both directions — int fields surface
+as Dart `int`, fixed fields as `double`, and `Create`/`Update.toMap()` serializes them back to
+decimal strings. Plain float fields are `double` and pass through untouched.
+
+### Scope
+
+The typed `rpc.*` (custom routes), auth-method, and feature-flag surfaces are **TypeScript-only**
+for now — in Dart, call custom routes through `zb.raw.send(...)` and non-password auth through the
+base `zb.raw.collection(name)` methods. These are planned Dart follow-ups.
+
 ## Not yet
 
-The Dart SDK is a base client — a few surfaces the TypeScript SDK has do not exist here yet:
+The Dart SDK is a base client plus the typed tier above — a few surfaces the TypeScript SDK has
+do not exist here yet:
 
-- **Typed codegen tier.** There is no Dart equivalent of `zig build gen-client` /
-  `npx @zigbase/typegen` — every read is dynamically typed (`ZbRecord`/`Map<String, dynamic>`),
-  and you `getString`/`getInt`/… your way to a value. No typed `db.*`/`rpc.*`/`auth.*`
-  surfaces.
+- **Typed `rpc.*` / auth-method / feature-flag surfaces.** The Dart typed tier covers the
+  collection/record/where/expand/realtime/files surface; typed custom routes, pluggable
+  auth methods, and feature flags are TypeScript-only for now (use `zb.raw.send(...)` /
+  `zb.raw.collection(...)`).
 - **SSE transport.** The server exposes realtime over both WebSocket and SSE
   (`EventSource`); this SDK speaks WebSocket only.
 - **Cookie-based auth store.** No `CookieAuthStore` equivalent — persist via `AsyncAuthStore`
   backed by your platform's secure storage instead.
 
-These are planned follow-ups, not permanent gaps — track them alongside the TypeScript SDK's
-own SP2.1b typed-generator work.
+These are planned follow-ups, not permanent gaps — track them alongside the TypeScript SDK,
+which reached them first.
 
 ## See also
 
 - [API reference](api.md) — the underlying HTTP + WebSocket protocol.
 - [TypeScript SDK](typescript-sdk.md) — the more mature sibling client, including the typed
-  codegen tiers this SDK doesn't have yet.
+  `rpc.*`/auth-method/flags surfaces this SDK's typed tier doesn't have yet.
 - [Recipes](recipes.md) — schema provisioning, owner-scoped rules, signup flows.
 - [Tutorial](tutorial.md) — build an app on ZigBase end to end.

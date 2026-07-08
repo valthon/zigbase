@@ -4,6 +4,7 @@ const db = @import("../db.zig");
 const migrations = @import("../migrations.zig");
 const provision = @import("../provision.zig");
 const gen_client = @import("gen_client.zig");
+const gen_dart = @import("gen_dart.zig");
 const acquire = @import("acquire.zig");
 const acquire_datadir = @import("acquire_datadir.zig");
 const acquire_http = @import("acquire_http.zig");
@@ -30,6 +31,17 @@ pub fn provisionAndGenerate(
     return gen_client.generate(alloc, rt, &.{}, &.{}, &.{}, &.{}, in_repo, authCollectionName(rt), client_name, api_prefix);
 }
 
+/// Output language for the runtime-introspection generator.
+pub const Lang = enum { ts, dart };
+
+/// Parse a `--lang` string ("ts"|"dart") to [Lang]; unknown values error.
+pub fn parseLang(s: []const u8) !Lang {
+    if (std.mem.eql(u8, s, "ts")) return .ts;
+    if (std.mem.eql(u8, s, "dart")) return .dart;
+    std.log.err("typegen: unknown --lang '{s}' (expected 'ts' or 'dart')", .{s});
+    return error.BadLang;
+}
+
 pub const Options = struct {
     data_dir: ?[]const u8 = null,
     url: ?[]const u8 = null,
@@ -40,6 +52,7 @@ pub const Options = struct {
     in_repo: bool = false,
     admin_email: ?[]const u8 = null,
     admin_password: ?[]const u8 = null,
+    lang: Lang = .ts,
 };
 
 /// First auth collection's name (mirrors gen_client's private helper; computed
@@ -88,7 +101,12 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, opts: Options) !void {
     else
         try acquireHttp(alloc, io, opts); // implemented in Task 4
 
-    const text = gen_client.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix) catch |e| {
+    // Runtime introspection has no comptime feature metadata → empty
+    // routes/custom_auth/flags/experiments regardless of language.
+    const text = switch (opts.lang) {
+        .ts => gen_client.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix),
+        .dart => gen_dart.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix),
+    } catch |e| {
         std.log.err("typegen: code generation failed: {s}", .{@errorName(e)});
         return e;
     };

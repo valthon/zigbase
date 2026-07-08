@@ -231,6 +231,12 @@ pub const codegen = struct {
     pub const rpc_ts = @import("codegen/rpc_ts.zig");
     /// RPC section renderer: assembles the three TS fragments from a []const RouteMeta (SP2.2b).
     pub const rpc = @import("codegen/rpc.zig");
+    /// Field → Dart type mapper (the Dart counterpart of ts_type.zig).
+    pub const dart_type = @import("codegen/dart_type.zig");
+    /// Per-fragment Dart emitters (the Dart counterpart of emit.zig).
+    pub const emit_dart = @import("codegen/emit_dart.zig");
+    /// The Dart generator core (the Dart counterpart of gen_client.generate).
+    pub const gen_dart = @import("codegen/gen_dart.zig");
     /// Source-agnostic schema acquisition core: RawRow → Collection, auth-strip, name-sort.
     pub const acquire = @import("codegen/acquire.zig");
     /// Data-dir acquisition adapter: reads _collections from an open db handle or a data dir path.
@@ -380,6 +386,9 @@ test {
     _ = @import("codegen/gen_client.zig");
     _ = @import("codegen/rpc_ts.zig");
     _ = @import("codegen/rpc.zig");
+    _ = @import("codegen/dart_type.zig");
+    _ = @import("codegen/emit_dart.zig");
+    _ = @import("codegen/gen_dart.zig");
     _ = @import("codegen/acquire.zig");
     _ = @import("codegen/acquire_datadir.zig");
     _ = @import("codegen/acquire_http.zig");

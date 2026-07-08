@@ -63,6 +63,8 @@ pub const TypegenArgs = struct {
     admin_email: ?[]const u8 = null,
     admin_password: ?[]const u8 = null,
     check: bool = false,
+    /// Output language: "ts" (default) or "dart".
+    lang: []const u8 = "ts",
 };
 
 /// Identifies which command a per-command `--help` request targets.
@@ -248,6 +250,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 ta.client_name = args[i];
+            } else if (std.mem.eql(u8, a, "--lang")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ta.lang = args[i];
             } else if (std.mem.eql(u8, a, "--admin-email")) {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;

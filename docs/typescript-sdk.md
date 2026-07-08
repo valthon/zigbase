@@ -635,6 +635,7 @@ which is included in the same package) at runtime.
 | `--out <file>` | *(required)* | Path to write the generated TypeScript file. |
 | `--api-prefix <p>` | `/api` | API path prefix used in the generated client. |
 | `--client-name <name>` | `ZbClient` | Name of the generated client class/factory. |
+| `--lang <ts\|dart>` | `ts` | Output language. `dart` emits a typed Dart client for the [Dart SDK](dart-sdk.md#typed-tier) instead of TypeScript. |
 | `--check` | — | Staleness gate: exits non-zero if the out file is out of date without writing it. |
 
 ### Output
