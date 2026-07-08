@@ -44,6 +44,13 @@ Initial release of the official Dart client for ZigBase — a behavioral port of
   lazily-created `RealtimeService`; it fires for every server error frame, including
   errors also delivered to a pending subscribe call. When omitted, a realtime error is
   never silently dropped — it falls back to a visible `dart:developer` log entry.
+- **Live store.** `zb.realtime.collection(name)` returns `LiveRecord`/`LiveList` objects kept
+  in sync from realtime events, backed by one shared ref-counted per-collection record cache.
+  Pure-Dart observables (synchronous `get()`/`version` + a broadcast `changes` stream, no
+  Flutter dependency). Filtered lists pick a two-tier correctness `mode`: `precise` (own-field
+  filters — surgical client-side insert/remove/move) or `refetch` (relation/macro filters — a
+  debounced single-flight re-fetch). `close()` is mandatory and idempotent; post-close use
+  throws.
 - **Transport.** One-shot, single-flight 401 auto-refresh (concurrent 401s all await
   the one in-flight refresh and then retry; a refresh endpoint that itself answers 401
   propagates rather than recursing without bound), 429 backoff with `Retry-After`

@@ -66,6 +66,7 @@ void main() {
     suToken = await superuserToken(server!);
     await createCollection(server!, suToken, _postsDefinition('posts'));
     await createCollection(server!, suToken, _postsDefinition('feed'));
+    await createCollection(server!, suToken, _postsDefinition('livefeed'));
   });
 
   tearDownAll(() async {
@@ -250,5 +251,41 @@ void main() {
     expect(events.first.action, 'create');
     expect(events.first.record.id, created.id);
     await unsub();
+  }, timeout: const Timeout(Duration(seconds: 30)));
+
+  test('live list updates when a record is created server-side', () async {
+    final client = ZigbaseClient(server!.baseUrl);
+    addTearDown(client.close);
+
+    // Seed a couple of records, then open a live list sorted by views.
+    await client.collection('livefeed').create({'title': 'Seed A', 'views': 1});
+    await client.collection('livefeed').create({'title': 'Seed B', 'views': 3});
+
+    final list =
+        await client.realtime.collection('livefeed').getList(sort: 'views');
+    addTearDown(list.close);
+    expect(list.mode, LiveListMode.precise);
+    final seededTitles =
+        list.items.map((r) => r.get().getString('title')).toList();
+    expect(seededTitles, containsAll(<String>['Seed A', 'Seed B']));
+    final seedCount = list.items.length;
+
+    // A server-side create must surface in the live list, at its sorted slot
+    // (views: 2 sorts between the two seeds).
+    final created = await client
+        .collection('livefeed')
+        .create({'title': 'Live', 'views': 2});
+
+    final deadline = DateTime.now().add(const Duration(seconds: 10));
+    while (
+        list.getById(created.id) == null && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    expect(list.getById(created.id), isNotNull,
+        reason: 'live list did not receive the server-side create within 10s');
+    expect(list.items.length, seedCount + 1);
+    // Ordered by views asc: Seed A (1), Live (2), Seed B (3).
+    expect(list.items.map((r) => r.get().getString('title')).toList(),
+        ['Seed A', 'Live', 'Seed B']);
   }, timeout: const Timeout(Duration(seconds: 30)));
 }

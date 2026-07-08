@@ -124,4 +124,60 @@ void main() {
           throwsArgumentError);
     });
   });
+
+  group('parseSort', () {
+    test('parses direction prefixes and drops blank terms', () {
+      expect(parseSort('-created,title'),
+          [const SortTerm('created', 'desc'), const SortTerm('title', 'asc')]);
+      expect(parseSort('+rank'), [const SortTerm('rank', 'asc')]);
+      expect(parseSort(' a , , -b '),
+          [const SortTerm('a', 'asc'), const SortTerm('b', 'desc')]);
+      expect(parseSort(''), isEmpty);
+    });
+  });
+
+  group('compareBySort', () {
+    List<Map<String, dynamic>> sorted(
+        List<Map<String, dynamic>> rows, String sort) {
+      final terms = parseSort(sort);
+      final copy = [...rows]..sort((a, b) => compareBySort(a, b, terms));
+      return copy;
+    }
+
+    test('sorts ascending and descending by a single key', () {
+      final rows = [
+        {'id': 'a', 'rank': 3},
+        {'id': 'b', 'rank': 1},
+        {'id': 'c', 'rank': 2},
+      ];
+      expect(sorted(rows, 'rank').map((r) => r['id']), ['b', 'c', 'a']);
+      expect(sorted(rows, '-rank').map((r) => r['id']), ['a', 'c', 'b']);
+    });
+
+    test('nulls sort first under asc, last under desc', () {
+      final rows = [
+        {'id': 'a', 'rank': 1},
+        {'id': 'b', 'rank': null},
+        {'id': 'c', 'rank': 2},
+      ];
+      expect(sorted(rows, 'rank').map((r) => r['id']), ['b', 'a', 'c']);
+      expect(sorted(rows, '-rank').map((r) => r['id']), ['c', 'a', 'b']);
+    });
+
+    test('applies multi-key order and reads dotted paths', () {
+      final rows = [
+        {
+          'id': 'a',
+          'rank': 1,
+          'author': {'name': 'Zed'}
+        },
+        {
+          'id': 'b',
+          'rank': 1,
+          'author': {'name': 'Ada'}
+        },
+      ];
+      expect(sorted(rows, 'rank,author.name').map((r) => r['id']), ['b', 'a']);
+    });
+  });
 }

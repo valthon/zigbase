@@ -214,8 +214,38 @@ await sub.cancel();
 
 A single shared WebSocket multiplexes every topic, auto-reconnects with bounded exponential
 backoff, and re-auths from the auth store on login/logout/refresh. Anonymous subscriptions
-require a `@public` view rule on the collection (server-enforced). There is no live-store tier
-yet (see [docs/dart-sdk.md](../../docs/dart-sdk.md) → Not yet).
+require a `@public` view rule on the collection (server-enforced).
+
+## Live store
+
+`zb.realtime.collection(name)` mirrors the record read API but returns **live** objects kept in
+sync from realtime events, backed by one shared per-collection record cache (the same record id
+is a single `LiveRecord` across every view). `LiveRecord`/`LiveList` are pure-Dart observables:
+synchronous `get()`/`items`/`version` plus a broadcast `Stream<void> changes`.
+
+```dart
+final live = zb.realtime.collection('posts');
+
+final post = await live.getOne('REC123'); // patched in place on updates
+post.changes.listen((_) => render(post.get()));
+post['title'];                            // read-through of a backing field
+post.close();                             // REQUIRED when done
+
+final list = await live.getList(sort: '-created');
+list.items;                               // read-only ordered List<LiveRecord> (alias: list.get())
+list.getById('REC123');                   // O(1) membership
+list.close();                             // REQUIRED
+```
+
+> **You must call `close()`** on every live record and list — it drops the subscription and
+> releases the cache ref(s). `close()` is idempotent; **post-close use throws `StateError`**.
+
+A filtered list picks a **correctness mode** (`list.mode`): `precise` (own-field filters —
+surgical client-side insert/remove/move, zero extra requests) or `refetch` (relation/macro
+filters the client can't evaluate locally — a debounced single-flight re-fetch). Caveat:
+precise mode is exact for the events the subscription delivers; a record that stops matching
+the server-side filter emits no event and is only dropped on the next refetch/reload. See
+[docs/dart-sdk.md → Live store](../../docs/dart-sdk.md#live-store--same-api-now-live).
 
 Pass `onRealtimeError` to the client to observe server-side realtime errors. The callback
 fires for **every** server error frame — including errors also delivered to (and rejecting)

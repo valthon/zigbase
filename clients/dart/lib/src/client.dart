@@ -17,6 +17,7 @@ import 'analytics.dart';
 import 'auth_store.dart';
 import 'collection.dart';
 import 'files.dart';
+import 'live/live_collection.dart';
 import 'realtime.dart';
 import 'senders.dart';
 import 'transport.dart';
@@ -269,6 +270,9 @@ class ZigbaseClient {
       authStore: authStore,
       connector: _webSocketConnector,
       onError: _onRealtimeError ?? _defaultRealtimeErrorLog,
+      // Back the live store (`realtime.collection(name)`) with a reader adapting
+      // this client's per-name CollectionService.
+      liveReaderFactory: (name) => CollectionLiveReader(collection(name)),
     );
   }
 
