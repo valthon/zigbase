@@ -73,8 +73,8 @@ notification-fired assertions listen on `changes` and pump the event queue.
 
 ## Tiered correctness rules (ported verbatim)
 
-A filtered live list decides membership with a two-tier strategy that is always
-correct; `LiveList.mode` reports which tier:
+A filtered live list decides membership with a two-tier strategy;
+`LiveList.mode` reports which tier:
 
 - **`precise`** — the filter references only the record's own scalar fields
   (`locallyEvaluable`: no dotted relation paths, no `@`-macros). Each event is
@@ -85,11 +85,20 @@ correct; `LiveList.mode` reports which tier:
   macro (`@request.auth.id = owner`). The client can't evaluate it locally, so
   the list degrades to a **debounced single-flight re-fetch** (default 200ms).
   At most one fetch is in flight; events arriving during a fetch set a rerun
-  flag and re-run once on completion (never overlap). Still live, still correct,
-  coalesced to one request per burst.
+  flag and re-run once on completion (never overlap). Still live, coalesced to
+  one request per burst. A failing refetch keeps the previous items (stale
+  until the next event schedules another attempt); it never surfaces as an
+  unhandled async error.
 
 The sort always appends an `id`-asc tiebreaker (unless the sort already names
 `id`) for a deterministic order — matching TS and the server keyset order.
+
+**Known caveat (both SDKs):** precise mode is exact for the events the
+subscription delivers, but the subscription is server-side filtered against a
+record's *new* state (`src/realtime/hub.zig` `shouldDeliver`) — an update that
+moves a record OUT of the filter emits no event, so the stale row lingers until
+the next refetch/reload. Cross-SDK follow-up: subscribe unfiltered in precise
+mode and let the client-side evaluator drop non-matching records.
 
 ## Architecture
 

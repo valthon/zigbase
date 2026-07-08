@@ -557,8 +557,8 @@ Flutter `ValueListenable` in a future companion package — `version` → `notif
 
 ### Correctness modes — `list.mode`
 
-Membership of a record in a filtered live list is decided with a two-tier strategy that is
-**always correct**. Read `list.mode` (`LiveListMode.precise` | `LiveListMode.refetch`):
+Membership of a record in a filtered live list is decided with a two-tier strategy. Read
+`list.mode` (`LiveListMode.precise` | `LiveListMode.refetch`):
 
 - **`precise` (own-field filters).** When the filter references only the record's own scalar
   fields (`status = 'published' && views > 10`), the list evaluates membership client-side and
@@ -568,7 +568,15 @@ Membership of a record in a filtered live list is decided with a two-tier strate
   (`author.name = 'Ada'`) or uses a macro (`@request.auth.id = owner`), the client can't
   evaluate it locally, so the list degrades to a **debounced single-flight re-fetch** of the
   query (default 200ms; at most one request in flight, re-run once if events arrive mid-fetch)
-  — still live, still correct, just coalesced to one request per burst.
+  — still live, coalesced to one request per burst. A failing refetch keeps the previous
+  items (stale until the next event schedules another attempt) rather than surfacing an
+  error.
+
+> **Caveat:** precise mode is exact for the events the subscription delivers, but the
+> subscription itself is server-side filtered against a record's *new* state — so a record
+> that is updated to *stop* matching the filter emits no event, and its stale row is only
+> dropped on the next refetch/reload. (This matches the TypeScript SDK; a cross-SDK fix —
+> subscribing unfiltered in precise mode — is a tracked follow-up.)
 
 ## Error handling
 

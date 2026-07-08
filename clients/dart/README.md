@@ -242,7 +242,9 @@ list.close();                             // REQUIRED
 
 A filtered list picks a **correctness mode** (`list.mode`): `precise` (own-field filters —
 surgical client-side insert/remove/move, zero extra requests) or `refetch` (relation/macro
-filters the client can't evaluate locally — a debounced single-flight re-fetch). See
+filters the client can't evaluate locally — a debounced single-flight re-fetch). Caveat:
+precise mode is exact for the events the subscription delivers; a record that stops matching
+the server-side filter emits no event and is only dropped on the next refetch/reload. See
 [docs/dart-sdk.md → Live store](../../docs/dart-sdk.md#live-store--same-api-now-live).
 
 Pass `onRealtimeError` to the client to observe server-side realtime errors. The callback
