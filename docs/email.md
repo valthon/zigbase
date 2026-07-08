@@ -136,15 +136,15 @@ try expect(tc.mail.find("Verify") != null);
 ```
 
 `mail.enable(suppress)`: `suppress = true` records and skips real delivery; `false` records **and**
-still delivers. This is compiled in only on a `dev_clock` build (on in `Debug`, off in release), so
+still delivers. This is compiled in only on a `dev_mode` build (on in `Debug`, off in release), so
 a production binary is unaffected.
 
 > **`testcapture.mail` vs `CaptureMailer`.** These are two different things. `testcapture.mail` is
 > the **framework-internal** outbox above — it captures the framework's own auth mail (and anything
-> else sent through the wired mailer) for e2e tests, gated on a `dev_clock` build. `CaptureMailer`
+> else sent through the wired mailer) for e2e tests, gated on a `dev_mode` build. `CaptureMailer`
 > is a **consumer-owned** `Mailer` backend you plug in yourself via `App(.{ .mailer =
 > CaptureMailer })` (or call its `mailer()` directly) to capture and assert your own application's
-> mail with no network, independent of the `dev_clock` gate.
+> mail with no network, independent of the `dev_mode` gate.
 
 ## Reference
 

@@ -3,14 +3,14 @@
 //! mail outbox in `testcapture.zig`. Recording is written from the send path; the HTTP bytes
 //! that actually go over the wire are separately assertable via `testcapture.http`.
 //!
-//! Gated by the same `dev_clock` build option as the rest of `testcapture`: on a production
+//! Gated by the same `dev_mode` build option as the rest of `testcapture`: on a production
 //! build `enabled` is comptime-false, every `record` call is comptime-dead, and this carries
 //! no runtime cost. The backing arena is over `page_allocator` (untracked by leak detection).
 
 const std = @import("std");
 const sender = @import("sender.zig");
 
-/// Comptime gate — true only on a `dev_clock` build (Debug by default; never prod).
+/// Comptime gate — true only on a `dev_mode` build (Debug by default; never prod).
 pub const enabled = @import("../testcapture.zig").enabled;
 
 /// A captured push send: the target endpoint plus the notification title/body.

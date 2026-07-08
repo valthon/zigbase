@@ -747,7 +747,7 @@ test "pollOnce: retry then terminal failure fires .onError" {
 
 test "pollOnce claims <= tokens on a rated queue while an unrated queue drains unthrottled" {
     // Needs `clock.setForTest` to freeze the token-bucket refill second deterministically;
-    // that's a no-op on a `-Ddev-clock=false` build (see clock.zig), so this can't run there.
+    // that's a no-op on a `-Ddev-mode=false` build (see clock.zig), so this can't run there.
     if (!clock.enabled) return error.SkipZigTest;
     const env = try PollTestEnv.init();
     defer env.deinit();

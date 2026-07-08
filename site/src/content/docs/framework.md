@@ -1343,7 +1343,7 @@ For deterministic e2e/integration tests, the framework can capture what it *sent
 in-memory mail **outbox** and a record of every outbound `ctx.http()` call — and inject
 **canned HTTP responses** instead of hitting the network. It mirrors the determinism seam
 (`ZIGBASE_FAKE_NOW`) and shares the **same comptime gate**: it is compiled in only on a
-`dev_clock` build (on in `Debug`, off in any release build), so a production binary is
+`dev_mode` build (on in `Debug`, off in any release build), so a production binary is
 byte-for-byte unaffected — `zigbase.testcapture.enabled` is `comptime false` there, the
 seams fold away, and there is no runtime branch or perf cost. Every API below is a no-op /
 returns empty when the gate is off.
@@ -4064,7 +4064,7 @@ registration or VFS on a remote server): when a freeze is active, every connecti
 session-level `now()` override — a `zigbase_frozen.now()` wrapper returning the frozen instant,
 placed on the connection's `search_path` ahead of `pg_catalog` (`src/backend/postgres/clock.zig`).
 Because the framework and any consumer raw SQL both call `now()`, this freezes record autodate
-stamps, KV/metadata timestamps, and a consumer's own `now()` alike. Same comptime `dev_clock`
+stamps, KV/metadata timestamps, and a consumer's own `now()` alike. Same comptime `dev_mode`
 gate, so a production Postgres binary is unaffected.
 
 ```sh
@@ -4092,16 +4092,16 @@ through this seam — those are security-critical at runtime and seeding them is
 
 ### Production gate
 
-Both seams are compiled in ONLY when the `dev_clock` build option is `true` (the
-default in `Debug` builds). The release script forces `-Ddev-clock=false` for all
+Both seams are compiled in ONLY when the `dev_mode` build option is `true` (the
+default in `Debug` builds). The release script forces `-Ddev-mode=false` for all
 shipped binaries, so a production binary has the override code comptime-eliminated:
 
 - `ZIGBASE_FAKE_NOW` is never read; the clock always returns wall time.
 - `ZIGBASE_FAKE_SEED` is never read; ID/token generation always uses the OS CSPRNG.
 
-You can also force the prod-safe behavior explicitly: `zig build -Ddev-clock=false`.
+You can also force the prod-safe behavior explicitly: `zig build -Ddev-mode=false`.
 
-CI runs both passes: the default `Debug` pass (dev features on, prod-gate assertions skipped) and a `-Ddev-clock=false` prod-gate pass (dev features off, prod-gate assertions executed) to verify the compiled-out guarantee.
+CI runs both passes: the default `Debug` pass (dev features on, prod-gate assertions skipped) and a `-Ddev-mode=false` prod-gate pass (dev features off, prod-gate assertions executed) to verify the compiled-out guarantee.
 
 ## 15. Testing your app (`zigbase.testing`)
 
@@ -4246,7 +4246,7 @@ test "verification email is sent" {
 
 `captureMail` is idempotent (repeated calls return the same instance) and the captured messages
 carry owned copies of every field (subject, recipient, both body parts, attachments). The
-`fake_now_unix` / `fake_seed` options drive the same dev-clock and seeded-entropy seams described
+`fake_now_unix` / `fake_seed` options drive the same dev-mode clock and seeded-entropy seams described
 in §14, so token `exp`, TTL math, and generated IDs are reproducible across runs.
 
 ## Compile-time build flags
@@ -4259,7 +4259,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dfts5` | **on** | SQLite full-text search (FTS5). `-Dfts5=false` drops `-DSQLITE_ENABLE_FTS5` from the SQLite build (~250-400 KB smaller) for lean binaries with no `.searchable` field; `?search=` then 400s and the server refuses to start over a `.searchable` SQLite schema. Postgres full-text search is unaffected. → [docs/search](./search#build-requirement--dfts5-default-on) |
 | `-Dvector` | off | Opt-in nearest-neighbor `?vector=` KNN search — sqlite-vec on SQLite, pgvector on Postgres. → [docs/search](./search#vector-search-opt-in) |
 | `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres](./postgres) |
-| `-Ddev-clock` | on in `Debug`, off in release | The `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` dev-only test seams (§14 above); the release script forces it off for shipped binaries. |
+| `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
 
 ## Exported names reference

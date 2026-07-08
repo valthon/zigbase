@@ -130,8 +130,9 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   only its current-time hooks overridden to return the frozen instant — all file I/O still
   delegates to the genuine OS VFS unchanged. There are no remaining unfrozen `'now'` paths.
 - **The test clock is impossible to enable on a production build.** It is compiled in only when
-  the `dev_clock` build option is true (on in `Debug`, off in any release build; the release
-  script ships it off). A production binary never reads `ZIGBASE_FAKE_NOW` — the override folds
+  the `dev_mode` build option is true (on in `Debug`, off in any release build; the release
+  script ships it off) — the same gate that covers all dev-only seams (frozen clock, seeded
+  entropy, test-capture). A production binary never reads `ZIGBASE_FAKE_NOW` — the override folds
   to a comptime no-op — so time can never be frozen in production.
 - **`ZIGBASE_FAKE_SEED` seeds ID/token generation for snapshot-test reproducibility.**
   Setting `ZIGBASE_FAKE_SEED` to a decimal `u64` on a dev build plants a deterministic
@@ -140,7 +141,7 @@ ZigBase is an early release. The gaps below are known and tracked for future rel
   identical IDs and tokens. Other randomness (AEAD nonces, OTP digits, WebAuthn challenges)
   is **not** seeded — those are security-critical and reproducibility there is not supported.
   Like `ZIGBASE_FAKE_NOW`, the seeded path is compiled out on a production build (gated by
-  the same `dev_clock` build option); a production binary always uses the OS CSPRNG for ID
+  the same `dev_mode` build option); a production binary always uses the OS CSPRNG for ID
   generation and cannot be seeded.
 
 ## Static file serving

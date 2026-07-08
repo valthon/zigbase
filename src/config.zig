@@ -143,7 +143,7 @@ pub const Config = struct {
 
     // DEV-ONLY frozen clock (`ZIGBASE_FAKE_NOW`, an ISO-8601 UTC instant). Resolved to unix
     // seconds here so serveImpl can `clock.install` it. ALWAYS null on a production build —
-    // `clock.resolveFromEnv` is comptime-gated off when the `dev_clock` build option is false,
+    // `clock.resolveFromEnv` is comptime-gated off when the `dev_mode` build option is false,
     // so a prod binary ignores the env var entirely (see clock.zig). null = wall-clock.
     fake_now_unix: ?i64 = null,
 
@@ -151,7 +151,7 @@ pub const Config = struct {
     // generation (record IDs, field IDs, token keys) uses a deterministic Xoshiro256++ PRNG
     // seeded from this value instead of the OS CSPRNG, making snapshot tests reproducible.
     // ALWAYS null on a production build — `entropy.resolveFromEnv` is comptime-gated off
-    // when the `dev_clock` build option is false, so a prod binary ignores the env var
+    // when the `dev_mode` build option is false, so a prod binary ignores the env var
     // entirely. null = real OS CSPRNG (the always-correct default).
     fake_seed: ?u64 = null,
 

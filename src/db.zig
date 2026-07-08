@@ -354,7 +354,7 @@ pub inline fn stmtFieldCipher(s: *const Stmt) ?*const anyopaque {
 }
 
 /// The SQLite connection handle behind a `Db`. Only valid on a SQLite-backed `Db`; used by the
-/// dev-clock SQL-shadow tests, which are inherently SQLite-specific.
+/// dev-mode SQL-shadow tests, which are inherently SQLite-specific.
 pub inline fn sqliteHandle(d: *Db) *@import("c.zig").c.sqlite3 {
     if (build_options.postgres) return d.sqlite.handle else return d.handle;
 }

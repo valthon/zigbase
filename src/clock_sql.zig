@@ -15,7 +15,7 @@
 //!
 //! ## Production gate (hard requirement)
 //! `register` begins with `if (comptime !clock.enabled) return;`. `clock.enabled` is the
-//! comptime `dev_clock` build option (off in every release build), so on a prod build the
+//! comptime `dev_mode` build option (off in every release build), so on a prod build the
 //! entire body — every `sqlite3_create_function` call, the callback, the helper connection
 //! — is comptime-dead and eliminated. A production connection is byte-for-byte unchanged
 //! and `ZIGBASE_FAKE_NOW` is never consulted.
@@ -271,7 +271,7 @@ test "frozen: consumer SQL 'now' resolves to the frozen instant (dev build only)
 }
 
 test "PROD GATE: a non-dev build leaves consumer SQL on the wall clock" {
-    if (clock.enabled) return error.SkipZigTest; // only meaningful with -Ddev-clock=false
+    if (clock.enabled) return error.SkipZigTest; // only meaningful with -Ddev-mode=false
     clock.setForTest(frozen_unix); // gate refuses the freeze
     defer clock.resetForTest();
     var d = try db.Db.openMemory();

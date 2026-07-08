@@ -615,7 +615,7 @@ fn prepareHold(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
     // Server-stamped expiry (now + 15m), ignoring any client-supplied expires_at.
     // "now" is read from the DATABASE clock (`strftime('%s','now')`) rather than the OS
-    // clock so it honors the determinism seam: under a `dev_clock` build with
+    // clock so it honors the determinism seam: under a `dev_mode` build with
     // `ZIGBASE_FAKE_NOW` set, SQLite's `'now'` is shadowed to the frozen instant
     // (clock_sql.zig), so a hold's `expires_at` is deterministic in e2e tests
     // (see test/golfsim.determinism.e2e.test.ts). A production build never reads

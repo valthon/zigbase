@@ -11,7 +11,7 @@
 //! zone is UTC).
 //!
 //! ## Production gate (hard requirement)
-//! The override is compiled in ONLY when the `dev_clock` build option is true. That
+//! The override is compiled in ONLY when the `dev_mode` build option is true. That
 //! option defaults to `optimize == .Debug` (see build.zig) and is forced false by the
 //! release script's cross-compiles, so a production binary never even reads the env var:
 //! `enabled` is `comptime false` there, the parse code is dead, and `frozenUnix()` folds
@@ -32,14 +32,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
+const dev = @import("dev.zig");
 const datetime = @import("datetime.zig");
 const db = @import("db.zig");
 
-/// Comptime gate. True only on a `dev_clock`-enabled build (Debug by default; never a
+/// Comptime gate. True only on a `dev_mode`-enabled build (Debug by default; never a
 /// release/prod build). When false, every override branch below is comptime-dead and
 /// the env var is never consulted.
-pub const enabled = build_options.dev_clock;
+pub const enabled = dev.enabled;
 
 /// The name of the env var that freezes time (dev builds only).
 pub const env_var = "ZIGBASE_FAKE_NOW";

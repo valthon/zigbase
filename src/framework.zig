@@ -2654,7 +2654,7 @@ fn BootedApp(comptime opts: ServeOpts) type {
 ///
 /// This is the reusable seam extracted out of `serveImpl` (Stage 1 of the in-process test
 /// harness, #239): it runs everything the monolithic serve path did before `srv.listen()` —
-/// jwt resolution, dev clock/entropy install, pool open, field-cipher resolution, migrations +
+/// jwt resolution, dev-mode clock/entropy install, pool open, field-cipher resolution, migrations +
 /// comptime provisioning, startup GC sweeps, storage/mailer/sms plugin creation, the auth-method
 /// registry, the rate limiter, static-source resolution, and the App assembly (+ metadata /
 /// feature caches and the captcha/unsubscribe/VAPID validations) — in the SAME order.

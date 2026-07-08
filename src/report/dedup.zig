@@ -74,7 +74,7 @@ pub const Dedup = struct {
     /// Returns true iff this report should be DELIVERED now — the first sighting of
     /// `(message, phase)`, or one whose previous sighting is older than `window_s`.
     /// Returns false for a duplicate seen within the window (suppress). Thread-safe.
-    /// Reads "now" through the framework clock seam (honors a frozen dev clock).
+    /// Reads "now" through the framework clock seam (honors a frozen dev-mode clock).
     ///
     /// Fails OPEN: any allocation failure inserting the key returns true (report). Dedup is
     /// a best-effort noise reducer — it must never DROP a report because it ran out of memory.

@@ -80,8 +80,8 @@ pub const StartOptions = struct {
     allocator: ?std.mem.Allocator = null,
     /// Async/IO handle threaded into the app. Defaults to `std.testing.io`.
     io: ?std.Io = null,
-    /// Deterministic frozen clock (unix seconds), via the dev-clock override — token expiry,
-    /// TTLs, and `datetime('now')` all read it. `null` = wall clock. Requires a dev-clock build
+    /// Deterministic frozen clock (unix seconds), via the dev-mode override — token expiry,
+    /// TTLs, and `datetime('now')` all read it. `null` = wall clock. Requires a dev-mode build
     /// (Debug/`zig build test`); a no-op on a prod build.
     fake_now_unix: ?i64 = null,
     /// Deterministic PRNG seed for id/token generation (reproducible snapshots). `null` = CSPRNG.
