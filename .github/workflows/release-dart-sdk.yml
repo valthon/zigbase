@@ -1,0 +1,87 @@
+# Dart SDK release: publishes zigbase_client to pub.dev on a `dart-client-v*` tag.
+# The Dart SDK is versioned INDEPENDENTLY of the server (`vX.Y.Z` tags) and the
+# TypeScript SDK (`client-v*` tags, see release-sdk.yml).
+#
+# Publishes via pub.dev's GitHub Actions "automated publishing" (OIDC, no
+# long-lived credentials) using the official reusable workflow from
+# dart-lang/setup-dart: https://dart.dev/tools/pub/automated-publishing.
+#
+# IMPORTANT — unlike npm trusted publishing, pub.dev's trusted-publisher
+# binding is on the *GitHub repository + the `on.push.tags` pattern*
+# configured on pub.dev's Admin tab, NOT on this file's name. Renaming this
+# workflow is safe; changing the tag pattern below (or the repository) is
+# not — it must keep matching what's configured on pub.dev. See
+# clients/dart/RELEASING.md for the one-time pub.dev setup this depends on.
+name: Release Dart SDK
+
+on:
+  push:
+    tags:
+      - "dart-client-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+
+      - name: Install dependencies
+        working-directory: clients/dart
+        run: mise exec dart@3.12 -- dart pub get
+
+      - name: Analyze
+        working-directory: clients/dart
+        run: mise exec dart@3.12 -- dart analyze --fatal-infos
+
+      - name: Format check
+        working-directory: clients/dart
+        run: mise exec dart@3.12 -- dart format --output=none --set-exit-if-changed .
+
+      - name: Unit tests
+        working-directory: clients/dart
+        run: mise exec dart@3.12 -- dart test --exclude-tags integration
+
+      - name: Assert pubspec.yaml version matches the tag
+        working-directory: clients/dart
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          expected="${tag#dart-client-v}"
+          # Strip optional surrounding quotes and a trailing `# comment` so the
+          # gate still extracts the bare version if pubspec.yaml ever writes
+          # `version: "0.1.0"` or `version: 0.1.0 # note` (otherwise it would
+          # fail closed with a confusing mismatch message).
+          actual="$(grep -m1 '^version:' pubspec.yaml \
+            | sed -E "s/^version:[[:space:]]*//; s/[[:space:]]+#.*\$//; s/^[\"']//; s/[\"']\$//; s/[[:space:]]+\$//")"
+          echo "tag=$tag expected=$expected pubspec.yaml=$actual"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::Tag ($tag => $expected) does not match pubspec.yaml version ($actual)."
+            exit 1
+          fi
+
+      - name: Dry-run publish
+        working-directory: clients/dart
+        run: mise exec dart@3.12 -- dart pub publish --dry-run
+
+  # Publishes using the reusable workflow dart-lang maintains, so pub.dev can
+  # verify how the package was published. It checks out the repo again, sets
+  # up Dart, resolves dependencies, dry-runs, then force-publishes — all
+  # scoped to clients/dart via `working-directory`.
+  publish:
+    name: Publish to pub.dev
+    needs: verify
+    permissions:
+      contents: read
+      id-token: write # Required for pub.dev's OIDC trusted publishing.
+    uses: dart-lang/setup-dart/.github/workflows/publish.yml@v1
+    with:
+      working-directory: clients/dart
+      # Optional hardening: only takes effect once pub.dev's Admin tab has
+      # "Require GitHub Actions environment" enabled for this package (with
+      # a matching `pub.dev` environment created under repo Settings >
+      # Environments). Until then this is inert. See RELEASING.md.
+      environment: pub.dev
