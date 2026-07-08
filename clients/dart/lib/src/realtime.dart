@@ -23,6 +23,7 @@ import 'package:stream_channel/stream_channel.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'auth_store.dart';
+import 'live/cache.dart';
 import 'live/live_collection.dart';
 import 'records.dart';
 
@@ -156,9 +157,17 @@ class RealtimeService implements LiveSubscriber {
   /// before the socket has connected.
   String? get clientId => _clientId;
 
+  /// One shared [RecordCache] per collection name: every [collection] view of
+  /// the same collection hands out the SAME [LiveRecord] for a given id, as
+  /// the live-store spec promises. (The [LiveCollection] objects themselves
+  /// are fresh per call; only the cache is shared.)
+  final Map<String, RecordCache> _liveCaches = {};
+
   /// The high-level live store for [name] (mirrors the TypeScript SDK's
   /// `client.realtime.collection(name)`): returns a [LiveCollection] whose
-  /// records/lists stay in sync from realtime events.
+  /// records/lists stay in sync from realtime events. Repeated calls for the
+  /// same [name] share one record cache, so record identity holds across
+  /// views.
   ///
   /// Requires a [liveReaderFactory] — present on a service created by
   /// [ZigbaseClient]. A standalone [RealtimeService] built without one throws a
@@ -173,7 +182,8 @@ class RealtimeService implements LiveSubscriber {
           'live collections via ZigbaseClient.realtime, not a standalone '
           'RealtimeService');
     }
-    return LiveCollection(name, factory(name), this);
+    return LiveCollection(name, factory(name), this,
+        cache: _liveCaches.putIfAbsent(name, RecordCache.new));
   }
 
   // ---- public API ---------------------------------------------------------

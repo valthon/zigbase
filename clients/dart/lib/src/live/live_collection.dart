@@ -12,6 +12,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import '../collection.dart';
+import '../paths.dart';
 import '../query.dart';
 import '../realtime.dart';
 import '../records.dart';
@@ -238,16 +239,15 @@ class LiveList implements Observable<List<LiveRecord>> {
   LiveList._(
     this._cache,
     List<ZbRecord> seed, {
-    String? filter,
+    FilterNode? filterAst,
     String? sort,
     required Future<List<ZbRecord>> Function() onRefetch,
     required Duration debounce,
     required ScheduleRefetch schedule,
     required ClearRefetch clear,
   })  : _sortTerms = _appendIdTiebreaker(parseSort(sort ?? '')),
-        _filterAst = filter != null ? parseFilter(filter) : null,
-        _precise = analyzeFilter(filter != null ? parseFilter(filter) : null)
-            .locallyEvaluable,
+        _filterAst = filterAst,
+        _precise = analyzeFilter(filterAst).locallyEvaluable,
         _onRefetch = onRefetch,
         _debounce = debounce,
         _schedule = schedule,
@@ -405,18 +405,22 @@ class LiveList implements Observable<List<LiveRecord>> {
   String _sortKeyOf(LiveRecord live) {
     final data = live.get().data;
     return _sortTerms
-        .map((t) => jsonEncode(_readPath(data, t.field)))
+        .map((t) => jsonEncode(readDottedPath(data, t.field)))
         .join(' ');
   }
 
-  void _removeById(String id) {
+  /// Remove [id] from the list (and release its cache ref). Pass
+  /// `notify: false` when the caller batches its own single [_bump] (the
+  /// reconcile loop), so observers see one notification per reconcile rather
+  /// than one per dropped row.
+  void _removeById(String id, {bool notify = true}) {
     final live = _index[id];
     if (live == null) return;
     final idx = _items.indexOf(live);
     if (idx != -1) _items.removeAt(idx);
     _index.remove(id);
     _cache.release(id);
-    _bump();
+    if (notify) _bump();
   }
 
   void _sortItems() {
@@ -437,6 +441,12 @@ class LiveList implements Observable<List<LiveRecord>> {
   /// Refetch the query and reconcile. Guarded so at most one fetch is in
   /// flight: a request that arrives while one is running sets [_rerunRequested]
   /// and re-runs once on completion instead of overlapping.
+  ///
+  /// Failure contract: a failing refetch (network error, auth expiry, …) is
+  /// swallowed — the list simply keeps its previous items (stale until the
+  /// next event schedules another refetch, which starts from a clean
+  /// single-flight state and can recover). It never surfaces as an unhandled
+  /// async error.
   Future<void> _doRefetch() async {
     if (_closed) return;
     if (_refetchInFlight) {
@@ -445,7 +455,15 @@ class LiveList implements Observable<List<LiveRecord>> {
     }
     _refetchInFlight = true;
     try {
-      final fresh = await _onRefetch();
+      final List<ZbRecord> fresh;
+      try {
+        fresh = await _onRefetch();
+      } catch (_) {
+        // Keep the previous items; see the failure contract above. The
+        // enclosing finally still clears the single-flight state (and honors a
+        // rerun request), so a later refetch is not wedged.
+        return;
+      }
       if (_closed) return;
       _reconcile(fresh);
     } finally {
@@ -459,9 +477,10 @@ class LiveList implements Observable<List<LiveRecord>> {
 
   void _reconcile(List<ZbRecord> fresh) {
     final nextIds = fresh.map((r) => r.id).toSet();
-    // Release rows that fell out.
+    // Release rows that fell out (without a per-row notification; the single
+    // _bump below covers the whole reconcile).
     for (final r in _items.toList()) {
-      if (!nextIds.contains(r.id)) _removeById(r.id);
+      if (!nextIds.contains(r.id)) _removeById(r.id, notify: false);
     }
     // Insert/patch the fresh set.
     for (final rec in fresh) {
@@ -489,17 +508,6 @@ List<SortTerm> _appendIdTiebreaker(List<SortTerm> terms) {
   return [...terms, const SortTerm('id', 'asc')];
 }
 
-/// Read a (possibly dotted) field path off a record map.
-Object? _readPath(Map<String, dynamic> obj, String path) {
-  if (!path.contains('.')) return obj[path];
-  Object? cur = obj;
-  for (final seg in path.split('.')) {
-    if (cur is! Map) return null;
-    cur = cur[seg];
-  }
-  return cur;
-}
-
 /// The live-store entry point for one collection. Backed by one shared record
 /// cache, so the same record id is a single [LiveRecord] across every view.
 ///
@@ -509,9 +517,15 @@ class LiveCollection {
   final String name;
   final LiveReader _reader;
   final LiveSubscriber _subscriber;
-  final RecordCache _cache = RecordCache();
+  final RecordCache _cache;
 
-  LiveCollection(this.name, this._reader, this._subscriber);
+  /// [cache] lets an owner (the `client.realtime.collection(name)` facade)
+  /// share one [RecordCache] across every [LiveCollection] view of the same
+  /// collection, so the same record id is a single [LiveRecord] SDK-wide.
+  /// Omitted (tests, standalone use), a private cache is created.
+  LiveCollection(this.name, this._reader, this._subscriber,
+      {RecordCache? cache})
+      : _cache = cache ?? RecordCache();
 
   /// The shared per-collection cache (exposed for teardown assertions in
   /// tests).
@@ -627,16 +641,25 @@ class LiveCollection {
     ScheduleRefetch? schedule,
     ClearRefetch? clearSchedule,
   }) async {
+    // Parse the filter exactly once; the AST feeds both the membership
+    // evaluator and the precise-vs-refetch analysis inside LiveList.
+    final filterAst = filter != null ? parseFilter(filter) : null;
     final list = LiveList._(
       _cache,
       seed,
-      filter: filter,
+      filterAst: filterAst,
       sort: sort,
       onRefetch: onRefetch,
       debounce: refetchDebounce,
       schedule: schedule ?? _defaultSchedule,
       clear: clearSchedule ?? _defaultClear,
     );
+    // Known cross-SDK gap (mirrors the TS live tier): the subscription itself
+    // is server-side filtered, and the server evaluates the filter on the
+    // record's NEW state (src/realtime/hub.zig shouldDeliver) — so an update
+    // that moves a record OUT of the filter emits no event, and a precise list
+    // keeps the stale row until the next refetch/reload. Follow-up: subscribe
+    // unfiltered in precise mode and let the client-side evaluator drop it.
     final unsub =
         await _subscriber.subscribe(name, list.handleEvent, filter: filter);
     list._setUnsub(unsub);

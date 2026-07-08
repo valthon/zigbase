@@ -17,6 +17,8 @@
 /// non-locally-evaluable filter drives the live list into its refetch tier.
 library;
 
+import '../paths.dart';
+
 // ---- AST -------------------------------------------------------------------
 
 /// Base type of a parsed filter node. Either a [CompareNode] or a [LogicNode].
@@ -112,6 +114,9 @@ List<_Token> _tokenize(String input) {
           buf.write(input[j]);
           j += 1;
         }
+      }
+      if (j >= n) {
+        throw const FormatException('unterminated string literal in filter');
       }
       tokens.add(_Token(_TokKind.lit, buf.toString()));
       i = j + 1;
@@ -240,29 +245,25 @@ FilterNode parseFilter(String input) => _Parser(_tokenize(input)).parse();
 
 // ---- evaluator -------------------------------------------------------------
 
-Object? _resolvePath(Map<String, dynamic> record, List<String> path) {
-  Object? cur = record;
-  for (final key in path) {
-    if (cur is! Map) return null;
-    cur = cur[key];
-  }
-  return cur;
-}
-
 bool _compare(Object? actual, String op, Object? expected) {
   switch (op) {
     case '=':
       return actual == expected;
     case '!=':
       return actual != expected;
+    // Ordering comparisons never throw: when either operand is not a number
+    // (a null/missing field, a string field compared to a number, …) the
+    // comparison evaluates to false — matching the JS evaluator's semantics.
+    // This runs inside the WS event path, so an unexpected record shape must
+    // degrade to a non-match, never crash the dispatcher.
     case '>':
-      return (actual as num) > (expected as num);
+      return actual is num && expected is num && actual > expected;
     case '>=':
-      return (actual as num) >= (expected as num);
+      return actual is num && expected is num && actual >= expected;
     case '<':
-      return (actual as num) < (expected as num);
+      return actual is num && expected is num && actual < expected;
     case '<=':
-      return (actual as num) <= (expected as num);
+      return actual is num && expected is num && actual <= expected;
     case '~':
       return actual is String && actual.contains(expected.toString());
     case '!~':
@@ -278,7 +279,7 @@ bool _compare(Object? actual, String op, Object? expected) {
 bool evaluateFilter(Map<String, dynamic> record, FilterNode node) {
   switch (node) {
     case CompareNode():
-      return _compare(_resolvePath(record, node.path), node.op, node.value);
+      return _compare(readPathSegments(record, node.path), node.op, node.value);
     case LogicNode(kind: 'and'):
       return evaluateFilter(record, node.left) &&
           evaluateFilter(record, node.right);

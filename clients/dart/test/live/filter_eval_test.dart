@@ -87,6 +87,29 @@ void main() {
       expect(() => parseFilter('a = 1 b = 2'), throwsFormatException);
       expect(() => parseFilter('(a = 1'), throwsFormatException);
     });
+
+    test('rejects an unterminated string literal', () {
+      expect(() => parseFilter("title = 'oops"), throwsFormatException);
+      expect(() => parseFilter('title = "oops'), throwsFormatException);
+      // An escaped quote at the end must not count as the closing quote.
+      expect(() => parseFilter(r"title = 'oops\'"), throwsFormatException);
+    });
+
+    test('ordering compare against a null/missing field is false, not a throw',
+        () {
+      expect(evaluateFilter({'n': null}, parseFilter('n > 4')), isFalse);
+      expect(evaluateFilter({'n': null}, parseFilter('n <= 4')), isFalse);
+      expect(
+          evaluateFilter(<String, dynamic>{}, parseFilter('n >= 0')), isFalse);
+    });
+
+    test('ordering compare against a non-numeric field is false, not a throw',
+        () {
+      expect(evaluateFilter({'n': 'five'}, parseFilter('n > 4')), isFalse);
+      expect(evaluateFilter({'n': 'five'}, parseFilter('n < 4')), isFalse);
+      // Numeric field against a string RHS literal: also false.
+      expect(evaluateFilter({'n': 5}, parseFilter("n > '4'")), isFalse);
+    });
   });
 
   group('analyzeFilter', () {

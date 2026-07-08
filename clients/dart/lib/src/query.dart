@@ -8,6 +8,8 @@
 /// exactly with each other and with the server.
 library;
 
+import 'paths.dart';
+
 /// Quotes a Dart string as a ZigBase filter literal.
 ///
 /// The server lexer unescapes backslash sequences inside a quoted string:
@@ -176,17 +178,6 @@ List<SortTerm> parseSort(String sort) {
   return terms.where((t) => t.field.isNotEmpty).toList();
 }
 
-/// Reads a possibly-dotted field path (`"author.name"`) out of a record map.
-Object? _readSortPath(Map<String, dynamic> obj, String path) {
-  if (!path.contains('.')) return obj[path];
-  Object? cur = obj;
-  for (final seg in path.split('.')) {
-    if (cur is! Map) return null;
-    cur = cur[seg];
-  }
-  return cur;
-}
-
 /// Compares two scalar values. Null/absent values sort BEFORE everything (the
 /// ascending baseline; the caller flips the sign for descending). Numbers
 /// compare numerically, booleans false-before-true, everything else by string.
@@ -213,7 +204,7 @@ int compareBySort(
 ) {
   for (final term in terms) {
     final cmp = _compareScalar(
-        _readSortPath(a, term.field), _readSortPath(b, term.field));
+        readDottedPath(a, term.field), readDottedPath(b, term.field));
     if (cmp != 0) return term.dir == 'desc' ? -cmp : cmp;
   }
   return 0;
