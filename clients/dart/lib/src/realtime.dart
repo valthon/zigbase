@@ -102,6 +102,11 @@ class RealtimeService {
   StreamSubscription<dynamic>? _streamSub;
   bool _opened = false;
   bool _connecting = false;
+
+  /// A reconnect is scheduled and sleeping out its backoff — the channel is
+  /// null and [_connecting] is false, so [_ensureConnected] must still defer to
+  /// it rather than racing a second connect.
+  bool _reconnectPending = false;
   bool _closedByUser = false;
   int _reconnectAttempts = 0;
   String? _clientId;
@@ -204,6 +209,10 @@ class RealtimeService {
         sub.callbacks.clear();
       }
       if (sub.callbacks.isEmpty) {
+        // Known pre-existing gap (documented, not fixed here): a still-pending
+        // (unacked) subscribe whose entry is removed at this point — e.g.
+        // unsubscribed while a reconnect backoff is in flight — never settles
+        // its future; nothing acks or rejects it after the entry is gone.
         _subscriptions.remove(_subKey(sub.topic, sub.filter));
         removed = true;
       }
@@ -332,7 +341,11 @@ class RealtimeService {
   // ---- connection lifecycle ----------------------------------------------
 
   void _ensureConnected() {
-    if (_channel != null || _connecting) return;
+    // Defer to an in-flight connect OR a scheduled reconnect that is sleeping
+    // out its backoff — during that sleep [_channel] is null and [_connecting]
+    // is false, and a fresh subscribe here would otherwise open a second socket
+    // that races the reconnect loop and orphans one of them.
+    if (_channel != null || _connecting || _reconnectPending) return;
     _connect();
   }
 
@@ -528,17 +541,28 @@ class RealtimeService {
   }
 
   void _onErrorFrame(String message) {
+    // The server's error frame carries NO topic, so this rejects EVERY unacked
+    // pending subscribe (pre-existing wire-protocol limitation: two subscribes
+    // in flight when one fails are both rejected).
     // Reject any still-pending subscribe so the awaiting caller learns of it
-    // (e.g. anonymous subscribe to a non-public collection).
-    for (final sub in _subscriptions.values) {
+    // (e.g. anonymous subscribe to a non-public collection), and DROP the
+    // failed subscription entry entirely. It never acked, so no unsubscribe
+    // frame is owed; leaving it in the map would silently re-subscribe it on
+    // the next reconnect — a topic the caller was already told had failed. A
+    // later subscribe() re-creates the entry and sends a fresh frame.
+    final failedKeys = <String>[];
+    for (final entry in _subscriptions.entries) {
+      final sub = entry.value;
       if (sub.acked || sub.pending.isEmpty) continue;
-      sub.inflight =
-          false; // allow a later subscribe to retry with a fresh frame
+      failedKeys.add(entry.key);
       final pending = List<Completer<void>>.from(sub.pending);
       sub.pending.clear();
       for (final c in pending) {
         if (!c.isCompleted) c.completeError(StateError(message));
       }
+    }
+    for (final key in failedKeys) {
+      _subscriptions.remove(key);
     }
     onError?.call(message);
   }
@@ -552,9 +576,14 @@ class RealtimeService {
   }
 
   Future<void> _reconnect() async {
+    // Mark the reconnect as pending for the whole backoff window so a subscribe
+    // arriving mid-sleep defers to us (see [_ensureConnected]) instead of
+    // opening a competing socket.
+    _reconnectPending = true;
     final delay = _backoffDelay();
     _reconnectAttempts += 1;
     await _sleep(delay);
+    _reconnectPending = false;
     if (_closedByUser) return;
     _connect();
   }

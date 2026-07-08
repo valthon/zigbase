@@ -221,6 +221,57 @@ void main() {
       expect(calls, hasLength(1));
     });
 
+    test('throws instead of looping when a page is empty but claims hasNext',
+        () async {
+      // A misbehaving server: first page has items + hasNext, the next page is
+      // empty but still claims hasNext. Without a guard this spins forever.
+      final transport = _scripted([
+        http.Response(
+            jsonEncode(_page(
+                items: [_record('r1')], nextCursor: 'TOK1', hasNext: true)),
+            200),
+        http.Response(
+            jsonEncode(_page(items: [], nextCursor: 'TOK2', hasNext: true)),
+            200),
+      ], []);
+      final svc = CollectionService(transport, MemoryAuthStore(), 'posts');
+
+      final seen = <String>[];
+      await expectLater(
+        () async {
+          await for (final r in svc.iterate(batch: 2)) {
+            seen.add(r.id);
+          }
+        }(),
+        throwsA(isA<ZigbaseException>()),
+      );
+      expect(seen, ['r1']); // the first page's items were still yielded
+    });
+
+    test('throws instead of looping when the server repeats the same cursor',
+        () async {
+      final calls = <_Call>[];
+      final transport = _scripted([
+        http.Response(
+            jsonEncode(_page(
+                items: [_record('r1')], nextCursor: 'STUCK', hasNext: true)),
+            200),
+        http.Response(
+            jsonEncode(_page(
+                items: [_record('r2')], nextCursor: 'STUCK', hasNext: true)),
+            200),
+      ], calls);
+      final svc = CollectionService(transport, MemoryAuthStore(), 'posts');
+
+      await expectLater(
+        svc.iterate(batch: 2).toList(),
+        throwsA(isA<ZigbaseException>()),
+      );
+      // First page used no cursor, second forwarded "STUCK", the third would
+      // repeat "STUCK" -> caught. Exactly two requests are made.
+      expect(calls, hasLength(2));
+    });
+
     test(
         'passes filter/sort/expand/fields/search through to every page request',
         () async {

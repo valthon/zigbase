@@ -157,8 +157,15 @@ class CollectionService {
 
   Future<AuthResponse> _authRequest(String path, Map<String, dynamic> body,
       {required bool skipAuth}) async {
+    // The refresh request must carry the bearer header (so no skipAuth) but is
+    // exempt from the transport's single-flight 401-refresh branch: a 401 here
+    // propagates instead of awaiting/starting a refresh (self-await deadlock /
+    // unbounded recursion otherwise).
     final res = await _transport.send('${_base()}$path',
-        method: 'POST', body: body, skipAuth: skipAuth);
+        method: 'POST',
+        body: body,
+        skipAuth: skipAuth,
+        isRefreshCall: path == '/auth-refresh');
     final auth = AuthResponse.fromJson(_asMap(res));
     _authStore.save(auth.token, auth.record?.data);
     return auth;
@@ -480,6 +487,7 @@ class CollectionService {
     String? fields,
     String? search,
   }) async* {
+    String? usedCursor;
     var page = await getPage(
       limit: batch,
       filter: filter,
@@ -494,6 +502,20 @@ class CollectionService {
       }
       final next = page.nextCursor;
       if (!page.hasNext || next == null || next.isEmpty) return;
+      // Guard against a misbehaving server that cannot make progress: a page
+      // that still claims `hasNext` but carries no items, or a `nextCursor`
+      // identical to the one we just used, would loop forever. Fail loudly
+      // rather than spin.
+      if (page.items.isEmpty || next == usedCursor) {
+        throw ZigbaseException(
+          status: 0,
+          message: 'iterate(): the server returned a non-advancing cursor page '
+              '(empty page or a repeated cursor); aborting to avoid an '
+              'infinite loop.',
+          url: _recordsBase(),
+        );
+      }
+      usedCursor = next;
       page = await getPage(
         cursor: next,
         limit: batch,

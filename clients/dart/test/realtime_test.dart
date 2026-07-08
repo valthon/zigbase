@@ -445,6 +445,66 @@ void main() {
       await service.close();
     });
 
+    test(
+        'a rejected subscribe is dropped so a reconnect never re-subscribes it',
+        () async {
+      final factory = FakeSocketFactory();
+      final service = makeService(factory);
+      // A good subscription keeps the socket alive across the reconnect.
+      final good = service.subscribe('posts', (_) {});
+      await pumpEventQueue();
+      final ws1 = factory.last;
+      ws1.push({'type': 'ack', 'action': 'subscribe', 'topic': 'posts'});
+      await good;
+
+      // A second subscribe the server rejects.
+      final bad = service.subscribe('private', (_) {});
+      await pumpEventQueue();
+      ws1.push({'type': 'error', 'message': 'not allowed'});
+      await expectLater(bad, throwsA(isA<Object>()));
+
+      // Transport drop -> reconnect resubscribes only the surviving topics.
+      await ws1.serverClose();
+      await pumpEventQueue();
+      final ws2 = factory.last;
+      expect(identical(ws2, ws1), isFalse);
+      final topics =
+          ws2.subscribeFrames.map((f) => (f as Map)['topic']).toList();
+      expect(topics, ['posts']); // NOT 'private'
+      await service.close();
+    });
+
+    test('a subscribe during the reconnect backoff does not open a 2nd socket',
+        () async {
+      final sleepGate = Completer<void>();
+      final factory = FakeSocketFactory();
+      final service = makeService(factory, sleep: (d) => sleepGate.future);
+      final p1 = service.subscribe('posts', (_) {});
+      await pumpEventQueue();
+      final ws1 = factory.last;
+      ws1.push({'type': 'ack', 'action': 'subscribe', 'topic': 'posts'});
+      await p1;
+      expect(factory.connections, hasLength(1));
+
+      // Drop -> schedules a reconnect that is now parked on the gated sleep.
+      await ws1.serverClose();
+      await pumpEventQueue();
+      // A fresh subscribe arrives while the reconnect is still sleeping.
+      final p2 = service.subscribe('comments', (_) {});
+      await pumpEventQueue();
+      expect(factory.connections, hasLength(1)); // no competing socket
+
+      // Release the backoff; the reconnect opens EXACTLY one new socket.
+      sleepGate.complete();
+      await pumpEventQueue();
+      expect(factory.connections, hasLength(2));
+      final ws2 = factory.last;
+      ws2.push({'type': 'ack', 'action': 'subscribe', 'topic': 'posts'});
+      ws2.push({'type': 'ack', 'action': 'subscribe', 'topic': 'comments'});
+      await p2;
+      await service.close();
+    });
+
     test('close() stops reconnects and detaches the auth listener', () async {
       final store = MemoryAuthStore();
       final factory = FakeSocketFactory();
