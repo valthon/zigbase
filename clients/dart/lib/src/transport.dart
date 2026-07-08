@@ -98,6 +98,17 @@ class Transport {
   final Future<void> Function(Duration) _sleep;
   Future<void> Function()? _refresh;
 
+  /// The single-flight 401 refresh. The first 401 starts it; every 401 that
+  /// lands while it runs awaits the SAME future and then retries its request
+  /// once (still bounded per exchange by `didRefresh`), so a parallel burst of
+  /// expired-token requests all succeed after exactly one refresh. Cleared in a
+  /// `whenComplete` so a later expiry starts a fresh refresh. The refresh
+  /// endpoint's own request never enters this path (see the `isRefreshCall`
+  /// parameter on [send]) — its 401 propagates, which both avoids a self-await
+  /// deadlock and keeps a persistently-401ing refresh from recursing without
+  /// bound.
+  Future<void>? _refreshInFlight;
+
   /// Cancel tokens keyed by `requestKey`, for opt-in last-write-wins
   /// de-duplication. Each token's future completes (with error) only when a
   /// newer keyed request supersedes the one that owns it.
@@ -188,6 +199,13 @@ class Transport {
   /// When [requestKey] is set, any in-flight request sharing the key is
   /// superseded: its future completes with [ZigbaseCancelledException] and its
   /// eventual HTTP response is discarded.
+  ///
+  /// [isRefreshCall] is internal: `CollectionService._authRequest` sets it for
+  /// `/auth-refresh`. A 401 from that request propagates instead of entering
+  /// the single-flight refresh branch — awaiting there would mean awaiting its
+  /// own refresh (deadlock), and starting another would recurse without bound.
+  /// It cannot ride on [skipAuth] because auth-refresh must still send the
+  /// bearer header.
   Future<dynamic> send(
     String path, {
     String method = 'GET',
@@ -196,9 +214,10 @@ class Transport {
     Map<String, String>? headers,
     bool skipAuth = false,
     String? requestKey,
+    bool isRefreshCall = false,
   }) {
     final url = buildUrl(path, query);
-    final work = _exchange(url, method, body, headers, skipAuth);
+    final work = _exchange(url, method, body, headers, skipAuth, isRefreshCall);
     if (requestKey == null) return work;
     return _dedupe(requestKey, work);
   }
@@ -227,6 +246,13 @@ class Transport {
 
   // --- internals -----------------------------------------------------------
 
+  /// Join (or start) the single-flight refresh.
+  Future<void> _awaitRefresh() {
+    return _refreshInFlight ??= Future.sync(() => _refresh!()).whenComplete(() {
+      _refreshInFlight = null;
+    });
+  }
+
   /// The refresh/retry loop around a single logical request. Rebuilds the
   /// request each attempt so a refreshed token / fresh headers are picked up.
   Future<dynamic> _exchange(
@@ -235,6 +261,7 @@ class Transport {
     Object? body,
     Map<String, String>? headers,
     bool skipAuth,
+    bool isRefreshCall,
   ) async {
     var didRefresh = false;
     var attempt = 0;
@@ -253,18 +280,24 @@ class Transport {
         return text.isEmpty ? null : jsonDecode(text);
       }
 
-      // One-shot auto-refresh on 401.
+      // Single-flight auto-refresh on 401 (one retry per exchange): join the
+      // in-flight refresh if one is running, else start it, then retry with
+      // the fresh token. A failed refresh falls through to this request's
+      // original 401. The refresh endpoint's own request is exempt via
+      // [isRefreshCall] — its 401 propagates (no self-await deadlock, no
+      // unbounded recursion).
       if (status == 401 &&
           _autoRefresh &&
           _refresh != null &&
           !didRefresh &&
-          !skipAuth) {
+          !skipAuth &&
+          !isRefreshCall) {
         didRefresh = true;
         try {
-          await _refresh!();
+          await _awaitRefresh();
           continue;
         } catch (_) {
-          // Refresh failed — fall through and throw the original error.
+          // Refresh failed — fall through and throw the original 401 error.
         }
       }
 

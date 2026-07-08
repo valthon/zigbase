@@ -22,6 +22,29 @@ on [Keep a Changelog](https://keepachangelog.com/), and this package adheres to
   an in-flight subscribe.** Back-to-back `auth` frames now share a single pending
   ack instead of overwriting its resolver, so a waiting resubscribe always settles
   on the next auth response rather than hanging.
+- **Realtime: a server-rejected subscribe is no longer silently re-subscribed on
+  reconnect.** When the server rejects a `subscribe` (error frame), the failed
+  subscription entry is now dropped instead of lingering in the map, where the
+  next reconnect would re-send it for a topic the caller was already told had
+  failed. A later `subscribe()` re-creates it and sends a fresh frame.
+- **Realtime: a `subscribe()` issued during the reconnect backoff no longer opens
+  a second, competing socket.** The scheduled reconnect is now treated as
+  in-flight for the whole backoff window, so `ensureConnected` defers to it
+  instead of racing it and orphaning a socket.
+- **Realtime: post-`close()` lifecycle hardening.** `subscribe()`/`subscribeTopic()`
+  now throw after `close()` instead of quietly re-opening a socket; `close()` rejects
+  any still-pending subscribe (so its promise never dangles) and can no longer be
+  wedged mid-connect — a socket that opens after `close()` is ignored.
+- **Pagination: `iterate()`/`getFullList()` no longer loop forever against a
+  misbehaving server.** A page that claims `hasNext` but is empty, or repeats the
+  cursor just used, now throws a clear `ZigbaseError` instead of spinning.
+- **Transport: 401 auto-refresh is now single-flight and bounded.** Concurrent
+  requests that 401 while a token refresh is already in flight await that one
+  refresh and then retry with the fresh token (previously each ran its own
+  redundant refresh). The refresh endpoint's own request is exempt from the
+  branch, so a persistently-401ing refresh endpoint no longer recurses without
+  bound — the refresh simply fails and every waiting request rejects with its
+  original 401.
 
 ## [0.3.0] - 2026-07-04
 

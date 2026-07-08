@@ -155,4 +155,169 @@ describe("RealtimeService reconnect", () => {
     await expect(subPromise).rejects.toThrow(/anonymous subscription not allowed/);
     expect(onError).toHaveBeenCalledWith("anonymous subscription not allowed");
   });
+
+  it("a rejected subscribe is dropped so a later reconnect never re-subscribes it", async () => {
+    const factory = new FakeWebSocketFactory();
+    const service = new RealtimeService({
+      baseUrl: "http://api.test",
+      authStore: new MemoryAuthStore(),
+      WebSocket: factory.WebSocket,
+      sleep: async () => {},
+    });
+    // A good subscription keeps the socket alive across the reconnect.
+    const good = service.subscribe("posts", vi.fn());
+    const ws1 = factory.last;
+    ws1.emitOpen();
+    ws1.emitMessage({ type: "ack", action: "subscribe", topic: "posts" });
+    await good;
+
+    // A second subscribe the server rejects.
+    const bad = service.subscribe("private", vi.fn());
+    ws1.emitMessage({ type: "error", message: "not allowed" });
+    await expect(bad).rejects.toThrow("not allowed");
+
+    // Transport drop -> reconnect resubscribes only the surviving topics.
+    ws1.emitClose();
+    await flush();
+    const ws2 = factory.last;
+    expect(ws2).not.toBe(ws1);
+    ws2.emitOpen();
+
+    const resubscribed = ws2.sentFrames.filter(
+      (f) => (f as { action: string }).action === "subscribe",
+    ) as Array<{ topic: string }>;
+    expect(resubscribed.map((f) => f.topic)).toEqual(["posts"]); // NOT "private"
+  });
+
+  it("a throwing sleep does not wedge the reconnect-pending flag or leak an unhandled rejection", async () => {
+    const factory = new FakeWebSocketFactory();
+    const onError = vi.fn();
+    let sleepCalls = 0;
+    const service = new RealtimeService({
+      baseUrl: "http://api.test",
+      authStore: new MemoryAuthStore(),
+      WebSocket: factory.WebSocket,
+      sleep: async () => {
+        sleepCalls += 1;
+        if (sleepCalls === 1) throw new Error("sleep broke");
+      },
+      onError,
+    });
+    const p1 = service.subscribe("posts", vi.fn());
+    const ws1 = factory.last;
+    ws1.emitOpen();
+    ws1.emitMessage({ type: "ack", action: "subscribe", topic: "posts" });
+    await p1;
+
+    // Drop -> schedules a reconnect whose sleep throws. Without the
+    // try/finally, reconnectPending stays true forever (ensureConnected is
+    // permanently no-op'd) and `void this.reconnect()` leaks an unhandled
+    // rejection.
+    ws1.emitClose();
+    await flush();
+    expect(onError).toHaveBeenCalledWith("sleep broke");
+
+    // Flag not wedged: the reconnect proceeded to a fresh socket.
+    expect(factory.instances).toHaveLength(2);
+    const ws2 = factory.last;
+    ws2.emitOpen();
+    ws2.emitMessage({ type: "ack", action: "subscribe", topic: "posts" });
+
+    // And a brand-new subscribe still works end-to-end.
+    const p2 = service.subscribe("comments", vi.fn());
+    ws2.emitMessage({ type: "ack", action: "subscribe", topic: "comments" });
+    await p2;
+  });
+
+  it("a subscribe during the reconnect backoff does not open a second socket", async () => {
+    // A gated sleep holds the backoff open so we can inject a subscribe mid-sleep.
+    let releaseSleep!: () => void;
+    const sleepGate = new Promise<void>((r) => {
+      releaseSleep = r;
+    });
+    const factory = new FakeWebSocketFactory();
+    const service = new RealtimeService({
+      baseUrl: "http://api.test",
+      authStore: new MemoryAuthStore(),
+      WebSocket: factory.WebSocket,
+      sleep: () => sleepGate,
+    });
+    const p1 = service.subscribe("posts", vi.fn());
+    const ws1 = factory.last;
+    ws1.emitOpen();
+    ws1.emitMessage({ type: "ack", action: "subscribe", topic: "posts" });
+    await p1;
+    expect(factory.instances).toHaveLength(1);
+
+    // Drop -> schedules a reconnect that is now parked on the gated sleep.
+    ws1.emitClose();
+    await flush();
+    // A fresh subscribe arrives while the reconnect is still sleeping.
+    const p2 = service.subscribe("comments", vi.fn());
+    // No competing socket must have been constructed.
+    expect(factory.instances).toHaveLength(1);
+
+    // Release the backoff; the reconnect loop opens EXACTLY one new socket.
+    releaseSleep();
+    await flush();
+    expect(factory.instances).toHaveLength(2);
+    const ws2 = factory.last;
+    ws2.emitOpen();
+    ws2.emitMessage({ type: "ack", action: "subscribe", topic: "posts" });
+    ws2.emitMessage({ type: "ack", action: "subscribe", topic: "comments" });
+    await p2;
+  });
+});
+
+describe("RealtimeService post-close lifecycle", () => {
+  function makeService() {
+    const factory = new FakeWebSocketFactory();
+    const service = new RealtimeService({
+      baseUrl: "http://api.test",
+      authStore: new MemoryAuthStore(),
+      WebSocket: factory.WebSocket,
+      sleep: async () => {},
+    });
+    return { service, factory };
+  }
+
+  it("subscribe() after close() throws instead of opening a socket", async () => {
+    const { service, factory } = makeService();
+    service.close();
+    await expect(service.subscribe("posts", vi.fn())).rejects.toThrow("closed");
+    expect(factory.instances).toHaveLength(0);
+  });
+
+  it("subscribeTopic() after close() throws instead of opening a socket", async () => {
+    const { service, factory } = makeService();
+    service.close();
+    await expect(service.subscribeTopic("orders", vi.fn())).rejects.toThrow("closed");
+    expect(factory.instances).toHaveLength(0);
+  });
+
+  it("close() rejects a still-pending subscribe rather than leaving it dangling", async () => {
+    const { service, factory } = makeService();
+    const p = service.subscribe("posts", vi.fn());
+    factory.last.emitOpen(); // frame sent, awaiting an ack that never comes
+    service.close();
+    await expect(p).rejects.toThrow("closed");
+  });
+
+  it("close() during an in-flight connect cannot wedge the flags or resurrect the socket", async () => {
+    const { service, factory } = makeService();
+    const p = service.subscribe("posts", vi.fn()); // constructs a socket, not yet open
+    const ws1 = factory.last;
+    service.close();
+    await expect(p).rejects.toThrow("closed");
+
+    // The stale socket opening after close() must be ignored: no frames sent,
+    // no state resurrected.
+    ws1.emitOpen();
+    expect(ws1.sentFrames).toHaveLength(0);
+
+    // A later subscribe still throws (the service stays closed) and opens no
+    // new socket — proving `connecting` was not left wedged.
+    await expect(service.subscribe("posts", vi.fn())).rejects.toThrow("closed");
+    expect(factory.instances).toHaveLength(1);
+  });
 });

@@ -13,7 +13,8 @@ Initial release of the official Dart client for ZigBase — a behavioral port of
 
 - **Records.** `CollectionService` CRUD (`getList`, `getOne`, `getFirstListItem`, `create`,
   `update`, `delete`) with offset pagination, and native server-side cursor (keyset)
-  pagination (`getPage`, `iterate`, `getFullList`).
+  pagination (`getPage`, `iterate`, `getFullList` — which abort with a clear
+  `ZigbaseException` rather than looping forever on a non-advancing server cursor).
 - **Safe filters.** `zbFilter`/`filterValue` — injection-safe interpolation of `{:name}`
   placeholders into filter expressions, matching the server's filter lexer byte-for-byte.
 - **Search & vector.** `search` on every list read; structured `VectorQuery` nearest-neighbor
@@ -35,18 +36,25 @@ Initial release of the official Dart client for ZigBase — a behavioral port of
   `create`/`update` bodies containing an `http.MultipartFile`.
 - **Realtime.** `RealtimeService.subscribe`/`subscribeTopic`/`stream` over a single
   auto-reconnecting, auto-reauthenticating WebSocket, multiplexing every collection and
-  custom-topic subscription. `ZigbaseClient(onRealtimeError: ...)` wires an error callback
-  into the client's lazily-created `RealtimeService`; it fires for every server error frame,
-  including errors also delivered to a pending subscribe call. When omitted, a realtime
-  error is never silently dropped — it falls back to a visible `dart:developer` log entry.
-- **Transport.** One-shot 401 auto-refresh, 429 backoff with `Retry-After` support, and
-  opt-in `requestKey` request de-duplication (discard-not-abort semantics — see
-  [docs/dart-sdk.md](../../docs/dart-sdk.md#auto-cancellation--requestkey)). Every non-GET,
-  non-multipart request body — including a bare `String`/`num`/`bool` — is JSON-encoded with
-  `Content-Type: application/json`, matching the TS SDK's `JSON.stringify`-everything
-  behavior byte-for-byte; a nested `DateTime` serializes as a millisecond-clamped UTC
-  ISO-8601 string (as JS `JSON.stringify` does for a `Date`), and any other non-encodable
-  value throws an `ArgumentError`. A query key that duplicates one already present in the
-  request path is appended rather than overwritten, so both values survive.
+  custom-topic subscription. A server-rejected subscribe is dropped (never silently
+  re-subscribed on reconnect), a subscribe issued during the reconnect backoff never
+  opens a competing socket, and the service is hardened after `close()`
+  (`subscribe`/`subscribeTopic`/`stream` throw; pending subscribes are failed).
+  `ZigbaseClient(onRealtimeError: ...)` wires an error callback into the client's
+  lazily-created `RealtimeService`; it fires for every server error frame, including
+  errors also delivered to a pending subscribe call. When omitted, a realtime error is
+  never silently dropped — it falls back to a visible `dart:developer` log entry.
+- **Transport.** One-shot, single-flight 401 auto-refresh (concurrent 401s all await
+  the one in-flight refresh and then retry; a refresh endpoint that itself answers 401
+  propagates rather than recursing without bound), 429 backoff with `Retry-After`
+  support, and opt-in `requestKey` request de-duplication (discard-not-abort semantics
+  — see [docs/dart-sdk.md](../../docs/dart-sdk.md#auto-cancellation--requestkey)). Every
+  non-GET, non-multipart request body — including a bare `String`/`num`/`bool` — is
+  JSON-encoded with `Content-Type: application/json`, matching the TS SDK's
+  `JSON.stringify`-everything behavior byte-for-byte; a nested `DateTime` serializes as
+  a millisecond-clamped UTC ISO-8601 string (as JS `JSON.stringify` does for a `Date`),
+  and any other non-encodable value throws an `ArgumentError`. A query key that
+  duplicates one already present in the request path is appended rather than
+  overwritten, so both values survive.
 - **Errors.** `ZigbaseException` (status/message/per-field `data`) and
   `ZigbaseCancelledException` for superseded `requestKey` requests.

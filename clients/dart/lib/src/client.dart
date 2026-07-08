@@ -185,13 +185,14 @@ class ZigbaseClient {
   /// Note: `authRefresh()` posts with `skipAuth: false` (it must send the
   /// current — possibly near-expiry but not yet cleared — token so the
   /// server knows which session to refresh). That nested request goes
-  /// through this same [Transport], which means it is itself eligible for
-  /// exactly one nested auto-refresh attempt if `/auth-refresh` answers 401.
-  /// This mirrors `clients/typescript/src/transport.ts` exactly (same
-  /// per-call `didRefresh` scoping) — a persistently-401ing refresh endpoint
-  /// recurses in both SDKs alike; it is not a regression introduced here.
-  /// The common, correctly-configured case (refresh succeeds) makes exactly
-  /// one nested call, verified by the `autoRefresh + authCollection` test.
+  /// through this same [Transport], marked `isRefreshCall`, so a 401 from
+  /// `/auth-refresh` itself propagates rather than entering the transport's
+  /// single-flight refresh branch (which would be a self-await deadlock, or
+  /// — pre-guard — unbounded recursion). Concurrent 401s while the refresh
+  /// runs all await the one in-flight refresh and then retry once. This
+  /// mirrors `clients/typescript/src/transport.ts` exactly. The common,
+  /// correctly-configured case (refresh succeeds) makes exactly one nested
+  /// call, verified by the `autoRefresh + authCollection` test.
   void _wireAuthRefresh(String? authCollection) {
     if (authCollection == null) return;
     _transport.refresh = () async {

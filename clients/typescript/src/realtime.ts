@@ -62,6 +62,10 @@ export class RealtimeService {
   private opened = false;
   private clientId: string | null = null;
   private connecting = false;
+  /** A reconnect is scheduled and sleeping out its backoff — the socket is
+   *  null and `connecting` is false, so `ensureConnected` must still defer to
+   *  it rather than racing a second connect. */
+  private reconnectPending = false;
   private closedByUser = false;
   private reconnectAttempts = 0;
   private authAck: {
@@ -93,6 +97,7 @@ export class RealtimeService {
     cb: RealtimeCallback,
     opts: { filter?: string } = {},
   ): Promise<() => void> {
+    if (this.closedByUser) throw new Error("RealtimeService has been closed");
     const key = subKey(topic, opts.filter);
     let sub = this.subscriptions.get(key);
     if (!sub) {
@@ -144,6 +149,10 @@ export class RealtimeService {
       else sub.callbacks.clear();
 
       if (sub.callbacks.size === 0) {
+        // Known pre-existing gap (documented, not fixed here): a still-pending
+        // (unacked) subscribe whose entry is removed at this point — e.g.
+        // unsubscribed while a reconnect backoff is in flight — never settles
+        // its promise; nothing acks or rejects it after the entry is gone.
         this.subscriptions.delete(subKey(sub.topic, sub.filter));
         removedSub = true;
       }
@@ -164,6 +173,7 @@ export class RealtimeService {
    * record subscriptions; a server-rejected subscribe rejects the returned promise.
    */
   async subscribeTopic(topic: string, cb: TopicCallback): Promise<() => void> {
+    if (this.closedByUser) throw new Error("RealtimeService has been closed");
     const key = topicKey(topic);
     let sub = this.subscriptions.get(key);
     if (!sub) {
@@ -211,16 +221,31 @@ export class RealtimeService {
   close(): void {
     this.closedByUser = true;
     this.authUnsub();
+    // Fail any subscribe still awaiting its ack so its promise never dangles
+    // forever (a caller `await`ing subscribe() would otherwise hang).
+    for (const sub of this.subscriptions.values()) {
+      const pending = sub.pending.splice(0);
+      for (const p of pending) p.reject(new Error("RealtimeService has been closed"));
+    }
     this.subscriptions.clear();
     this.ws?.close();
     this.ws = null;
+    // Reset `connecting` too: a connect may be in flight (socket constructed,
+    // not yet open). Clearing it — plus `this.ws = null` above, which the
+    // socket's own handlers check by identity — guarantees close() can never
+    // leave the service wedged mid-connect.
+    this.connecting = false;
     this.opened = false;
   }
 
   // ---- connection lifecycle ----------------------------------------------
 
   private ensureConnected(): void {
-    if (this.ws || this.connecting) return;
+    // Defer to an in-flight connect OR a scheduled reconnect that is sleeping
+    // out its backoff — during that sleep `ws` is null and `connecting` is
+    // false, and a fresh subscribe here would otherwise open a second socket
+    // that races the reconnect loop and orphans one of them.
+    if (this.ws || this.connecting || this.reconnectPending) return;
     this.connect();
   }
 
@@ -244,14 +269,22 @@ export class RealtimeService {
     }
     this.ws = ws;
 
+    // Every handler checks that this socket is still the live one (`this.ws`):
+    // a socket superseded by close() (which nulls `this.ws`) or by a later
+    // connect must not resurrect `opened`/`connecting` or drive reconnects.
     ws.onopen = () => {
+      if (this.ws !== ws) return;
       this.connecting = false;
       this.opened = true;
       this.reconnectAttempts = 0;
       this.onOpen();
     };
-    ws.onmessage = (ev: MessageEvent) => this.onMessage(ev);
-    ws.onclose = () => this.onClose();
+    ws.onmessage = (ev: MessageEvent) => {
+      if (this.ws === ws) this.onMessage(ev);
+    };
+    ws.onclose = () => {
+      if (this.ws === ws) this.onClose();
+    };
     ws.onerror = () => {
       /* errors precede close; reconnect is driven by onClose */
     };
@@ -404,12 +437,19 @@ export class RealtimeService {
   }
 
   private onErrorFrame(message: string): void {
+    // The server's error frame carries NO topic, so this rejects EVERY unacked
+    // pending subscribe (pre-existing wire-protocol limitation: two subscribes
+    // in flight when one fails are both rejected).
     // Reject any still-pending subscribe so the awaiting caller learns of it
-    // (e.g. anonymous subscribe to a non-public collection).
+    // (e.g. anonymous subscribe to a non-public collection), and DROP the
+    // failed subscription entry entirely. It never acked, so no unsubscribe
+    // frame is owed; leaving it in the map would silently re-subscribe it on
+    // the next reconnect — a topic the caller was already told had failed. A
+    // later subscribe() re-creates the entry and sends a fresh frame.
     let rejected = false;
-    for (const sub of this.subscriptions.values()) {
+    for (const [key, sub] of [...this.subscriptions.entries()]) {
       if (sub.acked || sub.pending.length === 0) continue;
-      sub.inflight = false; // allow a later subscribe to retry with a fresh frame
+      this.subscriptions.delete(key);
       const pending = sub.pending.splice(0);
       for (const p of pending) p.reject(new Error(message));
       rejected = true;
@@ -430,11 +470,26 @@ export class RealtimeService {
   }
 
   private async reconnect(): Promise<void> {
-    const min = this.cfg.minReconnectMs ?? 250;
-    const max = this.cfg.maxReconnectMs ?? 10_000;
-    const delay = Math.min(max, min * 2 ** this.reconnectAttempts);
-    this.reconnectAttempts += 1;
-    await (this.cfg.sleep ?? defaultSleep)(delay);
+    // Mark the reconnect as pending for the whole backoff window so a subscribe
+    // arriving mid-sleep defers to us (see ensureConnected) instead of opening
+    // a competing socket.
+    this.reconnectPending = true;
+    try {
+      const min = this.cfg.minReconnectMs ?? 250;
+      const max = this.cfg.maxReconnectMs ?? 10_000;
+      const delay = Math.min(max, min * 2 ** this.reconnectAttempts);
+      this.reconnectAttempts += 1;
+      await (this.cfg.sleep ?? defaultSleep)(delay);
+    } catch (e) {
+      // A rejecting injectable sleep must neither wedge `reconnectPending`
+      // (the finally below always clears it — a stuck flag would no-op
+      // ensureConnected forever) nor surface an unhandled rejection (call
+      // sites fire-and-forget via `void this.reconnect()`). Surface it and
+      // treat the backoff as elapsed — the reconnect itself still proceeds.
+      this.cfg.onError?.(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.reconnectPending = false;
+    }
     if (this.closedByUser) return;
     this.connect();
   }

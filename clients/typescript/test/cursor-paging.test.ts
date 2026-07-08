@@ -137,6 +137,61 @@ describe("native cursor pagination", () => {
     expect(call).toBe(3);
   });
 
+  it("iterate throws instead of looping when a server returns hasNext with an empty page", async () => {
+    // A misbehaving server: first page has items + hasNext, the next page is
+    // empty but still claims hasNext. Without a guard this spins forever.
+    const pages = [
+      { items: [{ id: "r1" }], nextCursor: "TOK1", prevCursor: null, hasNext: true, hasPrev: false },
+      { items: [], nextCursor: "TOK2", prevCursor: null, hasNext: true, hasPrev: false },
+    ];
+    let call = 0;
+    const fetchMock = vi.fn(async () => {
+      const body = pages[Math.min(call, pages.length - 1)]!;
+      call += 1;
+      return jsonResponse({ page: 1, perPage: 2, ...body });
+    }) as unknown as typeof fetch;
+    const zb = createClient("http://api.test", { fetch: fetchMock });
+
+    const seen: string[] = [];
+    await expect(
+      (async () => {
+        for await (const rec of zb.collection("posts").iterate({ batch: 2 })) {
+          seen.push(rec.id as string);
+        }
+      })(),
+    ).rejects.toThrow(/non-advancing cursor/);
+    expect(seen).toEqual(["r1"]); // the first page's items were still yielded
+  });
+
+  it("iterate throws instead of looping when the server repeats the same cursor", async () => {
+    // The server keeps handing back the very cursor we just used.
+    let call = 0;
+    const fetchMock = vi.fn(async () => {
+      call += 1;
+      return jsonResponse({
+        page: 1,
+        perPage: 2,
+        items: [{ id: `r${call}` }],
+        nextCursor: "STUCK", // never advances
+        prevCursor: null,
+        hasNext: true,
+        hasPrev: false,
+      });
+    }) as unknown as typeof fetch;
+    const zb = createClient("http://api.test", { fetch: fetchMock });
+
+    await expect(
+      (async () => {
+        for await (const _rec of zb.collection("posts").iterate({ batch: 2 })) {
+          // drain
+        }
+      })(),
+    ).rejects.toThrow(/non-advancing cursor/);
+    // First page used no cursor, second forwarded "STUCK", third would repeat
+    // "STUCK" -> caught. Exactly two requests are made.
+    expect(call).toBe(2);
+  });
+
   it("getFullList accumulates every record across cursor pages", async () => {
     const pages = [
       { items: [{ id: "a" }, { id: "b" }], nextCursor: "T", prevCursor: null, hasNext: true, hasPrev: false },

@@ -409,6 +409,126 @@ void main() {
       expect(calls, 2);
     });
 
+    test(
+        'single-flight: a parallel 401 burst performs ONE refresh and all requests succeed',
+        () async {
+      // Token expires; the app fires 3 parallel requests. All three 401. The
+      // first starts the refresh; the other two must AWAIT that same refresh
+      // (not skip it and fail, not start redundant ones) and then retry.
+      var refreshed = false;
+      var refreshCalls = 0;
+      var fetches = 0;
+      final gate = Completer<void>();
+      final t = _transport(
+        MockClient((_) async {
+          fetches++;
+          return refreshed
+              ? http.Response('{"ok":true}', 200)
+              : http.Response('{"message":"expired"}', 401);
+        }),
+        authStore: MemoryAuthStore()..save('stale-tok', {'id': 'u1'}),
+        autoRefresh: true,
+      )..refresh = () async {
+          refreshCalls++;
+          await gate
+              .future; // hold the refresh open so every 401 lands during it
+          refreshed = true;
+        };
+
+      final burst = [t.send('/api/a'), t.send('/api/b'), t.send('/api/c')];
+      // Let all three 401s land and register on the shared in-flight refresh.
+      await _pumpUntil(() => fetches == 3);
+      expect(refreshCalls, 1); // not three redundant refreshes
+
+      gate.complete();
+      final out = await Future.wait(burst); // NO spurious failures
+      expect(out, [
+        {'ok': true},
+        {'ok': true},
+        {'ok': true}
+      ]);
+      expect(refreshCalls, 1);
+      expect(fetches, 6); // 3 x 401 + 3 retried 200s
+    });
+
+    test(
+        'a persistently-401ing refresh endpoint stays bounded: waiters reject, no recursion, no deadlock',
+        () async {
+      // The refresh callback issues its OWN (isRefreshCall-marked) request
+      // through the transport, exactly like collection.authRefresh() does. When
+      // that request also 401s, it must propagate — not await its own refresh
+      // (deadlock) and not start another (unbounded recursion).
+      var fetches = 0;
+      var refreshCalls = 0;
+      final refreshGate = Completer<void>();
+      late Transport t;
+      t = _transport(
+        MockClient((req) async {
+          fetches++;
+          // Hold the auth-refresh response open until both waiters have joined.
+          if (req.url.path.contains('auth-refresh')) await refreshGate.future;
+          return http.Response('{"message":"expired"}', 401);
+        }),
+        authStore: MemoryAuthStore()..save('tok', {'id': 'u1'}),
+        autoRefresh: true,
+        refresh: () async {
+          refreshCalls++;
+          await t.send('/api/collections/users/auth-refresh',
+              method: 'POST', isRefreshCall: true);
+        },
+      );
+
+      final a = t.send('/api/a');
+      final b = t.send('/api/b');
+      // Attach expectations before releasing so neither rejection is ever
+      // unhandled.
+      final expectA = expectLater(a, throwsA(isA<ZigbaseException>()));
+      final expectB = expectLater(b, throwsA(isA<ZigbaseException>()));
+      await _pumpUntil(() => fetches == 3); // a + b + the one auth-refresh
+      refreshGate.complete();
+
+      await Future.wait([expectA, expectB]);
+      // Bounded: one refresh; its own 401 propagated. No retries, no nested
+      // refreshes.
+      expect(refreshCalls, 1);
+      expect(fetches, 3);
+    });
+
+    test('a failed refresh rejects every waiter with its ORIGINAL 401 error',
+        () async {
+      var fetches = 0;
+      var refreshCalls = 0;
+      final gate = Completer<void>();
+      final t = _transport(
+        MockClient((_) async {
+          fetches++;
+          return http.Response('{"message":"expired"}', 401);
+        }),
+        authStore: MemoryAuthStore()..save('tok', {'id': 'u1'}),
+        autoRefresh: true,
+      )..refresh = () async {
+          refreshCalls++;
+          await gate.future;
+          throw StateError('refresh broke');
+        };
+
+      final a = t.send('/api/a');
+      final b = t.send('/api/b');
+      // The waiter's own 401 (a ZigbaseException, status 401) — NOT the
+      // refresh's StateError.
+      final is401 = isA<ZigbaseException>()
+          .having((e) => e.status, 'status', 401)
+          .having((e) => e.message, 'message', 'expired');
+      final expectA = expectLater(a, throwsA(is401));
+      final expectB = expectLater(b, throwsA(is401));
+      await _pumpUntil(() => fetches == 2 && refreshCalls == 1);
+      gate.complete();
+
+      await Future.wait([expectA, expectB]);
+      expect(refreshCalls, 1);
+      expect(fetches, 2); // no retries after the failure
+    });
+
     test('skipAuth does not refresh on 401', () async {
       var refreshed = 0;
       final t = _transport(
