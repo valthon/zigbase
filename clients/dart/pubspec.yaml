@@ -1,0 +1,15 @@
+name: zigbase_client
+description: Official Dart client for ZigBase — REST, auth, cursor pagination, files, and realtime.
+version: 0.1.0
+repository: https://github.com/valthon/zigbase
+environment:
+  sdk: ^3.5.0
+dependencies:
+  crypto: ^3.0.3
+  http: ^1.2.0
+  http_parser: ^4.0.2
+  stream_channel: ^2.1.2
+  web_socket_channel: ^3.0.0
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.25.0
