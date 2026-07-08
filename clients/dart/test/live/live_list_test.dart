@@ -120,6 +120,30 @@ void main() {
       expect(list.getById('missing'), isNull);
     });
 
+    test('get() is one stable, unmodifiable view mutated in place', () async {
+      final rt = FakeLiveSubscriber();
+      final reader = FakeReader()
+        ..onGetListItems = () async => [
+              rec({'id': 'a', 'rank': 1})
+            ];
+      final lc = LiveCollection('posts', reader, rt);
+      final list = await lc.getList(sort: 'rank');
+
+      final view = list.get();
+      expect(list.items, same(view)); // items is the same object as get()
+
+      // Identity is stable across events; contents update in place.
+      rt.emit(
+          'posts', RecordEvent('posts', 'create', rec({'id': 'b', 'rank': 2})));
+      expect(list.get(), same(view));
+      expect(view.map((r) => r.id).toList(), ['a', 'b']);
+
+      // External mutation throws instead of desyncing the internal index.
+      expect(() => view.clear(), throwsUnsupportedError);
+      expect(() => view.removeAt(0), throwsUnsupportedError);
+      expect(view.map((r) => r.id).toList(), ['a', 'b']);
+    });
+
     test('id-asc tiebreaker orders records with equal sort keys', () async {
       final rt = FakeLiveSubscriber();
       final reader = FakeReader()

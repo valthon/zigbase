@@ -523,7 +523,7 @@ post.close();                     // REQUIRED
 
 // A live list: ordered items kept in sync as events arrive.
 final list = await live.getList(sort: '-created');
-list.items;                       // List<LiveRecord> ordered by the query sort (alias: list.get())
+list.items;                       // read-only List<LiveRecord> ordered by the query sort (alias: list.get())
 list.getById('REC123');           // O(1) membership lookup
 list.changes.listen((_) => render(list.items));
 list.close();                     // REQUIRED
@@ -550,6 +550,11 @@ Read state synchronously via `get()`/`items`/`version`; subscribe to `changes` (
 `StreamSubscription` to unsubscribe) to know *when* to re-read. This adapts trivially to a
 Flutter `ValueListenable` in a future companion package — `version` → `notifyListeners`,
 `get()` → `value`.
+
+A `LiveList`'s `get()`/`items` return an **unmodifiable view with a stable identity**: the same
+list object across events, mutated internally as items move (key re-reads on `version`, as the
+TS SDK's React binding does) — external mutation (`.clear()`, `.sort()`, …) throws
+`UnsupportedError` instead of silently desyncing the list's internal index.
 
 > Unlike the TypeScript SDK, a `LiveRecord` does **not** expose dynamic same-named getters
 > (`post.title`) — Dart can't synthesize them at runtime. Use `post.get()` (a `ZbRecord`, with

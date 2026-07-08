@@ -109,7 +109,7 @@ class LiveRecord implements Observable<ZbRecord> {
   /// Close the change stream. Called by [RecordCache] on eviction; not part of
   /// the public API.
   void dispose() {
-    if (!_changes.isClosed) _changes.close();
+    if (!_changes.isClosed) unawaited(_changes.close());
   }
 }
 

@@ -9,6 +9,7 @@
 library;
 
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 
 import '../collection.dart';
@@ -206,6 +207,14 @@ class LiveList implements Observable<List<LiveRecord>> {
   final RecordCache _cache;
   final List<LiveRecord> _items = [];
 
+  /// The ONE read-only view of [_items] handed out by [get]/[items]. A cached
+  /// wrapper (not a per-call copy) so the returned list keeps a stable
+  /// identity across events — callers key re-reads on [version], exactly like
+  /// the TS SDK's React binding — while an external `.clear()`/`.sort()`
+  /// throws [UnsupportedError] instead of silently desyncing [_index].
+  late final UnmodifiableListView<LiveRecord> _view =
+      UnmodifiableListView(_items);
+
   /// O(1) id -> record index kept in sync with [_items].
   final Map<String, LiveRecord> _index = {};
   final StreamController<void> _changes = StreamController<void>.broadcast();
@@ -279,14 +288,17 @@ class LiveList implements Observable<List<LiveRecord>> {
   @override
   List<LiveRecord> get() {
     _check();
-    return _items;
+    return _view;
   }
 
-  /// The live items, ordered by the query sort. Alias of [get]; a stable,
-  /// mutated reference (its identity does not change as items move).
+  /// The live items, ordered by the query sort. Alias of [get]; an
+  /// **unmodifiable** view with a stable identity — the same list object
+  /// across events, mutated internally as items move (key re-reads on
+  /// [version]). External mutation (`.clear()`, `.sort()`, …) throws
+  /// [UnsupportedError].
   List<LiveRecord> get items {
     _check();
-    return _items;
+    return _view;
   }
 
   @override

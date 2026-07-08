@@ -232,7 +232,7 @@ post['title'];                            // read-through of a backing field
 post.close();                             // REQUIRED when done
 
 final list = await live.getList(sort: '-created');
-list.items;                               // ordered List<LiveRecord> (alias: list.get())
+list.items;                               // read-only ordered List<LiveRecord> (alias: list.get())
 list.getById('REC123');                   // O(1) membership
 list.close();                             // REQUIRED
 ```
