@@ -21,6 +21,27 @@ import 'realtime.dart';
 import 'senders.dart';
 import 'transport.dart';
 
+/// Fallback for [ZigbaseClient.realtime]'s [RealtimeService.onError] when
+/// the client is not given an `onRealtimeError` callback.
+///
+/// A realtime `error` frame must never be silently dropped just because the
+/// service was built by the facade — so rather than passing no callback at
+/// all (the pre-existing behavior of the `realtime` getter), a client with
+/// no `onRealtimeError` gets this visible default: a `dart:developer` log
+/// entry (shows up in IDE/DevTools consoles), at the `WARNING` level (900)
+/// `logging`-package convention.
+///
+/// Parity note (tracked follow-up): [RealtimeService] invokes `onError` for
+/// EVERY server error frame — including one a pending subscribe already
+/// consumed (rejected) — so this default logs those too. The TS SDK gates
+/// its equivalent `console.warn` fallback on the error NOT having been
+/// consumed by a pending subscribe (`!rejected`); matching that requires a
+/// change in `realtime.dart`, which a concurrent branch owns.
+void _defaultRealtimeErrorLog(Object error) {
+  developer.log('Unhandled realtime error: $error',
+      name: 'zigbase.realtime', level: 900);
+}
+
 /// The official ZigBase Dart client.
 ///
 /// ```dart
@@ -61,22 +82,6 @@ import 'transport.dart';
 /// siblings do not need to be closed individually unless they created their
 /// own [RealtimeService], but calling [close] on one is always safe (it is
 /// idempotent and a no-op on the shared resources).
-/// Fallback used for [ZigbaseClient.realtime]'s [RealtimeService.onError]
-/// when the client is not given an `onRealtimeError` callback.
-///
-/// An unconsumed realtime `error` frame (one with no pending
-/// [RealtimeService.subscribe] to reject) must never be silently dropped —
-/// so rather than passing no callback at all (the pre-existing behavior of
-/// the `realtime` getter), a client with no `onRealtimeError` gets this
-/// visible default: a `dart:developer` log entry (shows up in IDE/DevTools
-/// consoles), at the `WARNING` level (900) `logging`-package convention.
-/// Exposed (not part of the `zigbase_client` barrel export) so it can be
-/// exercised directly in tests; pass `onRealtimeError` to replace it.
-void defaultRealtimeErrorLog(Object error) {
-  developer.log('Unhandled realtime error: $error',
-      name: 'zigbase.realtime', level: 900);
-}
-
 class ZigbaseClient {
   /// The normalized base URL (no trailing slash).
   final String baseUrl;
@@ -250,16 +255,19 @@ class ZigbaseClient {
   /// [RealtimeService] this client ever creates).
   ///
   /// The service's [RealtimeService.onError] is the constructor's
-  /// `onRealtimeError`, or (when omitted) [defaultRealtimeErrorLog] — an
-  /// unconsumed realtime error is never silently dropped just because this
-  /// getter, rather than direct [RealtimeService] construction, built it.
+  /// `onRealtimeError`, or (when omitted) a private `dart:developer`-logging
+  /// default — so a realtime error is never silently dropped just because
+  /// this getter, rather than direct [RealtimeService] construction, built
+  /// it. Either way the callback fires for **every** server error frame,
+  /// including one also delivered to (and rejecting) a pending
+  /// [RealtimeService.subscribe] call.
   RealtimeService get realtime {
     _checkNotClosed();
     return _realtimeService ??= RealtimeService(
       baseUrl: baseUrl,
       authStore: authStore,
       connector: _webSocketConnector,
-      onError: _onRealtimeError ?? defaultRealtimeErrorLog,
+      onError: _onRealtimeError ?? _defaultRealtimeErrorLog,
     );
   }
 

@@ -217,8 +217,10 @@ backoff, and re-auths from the auth store on login/logout/refresh. Anonymous sub
 require a `@public` view rule on the collection (server-enforced). There is no live-store tier
 yet (see [docs/dart-sdk.md](../../docs/dart-sdk.md) → Not yet).
 
-Pass `onRealtimeError` to the client to catch a realtime error with no pending subscribe to
-reject it (e.g. a rejection delivered after other callbacks already subscribed successfully):
+Pass `onRealtimeError` to the client to observe server-side realtime errors. The callback
+fires for **every** server error frame — including errors also delivered to (and rejecting)
+a pending `subscribe` call — so treat it as a logging/telemetry hook, not a replacement for
+handling a rejected subscribe `Future`:
 
 ```dart
 final zb = ZigbaseClient(
@@ -227,7 +229,7 @@ final zb = ZigbaseClient(
 );
 ```
 
-An unconsumed error is never silently dropped: when `onRealtimeError` is omitted, the client
+A realtime error is never silently dropped: when `onRealtimeError` is omitted, the client
 falls back to a visible `dart:developer` log entry instead of doing nothing.
 
 ## Error handling

@@ -454,15 +454,16 @@ final zb = ZigbaseClient(
 );
 ```
 
-Pass `onRealtimeError` to the client constructor to receive every realtime error that no
-pending `subscribe`/`subscribeTopic` call is around to reject — e.g. a server-side rejection
-of an anonymous subscribe to a non-public collection, delivered after the subscribe already
-succeeded for other callbacks, or a socket-level error with no in-flight subscribe at all.
-**An unconsumed error is never silently dropped:** when `onRealtimeError` is omitted, the
-client falls back to logging the error visibly via `dart:developer` (shows up in IDE/DevTools
-consoles) — the same posture as the TypeScript SDK's `console.warn` fallback. Constructing a
-`RealtimeService` directly (bypassing the client) still defaults its own `onError` to `null`
-(a real no-op) if you don't pass one.
+Pass `onRealtimeError` to the client constructor to observe server-side realtime errors —
+e.g. a server rejection of an anonymous subscribe to a non-public collection, or a
+socket-level error with no in-flight subscribe at all. The callback fires for **every**
+server error frame, *including* errors also delivered to (and rejecting) a pending
+`subscribe`/`subscribeTopic` call — treat it as a logging/telemetry hook, not a replacement
+for handling a rejected subscribe `Future`. **A realtime error is never silently dropped:**
+when `onRealtimeError` is omitted, the client falls back to logging the error visibly via
+`dart:developer` (shows up in IDE/DevTools consoles). Constructing a `RealtimeService`
+directly (bypassing the client) still defaults its own `onError` to `null` (a real no-op)
+if you don't pass one.
 
 ### As a `Stream`
 
@@ -546,6 +547,9 @@ For a non-GET request, `body` is **always** JSON-encoded (`Content-Type: applica
 unless it contains an `http.MultipartFile`, matching the TypeScript SDK's
 `JSON.stringify`-everything behavior byte-for-byte — this applies even to a bare scalar, so
 `body: 'hi'` is sent as the quoted JSON string literal `"hi"`, never as raw unquoted text.
+A `DateTime` nested anywhere in the body serializes as a millisecond-clamped UTC ISO-8601
+string (as JS `JSON.stringify` does for a `Date`); any other non-encodable value throws an
+`ArgumentError`.
 
 When you need the **raw `http.Response`** (binary/text bodies, response headers, custom
 status handling), use `zb.rawRequest(method, path, {...})`. It passes through

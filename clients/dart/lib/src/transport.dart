@@ -27,6 +27,41 @@ const Duration _maxBackoff = Duration(seconds: 30);
 
 Future<void> _defaultSleep(Duration d) => Future<void>.delayed(d);
 
+/// Formats a [DateTime] as a UTC ISO-8601 string clamped to millisecond
+/// precision, matching JS `Date.prototype.toJSON` byte-for-byte — the same
+/// (deliberately duplicated, library-private) helper as in
+/// `lib/src/records.dart` and `lib/src/query.dart`; see the latter for the
+/// full rationale. Kept private per file because every `lib/src` module is
+/// barrel-exported, so a shared non-underscore helper would expand the
+/// public API.
+String _formatDateTime(DateTime value) {
+  final utc = value.toUtc();
+  final clamped = utc.microsecond == 0
+      ? utc
+      : utc.subtract(Duration(microseconds: utc.microsecond));
+  return clamped.toIso8601String();
+}
+
+/// JSON-encode a request body the way JS `JSON.stringify` would: a nested
+/// [DateTime] serializes via its `toJSON`-equivalent (ms-clamped UTC
+/// ISO-8601). Anything else non-encodable is rejected loudly as an
+/// [ArgumentError] naming the offending runtime type — the same posture as
+/// `encodeMultipart` in `lib/src/records.dart` (TS would silently emit `{}`
+/// garbage for such values).
+String _jsonEncodeBody(Object? body) {
+  try {
+    return jsonEncode(body,
+        toEncodable: (Object? nested) =>
+            nested is DateTime ? _formatDateTime(nested) : nested);
+  } on JsonUnsupportedObjectError catch (e) {
+    throw ArgumentError.value(
+        e.unsupportedObject,
+        'body',
+        'send: body contains a value that is cyclic or not JSON-encodable '
+            '(${e.unsupportedObject.runtimeType})');
+  }
+}
+
 /// One caller-supplied file part, buffered to bytes so a fresh (unfinalized)
 /// [http.MultipartFile] can be rebuilt for every retry attempt. package:http
 /// marks a MultipartFile finalized after its first send and throws on reuse,
@@ -122,12 +157,16 @@ class Transport {
     final params = <String, List<String>>{};
     parsed.queryParametersAll
         .forEach((key, values) => params[key] = List<String>.from(values));
+    var added = false;
     for (final entry in query.entries) {
       final value = entry.value;
       if (value == null) continue;
       params.putIfAbsent(entry.key, () => <String>[]).add(value.toString());
+      added = true;
     }
-    if (params.isEmpty) return parsed;
+    // Nothing added (all values null): return the parsed Uri untouched
+    // instead of rebuilding an identical one.
+    if (!added) return parsed;
     final qp = <String, dynamic>{
       for (final entry in params.entries)
         entry.key: entry.value.length == 1 ? entry.value.first : entry.value,
@@ -292,10 +331,12 @@ class Transport {
       // bare String/num/bool — matching the TS transport, which always
       // `JSON.stringify`s a non-FormData body. A Dart String therefore
       // becomes a quoted JSON string literal (`"hi"`, not `hi`) with
-      // `Content-Type: application/json`, not sent raw.
+      // `Content-Type: application/json`, not sent raw. A nested [DateTime]
+      // serializes as a ms-clamped UTC ISO-8601 string (see
+      // [_jsonEncodeBody]); other non-encodables throw [ArgumentError].
       final req = http.Request(method, url)..headers.addAll(hdrs);
       req.headers['content-type'] = 'application/json';
-      req.body = jsonEncode(body);
+      req.body = _jsonEncodeBody(body);
       request = req;
     } else {
       request = http.Request(method, url)..headers.addAll(hdrs);

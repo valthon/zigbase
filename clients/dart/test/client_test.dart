@@ -129,9 +129,27 @@ void main() {
       expect(errors, contains('boom'));
     });
 
-    test('defaultRealtimeErrorLog does not throw (the facade default)', () {
-      expect(
-          () => defaultRealtimeErrorLog(StateError('boom')), returnsNormally);
+    test(
+        'the default (no onRealtimeError) logging fallback handles an '
+        'unconsumed error frame without throwing', () async {
+      final factory = FakeSocketFactory();
+      final client = ZigbaseClient(
+        'http://api.test',
+        webSocketConnector: factory.connect,
+      );
+      addTearDown(client.close);
+
+      final subFut = client.realtime.subscribe('posts', (_) {});
+      await pumpEventQueue();
+      final ws = factory.last;
+      ws.push({'type': 'ack', 'action': 'subscribe', 'topic': 'posts'});
+      await subFut;
+
+      // With no onRealtimeError, the facade's private dart:developer-logging
+      // default consumes the unhandled error frame; the frame must not
+      // surface as an unhandled async error (the test would fail loudly).
+      ws.push({'type': 'error', 'message': 'boom'});
+      await pumpEventQueue();
     });
 
     test('withAccount siblings inherit the parent\'s onRealtimeError',

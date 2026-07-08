@@ -174,6 +174,40 @@ void main() {
       expect(seen.body, '5');
     });
 
+    test(
+        'a DateTime nested in a JSON body encodes as a ms-clamped UTC '
+        'ISO-8601 string (no JsonUnsupportedObjectError)', () async {
+      late http.Request seen;
+      final t = _transport(MockClient((req) async {
+        seen = req;
+        return http.Response('{}', 200);
+      }));
+      final when = DateTime.utc(2026, 7, 8, 12, 34, 56, 789, 654);
+      await t.send('/api/x', method: 'POST', body: {
+        'title': 'hi',
+        'publishedAt': when,
+        'nested': {
+          'times': [when],
+        },
+      });
+      expect(seen.headers['content-type'], contains('application/json'));
+      expect(
+          seen.body,
+          '{"title":"hi","publishedAt":"2026-07-08T12:34:56.789Z",'
+          '"nested":{"times":["2026-07-08T12:34:56.789Z"]}}');
+    });
+
+    test(
+        'a non-encodable object in a JSON body throws ArgumentError, not '
+        'JsonUnsupportedObjectError', () async {
+      final t = _transport(MockClient((_) async => http.Response('{}', 200)));
+      await expectLater(
+        t.send('/api/x', method: 'POST', body: {'bad': Object()}),
+        throwsA(isA<ArgumentError>()
+            .having((e) => e.message, 'message', contains('Object'))),
+      );
+    });
+
     test('GET does not send a body even if one is provided', () async {
       late http.Request seen;
       final t = _transport(MockClient((req) async {
