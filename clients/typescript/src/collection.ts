@@ -81,6 +81,11 @@ export class CollectionService {
       method: "POST",
       body,
       skipAuth: path === "/auth-with-password",
+      // The refresh request must carry the bearer header (so no skipAuth) but
+      // is exempt from the transport's single-flight 401-refresh branch: a 401
+      // here propagates instead of awaiting/starting a refresh (self-await
+      // deadlock / unbounded recursion otherwise).
+      isRefreshCall: path === "/auth-refresh",
     });
     this.authStore.save(res.token, res.record);
     return res;
@@ -380,6 +385,7 @@ export class CollectionService {
     signal?: AbortSignal;
     requestKey?: string;
   } = {}): AsyncIterableIterator<T> {
+    let usedCursor: string | undefined;
     let page: CursorPage<T> = await this.getPage<T>({
       limit: opts.batch ?? 100,
       filter: opts.filter,
@@ -393,8 +399,22 @@ export class CollectionService {
     for (;;) {
       for (const item of page.items) yield item;
       if (!page.hasNext || !page.nextCursor) return;
+      // Guard against a misbehaving server that cannot make progress: a page
+      // that still claims `hasNext` but carries no items, or a `nextCursor`
+      // identical to the one we just used, would loop forever. Fail loudly
+      // rather than spin.
+      if (page.items.length === 0 || page.nextCursor === usedCursor) {
+        throw new ZigbaseError({
+          status: 0,
+          message:
+            "iterate(): the server returned a non-advancing cursor page " +
+            "(empty page or a repeated cursor); aborting to avoid an infinite loop.",
+          url: this.recordsBase(),
+        });
+      }
+      usedCursor = page.nextCursor;
       page = await this.getPage<T>({
-        cursor: page.nextCursor,
+        cursor: usedCursor,
         limit: opts.batch ?? 100,
         filter: opts.filter,
         sort: opts.sort,

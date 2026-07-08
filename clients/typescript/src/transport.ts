@@ -16,6 +16,15 @@ export interface RequestOptions {
    * request rejects with a DOMException whose `name` is `"AbortError"`.
    */
   requestKey?: string;
+  /**
+   * Internal: marks the auth-refresh request itself (`CollectionService.authRequest`
+   * sets it for `/auth-refresh`). A 401 from this request propagates instead of
+   * entering the single-flight refresh branch — awaiting there would mean awaiting
+   * its own refresh (deadlock), and starting another would recurse without bound.
+   * It cannot ride on `skipAuth` because auth-refresh must still send the bearer
+   * header.
+   */
+  isRefreshCall?: boolean;
 }
 
 export interface TransportConfig {
@@ -37,7 +46,27 @@ export class Transport {
   /** In-flight controllers keyed by `requestKey`, for opt-in auto-cancellation. */
   private readonly inflight = new Map<string, AbortController>();
 
+  /** The single-flight 401 refresh. The first 401 starts it; every 401 that
+   *  lands while it runs awaits the SAME promise and then retries its request
+   *  once (still bounded per exchange by `didRefresh`), so a parallel burst of
+   *  expired-token requests all succeed after exactly one refresh. Cleared in a
+   *  `finally` so a later expiry starts a fresh refresh. The refresh endpoint's
+   *  own request never enters this path (see `RequestOptions.isRefreshCall`) —
+   *  its 401 propagates, which both avoids a self-await deadlock and keeps a
+   *  persistently-401ing refresh from recursing without bound. */
+  private refreshInFlight: Promise<void> | null = null;
+
   constructor(private readonly cfg: TransportConfig) {}
+
+  /** Join (or start) the single-flight refresh. */
+  private awaitRefresh(): Promise<void> {
+    this.refreshInFlight ??= Promise.resolve()
+      .then(() => this.cfg.refresh!())
+      .finally(() => {
+        this.refreshInFlight = null;
+      });
+    return this.refreshInFlight;
+  }
 
   buildUrl(path: string, query?: Record<string, QueryValue>): string {
     const base = this.cfg.baseUrl.replace(/\/+$/, "");
@@ -154,14 +183,26 @@ export class Transport {
         return (text ? JSON.parse(text) : undefined) as T;
       }
 
-      // One-shot auto-refresh on 401.
-      if (res.status === 401 && this.cfg.autoRefresh && this.cfg.refresh && !didRefresh && !opts.skipAuth) {
+      // Single-flight auto-refresh on 401 (one retry per exchange): join the
+      // in-flight refresh if one is running, else start it, then retry with
+      // the fresh token. A failed refresh falls through to this request's
+      // original 401. The refresh endpoint's own request is exempt via
+      // `isRefreshCall` — its 401 propagates (no self-await deadlock, no
+      // unbounded recursion).
+      if (
+        res.status === 401 &&
+        this.cfg.autoRefresh &&
+        this.cfg.refresh &&
+        !didRefresh &&
+        !opts.skipAuth &&
+        !opts.isRefreshCall
+      ) {
         didRefresh = true;
         try {
-          await this.cfg.refresh();
+          await this.awaitRefresh();
           continue;
         } catch {
-          // fall through to error
+          // refresh failed — fall through to the original 401 error
         }
       }
 
