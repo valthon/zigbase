@@ -729,6 +729,12 @@ final cursorPage = await zb.posts.getPage(limit: 20);        // TypedCursorPage<
 await for (final p in zb.posts.iterate()) { /* … */ }        // Stream<Post>
 ```
 
+**Identifier mapping.** A schema name that is a Dart reserved word (`default`, `class`, `in`, …)
+or would shadow a generated/`Object` member (`expand`, `toMap`, `toString`, a collection named
+`raw`, …) gets a trailing `_` appended on the **Dart side only** — field `default` becomes member
+`default_`; the wire key, filter path, and `toMap()` key stay `default`. Two schema names that
+would sanitize to the same Dart identifier are a generation-time error naming both.
+
 ### Typed filters — the fluent builder
 
 `where:` takes a callback over a generated `<Rec>Fields` builder and compiles to a server filter
@@ -779,7 +785,9 @@ final url = zb.posts.fileUrl(post, field: api.PostFileField.cover, token: token)
 ZigBase `number` fields can be integer or fixed-point. To preserve full i64 precision they travel
 as **decimal strings** on the wire; the typed layer coerces both directions — int fields surface
 as Dart `int`, fixed fields as `double`, and `Create`/`Update.toMap()` serializes them back to
-decimal strings. Plain float fields are `double` and pass through untouched.
+decimal strings. Plain float fields are `double` and pass through untouched. An int-mode field
+receiving a value with a fractional part (schema drift) throws a `FormatException` rather than
+silently truncating.
 
 ### Scope
 

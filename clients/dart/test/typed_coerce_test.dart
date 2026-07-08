@@ -4,11 +4,21 @@ import 'package:zigbase_client/typed.dart';
 void main() {
   group('coerceInt', () {
     test('from JSON number', () => expect(coerceInt(42), 42));
-    test('from double', () => expect(coerceInt(42.0), 42));
+    test('from integral double', () => expect(coerceInt(42.0), 42));
     test('from decimal-string wire form', () => expect(coerceInt('42'), 42));
+    test('from integral decimal string', () => expect(coerceInt('42.0'), 42));
     test('empty string → fallback', () => expect(coerceInt('', 7), 7));
     test('null → fallback', () => expect(coerceInt(null), 0));
     test('garbage → fallback', () => expect(coerceInt('abc', 3), 3));
+    test('fractional string throws (schema drift, no silent truncation)', () {
+      expect(() => coerceInt('9.99'), throwsFormatException);
+    });
+    test('fractional double throws', () {
+      expect(() => coerceInt(9.99), throwsFormatException);
+    });
+    test('coerceIntList propagates the throw', () {
+      expect(() => coerceIntList(['1', '2.5']), throwsFormatException);
+    });
   });
 
   group('coerceDouble', () {

@@ -95,14 +95,26 @@ class CollectionMeta {
 // ---------------------------------------------------------------------------
 
 /// Coerce a wire value (a JSON number, or the decimal-string form used for
-/// int/fixed fields) to an [int]. Returns `fallback` for null/empty/unparseable.
+/// int-mode fields) to an [int]. Returns `fallback` for null/empty/unparseable
+/// values, but **throws [FormatException] on a numeric value with a fractional
+/// part** (`"9.99"`, `9.99`): the server always sends integers for int-mode
+/// fields, so a non-integer number means the field is not actually int-mode —
+/// silent truncation would hide the schema drift.
 int coerceInt(Object? v, [int fallback = 0]) {
   if (v is int) return v;
-  if (v is double) return v.toInt();
+  if (v is double) {
+    if (v == v.truncateToDouble()) return v.toInt();
+    throw FormatException('int-mode field received a non-integer value', v);
+  }
   if (v is String) {
     if (v.isEmpty) return fallback;
+    final i = int.tryParse(v);
+    if (i != null) return i;
     final n = num.tryParse(v);
-    if (n != null) return n.toInt();
+    if (n != null) {
+      if (n == n.truncate()) return n.toInt(); // e.g. "42.0"
+      throw FormatException('int-mode field received a non-integer value', v);
+    }
   }
   return fallback;
 }

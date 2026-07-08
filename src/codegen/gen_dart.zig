@@ -58,6 +58,10 @@ pub fn generate(
         \\// Regenerate with `zig build gen-dating-dart-client`, then `dart format` it
         \\// with the consuming package's language version (resolved from the package
         \\// config; without one, pass --language-version — style differs by version).
+        \\//
+        \\// Identifier mapping: a schema name that is a Dart reserved word or would
+        \\// shadow a generated/Object member gets a trailing `_` on the DART side
+        \\// only (field `default` -> member `default_`); wire keys are unchanged.
         \\// ignore_for_file: non_constant_identifier_names, constant_identifier_names, unused_element, unused_import, unnecessary_import, unused_field, prefer_const_constructors
         \\
         \\import 'package:zigbase_client/zigbase_client.dart';
@@ -125,4 +129,58 @@ test "generate emits a valid-looking Dart client for a mini blog" {
     try std.testing.expect(std.mem.indexOf(u8, out, "enum PostFileField {") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "ZbClient createClient(") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "import 'package:http/http.dart'") != null);
+}
+
+test "Dart reserved words and member collisions are sanitized (wire keys unchanged)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "users", .type = .auth, .fields = &.{} },
+        // `raw` collides with the ZbClient member; fields named `default`/`in`
+        // are Dart keywords; `expand` collides with the generated record member;
+        // select value `default` is a keyword enum member.
+        .{ .id = "", .name = "raw", .fields = &.{
+            .{ .id = "", .name = "default", .required = true, .options = .{ .text = .{} } },
+            .{ .id = "", .name = "in", .options = .{ .number = .{ .mode = .int } } },
+            .{ .id = "", .name = "expand", .options = .{ .text = .{} } },
+            .{ .id = "", .name = "kind", .options = .{ .select = .{ .values = &.{ "default", "custom" }, .maxSelect = 1 } } },
+            .{ .id = "", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } },
+        } },
+    };
+    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api");
+    // Record members: keyword-sanitized Dart identifier, wire key untouched.
+    try std.testing.expect(std.mem.indexOf(u8, out, "default_ = coerceString(r['default'])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "in_ = coerceInt(r['in'])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "expand_ = coerceString(r['expand'])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "final String default_;") != null);
+    // No unsanitized keyword member leaked.
+    try std.testing.expect(std.mem.indexOf(u8, out, "final String default;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "final int in;") == null);
+    // Payload: required ctor param + toMap keeps the wire key.
+    try std.testing.expect(std.mem.indexOf(u8, out, "required this.default_,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "'default': default_,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "'in': encodeInt(in_),") != null);
+    // Fluent getter sanitized; filter path stays wire.
+    try std.testing.expect(std.mem.indexOf(u8, out, "get default_ => StringFieldExpr('${_p}default')") != null);
+    // Select enum member: keyword value sanitized, wire string unchanged.
+    try std.testing.expect(std.mem.indexOf(u8, out, "default_('default')") != null);
+    // Client accessor: collection `raw` -> accessor `raw_` (ZbClient.raw reserved).
+    try std.testing.expect(std.mem.indexOf(u8, out, "late final RawService raw_ = RawService(raw);") != null);
+}
+
+test "two schema names mapping to one Dart identifier is a generation error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "posts", .fields = &.{
+            .{ .id = "", .name = "default", .options = .{ .text = .{} } },
+            .{ .id = "", .name = "default_", .options = .{ .text = .{} } },
+        } },
+    };
+    try std.testing.expectError(
+        error.DartIdentCollision,
+        generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api"),
+    );
 }

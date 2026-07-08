@@ -44,6 +44,85 @@ fn isAuthSynthesized(name: []const u8) bool {
         std.mem.eql(u8, name, "verified");
 }
 
+// ---------------------------------------------------------------------------
+// Dart identifier sanitizer
+//
+// TS keywords are legal as member names, so the TS emitter never sanitizes.
+// Dart's are NOT: a schema field named `default`/`class`/`in` would emit
+// `final String default;` and the generated file would not compile. The rule:
+// the DART identifier gets a trailing `_` appended while it collides (with a
+// reserved word, an Object member, or a context-reserved member); the WIRE key
+// is never changed — the runtime reads/writes by wire key, so only the
+// Dart-side name shifts (`default` -> `default_`, wire stays 'default').
+// ---------------------------------------------------------------------------
+
+/// Dart reserved words that cannot be used as identifiers (the strict reserved
+/// set, plus `await`/`yield` which are reserved inside async/generator bodies
+/// — generated members may be referenced from either).
+fn isDartKeyword(name: []const u8) bool {
+    const kws = [_][]const u8{
+        "assert",   "await",   "break",  "case",  "catch",  "class",   "const",
+        "continue", "default", "do",     "else",  "enum",   "extends", "false",
+        "final",    "finally", "for",    "if",    "in",     "is",      "new",
+        "null",     "rethrow", "return", "super", "switch", "this",    "throw",
+        "true",     "try",     "var",    "void",  "while",  "with",    "yield",
+    };
+    for (kws) |k| if (std.mem.eql(u8, name, k)) return true;
+    return false;
+}
+
+/// Members every Dart class inherits from Object — a schema name mapping onto
+/// one of these would conflict with the inherited member.
+fn isObjectMember(name: []const u8) bool {
+    const ms = [_][]const u8{ "toString", "hashCode", "runtimeType", "noSuchMethod" };
+    for (ms) |m| if (std.mem.eql(u8, name, m)) return true;
+    return false;
+}
+
+fn inSet(name: []const u8, set: []const []const u8) bool {
+    for (set) |s| if (std.mem.eql(u8, name, s)) return true;
+    return false;
+}
+
+/// Context-reserved member sets (the generated class's own members that a
+/// schema name must not shadow).
+const record_reserved: []const []const u8 = &.{ "expand", "fromRecord", "fromJson" };
+const payload_reserved: []const []const u8 = &.{"toMap"};
+const enum_reserved: []const []const u8 = &.{ "wire", "fromWire", "values", "index", "name" };
+const client_reserved: []const []const u8 = &.{ "raw", "owned", "close", "send", "authStore" };
+
+/// Map a schema name to a legal Dart member identifier for the given context.
+/// Appends `_` until the name no longer collides. The wire key is NEVER
+/// sanitized — callers keep using the original name for r['…'] / toMap keys /
+/// filter paths.
+fn memberIdent(alloc: std.mem.Allocator, name: []const u8, reserved: []const []const u8) ![]const u8 {
+    var out = name;
+    while (isDartKeyword(out) or isObjectMember(out) or inSet(out, reserved)) {
+        out = try std.fmt.allocPrint(alloc, "{s}_", .{out});
+    }
+    return out;
+}
+
+/// Generation-time duplicate-identifier check: two distinct schema names that
+/// sanitize to the same Dart identifier (e.g. fields `default` and `default_`)
+/// would emit a duplicate member. Errors with the colliding names.
+fn checkDuplicateIdents(idents: []const []const u8, names: []const []const u8, scope: []const u8) !void {
+    for (idents, 0..) |a, i| {
+        for (idents[i + 1 ..], i + 1..) |b, j| {
+            if (std.mem.eql(u8, a, b)) {
+                // warn (not err): the returned error is the failure signal and the
+                // CLI layer logs err at top level; std.log.err inside would also
+                // fail the Zig test runner in the expectError coverage test.
+                std.log.warn(
+                    "gen_dart: schema names '{s}' and '{s}' both map to Dart identifier '{s}' in {s} — rename one of them",
+                    .{ names[i], names[j], a, scope },
+                );
+                return error.DartIdentCollision;
+            }
+        }
+    }
+}
+
 fn collectionExists(cols: []const schema.Collection, name: []const u8) bool {
     for (cols) |c| if (std.mem.eql(u8, c.name, name)) return true;
     return false;
@@ -123,11 +202,11 @@ pub fn emitSelectEnums(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !v
 }
 
 /// Emit one enum member `<ident>('<wire>')`. The member identifier is the wire
-/// value when it is a valid Dart identifier; otherwise a positional `v<i>`.
+/// value when it is a valid Dart identifier (keyword-sanitized: `default` ->
+/// `default_`); otherwise a positional `v<i>`. The wire string is unchanged.
 fn emitEnumMember(alloc: std.mem.Allocator, w: *W, value: []const u8, i: usize) !void {
-    const valid = schema.isValidIdentifier(value);
-    if (valid) {
-        try put(alloc, w, value);
+    if (schema.isValidIdentifier(value)) {
+        try put(alloc, w, try memberIdent(alloc, value, enum_reserved));
     } else {
         try putf(alloc, w, "v{d}", .{i});
     }
@@ -173,12 +252,21 @@ pub fn emitRecord(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
     const fields = try recordFields(alloc, c);
     const has_rel = hasResolvableRelations(cols, c);
 
+    // Sanitize member identifiers (wire keys stay the schema names) + dedup check.
+    const idents = try alloc.alloc([]const u8, fields.len);
+    const names = try alloc.alloc([]const u8, fields.len);
+    for (fields, 0..) |f, i| {
+        idents[i] = try memberIdent(alloc, f.name, record_reserved);
+        names[i] = f.name;
+    }
+    try checkDuplicateIdents(idents, names, try std.fmt.allocPrint(alloc, "record class {s} (collection '{s}')", .{ rec, c.name }));
+
     // Constructor with an initializer list from the ZbRecord.
     try putf(alloc, w, "class {s} {{\n", .{rec});
     try putf(alloc, w, "  {s}.fromRecord(ZbRecord r)\n      : ", .{rec});
     for (fields, 0..) |f, i| {
         if (i != 0) try put(alloc, w, ",\n        ");
-        try putf(alloc, w, "{s} = {s}", .{ f.name, try coerceExpr(alloc, c.name, f) });
+        try putf(alloc, w, "{s} = {s}", .{ idents[i], try coerceExpr(alloc, c.name, f) });
     }
     if (has_rel) {
         const ex = try ident.expandName(alloc, c.name);
@@ -188,9 +276,9 @@ pub fn emitRecord(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
     // Convenience JSON factory.
     try putf(alloc, w, "  factory {s}.fromJson(Map<String, dynamic> json) => {s}.fromRecord(ZbRecord(json));\n\n", .{ rec, rec });
     // Fields.
-    for (fields) |f| {
+    for (fields, 0..) |f, i| {
         const ty = try dt.dartRecordTypeOf(alloc, c.name, f);
-        try putf(alloc, w, "  final {s} {s};\n", .{ ty, f.name });
+        try putf(alloc, w, "  final {s} {s};\n", .{ ty, idents[i] });
     }
     if (has_rel) {
         const ex = try ident.expandName(alloc, c.name);
@@ -203,6 +291,7 @@ pub fn emitRecord(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
 
 fn emitExpand(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, c: schema.Collection) !void {
     const ex = try ident.expandName(alloc, c.name);
+    const expand_reserved: []const []const u8 = &.{"fromRecord"};
     try putf(alloc, w, "class {s} {{\n  {s}.fromRecord(ZbRecord r)\n      : ", .{ ex, ex });
     var first = true;
     for (c.fields) |f| {
@@ -210,12 +299,13 @@ fn emitExpand(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, 
         const target = f.options.relation.targetCollectionId;
         if (!collectionExists(cols, target)) continue;
         const trec = try ident.recordName(alloc, target);
+        const mid = try memberIdent(alloc, f.name, expand_reserved);
         if (!first) try put(alloc, w, ",\n        ");
         first = false;
         if (f.isMultiValue()) {
-            try putf(alloc, w, "{s} = expandMany<{s}>(r, '{s}', {s}.fromRecord)", .{ f.name, trec, f.name, trec });
+            try putf(alloc, w, "{s} = expandMany<{s}>(r, '{s}', {s}.fromRecord)", .{ mid, trec, f.name, trec });
         } else {
-            try putf(alloc, w, "{s} = expandOne<{s}>(r, '{s}', {s}.fromRecord)", .{ f.name, trec, f.name, trec });
+            try putf(alloc, w, "{s} = expandOne<{s}>(r, '{s}', {s}.fromRecord)", .{ mid, trec, f.name, trec });
         }
     }
     try put(alloc, w, ";\n\n");
@@ -224,10 +314,11 @@ fn emitExpand(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, 
         const target = f.options.relation.targetCollectionId;
         if (!collectionExists(cols, target)) continue;
         const trec = try ident.recordName(alloc, target);
+        const mid = try memberIdent(alloc, f.name, expand_reserved);
         if (f.isMultiValue()) {
-            try putf(alloc, w, "  final List<{s}> {s};\n", .{ trec, f.name });
+            try putf(alloc, w, "  final List<{s}> {s};\n", .{ trec, mid });
         } else {
-            try putf(alloc, w, "  final {s}? {s};\n", .{ trec, f.name });
+            try putf(alloc, w, "  final {s}? {s};\n", .{ trec, mid });
         }
     }
     try put(alloc, w, "}\n\n");
@@ -253,41 +344,38 @@ fn payloadFieldType(alloc: std.mem.Allocator, col: []const u8, f: schema.Field) 
     return dt.dartRecordTypeOf(alloc, col, f);
 }
 
-/// Emit the `'<name>': <serialization>` map entry for one payload field, guarded
-/// by a null-check when `optional`.
-fn emitToMapEntry(alloc: std.mem.Allocator, w: *W, f: schema.Field, optional: bool) !void {
-    const name = f.name;
-    // The serialized value expression (assuming the field is in scope, non-null
-    // when guarded).
+/// Emit the `'<wire>': <serialization>` map entry for one payload field, guarded
+/// by a null-check when `optional`. `mid` is the (sanitized) Dart member the
+/// value expression references; the map key is always the wire name.
+fn emitToMapEntry(alloc: std.mem.Allocator, w: *W, f: schema.Field, mid: []const u8, optional: bool) !void {
+    // The serialized value expression (assuming the member is in scope,
+    // non-null when guarded).
     var val: []const u8 = undefined;
     switch (dt.kindOf(f)) {
-        .integer => val = if (optional)
-            try std.fmt.allocPrint(alloc, "encodeInt({s})", .{name})
-        else
-            try std.fmt.allocPrint(alloc, "encodeInt({s})", .{name}),
+        .integer => val = try std.fmt.allocPrint(alloc, "encodeInt({s})", .{mid}),
         .double_ => {
             if (f.options == .number and f.options.number.mode == .fixed) {
                 const scale = f.options.number.scale orelse 0;
-                val = try std.fmt.allocPrint(alloc, "encodeFixed({s}, {d})", .{ name, scale });
+                val = try std.fmt.allocPrint(alloc, "encodeFixed({s}, {d})", .{ mid, scale });
             } else {
-                val = name; // float: send the double as-is
+                val = mid; // float: send the double as-is
             }
         },
         .select_enum => {
             if (f.isMultiValue()) {
-                val = try std.fmt.allocPrint(alloc, "{s}.map((e) => e.wire).toList()", .{name});
+                val = try std.fmt.allocPrint(alloc, "{s}.map((e) => e.wire).toList()", .{mid});
             } else if (optional) {
-                val = try std.fmt.allocPrint(alloc, "{s}!.wire", .{name});
+                val = try std.fmt.allocPrint(alloc, "{s}!.wire", .{mid});
             } else {
-                val = try std.fmt.allocPrint(alloc, "{s}.wire", .{name});
+                val = try std.fmt.allocPrint(alloc, "{s}.wire", .{mid});
             }
         },
-        else => val = name, // string/relation/bool/json/file -> pass through
+        else => val = mid, // string/relation/bool/json/file -> pass through
     }
     if (optional) {
-        try putf(alloc, w, "        if ({s} != null) '{s}': {s},\n", .{ name, name, val });
+        try putf(alloc, w, "        if ({s} != null) '{s}': {s},\n", .{ mid, f.name, val });
     } else {
-        try putf(alloc, w, "        '{s}': {s},\n", .{ name, val });
+        try putf(alloc, w, "        '{s}': {s},\n", .{ f.name, val });
     }
 }
 
@@ -303,12 +391,12 @@ pub fn emitCreate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     for (c.fields) |f| {
         if (f.hidden or isReadOnlySystem(f.name) or !f.required) continue;
         if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
-        try putf(alloc, w, "    required this.{s},\n", .{f.name});
+        try putf(alloc, w, "    required this.{s},\n", .{try memberIdent(alloc, f.name, payload_reserved)});
     }
     for (c.fields) |f| {
         if (f.hidden or isReadOnlySystem(f.name) or f.required) continue;
         if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
-        try putf(alloc, w, "    this.{s},\n", .{f.name});
+        try putf(alloc, w, "    this.{s},\n", .{try memberIdent(alloc, f.name, payload_reserved)});
     }
     try put(alloc, w, "  });\n\n");
     // Fields.
@@ -320,7 +408,7 @@ pub fn emitCreate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
         if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
         const ty = try payloadFieldType(alloc, c.name, f);
         const optional = !f.required;
-        try putf(alloc, w, "  final {s}{s} {s};\n", .{ ty, if (optional) "?" else "", f.name });
+        try putf(alloc, w, "  final {s}{s} {s};\n", .{ ty, if (optional) "?" else "", try memberIdent(alloc, f.name, payload_reserved) });
     }
     // toMap.
     try put(alloc, w, "\n  Map<String, dynamic> toMap() => {\n");
@@ -330,7 +418,7 @@ pub fn emitCreate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     for (c.fields) |f| {
         if (f.hidden or isReadOnlySystem(f.name)) continue;
         if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
-        try emitToMapEntry(alloc, w, f, !f.required);
+        try emitToMapEntry(alloc, w, f, try memberIdent(alloc, f.name, payload_reserved), !f.required);
     }
     try put(alloc, w, "      };\n}\n\n");
 }
@@ -343,7 +431,7 @@ pub fn emitUpdate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     for (c.fields) |f| {
         if (f.hidden or isReadOnlySystem(f.name)) continue;
         if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
-        try putf(alloc, w, "    this.{s},\n", .{f.name});
+        try putf(alloc, w, "    this.{s},\n", .{try memberIdent(alloc, f.name, payload_reserved)});
     }
     try put(alloc, w, "  });\n\n");
     if (c.type == .auth) try put(alloc, w, "  final String? email;\n");
@@ -351,14 +439,14 @@ pub fn emitUpdate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
         if (f.hidden or isReadOnlySystem(f.name)) continue;
         if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
         const ty = try payloadFieldType(alloc, c.name, f);
-        try putf(alloc, w, "  final {s}? {s};\n", .{ ty, f.name });
+        try putf(alloc, w, "  final {s}? {s};\n", .{ ty, try memberIdent(alloc, f.name, payload_reserved) });
     }
     try put(alloc, w, "\n  Map<String, dynamic> toMap() => {\n");
     if (c.type == .auth) try put(alloc, w, "        if (email != null) 'email': email,\n");
     for (c.fields) |f| {
         if (f.hidden or isReadOnlySystem(f.name)) continue;
         if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
-        try emitToMapEntry(alloc, w, f, true);
+        try emitToMapEntry(alloc, w, f, try memberIdent(alloc, f.name, payload_reserved), true);
     }
     try put(alloc, w, "      };\n}\n\n");
 }
@@ -425,7 +513,8 @@ pub fn emitFields(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
         if (isReadOnlySystem(f.name)) continue;
         const rt = try fluentReturnType(alloc, cols, c.name, f) orelse continue;
         const ex = (try fluentExpr(alloc, cols, c.name, f)).?;
-        try putf(alloc, w, "  {s} get {s} => {s};\n", .{ rt, f.name, ex });
+        // Getter name is keyword-sanitized; the filter path inside `ex` stays wire.
+        try putf(alloc, w, "  {s} get {s} => {s};\n", .{ rt, try memberIdent(alloc, f.name, &.{}), ex });
     }
     try put(alloc, w, "  StringFieldExpr get id => StringFieldExpr('${_p}id');\n");
     try put(alloc, w, "  StringFieldExpr get created => StringFieldExpr('${_p}created');\n");
@@ -666,7 +755,8 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collect
         for (c.fields) |f| {
             if (dt.kindOf(f) != .file_name or f.isMultiValue()) continue;
             const member = try enumMemberFor(alloc, f.name);
-            try putf(alloc, w, "      {s}.{s} => record.{s},\n", .{ ffenum, member, f.name });
+            // record accessor uses the record class's sanitized member name.
+            try putf(alloc, w, "      {s}.{s} => record.{s},\n", .{ ffenum, member, try memberIdent(alloc, f.name, record_reserved) });
         }
         try put(alloc, w, "    };\n");
         try putf(alloc, w, "    return _c.fileUrl(\n      ZbRecord({{'id': record.id, 'collectionName': '{s}'}}),\n      filename,\n      download: download,\n      thumb: thumb,\n      token: token,\n    );\n  }}\n", .{c.name});
@@ -689,7 +779,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collect
 }
 
 fn enumMemberFor(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
-    if (schema.isValidIdentifier(name)) return name;
+    if (schema.isValidIdentifier(name)) return memberIdent(alloc, name, enum_reserved);
     return std.fmt.allocPrint(alloc, "f_{s}", .{name});
 }
 
@@ -715,17 +805,34 @@ pub fn emitRealtime(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void
 // ---------------------------------------------------------------------------
 
 pub fn emitClient(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, client_name: []const u8, auth_collection: []const u8) !void {
+    // Sanitize accessor names + dedup across the whole client-member scope
+    // (collection accessors, realtime accessors, and the fixed members):
+    // e.g. a collection named `raw` -> accessor `raw_`; collections `posts`
+    // and `postsRealtime` would both claim `postsRealtime` -> hard error.
+    const svc_idents = try alloc.alloc([]const u8, cols.len);
+    const rt_idents = try alloc.alloc([]const u8, cols.len);
+    const all_idents = try alloc.alloc([]const u8, cols.len * 2);
+    const all_names = try alloc.alloc([]const u8, cols.len * 2);
+    for (cols, 0..) |c, i| {
+        svc_idents[i] = try memberIdent(alloc, c.name, client_reserved);
+        rt_idents[i] = try memberIdent(alloc, try std.fmt.allocPrint(alloc, "{s}Realtime", .{c.name}), client_reserved);
+        all_idents[i] = svc_idents[i];
+        all_names[i] = c.name;
+        all_idents[cols.len + i] = rt_idents[i];
+        all_names[cols.len + i] = try std.fmt.allocPrint(alloc, "{s} (realtime accessor)", .{c.name});
+    }
+    try checkDuplicateIdents(all_idents, all_names, try std.fmt.allocPrint(alloc, "client class {s}", .{client_name}));
+
     try putf(alloc, w, "class {s} {{\n", .{client_name});
     try putf(alloc, w, "  {s}(this.raw, {{this.owned = false}});\n\n  final ZigbaseClient raw;\n  final bool owned;\n\n", .{client_name});
-    for (cols) |c| {
+    for (cols, 0..) |c, i| {
         const svc = try ident.serviceName(alloc, c.name);
-        try putf(alloc, w, "  late final {s} {s} = {s}(raw);\n", .{ svc, c.name, svc });
+        try putf(alloc, w, "  late final {s} {s} = {s}(raw);\n", .{ svc, svc_idents[i], svc });
     }
     try put(alloc, w, "\n");
-    for (cols) |c| {
+    for (cols, 0..) |c, i| {
         const rt = try ident.realtimeAliasName(alloc, c.name);
-        const field = try std.fmt.allocPrint(alloc, "{s}Realtime", .{c.name});
-        try putf(alloc, w, "  late final {s} {s} = {s}(raw);\n", .{ rt, field, rt });
+        try putf(alloc, w, "  late final {s} {s} = {s}(raw);\n", .{ rt, rt_idents[i], rt });
     }
     try put(alloc, w,
         \\

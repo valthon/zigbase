@@ -6,6 +6,10 @@
 // Regenerate with `zig build gen-dating-dart-client`, then `dart format` it
 // with the consuming package's language version (resolved from the package
 // config; without one, pass --language-version — style differs by version).
+//
+// Identifier mapping: a schema name that is a Dart reserved word or would
+// shadow a generated/Object member gets a trailing `_` on the DART side
+// only (field `default` -> member `default_`); wire keys are unchanged.
 // ignore_for_file: non_constant_identifier_names, constant_identifier_names, unused_element, unused_import, unnecessary_import, unused_field, prefer_const_constructors
 
 import 'package:zigbase_client/zigbase_client.dart';
