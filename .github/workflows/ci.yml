@@ -418,3 +418,40 @@ jobs:
         run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:e2e
       - name: Server package generator unit test
         run: cd clients/typescript/npm && mise exec node@24 -- node --test gen-server-packages.test.mjs
+
+  dart-sdk:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: zigbase-binaries
+          path: artifacts
+      - name: Export prebuilt binary path
+        run: |
+          chmod +x artifacts/zig-out/bin/zigbase
+          echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+      - name: Cache pub
+        uses: actions/cache@v5
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('clients/dart/pubspec.yaml') }}
+          restore-keys: pub-${{ runner.os }}-
+      - name: Install deps
+        working-directory: clients/dart
+        run: mise exec dart@3.12 -- dart pub get
+      - name: Analyze
+        working-directory: clients/dart
+        run: mise exec dart@3.12 -- dart analyze --fatal-infos
+      - name: Format check
+        working-directory: clients/dart
+        run: mise exec dart@3.12 -- dart format --output=none --set-exit-if-changed .
+      - name: Unit tests
+        working-directory: clients/dart
+        run: mise exec dart@3.12 -- dart test --exclude-tags integration
+      - name: Integration tests
+        working-directory: clients/dart
+        run: mise exec dart@3.12 -- dart test --tags integration

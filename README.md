@@ -63,6 +63,10 @@ See [docs/docker.md](docs/docker.md) for the data-volume/non-root/healthcheck de
   offset + cursor pagination, files, realtime + live store — plus a fully-typed client
   generated from your schema (`zig build gen-client`) or from any running instance
   (`npx @zigbase/typegen`). → [docs/typescript-sdk.md](docs/typescript-sdk.md)
+- **Dart SDK** — official client (`zigbase_client`) for the Dart VM, Flutter, and Flutter web:
+  auth + pluggable stores, records, offset + cursor pagination, files, and realtime
+  subscriptions over WebSocket. Not yet published to pub.dev (git dependency for now).
+  → [docs/dart-sdk.md](docs/dart-sdk.md)
 - **Static files** — serve a frontend from the same binary: `--serve-static <dir>` at runtime, or pin/embed it at comptime, with `.spa` SPA-fallback markers for client-routed apps. → [docs/framework.md](docs/framework.md)
 - **Admin UI** — embedded single-page app served at `/_/`, including a Settings / Feature-Flags screen. → [docs/api.md](docs/api.md)
 - **Framework** — `ctx`-first hooks, routes, and jobs expose a structured capability object (`ctx.records()`, `ctx.auth()`, `ctx.tx()`, `ctx.http()`, `ctx.kv()`) alongside comptime schema, additive auto-migration, and pluggable storage/mailer backends. → [docs/framework.md](docs/framework.md)
@@ -247,6 +251,7 @@ examples/
 - [docs/api.md](docs/api.md) — HTTP API reference (collections, records, query, rules, auth, oauth2, realtime, files, static files, admin)
 - [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs, static-file modes
 - [docs/typescript-sdk.md](docs/typescript-sdk.md) — the official `@zigbase/client` TypeScript SDK: auth, records, offset + cursor pagination, files, realtime + live store
+- [docs/dart-sdk.md](docs/dart-sdk.md) — the official `zigbase_client` Dart SDK: auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web
 - [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — current caveats
 - [CHANGELOG.md](CHANGELOG.md) — release history
 
