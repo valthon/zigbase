@@ -64,15 +64,25 @@ export class RealtimeService {
   private connecting = false;
   private closedByUser = false;
   private reconnectAttempts = 0;
-  private authAck: { resolve: () => void; reject: (e: Error) => void } | null = null;
+  private authAck: {
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (e: Error) => void;
+  } | null = null;
 
   private readonly subscriptions = new Map<string, Subscription>();
   private readonly authUnsub: () => void;
 
   constructor(private readonly cfg: RealtimeServiceConfig) {
-    // Re-auth whenever the token changes (login/logout/refresh).
-    this.authUnsub = cfg.authStore.onChange(() => {
-      if (this.opened) void this.sendAuth();
+    // Re-auth whenever the token changes (login/logout/refresh). On logout
+    // (token null/empty) an EMPTY-token frame is sent so the server, which
+    // clears a connection's identity only on an auth frame that FAILS
+    // verification (see src/realtime/hub.zig), de-auths this connection instead
+    // of silently retaining the old identity indefinitely. The token from the
+    // event is used verbatim (rather than re-reading authStore.token) so rapid
+    // successive changes each send their own value rather than coalescing.
+    this.authUnsub = cfg.authStore.onChange((token) => {
+      if (this.opened) void this.sendAuthFrame(token ?? "");
     });
   }
 
@@ -268,15 +278,41 @@ export class RealtimeService {
   }
 
   /** Sends an auth frame when a token exists; returns a promise that resolves on
-   * the auth ack (or null when anonymous so the caller can act synchronously). */
+   * the auth ack (or null when anonymous so the caller can resubscribe
+   * synchronously). Only the on-open path calls this; the connected-then-
+   * logged-out de-auth goes through {@link sendAuthFrame} directly. */
   private sendAuth(): Promise<void> | null {
     const token = this.cfg.authStore.token;
     if (!token) return null;
-    const ack = new Promise<void>((resolve, reject) => {
-      this.authAck = { resolve, reject };
-    });
+    return this.sendAuthFrame(token);
+  }
+
+  /**
+   * Sends an `auth` frame carrying `token` (the empty string de-auths the
+   * connection server-side) and returns a promise that resolves on the next auth
+   * response. Never rejects — an auth failure is swallowed here and surfaced via
+   * `onError`, so it cannot block the resubscribe gate or reject unrelated work.
+   *
+   * If an auth frame is already awaiting its response, its resolver is REUSED
+   * rather than replaced: back-to-back sends (rapid login/logout churn) therefore
+   * never strand an earlier waiter — every waiter settles on the first auth
+   * response, which is sufficient for the on-open resubscribe gate (it only needs
+   * *an* auth to have been applied before resubscribing, and the newest frame is
+   * already on the wire ahead of the resubscribes).
+   */
+  private sendAuthFrame(token: string): Promise<void> {
+    let ack = this.authAck;
+    if (!ack) {
+      let resolve!: () => void;
+      let reject!: (e: Error) => void;
+      const promise = new Promise<void>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      ack = this.authAck = { promise, resolve, reject };
+    }
     this.send({ action: "auth", token });
-    return ack.catch(() => {
+    return ack.promise.catch(() => {
       /* auth failure is surfaced via onError; don't block reconnect */
     });
   }
@@ -303,11 +339,18 @@ export class RealtimeService {
       case "connect":
         this.clientId = (frame.clientId as string) ?? null;
         break;
-      case "auth":
-        if (frame.status === "ok") this.authAck?.resolve();
-        else this.authAck?.reject(new Error("auth failed"));
+      case "auth": {
+        // Detach before settling so a superseded frame's later response (the
+        // resolver is reused across back-to-back sends) finds a null slot and is
+        // a no-op rather than settling a newer ack. A de-auth's
+        // {"status":"error"} response is benign: the promise carries a swallowing
+        // `.catch` (see sendAuthFrame), so it raises no unhandled rejection.
+        const ack = this.authAck;
         this.authAck = null;
+        if (frame.status === "ok") ack?.resolve();
+        else ack?.reject(new Error("auth failed"));
         break;
+      }
       case "ack":
         this.onAck(frame.topic as string);
         break;
