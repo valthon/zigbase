@@ -22,7 +22,7 @@ class AuthResponse {
   final ZbRecord? record;
   final Map<String, dynamic>? meta;
 
-  AuthResponse({required this.token, required this.record, this.meta});
+  AuthResponse({required this.token, this.record, this.meta});
 
   factory AuthResponse.fromJson(Map<String, dynamic> json) {
     final rawRecord = json['record'];

@@ -62,17 +62,20 @@ ZigbaseException parseErrorResponse(
 
       final rawData = decoded['data'];
       if (rawData is Map) {
-        data = rawData.map((key, value) {
-          String code = '';
-          String fieldMessage = '';
-          if (value is Map) {
-            final rawCode = value['code'];
-            final rawMessage = value['message'];
-            if (rawCode is String) code = rawCode;
-            if (rawMessage is String) fieldMessage = rawMessage;
-          }
-          return MapEntry(key.toString(), FieldError(code, fieldMessage));
-        });
+        // A malformed entry (value isn't a `{code, message}` object, or
+        // either isn't a String) is skipped entirely rather than included
+        // with '' defaults, so callers can't mistake "absent/malformed" for
+        // a real (if unusually empty) field error.
+        final entries = <String, FieldError>{};
+        for (final entry in rawData.entries) {
+          final value = entry.value;
+          if (value is! Map) continue;
+          final rawCode = value['code'];
+          final rawMessage = value['message'];
+          if (rawCode is! String || rawMessage is! String) continue;
+          entries[entry.key.toString()] = FieldError(rawCode, rawMessage);
+        }
+        data = entries;
       }
     }
   } catch (_) {

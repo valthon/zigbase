@@ -93,5 +93,25 @@ void main() {
           parseErrorResponse(502, 'oops', 'http://x/api/y', reasonPhrase: '');
       expect(err.message, 'Request failed with status 502');
     });
+
+    test(
+        'skips a malformed field-error entry rather than defaulting it to '
+        "empty strings", () {
+      final body = jsonEncode({
+        'message': 'Failed to validate the request.',
+        'data': {
+          'email': {'code': 'validation_required', 'message': 'Missing.'},
+          'title': 'not-an-object',
+          'age': {'code': 123, 'message': 'Bad.'},
+          'views': {'code': 'invalid'},
+        },
+      });
+      final err = parseErrorResponse(400, body, 'http://x/api/y');
+      expect(err.data.keys, ['email']);
+      expect(err.data['email']?.code, 'validation_required');
+      expect(err.data.containsKey('title'), isFalse);
+      expect(err.data.containsKey('age'), isFalse);
+      expect(err.data.containsKey('views'), isFalse);
+    });
   });
 }

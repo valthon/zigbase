@@ -8,6 +8,8 @@
 /// class-based (rather than closure-returning-object-literal) idiom.
 library;
 
+import 'dart:developer' as developer;
+
 import 'package:http/http.dart' as http;
 
 import 'accounts.dart';
@@ -59,6 +61,22 @@ import 'transport.dart';
 /// siblings do not need to be closed individually unless they created their
 /// own [RealtimeService], but calling [close] on one is always safe (it is
 /// idempotent and a no-op on the shared resources).
+/// Fallback used for [ZigbaseClient.realtime]'s [RealtimeService.onError]
+/// when the client is not given an `onRealtimeError` callback.
+///
+/// An unconsumed realtime `error` frame (one with no pending
+/// [RealtimeService.subscribe] to reject) must never be silently dropped —
+/// so rather than passing no callback at all (the pre-existing behavior of
+/// the `realtime` getter), a client with no `onRealtimeError` gets this
+/// visible default: a `dart:developer` log entry (shows up in IDE/DevTools
+/// consoles), at the `WARNING` level (900) `logging`-package convention.
+/// Exposed (not part of the `zigbase_client` barrel export) so it can be
+/// exercised directly in tests; pass `onRealtimeError` to replace it.
+void defaultRealtimeErrorLog(Object error) {
+  developer.log('Unhandled realtime error: $error',
+      name: 'zigbase.realtime', level: 900);
+}
+
 class ZigbaseClient {
   /// The normalized base URL (no trailing slash).
   final String baseUrl;
@@ -74,6 +92,7 @@ class ZigbaseClient {
   final String? _authCollection;
   final String? _lang;
   final int _maxRetries;
+  final void Function(Object error)? _onRealtimeError;
   late final Transport _transport;
 
   final Map<String, CollectionService> _collections = {};
@@ -94,6 +113,7 @@ class ZigbaseClient {
     int maxRetries = 3,
     http.Client? httpClient,
     WebSocketConnector? webSocketConnector,
+    void Function(Object error)? onRealtimeError,
   })  : baseUrl = _normalize(baseUrl),
         authStore = authStore ?? MemoryAuthStore(),
         _httpClient = httpClient ?? http.Client(),
@@ -103,7 +123,8 @@ class ZigbaseClient {
         _autoRefresh = autoRefresh,
         _authCollection = authCollection,
         _lang = lang,
-        _maxRetries = maxRetries {
+        _maxRetries = maxRetries,
+        _onRealtimeError = onRealtimeError {
     _transport = Transport(
       baseUrl: this.baseUrl,
       authStore: this.authStore,
@@ -129,6 +150,7 @@ class ZigbaseClient {
     required String? accountId,
     required String? lang,
     required int maxRetries,
+    required void Function(Object error)? onRealtimeError,
   })  : _httpClient = httpClient,
         _webSocketConnector = webSocketConnector,
         _ownsAuthStore = false,
@@ -136,7 +158,8 @@ class ZigbaseClient {
         _autoRefresh = autoRefresh,
         _authCollection = authCollection,
         _lang = lang,
-        _maxRetries = maxRetries {
+        _maxRetries = maxRetries,
+        _onRealtimeError = onRealtimeError {
     _transport = Transport(
       baseUrl: baseUrl,
       authStore: authStore,
@@ -225,12 +248,18 @@ class ZigbaseClient {
   /// call; accessing this getter alone does not connect. Throws [StateError]
   /// after [close] (which is what guarantees [close] tears down every
   /// [RealtimeService] this client ever creates).
+  ///
+  /// The service's [RealtimeService.onError] is the constructor's
+  /// `onRealtimeError`, or (when omitted) [defaultRealtimeErrorLog] — an
+  /// unconsumed realtime error is never silently dropped just because this
+  /// getter, rather than direct [RealtimeService] construction, built it.
   RealtimeService get realtime {
     _checkNotClosed();
     return _realtimeService ??= RealtimeService(
       baseUrl: baseUrl,
       authStore: authStore,
       connector: _webSocketConnector,
+      onError: _onRealtimeError ?? defaultRealtimeErrorLog,
     );
   }
 
@@ -298,6 +327,7 @@ class ZigbaseClient {
       accountId: accountId,
       lang: _lang,
       maxRetries: _maxRetries,
+      onRealtimeError: _onRealtimeError,
     );
   }
 

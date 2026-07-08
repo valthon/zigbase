@@ -102,7 +102,10 @@ class Transport {
   /// `buildUrl('/api/x')` resolve identically (internal callers always pass a
   /// leading slash; this guards the public surface). [query] entries with a
   /// `null` value are skipped; every other value is stringified and
-  /// url-encoded.
+  /// url-encoded. A [query] key that duplicates one already present in
+  /// [path]'s own query string is **appended**, not overwritten — both values
+  /// survive (matching the TS SDK's `URLSearchParams`-append behavior), so
+  /// the resulting [Uri] can carry the same key twice.
   Uri buildUrl(String path, [Map<String, dynamic>? query]) {
     final base = _baseUrl.replaceAll(RegExp(r'/+$'), '');
     final String raw;
@@ -116,18 +119,32 @@ class Transport {
     final parsed = Uri.parse(raw);
     if (query == null || query.isEmpty) return parsed;
 
-    final params = <String, String>{...parsed.queryParameters};
+    final params = <String, List<String>>{};
+    parsed.queryParametersAll
+        .forEach((key, values) => params[key] = List<String>.from(values));
     for (final entry in query.entries) {
       final value = entry.value;
       if (value == null) continue;
-      params[entry.key] = value.toString();
+      params.putIfAbsent(entry.key, () => <String>[]).add(value.toString());
     }
-    return parsed.replace(queryParameters: params.isEmpty ? null : params);
+    if (params.isEmpty) return parsed;
+    final qp = <String, dynamic>{
+      for (final entry in params.entries)
+        entry.key: entry.value.length == 1 ? entry.value.first : entry.value,
+    };
+    return parsed.replace(queryParameters: qp);
   }
 
   /// Issue a request and return its parsed JSON body (or `null` for a 204 /
   /// empty body). Non-2xx responses throw a [ZigbaseException]; a 401 may
   /// trigger a single auto-refresh + retry, and a 429 is retried with backoff.
+  ///
+  /// For a non-GET request, [body] is always sent as `application/json`
+  /// unless it contains an [http.MultipartFile] (which switches the whole
+  /// request to multipart instead) — this applies even to a bare scalar, so
+  /// a `String` [body] is JSON-encoded too and arrives as a quoted JSON
+  /// string literal (`"hi"`), never sent as raw unquoted text. [raw] shares
+  /// this same body encoding (it only skips JSON-*parsing* the response).
   ///
   /// When [requestKey] is set, any in-flight request sharing the key is
   /// superseded: its future completes with [ZigbaseCancelledException] and its
@@ -148,9 +165,11 @@ class Transport {
   }
 
   /// Raw escape hatch: perform the request and return the [http.Response]
-  /// as-is — no JSON parse, no error mapping, no 401 refresh, no 429 retry.
-  /// Auth/lang/account headers and the [body]/[query]/[headers] all still
-  /// apply. Use for binary/text bodies or custom status handling.
+  /// as-is — no JSON *parse* of the response, no error mapping, no 401
+  /// refresh, no 429 retry. Auth/lang/account headers and the
+  /// [body]/[query]/[headers] all still apply, including [send]'s body
+  /// encoding (see its dartdoc) — this only changes how the response is
+  /// handled. Use for a binary/text response or custom status handling.
   Future<http.Response> raw(
     String path, {
     String method = 'GET',
@@ -268,15 +287,18 @@ class Transport {
     http.BaseRequest request;
     if (multipart != null) {
       request = _multipartRequest(method, url, hdrs, multipart);
-    } else if (!isGet && (body is Map || body is List)) {
+    } else if (!isGet && body != null) {
+      // Every non-multipart, non-null body is JSON-encoded — including a
+      // bare String/num/bool — matching the TS transport, which always
+      // `JSON.stringify`s a non-FormData body. A Dart String therefore
+      // becomes a quoted JSON string literal (`"hi"`, not `hi`) with
+      // `Content-Type: application/json`, not sent raw.
       final req = http.Request(method, url)..headers.addAll(hdrs);
       req.headers['content-type'] = 'application/json';
       req.body = jsonEncode(body);
       request = req;
     } else {
-      final req = http.Request(method, url)..headers.addAll(hdrs);
-      if (!isGet && body is String) req.body = body;
-      request = req;
+      request = http.Request(method, url)..headers.addAll(hdrs);
     }
 
     final streamed = await _httpClient.send(request);

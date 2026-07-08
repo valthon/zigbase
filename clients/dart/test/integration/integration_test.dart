@@ -55,22 +55,25 @@ void main() {
     return;
   }
 
-  late TestServer server;
+  // Nullable so a `setUpAll` failure (e.g. the binary never becomes healthy)
+  // leaves `tearDownAll` something safe to check, instead of a `late` field
+  // that throws `LateInitializationError` noise on top of the real failure.
+  TestServer? server;
   late String suToken;
 
   setUpAll(() async {
     server = await startServer();
-    suToken = await superuserToken(server);
-    await createCollection(server, suToken, _postsDefinition('posts'));
-    await createCollection(server, suToken, _postsDefinition('feed'));
+    suToken = await superuserToken(server!);
+    await createCollection(server!, suToken, _postsDefinition('posts'));
+    await createCollection(server!, suToken, _postsDefinition('feed'));
   });
 
   tearDownAll(() async {
-    await server.stop();
+    await server?.stop();
   });
 
   test('health check via client.send', () async {
-    final client = ZigbaseClient(server.baseUrl);
+    final client = ZigbaseClient(server!.baseUrl);
     addTearDown(client.close);
     final health =
         await client.send('GET', '/api/health') as Map<String, dynamic>;
@@ -78,18 +81,18 @@ void main() {
   });
 
   test('superuser authWithPassword on _superusers', () async {
-    final client = ZigbaseClient(server.baseUrl);
+    final client = ZigbaseClient(server!.baseUrl);
     addTearDown(client.close);
     final auth = await client
         .collection('_superusers')
-        .authWithPassword(server.superuserEmail, server.superuserPassword);
+        .authWithPassword(server!.superuserEmail, server!.superuserPassword);
     expect(auth.token, isNotEmpty);
     expect(client.authStore.token, auth.token);
-    expect(auth.record?.getString('email'), server.superuserEmail);
+    expect(auth.record?.getString('email'), server!.superuserEmail);
   });
 
   test('CRUD round-trip against a live collection', () async {
-    final client = ZigbaseClient(server.baseUrl);
+    final client = ZigbaseClient(server!.baseUrl);
     addTearDown(client.close);
     final posts = client.collection('posts');
 
@@ -112,7 +115,7 @@ void main() {
   });
 
   test('zbFilter round-trips a single-quoted value to the server', () async {
-    final client = ZigbaseClient(server.baseUrl);
+    final client = ZigbaseClient(server!.baseUrl);
     addTearDown(client.close);
     final posts = client.collection('posts');
 
@@ -127,11 +130,11 @@ void main() {
   });
 
   test('offset getList reports totals across pages', () async {
-    final client = ZigbaseClient(server.baseUrl);
+    final client = ZigbaseClient(server!.baseUrl);
     addTearDown(client.close);
     final posts = client.collection('offsetposts');
     // Provision a dedicated collection so counts are deterministic.
-    await createCollection(server, suToken, _postsDefinition('offsetposts'));
+    await createCollection(server!, suToken, _postsDefinition('offsetposts'));
 
     for (var i = 0; i < 5; i++) {
       await posts.create({'title': 'Post $i', 'views': i});
@@ -150,10 +153,10 @@ void main() {
   });
 
   test('cursor getPage + iterate cover >=3 pages of >=25 records', () async {
-    final client = ZigbaseClient(server.baseUrl);
+    final client = ZigbaseClient(server!.baseUrl);
     addTearDown(client.close);
     final posts = client.collection('cursorposts');
-    await createCollection(server, suToken, _postsDefinition('cursorposts'));
+    await createCollection(server!, suToken, _postsDefinition('cursorposts'));
 
     const seedCount = 25;
     for (var i = 0; i < seedCount; i++) {
@@ -189,10 +192,11 @@ void main() {
   });
 
   test('authRefresh mints a fresh token for the superuser', () async {
-    final client = ZigbaseClient(server.baseUrl);
+    final client = ZigbaseClient(server!.baseUrl);
     addTearDown(client.close);
     final su = client.collection('_superusers');
-    await su.authWithPassword(server.superuserEmail, server.superuserPassword);
+    await su.authWithPassword(
+        server!.superuserEmail, server!.superuserPassword);
     final refreshed = await su.authRefresh();
     expect(refreshed.token, isNotEmpty);
     expect(client.authStore.token, refreshed.token);
@@ -203,7 +207,7 @@ void main() {
   });
 
   test('file upload (MultipartFile) + fetch bytes via files.getUrl', () async {
-    final client = ZigbaseClient(server.baseUrl);
+    final client = ZigbaseClient(server!.baseUrl);
     addTearDown(client.close);
     final posts = client.collection('posts');
 
@@ -228,7 +232,7 @@ void main() {
   });
 
   test('realtime subscribe delivers a create event within 10s', () async {
-    final client = ZigbaseClient(server.baseUrl);
+    final client = ZigbaseClient(server!.baseUrl);
     addTearDown(client.close);
 
     final events = <RecordEvent>[];

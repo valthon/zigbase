@@ -69,9 +69,11 @@ String _formatDouble(double v) {
 /// TEXT, and `"...05.678Z" > "...05.678901Z"` in a string compare (`Z` sorts
 /// above digits), so a microsecond-precision boundary literal would
 /// mis-order against stored millisecond-precision values. The sub-millisecond
-/// part is dropped by subtraction (not an epoch-integer round-trip, whose
-/// `~/` truncation rounds toward zero and thus the wrong way for pre-1970
-/// instants).
+/// part is dropped by subtraction rather than an epoch-integer round-trip:
+/// Dart's `millisecondsSinceEpoch` getter already floors, so this is not
+/// needed to protect it — the hazard would only bite a hand-rolled
+/// `microsecondsSinceEpoch ~/ 1000`, whose `~/` truncates toward zero and
+/// thus rounds the wrong way for pre-1970 (negative-epoch) instants.
 String _formatDateTime(DateTime value) {
   final utc = value.toUtc();
   final clamped = utc.microsecond == 0

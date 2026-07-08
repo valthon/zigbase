@@ -102,6 +102,63 @@ void main() {
     });
   });
 
+  group('ZigbaseClient onRealtimeError', () {
+    test(
+        'an unconsumed realtime error frame reaches the constructor-supplied '
+        'onRealtimeError (not silently dropped)', () async {
+      final factory = FakeSocketFactory();
+      final errors = <Object>[];
+      final client = ZigbaseClient(
+        'http://api.test',
+        webSocketConnector: factory.connect,
+        onRealtimeError: errors.add,
+      );
+      addTearDown(client.close);
+
+      final subFut = client.realtime.subscribe('posts', (_) {});
+      await pumpEventQueue();
+      final ws = factory.last;
+      ws.push({'type': 'ack', 'action': 'subscribe', 'topic': 'posts'});
+      await subFut;
+
+      // No pending subscribe is left to reject this error frame — without
+      // the facade wiring onRealtimeError through, it would be dropped.
+      ws.push({'type': 'error', 'message': 'boom'});
+      await pumpEventQueue();
+
+      expect(errors, contains('boom'));
+    });
+
+    test('defaultRealtimeErrorLog does not throw (the facade default)', () {
+      expect(
+          () => defaultRealtimeErrorLog(StateError('boom')), returnsNormally);
+    });
+
+    test('withAccount siblings inherit the parent\'s onRealtimeError',
+        () async {
+      final factory = FakeSocketFactory();
+      final errors = <Object>[];
+      final client = ZigbaseClient(
+        'http://api.test',
+        webSocketConnector: factory.connect,
+        onRealtimeError: errors.add,
+      );
+      addTearDown(client.close);
+      final sibling = client.withAccount('acct-1');
+
+      final subFut = sibling.realtime.subscribe('posts', (_) {});
+      await pumpEventQueue();
+      final ws = factory.last;
+      ws.push({'type': 'ack', 'action': 'subscribe', 'topic': 'posts'});
+      await subFut;
+
+      ws.push({'type': 'error', 'message': 'sibling-boom'});
+      await pumpEventQueue();
+
+      expect(errors, contains('sibling-boom'));
+    });
+  });
+
   group('ZigbaseClient.send', () {
     test('delegates to the transport, attaching the bearer token', () async {
       final calls = <_Call>[];

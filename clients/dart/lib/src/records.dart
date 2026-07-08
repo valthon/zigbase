@@ -184,8 +184,8 @@ http.MultipartFile _withField(http.MultipartFile file, String key) {
         throw ArgumentError.value(
             e.unsupportedObject,
             'body',
-            'encodeMultipart: value nested under key "$key" is not '
-                'JSON-encodable (${e.unsupportedObject.runtimeType})');
+            'encodeMultipart: value nested under key "$key" is cyclic or '
+                'not JSON-encodable (${e.unsupportedObject.runtimeType})');
       }
     }
     return value.toString();
