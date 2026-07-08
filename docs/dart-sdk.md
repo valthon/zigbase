@@ -2,8 +2,8 @@
 
 The official Dart client (`zigbase_client`) wraps the ZigBase HTTP REST + realtime WebSocket
 API ([docs/api.md](api.md)) in an ergonomic surface: auth + stores, records, offset and cursor
-pagination, files, and realtime subscriptions. It runs on the Dart VM, Flutter (iOS, Android,
-desktop), and Flutter web.
+pagination, files, realtime subscriptions, and a high-level **live store**. It runs on the Dart
+VM, Flutter (iOS, Android, desktop), and Flutter web.
 
 Unlike the [TypeScript SDK](typescript-sdk.md), there is currently only **one** tier — a
 hand-written dynamic client. There is no comptime/runtime code generator for Dart yet (see
@@ -488,6 +488,80 @@ await zb.realtime.unsubscribeTopic('availability', callback);
 shared-socket machinery as record subscriptions (ack/pending/resubscribe/backoff) but take no
 `filter`.
 
+## Live store — "same API, now live"
+
+`zb.realtime.collection(name)` mirrors the record read API but returns **live** objects that
+stay in sync as events arrive — backed by one shared per-collection record cache, so the same
+record id is a single object across every view (a list and a `getOne` share the same
+`LiveRecord`; one event patches both).
+
+> **You must call `close()`** on a live record or list when you're done with it. `close()`
+> drops the realtime subscription and releases the cache ref(s); skipping it leaks the
+> subscription and keeps records pinned in the cache. Both `close()` methods are idempotent,
+> and **post-close use throws `StateError`** (matching the SDK's other close contracts).
+
+```dart
+final live = zb.realtime.collection('posts');
+
+// A live record: patched IN PLACE on update events, flipped deleted on delete.
+final post = await live.getOne('REC123');
+post.get();                       // current backing ZbRecord
+post['title'];                    // convenience read-through of a backing field
+final sub = post.changes.listen((_) => render(post.get()));
+post.deleted;                     // true after a delete event
+// ... teardown:
+await sub.cancel();
+post.close();                     // REQUIRED
+
+// A live list: ordered items kept in sync as events arrive.
+final list = await live.getList(sort: '-created');
+list.items;                       // List<LiveRecord> ordered by the query sort (alias: list.get())
+list.getById('REC123');           // O(1) membership lookup
+list.changes.listen((_) => render(list.items));
+list.close();                     // REQUIRED
+
+// cursor-seeded live list
+final feed = await live.getPage(limit: 30, sort: '-created');
+// ... feed.close() when done
+```
+
+### The observable contract
+
+`LiveRecord` and `LiveList` are pure-Dart observables (no Flutter dependency) — a synchronous
+snapshot + version plus a broadcast change stream:
+
+```dart
+abstract class Observable<T> {
+  T get();                    // synchronous current snapshot
+  int get version;            // monotonic counter, bumped before each notification
+  Stream<void> get changes;   // broadcast; one event per mutation
+}
+```
+
+Read state synchronously via `get()`/`items`/`version`; subscribe to `changes` (and cancel the
+`StreamSubscription` to unsubscribe) to know *when* to re-read. This adapts trivially to a
+Flutter `ValueListenable` in a future companion package — `version` → `notifyListeners`,
+`get()` → `value`.
+
+> Unlike the TypeScript SDK, a `LiveRecord` does **not** expose dynamic same-named getters
+> (`post.title`) — Dart can't synthesize them at runtime. Use `post.get()` (a `ZbRecord`, with
+> its own `getString`/`getInt`/… accessors) or the convenience `post['title']`.
+
+### Correctness modes — `list.mode`
+
+Membership of a record in a filtered live list is decided with a two-tier strategy that is
+**always correct**. Read `list.mode` (`LiveListMode.precise` | `LiveListMode.refetch`):
+
+- **`precise` (own-field filters).** When the filter references only the record's own scalar
+  fields (`status = 'published' && views > 10`), the list evaluates membership client-side and
+  applies surgical insert / remove / move on each event — zero extra requests. The sort always
+  appends an `id`-asc tiebreaker for a deterministic order.
+- **`refetch` (relations / macros).** When the filter traverses a relation
+  (`author.name = 'Ada'`) or uses a macro (`@request.auth.id = owner`), the client can't
+  evaluate it locally, so the list degrades to a **debounced single-flight re-fetch** of the
+  query (default 200ms; at most one request in flight, re-run once if events arrive mid-fetch)
+  — still live, still correct, just coalesced to one request per burst.
+
 ## Error handling
 
 Every non-2xx response throws a `ZigbaseException` carrying `status`, `message`, `url`, and
@@ -588,9 +662,6 @@ The Dart SDK is a base client — a few surfaces the TypeScript SDK has do not e
   `npx @zigbase/typegen` — every read is dynamically typed (`ZbRecord`/`Map<String, dynamic>`),
   and you `getString`/`getInt`/… your way to a value. No typed `db.*`/`rpc.*`/`auth.*`
   surfaces.
-- **Live store.** `zb.realtime.collection(name)` (kept-in-sync live records/lists,
-  `LiveList.mode` precise/refetch tracking) has no Dart port; only the low-level
-  `subscribe`/`subscribeTopic`/`stream` primitives exist.
 - **SSE transport.** The server exposes realtime over both WebSocket and SSE
   (`EventSource`); this SDK speaks WebSocket only.
 - **Cookie-based auth store.** No `CookieAuthStore` equivalent — persist via `AsyncAuthStore`
