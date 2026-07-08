@@ -6,6 +6,23 @@ on [Keep a Changelog](https://keepachangelog.com/), and this package adheres to
 
 ## [Unreleased]
 
+### Security
+
+- **Realtime connections are now de-authed on logout.** Previously, clearing the
+  auth store (logout) while a realtime WebSocket was open left the connection
+  authenticated server-side — the socket kept delivering events under the
+  logged-out identity until it was closed or reconnected. The client now sends an
+  empty-token `auth` frame on that transition, which the server rejects and treats
+  as a de-auth, clearing the connection's identity while leaving existing
+  subscriptions in place. A fresh anonymous connection still sends no auth frame.
+
+### Fixed
+
+- **Realtime: rapid auth changes (e.g. quick login/logout churn) no longer strand
+  an in-flight subscribe.** Back-to-back `auth` frames now share a single pending
+  ack instead of overwriting its resolver, so a waiting resubscribe always settles
+  on the next auth response rather than hanging.
+
 ## [0.3.0] - 2026-07-04
 
 Feature-parity release: closes the gap between the client and the server's
