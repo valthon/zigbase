@@ -14,6 +14,7 @@ export 'src/files.dart';
 export 'src/jwt.dart';
 export 'src/live/cache.dart';
 export 'src/live/filter_eval.dart';
+export 'src/live/live_collection.dart';
 export 'src/pkce.dart';
 export 'src/query.dart';
 export 'src/realtime.dart';

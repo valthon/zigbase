@@ -23,6 +23,7 @@ import 'package:stream_channel/stream_channel.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'auth_store.dart';
+import 'live/live_collection.dart';
 import 'records.dart';
 
 /// Builds and connects the underlying transport. The default connects via
@@ -80,7 +81,10 @@ class _Subscription {
 
 /// Multiplexes realtime subscriptions over a single, auto-reconnecting
 /// WebSocket. Construct one per client; call [close] to tear it down.
-class RealtimeService {
+///
+/// Implements [LiveSubscriber], so it can back the high-level live store
+/// (`client.realtime.collection(name)` → [LiveCollection]).
+class RealtimeService implements LiveSubscriber {
   final String baseUrl;
   final AuthStore authStore;
   final WebSocketConnector _connector;
@@ -88,6 +92,11 @@ class RealtimeService {
   final Duration maxReconnect;
   final Future<void> Function(Duration) _sleep;
   final void Function(Object error)? onError;
+
+  /// Builds the [LiveReader] a [collection]'s live store seeds through. Injected
+  /// by [ZigbaseClient] (each reader adapts the collection's `CollectionService`);
+  /// null on a standalone service, where [collection] then throws.
+  final LiveReader Function(String name)? liveReaderFactory;
 
   final Map<String, _Subscription> _subscriptions = {};
 
@@ -120,6 +129,7 @@ class RealtimeService {
     this.maxReconnect = const Duration(seconds: 10),
     Future<void> Function(Duration)? sleep,
     this.onError,
+    this.liveReaderFactory,
   })  : _connector = connector ?? _defaultConnector,
         _sleep = sleep ?? _defaultSleep {
     // Re-auth whenever the token changes (login/logout/refresh). On logout
@@ -146,6 +156,26 @@ class RealtimeService {
   /// before the socket has connected.
   String? get clientId => _clientId;
 
+  /// The high-level live store for [name] (mirrors the TypeScript SDK's
+  /// `client.realtime.collection(name)`): returns a [LiveCollection] whose
+  /// records/lists stay in sync from realtime events.
+  ///
+  /// Requires a [liveReaderFactory] — present on a service created by
+  /// [ZigbaseClient]. A standalone [RealtimeService] built without one throws a
+  /// [StateError] (obtain live collections via the client). Throws once the
+  /// service has been [close]d.
+  LiveCollection collection(String name) {
+    if (_closedByUser) throw StateError('RealtimeService has been closed');
+    final factory = liveReaderFactory;
+    if (factory == null) {
+      throw StateError(
+          'RealtimeService.collection requires a live reader factory; obtain '
+          'live collections via ZigbaseClient.realtime, not a standalone '
+          'RealtimeService');
+    }
+    return LiveCollection(name, factory(name), this);
+  }
+
   // ---- public API ---------------------------------------------------------
 
   /// Subscribe to a collection [topic] (optionally narrowed by a server-side
@@ -160,6 +190,7 @@ class RealtimeService {
   /// receive the second filter's events.
   ///
   /// Throws a [StateError] once the service has been [close]d.
+  @override
   Future<ZbUnsubscribe> subscribe(
     String topic,
     void Function(RecordEvent) callback, {
