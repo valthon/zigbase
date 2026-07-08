@@ -39,17 +39,21 @@ changing the tag pattern (or the repository) is not.
 2. **Enable automated publishing.** On `pub.dev/packages/zigbase_client/admin`, under
    *Automated publishing*, click *Enable publishing from GitHub Actions* and set:
    - **Repository**: `valthon/zigbase`
-   - **Tag pattern**: `dart-client-v{{version}}` — must match `on.push.tags` in
-     `release-dart-sdk.yml` exactly (currently `dart-client-v*`), or the workflow won't be
-     allowed to publish.
+   - **Tag pattern**: `dart-client-v{{version}}` — must stay **in sync with** (not
+     textually identical to) the `on.push.tags` glob in `release-dart-sdk.yml` (currently
+     `dart-client-v*`): pub.dev's `{{version}}` placeholder and the workflow's `*` glob must
+     accept the same tags, or the workflow either won't trigger or won't be allowed to
+     publish.
 3. **Optional hardening — GitHub Actions environment.** `release-dart-sdk.yml`'s publish job
    already sets `environment: pub.dev`, but that's inert until pub.dev is told to require it:
    on the same Admin tab, click *Require GitHub Actions environment*, name it `pub.dev`, and
    create a matching environment under the repo's **Settings → Environments** (optionally with
    required reviewers, mirroring `tests/admin`-style safe-by-default posture). Until this is
    done, the workflow publishes without the extra gate.
-4. **Optional — tag protection rules.** Restrict who can push `dart-client-v*` tags under the
-   repo's **Settings → Tags** to limit who can trigger a publish, independent of step 3.
+4. **Optional — tag protection.** Restrict who can push `dart-client-v*` tags with a
+   repository ruleset (**Settings → Rules → Rulesets**, targeting tags) to limit who can
+   trigger a publish, independent of step 3. (The classic **Settings → Tags** tag-protection
+   page still exists, but rulesets are GitHub's current mechanism.)
 
 Once steps 1–2 are done, every subsequent `dart-client-v*` tag push publishes automatically —
 no further manual `dart pub publish` needed.

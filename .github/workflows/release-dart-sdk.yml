@@ -51,7 +51,12 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           expected="${tag#dart-client-v}"
-          actual="$(grep -m1 '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*//')"
+          # Strip optional surrounding quotes and a trailing `# comment` so the
+          # gate still extracts the bare version if pubspec.yaml ever writes
+          # `version: "0.1.0"` or `version: 0.1.0 # note` (otherwise it would
+          # fail closed with a confusing mismatch message).
+          actual="$(grep -m1 '^version:' pubspec.yaml \
+            | sed -E "s/^version:[[:space:]]*//; s/[[:space:]]+#.*\$//; s/^[\"']//; s/[\"']\$//; s/[[:space:]]+\$//")"
           echo "tag=$tag expected=$expected pubspec.yaml=$actual"
           if [ "$expected" != "$actual" ]; then
             echo "::error::Tag ($tag => $expected) does not match pubspec.yaml version ($actual)."
