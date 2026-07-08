@@ -474,12 +474,22 @@ export class RealtimeService {
     // arriving mid-sleep defers to us (see ensureConnected) instead of opening
     // a competing socket.
     this.reconnectPending = true;
-    const min = this.cfg.minReconnectMs ?? 250;
-    const max = this.cfg.maxReconnectMs ?? 10_000;
-    const delay = Math.min(max, min * 2 ** this.reconnectAttempts);
-    this.reconnectAttempts += 1;
-    await (this.cfg.sleep ?? defaultSleep)(delay);
-    this.reconnectPending = false;
+    try {
+      const min = this.cfg.minReconnectMs ?? 250;
+      const max = this.cfg.maxReconnectMs ?? 10_000;
+      const delay = Math.min(max, min * 2 ** this.reconnectAttempts);
+      this.reconnectAttempts += 1;
+      await (this.cfg.sleep ?? defaultSleep)(delay);
+    } catch (e) {
+      // A rejecting injectable sleep must neither wedge `reconnectPending`
+      // (the finally below always clears it — a stuck flag would no-op
+      // ensureConnected forever) nor surface an unhandled rejection (call
+      // sites fire-and-forget via `void this.reconnect()`). Surface it and
+      // treat the backoff as elapsed — the reconnect itself still proceeds.
+      this.cfg.onError?.(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.reconnectPending = false;
+    }
     if (this.closedByUser) return;
     this.connect();
   }

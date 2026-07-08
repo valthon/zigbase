@@ -189,6 +189,46 @@ describe("RealtimeService reconnect", () => {
     expect(resubscribed.map((f) => f.topic)).toEqual(["posts"]); // NOT "private"
   });
 
+  it("a throwing sleep does not wedge the reconnect-pending flag or leak an unhandled rejection", async () => {
+    const factory = new FakeWebSocketFactory();
+    const onError = vi.fn();
+    let sleepCalls = 0;
+    const service = new RealtimeService({
+      baseUrl: "http://api.test",
+      authStore: new MemoryAuthStore(),
+      WebSocket: factory.WebSocket,
+      sleep: async () => {
+        sleepCalls += 1;
+        if (sleepCalls === 1) throw new Error("sleep broke");
+      },
+      onError,
+    });
+    const p1 = service.subscribe("posts", vi.fn());
+    const ws1 = factory.last;
+    ws1.emitOpen();
+    ws1.emitMessage({ type: "ack", action: "subscribe", topic: "posts" });
+    await p1;
+
+    // Drop -> schedules a reconnect whose sleep throws. Without the
+    // try/finally, reconnectPending stays true forever (ensureConnected is
+    // permanently no-op'd) and `void this.reconnect()` leaks an unhandled
+    // rejection.
+    ws1.emitClose();
+    await flush();
+    expect(onError).toHaveBeenCalledWith("sleep broke");
+
+    // Flag not wedged: the reconnect proceeded to a fresh socket.
+    expect(factory.instances).toHaveLength(2);
+    const ws2 = factory.last;
+    ws2.emitOpen();
+    ws2.emitMessage({ type: "ack", action: "subscribe", topic: "posts" });
+
+    // And a brand-new subscribe still works end-to-end.
+    const p2 = service.subscribe("comments", vi.fn());
+    ws2.emitMessage({ type: "ack", action: "subscribe", topic: "comments" });
+    await p2;
+  });
+
   it("a subscribe during the reconnect backoff does not open a second socket", async () => {
     // A gated sleep holds the backoff open so we can inject a subscribe mid-sleep.
     let releaseSleep!: () => void;

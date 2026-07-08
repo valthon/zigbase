@@ -474,6 +474,44 @@ void main() {
       await service.close();
     });
 
+    test(
+        'a throwing sleep does not wedge the reconnect-pending flag '
+        'or leak an unhandled async error', () async {
+      var sleepCalls = 0;
+      final errors = <Object>[];
+      final factory = FakeSocketFactory();
+      final service =
+          makeService(factory, onError: errors.add, sleep: (Duration d) async {
+        sleepCalls++;
+        if (sleepCalls == 1) throw StateError('sleep broke');
+      });
+      final p1 = service.subscribe('posts', (_) {});
+      await pumpEventQueue();
+      final ws1 = factory.last;
+      ws1.push({'type': 'ack', 'action': 'subscribe', 'topic': 'posts'});
+      await p1;
+
+      // Drop -> schedules a reconnect whose sleep throws. Without the
+      // try/finally, _reconnectPending stays true forever (ensureConnected
+      // is permanently no-op'd) and the fire-and-forget _reconnect() future
+      // surfaces an unhandled async error (which fails this test loudly).
+      await ws1.serverClose();
+      await pumpEventQueue();
+      expect(errors.any((e) => e.toString().contains('sleep broke')), isTrue);
+
+      // Flag not wedged: the reconnect proceeded to a fresh socket.
+      expect(factory.connections, hasLength(2));
+      final ws2 = factory.last;
+      ws2.push({'type': 'ack', 'action': 'subscribe', 'topic': 'posts'});
+
+      // And a brand-new subscribe still works end-to-end.
+      final p2 = service.subscribe('comments', (_) {});
+      await pumpEventQueue();
+      ws2.push({'type': 'ack', 'action': 'subscribe', 'topic': 'comments'});
+      await p2;
+      await service.close();
+    });
+
     test('a subscribe during the reconnect backoff does not open a 2nd socket',
         () async {
       final sleepGate = Completer<void>();

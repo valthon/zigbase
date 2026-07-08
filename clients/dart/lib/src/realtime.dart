@@ -580,10 +580,20 @@ class RealtimeService {
     // arriving mid-sleep defers to us (see [_ensureConnected]) instead of
     // opening a competing socket.
     _reconnectPending = true;
-    final delay = _backoffDelay();
-    _reconnectAttempts += 1;
-    await _sleep(delay);
-    _reconnectPending = false;
+    try {
+      final delay = _backoffDelay();
+      _reconnectAttempts += 1;
+      await _sleep(delay);
+    } catch (e) {
+      // A throwing injectable sleep must neither wedge [_reconnectPending]
+      // (the finally below always clears it — a stuck flag would no-op
+      // [_ensureConnected] forever) nor surface an unhandled async error
+      // (call sites fire-and-forget this future). Surface it and treat the
+      // backoff as elapsed — the reconnect itself still proceeds.
+      onError?.call(e);
+    } finally {
+      _reconnectPending = false;
+    }
     if (_closedByUser) return;
     _connect();
   }
