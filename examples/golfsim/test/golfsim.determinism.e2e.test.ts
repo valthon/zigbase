@@ -5,7 +5,7 @@ import { startGolfsim, type GolfServer } from "./harness.js";
 import { createClient, type Booking, type Hold } from "../clients/typescript/zbase.gen.js";
 
 // The whole process clock is frozen to this instant via ZIGBASE_FAKE_NOW. The seam is
-// compiled in only on a dev-clock build (the default Debug build the harness produces),
+// compiled in only on a dev-mode build (the default Debug build the harness produces),
 // so every framework + consumer `'now'` (token exp, SQLite `unixepoch('now')`, autodate
 // columns) resolves to this fixed point. golfsim's prepareHold hook reads "now" from the
 // DB clock, so a hold's expires_at becomes deterministic: FROZEN + 15 minutes.

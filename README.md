@@ -143,6 +143,7 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_FIELD_KEY` | — | `""` (unset) | key for at-rest field encryption (`.encrypted` fields). Never auto-generated/persisted/logged; the server **refuses to start** if any collection declares an encrypted field while this is empty. See [docs/fields.md](docs/fields.md) |
 | `ZIGBASE_FIELD_KEY_GENERATION` | — | `1` | generation of the primary (write) field-encryption key — the envelope version stamped on writes (`v<N>:`). Bump to rotate, then run `zigbase rewrap` |
 | `ZIGBASE_FIELD_KEY_V<n>` | — | _unset_ | older read-only key for generation `<n>`, needed to decrypt existing `v<n>:` data after a key rotation |
+| `ZIGBASE_FIELD_CRYPTO` | — | `real` | **dev builds only** (`-Ddev-mode`, on by default in Debug): set `fake` to store `.encrypted` fields as readable `fake:<key>:<value>` instead of AES-GCM — useful for eyeballing values while debugging. Compiled out of release binaries; never read there. See [docs/fields.md](docs/fields.md) |
 | `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
 | `ZIGBASE_TRUST_PROXY` | `--trust-proxy` (sets `true`) | `false` | trust `X-Forwarded-For`/`X-Real-IP` for client-IP / rate-limit keying (set only behind a trusted reverse proxy) |
 | `ZIGBASE_AUTH_TOKEN_TTL` | — | `1209600` (14 days) | auth token lifetime, seconds |

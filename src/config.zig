@@ -1,6 +1,7 @@
 const std = @import("std");
 const clock = @import("clock.zig");
 const entropy = @import("entropy.zig");
+const field_policy = @import("field_policy.zig");
 
 /// SMTP transport security mode (config-driven).
 ///   none     — plaintext SMTP (MailHog / local relays; current behavior).
@@ -155,6 +156,12 @@ pub const Config = struct {
     // entirely. null = real OS CSPRNG (the always-correct default).
     fake_seed: ?u64 = null,
 
+    // DEV-ONLY fake field-crypto (`ZIGBASE_FIELD_CRYPTO=fake`). When `.fake`, `.encrypted`
+    // fields are stored READABLE as `fake:<key>:<value>` for debugging. ALWAYS `.real` on a
+    // production build — `field_policy.resolveModeFromEnv` is comptime-gated off when
+    // `dev_mode` is false, so a prod binary ignores the env var entirely. `.real` = AES-GCM.
+    field_crypto: field_policy.Mode = .real,
+
     /// Resolve `auto` to a concrete TLS mode from the port:
     ///   465 → implicit (SMTPS), 587 → starttls, anything else → none.
     /// `none`/`starttls`/`implicit` are returned unchanged.
@@ -225,6 +232,8 @@ pub const Config = struct {
         cfg.fake_now_unix = clock.resolveFromEnv(getter.get(clock.env_var));
         // Dev-only seeded entropy. resolveFromEnv is comptime-gated off on a prod build.
         cfg.fake_seed = entropy.resolveFromEnv(getter.get(entropy.env_var));
+        // Dev-only fake field-crypto. resolveModeFromEnv is comptime-gated off on a prod build.
+        cfg.field_crypto = field_policy.resolveModeFromEnv(getter.get(field_policy.env_var));
         return cfg;
     }
 };

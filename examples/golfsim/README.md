@@ -448,7 +448,7 @@ an in-process Node capture server, then asserts:
 - Confirming a booking POSTs the `booking.confirmed` webhook to the capture server.
 
 The determinism seam (`ZIGBASE_FAKE_NOW`, test-capture) is compiled in only on a
-`dev_clock` build — the default Debug build the harness produces — and is comptime-
+`dev_mode` build — the default Debug build the harness produces — and is comptime-
 eliminated from any release binary. See [docs/framework.md](../../docs/framework.md)
 (the determinism + `zigbase.testcapture` sections).
 
