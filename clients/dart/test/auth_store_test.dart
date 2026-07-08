@@ -182,16 +182,21 @@ void main() {
     test('a failed persistence write does not poison the chain', () async {
       final calls = <String>[];
       final zoneErrors = <Object>[];
+      final goodWritten = Completer<void>();
 
       await runZonedGuarded(() async {
         final store = AsyncAuthStore(save: (data) async {
           if (data.contains('"bad"')) throw StateError('disk full');
           calls.add(data);
+          goodWritten.complete();
         });
 
         store.save('bad', null);
         store.save('good', {'id': 'u1'});
-        await Future<void>.delayed(const Duration(milliseconds: 10));
+        // Deterministic handshake: wait for the "good" write to actually run
+        // (rather than a fixed sleep) — it can only happen after the
+        // "bad" write's chained future has settled (thrown + been caught).
+        await goodWritten.future;
         store.dispose();
       }, (error, stack) {
         zoneErrors.add(error);
@@ -210,22 +215,29 @@ void main() {
 
     test('writes are chained in order and do not interleave', () async {
       final order = <String>[];
+      final firstGate = Completer<void>();
+      final secondWritten = Completer<void>();
       final store = AsyncAuthStore(save: (data) async {
         if (data.contains('"first"')) {
-          await Future<void>.delayed(const Duration(milliseconds: 30));
+          // Held open until the test releases it below, so the "second"
+          // write cannot even start (per AsyncAuthStore's chaining
+          // contract) until this completes.
+          await firstGate.future;
           order.add('first-done');
         } else {
-          // If writes were not chained, this callback would run
-          // concurrently with the still-pending "first" write.
+          // If writes were not chained, this callback could run before
+          // the still-pending "first" write completes.
           expect(order, contains('first-done'));
           order.add('second-done');
+          secondWritten.complete();
         }
       });
 
       store.save('first', null);
       store.save('second', null);
+      firstGate.complete();
 
-      await Future<void>.delayed(const Duration(milliseconds: 60));
+      await secondWritten.future;
       expect(order, ['first-done', 'second-done']);
       store.dispose();
     });

@@ -65,6 +65,7 @@ final zb = ZigbaseClient(
 | `maxRetries` | `3` | 429-backoff retry budget. |
 | `httpClient` | `http.Client()` | Override the HTTP transport (tests, custom `http.Client`). |
 | `webSocketConnector` | `WebSocketChannel.connect` | Override the realtime transport. |
+| `onRealtimeError` | logs via `dart:developer` | Realtime error callback — see [Realtime](#realtime). |
 
 ### Ownership & `close()`
 
@@ -441,11 +442,30 @@ created lazily on the first `subscribe`/`subscribeTopic` call and multiplexes ev
 
 Anonymous subscriptions are allowed only for collections with a `@public` view rule
 (server-enforced); the client does not pre-gate — a rejected subscribe rejects the returned
-`Future` and/or calls the `onError` callback (configurable via `zb.realtime`'s underlying
-`RealtimeService`, constructed by the client). **Known limitation:** the server keys a
+`Future` and/or calls the error callback. **Known limitation:** the server keys a
 subscription per topic per connection, so subscribing to the same topic with two different
 filters on one client makes the second filter overwrite the first server-side — both
 callbacks then receive the second filter's events.
+
+### Error handling — `onRealtimeError`
+
+```dart
+final zb = ZigbaseClient(
+  'http://127.0.0.1:8090',
+  onRealtimeError: (error) => myLogger.warn('realtime: $error'),
+);
+```
+
+Pass `onRealtimeError` to the client constructor to observe server-side realtime errors —
+e.g. a server rejection of an anonymous subscribe to a non-public collection, or a
+socket-level error with no in-flight subscribe at all. The callback fires for **every**
+server error frame, *including* errors also delivered to (and rejecting) a pending
+`subscribe`/`subscribeTopic` call — treat it as a logging/telemetry hook, not a replacement
+for handling a rejected subscribe `Future`. **A realtime error is never silently dropped:**
+when `onRealtimeError` is omitted, the client falls back to logging the error visibly via
+`dart:developer` (shows up in IDE/DevTools consoles). Constructing a `RealtimeService`
+directly (bypassing the client) still defaults its own `onError` to `null` (a real no-op)
+if you don't pass one.
 
 ### As a `Stream`
 
@@ -524,6 +544,14 @@ final stats = await zb.send('GET', '/api/custom/stats', query: {'window': '7d'})
     as Map<String, dynamic>;
 await zb.send('POST', '/api/custom/reindex', body: {'collection': 'posts'});
 ```
+
+For a non-GET request, `body` is **always** JSON-encoded (`Content-Type: application/json`)
+unless it contains an `http.MultipartFile`, matching the TypeScript SDK's
+`JSON.stringify`-everything behavior byte-for-byte — this applies even to a bare scalar, so
+`body: 'hi'` is sent as the quoted JSON string literal `"hi"`, never as raw unquoted text.
+A `DateTime` nested anywhere in the body serializes as a millisecond-clamped UTC ISO-8601
+string (as JS `JSON.stringify` does for a `Date`); any other non-encodable value throws an
+`ArgumentError`.
 
 When you need the **raw `http.Response`** (binary/text bodies, response headers, custom
 status handling), use `zb.rawRequest(method, path, {...})`. It passes through

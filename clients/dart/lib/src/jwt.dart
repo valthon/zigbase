@@ -12,12 +12,11 @@ Map<String, dynamic>? decodeJwtPayload(String token) {
   try {
     final normalized = base64Url.normalize(parts[1]);
     final bytes = base64Url.decode(normalized);
+    // `jsonDecode` always produces a `Map<String, dynamic>` for a JSON object
+    // (its keys are always strings), so there is no other `Map` shape to
+    // re-key here.
     final decoded = jsonDecode(utf8.decode(bytes));
-    if (decoded is Map<String, dynamic>) return decoded;
-    if (decoded is Map) {
-      return decoded.map((key, value) => MapEntry(key.toString(), value));
-    }
-    return null;
+    return decoded is Map<String, dynamic> ? decoded : null;
   } catch (_) {
     return null;
   }

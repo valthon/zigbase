@@ -217,6 +217,21 @@ backoff, and re-auths from the auth store on login/logout/refresh. Anonymous sub
 require a `@public` view rule on the collection (server-enforced). There is no live-store tier
 yet (see [docs/dart-sdk.md](../../docs/dart-sdk.md) → Not yet).
 
+Pass `onRealtimeError` to the client to observe server-side realtime errors. The callback
+fires for **every** server error frame — including errors also delivered to (and rejecting)
+a pending `subscribe` call — so treat it as a logging/telemetry hook, not a replacement for
+handling a rejected subscribe `Future`:
+
+```dart
+final zb = ZigbaseClient(
+  'http://127.0.0.1:8090',
+  onRealtimeError: (error) => print('realtime error: $error'),
+);
+```
+
+A realtime error is never silently dropped: when `onRealtimeError` is omitted, the client
+falls back to a visible `dart:developer` log entry instead of doing nothing.
+
 ## Error handling
 
 Every non-2xx response throws a `ZigbaseException` carrying `status`, `message`, `url`, and
@@ -252,7 +267,10 @@ try {
 ## Escape hatch — `send()` and `rawRequest()`
 
 `send()` calls any endpoint the typed surface doesn't cover, returning parsed JSON; the auth
-header, retries, and `ZigbaseException` mapping still apply:
+header, retries, and `ZigbaseException` mapping still apply. For a non-GET request, `body` is
+always JSON-encoded (`Content-Type: application/json`) unless it contains an
+`http.MultipartFile` — even a bare `String` body, which is sent as a quoted JSON string
+literal (`"hi"`), not raw text:
 
 ```dart
 final stats = await zb.send('GET', '/api/custom/stats', query: {'window': '7d'})

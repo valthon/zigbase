@@ -27,6 +27,41 @@ const Duration _maxBackoff = Duration(seconds: 30);
 
 Future<void> _defaultSleep(Duration d) => Future<void>.delayed(d);
 
+/// Formats a [DateTime] as a UTC ISO-8601 string clamped to millisecond
+/// precision, matching JS `Date.prototype.toJSON` byte-for-byte — the same
+/// (deliberately duplicated, library-private) helper as in
+/// `lib/src/records.dart` and `lib/src/query.dart`; see the latter for the
+/// full rationale. Kept private per file because every `lib/src` module is
+/// barrel-exported, so a shared non-underscore helper would expand the
+/// public API.
+String _formatDateTime(DateTime value) {
+  final utc = value.toUtc();
+  final clamped = utc.microsecond == 0
+      ? utc
+      : utc.subtract(Duration(microseconds: utc.microsecond));
+  return clamped.toIso8601String();
+}
+
+/// JSON-encode a request body the way JS `JSON.stringify` would: a nested
+/// [DateTime] serializes via its `toJSON`-equivalent (ms-clamped UTC
+/// ISO-8601). Anything else non-encodable is rejected loudly as an
+/// [ArgumentError] naming the offending runtime type — the same posture as
+/// `encodeMultipart` in `lib/src/records.dart` (TS would silently emit `{}`
+/// garbage for such values).
+String _jsonEncodeBody(Object? body) {
+  try {
+    return jsonEncode(body,
+        toEncodable: (Object? nested) =>
+            nested is DateTime ? _formatDateTime(nested) : nested);
+  } on JsonUnsupportedObjectError catch (e) {
+    throw ArgumentError.value(
+        e.unsupportedObject,
+        'body',
+        'send: body contains a value that is cyclic or not JSON-encodable '
+            '(${e.unsupportedObject.runtimeType})');
+  }
+}
+
 /// One caller-supplied file part, buffered to bytes so a fresh (unfinalized)
 /// [http.MultipartFile] can be rebuilt for every retry attempt. package:http
 /// marks a MultipartFile finalized after its first send and throws on reuse,
@@ -102,7 +137,10 @@ class Transport {
   /// `buildUrl('/api/x')` resolve identically (internal callers always pass a
   /// leading slash; this guards the public surface). [query] entries with a
   /// `null` value are skipped; every other value is stringified and
-  /// url-encoded.
+  /// url-encoded. A [query] key that duplicates one already present in
+  /// [path]'s own query string is **appended**, not overwritten — both values
+  /// survive (matching the TS SDK's `URLSearchParams`-append behavior), so
+  /// the resulting [Uri] can carry the same key twice.
   Uri buildUrl(String path, [Map<String, dynamic>? query]) {
     final base = _baseUrl.replaceAll(RegExp(r'/+$'), '');
     final String raw;
@@ -116,18 +154,36 @@ class Transport {
     final parsed = Uri.parse(raw);
     if (query == null || query.isEmpty) return parsed;
 
-    final params = <String, String>{...parsed.queryParameters};
+    final params = <String, List<String>>{};
+    parsed.queryParametersAll
+        .forEach((key, values) => params[key] = List<String>.from(values));
+    var added = false;
     for (final entry in query.entries) {
       final value = entry.value;
       if (value == null) continue;
-      params[entry.key] = value.toString();
+      params.putIfAbsent(entry.key, () => <String>[]).add(value.toString());
+      added = true;
     }
-    return parsed.replace(queryParameters: params.isEmpty ? null : params);
+    // Nothing added (all values null): return the parsed Uri untouched
+    // instead of rebuilding an identical one.
+    if (!added) return parsed;
+    final qp = <String, dynamic>{
+      for (final entry in params.entries)
+        entry.key: entry.value.length == 1 ? entry.value.first : entry.value,
+    };
+    return parsed.replace(queryParameters: qp);
   }
 
   /// Issue a request and return its parsed JSON body (or `null` for a 204 /
   /// empty body). Non-2xx responses throw a [ZigbaseException]; a 401 may
   /// trigger a single auto-refresh + retry, and a 429 is retried with backoff.
+  ///
+  /// For a non-GET request, [body] is always sent as `application/json`
+  /// unless it contains an [http.MultipartFile] (which switches the whole
+  /// request to multipart instead) — this applies even to a bare scalar, so
+  /// a `String` [body] is JSON-encoded too and arrives as a quoted JSON
+  /// string literal (`"hi"`), never sent as raw unquoted text. [raw] shares
+  /// this same body encoding (it only skips JSON-*parsing* the response).
   ///
   /// When [requestKey] is set, any in-flight request sharing the key is
   /// superseded: its future completes with [ZigbaseCancelledException] and its
@@ -148,9 +204,11 @@ class Transport {
   }
 
   /// Raw escape hatch: perform the request and return the [http.Response]
-  /// as-is — no JSON parse, no error mapping, no 401 refresh, no 429 retry.
-  /// Auth/lang/account headers and the [body]/[query]/[headers] all still
-  /// apply. Use for binary/text bodies or custom status handling.
+  /// as-is — no JSON *parse* of the response, no error mapping, no 401
+  /// refresh, no 429 retry. Auth/lang/account headers and the
+  /// [body]/[query]/[headers] all still apply, including [send]'s body
+  /// encoding (see its dartdoc) — this only changes how the response is
+  /// handled. Use for a binary/text response or custom status handling.
   Future<http.Response> raw(
     String path, {
     String method = 'GET',
@@ -268,15 +326,20 @@ class Transport {
     http.BaseRequest request;
     if (multipart != null) {
       request = _multipartRequest(method, url, hdrs, multipart);
-    } else if (!isGet && (body is Map || body is List)) {
+    } else if (!isGet && body != null) {
+      // Every non-multipart, non-null body is JSON-encoded — including a
+      // bare String/num/bool — matching the TS transport, which always
+      // `JSON.stringify`s a non-FormData body. A Dart String therefore
+      // becomes a quoted JSON string literal (`"hi"`, not `hi`) with
+      // `Content-Type: application/json`, not sent raw. A nested [DateTime]
+      // serializes as a ms-clamped UTC ISO-8601 string (see
+      // [_jsonEncodeBody]); other non-encodables throw [ArgumentError].
       final req = http.Request(method, url)..headers.addAll(hdrs);
       req.headers['content-type'] = 'application/json';
-      req.body = jsonEncode(body);
+      req.body = _jsonEncodeBody(body);
       request = req;
     } else {
-      final req = http.Request(method, url)..headers.addAll(hdrs);
-      if (!isGet && body is String) req.body = body;
-      request = req;
+      request = http.Request(method, url)..headers.addAll(hdrs);
     }
 
     final streamed = await _httpClient.send(request);

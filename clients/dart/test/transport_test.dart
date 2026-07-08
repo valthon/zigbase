@@ -71,6 +71,15 @@ void main() {
       expect(t.buildUrl('api/x').toString(), t.buildUrl('/api/x').toString());
       expect(t.buildUrl('api/x').toString(), 'http://api.test/api/x');
     });
+
+    test(
+        'a query key duplicating one already in the path is appended, not '
+        'overwritten (both values survive)', () {
+      final t = _transport(MockClient((_) async => http.Response('', 204)));
+      final u = t.buildUrl('/api/x?a=1', {'a': 2, 'b': 'new'});
+      expect(u.queryParametersAll['a'], ['1', '2']);
+      expect(u.queryParametersAll['b'], ['new']);
+    });
   });
 
   group('headers', () {
@@ -140,6 +149,63 @@ void main() {
       await t.send('/api/x', method: 'POST', body: [1, 2, 3]);
       expect(seen.headers['content-type'], contains('application/json'));
       expect(seen.body, '[1,2,3]');
+    });
+
+    test('String body is JSON-encoded (a quoted string literal), not sent raw',
+        () async {
+      late http.Request seen;
+      final t = _transport(MockClient((req) async {
+        seen = req;
+        return http.Response('{}', 200);
+      }));
+      await t.send('/api/x', method: 'POST', body: 'hi');
+      expect(seen.headers['content-type'], contains('application/json'));
+      expect(seen.body, '"hi"');
+    });
+
+    test('num body is JSON-encoded bare', () async {
+      late http.Request seen;
+      final t = _transport(MockClient((req) async {
+        seen = req;
+        return http.Response('{}', 200);
+      }));
+      await t.send('/api/x', method: 'POST', body: 5);
+      expect(seen.headers['content-type'], contains('application/json'));
+      expect(seen.body, '5');
+    });
+
+    test(
+        'a DateTime nested in a JSON body encodes as a ms-clamped UTC '
+        'ISO-8601 string (no JsonUnsupportedObjectError)', () async {
+      late http.Request seen;
+      final t = _transport(MockClient((req) async {
+        seen = req;
+        return http.Response('{}', 200);
+      }));
+      final when = DateTime.utc(2026, 7, 8, 12, 34, 56, 789, 654);
+      await t.send('/api/x', method: 'POST', body: {
+        'title': 'hi',
+        'publishedAt': when,
+        'nested': {
+          'times': [when],
+        },
+      });
+      expect(seen.headers['content-type'], contains('application/json'));
+      expect(
+          seen.body,
+          '{"title":"hi","publishedAt":"2026-07-08T12:34:56.789Z",'
+          '"nested":{"times":["2026-07-08T12:34:56.789Z"]}}');
+    });
+
+    test(
+        'a non-encodable object in a JSON body throws ArgumentError, not '
+        'JsonUnsupportedObjectError', () async {
+      final t = _transport(MockClient((_) async => http.Response('{}', 200)));
+      await expectLater(
+        t.send('/api/x', method: 'POST', body: {'bad': Object()}),
+        throwsA(isA<ArgumentError>()
+            .having((e) => e.message, 'message', contains('Object'))),
+      );
     });
 
     test('GET does not send a body even if one is provided', () async {
@@ -240,6 +306,35 @@ void main() {
       expect(second, contains('name="title"'));
       expect(second, contains('name="avatar"; filename="a.png"'));
       expect(second, contains('IMGBYTES'));
+    });
+
+    test(
+        'a null-filename MultipartFile survives a 429 retry as a field part, '
+        'not a file part', () async {
+      final bodies = <String>[];
+      var calls = 0;
+      final t = _transport(
+        MockClient((req) async {
+          calls++;
+          bodies.add(req.body);
+          return calls == 1
+              ? http.Response('{"message":"slow"}', 429)
+              : http.Response('{"ok":true}', 200);
+        }),
+        sleep: (_) async {},
+      );
+      final out = await t.send('/api/x', method: 'POST', body: {
+        // No `filename:` — the server treats a filename-less part as a plain
+        // form field, even though package:http still models it as a
+        // MultipartFile.
+        'tag': http.MultipartFile.fromString('tag', 'value'),
+      });
+      expect(out, {'ok': true});
+      expect(calls, 2);
+      final second = bodies[1];
+      expect(second, contains('name="tag"'));
+      expect(second, contains('value'));
+      expect(second, isNot(contains('name="tag"; filename')));
     });
   });
 

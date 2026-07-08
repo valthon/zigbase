@@ -46,6 +46,15 @@ Transport _scripted(
 }
 
 void main() {
+  group('AuthResponse', () {
+    test('record is an optional named parameter (defaults to null)', () {
+      final auth = AuthResponse(token: 't');
+      expect(auth.token, 't');
+      expect(auth.record, isNull);
+      expect(auth.meta, isNull);
+    });
+  });
+
   group('authWithPassword', () {
     test('POSTs auth-with-password with skipAuth and saves {token, record}',
         () async {
