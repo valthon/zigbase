@@ -690,6 +690,6 @@ own SP2.1b typed-generator work.
 
 - [API reference](./api) — the underlying HTTP + WebSocket protocol.
 - [TypeScript SDK](./typescript-sdk) — the more mature sibling client, including the typed
-  codegen tiers and live store this SDK doesn't have yet.
+  codegen tiers this SDK doesn't have yet.
 - [Recipes](./recipes) — schema provisioning, owner-scoped rules, signup flows.
 - [Tutorial](./tutorial) — build an app on ZigBase end to end.
