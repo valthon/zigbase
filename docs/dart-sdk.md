@@ -11,9 +11,10 @@ hand-written dynamic client. There is no comptime/runtime code generator for Dar
 
 ## Install
 
-**Not yet published to pub.dev** — the initial publish is a documented follow-up (see
-[clients/dart/RELEASING.md](../clients/dart/RELEASING.md)). Until then, add it as a git
-dependency:
+**Not yet published to pub.dev.** The publishing workflow (`release-dart-sdk.yml`, OIDC
+automated publishing) is wired up, but the first publish still needs one-time owner setup
+on pub.dev — see [clients/dart/RELEASING.md](../clients/dart/RELEASING.md). Until then, add
+it as a git dependency:
 
 ```yaml
 dependencies:
