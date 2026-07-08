@@ -71,10 +71,15 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-runtime-client-check
+      # Format-then-diff so the comparison can never fail on formatter style alone.
+      # --language-version pins the formatter's style (short, matching the package's
+      # `sdk: ^3.5.0` in clients/dart/pubspec.yaml) because this job never runs
+      # `dart pub get`, and without a package config `dart format` silently falls
+      # back to the LATEST language version (tall style) — a pure-formatting diff.
       - name: Dating Dart client snapshot is fresh
         run: |
           mise exec zig@0.16.0 -- zig build gen-dating-dart-client
-          mise exec dart@3.12 -- dart format clients/dart/test/codegen/dating/zbase.gen.dart
+          mise exec dart@3.12 -- dart format --language-version=3.5 clients/dart/test/codegen/dating/zbase.gen.dart
           git diff --exit-code clients/dart/test/codegen/dating/zbase.gen.dart
       - name: Golfsim client snapshot is fresh
         working-directory: examples/golfsim
