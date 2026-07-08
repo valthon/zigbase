@@ -134,6 +134,91 @@ String zbFilter(String expr, [Map<String, Object?> params = const {}]) {
   });
 }
 
+/// One term of a parsed sort spec: a (possibly dotted) field path and a
+/// direction. Ported from `SortTerm` in `clients/typescript/src/query.ts`.
+class SortTerm {
+  final String field;
+
+  /// `'asc'` or `'desc'`.
+  final String dir;
+
+  const SortTerm(this.field, this.dir);
+
+  @override
+  bool operator ==(Object other) =>
+      other is SortTerm && other.field == field && other.dir == dir;
+
+  @override
+  int get hashCode => Object.hash(field, dir);
+
+  @override
+  String toString() => 'SortTerm($field, $dir)';
+}
+
+/// Parses a sort string (`"-created,title"`) into ordered [SortTerm]s.
+///
+/// A leading `-` means descending; a leading `+` or no prefix means ascending;
+/// blank terms are dropped. Byte-for-byte port of `parseSort` in
+/// `clients/typescript/src/query.ts`.
+List<SortTerm> parseSort(String sort) {
+  final terms = <SortTerm>[];
+  for (final raw in sort.split(',')) {
+    final t = raw.trim();
+    if (t.isEmpty) continue;
+    if (t.startsWith('-')) {
+      terms.add(SortTerm(t.substring(1).trim(), 'desc'));
+    } else if (t.startsWith('+')) {
+      terms.add(SortTerm(t.substring(1).trim(), 'asc'));
+    } else {
+      terms.add(SortTerm(t, 'asc'));
+    }
+  }
+  return terms.where((t) => t.field.isNotEmpty).toList();
+}
+
+/// Reads a possibly-dotted field path (`"author.name"`) out of a record map.
+Object? _readSortPath(Map<String, dynamic> obj, String path) {
+  if (!path.contains('.')) return obj[path];
+  Object? cur = obj;
+  for (final seg in path.split('.')) {
+    if (cur is! Map) return null;
+    cur = cur[seg];
+  }
+  return cur;
+}
+
+/// Compares two scalar values. Null/absent values sort BEFORE everything (the
+/// ascending baseline; the caller flips the sign for descending). Numbers
+/// compare numerically, booleans false-before-true, everything else by string.
+/// Port of `compareScalar` in `clients/typescript/src/query.ts` (returns a
+/// sign, which is all the multi-key comparator uses).
+int _compareScalar(Object? a, Object? b) {
+  final an = a == null;
+  final bn = b == null;
+  if (an && bn) return 0;
+  if (an) return -1;
+  if (bn) return 1;
+  if (a is num && b is num) return a.compareTo(b);
+  if (a is bool && b is bool) return (a ? 1 : 0) - (b ? 1 : 0);
+  return a.toString().compareTo(b.toString());
+}
+
+/// Multi-key comparator over [terms]. Null/absent values sort first under
+/// ascending and last under descending. Reused by the live-store list to keep
+/// items ordered. Port of `compareBySort` in `clients/typescript/src/query.ts`.
+int compareBySort(
+  Map<String, dynamic> a,
+  Map<String, dynamic> b,
+  List<SortTerm> terms,
+) {
+  for (final term in terms) {
+    final cmp = _compareScalar(
+        _readSortPath(a, term.field), _readSortPath(b, term.field));
+    if (cmp != 0) return term.dir == 'desc' ? -cmp : cmp;
+  }
+  return 0;
+}
+
 /// A structured nearest-neighbor query for `getList` (server `-Dvector`
 /// builds only).
 class VectorQuery {

@@ -12,6 +12,8 @@ export 'src/cursor.dart';
 export 'src/errors.dart';
 export 'src/files.dart';
 export 'src/jwt.dart';
+export 'src/live/cache.dart';
+export 'src/live/filter_eval.dart';
 export 'src/pkce.dart';
 export 'src/query.dart';
 export 'src/realtime.dart';
