@@ -185,6 +185,27 @@ jobs:
           restore-keys: |
             zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
             zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
+      - name: Wait for target database to be ready
+        # The services: health-cmd (pg_isready) only checks that the server responds to a
+        # ping -- it races the container entrypoint's own createdb step (postgres:16
+        # restarts itself during init: initdb -> temp server -> final server + createdb),
+        # so GitHub Actions can mark the service "healthy" before `zbpgtest` exists. Poll
+        # with a real query against the target database instead (see the postgres-tls job
+        # below for the identical race, hit for real in CI: readiness passed but the very
+        # next command failed with "database \"zbpgtest\" does not exist").
+        run: |
+          ready=""
+          for i in $(seq 1 30); do
+            if docker exec "${{ job.services.postgres.id }}" psql -U zbpg -d zbpgtest -c 'select 1' >/dev/null 2>&1; then
+              echo "postgres ready"; ready=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::postgres did not become ready (database zbpgtest) within the retry budget" >&2
+            docker logs "${{ job.services.postgres.id }}" || true
+            exit 1
+          fi
       # -Dvector=true so the live pgvector KNN parity + tenant/ability chokepoint tests run too
       # (sqlite-vec is also compiled in; the SQLite vector tests run alongside). The pgvector image
       # above makes `CREATE EXTENSION vector` succeed for the superuser test role.
@@ -239,13 +260,25 @@ jobs:
             -v "$PWD/pgtls/server.key":/etc/pgtls/server.key:ro \
             postgres:16 \
             -c ssl=on -c ssl_cert_file=/etc/pgtls/server.crt -c ssl_key_file=/etc/pgtls/server.key
-          # Wait until the server accepts connections.
+          # Wait until the target database actually exists and accepts queries. pg_isready
+          # alone races the container entrypoint: postgres:16 restarts itself during init
+          # (initdb -> temp server -> final server + createdb), and pg_isready reports
+          # "accepting connections" as soon as ANY of those phases responds -- including
+          # before `zbpgtest` has been created. Poll with a real query against the target
+          # database instead (CI flake: readiness printed "postgres ready" but the very
+          # next psql failed with "database \"zbpgtest\" does not exist").
+          ready=""
           for i in $(seq 1 30); do
-            if docker exec pgtls pg_isready -U zbpg -d zbpgtest >/dev/null 2>&1; then
-              echo "postgres ready"; break
+            if docker exec pgtls psql -U zbpg -d zbpgtest -c 'select 1' >/dev/null 2>&1; then
+              echo "postgres ready"; ready=1; break
             fi
             sleep 2
           done
+          if [ -z "$ready" ]; then
+            echo "::error::postgres did not become ready (database zbpgtest) within the retry budget" >&2
+            docker logs pgtls || true
+            exit 1
+          fi
           # Sanity: confirm SSL is actually on.
           docker exec pgtls psql -U zbpg -d zbpgtest -tAc "SHOW ssl;"
       - name: Unit + PostgreSQL driver tests over TLS (sslmode=require)
