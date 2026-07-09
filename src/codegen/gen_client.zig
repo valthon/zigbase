@@ -12,6 +12,7 @@ const guards = @import("guards.zig");
 const ident = @import("identifiers.zig");
 const rpc_ts = @import("rpc_ts.zig");
 const rpc = @import("rpc.zig");
+const gen_dart = @import("gen_dart.zig");
 
 const W = std.ArrayList(u8);
 
@@ -813,6 +814,8 @@ const Args = struct {
     out: ?[]const u8 = null,
     api_prefix: []const u8 = "/api",
     check: bool = false,
+    /// Output language: "ts" (default) or "dart".
+    lang: []const u8 = "ts",
 };
 
 /// Parse CLI args from the Zig 0.16 argv slice ([]const [:0]const u8).
@@ -831,6 +834,10 @@ fn parseArgsSlice(alloc: std.mem.Allocator, argv: []const [:0]const u8) !Args {
             args.api_prefix = try alloc.dupe(u8, argv[i]);
         } else if (std.mem.eql(u8, a, "--check")) {
             args.check = true;
+        } else if (std.mem.eql(u8, a, "--lang")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingLangValue;
+            args.lang = try alloc.dupe(u8, argv[i]);
         } else {
             std.log.warn("gen_client: ignoring unknown arg '{s}'", .{a});
         }
@@ -878,8 +885,16 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
     // contains() means the var is set (value may be empty string — that's fine).
     const in_repo = init.environ_map.contains("ZBASE_INREPO");
     const client_name = "ZbClient";
+    const want_dart = std.mem.eql(u8, args.lang, "dart");
+    if (!want_dart and !std.mem.eql(u8, args.lang, "ts")) {
+        std.log.err("gen_client: unknown --lang '{s}' (expected 'ts' or 'dart')", .{args.lang});
+        return error.BadLang;
+    }
 
-    const text = generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix) catch |e| {
+    const text = (if (want_dart)
+        gen_dart.generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix)
+    else
+        generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix)) catch |e| {
         // guard messages are printed via the report; re-run path for the message:
         var report = guards.GuardReport{ .message = "" };
         guards.checkOperatorNames(a, cols, &report) catch {};

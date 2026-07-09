@@ -1814,6 +1814,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
                     std.log.err("typegen: --out <path> is required", .{});
                     return error.MissingOut;
                 };
+                const lang = tgen.parseLang(ta.lang) catch return error.BadLang;
                 try tgen.run(a, init.io, .{
                     .data_dir = ta.data_dir,
                     .url = ta.url,
@@ -1824,6 +1825,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
                     .in_repo = init.environ_map.contains("ZBASE_INREPO"),
                     .admin_email = ta.admin_email,
                     .admin_password = ta.admin_password,
+                    .lang = lang,
                 });
             } else {
                 std.log.err("typegen: this binary was not built with .enable_typegen = true", .{});

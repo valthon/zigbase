@@ -59,6 +59,12 @@ class TestServer {
 /// Callers guard on this being non-null before invoking [startServer].
 String get binaryPath => Platform.environment['ZIGBASE_TEST_BINARY']!;
 
+/// The `dating-server` binary (the dating fixture compiled as a runnable
+/// server, schema baked in), supplied via `ZIGBASE_TEST_DATING_BINARY`. Used by
+/// the typed-tier e2e; callers guard on it being set before launching.
+String? get datingBinaryPath =>
+    Platform.environment['ZIGBASE_TEST_DATING_BINARY'];
+
 /// Ask the OS for a free loopback TCP port (bind :0, read it, release). The
 /// retry loop in [startServer] is the real guarantee against a lost race.
 Future<int> _freePort() async {
@@ -111,8 +117,9 @@ Future<void> _waitForHealthOrExit(
 Future<TestServer> startServer({
   String email = 'admin@test.local',
   String password = 'test-password-123',
+  String? bin,
 }) async {
-  final bin = binaryPath;
+  bin ??= binaryPath;
   Object? lastErr;
 
   for (var attempt = 1; attempt <= _startAttempts; attempt++) {

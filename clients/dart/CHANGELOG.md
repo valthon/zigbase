@@ -65,3 +65,10 @@ Initial release of the official Dart client for ZigBase — a behavioral port of
   overwritten, so both values survive.
 - **Errors.** `ZigbaseException` (status/message/per-field `data`) and
   `ZigbaseCancelledException` for superseded `requestKey` requests.
+- **Typed tier** (`package:zigbase_client/typed.dart`). The generic runtime a generated
+  `zbase.gen.dart` instantiates: `CollectionMeta`/`FieldMeta` descriptors, a fluent filter
+  builder (`Expr`, `FieldExpr` family with `eq`/`neq`/`gt`/`like`/`inList`, enum + nested-relation
+  support) that compiles to server filter strings, `TypedCollection<T>` (typed CRUD wrapping
+  `CollectionService`, mapping records to generated classes), `TypedRealtime<T>`, and int/fixed
+  decimal-string coercion helpers (`coerceInt`/`coerceDouble`/`encodeInt`/`encodeFixed`). Generate
+  a client with `zigbase typegen --lang dart` (or `zig build gen-client` with a `.dart` output).

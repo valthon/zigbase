@@ -71,6 +71,16 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-runtime-client-check
+      # Format-then-diff so the comparison can never fail on formatter style alone.
+      # --language-version pins the formatter's style (short, matching the package's
+      # `sdk: ^3.5.0` in clients/dart/pubspec.yaml) because this job never runs
+      # `dart pub get`, and without a package config `dart format` silently falls
+      # back to the LATEST language version (tall style) — a pure-formatting diff.
+      - name: Dating Dart client snapshot is fresh
+        run: |
+          mise exec zig@0.16.0 -- zig build gen-dating-dart-client
+          mise exec dart@3.12 -- dart format --language-version=3.5 clients/dart/test/codegen/dating/zbase.gen.dart
+          git diff --exit-code clients/dart/test/codegen/dating/zbase.gen.dart
       - name: Golfsim client snapshot is fresh
         working-directory: examples/golfsim
         run: mise exec zig@0.16.0 -- zig build gen-client-check
@@ -432,8 +442,9 @@ jobs:
           path: artifacts
       - name: Export prebuilt binary path
         run: |
-          chmod +x artifacts/zig-out/bin/zigbase
+          chmod +x artifacts/zig-out/bin/zigbase artifacts/zig-out/bin/dating-server
           echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_DATING_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/dating-server" >> "$GITHUB_ENV"
       - name: Cache pub
         uses: actions/cache@v5
         with:

@@ -273,6 +273,18 @@ pub fn build(b: *std.Build) void {
     const rt_check_step = b.step("gen-dating-runtime-client-check", "Fail if the dating runtime client golden is stale");
     rt_check_step.dependOn(&rt_check_run.step);
 
+    // --- Dart codegen: generate the dating fixture's typed Dart client. Reuses
+    // the same comptime generator exe (`zbase-gen-client`) with `--lang dart`.
+    const dart_out = "clients/dart/test/codegen/dating/zbase.gen.dart";
+    const gen_dart_run = b.addRunArtifact(gen_exe);
+    gen_dart_run.setEnvironmentVariable("ZBASE_INREPO", "1");
+    gen_dart_run.addArgs(&.{ "--out", dart_out, "--api-prefix", "/api", "--lang", "dart" });
+    // The Dart golden is committed `dart format`-clean, so its staleness gate is a
+    // regenerate-then-`dart format`-then-`git diff` shell step in CI (the raw
+    // generator output differs from the formatted golden only in line wrapping).
+    const gen_dart_step = b.step("gen-dating-dart-client", "Generate the dating fixture's typed Dart client (run `dart format` after)");
+    gen_dart_step.dependOn(&gen_dart_run.step);
+
     // --- gen-test: golden snapshot byte-exact test (Task 8) -------------------
     // Builds gen_test_root.zig as a test binary with both zigbase_mod (for
     // gen_client.generate) and dating_app_mod (for App.collections) injected.
@@ -314,6 +326,8 @@ pub const GenOpts = struct {
     api_prefix: []const u8 = "/api",
     check: bool = false,
     in_repo: bool = false,
+    /// Output language: "ts" (default) or "dart".
+    lang: []const u8 = "ts",
 };
 
 /// Build the pure-Zig client generator with `app_mod` (a module exposing
@@ -365,6 +379,8 @@ fn genClientStepInner(
     run.addArg(opts.out);
     run.addArg("--api-prefix");
     run.addArg(opts.api_prefix);
+    run.addArg("--lang");
+    run.addArg(opts.lang);
     if (opts.check) run.addArg("--check");
     if (opts.in_repo) run.setEnvironmentVariable("ZBASE_INREPO", "1");
     return run;
