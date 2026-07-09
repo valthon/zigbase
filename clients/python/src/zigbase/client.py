@@ -29,11 +29,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import TracebackType
-from typing import Any, cast
+from typing import Any
 
 import httpx
 
-from zigbase._request import RequestSpec
+from zigbase._request import RequestSpec, ensure_object_body
 from zigbase._transport import AsyncTransport, SyncTransport
 from zigbase.accounts import AccountsService, AsyncAccountsService
 from zigbase.analytics import AnalyticsService, AsyncAnalyticsService
@@ -169,7 +169,7 @@ class ZigBase:
 
     def health(self) -> dict[str, Any]:
         """`GET /api/health`."""
-        return cast(dict[str, Any], self.send("GET", "/api/health"))
+        return ensure_object_body(self.send("GET", "/api/health"), context="health")
 
     def with_account(self, account_id: str) -> ZigBase:
         """A sibling `ZigBase` sharing this instance's `auth_store` and
@@ -309,7 +309,7 @@ class AsyncZigBase:
 
     async def health(self) -> dict[str, Any]:
         """`GET /api/health`."""
-        return cast(dict[str, Any], await self.send("GET", "/api/health"))
+        return ensure_object_body(await self.send("GET", "/api/health"), context="health")
 
     def with_account(self, account_id: str) -> AsyncZigBase:
         """See `ZigBase.with_account`."""

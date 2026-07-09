@@ -579,3 +579,58 @@ async def test_async_iterate_raises_status_0_on_non_advancing_cursor() -> None:
             pass
 
     assert excinfo.value.status == 0
+
+
+# --- non-object 2xx body guard ---------------------------------------------------
+#
+# `SyncTransport`/`AsyncTransport._decode_response` returns `None` for a 204 or
+# any other empty-bodied 2xx -- the transport has no way to know a given
+# endpoint's contract promises a JSON object. Every helper below used to
+# `typing.cast(dict, body)` that `None` and then crash with a bare
+# AttributeError on the first `.get(...)`. They now route through
+# `ensure_object_body` and raise a clear status-0 `ZigbaseError` instead.
+
+
+def test_get_one_raises_clear_error_on_non_object_body() -> None:
+    transport = MockTransport(lambda spec: None)
+    svc = CollectionService(transport, "posts")
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        svc.get_one("r1")
+    assert excinfo.value.status == 0
+
+
+def test_get_list_raises_clear_error_on_non_object_body() -> None:
+    transport = MockTransport(lambda spec: None)
+    svc = CollectionService(transport, "posts")
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        svc.get_list()
+    assert excinfo.value.status == 0
+
+
+def test_get_page_raises_clear_error_on_non_object_body() -> None:
+    transport = MockTransport(lambda spec: None)
+    svc = CollectionService(transport, "posts")
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        svc.get_page()
+    assert excinfo.value.status == 0
+
+
+async def test_async_get_one_raises_clear_error_on_non_object_body() -> None:
+    transport = AsyncMockTransport(lambda spec: None)
+    svc = AsyncCollectionService(transport, "posts")
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        await svc.get_one("r1")
+    assert excinfo.value.status == 0
+
+
+async def test_async_get_list_raises_clear_error_on_non_object_body() -> None:
+    transport = AsyncMockTransport(lambda spec: None)
+    svc = AsyncCollectionService(transport, "posts")
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        await svc.get_list()
+    assert excinfo.value.status == 0

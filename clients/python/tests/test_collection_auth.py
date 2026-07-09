@@ -502,3 +502,38 @@ def test_auth_endpoints_uri_encode_collection_name() -> None:
     svc.request_password_reset("a@b.com")
 
     assert "weird%20name%2Fx" in transport.calls[0].path
+
+
+# --- non-object 2xx body guard ---------------------------------------------------
+#
+# A 204/empty-bodied 2xx decodes to `None` (see test_collection.py's
+# equivalent section for the full rationale); auth-response parsing and
+# `{items}` unwrapping must raise a clear status-0 `ZigbaseError` rather than
+# crash on `.get(...)`.
+
+
+def test_auth_with_password_raises_clear_error_on_non_object_body() -> None:
+    transport = MockTransport(sequence_handler(None))
+    svc = CollectionService(transport, "users")
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        svc.auth_with_password("a@b.com", "secret")
+    assert excinfo.value.status == 0
+
+
+def test_list_auth_providers_raises_clear_error_on_non_object_body() -> None:
+    transport = MockTransport(sequence_handler(None))
+    svc = CollectionService(transport, "users")
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        svc.list_auth_providers()
+    assert excinfo.value.status == 0
+
+
+async def test_async_auth_with_password_raises_clear_error_on_non_object_body() -> None:
+    transport = AsyncMockTransport(sequence_handler(None))
+    svc = AsyncCollectionService(transport, "users")
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        await svc.auth_with_password("a@b.com", "secret")
+    assert excinfo.value.status == 0

@@ -19,9 +19,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
-from zigbase._request import RequestSpec, encode_path_segment
+from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body
 from zigbase._transport import AsyncTransport, SyncTransport
 from zigbase.errors import ZigbaseError
 from zigbase.query import build_list_params
@@ -92,10 +92,13 @@ def _pluck(opts: dict[str, Any], keys: frozenset[str]) -> dict[str, Any]:
     return picked
 
 
-def _as_dict(body: Any) -> dict[str, Any]:
-    """Trust-the-wire-contract cast: the server always answers these
-    endpoints with a JSON object (never a bare array/scalar)."""
-    return cast(dict[str, Any], body)
+def _as_dict(body: Any, context: str) -> dict[str, Any]:
+    """The server always answers these endpoints with a JSON object (never
+    a bare array/scalar) -- but `_decode_response` returns `None` for any
+    2xx with a 204/empty body, so this is a real runtime check, not a bare
+    cast: `ensure_object_body` raises a clear `ZigbaseError` rather than
+    letting a malformed 2xx crash on the first `.get(...)`."""
+    return ensure_object_body(body, context=context)
 
 
 def _collection_base(name: str) -> str:
@@ -110,12 +113,12 @@ def _record_path(name: str, record_id: str) -> str:
     return f"{_records_base(name)}/{encode_path_segment(record_id)}"
 
 
-def _parse_auth_response(body: Any) -> AuthResponse:
+def _parse_auth_response(body: Any, context: str) -> AuthResponse:
     """Parse a `{token, record?, meta?}` auth envelope. `record`/`meta` fall
     back to `None` when absent or not shaped as an object -- trusting the
     wire contract for `token` (always present on these endpoints) but not
     over-trusting the optional fields."""
-    envelope = _as_dict(body)
+    envelope = _as_dict(body, context)
     raw_record = envelope.get("record")
     raw_meta = envelope.get("meta")
     return AuthResponse(
@@ -139,10 +142,10 @@ def _oauth2_complete_body(
     return body
 
 
-def _unwrap_items(body: Any) -> list[dict[str, Any]]:
+def _unwrap_items(body: Any, context: str) -> list[dict[str, Any]]:
     """Unwrap the house `{items}` list envelope used by
     `list_auth_providers`/`list_sessions`."""
-    envelope = _as_dict(body)
+    envelope = _as_dict(body, context)
     items = envelope.get("items")
     return list(items) if isinstance(items, list) else []
 
@@ -160,8 +163,8 @@ def _change_password_reauth_identity(
     return identity if isinstance(identity, str) else None
 
 
-def _parse_list_result(body: Any) -> ListResult:
-    envelope = _as_dict(body)
+def _parse_list_result(body: Any, context: str) -> ListResult:
+    envelope = _as_dict(body, context)
     items = envelope.get("items")
     return ListResult(
         page=envelope.get("page", 0),
@@ -172,8 +175,8 @@ def _parse_list_result(body: Any) -> ListResult:
     )
 
 
-def _parse_cursor_page(body: Any) -> CursorPage:
-    envelope = _as_dict(body)
+def _parse_cursor_page(body: Any, context: str) -> CursorPage:
+    envelope = _as_dict(body, context)
     items = envelope.get("items")
     return CursorPage(
         items=list(items) if isinstance(items, list) else [],
@@ -280,7 +283,7 @@ class CollectionService:
                 skip_auth=True,
             )
         )
-        auth = _parse_auth_response(body)
+        auth = _parse_auth_response(body, "auth_with_password")
         self._transport.auth_store.save(auth.token, auth.record)
         return auth
 
@@ -298,7 +301,7 @@ class CollectionService:
                 is_refresh=True,
             )
         )
-        auth = _parse_auth_response(body)
+        auth = _parse_auth_response(body, "auth_refresh")
         self._transport.auth_store.save(auth.token, auth.record)
         return auth
 
@@ -308,7 +311,7 @@ class CollectionService:
         body = self._transport.request(
             RequestSpec(method="GET", path=f"{_collection_base(self.name)}/auth/oauth2/providers")
         )
-        return _unwrap_items(body)
+        return _unwrap_items(body, "list_auth_providers")
 
     def oauth2_init(self, provider: str) -> dict[str, Any]:
         """`POST /auth/oauth2/initiate` with `{provider}` --
@@ -320,7 +323,7 @@ class CollectionService:
                 body={"provider": provider},
             )
         )
-        return _as_dict(body)
+        return _as_dict(body, "oauth2_init")
 
     def auth_with_oauth2(
         self,
@@ -348,7 +351,7 @@ class CollectionService:
                 skip_auth=True,
             )
         )
-        token = _as_dict(body).get("token", "")
+        token = _as_dict(body, "auth_with_oauth2").get("token", "")
         self._transport.auth_store.save(token, None)
         return AuthResponse(token=token, record=None, meta=None)
 
@@ -430,7 +433,7 @@ class CollectionService:
         body = self._transport.request(
             RequestSpec(method="GET", path=f"{_collection_base(self.name)}/auth/sessions")
         )
-        return _unwrap_items(body)
+        return _unwrap_items(body, "list_sessions")
 
     def revoke_session(self, session_id: str) -> None:
         """`DELETE /auth/sessions/:id` -- "log out THIS device" (table mode
@@ -484,7 +487,7 @@ class CollectionService:
         body = self._transport.request(
             RequestSpec(method="GET", path=_records_base(self.name), query=query)
         )
-        return _parse_list_result(body)
+        return _parse_list_result(body, "get_list")
 
     def get_one(
         self, record_id: str, *, expand: str | None = None, fields: str | None = None
@@ -494,7 +497,7 @@ class CollectionService:
         body = self._transport.request(
             RequestSpec(method="GET", path=_record_path(self.name, record_id), query=query)
         )
-        return _as_dict(body)
+        return _as_dict(body, "get_one")
 
     def get_first_list_item(self, filter: str, **opts: Any) -> dict[str, Any]:
         """`get_list(1, 1, skip_total=True, filter=filter, ...)` sugar.
@@ -524,7 +527,7 @@ class CollectionService:
         res = self._transport.request(
             RequestSpec(method="POST", path=_records_base(self.name), query=query, body=body)
         )
-        return _as_dict(res)
+        return _as_dict(res, "create")
 
     def update(
         self,
@@ -541,7 +544,7 @@ class CollectionService:
                 method="PATCH", path=_record_path(self.name, record_id), query=query, body=body
             )
         )
-        return _as_dict(res)
+        return _as_dict(res, "update")
 
     def delete(self, record_id: str) -> None:
         """`DELETE /records/:id`."""
@@ -554,7 +557,7 @@ class CollectionService:
         body = self._transport.request(
             RequestSpec(method="GET", path=f"{_record_path(self.name, record_id)}/abilities")
         )
-        envelope = _as_dict(body)
+        envelope = _as_dict(body, "get_abilities")
         return {
             "view": bool(envelope.get("view", False)),
             "update": bool(envelope.get("update", False)),
@@ -581,7 +584,7 @@ class CollectionService:
         body = self._transport.request(
             RequestSpec(method="GET", path=_records_base(self.name), query=query)
         )
-        return _parse_cursor_page(body)
+        return _parse_cursor_page(body, "get_page")
 
     def iterate(self, *, batch: int = 100, **opts: Any) -> Iterator[dict[str, Any]]:
         """Iterate every matching record, following the server's `next_cursor`.
@@ -631,7 +634,7 @@ class AsyncCollectionService:
                 skip_auth=True,
             )
         )
-        auth = _parse_auth_response(body)
+        auth = _parse_auth_response(body, "auth_with_password")
         self._transport.auth_store.save(auth.token, auth.record)
         return auth
 
@@ -645,7 +648,7 @@ class AsyncCollectionService:
                 is_refresh=True,
             )
         )
-        auth = _parse_auth_response(body)
+        auth = _parse_auth_response(body, "auth_refresh")
         self._transport.auth_store.save(auth.token, auth.record)
         return auth
 
@@ -655,7 +658,7 @@ class AsyncCollectionService:
         body = await self._transport.request(
             RequestSpec(method="GET", path=f"{_collection_base(self.name)}/auth/oauth2/providers")
         )
-        return _unwrap_items(body)
+        return _unwrap_items(body, "list_auth_providers")
 
     async def oauth2_init(self, provider: str) -> dict[str, Any]:
         """`POST /auth/oauth2/initiate` with `{provider}` --
@@ -667,7 +670,7 @@ class AsyncCollectionService:
                 body={"provider": provider},
             )
         )
-        return _as_dict(body)
+        return _as_dict(body, "oauth2_init")
 
     async def auth_with_oauth2(
         self,
@@ -693,7 +696,7 @@ class AsyncCollectionService:
                 skip_auth=True,
             )
         )
-        token = _as_dict(body).get("token", "")
+        token = _as_dict(body, "auth_with_oauth2").get("token", "")
         self._transport.auth_store.save(token, None)
         return AuthResponse(token=token, record=None, meta=None)
 
@@ -766,7 +769,7 @@ class AsyncCollectionService:
         body = await self._transport.request(
             RequestSpec(method="GET", path=f"{_collection_base(self.name)}/auth/sessions")
         )
-        return _unwrap_items(body)
+        return _unwrap_items(body, "list_sessions")
 
     async def revoke_session(self, session_id: str) -> None:
         """`DELETE /auth/sessions/:id` -- "log out THIS device" (table mode
@@ -820,7 +823,7 @@ class AsyncCollectionService:
         body = await self._transport.request(
             RequestSpec(method="GET", path=_records_base(self.name), query=query)
         )
-        return _parse_list_result(body)
+        return _parse_list_result(body, "get_list")
 
     async def get_one(
         self, record_id: str, *, expand: str | None = None, fields: str | None = None
@@ -830,7 +833,7 @@ class AsyncCollectionService:
         body = await self._transport.request(
             RequestSpec(method="GET", path=_record_path(self.name, record_id), query=query)
         )
-        return _as_dict(body)
+        return _as_dict(body, "get_one")
 
     async def get_first_list_item(self, filter: str, **opts: Any) -> dict[str, Any]:
         """`get_list(1, 1, skip_total=True, filter=filter, ...)` sugar.
@@ -860,7 +863,7 @@ class AsyncCollectionService:
         res = await self._transport.request(
             RequestSpec(method="POST", path=_records_base(self.name), query=query, body=body)
         )
-        return _as_dict(res)
+        return _as_dict(res, "create")
 
     async def update(
         self,
@@ -877,7 +880,7 @@ class AsyncCollectionService:
                 method="PATCH", path=_record_path(self.name, record_id), query=query, body=body
             )
         )
-        return _as_dict(res)
+        return _as_dict(res, "update")
 
     async def delete(self, record_id: str) -> None:
         """`DELETE /records/:id`."""
@@ -890,7 +893,7 @@ class AsyncCollectionService:
         body = await self._transport.request(
             RequestSpec(method="GET", path=f"{_record_path(self.name, record_id)}/abilities")
         )
-        envelope = _as_dict(body)
+        envelope = _as_dict(body, "get_abilities")
         return {
             "view": bool(envelope.get("view", False)),
             "update": bool(envelope.get("update", False)),
@@ -912,7 +915,7 @@ class AsyncCollectionService:
         body = await self._transport.request(
             RequestSpec(method="GET", path=_records_base(self.name), query=query)
         )
-        return _parse_cursor_page(body)
+        return _parse_cursor_page(body, "get_page")
 
     async def iterate(self, *, batch: int = 100, **opts: Any) -> AsyncIterator[dict[str, Any]]:
         """Async-iterate every matching record, following the server's

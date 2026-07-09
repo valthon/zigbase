@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
+from zigbase.errors import ZigbaseError
+
 
 @dataclass
 class RequestSpec:
@@ -44,4 +46,25 @@ def encode_path_segment(s: str) -> str:
     return quote(s, safe="")
 
 
-__all__ = ["RequestSpec", "encode_path_segment"]
+def ensure_object_body(body: Any, *, context: str) -> dict[str, Any]:
+    """Guard the boundary between `_decode_response`'s `Any` and every
+    service helper that expects a JSON object envelope.
+
+    `_decode_response` returns `None` for a 204/empty body on ANY 2xx
+    response -- the transport has no way to know a given endpoint's
+    contract promises an object. Without this guard, service helpers used
+    to `typing.cast(dict, body)` that `None` (or any other non-dict) and
+    then crash with a bare `AttributeError` on the first `.get(...)`. We'd
+    rather fail loudly with a clear `ZigbaseError` than let a malformed 2xx
+    masquerade as a value -- matching the SDK's reject-don't-coerce
+    posture (e.g. the non-advancing-cursor guard in collection.py)."""
+    if not isinstance(body, dict):
+        raise ZigbaseError(
+            status=0,
+            message=f"Expected a JSON object response ({context}).",
+            url="",
+        )
+    return body
+
+
+__all__ = ["RequestSpec", "encode_path_segment", "ensure_object_body"]

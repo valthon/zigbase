@@ -9,9 +9,9 @@ against clients/dart/lib/src/senders.dart and src/api/senders.zig.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
-from zigbase._request import RequestSpec, encode_path_segment
+from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body
 from zigbase._transport import AsyncTransport, SyncTransport
 
 
@@ -19,8 +19,8 @@ def _verify_path(sender_id: str) -> str:
     return f"/api/senders/{encode_path_segment(sender_id)}/verify"
 
 
-def _unwrap_items(body: Any) -> list[dict[str, Any]]:
-    envelope = cast(dict[str, Any], body)
+def _unwrap_items(body: Any, context: str) -> list[dict[str, Any]]:
+    envelope = ensure_object_body(body, context=context)
     items = envelope.get("items")
     return list(items) if isinstance(items, list) else []
 
@@ -35,7 +35,7 @@ class SendersService:
         """`GET /api/senders` -- the active account's sender identities.
         Unwraps `{items}`. Requires ZigBase >= 0.10.0."""
         body = self._transport.request(RequestSpec(method="GET", path="/api/senders"))
-        return _unwrap_items(body)
+        return _unwrap_items(body, "list")
 
     def create(self, email: str) -> dict[str, Any]:
         """`POST /api/senders` -- request verification of a From address.
@@ -45,7 +45,7 @@ class SendersService:
         body = self._transport.request(
             RequestSpec(method="POST", path="/api/senders", body={"email": email})
         )
-        return cast(dict[str, Any], body)
+        return ensure_object_body(body, context="create")
 
     def verify(self, sender_id: str, token: str) -> bool:
         """`POST /api/senders/:id/verify` -- confirm a pending identity.
@@ -55,7 +55,7 @@ class SendersService:
         body = self._transport.request(
             RequestSpec(method="POST", path=_verify_path(sender_id), body={"token": token})
         )
-        return bool(cast(dict[str, Any], body).get("verified", False))
+        return bool(ensure_object_body(body, context="verify").get("verified", False))
 
 
 class AsyncSendersService:
@@ -67,21 +67,21 @@ class AsyncSendersService:
     async def list(self) -> list[dict[str, Any]]:
         """See `SendersService.list`."""
         body = await self._transport.request(RequestSpec(method="GET", path="/api/senders"))
-        return _unwrap_items(body)
+        return _unwrap_items(body, "list")
 
     async def create(self, email: str) -> dict[str, Any]:
         """See `SendersService.create`."""
         body = await self._transport.request(
             RequestSpec(method="POST", path="/api/senders", body={"email": email})
         )
-        return cast(dict[str, Any], body)
+        return ensure_object_body(body, context="create")
 
     async def verify(self, sender_id: str, token: str) -> bool:
         """See `SendersService.verify`."""
         body = await self._transport.request(
             RequestSpec(method="POST", path=_verify_path(sender_id), body={"token": token})
         )
-        return bool(cast(dict[str, Any], body).get("verified", False))
+        return bool(ensure_object_body(body, context="verify").get("verified", False))
 
 
 __all__ = ["AsyncSendersService", "SendersService"]

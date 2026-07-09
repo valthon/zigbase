@@ -8,9 +8,9 @@ confirmed against src/api/accounts.zig.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
-from zigbase._request import RequestSpec, encode_path_segment
+from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body
 from zigbase._transport import AsyncTransport, SyncTransport
 
 
@@ -31,7 +31,7 @@ class AccountsService:
         prefer a dedicated `X-Account-Id`-scoped client -- the SDK never
         reads the cookie itself."""
         body = self._transport.request(RequestSpec(method="POST", path=_activate_path(account_id)))
-        return cast(dict[str, Any], body)
+        return ensure_object_body(body, context="activate")
 
 
 class AsyncAccountsService:
@@ -45,7 +45,7 @@ class AsyncAccountsService:
         body = await self._transport.request(
             RequestSpec(method="POST", path=_activate_path(account_id))
         )
-        return cast(dict[str, Any], body)
+        return ensure_object_body(body, context="activate")
 
 
 __all__ = ["AccountsService", "AsyncAccountsService"]

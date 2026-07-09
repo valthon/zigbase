@@ -11,10 +11,10 @@ it off the transport, which has no public `base_url` attribute.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any
 from urllib.parse import urlencode
 
-from zigbase._request import RequestSpec, encode_path_segment
+from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body
 from zigbase._transport import AsyncTransport, SyncTransport
 
 
@@ -115,7 +115,7 @@ class FilesService:
         """`POST /api/files/token` -- mint a short-lived file-access token
         for embedding protected files (e.g. in an `<img>` tag)."""
         body = self._transport.request(RequestSpec(method="POST", path="/api/files/token"))
-        return str(cast(dict[str, Any], body).get("token", ""))
+        return str(ensure_object_body(body, context="get_token").get("token", ""))
 
 
 class AsyncFilesService:
@@ -170,7 +170,7 @@ class AsyncFilesService:
     async def get_token(self) -> str:
         """See `FilesService.get_token`."""
         body = await self._transport.request(RequestSpec(method="POST", path="/api/files/token"))
-        return str(cast(dict[str, Any], body).get("token", ""))
+        return str(ensure_object_body(body, context="get_token").get("token", ""))
 
 
 __all__ = ["AsyncFilesService", "FilesService"]

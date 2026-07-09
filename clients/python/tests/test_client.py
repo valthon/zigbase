@@ -19,6 +19,7 @@ from zigbase.analytics import AnalyticsService, AsyncAnalyticsService
 from zigbase.auth_store import MemoryAuthStore
 from zigbase.client import AsyncZigBase, ZigBase
 from zigbase.collection import AsyncCollectionService, CollectionService
+from zigbase.errors import ZigbaseError
 from zigbase.files import AsyncFilesService, FilesService
 from zigbase.senders import AsyncSendersService, SendersService
 
@@ -121,6 +122,30 @@ def test_health_gets_api_health() -> None:
     assert requests[0].method == "GET"
     assert requests[0].url.path == "/api/health"
     zb.close()
+
+
+def test_health_raises_clear_error_on_204() -> None:
+    # A 2xx with no body decodes to `None` -- `health()` must not crash with
+    # a bare AttributeError trying to `.get(...)` off it.
+    zb = ZigBase(
+        "http://localhost:8090", http_client=make_sync_client(lambda r: httpx.Response(204))
+    )
+
+    with pytest.raises(ZigbaseError, match="JSON object") as exc_info:
+        zb.health()
+    assert exc_info.value.status == 0
+    zb.close()
+
+
+async def test_async_health_raises_clear_error_on_204() -> None:
+    zb = AsyncZigBase(
+        "http://localhost:8090", http_client=make_async_client(lambda r: httpx.Response(204))
+    )
+
+    with pytest.raises(ZigbaseError, match="JSON object") as exc_info:
+        await zb.health()
+    assert exc_info.value.status == 0
+    await zb.aclose()
 
 
 # --- send() / raw_request() --------------------------------------------------

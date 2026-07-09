@@ -17,9 +17,9 @@ field access degrades correctly (`prev_cursor`/`total_items` fall back to
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, cast
+from typing import Any
 
-from zigbase._request import RequestSpec, encode_path_segment
+from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body
 from zigbase._transport import AsyncTransport, SyncTransport
 from zigbase.collection import CursorPage, _parse_cursor_page
 from zigbase.query import build_list_params, format_date
@@ -66,8 +66,8 @@ def _rollup_query(opts: dict[str, Any]) -> dict[str, str]:
     return query
 
 
-def _unwrap_items(body: Any) -> list[dict[str, Any]]:
-    envelope = cast(dict[str, Any], body)
+def _unwrap_items(body: Any, context: str) -> list[dict[str, Any]]:
+    envelope = ensure_object_body(body, context=context)
     items = envelope.get("items")
     return list(items) if isinstance(items, list) else []
 
@@ -90,7 +90,7 @@ class AnalyticsService:
         body = self._transport.request(
             RequestSpec(method="GET", path="/api/analytics/events", query=_events_query(picked))
         )
-        return _parse_cursor_page(body)
+        return _parse_cursor_page(body, "events")
 
     def rollup(self, name: str, **opts: Any) -> list[dict[str, Any]]:
         """`GET /api/analytics/rollups/:name` -- a declared rollup's summary
@@ -107,7 +107,7 @@ class AnalyticsService:
                 query=_rollup_query(picked),
             )
         )
-        return _unwrap_items(body)
+        return _unwrap_items(body, "rollup")
 
 
 class AsyncAnalyticsService:
@@ -122,7 +122,7 @@ class AsyncAnalyticsService:
         body = await self._transport.request(
             RequestSpec(method="GET", path="/api/analytics/events", query=_events_query(picked))
         )
-        return _parse_cursor_page(body)
+        return _parse_cursor_page(body, "events")
 
     async def rollup(self, name: str, **opts: Any) -> list[dict[str, Any]]:
         """See `AnalyticsService.rollup`."""
@@ -134,7 +134,7 @@ class AsyncAnalyticsService:
                 query=_rollup_query(picked),
             )
         )
-        return _unwrap_items(body)
+        return _unwrap_items(body, "rollup")
 
 
 __all__ = ["AnalyticsService", "AsyncAnalyticsService"]

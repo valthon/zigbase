@@ -20,6 +20,7 @@ import pytest
 from zigbase._request import RequestSpec
 from zigbase.accounts import AccountsService, AsyncAccountsService
 from zigbase.analytics import AnalyticsService, AsyncAnalyticsService
+from zigbase.errors import ZigbaseError
 from zigbase.files import AsyncFilesService, FilesService
 from zigbase.senders import AsyncSendersService, SendersService
 
@@ -328,3 +329,76 @@ async def test_async_senders_list_create_verify() -> None:
     assert await svc.list() == [{"id": "s1"}]
     assert await svc.create("e@f.com") == {"id": "s2", "email": "e@f.com", "status": "pending"}
     assert await svc.verify("s2", "tok") is True
+
+
+# --- non-object 2xx body guard ---------------------------------------------------
+#
+# `_decode_response` returns `None` for a 204/empty body on ANY 2xx -- the
+# transport can't know a given endpoint's contract promises a JSON object.
+# `get_token`/`rollup`/`list`/`verify` used to `typing.cast(dict, body)` that
+# `None` and crash with a bare AttributeError on the first `.get(...)`; they
+# now raise a clear status-0 `ZigbaseError` instead.
+
+
+def test_get_token_raises_clear_error_on_non_object_body() -> None:
+    svc = FilesService(MockTransport(sequence_handler(None)), "http://localhost:8090")
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        svc.get_token()
+    assert excinfo.value.status == 0
+
+
+async def test_async_get_token_raises_clear_error_on_non_object_body() -> None:
+    svc = AsyncFilesService(AsyncMockTransport(sequence_handler(None)), "http://localhost:8090")
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        await svc.get_token()
+    assert excinfo.value.status == 0
+
+
+def test_rollup_raises_clear_error_on_non_object_body() -> None:
+    svc = AnalyticsService(MockTransport(sequence_handler(None)))
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        svc.rollup("daily")
+    assert excinfo.value.status == 0
+
+
+async def test_async_events_raises_clear_error_on_non_object_body() -> None:
+    svc = AsyncAnalyticsService(AsyncMockTransport(sequence_handler(None)))
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        await svc.events()
+    assert excinfo.value.status == 0
+
+
+def test_senders_list_raises_clear_error_on_non_object_body() -> None:
+    svc = SendersService(MockTransport(sequence_handler(None)))
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        svc.list()
+    assert excinfo.value.status == 0
+
+
+def test_senders_verify_raises_clear_error_on_non_object_body() -> None:
+    svc = SendersService(MockTransport(sequence_handler(None)))
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        svc.verify("s1", "tok")
+    assert excinfo.value.status == 0
+
+
+async def test_async_senders_verify_raises_clear_error_on_non_object_body() -> None:
+    svc = AsyncSendersService(AsyncMockTransport(sequence_handler(None)))
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        await svc.verify("s1", "tok")
+    assert excinfo.value.status == 0
+
+
+def test_activate_raises_clear_error_on_non_object_body() -> None:
+    svc = AccountsService(MockTransport(sequence_handler(None)))
+
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        svc.activate("acc_1")
+    assert excinfo.value.status == 0

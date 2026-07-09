@@ -17,7 +17,7 @@ import httpx
 import pytest
 
 from zigbase import _transport
-from zigbase._request import RequestSpec, encode_path_segment
+from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body
 from zigbase._transport import SyncTransport
 from zigbase.auth_store import MemoryAuthStore
 from zigbase.errors import ZigbaseError
@@ -60,6 +60,19 @@ def json_response(
 def test_encode_path_segment_escapes_slash_and_special_chars() -> None:
     assert encode_path_segment("a/b c") == "a%2Fb%20c"
     assert encode_path_segment("plain") == "plain"
+
+
+def test_ensure_object_body_passes_through_a_dict() -> None:
+    body = {"a": 1}
+    assert ensure_object_body(body, context="x") is body
+
+
+@pytest.mark.parametrize("body", [None, [], "str", 1, True])
+def test_ensure_object_body_raises_status_0_on_non_dict(body: object) -> None:
+    with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
+        ensure_object_body(body, context="get_one")
+    assert excinfo.value.status == 0
+    assert "get_one" in excinfo.value.message
 
 
 def test_request_spec_defaults() -> None:
