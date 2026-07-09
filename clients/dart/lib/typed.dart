@@ -536,6 +536,13 @@ class TypedRealtimeEvent<T> {
 
 /// Typed realtime surface for one collection. A generated subclass fixes [T]
 /// and the `fromRecord` mapper.
+///
+/// This wraps the client's single **shared, multiplexed** [RealtimeService] —
+/// there is deliberately no per-collection `close()` (the TS typed realtime
+/// surface has none either): closing the shared service would kill every
+/// other collection's subscriptions and permanently disable reconnect.
+/// Tear down individual subscriptions with the [ZbUnsubscribe] returned by
+/// [subscribe]; tear down the connection itself with `ZigbaseClient.close()`.
 class TypedRealtime<T> {
   TypedRealtime(ZigbaseClient client, this.meta, this.fromRecord)
       : _rt = client.realtime;
@@ -559,6 +566,4 @@ class TypedRealtime<T> {
   Stream<TypedRealtimeEvent<T>> stream({String? filter, Expr? where}) =>
       _rt.stream(meta.name, filter: where?.compile() ?? filter).map((e) =>
           TypedRealtimeEvent<T>(e.topic, e.action, fromRecord(e.record)));
-
-  Future<void> close() => _rt.close();
 }
