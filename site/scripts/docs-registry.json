@@ -1,0 +1,172 @@
+[
+  {
+    "canonical": "CHANGELOG.md",
+    "mirror": "changelog.md",
+    "frontmatter": {
+      "title": "Changelog",
+      "description": "Release history for ZigBase, following Keep a Changelog and Semantic Versioning.",
+      "order": 4,
+      "group": "reference"
+    }
+  },
+  {
+    "canonical": "KNOWN_LIMITATIONS.md",
+    "mirror": "known-limitations.md",
+    "frontmatter": {
+      "title": "Known limitations",
+      "description": "Current caveats in ZigBase — auth/email, framework hooks, schema migrations, fields, the scheduler, platform/UI gaps, and deferred work.",
+      "order": 3,
+      "group": "reference"
+    }
+  },
+  {
+    "canonical": "docs/abilities.md",
+    "mirror": "abilities.md",
+    "frontmatter": {
+      "title": "Relationship abilities",
+      "description": "Per-collection, per-action authorization by the principal's relationship to the row — declaring abilities, ctx.can, and the abilities endpoint.",
+      "order": 3,
+      "group": "features"
+    }
+  },
+  {
+    "canonical": "docs/analytics.md",
+    "mirror": "analytics.md",
+    "frontmatter": {
+      "title": "Product analytics",
+      "description": "Capturing immutable events with ctx.track, declarative rollups, and the tenant-scoped analytics read API.",
+      "order": 5,
+      "group": "features"
+    }
+  },
+  {
+    "canonical": "docs/api.md",
+    "mirror": "api.md",
+    "frontmatter": {
+      "title": "API",
+      "description": "The ZigBase HTTP REST and realtime WebSocket reference — collections, records, query grammar, access rules, auth, OAuth2, files, and realtime.",
+      "order": 1,
+      "group": "reference"
+    }
+  },
+  {
+    "canonical": "docs/dart-sdk.md",
+    "mirror": "dart-sdk.md",
+    "frontmatter": {
+      "title": "Dart SDK",
+      "description": "The official zigbase_client Dart SDK — auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web.",
+      "order": 6,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/docker.md",
+    "mirror": "docker.md",
+    "frontmatter": {
+      "title": "Docker",
+      "description": "The official ghcr.io/valthon/zigbase image — quick start, data-volume ownership, non-root user, network bind, healthchecks, and tags.",
+      "order": 5,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/email.md",
+    "mirror": "email.md",
+    "frontmatter": {
+      "title": "Email",
+      "description": "Sending application mail — templates, SES/Postmark/SMTP providers, verified senders, bounce suppression, and asserting mail in tests.",
+      "order": 6,
+      "group": "features"
+    }
+  },
+  {
+    "canonical": "docs/fields.md",
+    "mirror": "fields.md",
+    "frontmatter": {
+      "title": "Fields",
+      "description": "The complete catalog of ZigBase field types and their options — text, email, url, editor, date, autodate, bool, number, json, select, relation, and file.",
+      "order": 2,
+      "group": "reference"
+    }
+  },
+  {
+    "canonical": "docs/framework.md",
+    "mirror": "framework.md",
+    "frontmatter": {
+      "title": "Framework",
+      "description": "Embed ZigBase as a Zig library — comptime record hooks, custom routes, scheduled jobs, a comptime schema with additive auto-migration, pluggable storage/mailer backends, and footprint levers.",
+      "order": 2,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/jobs-and-webhooks.md",
+    "mirror": "jobs-and-webhooks.md",
+    "frontmatter": {
+      "title": "Jobs & webhooks",
+      "description": "Background queues, workers, and job kinds — plus signed outbound webhooks with retry, backoff, and idempotency keys.",
+      "order": 7,
+      "group": "features"
+    }
+  },
+  {
+    "canonical": "docs/postgres.md",
+    "mirror": "postgres.md",
+    "frontmatter": {
+      "title": "PostgreSQL backend",
+      "description": "Run ZigBase on PostgreSQL — the -Dpostgres build, ZIGBASE_DB_URL, multi-instance realtime, migrating from SQLite with migrate-db, and pgvector.",
+      "order": 1,
+      "group": "features"
+    }
+  },
+  {
+    "canonical": "docs/realtime-broadcast.md",
+    "mirror": "realtime-broadcast.md",
+    "frontmatter": {
+      "title": "Realtime broadcast",
+      "description": "Pushing to custom WebSocket channels from routes and jobs — signal vs broadcast, and gating subscriptions with canSubscribe.",
+      "order": 8,
+      "group": "features"
+    }
+  },
+  {
+    "canonical": "docs/recipes.md",
+    "mirror": "recipes.md",
+    "frontmatter": {
+      "title": "Recipes",
+      "description": "Copy-pasteable recipes — provisioning a schema, signup, owner-scoped access rules, validation hooks, custom routes, and DB access in cron jobs.",
+      "order": 1,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/search.md",
+    "mirror": "search.md",
+    "frontmatter": {
+      "title": "Full-text & vector search",
+      "description": "Ranked ?search= queries on searchable fields, operators, how search composes with filters and rules, and opt-in -Dvector KNN.",
+      "order": 4,
+      "group": "features"
+    }
+  },
+  {
+    "canonical": "docs/tenancy.md",
+    "mirror": "tenancy.md",
+    "frontmatter": {
+      "title": "Multi-tenancy",
+      "description": "Account-scoped collections — enabling tenancy, tenant_field, accounts/memberships/invitations, roles, and the @request.account rule macros.",
+      "order": 2,
+      "group": "features"
+    }
+  },
+  {
+    "canonical": "docs/typescript-sdk.md",
+    "mirror": "typescript-sdk.md",
+    "frontmatter": {
+      "title": "TypeScript SDK",
+      "description": "The official @zigbase/client TypeScript SDK — auth, records, offset + cursor pagination, files, realtime, and the live store.",
+      "order": 4,
+      "group": "guides"
+    }
+  }
+]

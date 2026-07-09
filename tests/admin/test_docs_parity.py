@@ -90,8 +90,11 @@ def _table_keys(md_path):
 
 def test_config_key_table_matches_allowed_tuple():
     allowed = _allowed_keys()
-    for doc in (REPO / "docs" / "framework.md", REPO / "site" / "src" / "content" / "docs" / "framework.md"):
-        table = _table_keys(doc)
-        assert table == allowed, (
-            f"{doc}: config-key table drift. missing={sorted(allowed - table)} stale={sorted(table - allowed)}"
-        )
+    # Only the canonical docs/framework.md is checked: the site mirror
+    # (site/src/content/docs/framework.md) is a gitignored build artifact generated
+    # from this canonical by site/scripts/gen-docs-mirror.mjs, so it cannot drift and
+    # is absent from a plain checkout (e.g. CI, which does not build the Astro site).
+    table = _table_keys(REPO / "docs" / "framework.md")
+    assert table == allowed, (
+        f"config-key table drift in docs/framework.md. missing={sorted(allowed - table)} stale={sorted(table - allowed)}"
+    )
