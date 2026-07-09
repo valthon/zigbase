@@ -3548,6 +3548,8 @@ transpiler:
 ZigBase deliberately does **not** transpile SQL between dialects — it is fragile and
 silently mis-handles the edges that matter (collation, `strftime`, `GLOB`). A
 SQLite-only consumer that never builds with `-Dpostgres` keeps working unchanged.
+The framework's own comptime-schema provisioning is fully cross-backend, so most
+apps need no raw migrations.
 
 **Postgres collation.** Provisioned TEXT columns are pinned to `COLLATE "C"` so text
 ordering / keyset pagination matches SQLite's BINARY byte order across backends. A comptime

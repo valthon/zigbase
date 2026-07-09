@@ -137,7 +137,8 @@ type-specific `options` object. Common options include `required`, `unique`, and
 `encrypted` (text/editor/json only — see
 [fields.md → Encryption at rest](fields.md#encryption-at-rest-encrypted));
 `relation` fields reference another collection. Auth collections (`"type":"auth"`)
-have system fields such as `email` injected automatically.
+have system fields such as `email` injected automatically. The complete field-type
+catalog is in [fields.md](fields.md).
 
 ### Collection options
 
@@ -841,6 +842,7 @@ Per-method rate-limit behavior is configured in `.auth.methods` via the `rate_li
   set **only** behind a trusted reverse proxy that rewrites them, the key is the IP from
   `X-Forwarded-For` (first hop) or `X-Real-IP`. Otherwise the limiter keys on the submitted
   identity/email, which is not header-spoofable. This makes direct exposure safe by default.
+  See [Known limitations](../KNOWN_LIMITATIONS.md).
 
 ### OAuth2
 

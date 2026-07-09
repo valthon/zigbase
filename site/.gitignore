@@ -5,3 +5,18 @@ dist/
 # Generated from canonical docs by scripts/gen-docs-mirror.mjs — do not commit.
 src/content/docs/changelog.md
 src/content/docs/known-limitations.md
+src/content/docs/abilities.md
+src/content/docs/analytics.md
+src/content/docs/api.md
+src/content/docs/dart-sdk.md
+src/content/docs/docker.md
+src/content/docs/email.md
+src/content/docs/fields.md
+src/content/docs/framework.md
+src/content/docs/jobs-and-webhooks.md
+src/content/docs/postgres.md
+src/content/docs/realtime-broadcast.md
+src/content/docs/recipes.md
+src/content/docs/search.md
+src/content/docs/tenancy.md
+src/content/docs/typescript-sdk.md
