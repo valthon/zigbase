@@ -444,15 +444,21 @@ class EnumFieldExpr(FieldExpr[E]):
         super().__init__(path)
         self._wire_of = wire_of
 
-    def eq(self, value: E) -> Expr:
-        return Expr(f"{self.path} = {filter_value(self._wire_of(value))}")
+    def eq(self, value: E | None) -> Expr:
+        return Expr(f"{self.path} = {self._filter_wire(value)}")
 
-    def neq(self, value: E) -> Expr:
-        return Expr(f"{self.path} != {filter_value(self._wire_of(value))}")
+    def neq(self, value: E | None) -> Expr:
+        return Expr(f"{self.path} != {self._filter_wire(value)}")
 
-    def in_list(self, values: Sequence[E]) -> Expr:
-        rendered = ", ".join(filter_value(self._wire_of(v)) for v in values)
+    def in_list(self, values: Sequence[E | None]) -> Expr:
+        rendered = ", ".join(self._filter_wire(v) for v in values)
         return Expr(f"{self.path} in ({rendered})")
+
+    def _filter_wire(self, value: E | None) -> str:
+        # `None` must reach `filter_value` un-wired -- `wire_of` (e.g. `lambda
+        # e: e.value`) has no defined behavior for `None`, and every other
+        # FieldExpr already renders `None` -> `null` via `filter_value` alone.
+        return filter_value(value if value is None else self._wire_of(value))
 
     # Rebind (not inherited): FieldExpr.__eq__/__ne__ were assigned from
     # FieldExpr's own eq/neq at that class's definition time, so without

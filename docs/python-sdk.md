@@ -837,8 +837,10 @@ zb.posts.get_list(where=lambda p: p.author.rel(lambda a: a.name.like("A")))
 ```
 
 Operators: `eq`/`neq` (all fields; also bound to `==`/`!=`), `gt`/`gte`/`lt`/`lte` (also
-`>`/`>=`/`<`/`<=`; numbers, dates, strings), `like`/`nlike` (strings), `in_list`. `sort=`
-accepts a field string or a sequence (`"-created"`, `["-age", "name"]`).
+`>`/`>=`/`<`/`<=`; numbers, dates, strings), `like`/`nlike` (strings), `in_list`. A `select`
+field's `eq`/`neq`/`in_list` also accept `None` for null filtering (`p.status.eq(None)` ->
+`status = null`), same as every other field. `sort=` accepts a field string or a sequence
+(`"-created"`, `["-age", "name"]`).
 `<Service>.filter(fn)` compiles a `where=`-style lambda to a plain filter string without
 issuing a request, when you need the string itself rather than a request.
 
@@ -865,6 +867,11 @@ with_tags.expand.tags        # list[Tag]
 
 Python has no way to statically prove "this call requested `author`", so `expand` attributes
 are nullable/empty by design — same as the Dart typed tier.
+
+`expand` (and each relation on the generated `<Rec>Expand` submodel) defaults, so
+manually constructing a record — in a test or mock — never requires building an expand
+submodel by hand: `Post(id="p1", title="hi", author="u1", ...)` is valid, and
+`post.expand.author is None` / `post.expand.tags == []`.
 
 ### Typed realtime + files
 

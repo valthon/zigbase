@@ -315,6 +315,16 @@ pub fn emitRecord(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
     }
     try checkDuplicateIdents(idents, names, try std.fmt.allocPrint(alloc, "record class {s} (collection '{s}')", .{ rec, c.name }));
 
+    // `<Rec>Expand` is emitted *before* `<Rec>` (not after, as its own
+    // from_record cross-reference alone would require) so that `<Rec>`'s
+    // `expand: <Rec>Expand = <Rec>Expand()` default -- a real expression,
+    // evaluated eagerly when the class body executes -- can resolve the
+    // name. This is unlike every *annotation* in this file (including
+    // `expand`'s own), which `from __future__ import annotations` turns
+    // into a lazily-resolved string; those may still forward-reference a
+    // collection emitted later.
+    if (has_rel) try emitExpand(alloc, w, cols, c);
+
     try putf(alloc, w, "class {s}(BaseModel):\n", .{rec});
     for (fields, 0..) |f, i| {
         const ty = try pt.pyRecordTypeOf(alloc, c.name, f);
@@ -322,7 +332,7 @@ pub fn emitRecord(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
     }
     if (has_rel) {
         const ex = try ident.expandName(alloc, c.name);
-        try putf(alloc, w, "    expand: {s}\n", .{ex});
+        try putf(alloc, w, "    expand: {s} = {s}()\n", .{ ex, ex });
     }
 
     try put(alloc, w, "\n    @classmethod\n");
@@ -335,8 +345,6 @@ pub fn emitRecord(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
         try putf(alloc, w, "            expand={s}.from_record(r),\n", .{ex});
     }
     try put(alloc, w, "        )\n\n\n");
-
-    if (has_rel) try emitExpand(alloc, w, cols, c);
 }
 
 fn emitExpand(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, c: schema.Collection) !void {
@@ -351,9 +359,12 @@ fn emitExpand(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, 
         const trec = try ident.recordName(alloc, target);
         const mid = try memberIdent(alloc, f.name, expand_reserved);
         if (f.isMultiValue()) {
-            try putf(alloc, w, "    {s}: list[{s}]\n", .{ mid, trec });
+            // A plain `= []` default is safe here (not the shared-mutable-
+            // default footgun of e.g. dataclasses): pydantic v2 deep-copies
+            // mutable defaults per instance.
+            try putf(alloc, w, "    {s}: list[{s}] = []\n", .{ mid, trec });
         } else {
-            try putf(alloc, w, "    {s}: {s} | None\n", .{ mid, trec });
+            try putf(alloc, w, "    {s}: {s} | None = None\n", .{ mid, trec });
         }
     }
 

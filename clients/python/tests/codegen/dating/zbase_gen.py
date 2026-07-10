@@ -101,6 +101,18 @@ class Tag(BaseModel):
         )
 
 
+class PhotoExpand(BaseModel):
+    owner: Profile | None = None
+    tags: list[Tag] = []
+
+    @classmethod
+    def from_record(cls, r: Mapping[str, Any]) -> PhotoExpand:
+        return cls(
+            owner=zbt.expand_one(r, "owner", Profile.from_record),
+            tags=zbt.expand_many(r, "tags", Tag.from_record),
+        )
+
+
 class Photo(BaseModel):
     id: str
     owner: str
@@ -109,7 +121,7 @@ class Photo(BaseModel):
     tags: list[str]
     created: str
     updated: str
-    expand: PhotoExpand
+    expand: PhotoExpand = PhotoExpand()
 
     @classmethod
     def from_record(cls, r: Mapping[str, Any]) -> Photo:
@@ -125,15 +137,13 @@ class Photo(BaseModel):
         )
 
 
-class PhotoExpand(BaseModel):
-    owner: Profile | None
-    tags: list[Tag]
+class PrivatePhotoExpand(BaseModel):
+    owner: Profile | None = None
 
     @classmethod
-    def from_record(cls, r: Mapping[str, Any]) -> PhotoExpand:
+    def from_record(cls, r: Mapping[str, Any]) -> PrivatePhotoExpand:
         return cls(
             owner=zbt.expand_one(r, "owner", Profile.from_record),
-            tags=zbt.expand_many(r, "tags", Tag.from_record),
         )
 
 
@@ -144,7 +154,7 @@ class PrivatePhoto(BaseModel):
     caption: str
     created: str
     updated: str
-    expand: PrivatePhotoExpand
+    expand: PrivatePhotoExpand = PrivatePhotoExpand()
 
     @classmethod
     def from_record(cls, r: Mapping[str, Any]) -> PrivatePhoto:
@@ -159,13 +169,15 @@ class PrivatePhoto(BaseModel):
         )
 
 
-class PrivatePhotoExpand(BaseModel):
-    owner: Profile | None
+class MessageExpand(BaseModel):
+    from_: Profile | None = None
+    to: Profile | None = None
 
     @classmethod
-    def from_record(cls, r: Mapping[str, Any]) -> PrivatePhotoExpand:
+    def from_record(cls, r: Mapping[str, Any]) -> MessageExpand:
         return cls(
-            owner=zbt.expand_one(r, "owner", Profile.from_record),
+            from_=zbt.expand_one(r, "from", Profile.from_record),
+            to=zbt.expand_one(r, "to", Profile.from_record),
         )
 
 
@@ -178,7 +190,7 @@ class Message(BaseModel):
     read: bool
     created: str
     updated: str
-    expand: MessageExpand
+    expand: MessageExpand = MessageExpand()
 
     @classmethod
     def from_record(cls, r: Mapping[str, Any]) -> Message:
@@ -195,12 +207,12 @@ class Message(BaseModel):
         )
 
 
-class MessageExpand(BaseModel):
-    from_: Profile | None
-    to: Profile | None
+class WinkExpand(BaseModel):
+    from_: Profile | None = None
+    to: Profile | None = None
 
     @classmethod
-    def from_record(cls, r: Mapping[str, Any]) -> MessageExpand:
+    def from_record(cls, r: Mapping[str, Any]) -> WinkExpand:
         return cls(
             from_=zbt.expand_one(r, "from", Profile.from_record),
             to=zbt.expand_one(r, "to", Profile.from_record),
@@ -214,7 +226,7 @@ class Wink(BaseModel):
     createdAt: str
     created: str
     updated: str
-    expand: WinkExpand
+    expand: WinkExpand = WinkExpand()
 
     @classmethod
     def from_record(cls, r: Mapping[str, Any]) -> Wink:
@@ -229,15 +241,13 @@ class Wink(BaseModel):
         )
 
 
-class WinkExpand(BaseModel):
-    from_: Profile | None
-    to: Profile | None
+class SubscriptionExpand(BaseModel):
+    profile: Profile | None = None
 
     @classmethod
-    def from_record(cls, r: Mapping[str, Any]) -> WinkExpand:
+    def from_record(cls, r: Mapping[str, Any]) -> SubscriptionExpand:
         return cls(
-            from_=zbt.expand_one(r, "from", Profile.from_record),
-            to=zbt.expand_one(r, "to", Profile.from_record),
+            profile=zbt.expand_one(r, "profile", Profile.from_record),
         )
 
 
@@ -251,7 +261,7 @@ class Subscription(BaseModel):
     metadata: Any
     created: str
     updated: str
-    expand: SubscriptionExpand
+    expand: SubscriptionExpand = SubscriptionExpand()
 
     @classmethod
     def from_record(cls, r: Mapping[str, Any]) -> Subscription:
@@ -266,16 +276,6 @@ class Subscription(BaseModel):
             created=zbt.coerce_str(r.get("created")),
             updated=zbt.coerce_str(r.get("updated")),
             expand=SubscriptionExpand.from_record(r),
-        )
-
-
-class SubscriptionExpand(BaseModel):
-    profile: Profile | None
-
-    @classmethod
-    def from_record(cls, r: Mapping[str, Any]) -> SubscriptionExpand:
-        return cls(
-            profile=zbt.expand_one(r, "profile", Profile.from_record),
         )
 
 

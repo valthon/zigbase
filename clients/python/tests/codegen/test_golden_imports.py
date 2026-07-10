@@ -14,6 +14,7 @@ exercise of the generated module, so it runs under the default
 from __future__ import annotations
 
 from tests.codegen.dating.zbase_gen import (
+    Photo,
     Profile,
     ProfileGender,
     Subscription,
@@ -66,6 +67,24 @@ def test_subscription_from_record_coerces_fixed_to_float() -> None:
     assert sub.price == 19.99
     assert sub.plan is SubscriptionPlan.PLUS
     assert sub.metadata == {"tier": "gold"}
+
+
+def test_record_with_relations_defaults_expand_without_manual_construction() -> None:
+    # A record with relation fields (e.g. Photo -> owner/tags) must be
+    # manually instantiable without building its `<Rec>Expand` submodel by
+    # hand: `expand` defaults to an already-constructed `PhotoExpand()`,
+    # whose own relation fields default to `None`/`[]`.
+    photo = Photo(
+        id="p1",
+        owner="prof123",
+        image="photo.png",
+        caption="hi",
+        tags=[],
+        created="2024-01-01T00:00:00Z",
+        updated="2024-01-02T00:00:00Z",
+    )
+    assert photo.expand.owner is None
+    assert photo.expand.tags == []
 
 
 def test_subscription_create_to_map_renders_fixed_scale_and_omits_unset() -> None:

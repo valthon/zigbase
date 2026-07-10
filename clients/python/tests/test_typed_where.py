@@ -158,6 +158,26 @@ class TestEnumField:
         assert (f.status == Status.PUBLISHED).compile() == "status = 'published'"
         assert (f.status != Status.DRAFT).compile() == "status != 'draft'"
 
+    def test_eq_neq_none_pass_through_to_null_without_calling_wire_of(self) -> None:
+        # Regression guard: eq/neq must not unconditionally call wire_of(value)
+        # -- wire_of is `lambda e: e.value`, and `None.value` raises
+        # AttributeError. None must reach filter_value() un-wired, same as
+        # every other FieldExpr (see the parity test below).
+        assert f.status.eq(None).compile() == "status = null"
+        assert f.status.neq(None).compile() == "status != null"
+
+    def test_in_list_none_element_passes_through_to_null(self) -> None:
+        assert f.status.in_list([Status.DRAFT, None]).compile() == "status in ('draft', null)"
+
+    def test_none_handling_matches_a_plain_fieldexpr(self) -> None:
+        # Parity: a plain FieldExpr (e.g. title, which has no wire_of at all)
+        # already renders None -> null via filter_value. EnumFieldExpr's None
+        # guard must produce the identical shape for the same op.
+        assert f.status.eq(None).compile() == f.title.eq(None).compile().replace("title", "status")
+        assert f.status.neq(None).compile() == f.title.neq(None).compile().replace(
+            "title", "status"
+        )
+
 
 class TestInList:
     def test_non_empty(self) -> None:
