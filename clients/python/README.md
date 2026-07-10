@@ -314,6 +314,46 @@ sharing state across a sync/async boundary — each facade owns its own `httpx` 
 default (pass `http_client=` to share/override one, mirroring `with_account`'s ownership
 rule).
 
+## Typed tier
+
+Generate a schema-aware client with Pydantic v2 record models, an injection-safe fluent
+filter builder, and typed sync/async collection services (plus async typed realtime) layered
+over the base SDK:
+
+```sh
+pip install 'zigbase[typed]'            # + `[typed,realtime]` if you also want typed realtime
+
+zigbase typegen --data-dir ./zb_data --out zbase_gen.py --lang python
+# or against a live server:
+zigbase typegen --url https://api.example.com --admin-email admin@x.io \
+  --admin-password '…' --out zbase_gen.py --lang python
+```
+
+```python
+from zbase_gen import PostCreate, PostStatus, create_client
+
+zb = create_client("http://127.0.0.1:8090")
+
+post = zb.posts.get_one("REC123")
+post.title    # str
+post.status   # PostStatus | None (a generated enum from the select field)
+
+created = zb.posts.create(PostCreate(title="Hi", status=PostStatus.DRAFT))
+page = zb.posts.get_list(
+    where=lambda p: p.status.eq(PostStatus.PUBLISHED) & (p.price >= 10),
+)
+zb.close()
+```
+
+`create_async_client(url, **kwargs)` builds the `asyncio` mirror (`AsyncZbClient`); every
+service method is `await`-ed, plus one typed realtime accessor per collection
+(`zb.postsRealtime.subscribe(...)`, async-only — there's no sync realtime to wrap). Every
+filter operand goes through the same `filter_value` the base SDK's `zb_filter` uses, so a
+`where=` lambda is exactly as injection-safe as a hand-built filter string.
+
+See [docs/python-sdk.md#typed-tier](../../docs/python-sdk.md#typed-tier) for the full
+generated-surface tour, int/fixed coercion semantics, and scope notes.
+
 ## Divergences from the TypeScript/Dart SDKs
 
 This is a straight behavioral port, but a few things differ by design, not oversight:

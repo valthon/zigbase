@@ -16,8 +16,8 @@ const REGISTRY = JSON.parse(readFileSync(join(siteDir, 'scripts/docs-registry.js
 const PUBLISHED = new Set([
   'abilities', 'analytics', 'api', 'changelog', 'configuration', 'dart-sdk',
   'docker', 'email', 'fields', 'framework', 'jobs-and-webhooks', 'known-limitations',
-  'overview', 'postgres', 'quick-start', 'realtime-broadcast', 'recipes', 'search',
-  'tenancy', 'tutorial', 'typescript-sdk',
+  'overview', 'postgres', 'python-sdk', 'quick-start', 'realtime-broadcast', 'recipes',
+  'search', 'tenancy', 'tutorial', 'typescript-sdk',
 ]);
 // Root canonicals linked by UPPER_CASE basename → their route.
 const ROOT_ROUTE = new Map([['CHANGELOG', 'changelog'], ['KNOWN_LIMITATIONS', 'known-limitations']]);

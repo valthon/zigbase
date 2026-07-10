@@ -55,6 +55,15 @@ Initial development of the official Python client for ZigBase — a behavioral p
   (`subscribe_topic`/`unsubscribe_topic`, `signal`/`message`), automatic re-auth on
   `auth_store` changes, and exponential-backoff reconnection with full resubscribe.
   `asyncio`-only — `ZigBase.realtime` raises `RuntimeError` naming `AsyncZigBase`.
+- **Typed tier (`zigbase[typed]`).** `zigbase typegen --lang python` generates Pydantic v2
+  record models, an injection-safe fluent filter builder (`Expr`/`FieldExpr` family, enum +
+  one-level nested-relation support) compiling to server filter strings, typed sync/async
+  collection services (`TypedCollection`/`AsyncTypedCollection` wrapping
+  `CollectionService`/`AsyncCollectionService`), async typed realtime
+  (`TypedRealtime`/`TypedRealtimeEvent`), and int/fixed decimal-string coercion helpers
+  (`coerce_int`/`coerce_float`/`encode_int`/`encode_fixed`) — over the new `zigbase.typed`
+  runtime module. Golden-gated in CI against the dating fixture, cross-checked against the
+  Dart and TypeScript typed tiers.
 
 ### Known limitations
 
