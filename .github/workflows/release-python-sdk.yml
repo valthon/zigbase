@@ -31,7 +31,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: clients/python
-        run: mise exec python@3.13 -- python -m pip install --quiet -e '.[dev]' build twine
+        run: mise exec python@3.13 -- python -m pip install --quiet -e '.[dev,realtime]' build twine
 
       - name: Lint (format)
         working-directory: clients/python

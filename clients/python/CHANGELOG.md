@@ -50,11 +50,17 @@ Initial development of the official Python client for ZigBase — a behavioral p
   the typed surface doesn't cover.
 - **Packaging.** PEP 561 `py.typed` marker — the package ships inline type hints
   (`mypy --strict`-checked) for downstream type checkers.
+- **Realtime (`zigbase[realtime]`).** `AsyncZigBase.realtime` with ack-gated
+  `subscribe`/`unsubscribe`, `stream()` async iteration, custom broadcast topics
+  (`subscribe_topic`/`unsubscribe_topic`, `signal`/`message`), automatic re-auth on
+  `auth_store` changes, and exponential-backoff reconnection with full resubscribe.
+  `asyncio`-only — `ZigBase.realtime` raises `RuntimeError` naming `AsyncZigBase`.
 
 ### Known limitations
 
-- **No realtime yet.** `RealtimeService`/live-store parity with the TypeScript/Dart SDKs is
-  deferred to a follow-up SDK milestone.
+- **No live-store tier yet.** The Dart/TypeScript SDKs'
+  `realtime.collection()`/`LiveRecord`/`LiveList` observables have no Python equivalent yet;
+  only the base subscribe/stream/topic API ships in this release.
 - **No request-key de-duplication.** The TypeScript/Dart SDKs' opt-in `requestKey`
   last-write-wins cancellation has no Python equivalent yet; use `httpx`'s own
   cancellation (e.g. `asyncio.wait_for`/task cancellation for `AsyncZigBase`) at the call

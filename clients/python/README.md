@@ -245,6 +245,38 @@ underlying `httpx` client — a login/logout via either is visible to both, and 
 instance that originally created the shared client (i.e. never a `with_account` sibling)
 closes it.
 
+## Realtime
+
+WebSocket subscriptions are `asyncio`-only (`ZigBase.realtime` raises `RuntimeError`); the
+default transport needs the `zigbase[realtime]` extra:
+
+```sh
+pip install 'zigbase[realtime]'
+```
+
+```python
+async with AsyncZigBase("http://127.0.0.1:8090") as zb:
+    def on_event(e):
+        print(e.action, e.record["id"])  # "create" | "update" | "delete"
+
+    unsub = await zb.realtime.subscribe("posts", on_event, filter="status = 'published'")
+    ...
+    await unsub()
+
+    # or iterate as an async generator
+    async for event in zb.realtime.stream("posts"):
+        ...
+```
+
+`zb.realtime` shares one WebSocket across every subscription, auto-reconnects with bounded
+exponential backoff, re-authenticates from `auth_store` on login/logout/refresh, and
+resubscribes everything after a reconnect. A `with_account` sibling that touches `.realtime`
+builds its own connection, separate from the parent's — `await sibling.aclose()` it
+individually; closing the parent (or another sibling) never closes it. See
+[docs/python-sdk.md#realtime](../../docs/python-sdk.md#realtime) for custom topics
+(`subscribe_topic`), the auth lifecycle (including the silent-token-expiry caveat), and known
+limitations.
+
 ## Escape hatch — `send()` and `raw_request()`
 
 `send()` calls any endpoint the typed surface doesn't cover, returning parsed JSON (or
@@ -286,8 +318,10 @@ rule).
 
 This is a straight behavioral port, but a few things differ by design, not oversight:
 
-- **No realtime yet.** `RealtimeService`/live-store parity is deferred to a follow-up SDK
-  milestone; there is no WebSocket/subscribe API in this release.
+- **No live-store tier yet.** `realtime` ships subscribe/stream/topic support (see
+  [Realtime](#realtime)), but not the Dart/TypeScript SDKs'
+  `realtime.collection()`/`LiveRecord`/`LiveList` observables — deferred to a follow-up SDK
+  milestone.
 - **No `requestKey` de-duplication.** The TypeScript/Dart SDKs' opt-in last-write-wins
   request cancellation (`requestKey=`) has no Python equivalent. For the async facade, use
   `asyncio` task cancellation (e.g. cancel the previous `asyncio.Task` before issuing a new

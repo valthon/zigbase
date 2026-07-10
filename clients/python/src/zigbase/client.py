@@ -23,13 +23,25 @@ is visible to both (same instance); closing the parent closes the shared
 client for every sibling. Using a closed client raises httpx's own
 `RuntimeError` -- there are no extra guards here (unlike client.dart's
 `StateError` gate on every accessor).
+
+Realtime (Task 6) is `asyncio`-only: `AsyncZigBase.realtime` lazily builds
+ONE `RealtimeService` per client instance (bound to `base_url`/`auth_store`,
+same instance on every later access) and `aclose()` tears it down first --
+before the transport -- since `RealtimeService.close()` needs the running
+loop and cancels its own tasks, while closing the transport is just an
+`httpx` client shutdown. `with_account` siblings each get their own lazily-
+built `realtime` service (subscriptions are tied to one connection, not
+shared across account-scoped siblings), constructed with the same injected
+`realtime_connector`/`on_realtime_error` as the parent. `ZigBase.realtime`
+raises `RuntimeError` naming `AsyncZigBase` -- there is no sync realtime
+transport.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from types import TracebackType
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 
@@ -40,6 +52,7 @@ from zigbase.analytics import AnalyticsService, AsyncAnalyticsService
 from zigbase.auth_store import AuthStore, MemoryAuthStore
 from zigbase.collection import AsyncCollectionService, CollectionService
 from zigbase.files import AsyncFilesService, FilesService
+from zigbase.realtime import RealtimeConnection, RealtimeService, _default_connector
 from zigbase.senders import AsyncSendersService, SendersService
 
 _SEND_OPT_KEYS = frozenset({"query", "body", "headers"})
@@ -133,6 +146,12 @@ class ZigBase:
         if self._senders is None:
             self._senders = SendersService(self._transport)
         return self._senders
+
+    @property
+    def realtime(self) -> NoReturn:
+        """Realtime (WebSocket) subscriptions are `asyncio`-only; use
+        `AsyncZigBase` instead."""
+        raise RuntimeError("Realtime is async-only; use AsyncZigBase")
 
     def send(
         self,
@@ -228,6 +247,8 @@ class AsyncZigBase:
         lang: str | None = None,
         max_retries: int = 3,
         http_client: httpx.AsyncClient | None = None,
+        realtime_connector: Callable[[str], Awaitable[RealtimeConnection]] | None = None,
+        on_realtime_error: Callable[[str], None] | None = None,
     ) -> None:
         self.base_url = _normalize_base_url(base_url)
         self.auth_store: AuthStore = auth_store if auth_store is not None else MemoryAuthStore()
@@ -251,6 +272,9 @@ class AsyncZigBase:
         self._accounts: AsyncAccountsService | None = None
         self._analytics: AsyncAnalyticsService | None = None
         self._senders: AsyncSendersService | None = None
+        self._realtime_connector = realtime_connector
+        self._on_realtime_error = on_realtime_error
+        self._realtime: RealtimeService | None = None
 
     def collection(self, name: str) -> AsyncCollectionService:
         """See `ZigBase.collection`."""
@@ -279,6 +303,24 @@ class AsyncZigBase:
         if self._senders is None:
             self._senders = AsyncSendersService(self._transport)
         return self._senders
+
+    @property
+    def realtime(self) -> RealtimeService:
+        """Lazily-constructed `RealtimeService` bound to this client's
+        `base_url`/`auth_store` -- the same instance on every later access.
+        Uses the constructor's `realtime_connector` when one was given, else
+        the default `websockets`-backed connector (requires the
+        `zigbase[realtime]` extra; only imported when a connection is
+        actually attempted). Each `with_account` sibling gets its own
+        instance -- see the module docstring."""
+        if self._realtime is None:
+            self._realtime = RealtimeService(
+                self.base_url,
+                self.auth_store,
+                connector=self._realtime_connector or _default_connector,
+                on_error=self._on_realtime_error,
+            )
+        return self._realtime
 
     async def send(
         self,
@@ -312,7 +354,9 @@ class AsyncZigBase:
         return ensure_object_body(await self.send("GET", "/api/health"), context="health")
 
     def with_account(self, account_id: str) -> AsyncZigBase:
-        """See `ZigBase.with_account`."""
+        """See `ZigBase.with_account`. The sibling gets its own lazily-built
+        `realtime` service (constructed with the same `realtime_connector`/
+        `on_realtime_error` as this instance) -- not shared with it."""
         return AsyncZigBase(
             self.base_url,
             auth_store=self.auth_store,
@@ -322,10 +366,17 @@ class AsyncZigBase:
             lang=self._lang,
             max_retries=self._max_retries,
             http_client=self._http_client,
+            realtime_connector=self._realtime_connector,
+            on_realtime_error=self._on_realtime_error,
         )
 
     async def aclose(self) -> None:
-        """See `ZigBase.close`."""
+        """See `ZigBase.close`. Closes the `realtime` service first, if one
+        was ever built -- it needs the running loop to cancel its own tasks,
+        so it must run before the transport's `httpx` client (which doesn't)
+        is torn down."""
+        if self._realtime is not None:
+            await self._realtime.close()
         if self._owns_client:
             await self._http_client.aclose()
 
