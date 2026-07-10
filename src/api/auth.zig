@@ -797,10 +797,10 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
     // delete 403'd the losers). The GC sweep (#114) reaps graced rows; grace=0 restores
     // the immediate delete. In txn: an error trips the errdefer rollback above.
     if (app.session_store == .table and authed.sid.len > 0) {
-        if (app.session_rotation_grace_s > 0)
-            _ = try graceExpireSession(w, authed.sid, app.session_rotation_grace_s)
+        _ = if (app.session_rotation_grace_s > 0)
+            try graceExpireSession(w, authed.sid, app.session_rotation_grace_s)
         else
-            _ = try deleteSession(w, authed.sid);
+            try deleteSession(w, authed.sid);
     }
     const issued = issueSessionNoEmit(ctx, w, col_name, rid) catch |err| switch (err) {
         error.NotFound => {
