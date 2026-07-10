@@ -28,6 +28,7 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'typescript-sdk', label: 'TypeScript SDK' },
       { slug: 'dart-sdk', label: 'Dart SDK' },
       { slug: 'python-sdk', label: 'Python SDK' },
+      { slug: 'kotlin-sdk', label: 'Kotlin SDK' },
       { slug: 'configuration', label: 'Configuration' },
       { slug: 'docker', label: 'Docker' },
     ],

@@ -71,6 +71,10 @@ See [docs/docker.md](docs/docker.md) for the data-volume/non-root/healthcheck de
   facades over `httpx`, covering auth + pluggable stores, records, offset + cursor
   pagination, files, and accounts/analytics/senders. Not yet published to PyPI (git
   dependency for now). → [docs/python-sdk.md](docs/python-sdk.md)
+- **Kotlin SDK** — official client (`io.github.valthon:zigbase-client`): a coroutine-first
+  `ZigbaseClient` over Ktor, covering auth + pluggable stores, records, offset + cursor
+  pagination, files, and accounts/analytics/senders. Not yet published to Maven Central
+  (build `publishToMavenLocal` for now). → [docs/kotlin-sdk.md](docs/kotlin-sdk.md)
 - **Static files** — serve a frontend from the same binary: `--serve-static <dir>` at runtime, or pin/embed it at comptime, with `.spa` SPA-fallback markers for client-routed apps. → [docs/framework.md](docs/framework.md)
 - **Admin UI** — embedded single-page app served at `/_/`, including a Settings / Feature-Flags screen. → [docs/api.md](docs/api.md)
 - **Framework** — `ctx`-first hooks, routes, and jobs expose a structured capability object (`ctx.records()`, `ctx.auth()`, `ctx.tx()`, `ctx.http()`, `ctx.kv()`) alongside comptime schema, additive auto-migration, and pluggable storage/mailer backends. → [docs/framework.md](docs/framework.md)
@@ -257,6 +261,7 @@ examples/
 - [docs/typescript-sdk.md](docs/typescript-sdk.md) — the official `@zigbase/client` TypeScript SDK: auth, records, offset + cursor pagination, files, realtime + live store
 - [docs/dart-sdk.md](docs/dart-sdk.md) — the official `zigbase_client` Dart SDK: auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web
 - [docs/python-sdk.md](docs/python-sdk.md) — the official `zigbase` Python SDK: sync and async clients for auth, records, offset + cursor pagination, and files
+- [docs/kotlin-sdk.md](docs/kotlin-sdk.md) — the official Kotlin SDK: a coroutine-first `ZigbaseClient` for auth, records, offset + cursor pagination, and files
 - [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — current caveats
 - [CHANGELOG.md](CHANGELOG.md) — release history
 

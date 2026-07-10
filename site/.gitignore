@@ -14,6 +14,7 @@ src/content/docs/email.md
 src/content/docs/fields.md
 src/content/docs/framework.md
 src/content/docs/jobs-and-webhooks.md
+src/content/docs/kotlin-sdk.md
 src/content/docs/postgres.md
 src/content/docs/python-sdk.md
 src/content/docs/realtime-broadcast.md

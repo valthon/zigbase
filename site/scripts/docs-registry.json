@@ -130,6 +130,16 @@
     }
   },
   {
+    "canonical": "docs/kotlin-sdk.md",
+    "mirror": "kotlin-sdk.md",
+    "frontmatter": {
+      "title": "Kotlin SDK",
+      "description": "The official zigbase Kotlin client — a coroutine-first ZigbaseClient over Ktor for auth, records, offset + cursor pagination, and files. Realtime and a typed tier follow.",
+      "order": 8,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/realtime-broadcast.md",
     "mirror": "realtime-broadcast.md",
     "frontmatter": {
