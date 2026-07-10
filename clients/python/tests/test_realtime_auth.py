@@ -232,6 +232,38 @@ class TestPendingAuthAckOnClose:
             await asyncio.wait_for(task, timeout=1)
 
 
+class TestSendAuthFrameSendFailure:
+    async def test_send_failure_fails_the_ack_waiter_and_calls_on_error(self) -> None:
+        # Regression guard: `_send_auth_frame`'s docstring promises "never
+        # raises", but the `await connection.send(...)` itself used to be
+        # unguarded -- a transport-level send failure (not a rejected auth
+        # reply) would escape past this method's own try/except (which only
+        # wrapped `await ack`) straight out of `_on_open`. The fix wraps the
+        # send too: on failure it must fail the (possibly shared/reused) ack
+        # future via `_fail_auth_ack` -- so no waiter strands -- and report
+        # through `on_error`, never raise.
+        store = MemoryAuthStore()
+        store.save("tok-1", {"id": "u1"})
+        errors: list[str] = []
+        factory = FakeConnectorFactory()
+        factory.next_send_exception = RuntimeError("send boom")
+        service, _, _ = make_service(factory, auth_store=store, on_error=errors.append)
+
+        task = asyncio.create_task(service.subscribe("posts", lambda e: None))
+        await _pump()
+
+        assert any("send boom" in e for e in errors)
+        # Detached, not stranded: a fresh send later reuses `_auth_ack` clean.
+        assert service._auth_ack is None  # type: ignore[attr-defined]
+        # The one-shot send failure only hit the auth frame -- the resubscribe
+        # that follows in `_on_open` still goes out normally.
+        assert factory.last.subscribe_frames == [{"action": "subscribe", "topic": "posts"}]
+
+        await factory.last.push({"type": "ack", "action": "subscribe", "topic": "posts"})
+        await asyncio.wait_for(task, timeout=1)
+        await service.close()
+
+
 class TestConnectionDropDuringAuthGate:
     async def test_drop_before_auth_reply_unblocks_the_auth_gate_without_close(self) -> None:
         # Regression guard: an unexpected connection drop (not a user

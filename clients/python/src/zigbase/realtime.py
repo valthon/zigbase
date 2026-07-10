@@ -673,7 +673,18 @@ class RealtimeService:
         self._opened = True
         self._reconnect_attempts = 0
         self._receive_task = asyncio.create_task(self._receive_loop(connection))
-        await self._on_open()
+        try:
+            await self._on_open()
+        except Exception as exc:
+            # `_on_open` (auth + resubscribe) is documented fire-and-forget,
+            # same as the connector call above: never raise past this method.
+            # Close the now-suspect connection so the receive loop's own
+            # `finally` (see `_receive_loop`) unwinds state and schedules a
+            # reconnect exactly as it would for an unexpected drop -- do NOT
+            # duplicate that handling here.
+            self._on_error(str(exc))
+            with contextlib.suppress(Exception):
+                await connection.close()
 
     async def _on_open(self) -> None:
         # A present token is sent and awaited BEFORE resubscribing, so the
@@ -755,7 +766,24 @@ class RealtimeService:
         ack = self._auth_ack
         if ack is None:
             ack = self._auth_ack = asyncio.get_running_loop().create_future()
-        await connection.send(encode_auth(token))
+        try:
+            await connection.send(encode_auth(token))
+        except Exception as exc:
+            # No reply will ever arrive for a frame that never went out --
+            # fail the (possibly shared/reused) ack so nothing strands, then
+            # report and return without awaiting it below.
+            self._on_error(str(exc))
+            self._fail_auth_ack(str(exc))
+            # In the common case this call is `ack`'s only owner (no
+            # concurrent re-auth send sharing it), so `_fail_auth_ack` just
+            # set an exception nobody will ever `await`/retrieve -- asyncio
+            # would warn "exception was never retrieved" at GC time. Mark it
+            # seen here; a genuinely concurrent second call still retrieves
+            # it too via its own `await ack` below (a Future's exception can
+            # be read more than once).
+            if not ack.cancelled():
+                ack.exception()
+            return
         try:
             await ack
         except Exception as exc:
@@ -846,7 +874,17 @@ class RealtimeService:
         if connection is None:
             return
         sub.inflight = True
-        await connection.send(encode_subscribe(sub.topic, sub.filter))
+        try:
+            await connection.send(encode_subscribe(sub.topic, sub.filter))
+        except Exception as exc:
+            # The frame never went out -- undo the inflight mark so the next
+            # open (this connection's own resubscribe, or a later reconnect)
+            # re-sends it instead of treating it as already on the wire.
+            # `sub.pending`'s futures are left untouched: the established
+            # contract (see the module docstring's known-limitations list) is
+            # that they stay pending until a fresh ack eventually arrives.
+            sub.inflight = False
+            self._on_error(str(exc))
 
     def _fail_pending(self, message: str) -> None:
         for sub in self._subscriptions.values():

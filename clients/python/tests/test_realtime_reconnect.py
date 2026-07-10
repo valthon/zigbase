@@ -387,6 +387,99 @@ class TestReconnectGatedOnLiveSubscriptions:
         await service.close()
 
 
+class TestOnOpenFailureDoesNotEscapeConnect:
+    async def test_on_open_failure_does_not_raise_to_subscribe_and_reconnect_completes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression guard: `await self._on_open()` in `_connect_once` used to
+        # be unguarded -- any exception raised out of it (auth/resubscribe
+        # sends, or anything else `_on_open` might someday do) escaped
+        # `_connect_once` entirely, reaching a racing `subscribe()` caller (via
+        # `_ensure_connected`) or killing the reconnect task outright. The fix
+        # catches it, reports via `on_error`, and closes the now-suspect
+        # connection so the receive loop's own drop-handling (`finally` ->
+        # `_schedule_reconnect`) takes over -- never re-raising to the caller.
+        # `_on_open` is monkeypatched directly here to isolate this guard from
+        # the (separately fixed) inner send guards in `_send_auth_frame`/
+        # `_send_subscribe`, which would otherwise absorb the failure before
+        # it ever reaches `_connect_once`.
+        monkeypatch.setattr(realtime, "_asleep", lambda seconds: asyncio.sleep(0))
+        errors: list[str] = []
+        service, factory = make_service(on_error=errors.append)
+
+        original_on_open = service._on_open  # type: ignore[attr-defined]
+        calls = 0
+
+        async def failing_on_open() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("on-open boom")
+            await original_on_open()
+
+        monkeypatch.setattr(service, "_on_open", failing_on_open)
+
+        task = asyncio.create_task(service.subscribe("posts", lambda e: None))
+        await _pump_until(lambda: len(factory.connections) == 1)
+        await _pump()
+        assert not task.done()
+        assert any("on-open boom" in e for e in errors)
+
+        # The failed-open connection was closed/discarded -> the receive
+        # loop's finally schedules a reconnect, same as an unexpected drop.
+        await _pump_until(lambda: len(factory.connections) == 2)
+        assert not task.done()
+
+        second = factory.last
+        assert second.subscribe_frames == [{"action": "subscribe", "topic": "posts"}]
+        await second.push({"type": "ack", "action": "subscribe", "topic": "posts"})
+        await asyncio.wait_for(task, timeout=1)
+        await service.close()
+
+
+class TestSendSubscribeSendFailure:
+    async def test_send_failure_does_not_raise_resets_inflight_and_resends_on_next_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression guard: `_send_subscribe`'s `await connection.send(...)`
+        # used to be unguarded, so a transport-level send failure escaped
+        # straight out of `subscribe()`/`subscribe_topic()` (and out of
+        # `_resubscribe_all`/`_on_open`). The fix catches it, resets
+        # `sub.inflight` so the subscription isn't wedged looking "in flight"
+        # forever, and reports via `on_error` -- the caller's pending future
+        # stays pending (same established contract as an unacked subscribe
+        # surviving a drop) until the next reconnect resends the frame.
+        monkeypatch.setattr(realtime, "_asleep", lambda seconds: asyncio.sleep(0))
+        errors: list[str] = []
+        factory = FakeConnectorFactory()
+        service, _ = make_service(factory, on_error=errors.append)
+
+        t1 = asyncio.create_task(service.subscribe("posts", lambda e: None))
+        await _pump()
+        await factory.last.push({"type": "ack", "action": "subscribe", "topic": "posts"})
+        await t1
+
+        conn = factory.last
+        conn.send_exception = RuntimeError("send boom")
+
+        task = asyncio.create_task(service.subscribe("comments", lambda e: None))
+        await asyncio.wait_for(_pump(), timeout=1)
+
+        assert any("send boom" in e for e in errors)
+        sub = service._subscriptions["r:comments"]  # type: ignore[attr-defined]
+        assert sub.inflight is False
+        assert not task.done()
+
+        await conn.server_close()
+        await _pump_until(lambda: len(factory.connections) == 2)
+        second = factory.last
+        assert "comments" in [f["topic"] for f in second.subscribe_frames]
+        await second.push({"type": "ack", "action": "subscribe", "topic": "posts"})
+        await second.push({"type": "ack", "action": "subscribe", "topic": "comments"})
+        await asyncio.wait_for(task, timeout=1)
+        await service.close()
+
+
 # ---- carry-forward closures from the T2/T3 reviews -------------------------
 
 

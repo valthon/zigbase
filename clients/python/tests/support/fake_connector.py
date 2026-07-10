@@ -30,8 +30,16 @@ class FakeConnection:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
         self._incoming: asyncio.Queue[str | bytes | None] = asyncio.Queue()
+        # When set, the NEXT `send` raises this instead of recording the
+        # frame, then clears itself back to `None` (one-shot) so a test can
+        # fail exactly one send -- e.g. the auth frame -- without derailing
+        # every send that follows on the same connection.
+        self.send_exception: Exception | None = None
 
     async def send(self, data: str) -> None:
+        if self.send_exception is not None:
+            exc, self.send_exception = self.send_exception, None
+            raise exc
         self.sent.append(json.loads(data))
 
     async def recv(self) -> AsyncIterator[str | bytes]:
@@ -72,6 +80,11 @@ class FakeConnectorFactory:
         # When set, `connect` parks on this event before resolving, letting a
         # test interleave work (e.g. close()) while the connect is in flight.
         self.gate: asyncio.Event | None = None
+        # Primes the NEXT connection built with a one-shot `send_exception`
+        # (see `FakeConnection`), for tests that need the very first send on
+        # a freshly-opened connection -- e.g. the on-open auth frame -- to
+        # fail. Consumed (reset to `None`) as soon as it's applied.
+        self.next_send_exception: Exception | None = None
 
     async def connect(self, url: str) -> FakeConnection:
         gate = self.gate
@@ -81,6 +94,8 @@ class FakeConnectorFactory:
             self.pending_failures -= 1
             raise ConnectionError("connect failed")
         conn = FakeConnection()
+        if self.next_send_exception is not None:
+            conn.send_exception, self.next_send_exception = self.next_send_exception, None
         self.connections.append(conn)
         return conn
 
