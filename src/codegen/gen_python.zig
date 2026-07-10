@@ -1,13 +1,10 @@
 //! Pure-Zig Python client generator: collections -> a zbase_gen.py that
 //! instantiates the runtime in clients/python/src/zigbase/typed.py (imported
-//! as `zbt`) into concrete pydantic BaseModel classes. The Python counterpart
-//! of gen_dart.generate; shares the acquisition, identifier, and guard layers
+//! as `zbt`) into concrete pydantic BaseModel classes, fluent field builders,
+//! per-collection metadata, sync/async typed services, realtime subclasses,
+//! and the `ZbClient`/`AsyncZbClient` façades. The Python counterpart of
+//! gen_dart.generate; shares the acquisition, identifier, and guard layers
 //! (language-neutral) and branches only in emission.
-//!
-//! Scope note (Task 5): emits the data half only — enums, records/expand,
-//! Create/Update payloads. Fluent field builders / metadata / typed services
-//! / realtime (the Python counterparts of gen_dart's emitFields/emitMeta/
-//! emitService/emitRealtime/emitClient) are Task 6.
 const std = @import("std");
 const schema = @import("../schema.zig");
 const events = @import("../events.zig");
@@ -333,6 +330,7 @@ test "generate emits fields builder, meta, service, realtime and client fragment
     try std.testing.expect(std.mem.indexOf(u8, out, "class PostFileField(Enum):") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    COVER = \"cover\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "def file_url(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        if filename is None:\n            raise ValueError(f\"record has no value for file field '{field.value}'\")\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "class ZbClient:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "self.posts = PostsService(raw)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "class AsyncZbClient:") != null);

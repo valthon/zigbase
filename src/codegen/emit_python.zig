@@ -695,6 +695,12 @@ fn emitFileFieldEnum(alloc: std.mem.Allocator, w: *W, c: schema.Collection, ffen
 /// realtime payload) even though the OTHER fields' keys are never looked at
 /// again after `[field]` selects one. `.get()` fixes that: only the
 /// requested field's key needs to actually be present.
+///
+/// Once `[field]` has picked a `filename`, a `None` result (an absent key
+/// for the Mapping branch, or an unset field on the model branch) is
+/// rejected with a `ValueError` naming the field, rather than flowing into
+/// `_c.file_url`'s URL builder where it would surface as an opaque
+/// `TypeError` from deep inside `urllib.parse.quote`.
 fn emitFileUrlMethod(alloc: std.mem.Allocator, w: *W, c: schema.Collection, rec: []const u8, ffenum: []const u8) !void {
     try putf(alloc, w, "    def file_url(\n        self,\n        record: {s} | Mapping[str, Any],\n        *,\n        field: {s},\n        download: bool = False,\n        thumb: str | None = None,\n        token: str | None = None,\n    ) -> str:\n", .{ rec, ffenum });
     try put(alloc, w, "        record_id = record[\"id\"] if isinstance(record, Mapping) else record.id\n");
@@ -706,6 +712,7 @@ fn emitFileUrlMethod(alloc: std.mem.Allocator, w: *W, c: schema.Collection, rec:
         try putf(alloc, w, "            {s}.{s}: record.get(\"{s}\") if isinstance(record, Mapping) else record.{s},\n", .{ ffenum, member, f.name, mid });
     }
     try put(alloc, w, "        }[field]\n");
+    try put(alloc, w, "        if filename is None:\n            raise ValueError(f\"record has no value for file field '{field.value}'\")\n");
     try putf(alloc, w, "        return self._c.file_url(\n            {{\"id\": record_id, \"collectionName\": \"{s}\"}},\n            filename,\n            download=download,\n            thumb=thumb,\n            token=token,\n        )\n\n\n", .{c.name});
 }
 

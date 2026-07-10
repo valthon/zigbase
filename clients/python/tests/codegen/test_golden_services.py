@@ -16,6 +16,7 @@ import json
 from collections.abc import Callable
 
 import httpx
+import pytest
 
 from tests.codegen.dating.zbase_gen import (
     AsyncProfilesService,
@@ -231,6 +232,21 @@ def test_file_url_accepts_raw_mapping_too() -> None:
     url = svc.file_url(PROFILE_RECORD, field=ProfileFileField.AVATAR)
 
     assert url == "http://localhost:8090/api/files/profiles/prof123/avatar.png"
+    zb.close()
+
+
+def test_file_url_raises_on_mapping_missing_the_requested_file_field() -> None:
+    # A partial Mapping (e.g. a realtime event's payload) that doesn't carry
+    # the requested file field must raise a clear, actionable error naming
+    # the field -- not let `None` flow into the underlying URL builder and
+    # surface as a cryptic TypeError deep in urllib.
+    zb = ZigBase("http://localhost:8090", http_client=make_sync_client(lambda r: json_response({})))
+    svc = ProfilesService(zb)
+    partial = {"id": "prof123", "collectionName": "profiles"}
+
+    with pytest.raises(ValueError, match="avatar"):
+        svc.file_url(partial, field=ProfileFileField.AVATAR)
+
     zb.close()
 
 

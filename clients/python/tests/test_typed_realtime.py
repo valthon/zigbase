@@ -297,7 +297,7 @@ class TestNoClose:
         would kill every other collection's subscriptions and permanently
         disable reconnect. Tear down individual subscriptions with the
         `Unsubscribe` returned by `subscribe()`; tear down the connection
-        itself with `AsyncZigBase.close()`.
+        itself with `AsyncZigBase.aclose()`.
         """
         rt, _client, _factory = make_typed_realtime()
         assert not hasattr(rt, "close")

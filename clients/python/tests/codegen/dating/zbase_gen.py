@@ -1187,6 +1187,8 @@ class ProfilesService:
             if isinstance(record, Mapping)
             else record.avatar,
         }[field]
+        if filename is None:
+            raise ValueError(f"record has no value for file field '{field.value}'")
         return self._c.file_url(
             {"id": record_id, "collectionName": "profiles"},
             filename,
@@ -1348,6 +1350,8 @@ class AsyncProfilesService:
             if isinstance(record, Mapping)
             else record.avatar,
         }[field]
+        if filename is None:
+            raise ValueError(f"record has no value for file field '{field.value}'")
         return self._c.file_url(
             {"id": record_id, "collectionName": "profiles"},
             filename,
@@ -1762,6 +1766,8 @@ class PhotosService:
             if isinstance(record, Mapping)
             else record.image,
         }[field]
+        if filename is None:
+            raise ValueError(f"record has no value for file field '{field.value}'")
         return self._c.file_url(
             {"id": record_id, "collectionName": "photos"},
             filename,
@@ -1920,6 +1926,8 @@ class AsyncPhotosService:
             if isinstance(record, Mapping)
             else record.image,
         }[field]
+        if filename is None:
+            raise ValueError(f"record has no value for file field '{field.value}'")
         return self._c.file_url(
             {"id": record_id, "collectionName": "photos"},
             filename,
@@ -2082,6 +2090,8 @@ class PrivatePhotosService:
             if isinstance(record, Mapping)
             else record.image,
         }[field]
+        if filename is None:
+            raise ValueError(f"record has no value for file field '{field.value}'")
         return self._c.file_url(
             {"id": record_id, "collectionName": "privatePhotos"},
             filename,
@@ -2248,6 +2258,8 @@ class AsyncPrivatePhotosService:
             if isinstance(record, Mapping)
             else record.image,
         }[field]
+        if filename is None:
+            raise ValueError(f"record has no value for file field '{field.value}'")
         return self._c.file_url(
             {"id": record_id, "collectionName": "privatePhotos"},
             filename,
@@ -3204,6 +3216,8 @@ class NotesService:
             if isinstance(record, Mapping)
             else record.attachment,
         }[field]
+        if filename is None:
+            raise ValueError(f"record has no value for file field '{field.value}'")
         return self._c.file_url(
             {"id": record_id, "collectionName": "notes"},
             filename,
@@ -3362,6 +3376,8 @@ class AsyncNotesService:
             if isinstance(record, Mapping)
             else record.attachment,
         }[field]
+        if filename is None:
+            raise ValueError(f"record has no value for file field '{field.value}'")
         return self._c.file_url(
             {"id": record_id, "collectionName": "notes"},
             filename,
