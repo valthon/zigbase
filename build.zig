@@ -285,6 +285,18 @@ pub fn build(b: *std.Build) void {
     const gen_dart_step = b.step("gen-dating-dart-client", "Generate the dating fixture's typed Dart client (run `dart format` after)");
     gen_dart_step.dependOn(&gen_dart_run.step);
 
+    // --- Python codegen: generate the dating fixture's typed Python client. Reuses
+    // the same comptime generator exe (`zbase-gen-client`) with `--lang python`.
+    const python_out = "clients/python/tests/codegen/dating/zbase_gen.py";
+    const gen_python_run = b.addRunArtifact(gen_exe);
+    gen_python_run.setEnvironmentVariable("ZBASE_INREPO", "1");
+    gen_python_run.addArgs(&.{ "--out", python_out, "--api-prefix", "/api", "--lang", "python" });
+    // The Python golden is committed `ruff format`-clean, so its staleness gate is a
+    // regenerate-then-`ruff format`-then-`git diff` shell step in CI, mirroring the
+    // Dart golden's freshness check.
+    const gen_python_step = b.step("gen-dating-python-client", "Generate the dating fixture's typed Python client (run `ruff format` after)");
+    gen_python_step.dependOn(&gen_python_run.step);
+
     // --- gen-test: golden snapshot byte-exact test (Task 8) -------------------
     // Builds gen_test_root.zig as a test binary with both zigbase_mod (for
     // gen_client.generate) and dating_app_mod (for App.collections) injected.
@@ -326,7 +338,7 @@ pub const GenOpts = struct {
     api_prefix: []const u8 = "/api",
     check: bool = false,
     in_repo: bool = false,
-    /// Output language: "ts" (default) or "dart".
+    /// Output language: "ts" (default), "dart", or "python".
     lang: []const u8 = "ts",
 };
 

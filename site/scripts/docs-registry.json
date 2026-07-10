@@ -120,6 +120,16 @@
     }
   },
   {
+    "canonical": "docs/python-sdk.md",
+    "mirror": "python-sdk.md",
+    "frontmatter": {
+      "title": "Python SDK",
+      "description": "The official zigbase Python SDK — sync and async clients for auth, records, offset + cursor pagination, files, realtime, and a generated typed tier.",
+      "order": 7,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/realtime-broadcast.md",
     "mirror": "realtime-broadcast.md",
     "frontmatter": {

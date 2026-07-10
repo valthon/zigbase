@@ -1,0 +1,3 @@
+### Features
+
+- Python SDK typed tier (`zigbase[typed]`): `zigbase typegen --lang python` generates Pydantic v2 record models, injection-safe fluent filter builders, and typed sync/async collection services (plus async typed realtime) over the new `zigbase.typed` runtime, golden-gated in CI against the dating fixture. A `select`-typed field's `eq`/`neq`/`in_list` accept `None` for null filtering; a generated record's `expand` attribute (and each relation on its `<Rec>Expand` submodel) defaults to an empty value, so manual instantiation (tests, mocks) never requires building an expand submodel by hand.

@@ -12,8 +12,8 @@ Like the [TypeScript](typescript-sdk.md) and [Dart](dart-sdk.md) SDKs, this is a
 behavioral port of the same client contract — same wire format, same filter-escaping rules,
 same cursor-pagination semantics — with a few deliberate divergences called out in
 [Divergences from the TypeScript/Dart SDKs](#divergences-from-the-typescriptdart-sdks).
-WebSocket [realtime](#realtime) ships in this release; a generated typed tier and the
-TypeScript/Dart SDKs' live-store observables are **not** — see that section.
+WebSocket [realtime](#realtime) and a generated [typed tier](#typed-tier) both ship in this
+release; the TypeScript/Dart SDKs' live-store observables are **not** — see that section.
 
 ## Install
 
@@ -696,9 +696,6 @@ This is a straight behavioral port, but a few things differ by design, not overs
   `realtime.collection()`/`LiveRecord`/`LiveList` observables that stay in sync
   automatically, this SDK's [realtime](#realtime) tier is subscribe/stream only — deferred to
   a follow-up SDK milestone.
-- **No typed tier yet.** Unlike the [TypeScript](typescript-sdk.md#typed-client--zigbaseclienttyped)
-  and [Dart](dart-sdk.md#typed-tier) SDKs, there is no generated typed client for Python
-  yet — `zigbase typegen` does not emit a Python target. Records stay plain `dict[str, Any]`.
 - **No `requestKey` de-duplication.** The TypeScript/Dart SDKs' opt-in last-write-wins
   request cancellation (`requestKey=`) has no Python equivalent. For the async facade, use
   `asyncio` task cancellation (e.g. cancel the previous `asyncio.Task` before issuing a new
@@ -736,16 +733,215 @@ fresh tempdir data directory and `--insecure-cookies`, seeds a superuser via the
 create` CLI subcommand, polls `/api/health` for readiness (retrying on a fresh port if a
 bind race kills the child), and tears the process + tempdir down on teardown.
 
+## Typed tier
+
+Beyond the dynamic base client, `zigbase typegen --lang python` (or the build-time comptime
+generator) emits a **typed Python client**: Pydantic v2 record models, one typed sync/async
+service per collection, an injection-safe fluent filter builder, typed expand, and int/fixed
+numeric coercion. It ships in the base `zigbase` wheel as `zigbase.typed`, with the generated
+code layering Pydantic on top — install the `zigbase[typed]` extra to pull in Pydantic
+itself. It's the Python counterpart of the
+[TypeScript](typescript-sdk.md#typed-client--zigbaseclienttyped) and
+[Dart](dart-sdk.md#typed-tier) typed clients (and JSON-Schema export comes free with it —
+every generated record is a `pydantic.BaseModel`, so `Post.model_json_schema()` works out of
+the box).
+
+```sh
+pip install 'zigbase[typed]'
+```
+
+### Generate
+
+The same generator that emits TypeScript and Dart emits Python — pass `--lang python`:
+
+```bash
+# Runtime introspection (no Zig source; reads a provisioned data dir or a live server):
+zigbase typegen --data-dir ./zb_data --out zbase_gen.py --lang python
+zigbase typegen --url https://api.example.com --admin-email admin@x.io --admin-password '…' \
+  --out zbase_gen.py --lang python
+
+# Comptime (reads your Zig schema) via a build step wired with genClientStep's `lang: "python"`:
+zig build gen-client   # when the consumer's step passes .lang = "python"
+```
+
+The generated file imports the base SDK (`zigbase`) and its typed runtime (`zigbase.typed`,
+imported as `zbt`), so the emitted code stays thin — the same split the Dart and TypeScript
+typed tiers use. Regenerate and re-run `ruff format` on the output (it is committed
+`ruff format`-clean); pass `--check` in CI to fail the build when the committed file has
+drifted from the schema, the same staleness-gate recipe as the
+[TypeScript generator](typescript-sdk.md#staleness-gate-ci).
+
+The header comment stamps a `schema-hash` (a content fingerprint — what `--check` actually
+compares) and a `typed-core-version` — the `zigbase.typed.TYPED_CORE_VERSION` the emitter
+targeted (currently `"0.1.0"`). It's a human/tooling compatibility marker, not a runtime
+assertion: nothing checks it at import time, so regenerate after any `zigbase[typed]` upgrade
+that bumps `TYPED_CORE_VERSION` rather than relying on it to fail loudly.
+
+### Create a typed client
+
+```python
+from zbase_gen import create_client
+
+zb = create_client("http://127.0.0.1:8090")
+# auth_collection defaults to your auth collection; pass the same kwargs ZigBase(...) takes
+# (auth_store=..., http_client=..., ...) for persistence/customization.
+```
+
+`create_async_client(url, **kwargs)` builds `AsyncZbClient`, the `asyncio` mirror. Both
+clients expose one accessor per collection (`zb.posts`, `zb.users`, …); `AsyncZbClient` also
+gets a matching realtime accessor per collection (`zb.postsRealtime`) — see [Typed realtime +
+files](#typed-realtime--files). `zb.raw` is the underlying `ZigBase`/`AsyncZigBase` for
+anything the typed surface doesn't wrap; `zb.close()` (`await zb.aclose()` on the async
+client) tears it down.
+
+### Typed records + CRUD
+
+Every read returns a Pydantic model with typed fields; writes take a typed `Create`/`Update`:
+
+```python
+post = zb.posts.get_one("REC123")
+post.title    # str
+post.status   # PostStatus | None (a generated enum from the select field)
+
+created = zb.posts.create(PostCreate(title="Hello", status=PostStatus.DRAFT))
+page = zb.posts.get_list(page=1, per_page=20)      # zbt.TypedList[Post]
+cursor_page = zb.posts.get_page(limit=20)          # zbt.TypedCursorPage[Post] (next_cursor/has_next)
+for p in zb.posts.iterate():                        # Iterator[Post]
+    ...
+```
+
+**Schema casing.** Generated attributes mirror your schema's field/collection names exactly
+— a `snake_case`, `camelCase`, or mixed-case field stays exactly that as the Python
+attribute; the wire key, filter path, and `to_map()` key are never touched. The **only**
+rewriting is collision avoidance: a schema name that is a Python keyword (`class`, `import`,
+…), or that would shadow a member the generated class already needs (`expand`, `from_record`,
+a payload's `to_map`, a client's `raw`/`close`/`send`, …), gets a trailing `_` appended on the
+**Python side only** — field `class` becomes member `class_`. Two schema names that would
+sanitize to the same Python identifier is a generation-time error naming both, shared with
+the TypeScript/Dart emitters (the identifier/guard layer is language-neutral).
+
+### Typed filters — the fluent builder
+
+`where=` takes a callable over a generated `<Rec>Fields` builder and compiles to a server
+filter string. Every operand is escaped through the same `filter_value` the base SDK's
+[`zb_filter`](#safe-filters--zb_filter) uses, so a `where=` lambda is exactly as
+injection-safe as a hand-built filter string:
+
+```python
+# scalar + enum + and/or (`&`/`|`, or `.and_()`/`.or_()`):
+zb.posts.get_list(where=lambda p: p.status.eq(PostStatus.PUBLISHED) & (p.price >= 10))
+# native `in (...)`:
+zb.posts.get_list(where=lambda p: p.status.in_list([PostStatus.DRAFT, PostStatus.PUBLISHED]))
+# one level of nested-relation filtering (author.name ~ 'A'):
+zb.posts.get_list(where=lambda p: p.author.rel(lambda a: a.name.like("A")))
+```
+
+Operators: `eq`/`neq` (all fields; also bound to `==`/`!=`), `gt`/`gte`/`lt`/`lte` (also
+`>`/`>=`/`<`/`<=`; numbers, dates, strings), `like`/`nlike` (strings), `in_list`. A `select`
+field's `eq`/`neq`/`in_list` also accept `None` for null filtering (`p.status.eq(None)` ->
+`status = null`), same as every other field. `sort=` accepts a field string or a sequence
+(`"-created"`, `["-age", "name"]`).
+`<Service>.filter(fn)` compiles a `where=`-style lambda to a plain filter string without
+issuing a request, when you need the string itself rather than a request.
+
+Because `eq`/`neq` are also bound to `__eq__`/`__ne__` (so `p.title == "x"` reads naturally),
+the field-accessor objects `where=`'s builder returns (`p.title`, `p.status`, …) are not
+hashable and not meaningfully comparable — they're throwaway builders returned from the
+generated `*Fields` accessor, never dict keys or set members.
+
+Always combine `Expr`s with `&`/`|` (or `.and_()`/`.or_()`) — never Python's `and`/`or`, and
+never a chained comparison like `10 <= p.price <= 20` — both implicitly coerce an `Expr` to
+`bool` and would silently drop half the filter, so `Expr.__bool__` raises `TypeError` instead.
+
+### Typed expand
+
+Every generated record with a relation field carries a typed `expand` attribute; request it
+with `expand=` and read the related record(s) off it:
+
+```python
+with_author = zb.posts.get_one("REC123", expand=["author"])
+with_author.expand.author    # Author | None (populated when requested)
+with_tags = zb.posts.get_one("REC123", expand=["tags"])
+with_tags.expand.tags        # list[Tag]
+```
+
+Python has no way to statically prove "this call requested `author`", so `expand` attributes
+are nullable/empty by design — same as the Dart typed tier.
+
+`expand` (and each relation on the generated `<Rec>Expand` submodel) defaults, so
+manually constructing a record — in a test or mock — never requires building an expand
+submodel by hand: `Post(id="p1", title="hi", author="u1", ...)` is valid, and
+`post.expand.author is None` / `post.expand.tags == []`.
+
+### Typed realtime + files
+
+```python
+zb = create_async_client("http://127.0.0.1:8090")
+
+def on_event(e):
+    print(e.action, e.record.title)   # 'create' | 'update' | 'delete'
+
+# filter= takes a plain string -- <Service>.filter(fn) compiles a where=-style lambda to one:
+unsub = await zb.postsRealtime.subscribe(
+    on_event, filter=zb.posts.filter(lambda p: p.status.eq(PostStatus.PUBLISHED))
+)
+...
+await unsub()
+
+# or as an async iterator:
+async for e in zb.postsRealtime.stream():
+    ...
+
+# File URLs: `field` is a generated enum of the collection's single-value file fields.
+url = zb.posts.file_url(post, field=PostFileField.COVER, token=token)
+```
+
+Typed realtime is **`asyncio`-only** — it exists only on `AsyncZbClient` (there's no sync
+realtime to wrap, matching `AsyncZigBase.realtime`) — and needs the `zigbase[realtime]` extra
+too (`pip install 'zigbase[typed,realtime]'`). It wraps the client's single, shared,
+multiplexed `RealtimeService`, so there is deliberately no per-collection `close()`: tear
+down individual subscriptions with the `Unsubscribe` returned by `subscribe()`, and the
+connection itself with `await zb.aclose()`.
+
+`subscribe`/`stream` also take `where=`, but — unlike the service-level `where=` above —
+here it's an already-compiled `Expr`, not a lambda (the generated `<Rec>Realtime` class
+doesn't carry the `<Rec>Fields` builder the way a service does): build one directly
+(`where=PostFields().status.eq(PostStatus.PUBLISHED)`) or use `filter=` with
+`<Service>.filter(fn)` as above. `where=` takes precedence over `filter=` when both are
+given.
+
+### int/fixed numbers
+
+ZigBase `number` fields can be integer or fixed-point. To preserve full i64 precision they
+travel as **decimal strings** on the wire; the typed layer coerces both directions — int
+fields surface as Python `int`, fixed fields as `float`, and `Create`/`Update.to_map()`
+serializes them back to decimal strings. Plain float fields are `float` and pass through
+untouched. An int-mode field receiving a value with a fractional part (schema drift) raises
+`ValueError` rather than silently truncating.
+
+Fixed-point encoding (`zbt.encode_fixed`) rounds the float's exact binary value **half-up**
+(`decimal.ROUND_HALF_UP`) to the field's scale, matching the Dart port's
+`toStringAsFixed` — not Python's own round-half-to-even default, which would render an exact
+tie like `0.125` at scale 2 as `"0.12"` instead of the `"0.13"` this SDK (and Dart) produce.
+
+### Scope
+
+The typed `rpc.*` (custom routes), auth-method, and feature-flag surfaces are
+**TypeScript-only** for now — in Python, call custom routes through `zb.raw.send(...)` and
+non-password auth through the base `zb.raw.collection(name)` methods. These are planned
+follow-ups, same as the Dart typed tier.
+
 ## Not yet
 
-The Python SDK is a base + realtime client — a few surfaces the TypeScript and Dart SDKs have
-do not exist here yet:
+The Python SDK is a base, realtime, and typed client — a couple of surfaces the TypeScript
+and Dart SDKs have do not exist here yet:
 
 - **Live store.** No `realtime.collection()`/`LiveRecord`/`LiveList` observable objects — only
   the base [subscribe/stream/topic API](#realtime); see
   [Divergences](#divergences-from-the-typescriptdart-sdks).
-- **Typed tier.** No generated typed client (`zigbase typegen` doesn't emit Python); records
-  stay plain `dict[str, Any]`.
+- **Typed `rpc.*` / auth-method / feature-flag surfaces.** The typed tier covers the
+  collection/record/where/expand/realtime/files surface (see [Typed tier](#typed-tier)); typed
+  custom routes, pluggable auth methods, and feature flags are TypeScript-only for now.
 - **`requestKey` de-duplication.** Use `asyncio` task cancellation on the async facade
   instead; see [Divergences](#divergences-from-the-typescriptdart-sdks).
 
