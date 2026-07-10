@@ -25,6 +25,13 @@ pub const App = struct {
     /// Selected session-management model (#99); resolved from the comptime
     /// `App(.{ .session_store = .epoch | .table })` config. Defaults to `.epoch`.
     session_store: SessionStore = .epoch,
+    /// Table mode only: how long (seconds) the PREDECESSOR session stays valid after an
+    /// HTTP auth-refresh rotates it. Rotation used to DELETE the old row immediately,
+    /// which 403'd any request already in flight with the old cookie — an SPA whose
+    /// guard refreshes on navigation races its own data fetches. The old row's expiry
+    /// is clamped to now+grace instead (the GC sweep reaps it); 0 restores the
+    /// immediate-delete behavior. Resolved from `.auth.session.rotation_grace_s`.
+    session_rotation_grace_s: i64 = 30,
     verification_ttl_s: i64 = 7 * 24 * 3600,
     password_reset_ttl_s: i64 = 3600,
     /// Server-side OAuth `state` CSRF protection (F11). ON by default: the backend

@@ -293,6 +293,24 @@ pub fn deleteSession(conn: *db.Db, sid: []const u8) !bool {
     return try st.step();
 }
 
+/// Rotation grace: clamp a session row's expiry to now+grace instead of deleting it, so a
+/// request already in flight with the predecessor cookie still authenticates through an
+/// auth-refresh rotation (`sessionActive` honors `expires`; the #114 GC sweep reaps the
+/// row once graced-out). Never EXTENDS an expiry that is already sooner. True iff the row
+/// existed. Writer required. Standard SQL (CASE, no dialect-specific LEAST/MIN).
+pub fn graceExpireSession(conn: *db.Db, sid: []const u8, grace_s: i64) !bool {
+    const cutoff = (try nowUnix(conn)) + grace_s;
+    var st = try prep(conn,
+        \\UPDATE "_sessions"
+        \\ SET "expires" = CASE WHEN "expires" IS NULL OR "expires" > ?2 THEN ?2 ELSE "expires" END
+        \\ WHERE "id" = ?1 RETURNING "id";
+    );
+    defer st.finalize();
+    try st.bindText(1, sid);
+    try st.bindInt(2, cutoff);
+    return try st.step();
+}
+
 /// Delete a session row AND return its original `created` timestamp (RETURNING). Used by
 /// refresh/rotate to carry the true session-start time forward onto the replacement row.
 /// Null when no row existed. Writer required.
@@ -772,10 +790,18 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return resp;
     }
-    // Table mode: rotate the session row — drop this token's old `sid` row before issue()
-    // inserts the replacement, so a device keeps exactly ONE row across refreshes (no leak).
-    // In txn: an error trips the errdefer rollback above (fail closed, session not reissued).
-    if (app.session_store == .table and authed.sid.len > 0) _ = try deleteSession(w, authed.sid);
+    // Table mode: rotate the session row. The predecessor is NOT deleted immediately —
+    // its expiry is clamped to now+grace (`session_rotation_grace_s`) so requests already
+    // in flight with the old cookie keep authenticating through the rotation window (an
+    // SPA whose guard refreshes on navigation races its own data fetches; an immediate
+    // delete 403'd the losers). The GC sweep (#114) reaps graced rows; grace=0 restores
+    // the immediate delete. In txn: an error trips the errdefer rollback above.
+    if (app.session_store == .table and authed.sid.len > 0) {
+        _ = if (app.session_rotation_grace_s > 0)
+            try graceExpireSession(w, authed.sid, app.session_rotation_grace_s)
+        else
+            try deleteSession(w, authed.sid);
+    }
     const issued = issueSessionNoEmit(ctx, w, col_name, rid) catch |err| switch (err) {
         error.NotFound => {
             w.rollback() catch {};
@@ -1732,6 +1758,85 @@ test "#99 table mode: an expired session row is rejected by verify" {
     var r = try env.pool.acquireReader();
     defer env.pool.releaseReader(&r);
     try std.testing.expect(auth.verifyToken(a, &env.app, &r, issued.token) == null);
+}
+
+test "rotation grace: after auth-refresh the predecessor token stays valid until the grace expires" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    env.app.session_store = .table;
+    env.app.session_rotation_grace_s = 30;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "gr@x.io", "longenough");
+    const old_token = try loginToken(env, a, "users", "gr@x.io", "longenough");
+    const old_sid = (try jwt.peekClaims(a, old_token)).sid.?;
+
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    var refresh = env.ctx(a, .POST, "", &p);
+    refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{old_token});
+    const res = try authRefresh(&refresh);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+
+    // Two rows during the grace window: the graced predecessor + the replacement.
+    try std.testing.expectEqual(@as(i64, 2), try sessionCount(env));
+    // The OLD token still authenticates — a request in flight through the rotation
+    // (an SPA guard refreshing while the page's data fetches race it) must not 403.
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, old_token) != null);
+    }
+    // The predecessor's expiry was clamped to <= now+grace (never NULL, never extended).
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        var st = try r.prepare("SELECT \"expires\" FROM \"_sessions\" WHERE \"id\" = ?1;");
+        defer st.finalize();
+        try st.bindText(1, old_sid);
+        try std.testing.expect(try st.step());
+        const expires = st.columnInt(0);
+        const now = try nowUnix(&r);
+        try std.testing.expect(expires > now); // still inside the grace window
+        try std.testing.expect(expires <= now + env.app.session_rotation_grace_s);
+    }
+    // Once the grace passes, the predecessor is rejected (sessionActive honors expires):
+    // simulate the elapse by clamping the row into the past, exactly what the clock does.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var st = try w.prepare("UPDATE \"_sessions\" SET \"expires\" = 1 WHERE \"id\" = ?1;");
+        defer st.finalize();
+        try st.bindText(1, old_sid);
+        _ = try st.step();
+    }
+    {
+        var r = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&r);
+        try std.testing.expect(auth.verifyToken(a, &env.app, &r, old_token) == null);
+    }
+}
+
+test "rotation grace 0: auth-refresh deletes the predecessor immediately (legacy behavior)" {
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+    env.app.session_store = .table;
+    env.app.session_rotation_grace_s = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "gz@x.io", "longenough");
+    const old_token = try loginToken(env, a, "users", "gz@x.io", "longenough");
+
+    const p = [_]http.Param{.{ .key = "col", .value = "users" }};
+    var refresh = env.ctx(a, .POST, "", &p);
+    refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{old_token});
+    try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
+
+    try std.testing.expectEqual(@as(i64, 1), try sessionCount(env)); // old row gone
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    try std.testing.expect(auth.verifyToken(a, &env.app, &r, old_token) == null);
 }
 
 test "#99 table mode: listActiveSessions + is_current; revoke authorizes owner-or-superuser" {
