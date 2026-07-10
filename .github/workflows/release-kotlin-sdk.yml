@@ -1,0 +1,109 @@
+# Kotlin SDK release: publishes `io.github.valthon:zigbase-client` to Maven
+# Central on a `kotlin-client-v*` tag. The Kotlin SDK is versioned
+# INDEPENDENTLY of the server (`vX.Y.Z` tags), the TypeScript SDK (`client-v*`
+# tags), the Dart SDK (`dart-client-v*` tags), and the Python SDK
+# (`python-client-v*` tags).
+#
+# UNLIKE PyPI (OIDC Trusted Publishing) and pub.dev (OIDC automated
+# publishing), Maven Central has no GitHub Actions OIDC integration -- this
+# workflow authenticates with a Central Portal user token (username/password
+# secrets) and signs every publication with an in-memory GPG key, all
+# supplied as repository/environment secrets. There is no `id-token: write`
+# permission anywhere in this file because there is nothing to exchange it
+# for. See clients/kotlin/RELEASING.md for the one-time Central Portal setup
+# (namespace verification, user token, GPG key) this depends on -- **do not
+# push a `kotlin-client-v*` tag until that setup is done** (see RELEASING.md's
+# "first publish pending" banner).
+name: Release Kotlin SDK
+
+on:
+  push:
+    tags:
+      - "kotlin-client-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+
+      - name: Cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('clients/kotlin/**/*.gradle.kts', 'clients/kotlin/gradle/libs.versions.toml', 'clients/kotlin/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Format + lint (spotless) + unit tests
+        run: mise exec gradle@9.6 -- gradle -p clients/kotlin spotlessCheck build
+
+      - name: Assert build.gradle.kts version matches the tag
+        working-directory: clients/kotlin
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          expected="${tag#kotlin-client-v}"
+          # Strip an optional trailing `// comment` so the gate still
+          # extracts the bare version if build.gradle.kts ever writes
+          # `version = "0.1.0" // note` (otherwise it would fail closed with
+          # a confusing mismatch message).
+          actual="$(grep -m1 '^version[[:space:]]*=' build.gradle.kts \
+            | sed -E 's/^version[[:space:]]*=[[:space:]]*//; s#[[:space:]]*//.*$##; s/^"//; s/"$//; s/[[:space:]]+$//')"
+          echo "tag=$tag expected=$expected build.gradle.kts=$actual"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::Tag ($tag => $expected) does not match build.gradle.kts version ($actual)."
+            exit 1
+          fi
+
+      # Sanity check only -- no signing, no upload. Proves the publication
+      # (coordinates, POM, jar/sources/javadoc artifacts) assembles cleanly
+      # before the publish job spends a real Central Portal deployment on it.
+      # Must succeed WITHOUT any signing secrets present (see build.gradle.kts:
+      # `signAllPublications()` is gated on `signingInMemoryKey` being set).
+      - name: publishToMavenLocal sanity check
+        run: mise exec gradle@9.6 -- gradle -p clients/kotlin publishToMavenLocal
+
+  publish:
+    name: Publish to Maven Central
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: maven-central
+    permissions:
+      contents: read
+    env:
+      # Gradle auto-maps `ORG_GRADLE_PROJECT_<name>` env vars to the project
+      # property `<name>` -- these are exactly the properties
+      # `com.vanniktech.maven.publish` reads for Central Portal credentials
+      # and in-memory GPG signing (see build.gradle.kts).
+      ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+      ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+      ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_CENTRAL_SIGNING_KEY }}
+      ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_CENTRAL_SIGNING_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+
+      - name: Cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('clients/kotlin/**/*.gradle.kts', 'clients/kotlin/gradle/libs.versions.toml', 'clients/kotlin/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # Rebuilds from source rather than reusing verify's artifacts (unlike
+      # the PyPI/pub.dev lanes) -- signing wires the GPG-signed `.asc` files
+      # into the publication as part of this same Gradle invocation, so
+      # there is no unsigned intermediate artifact to pass between jobs.
+      # `automaticRelease` defaults to false: this uploads a deployment to
+      # Central Portal that lands in "pending" state for manual review/
+      # release, rather than auto-releasing -- see RELEASING.md.
+      - name: Publish to Maven Central (Central Portal)
+        run: mise exec gradle@9.6 -- gradle -p clients/kotlin publishToMavenCentral

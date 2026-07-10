@@ -29,3 +29,8 @@ clients/typescript/npm/server/package.json
 clients/typescript/npm/server/README.md
 clients/typescript/npm/*/node_modules
 clients/typescript/test/codegen/dating/zbase.runtime.live.gen.ts
+
+clients/kotlin/.gradle/
+clients/kotlin/**/build/
+.idea/
+*.iml

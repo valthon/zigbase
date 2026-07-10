@@ -521,3 +521,32 @@ jobs:
       - name: Integration tests
         working-directory: clients/python
         run: mise exec python@3.13 -- python -m pytest -q -m integration tests/integration
+
+  kotlin-sdk:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: zigbase-binaries
+          path: artifacts
+      - name: Export prebuilt binary path
+        run: |
+          chmod +x artifacts/zig-out/bin/zigbase artifacts/zig-out/bin/dating-server
+          echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_DATING_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/dating-server" >> "$GITHUB_ENV"
+      - name: Cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('clients/kotlin/**/*.gradle.kts', 'clients/kotlin/gradle/libs.versions.toml', 'clients/kotlin/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+      - name: Format + lint (spotless) + unit tests
+        run: mise exec gradle@9.6 -- gradle -p clients/kotlin spotlessCheck build
+      - name: Integration tests
+        run: mise exec gradle@9.6 -- gradle -p clients/kotlin integrationTest
