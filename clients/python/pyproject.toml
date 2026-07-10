@@ -14,6 +14,7 @@ dependencies = ["httpx>=0.27,<1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13"]
+realtime = ["websockets>=13"]
 
 [project.urls]
 Repository = "https://github.com/valthon/zigbase"
@@ -31,6 +32,16 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 [tool.mypy]
 strict = true
 python_version = "3.10"
+
+# `websockets` (the `zigbase[realtime]` extra) IS installed in CI's mypy job
+# (it runs against `.[dev,realtime]`), so this override is a no-op there --
+# it remains as a safety net for a plain `.[dev]` mypy/CI environment, where
+# `websockets` is absent: realtime.py's default connector imports it lazily
+# at runtime, but the TYPE_CHECKING import used for the adapter's
+# annotations still needs resolving statically either way.
+[[tool.mypy.overrides]]
+module = "websockets.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
