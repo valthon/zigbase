@@ -245,6 +245,12 @@ pub const codegen = struct {
     pub const acquire_http = @import("codegen/acquire_http.zig");
     /// CLI orchestrator: acquire → generate → write/check (data-dir + runtime equivalence).
     pub const typegen_cli = @import("codegen/typegen_cli.zig");
+    /// Field → Python type mapper (the Python counterpart of dart_type.zig).
+    pub const python_type = @import("codegen/python_type.zig");
+    /// Per-fragment Python emitters (the Python counterpart of emit_dart.zig).
+    pub const emit_python = @import("codegen/emit_python.zig");
+    /// The Python generator core (the Python counterpart of gen_dart.generate).
+    pub const gen_python = @import("codegen/gen_python.zig");
 };
 
 // ---- Test discovery --------------------------------------------------------
@@ -393,6 +399,9 @@ test {
     _ = @import("codegen/acquire_datadir.zig");
     _ = @import("codegen/acquire_http.zig");
     _ = @import("codegen/typegen_cli.zig");
+    _ = @import("codegen/python_type.zig");
+    _ = @import("codegen/emit_python.zig");
+    _ = @import("codegen/gen_python.zig");
     _ = @import("route_types.zig");
     _ = @import("auth_helpers.zig");
     _ = @import("auth/method.zig");

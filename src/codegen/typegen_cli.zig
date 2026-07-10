@@ -5,6 +5,7 @@ const migrations = @import("../migrations.zig");
 const provision = @import("../provision.zig");
 const gen_client = @import("gen_client.zig");
 const gen_dart = @import("gen_dart.zig");
+const gen_python = @import("gen_python.zig");
 const acquire = @import("acquire.zig");
 const acquire_datadir = @import("acquire_datadir.zig");
 const acquire_http = @import("acquire_http.zig");
@@ -32,13 +33,14 @@ pub fn provisionAndGenerate(
 }
 
 /// Output language for the runtime-introspection generator.
-pub const Lang = enum { ts, dart };
+pub const Lang = enum { ts, dart, python };
 
-/// Parse a `--lang` string ("ts"|"dart") to [Lang]; unknown values error.
+/// Parse a `--lang` string ("ts"|"dart"|"python") to [Lang]; unknown values error.
 pub fn parseLang(s: []const u8) !Lang {
     if (std.mem.eql(u8, s, "ts")) return .ts;
     if (std.mem.eql(u8, s, "dart")) return .dart;
-    std.log.err("typegen: unknown --lang '{s}' (expected 'ts' or 'dart')", .{s});
+    if (std.mem.eql(u8, s, "python")) return .python;
+    std.log.err("typegen: unknown --lang '{s}' (expected 'ts', 'dart', or 'python')", .{s});
     return error.BadLang;
 }
 
@@ -106,6 +108,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const text = switch (opts.lang) {
         .ts => gen_client.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix),
         .dart => gen_dart.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix),
+        .python => gen_python.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix),
     } catch |e| {
         std.log.err("typegen: code generation failed: {s}", .{@errorName(e)});
         return e;

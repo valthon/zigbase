@@ -13,6 +13,7 @@ const ident = @import("identifiers.zig");
 const rpc_ts = @import("rpc_ts.zig");
 const rpc = @import("rpc.zig");
 const gen_dart = @import("gen_dart.zig");
+const gen_python = @import("gen_python.zig");
 
 const W = std.ArrayList(u8);
 
@@ -886,13 +887,16 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
     const in_repo = init.environ_map.contains("ZBASE_INREPO");
     const client_name = "ZbClient";
     const want_dart = std.mem.eql(u8, args.lang, "dart");
-    if (!want_dart and !std.mem.eql(u8, args.lang, "ts")) {
-        std.log.err("gen_client: unknown --lang '{s}' (expected 'ts' or 'dart')", .{args.lang});
+    const want_python = std.mem.eql(u8, args.lang, "python");
+    if (!want_dart and !want_python and !std.mem.eql(u8, args.lang, "ts")) {
+        std.log.err("gen_client: unknown --lang '{s}' (expected 'ts', 'dart', or 'python')", .{args.lang});
         return error.BadLang;
     }
 
     const text = (if (want_dart)
         gen_dart.generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix)
+    else if (want_python)
+        gen_python.generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix)
     else
         generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix)) catch |e| {
         // guard messages are printed via the report; re-run path for the message:

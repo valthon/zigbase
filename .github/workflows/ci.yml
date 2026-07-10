@@ -81,6 +81,27 @@ jobs:
           mise exec zig@0.16.0 -- zig build gen-dating-dart-client
           mise exec dart@3.12 -- dart format --language-version=3.5 clients/dart/test/codegen/dating/zbase.gen.dart
           git diff --exit-code clients/dart/test/codegen/dating/zbase.gen.dart
+      # Same format-then-diff shape as the Dart snapshot above: the Python
+      # golden is committed `ruff format`-clean, and the raw generator output
+      # differs from it only in blank-line normalization, so a byte-exact
+      # `--check` (unlike the TS/runtime `gen-*-check` steps) would false-
+      # positive on formatting alone. `ruff` is installed standalone here
+      # (not the full `zigbase[dev]` extra) since this job only needs the
+      # formatter, not the whole python-sdk toolchain (see the `python-sdk`
+      # job below for that). Version pinned for the same reason the Dart
+      # snapshot's `--language-version` above is pinned: this job never runs
+      # `pip install -e clients/python[dev]`, so nothing else constrains the
+      # version, and an unpinned `pip install ruff` could silently pick up a
+      # newer release whose formatter disagrees with the one that produced
+      # the committed golden — a pure tooling-version diff, not a real
+      # regression. Bump deliberately alongside `clients/python/pyproject.toml`'s
+      # `ruff>=0.8` dev-extra floor.
+      - name: Dating Python client snapshot is fresh
+        run: |
+          mise exec zig@0.16.0 -- zig build gen-dating-python-client
+          mise exec python@3.13 -- python -m pip install --quiet ruff==0.15.21
+          mise exec python@3.13 -- python -m ruff format clients/python/tests/codegen/dating/zbase_gen.py
+          git diff --exit-code clients/python/tests/codegen/dating/zbase_gen.py
       - name: Golfsim client snapshot is fresh
         working-directory: examples/golfsim
         run: mise exec zig@0.16.0 -- zig build gen-client-check
@@ -480,8 +501,9 @@ jobs:
           path: artifacts
       - name: Export prebuilt binary path
         run: |
-          chmod +x artifacts/zig-out/bin/zigbase
+          chmod +x artifacts/zig-out/bin/zigbase artifacts/zig-out/bin/dating-server
           echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_DATING_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/dating-server" >> "$GITHUB_ENV"
       - name: Install
         run: mise exec python@3.13 -- python -m pip install --quiet -e 'clients/python[dev,realtime]'
       - name: Lint (format)
