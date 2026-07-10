@@ -245,12 +245,16 @@ def _bootstrap(server_url: str, superuser_token: str) -> None:
     """Provision the fixed collection set every test in this directory
     shares: `posts` (@public CRUD/filter/abilities/files), `cursorposts`
     (@public, dedicated to the cursor-pagination test so its record count
-    stays exact), `locked` (blank rules, for the anon-403 test), and
-    `members` (auth-type, for the password-auth/refresh/logout coverage)."""
+    stays exact), `locked` (blank rules, for the anon-403 test), `members`
+    (auth-type, for the password-auth/refresh/logout coverage), and `feed`
+    (@public, dedicated to the realtime tests -- mirroring the Dart/TS
+    integration harnesses' own `feed` collection -- so its event stream
+    isn't shared with `posts`' CRUD/filter/abilities/files coverage)."""
     _create_collection(server_url, superuser_token, _posts_definition("posts"))
     _create_collection(server_url, superuser_token, _posts_definition("cursorposts"))
     _create_collection(server_url, superuser_token, _locked_definition("locked"))
     _create_collection(server_url, superuser_token, _members_definition("members"))
+    _create_collection(server_url, superuser_token, _posts_definition("feed"))
 
 
 @pytest.fixture()
@@ -266,10 +270,20 @@ async def async_client(server_url: str) -> AsyncIterator[AsyncZigBase]:
 
 
 @pytest.fixture()
-def admin_client(server_url: str) -> Iterator[ZigBase]:
+def admin_client(server_url: str, superuser_token: str) -> Iterator[ZigBase]:
     """A superuser-authenticated client, for seeding data outside the
     collection under test (e.g. a `members` record with a password, before
-    the test logs in as that member through the public API)."""
+    the test logs in as that member through the public API).
+
+    Seeds the auth store directly from the session-scoped `superuser_token`
+    fixture instead of calling `auth-with-password` again per test: the
+    server's login rate limiter is keyed per identity (`rate_limit_max`
+    attempts per `rate_limit_window_s`, default 10/60s -- see
+    `src/config.zig`), and every `admin_client` use logs in as the SAME
+    `SUPERUSER_EMAIL` -- a fresh password auth call per test exceeds that
+    window once enough tests across this directory use the fixture (a real
+    429 this harness hit once the realtime live tests added their own
+    `admin_client` uses on top of `test_auth_live.py`'s)."""
     with ZigBase(server_url) as zb:
-        zb.collection("_superusers").auth_with_password(SUPERUSER_EMAIL, SUPERUSER_PASSWORD)
+        zb.auth_store.save(superuser_token, None)
         yield zb

@@ -6,6 +6,7 @@ from zigbase.client import AsyncZigBase, ZigBase
 from zigbase.collection import AuthResponse, CursorPage, ListResult
 from zigbase.errors import FieldError, ZigbaseError
 from zigbase.query import zb_filter
+from zigbase.realtime import RealtimeEvent, TopicMessage
 
 __all__ = [
     "AsyncZigBase",
@@ -16,6 +17,8 @@ __all__ = [
     "FileAuthStore",
     "ListResult",
     "MemoryAuthStore",
+    "RealtimeEvent",
+    "TopicMessage",
     "ZigBase",
     "ZigbaseError",
     "__version__",
