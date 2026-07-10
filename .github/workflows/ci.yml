@@ -466,3 +466,36 @@ jobs:
       - name: Integration tests
         working-directory: clients/dart
         run: mise exec dart@3.12 -- dart test --tags integration
+
+  python-sdk:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: zigbase-binaries
+          path: artifacts
+      - name: Export prebuilt binary path
+        run: |
+          chmod +x artifacts/zig-out/bin/zigbase
+          echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+      - name: Install
+        run: mise exec python@3.13 -- python -m pip install --quiet -e 'clients/python[dev]'
+      - name: Lint (format)
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m ruff format --check .
+      - name: Lint (check)
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m ruff check .
+      - name: Typecheck
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m mypy src
+      - name: Unit tests
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m pytest -q -m "not integration"
+      - name: Integration tests
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m pytest -q -m integration tests/integration

@@ -1,0 +1,105 @@
+# Python SDK release: publishes `zigbase` to PyPI on a `python-client-v*` tag.
+# The Python SDK is versioned INDEPENDENTLY of the server (`vX.Y.Z` tags), the
+# TypeScript SDK (`client-v*` tags, see release-sdk.yml), and the Dart SDK
+# (`dart-client-v*` tags, see release-dart-sdk.yml).
+#
+# Publishes via PyPI's Trusted Publishing (OIDC, no long-lived API token) --
+# https://docs.pypi.org/trusted-publishers/. UNLIKE pub.dev (which binds to
+# the repository + a tag pattern) and LIKE npm, PyPI's trusted-publisher
+# binding is on this file's PATH (owner/repo/workflow-filename[/environment]),
+# configured on PyPI's "Publishing" settings page for the project -- renaming
+# this file breaks the binding until PyPI is told the new filename. See
+# clients/python/RELEASING.md for the one-time PyPI setup this depends on,
+# including the "pending publisher" route for a package's first-ever publish.
+name: Release Python SDK
+
+on:
+  push:
+    tags:
+      - "python-client-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+
+      - name: Install dependencies
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m pip install --quiet -e '.[dev]' build twine
+
+      - name: Lint (format)
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m ruff format --check .
+
+      - name: Lint (check)
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m ruff check .
+
+      - name: Typecheck
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m mypy src
+
+      - name: Unit tests
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m pytest -q -m "not integration"
+
+      - name: Assert pyproject.toml version matches the tag
+        working-directory: clients/python
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          expected="${tag#python-client-v}"
+          # Strip optional surrounding quotes and a trailing `# comment` so the
+          # gate still extracts the bare version if pyproject.toml ever writes
+          # `version = '0.1.0'` or `version = "0.1.0"  # note` (otherwise it
+          # would fail closed with a confusing mismatch message).
+          actual="$(grep -m1 '^version[[:space:]]*=' pyproject.toml \
+            | sed -E 's/^version[[:space:]]*=[[:space:]]*//; s/[[:space:]]+#.*$//; s/^[\"'"'"']//; s/[\"'"'"']$//; s/[[:space:]]+$//')"
+          echo "tag=$tag expected=$expected pyproject.toml=$actual"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::Tag ($tag => $expected) does not match pyproject.toml version ($actual)."
+            exit 1
+          fi
+
+      - name: Build sdist + wheel
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m build
+
+      - name: twine check
+        working-directory: clients/python
+        run: mise exec python@3.13 -- python -m twine check dist/*
+
+      # Publish the exact artifacts checked above -- the publish job does not
+      # rebuild, so what gets uploaded to PyPI is byte-for-byte what passed
+      # `twine check` here.
+      - name: Upload dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-sdk-dist
+          path: clients/python/dist/
+          retention-days: 7
+
+  publish:
+    name: Publish to PyPI
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # Required for PyPI's OIDC Trusted Publishing.
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v8
+        with:
+          name: python-sdk-dist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
