@@ -17,7 +17,7 @@ import httpx
 import pytest
 
 from zigbase import _transport
-from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body
+from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body, require_str_field
 from zigbase._transport import SyncTransport
 from zigbase.auth_store import MemoryAuthStore
 from zigbase.errors import ZigbaseError
@@ -73,6 +73,28 @@ def test_ensure_object_body_raises_status_0_on_non_dict(body: object) -> None:
         ensure_object_body(body, context="get_one")
     assert excinfo.value.status == 0
     assert "get_one" in excinfo.value.message
+
+
+def test_require_str_field_returns_the_string() -> None:
+    assert require_str_field({"token": "tok1"}, "token", context="x") == "tok1"
+
+
+def test_require_str_field_accepts_an_empty_string() -> None:
+    assert require_str_field({"token": ""}, "token", context="x") == ""
+
+
+def test_require_str_field_raises_status_0_when_key_is_missing() -> None:
+    with pytest.raises(ZigbaseError, match="'token'") as excinfo:
+        require_str_field({}, "token", context="get_one")
+    assert excinfo.value.status == 0
+    assert "get_one" in excinfo.value.message
+
+
+@pytest.mark.parametrize("value", [None, 1, True, [], {}])
+def test_require_str_field_raises_status_0_when_value_is_not_a_string(value: object) -> None:
+    with pytest.raises(ZigbaseError, match="'token'") as excinfo:
+        require_str_field({"token": value}, "token", context="get_one")
+    assert excinfo.value.status == 0
 
 
 def test_request_spec_defaults() -> None:

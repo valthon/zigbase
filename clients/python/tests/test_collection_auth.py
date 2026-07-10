@@ -537,3 +537,47 @@ async def test_async_auth_with_password_raises_clear_error_on_non_object_body() 
     with pytest.raises(ZigbaseError, match="JSON object") as excinfo:
         await svc.auth_with_password("a@b.com", "secret")
     assert excinfo.value.status == 0
+
+
+# --- mandatory `token` field guard -------------------------------------------
+#
+# `_parse_auth_response` used to default a missing/non-string `token` to
+# `""` via `.get("token", "")`, letting a malformed 2xx masquerade as a
+# successful (but silently empty) login. It must now raise instead, matching
+# TS/Dart's throw-on-malformed-response behavior.
+
+
+def test_auth_with_password_raises_when_token_is_missing() -> None:
+    transport = MockTransport(sequence_handler({"record": {"id": "u1"}}))
+    svc = CollectionService(transport, "users")
+
+    with pytest.raises(ZigbaseError, match="'token'") as excinfo:
+        svc.auth_with_password("a@b.com", "secret")
+    assert excinfo.value.status == 0
+
+
+def test_auth_with_password_raises_when_token_is_not_a_string() -> None:
+    transport = MockTransport(sequence_handler({"token": 12345, "record": {"id": "u1"}}))
+    svc = CollectionService(transport, "users")
+
+    with pytest.raises(ZigbaseError, match="'token'") as excinfo:
+        svc.auth_with_password("a@b.com", "secret")
+    assert excinfo.value.status == 0
+
+
+def test_auth_refresh_raises_when_token_is_missing() -> None:
+    transport = MockTransport(sequence_handler({"record": {"id": "u1"}}))
+    svc = CollectionService(transport, "users")
+
+    with pytest.raises(ZigbaseError, match="'token'") as excinfo:
+        svc.auth_refresh()
+    assert excinfo.value.status == 0
+
+
+async def test_async_auth_refresh_raises_when_token_is_not_a_string() -> None:
+    transport = AsyncMockTransport(sequence_handler({"token": None, "record": {"id": "u1"}}))
+    svc = AsyncCollectionService(transport, "users")
+
+    with pytest.raises(ZigbaseError, match="'token'") as excinfo:
+        await svc.auth_refresh()
+    assert excinfo.value.status == 0

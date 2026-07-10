@@ -268,6 +268,50 @@ class TestFileAuthStore:
         leftovers = [p for p in tmp_path.iterdir() if p.name != "auth.json"]
         assert leftovers == []
 
+    def test_concurrent_saves_from_the_same_process_never_raise_and_leave_no_temp_files(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression test: the temp filename used to be `{name}.tmp.{pid}`
+        -- identical across every thread of the same process -- so two
+        threads racing `save()` could collide on `O_CREAT|O_EXCL`, and the
+        old FileExistsError handler unlinked the *other* thread's in-flight
+        temp file before its `os.replace`, losing a write or raising. The
+        temp name must be unique per call so concurrent same-process writers
+        never collide."""
+        import threading
+
+        path = tmp_path / "auth.json"
+        store = FileAuthStore(path)
+        n_threads = 8
+        iterations = 25
+        barrier = threading.Barrier(n_threads)
+        errors: list[BaseException] = []
+
+        def worker(idx: int) -> None:
+            barrier.wait()
+            try:
+                for i in range(iterations):
+                    store.save(_valid_token(), {"id": f"u{idx}-{i}"})
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert isinstance(on_disk, dict)
+        assert isinstance(on_disk["token"], str)
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600
+
+        leftovers = [p for p in tmp_path.iterdir() if p.name != "auth.json"]
+        assert leftovers == []
+
 
 class TestAuthStoreIsAbstractBase:
     def test_memory_and_file_stores_are_auth_stores(self, tmp_path: Path) -> None:

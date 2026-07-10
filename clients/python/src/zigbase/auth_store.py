@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import secrets
 from abc import ABC
 from collections.abc import Callable
 from pathlib import Path
@@ -121,14 +122,16 @@ class FileAuthStore(AuthStore):
     def _write(self, token: str | None, record: dict[str, Any] | None) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps({"token": token, "record": record})
-        tmp_path = self._path.with_name(f"{self._path.name}.tmp.{os.getpid()}")
-        try:
-            self._write_new_file(tmp_path, payload)
-        except FileExistsError:
-            # A stale temp file from a prior crashed run of this same pid
-            # (e.g. a reused pid across reboots) -- clear it and retry once.
-            tmp_path.unlink()
-            self._write_new_file(tmp_path, payload)
+        # The suffix must be unique per *call*, not just per process: two
+        # threads of the same process racing `save()` would otherwise share
+        # `{name}.tmp.{pid}` and could collide on O_CREAT|O_EXCL. With a
+        # random per-call suffix a collision is practically impossible, so
+        # there is no retry branch -- a colliding/failing O_EXCL propagates
+        # like any other write failure.
+        tmp_path = self._path.with_name(
+            f"{self._path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        )
+        self._write_new_file(tmp_path, payload)
         try:
             os.replace(tmp_path, self._path)
         finally:

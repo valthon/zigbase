@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlencode
 
-from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body
+from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body, require_str_field
 from zigbase._transport import AsyncTransport, SyncTransport
 
 
@@ -113,9 +113,12 @@ class FilesService:
 
     def get_token(self) -> str:
         """`POST /api/files/token` -- mint a short-lived file-access token
-        for embedding protected files (e.g. in an `<img>` tag)."""
+        for embedding protected files (e.g. in an `<img>` tag). Raises when
+        the response is missing `token` or it isn't a string, rather than
+        silently defaulting to `""`."""
         body = self._transport.request(RequestSpec(method="POST", path="/api/files/token"))
-        return str(ensure_object_body(body, context="get_token").get("token", ""))
+        envelope = ensure_object_body(body, context="get_token")
+        return require_str_field(envelope, "token", context="get_token")
 
 
 class AsyncFilesService:
@@ -170,7 +173,8 @@ class AsyncFilesService:
     async def get_token(self) -> str:
         """See `FilesService.get_token`."""
         body = await self._transport.request(RequestSpec(method="POST", path="/api/files/token"))
-        return str(ensure_object_body(body, context="get_token").get("token", ""))
+        envelope = ensure_object_body(body, context="get_token")
+        return require_str_field(envelope, "token", context="get_token")
 
 
 __all__ = ["AsyncFilesService", "FilesService"]

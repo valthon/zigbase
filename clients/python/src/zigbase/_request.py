@@ -67,4 +67,21 @@ def ensure_object_body(body: Any, *, context: str) -> dict[str, Any]:
     return body
 
 
-__all__ = ["RequestSpec", "encode_path_segment", "ensure_object_body"]
+def require_str_field(envelope: Mapping[str, Any], key: str, *, context: str) -> str:
+    """Extract a mandatory string field (e.g. `token`) from a parsed JSON
+    envelope, raising a clear `ZigbaseError` when it is missing or not a
+    `str` -- matching the TS/Dart SDKs, which throw on a malformed response
+    rather than silently defaulting a mandatory field to `""`. An empty
+    string IS a valid value (some flows legitimately return one) -- only
+    absence or a wrong type raises."""
+    value = envelope.get(key)
+    if not isinstance(value, str):
+        raise ZigbaseError(
+            status=0,
+            message=f"Expected a string '{key}' in response ({context}).",
+            url="",
+        )
+    return value
+
+
+__all__ = ["RequestSpec", "encode_path_segment", "ensure_object_body", "require_str_field"]

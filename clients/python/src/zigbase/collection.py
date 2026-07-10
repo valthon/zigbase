@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body
+from zigbase._request import RequestSpec, encode_path_segment, ensure_object_body, require_str_field
 from zigbase._transport import AsyncTransport, SyncTransport
 from zigbase.errors import ZigbaseError
 from zigbase.query import build_list_params
@@ -114,15 +114,16 @@ def _record_path(name: str, record_id: str) -> str:
 
 
 def _parse_auth_response(body: Any, context: str) -> AuthResponse:
-    """Parse a `{token, record?, meta?}` auth envelope. `record`/`meta` fall
-    back to `None` when absent or not shaped as an object -- trusting the
-    wire contract for `token` (always present on these endpoints) but not
-    over-trusting the optional fields."""
+    """Parse a `{token, record?, meta?}` auth envelope. `token` is
+    mandatory -- a missing/non-string `token` raises rather than silently
+    defaulting to `""`, matching TS/Dart's throw-on-malformed-response
+    behavior. `record`/`meta` fall back to `None` when absent or not shaped
+    as an object -- those two stay optional."""
     envelope = _as_dict(body, context)
     raw_record = envelope.get("record")
     raw_meta = envelope.get("meta")
     return AuthResponse(
-        token=envelope.get("token", ""),
+        token=require_str_field(envelope, "token", context=context),
         record=raw_record if isinstance(raw_record, dict) else None,
         meta=raw_meta if isinstance(raw_meta, dict) else None,
     )

@@ -143,6 +143,42 @@ async def test_async_get_token_posts_and_unwraps_token() -> None:
     assert transport.calls[0].path == "/api/files/token"
 
 
+def test_get_token_raises_when_token_is_missing() -> None:
+    transport = MockTransport(sequence_handler({}))
+    svc = FilesService(transport, "http://localhost:8090")
+
+    with pytest.raises(ZigbaseError, match="'token'") as excinfo:
+        svc.get_token()
+    assert excinfo.value.status == 0
+
+
+def test_get_token_raises_when_token_is_not_a_string() -> None:
+    transport = MockTransport(sequence_handler({"token": 12345}))
+    svc = FilesService(transport, "http://localhost:8090")
+
+    with pytest.raises(ZigbaseError, match="'token'") as excinfo:
+        svc.get_token()
+    assert excinfo.value.status == 0
+
+
+async def test_async_get_token_raises_when_token_is_missing() -> None:
+    transport = AsyncMockTransport(sequence_handler({}))
+    svc = AsyncFilesService(transport, "http://localhost:8090")
+
+    with pytest.raises(ZigbaseError, match="'token'") as excinfo:
+        await svc.get_token()
+    assert excinfo.value.status == 0
+
+
+async def test_async_get_token_raises_when_token_is_not_a_string() -> None:
+    transport = AsyncMockTransport(sequence_handler({"token": None}))
+    svc = AsyncFilesService(transport, "http://localhost:8090")
+
+    with pytest.raises(ZigbaseError, match="'token'") as excinfo:
+        await svc.get_token()
+    assert excinfo.value.status == 0
+
+
 # --- AccountsService.activate -------------------------------------------------
 
 
