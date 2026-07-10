@@ -496,10 +496,10 @@ pub fn App(comptime cfg: anytype) type {
                 if (@hasField(AuthT, "session")) {
                     const ST = @TypeOf(cfg.auth.session);
                     if (@typeInfo(ST) != .@"struct")
-                        @compileError(".auth.session must be a struct: .session = .{ .store = .epoch|.table, .gc_cron = \"...\" }");
+                        @compileError(".auth.session must be a struct: .session = .{ .store = .epoch|.table, .gc_cron = \"...\", .rotation_grace_s = N }");
                     for (std.meta.fields(ST)) |sf| {
-                        if (!std.mem.eql(u8, sf.name, "store") and !std.mem.eql(u8, sf.name, "gc_cron"))
-                            @compileError(".auth.session: unknown key '." ++ sf.name ++ "' (recognized: .store, .gc_cron)");
+                        if (!std.mem.eql(u8, sf.name, "store") and !std.mem.eql(u8, sf.name, "gc_cron") and !std.mem.eql(u8, sf.name, "rotation_grace_s"))
+                            @compileError(".auth.session: unknown key '." ++ sf.name ++ "' (recognized: .store, .gc_cron, .rotation_grace_s)");
                     }
                 }
             }
@@ -914,15 +914,30 @@ pub fn App(comptime cfg: anytype) type {
             break :blk if (@hasField(@TypeOf(auth_session_cfg), "gc_cron")) auth_session_cfg.gc_cron else "0 * * * *";
         };
 
-        // Force analysis of `session_gc_cron` so its misuse `@compileError` (setting
-        // `.auth.session.gc_cron` without `.auth.session.store = .table`) actually fires. It
-        // is otherwise a lazy `pub const` referenced only by the conditionally-installed
-        // `_session_gc` job (see `session_gc_jobs`), which is absent in `.epoch` mode — exactly
-        // the misuse case — so the const was never analyzed and the guard was silently dead.
-        // Referencing it here makes the guard live on every `App(...)`; the valid default and
-        // `.store = .table` cases resolve to their cron string with no error.
+        /// Predecessor-session grace (seconds) after an HTTP auth-refresh rotation — the old
+        /// row's expiry is clamped to now+grace instead of being deleted, so requests already
+        /// in flight with the old cookie don't 403 through the rotation window. Default 30;
+        /// `.auth.session.rotation_grace_s = 0` restores the immediate delete. Table mode only.
+        pub const session_rotation_grace_config: i64 = blk: {
+            if (@hasField(@TypeOf(auth_session_cfg), "rotation_grace_s") and session_store_config != .table)
+                @compileError(".auth.session.rotation_grace_s has no effect without .auth.session.store = .table");
+            if (!@hasField(@TypeOf(auth_session_cfg), "rotation_grace_s")) break :blk 30;
+            const g: i64 = auth_session_cfg.rotation_grace_s;
+            if (g < 0) @compileError(".auth.session.rotation_grace_s must be >= 0");
+            break :blk g;
+        };
+
+        // Force analysis of `session_gc_cron` (and the rotation-grace guard) so their misuse
+        // `@compileError`s (setting `.auth.session.gc_cron`/`.rotation_grace_s` without
+        // `.auth.session.store = .table`) actually fire. `session_gc_cron` is otherwise a lazy
+        // `pub const` referenced only by the conditionally-installed `_session_gc` job (see
+        // `session_gc_jobs`), which is absent in `.epoch` mode — exactly the misuse case — so
+        // the const was never analyzed and the guard was silently dead. Referencing them here
+        // makes the guards live on every `App(...)`; the valid default and `.store = .table`
+        // cases resolve with no error.
         comptime {
             _ = session_gc_cron;
+            _ = session_rotation_grace_config;
         }
 
         /// Cadence for the framework-internal TTL garbage-collection sweep (`_ttl_gc`), which
@@ -1522,6 +1537,7 @@ pub fn App(comptime cfg: anytype) type {
             .collections_frozen = collections_frozen,
             .pagination = pagination_config,
             .session_store = session_store_config,
+            .session_rotation_grace_s = session_rotation_grace_config,
             .enable_typegen = enable_typegen,
             .has_ttl = has_ttl_collection,
             .features = &features_registry,
@@ -1704,6 +1720,9 @@ pub const ServeOpts = struct {
     pagination: pagination.Config = .{},
     /// Selected session-management model (#99); threaded into `App.session_store`.
     session_store: app_mod.SessionStore = .epoch,
+    /// Predecessor grace after an auth-refresh rotation (table mode); threaded into
+    /// `App.session_rotation_grace_s`.
+    session_rotation_grace_s: i64 = 30,
     /// When true, compiles the `typegen` CLI subcommand into the binary.
     /// Off by default so production builds carry no codegen.
     enable_typegen: bool = false,
@@ -2962,6 +2981,7 @@ fn bootApp(
         .cookie_secure = cfg.cookie_secure,
         .auth_token_ttl_s = cfg.auth_token_ttl_s,
         .session_store = opts.session_store,
+        .session_rotation_grace_s = opts.session_rotation_grace_s,
         .verification_ttl_s = cfg.verification_ttl_s,
         .password_reset_ttl_s = cfg.password_reset_ttl_s,
         .oauth_state_server = cfg.oauth_state_server,
