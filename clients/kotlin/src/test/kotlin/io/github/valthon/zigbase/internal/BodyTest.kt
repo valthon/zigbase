@@ -76,10 +76,43 @@ class EncodeBodyJsonPathTest {
     }
 
     @Test
+    fun `Short and Byte widen to a long json number`() {
+        val result =
+            encodeBody(
+                mapOf(
+                    "small" to 7.toShort(),
+                    "tiny" to 3.toByte(),
+                ),
+            )
+        require(result is EncodedBody.Json)
+        assertEquals(JsonPrimitive(7L), result.element["small"])
+        assertEquals(JsonPrimitive(3L), result.element["tiny"])
+    }
+
+    @Test
     fun `rejects a non-encodable value naming the key`() {
         val ex =
             assertThrows(IllegalArgumentException::class.java) {
                 encodeBody(mapOf("good_key" to "ok", "bad_key" to StringBuilder("nope")))
+            }
+        assertTrue(ex.message!!.contains("bad_key"))
+    }
+
+    @Test
+    fun `rejects a BigDecimal naming the key and the type`() {
+        val ex =
+            assertThrows(IllegalArgumentException::class.java) {
+                encodeBody(mapOf("good_key" to "ok", "bad_key" to java.math.BigDecimal("1.1")))
+            }
+        assertTrue(ex.message!!.contains("bad_key"))
+        assertTrue(ex.message!!.contains("BigDecimal"))
+    }
+
+    @Test
+    fun `rejects a BigInteger naming the key`() {
+        val ex =
+            assertThrows(IllegalArgumentException::class.java) {
+                encodeBody(mapOf("good_key" to "ok", "bad_key" to java.math.BigInteger.TEN))
             }
         assertTrue(ex.message!!.contains("bad_key"))
     }
@@ -238,6 +271,21 @@ class EncodeBodyMultipartPathTest {
         require(result is EncodedBody.Multipart)
         assertTrue(("n" to "5") in result.fields)
         assertTrue(("f" to "3.5") in result.fields)
+    }
+
+    @Test
+    fun `Short and Byte stringify like any other scalar`() {
+        val result =
+            encodeBody(
+                mapOf(
+                    "small" to 7.toShort(),
+                    "tiny" to 3.toByte(),
+                    "avatar" to FileArg.Bytes("a.png", byteArrayOf(1)),
+                ),
+            )
+        require(result is EncodedBody.Multipart)
+        assertTrue(("small" to "7") in result.fields)
+        assertTrue(("tiny" to "3") in result.fields)
     }
 
     @Test

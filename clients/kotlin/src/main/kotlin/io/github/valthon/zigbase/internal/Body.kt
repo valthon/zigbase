@@ -90,7 +90,13 @@ private fun readFileArg(value: FileArg): Triple<String, ByteArray, String?> =
  * body) and a non-finite `Double`/`Float` (RFC 8259 forbids `NaN`/
  * `Infinity` in JSON; this is the `allow_nan=False` hardening from the
  * Python port, which the raw `kotlinx.serialization` `JsonPrimitive(Double)`
- * constructor does not itself enforce).
+ * constructor does not itself enforce). `Short`/`Byte` widen to `Long` since
+ * every JVM integral type but `Int`/`Long` is otherwise unreachable from
+ * ordinary caller code; `BigDecimal`/`BigInteger` are deliberately *not*
+ * widened here (unlike a blanket `is Number` branch would) and fall through
+ * to the rejection below, since collapsing arbitrary precision through
+ * `Long`/`Double` is a silent-precision-loss trap this SDK would rather
+ * surface as a loud, immediate error than let a caller discover downstream.
  *
  * Numeric fidelity note: a `Double`/`Float` renders via
  * `JsonPrimitive(Double).toString()`, which uses `Double.toString()` --
@@ -127,6 +133,10 @@ private fun toJsonElement(
 
         is Long -> {
             JsonPrimitive(value)
+        }
+
+        is Short, is Byte -> {
+            JsonPrimitive((value as Number).toLong())
         }
 
         is Double -> {

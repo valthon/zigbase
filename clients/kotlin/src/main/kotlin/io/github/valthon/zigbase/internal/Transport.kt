@@ -327,13 +327,16 @@ private fun hasHeader(
 ): Boolean = headers.keys.any { it.equals(name, ignoreCase = true) }
 
 /**
- * Decodes a 2xx response body (rule 2): 204 or an empty body -> `null`;
- * otherwise parsed JSON.
+ * Decodes a 2xx response body (rule 2): 204 or an empty-or-whitespace-only
+ * body -> `null`; otherwise parsed JSON. `isBlank` (not `isEmpty`) so a
+ * proxy/server that sends a bare newline or spaces for an otherwise-empty
+ * response doesn't reach [Json.parseToJsonElement] and raise a
+ * [kotlinx.serialization.SerializationException].
  */
 private suspend fun decodeResponse(response: HttpResponse): JsonElement? {
     if (response.status == HttpStatusCode.NoContent) return null
     val text = response.bodyAsText()
-    if (text.isEmpty()) return null
+    if (text.isBlank()) return null
     return Json.parseToJsonElement(text)
 }
 

@@ -396,6 +396,25 @@ class FileAuthStoreTest {
     }
 
     @Test
+    fun `newPlainChannelWithBestEffortOwnerOnly restricts permissions best-effort`(
+        @TempDir tmpDir: Path,
+    ) {
+        // Exercises the non-POSIX fallback's permission-narrowing directly --
+        // the UnsupportedOperationException it's meant to run after isn't
+        // reproducible on this (POSIX) CI runner, so this is the reachable
+        // way to pin its behavior. On a POSIX filesystem, setReadable/
+        // setWritable(false, false) followed by setReadable/setWritable(true,
+        // true) does narrow down to owner-only, same end state as the
+        // primary path.
+        val path = tmpDir.resolve("plain.tmp")
+
+        newPlainChannelWithBestEffortOwnerOnly(path).use { }
+
+        val perms = Files.getPosixFilePermissions(path)
+        assertEquals(PosixFilePermissions.fromString("rw-------"), perms)
+    }
+
+    @Test
     fun `concurrent saves from multiple threads never raise and leave no temp files`(
         @TempDir tmpDir: Path,
     ) {

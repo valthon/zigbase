@@ -262,6 +262,13 @@ class TransportTest {
         }
 
     @Test
+    fun `200 whitespace-only body returns null`() =
+        runTest {
+            val transport = makeTransport { respond(" \n\t ", HttpStatusCode.OK) }
+            assertNull(transport.request(RequestSpec(HttpMethod.Get, "/api/x")))
+        }
+
+    @Test
     fun `200 json body parses`() =
         runTest {
             val transport = makeTransport { respond("""{"page":2,"items":[]}""", HttpStatusCode.OK) }

@@ -10,6 +10,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.IOException
 import java.nio.ByteBuffer
+import java.nio.channels.SeekableByteChannel
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
@@ -228,16 +229,10 @@ class FileAuthStore(
         tmpPath: Path,
         payload: String,
     ) {
-        val ownerOnly = PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))
         try {
-            Files
-                .newByteChannel(
-                    tmpPath,
-                    setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE),
-                    ownerOnly,
-                ).use { channel ->
-                    channel.write(ByteBuffer.wrap(payload.toByteArray(StandardCharsets.UTF_8)))
-                }
+            openOwnerOnlyChannel(tmpPath).use { channel ->
+                channel.write(ByteBuffer.wrap(payload.toByteArray(StandardCharsets.UTF_8)))
+            }
         } catch (e: Exception) {
             Files.deleteIfExists(tmpPath)
             throw e
@@ -254,6 +249,54 @@ class FileAuthStore(
             return bytes.joinToString("") { "%02x".format(it) }
         }
     }
+}
+
+/**
+ * Opens [tmpPath] for exclusive create+write, restricted to the owner.
+ *
+ * Prefers the POSIX `rw-------` file-attribute form: the permissions are
+ * applied by the same syscall that creates the file, so there is never a
+ * window where the file briefly exists world-readable. On a filesystem
+ * without POSIX permission support (e.g. a Windows JVM, or FAT/exFAT even
+ * on Linux/macOS), `Files.newByteChannel` rejects the POSIX
+ * [java.nio.file.attribute.FileAttribute] with [UnsupportedOperationException];
+ * this falls back to plain creation plus a best-effort
+ * [newPlainChannelWithBestEffortOwnerOnly] restriction. That fallback isn't
+ * atomic -- there's a brief window post-create, pre-`setReadable` where the
+ * file has the filesystem's default permissions -- but it's the closest a
+ * non-POSIX filesystem allows, and mirrors the Python port's
+ * `os.open(..., 0o600)` (itself a no-op mode on Windows).
+ */
+internal fun openOwnerOnlyChannel(tmpPath: Path): SeekableByteChannel =
+    try {
+        newPosixOwnerOnlyChannel(tmpPath)
+    } catch (e: UnsupportedOperationException) {
+        newPlainChannelWithBestEffortOwnerOnly(tmpPath)
+    }
+
+private fun newPosixOwnerOnlyChannel(tmpPath: Path): SeekableByteChannel {
+    val ownerOnly = PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))
+    return Files.newByteChannel(tmpPath, setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), ownerOnly)
+}
+
+/**
+ * Non-POSIX fallback for [openOwnerOnlyChannel]: creates [tmpPath] with the
+ * filesystem's default permissions, then narrows it to owner-read/write via
+ * [java.io.File.setReadable]/[java.io.File.setWritable]. Each call's boolean
+ * result is ignored (best-effort, matching the no-throw-on-Windows semantics
+ * the Python port relies on for its own POSIX-mode `os.open` call) --
+ * exercised directly (rather than only through the
+ * [UnsupportedOperationException] catch above, which isn't reproducible on
+ * a POSIX CI runner) by a unit test asserting the resulting permissions.
+ */
+internal fun newPlainChannelWithBestEffortOwnerOnly(tmpPath: Path): SeekableByteChannel {
+    val channel = Files.newByteChannel(tmpPath, setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE))
+    val file = tmpPath.toFile()
+    file.setReadable(false, false)
+    file.setReadable(true, true)
+    file.setWritable(false, false)
+    file.setWritable(true, true)
+    return channel
 }
 
 private fun decodeStrictUtf8(bytes: ByteArray): String {
