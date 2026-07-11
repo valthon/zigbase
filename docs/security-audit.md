@@ -22,7 +22,12 @@ hardening, PR B). The rest are written up as recommendations. Several items in
 The query/SQL layer is genuinely strong: every value reaching SQLite is bound as a parameter,
 and every interpolated identifier (table/column/index/alias name) is gated through
 `schema.isValidIdentifier` (letters/digits/underscore, must start with a letter) *before* it can
-reach DDL or a join. The JWT implementation is header-pinned to HS256, verifies signatures in
+reach DDL or a join. The offline `zigbase import` subcommand introduces no new threat surface: it
+writes through the same record engine as the HTTP path (identical validation, defaults, and
+`.encrypted` at-rest envelope), its `--collection`/`--upsert-key` identifiers pass the same
+`isValidIdentifier` gate before interpolation while row values bind as parameters, and its
+id-preservation is import-only (the HTTP/route/hook create path still always generates the id and
+ignores any client-supplied one). The JWT implementation is header-pinned to HS256, verifies signatures in
 constant time, and enforces `exp`. argon2id uses sane parameters. Password verify, CSRF, and
 login-timing are all handled carefully. **No SQL-injection or auth-bypass was found in stock
 ZigBase.**

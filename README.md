@@ -115,8 +115,8 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-`runCli` gives your binary the same `serve` / `migrate` / `superuser create` / `help`
-commands as the stock server. Beyond hooks, `App(.{...})` also accepts a comptime
+`runCli` gives your binary the same `serve` / `migrate` / `import` / `superuser create` /
+`help` commands as the stock server. Beyond hooks, `App(.{...})` also accepts a comptime
 **schema** (`.collections` + `.migrations`, provisioned at startup with additive
 auto-migration), **pluggable backends** (`.storage` / `.mailer`), and **footprint
 levers** (`.pools`). See [docs/framework.md](docs/framework.md) and the worked
@@ -133,10 +133,16 @@ an Astro + React frontend demonstrating a different static-files mode.
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
               [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
 zigbase migrate [--data-dir PATH]
+zigbase import --collection NAME [--upsert-key FIELD] [--batch-size N] [--data-dir PATH] <file.ndjson>
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase version
 zigbase help
 ```
+
+`import` bulk-loads NDJSON records **offline (no running server)** through the record
+engine — validation, defaults, the `.encrypted` envelope, and auth password hashing all
+apply — with optional `--upsert-key` idempotency and source-id preservation. See
+[docs/framework.md](docs/framework.md) → "Offline bulk import".
 
 Running `zigbase` with no recognised command prints usage.
 
