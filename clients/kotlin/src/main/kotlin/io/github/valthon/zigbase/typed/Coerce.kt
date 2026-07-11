@@ -53,14 +53,28 @@ fun coerceLong(
         if (s.isEmpty()) return fallback
         s.toLongOrNull()?.let { return it }
         val d = s.toDoubleOrNull() ?: return fallback
-        if (d == floor(d) && d.isFinite()) return d.toLong()
-        throw IllegalArgumentException("int-mode field received a non-integer value: \"$s\"")
+        if (d != floor(d) || !d.isFinite()) {
+            throw IllegalArgumentException("int-mode field received a non-integer value: \"$s\"")
+        }
+        // A whole double outside Long's range would silently clamp to
+        // Long.MIN/MAX under toLong() -- the same silent corruption the
+        // fractional check above rejects. Upper bound is `<` because
+        // Long.MAX_VALUE.toDouble() rounds UP to 2^63 (out of range).
+        if (d < Long.MIN_VALUE.toDouble() || d >= Long.MAX_VALUE.toDouble()) {
+            throw IllegalArgumentException("int-mode field value out of Long range: \"$s\"")
+        }
+        return d.toLong()
     }
     if (e.booleanOrNull != null) return fallback
     e.longOrNull?.let { return it }
     val d = e.doubleOrNull ?: return fallback
-    if (d == floor(d) && d.isFinite()) return d.toLong()
-    throw IllegalArgumentException("int-mode field received a non-integer value: $d")
+    if (d != floor(d) || !d.isFinite()) {
+        throw IllegalArgumentException("int-mode field received a non-integer value: $d")
+    }
+    if (d < Long.MIN_VALUE.toDouble() || d >= Long.MAX_VALUE.toDouble()) {
+        throw IllegalArgumentException("int-mode field value out of Long range: $d")
+    }
+    return d.toLong()
 }
 
 /**

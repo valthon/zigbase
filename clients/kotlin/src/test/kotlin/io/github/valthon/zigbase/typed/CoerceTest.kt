@@ -149,6 +149,24 @@ class CoerceLongTest {
     }
 
     @Test
+    fun `rejects a whole json number outside Long range`() {
+        // Would silently clamp to Long.MAX_VALUE under a bare toLong().
+        assertThrows(IllegalArgumentException::class.java) { coerceLong(JsonPrimitive(1e30)) }
+        assertThrows(IllegalArgumentException::class.java) { coerceLong(JsonPrimitive(-1e30)) }
+    }
+
+    @Test
+    fun `rejects a whole string outside Long range`() {
+        assertThrows(IllegalArgumentException::class.java) { coerceLong(JsonPrimitive("1e30")) }
+    }
+
+    @Test
+    fun `accepts a large whole value still inside Long range`() {
+        // 1e18 < 2^63: representable and must NOT be rejected by the range guard.
+        assertEquals(1_000_000_000_000_000_000L, coerceLong(JsonPrimitive(1e18)))
+    }
+
+    @Test
     fun `empty string returns fallback`() {
         assertEquals(7L, coerceLong(JsonPrimitive(""), 7L))
     }

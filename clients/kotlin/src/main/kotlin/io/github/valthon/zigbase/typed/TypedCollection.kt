@@ -6,6 +6,7 @@ import io.github.valthon.zigbase.ZbRecord
 import io.github.valthon.zigbase.ZigbaseClient
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.toList
 import kotlinx.serialization.json.JsonObject
 
 /*
@@ -225,11 +226,7 @@ class TypedCollection<T>(
         expand: List<String>? = null,
         fields: String? = null,
         search: String? = null,
-    ): List<T> {
-        val out = mutableListOf<T>()
-        iterate(batch, filter, sort, expand, fields, search).collect { out.add(it) }
-        return out
-    }
+    ): List<T> = iterate(batch, filter, sort, expand, fields, search).toList()
 
     /**
      * `POST /records`. [body] is the raw map a generated `toMap()` produced
