@@ -185,6 +185,18 @@ pub const FilterArg = @import("records.zig").FilterArg;
 /// wrapper is `ctx.records().queryAs(T, sql, args)`. See docs/framework.md.
 pub const data = @import("data.zig");
 
+/// Comptime-checked raw SQL (#281). `checkSql`/`checkedSql`/`checkSqlOpts` validate the table and
+/// qualified-column identifiers in a raw-SQL string against `App(cfg).collections`, failing the
+/// build on an unknown table or a mistyped qualified column. Name the App type to reach its lowered
+/// schema: `const Backend = zigbase.App(.{...}); checkedSql(Backend.collections, "SELECT ...")`.
+/// Best-effort by design (tables strict; qualified columns checked; unqualified columns/functions
+/// untouched) so it never rejects valid SQL. `.extra_tables` opts internal/migration-owned tables
+/// (`_kv`, a migration's own table) into the known set. See docs/framework.md.
+pub const checkSql = @import("sql/schema_check.zig").checkSql;
+pub const checkedSql = @import("sql/schema_check.zig").checkedSql;
+pub const checkSqlOpts = @import("sql/schema_check.zig").checkSqlOpts;
+pub const SqlCheckOptions = @import("sql/schema_check.zig").SqlCheckOptions;
+
 // ---- General outbound HTTP client -----------------------------------------
 // HttpMethod/HttpHeader use the Http-prefix to avoid collision with http.zig's
 // Method/Header enums (which are already accessible via `zigbase.http.Method`).
@@ -349,6 +361,7 @@ test {
     _ = @import("files/serve_file.zig");
     _ = @import("files/config.zig");
     _ = @import("data.zig");
+    _ = @import("sql/schema_check.zig");
     _ = @import("events.zig");
     _ = @import("report/reporter.zig");
     _ = @import("report/log.zig");
