@@ -3,6 +3,7 @@ package io.github.valthon.zigbase.realtime
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -89,6 +90,15 @@ internal class FakeConnection : RealtimeConnection {
     override val incoming: ReceiveChannel<String> get() = channel
 
     override suspend fun close() {
+        // A real (ktor) close() suspends, so model a suspension point here.
+        // This makes a close() mistakenly invoked in an already-cancelled
+        // coroutine (i.e. outside `withContext(NonCancellable)`) observably
+        // throw rather than silently completing -- which is what lets
+        // RealtimeServiceConnectCancelledAfterCommitTest actually catch a
+        // leaked socket on connectOnce's cancellation path. A synchronous
+        // fake close would run to completion even under cancellation and hide
+        // the leak.
+        yield()
         closeCount += 1
         channel.close()
     }

@@ -874,14 +874,24 @@ class RealtimeService internal constructor(
                         opened = false
                     }
                 }
+                // Close the socket on ANY unsuccessful exit -- not just the
+                // never-adopted case. A commit that failed to finish wiring up
+                // (rolled back just above) owns closing its own connection too:
+                // otherwise an adopted-but-unwired socket leaks (nothing else
+                // holds a reference to `.close()` it). Idempotent + `runCatching`,
+                // so a double close racing `close()`'s own teardown is harmless.
+                //
+                // MUST run INSIDE `withContext(NonCancellable)` (but outside the
+                // `mutex.withLock`, to avoid holding the lock across I/O):
+                // `conn.close()` is a suspend fn, and this finally's whole reason
+                // to exist is the cancellation path. Left outside NonCancellable,
+                // `close()` would throw `CancellationException` at its first
+                // suspension point in the already-cancelled coroutine and
+                // `runCatching` would swallow it -- so the socket would never
+                // actually close, leaking exactly the connection we are here to
+                // reclaim.
+                if (!success) runCatching { conn.close() }
             }
-            // Close the socket on ANY unsuccessful exit -- not just the
-            // never-adopted case. A commit that failed to finish wiring up
-            // (rolled back just above) owns closing its own connection too:
-            // otherwise an adopted-but-unwired socket leaks (nothing else
-            // holds a reference to `.close()` it). Idempotent + `runCatching`,
-            // so a double close racing `close()`'s own teardown is harmless.
-            if (!success) runCatching { conn.close() }
         }
     }
 
