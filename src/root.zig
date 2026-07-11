@@ -1,5 +1,12 @@
 const std = @import("std");
 
+// Force the compile-time Zig-version guard on every build. Building against an
+// unsupported compiler fails here with a clear required-vs-actual message rather
+// than a confusing deep-compilation error downstream (see src/zig_compat.zig).
+comptime {
+    _ = @import("zig_compat.zig");
+}
+
 // ---- Public API (grows over this plan) -------------------------------------
 pub const App = @import("framework.zig").App; // comptime application builder
 pub const Runtime = @import("app.zig").App; // runtime app context struct
@@ -266,6 +273,7 @@ pub const codegen = struct {
 // so its `test {}` blocks are analyzed and run (matches pre-restructure behavior
 // where main.zig's import graph reached them).
 test {
+    _ = @import("zig_compat.zig");
     _ = @import("app.zig");
     _ = @import("config.zig");
     _ = @import("ratelimit.zig");

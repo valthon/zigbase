@@ -60,6 +60,14 @@ exe_mod.addImport("zigbase", zb.module("zigbase"));
 Your `exe_mod` must be created with `.link_libc = true` (the `zigbase` module
 itself is built with `link_libc` and the bundled SQLite amalgamation + zap).
 
+zigbase is pinned to a single Zig minor series (currently **0.16.0**, see
+`build.zig.zon`'s `minimum_zig_version` and `mise.toml`). Building against an
+unsupported Zig version fails at **compile time** with a clear required-vs-actual
+message (e.g. `zigbase requires Zig 0.16.x … but you are building with 0.17.0`)
+instead of an opaque deep-compilation error, so a toolchain mismatch is obvious.
+Install the pinned toolchain with `mise install`, or invoke
+`mise exec zig@0.16.0 -- zig build`.
+
 Minimal `src/main.zig`:
 
 ```zig
@@ -4501,6 +4509,34 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres.md](./postgres.md) |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
+
+## Version transparency & dependency auditing
+
+A ZigBase binary bakes in a vendored SQLite C amalgamation, an optional sqlite-vec amalgamation
+(`-Dvector`), and the `zap`/facil.io server. The pinned versions of all of these — plus zigbase
+itself — are aggregated at build time (zero runtime cost) and surfaced four ways (#282):
+
+- **`zigbase --version`** prints build provenance *and* a "Vendored/native components" block:
+  SQLite (+ source id), sqlite-vec (+ a linked / not-linked note), zap (+ pinned commit), facil.io.
+- **`zig build versions`** runs the freshly-built binary with `--version`, so you can read exactly
+  what a build would ship without launching a server.
+- **Startup log** — `zigbase serve` emits one `versions: …` `INFO` line at boot (the `sqlite`
+  value there is the live linked library version).
+- **`GET /api/health`** returns a `versions` object next to the backend badge:
+
+  ```json
+  { "status": "ok", "backend": "sqlite",
+    "versions": { "zigbase": "0.11.0", "commit": "…", "sqlite": "3.53.2",
+                  "sqliteVec": "v0.1.6", "zap": "0.10.6", "facil": "0.7.4" } }
+  ```
+
+  These are non-secret build provenance only — no connection string, host, or credential is exposed.
+
+**`zig build audit`** compares the pinned versions against a curated in-repo advisory table
+(`docs/security-advisories.md`) and exits non-zero if any pin falls in a known-affected range. The
+transparency sources, the audit workflow, and the update process for a vendored C / dependency
+security fix are documented in [docs/security-audit.md](./security-audit.md) →
+"Dependency version transparency & supply-chain auditing".
 
 ## Exported names reference
 

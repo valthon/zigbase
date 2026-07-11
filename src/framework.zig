@@ -2020,14 +2020,27 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
     , .{});
 }
 
-/// Print build provenance (for `--version`) to stdout. emit() keeps it prefix-free.
+/// Human-readable note on whether the sqlite-vec amalgamation is actually linked into
+/// this binary (it is compiled in ONLY with `-Dvector`), so `--version` never implies a
+/// vendored version is active when the default build folds it away.
+const sqlite_vec_note = if (build_options.vector) "linked" else "not linked; build -Dvector to enable";
+
+/// Print build provenance + baked-in component versions (for `--version`) to stdout (#282).
+/// emit() keeps it prefix-free. The component block mirrors the `versions:` startup log line
+/// and the `versions` object on `GET /api/health` — one source of truth (build_options).
 fn printVersion(io: std.Io, file: std.Io.File) void {
     emit(io, file,
         \\zigbase {s}
-        \\commit:  {s}
-        \\build:   {s}
-        \\target:  {s}-{s}-{s}
-        \\zig:     {s}
+        \\commit:      {s}
+        \\build:       {s}
+        \\target:      {s}-{s}-{s}
+        \\zig:         {s}
+        \\
+        \\Vendored/native components:
+        \\  sqlite:     {s} (source {s})
+        \\  sqlite-vec: {s} ({s})
+        \\  zap:        {s} (commit {s})
+        \\  facil.io:   {s}
         \\
     , .{
         build_options.version,
@@ -2037,6 +2050,13 @@ fn printVersion(io: std.Io, file: std.Io.File) void {
         @tagName(builtin.target.os.tag),
         @tagName(builtin.target.abi),
         builtin.zig_version_string,
+        build_options.sqlite_version,
+        build_options.sqlite_source_id,
+        build_options.sqlite_vec_version,
+        sqlite_vec_note,
+        build_options.zap_version,
+        build_options.zap_commit,
+        build_options.facil_version,
     });
 }
 
@@ -3270,6 +3290,24 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     defer holder.deinit();
     const app = &holder.app;
     const cfg = holder.cfg;
+
+    // Emit the baked-in component versions once at boot (#282) — the same block `--version`
+    // and `GET /api/health` report, so an operator can see (and audit) what a running binary
+    // vendors straight from the logs. sqlite is the LIVE linked version; the rest come from
+    // build_options (single source of truth).
+    std.log.info(
+        "versions: zigbase {s} ({s}) | sqlite {s} | sqlite-vec {s} ({s}) | zap {s} | facil.io {s} | zig {s}",
+        .{
+            build_options.version,
+            build_options.commit,
+            db.libVersion(),
+            build_options.sqlite_vec_version,
+            sqlite_vec_note,
+            build_options.zap_version,
+            build_options.facil_version,
+            builtin.zig_version_string,
+        },
+    );
 
     const Ctx = @import("ctx.zig").Ctx;
     if (dispatch.on_before_serve) |h| {

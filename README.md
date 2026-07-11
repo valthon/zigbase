@@ -30,7 +30,8 @@ interfaces, pass `--http-host 0.0.0.0` (front it with a firewall / reverse proxy
 On first `serve` with no `ZIGBASE_JWT_SECRET`, a strong random secret is generated and
 persisted at `<data-dir>/.jwt_secret` (mode 0600), then reused on later runs. Your `zig`
 must be 0.16.0 — either activate mise (`eval "$(mise activate bash)"`) or prefix commands
-with `mise exec zig@0.16.0 --`.
+with `mise exec zig@0.16.0 --`. Building with an unsupported Zig version fails at compile
+time with a clear required-vs-actual message rather than a confusing deep-compile error.
 
 ## Docker
 
