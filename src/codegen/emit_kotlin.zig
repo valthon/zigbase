@@ -80,10 +80,10 @@ fn isAuthSynthesized(name: []const u8) bool {
 /// this emitter deliberately avoids, see the SP3 plan's Global Constraints).
 fn isKotlinKeyword(name: []const u8) bool {
     const kws = [_][]const u8{
-        "as",     "break",  "class",     "continue", "do",     "else",  "false",
-        "for",    "fun",    "if",        "in",       "interface", "is", "null",
-        "object", "package", "return",   "super",    "this",   "throw", "true",
-        "try",    "typealias", "typeof", "val",      "var",    "when",  "while",
+        "as",     "break",     "class",  "continue", "do",        "else",  "false",
+        "for",    "fun",       "if",     "in",       "interface", "is",    "null",
+        "object", "package",   "return", "super",    "this",      "throw", "true",
+        "try",    "typealias", "typeof", "val",      "var",       "when",  "while",
     };
     for (kws) |k| if (std.mem.eql(u8, name, k)) return true;
     return false;
