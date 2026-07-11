@@ -502,6 +502,15 @@ class RealtimeService internal constructor(
                     // ack, so `closeWatcher` is guaranteed to close the
                     // channel -- just wait for it. No unsubscribe is owed:
                     // `close()` already cleared the subscription map.
+                    //
+                    // By design, this can't tell a close()-induced failure
+                    // apart from a genuine server rejection that happens to
+                    // land in this exact instant `closedByUser` flips true --
+                    // both throw here, and both take this branch. That's
+                    // intentional, not a bug: the service is closing either
+                    // way, so surfacing the rejection instead would gain
+                    // nothing and risks this path hanging on a connection
+                    // that will never reply again.
                     closeWatcher.join()
                     return@callbackFlow
                 }
@@ -537,7 +546,9 @@ class RealtimeService internal constructor(
                 if (e !is CancellationException && closedByUser) {
                     // Same service-close-vs-genuine-rejection distinction as
                     // `stream()`'s catch block above -- see there for the
-                    // full rationale.
+                    // full rationale, including why a genuine rejection
+                    // landing in this exact instant is by-design swallowed
+                    // as a clean close rather than surfaced.
                     closeWatcher.join()
                     return@callbackFlow
                 }
@@ -1087,7 +1098,15 @@ class RealtimeService internal constructor(
             }
         }
         if (closedByUser) {
-            mutex.withLock { connecting = false }
+            // Wrapped in `NonCancellable`, matching every other
+            // cleanup-under-cancellation `finally` in this file: a
+            // cancellation landing exactly here (between the `closedByUser`
+            // read and the `connecting = false` write) must not leave
+            // `connecting` stuck `true` -- inert post-close in practice
+            // (`raiseIfClosed` already gates every reader), but this closes
+            // the cancellation window rather than leaving it open by
+            // omission.
+            withContext(NonCancellable) { mutex.withLock { connecting = false } }
             return
         }
         connectOnce()
