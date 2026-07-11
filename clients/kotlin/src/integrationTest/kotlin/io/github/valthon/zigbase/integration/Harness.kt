@@ -80,6 +80,30 @@ fun requireBinaryOrSkip(): String {
     return bin!!
 }
 
+/**
+ * `ZIGBASE_TEST_DATING_BINARY`, or `null` when unset -- the separate
+ * `dating-server` binary (the dating fixture's schema is comptime-baked in,
+ * so unlike [testBinaryPath] it needs no collection bootstrap). Callers guard
+ * on this via [requireDatingBinaryOrSkip] before touching the filesystem or a
+ * process, mirroring `clients/dart/test/integration/harness.dart`'s
+ * `datingBinaryPath` and `test_typed_dating_live.py`'s `_DATING_BIN_ENV` guard.
+ */
+fun datingBinaryPath(): String? = System.getenv("ZIGBASE_TEST_DATING_BINARY")?.takeIf { it.isNotBlank() }
+
+/**
+ * `Assumptions.assumeTrue`-based skip guard for a `@BeforeAll`: when
+ * `ZIGBASE_TEST_DATING_BINARY` is unset, aborts the whole class as SKIPPED
+ * (not failed), matching [requireBinaryOrSkip].
+ */
+fun requireDatingBinaryOrSkip(): String {
+    val bin = datingBinaryPath()
+    Assumptions.assumeTrue(
+        bin != null,
+        "ZIGBASE_TEST_DATING_BINARY not set; skipping typed-tier dating-fixture integration tests",
+    )
+    return bin!!
+}
+
 private fun freePort(): Int = ServerSocket(0).use { it.localPort }
 
 // The default client negotiates HTTP/2 (an `Upgrade: h2c` cleartext-upgrade

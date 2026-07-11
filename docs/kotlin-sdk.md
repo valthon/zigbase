@@ -11,8 +11,10 @@ Like the [TypeScript](typescript-sdk.md), [Dart](dart-sdk.md), and [Python](pyth
 SDKs, this is a straight behavioral port of the same client contract — same wire format, same
 filter-escaping rules, same cursor-pagination semantics — with a few deliberate divergences
 called out in [Divergences and what's next](#divergences-and-whats-next), including
-[realtime](#realtime)'s scope-ownership divergence. A generated typed tier is **not** in this
-release — see that section.
+[realtime](#realtime)'s scope-ownership divergence. It also ships a generated [typed
+tier](#typed-tier): `zigbase typegen --lang kotlin` emits `@Serializable` record models, an
+injection-safe fluent filter builder, and typed collection/realtime services over a new
+`io.github.valthon.zigbase.typed` runtime.
 
 ## Install
 
@@ -739,14 +741,209 @@ Inside an existing coroutine scope (a Ktor server route, an Android `viewModelSc
 `withAccount` siblings, which share the same store) is safe to call from multiple coroutines
 concurrently.
 
+## Typed tier
+
+Beyond the dynamic base client, `zigbase typegen --lang kotlin` (or the build-time comptime
+generator) emits a **typed Kotlin client**: `@Serializable` record data classes with
+`fromRecord` wire coercion, `Create`/`Update` payload classes with a `toMap()` wire encoder,
+an injection-safe fluent filter builder, typed expand, typed `Flow`-based realtime, and
+int/fixed numeric coercion — over a new `io.github.valthon.zigbase.typed` runtime that ships
+in `zigbase-client` itself (no extra dependency, unlike the Python SDK's `zigbase[typed]`
+extra). It's the Kotlin counterpart of the
+[TypeScript](typescript-sdk.md#typed-client--zigbaseclienttyped),
+[Dart](dart-sdk.md#typed-tier), and [Python](python-sdk.md#typed-tier) typed clients. Every
+generated record/enum/payload is already `@Serializable`, so — unlike Pydantic's free
+JSON-Schema export on the Python side — the win here is that these types drop straight into
+anything else in your app that already speaks `kotlinx.serialization` (Ktor content
+negotiation, disk caching, …) with zero extra annotations.
+
+### Generate
+
+The same generator that emits TypeScript/Dart/Python emits Kotlin — pass `--lang kotlin`:
+
+```bash
+# Runtime introspection (no Zig source; reads a provisioned data dir or a live server):
+zigbase typegen --data-dir ./zb_data --out ZbaseGen.kt --lang kotlin
+zigbase typegen --url https://api.example.com --admin-email admin@x.io --admin-password '…' \
+  --out ZbaseGen.kt --lang kotlin
+
+# Comptime (reads your Zig schema) via a build step wired with genClientStep's `lang: "kotlin"`:
+zig build gen-client   # when the consumer's step passes .lang = "kotlin"
+```
+
+The generated file imports the base SDK (`io.github.valthon.zigbase`) and its typed runtime
+(`io.github.valthon.zigbase.typed`), so the emitted code stays thin — the same split the
+TypeScript/Dart/Python typed tiers use. `--client-name` (default `ZbClient`) renames the
+façade class; the `createClient` factory function's name is fixed regardless. Regenerate and
+re-run your formatter on the output — this repo formats its own committed golden with
+`gradle -p clients/kotlin spotlessApply` — then pass `--check` in CI to fail the build when
+the committed file has drifted from the schema, the same staleness-gate recipe as the
+[TypeScript generator](typescript-sdk.md#staleness-gate-ci).
+
+**The emitted `package` declaration is currently fixed**, regardless of `--out`'s destination
+— today it's always `package io.github.valthon.zigbase.codegen.dating` (the repo's own golden
+fixture's package). After generating into your own project, edit that one line (and move the
+file to match, if your build layout cares) to your app's own package; parameterizing it via a
+future `--package` flag is a natural follow-up.
+
+The header comment stamps a `schema-hash` (a content fingerprint — what `--check` actually
+compares) and a `typed-core-version` — the `io.github.valthon.zigbase.typed.TYPED_CORE_VERSION`
+the emitter targeted (currently `"0.1.0"`). It's a human/tooling compatibility marker, not a
+runtime assertion: nothing checks it at import time, so regenerate after any `zigbase-client`
+upgrade that bumps `TYPED_CORE_VERSION` rather than relying on it to fail loudly.
+
+### Create a typed client
+
+```kotlin
+import io.github.valthon.zigbase.codegen.myapp.createClient
+
+val zb = createClient("http://127.0.0.1:8090")
+// authCollection defaults to your schema's auth collection; pass the same kwargs
+// ZigbaseClient(...) takes (authStore=..., httpClient=..., ...) for persistence/customization.
+```
+
+`createClient` returns a `ZbClient` — one `suspend`-only, coroutine-first façade (Kotlin ships
+no sync/async split, matching the base SDK). It exposes one accessor per collection
+(`zb.profiles`, `zb.photos`, …) plus a matching realtime accessor per collection
+(`zb.photosRealtime`, …) — see [Typed realtime + files](#typed-realtime--files). `zb.raw` is
+the underlying `ZigbaseClient` for anything the typed surface doesn't wrap; `zb.close()`
+(`AutoCloseable`, so `use { }` works too) tears it down — but only when `zb` owns it, i.e. it
+was built via `createClient` (`owned = true`), matching the base client's `close()` ownership
+rule.
+
+### Typed records + CRUD
+
+Every read returns a `@Serializable` data class with typed fields; writes take a typed
+`Create`/`Update` payload and its `toMap()`:
+
+```kotlin
+val profile = zb.profiles.getOne("REC123")
+profile.email    // String
+profile.age      // Long (an int-mode number field)
+profile.gender   // ProfileGender? (a generated enum from the select field)
+
+val created = zb.profiles.create(
+    ProfileCreate(email = "a@b.com", password = "secret", passwordConfirm = "secret", age = 28),
+)
+val page = zb.profiles.getList(page = 1, perPage = 20)   // TypedList<Profile>
+val cursorPage = zb.profiles.getPage(limit = 20)          // TypedCursorPage<Profile> (nextCursor/hasNext)
+zb.profiles.iterate().collect { p -> ... }                // Flow<Profile>
+```
+
+**Schema casing.** Generated members mirror your schema's field/collection names exactly —
+the wire key, filter path, and `toMap()` key are never touched. The **only** rewriting is
+collision avoidance: a schema name that is a Kotlin keyword (`class`, `object`, …), or that
+would clash with a member the generated class already needs, gets a trailing `_` appended on
+the **Kotlin side only** (field `class` becomes member `class_`), with a `@SerialName`
+carrying the original wire key. Two schema names that would sanitize to the same Kotlin
+identifier is a generation-time error naming both, shared with the
+TypeScript/Dart/Python emitters (the identifier/guard layer is language-neutral).
+
+### Typed filters — the fluent builder
+
+`where =` takes a lambda over a generated `<Rec>Fields` builder and compiles to a server
+filter string. Every operand is escaped through the same `filterValue` the base SDK's
+[`zbFilter`](#safe-filters--zbfilter) uses, so a `where =` lambda is exactly as
+injection-safe as a hand-built filter string. Kotlin cannot overload `==`/`&`/`|` to return a
+non-`Boolean` `Expr`, so operators are `infix` methods and combinators are `infix and`/`or`:
+
+```kotlin
+import io.github.valthon.zigbase.typed.and
+
+// scalar + enum + and (`.and`, or nest expressions with `.or`):
+zb.profiles.getList(where = { p -> (p.gender eq ProfileGender.FEMALE) and (p.age gte 21) })
+
+// native `in (...)`:
+zb.profiles.getList(where = { p -> p.gender.inList(listOf(ProfileGender.FEMALE, ProfileGender.NONBINARY)) })
+
+// one level of nested-relation filtering (owner.username ~ 'a'):
+zb.photos.getList(where = { p -> p.owner.rel { it.username like "a" } })
+```
+
+Operators: `eq`/`neq` (every field), `gt`/`gte`/`lt`/`lte` (numbers, dates, strings),
+`like`/`nlike` (strings), `inList` (a plain method, not infix). A `select` field's
+`eq`/`neq`/`inList` also accept `null` for null filtering (`p.gender eq null` ->
+`gender = null`), same as every other field. `<Service>.filter(fn)` compiles a `where =`-style
+lambda to a plain filter string without issuing a request, when you need the string itself
+rather than a request.
+
+### Typed expand
+
+Every generated record with a relation field carries a typed `expand` property (defaulting to
+an empty expand instance, so hand-constructing a record in a test never requires building one
+by hand); request it with `expand = listOf(...)` and read the related record(s) off it:
+
+```kotlin
+val withOwner = zb.photos.getOne("REC123", expand = listOf("owner"))
+withOwner.expand.owner   // Profile? (populated when requested)
+
+val withTags = zb.photos.getOne("REC123", expand = listOf("tags"))
+withTags.expand.tags     // List<Tag>
+```
+
+Kotlin has no way to statically prove "this call requested `owner`", so `expand` properties
+are nullable/empty by design — same as the Python and Dart typed tiers.
+
+### Typed realtime + files
+
+```kotlin
+// PhotoFields/PhotoFileField are generated symbols, imported from your generated
+// file's own package alongside createClient.
+
+// where = takes an already-compiled Expr (build one from the collection's *Fields
+// builder directly), or filter = a plain string via <Service>.filter(fn):
+val unsub =
+    zb.photosRealtime.subscribe(where = PhotoFields().caption.like("cat")) { event ->
+        event.action   // "create" | "update" | "delete"
+        event.record.caption
+    }
+...
+unsub()
+
+// or as a cold Flow -- subscribes on first collect, unsubscribes on completion/cancellation:
+zb.photosRealtime.stream().collect { event -> handle(event) }
+
+// File URLs: `field` is a generated enum of the collection's single-value file fields.
+val url = zb.photos.fileUrl(photo, field = PhotoFileField.IMAGE, token = token)
+```
+
+Typed realtime wraps the client's single, shared, multiplexed `RealtimeService`
+(`zb.raw.realtime`), so there is deliberately no per-collection `close()`: tear down individual
+subscriptions with the unsubscribe function `subscribe()` returns (or by ending collection of
+a `stream()`), and the connection itself with `zb.close()`. `where` takes precedence over
+`filter` when both are given. A `delete` event's `record` is still mapped through
+`fromRecord` from an id-only object — its coercer fallbacks tolerate the missing fields, same
+as the Python/Dart ports.
+
+### int/fixed numbers
+
+ZigBase `number` fields can be integer or fixed-point. To preserve full i64 precision they
+travel as **decimal strings** on the wire; the typed layer coerces both directions — int
+fields surface as Kotlin `Long`, fixed fields as `Double`, and `Create`/`Update.toMap()`
+serializes them back to decimal strings. Plain float fields are `Double` and pass through
+untouched. An int-mode field receiving a value with a fractional part (schema drift) throws
+`IllegalArgumentException` rather than silently truncating.
+
+Fixed-point encoding (`encodeFixed`) rounds the double's exact binary value (`BigDecimal(v)`,
+not `BigDecimal(v.toString())`) **half-up** to the field's scale, matching the Dart port's
+`toStringAsFixed` — not `String.format`'s round-half-to-even default, which would render an
+exact tie like `0.125` at scale 2 as `"0.12"` instead of the `"0.13"` this SDK (and Dart)
+produce.
+
+### Scope
+
+The typed `rpc.*` (custom routes), auth-method, and feature-flag surfaces are
+**TypeScript-only** for now — in Kotlin, call custom routes through `zb.raw.send(...)` and
+non-password auth through the base `zb.raw.collection(name)` methods. These are planned
+follow-ups, same as the Python and Dart typed tiers. Kotlin ships **one** coroutine-first
+typed surface (no sync/async fork, matching the base SDK and the Dart typed tier) and carries
+the same [`requestKey`/SSE divergence](#divergences-and-whats-next) as the rest of this SDK.
+
 ## Divergences and what's next
 
 This is a straight behavioral port of the TypeScript SDK (the wire truth), cross-checked
 against the Python and Dart SDKs, but a few things differ by design or aren't here yet:
 
-- **No typed codegen tier yet.** The TypeScript/Dart/Python SDKs' generated-schema client
-  (typed record models, an injection-safe fluent filter builder, typed collection services)
-  is deferred to a later milestone. Records stay a `ZbRecord` wrapper over a raw `JsonObject`.
 - **No `requestKey` de-duplication.** The TypeScript/Dart SDKs' opt-in last-write-wins request
   cancellation (`requestKey =`) has no Kotlin equivalent; use structured concurrency instead —
   cancel the previous request's coroutine `Job` before launching a new one at the call site.
@@ -763,9 +960,6 @@ against the Python and Dart SDKs, but a few things differ by design or aren't he
   whitespace-only one), so this is a defensive divergence with no observed behavioral
   difference in practice — flagged here for completeness rather than as a compatibility
   concern.
-
-The typed tier is a planned follow-up, not a permanent gap — track it alongside the
-TypeScript, Dart, and Python SDKs, which reached one first.
 
 ## Integration-test recipe
 

@@ -104,6 +104,18 @@ jobs:
           mise exec python@3.13 -- python -m pip install --quiet ruff==0.15.21
           mise exec python@3.13 -- python -m ruff format clients/python/tests/codegen/dating/zbase_gen.py
           git diff --exit-code clients/python/tests/codegen/dating/zbase_gen.py
+      # Same format-then-diff shape as the Dart/Python snapshots above: the
+      # committed Kotlin golden is Spotless (ktlint)-clean, but the raw
+      # generator output isn't formatted (compact form), so a byte-exact
+      # `--check` would false-positive on formatting alone. `spotlessApply`
+      # normalizes the regenerated file to exactly what a fresh, correct
+      # golden looks like; the scoped `--exit-code` diff then fails only on a
+      # real semantic drift (an emitter change that wasn't regenerated).
+      - name: Dating Kotlin client snapshot is fresh
+        run: |
+          mise exec zig@0.16.0 -- zig build gen-dating-kotlin-client
+          mise exec gradle@9.6 -- gradle -p clients/kotlin spotlessApply
+          git diff --exit-code clients/kotlin/src/test/kotlin/io/github/valthon/zigbase/codegen/dating/ZbaseGen.kt
       - name: Golfsim client snapshot is fresh
         working-directory: examples/golfsim
         run: mise exec zig@0.16.0 -- zig build gen-client-check

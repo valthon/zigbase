@@ -22,6 +22,11 @@ sourceSets {
         resources.srcDir("src/integrationTest/resources")
         compileClasspath += sourceSets.main.get().output
         runtimeClasspath += output + sourceSets.main.get().output
+        // The generated golden dating client (ZbaseGen.kt) lives under `src/test` --
+        // the typed-tier e2e in this source set drives it directly, so it needs
+        // `test`'s compiled output on both classpaths too.
+        compileClasspath += sourceSets["test"].output
+        runtimeClasspath += sourceSets["test"].output
     }
 }
 

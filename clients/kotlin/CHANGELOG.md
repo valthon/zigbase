@@ -55,15 +55,20 @@ coroutines-first, `suspend fun` API (JDK 17+).
 - **Escape hatch.** `send()` (parsed JSON, auth/retry/error-mapping applied) and
   `rawRequest()` (the raw Ktor `HttpResponse`, no parsing or error mapping) for any endpoint
   the typed surface doesn't cover.
+- **Typed tier.** `zigbase typegen --lang kotlin` generates `@Serializable` record data
+  classes with `fromRecord` coercion, `Create`/`Update` payloads with `toMap` wire encoding,
+  injection-safe fluent filter builders (`infix` operators + `infix and`/`or`, since Kotlin
+  cannot overload `==`/`&`/`|`), and typed collection services (plus `Flow`-based typed
+  realtime) over the new `io.github.valthon.zigbase.typed` runtime — golden-gated in CI
+  against the dating fixture. No sync/async fork (one coroutine-first surface, matching the
+  base client); RPC/typed custom-auth emission is TypeScript-only, as in the Python and Dart
+  typed tiers.
 - **Packaging.** Published to Maven Central as `io.github.valthon:zigbase-client` (deferred —
   see [RELEASING.md](RELEASING.md)); JDK 17 toolchain, Kotlin 2.4, ktlint-enforced style via
   Spotless.
 
 ### Known limitations
 
-- **No typed codegen tier yet.** The generated-schema client (typed record models, an
-  injection-safe fluent filter builder, typed collection services) that the Python/Dart SDKs
-  ship follows in a later milestone (KSP3).
 - **No request-key de-duplication.** The TypeScript/Dart SDKs' opt-in `requestKey`
   last-write-wins cancellation has no Kotlin equivalent yet; use coroutine `Job` cancellation
   (cancel the previous request's `Job` before launching a new one) at the call site instead.

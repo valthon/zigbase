@@ -6,9 +6,10 @@ pagination, and files. A single, coroutine-first `ZigbaseClient` over
 (Kotlin/JVM; Android/Kotlin Multiplatform are not yet targets — see
 [Requirements](#requirements)).
 
-Ships records, auth, files, the multi-tenancy/analytics/senders surface, and a realtime
-tier (`zb.realtime` — WebSocket subscriptions, no extra dependency needed). A typed codegen
-tier is **not** in this release — see [Divergences and what's next](#divergences-and-whats-next).
+Ships records, auth, files, the multi-tenancy/analytics/senders surface, a realtime
+tier (`zb.realtime` — WebSocket subscriptions, no extra dependency needed), and a generated
+[typed tier](#typed-tier) (`zigbase typegen --lang kotlin`) — see
+[Divergences and what's next](#divergences-and-whats-next) for what's still not here.
 
 ## Install
 
@@ -357,14 +358,38 @@ Inside an existing coroutine scope (a Ktor server route, an Android `viewModelSc
 internally lock-guarded, so a single `ZigbaseClient` (and its `withAccount` siblings, which
 share the same store) is safe to call from multiple coroutines concurrently.
 
+## Typed tier
+
+`zigbase typegen --lang kotlin` generates a typed client: `@Serializable` record data
+classes, `Create`/`Update` payloads with `toMap()`, an injection-safe fluent filter builder,
+typed expand, and typed `Flow`-based realtime, over a new
+`io.github.valthon.zigbase.typed` runtime — no extra dependency needed.
+
+```bash
+zigbase typegen --data-dir ./zb_data --out ZbaseGen.kt --lang kotlin
+```
+
+```kotlin
+import io.github.valthon.zigbase.codegen.myapp.createClient
+
+val zb = createClient("http://127.0.0.1:8090")
+
+val profile = zb.profiles.getOne("REC123")
+profile.email   // String
+
+val adults = zb.profiles.getList(where = { p -> p.age gte 18 })   // TypedList<Profile>
+```
+
+See [docs/kotlin-sdk.md#typed-tier](../../docs/kotlin-sdk.md#typed-tier) for generation
+(including the comptime `genClientStep` path and the CI staleness gate), the full filter DSL
+(`and`/`or`, `inList`, nested-relation `.rel { }`), typed expand, typed realtime, and
+int/fixed number coercion.
+
 ## Divergences and what's next
 
 This is a straight behavioral port of the TypeScript SDK (the wire truth), cross-checked
 against the Python and Dart SDKs, but a few things differ by design or aren't here yet:
 
-- **No typed codegen tier yet.** The Python/Dart/TypeScript SDKs' generated-schema client
-  (typed record models, an injection-safe fluent filter builder, typed collection services)
-  is deferred to a later milestone (KSP3).
 - **No `requestKey` de-duplication.** The TypeScript/Dart SDKs' opt-in last-write-wins request
   cancellation (`requestKey=`) has no Kotlin equivalent; use structured concurrency instead —
   cancel the previous request's coroutine `Job` before launching a new one at the call site.
