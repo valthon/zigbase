@@ -285,6 +285,12 @@ pub const codegen = struct {
     pub const emit_python = @import("codegen/emit_python.zig");
     /// The Python generator core (the Python counterpart of gen_dart.generate).
     pub const gen_python = @import("codegen/gen_python.zig");
+    /// Field → Kotlin type mapper (the Kotlin counterpart of dart_type.zig/python_type.zig).
+    pub const kotlin_type = @import("codegen/kotlin_type.zig");
+    /// Per-fragment Kotlin emitters (the Kotlin counterpart of emit_python.zig).
+    pub const emit_kotlin = @import("codegen/emit_kotlin.zig");
+    /// The Kotlin generator core (the Kotlin counterpart of gen_python.generate).
+    pub const gen_kotlin = @import("codegen/gen_kotlin.zig");
 };
 
 // ---- Test discovery --------------------------------------------------------
@@ -441,6 +447,9 @@ test {
     _ = @import("codegen/python_type.zig");
     _ = @import("codegen/emit_python.zig");
     _ = @import("codegen/gen_python.zig");
+    _ = @import("codegen/kotlin_type.zig");
+    _ = @import("codegen/emit_kotlin.zig");
+    _ = @import("codegen/gen_kotlin.zig");
     _ = @import("route_types.zig");
     _ = @import("auth_helpers.zig");
     _ = @import("auth/method.zig");

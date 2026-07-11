@@ -356,6 +356,18 @@ pub fn build(b: *std.Build) void {
     const gen_python_step = b.step("gen-dating-python-client", "Generate the dating fixture's typed Python client (run `ruff format` after)");
     gen_python_step.dependOn(&gen_python_run.step);
 
+    // --- Kotlin codegen: generate the dating fixture's typed Kotlin client. Reuses
+    // the same comptime generator exe (`zbase-gen-client`) with `--lang kotlin`.
+    const kotlin_out = "clients/kotlin/src/test/kotlin/io/github/valthon/zigbase/codegen/dating/ZbaseGen.kt";
+    const gen_kotlin_run = b.addRunArtifact(gen_exe);
+    gen_kotlin_run.setEnvironmentVariable("ZBASE_INREPO", "1");
+    gen_kotlin_run.addArgs(&.{ "--out", kotlin_out, "--api-prefix", "/api", "--lang", "kotlin" });
+    // The Kotlin golden is committed Spotless/ktlint-clean, so its staleness gate is a
+    // regenerate-then-`spotlessApply`-then-`git diff` shell step in CI, mirroring the
+    // Dart/Python goldens' freshness checks.
+    const gen_kotlin_step = b.step("gen-dating-kotlin-client", "Generate the dating fixture's typed Kotlin client (run `spotlessApply` after)");
+    gen_kotlin_step.dependOn(&gen_kotlin_run.step);
+
     // --- gen-test: golden snapshot byte-exact test (Task 8) -------------------
     // Builds gen_test_root.zig as a test binary with both zigbase_mod (for
     // gen_client.generate) and dating_app_mod (for App.collections) injected.
