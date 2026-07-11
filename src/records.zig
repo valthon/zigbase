@@ -67,8 +67,30 @@ pub fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
 const ReadError = @typeInfo(@typeInfo(@TypeOf(values.readValue)).@"fn".return_type.?).error_union.error_set;
 const CollectionsGetError = @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".return_type.?).error_union.error_set;
 
-pub const RecordError = error{ Validation, NotFound, NotObject, Forbidden } ||
+pub const RecordError = error{ Validation, NotFound, NotObject, Forbidden, InvalidId } ||
     db.DbError || values.ValueError || ReadError || CollectionsGetError;
+
+/// Options for the low-level create path. `allow_provided_id` is **import-only**: the
+/// offline bulk-import (`src/import.zig`) sets it so a source record's own `id` is
+/// preserved (relations across an exported dataset stay intact). Every HTTP / route /
+/// hook create path leaves it false — the public `create`/`createInTxn` wrappers pass
+/// `.{}` — so a client can NEVER supply a record id; the server always generates one.
+/// Do not thread this flag to any request-facing caller.
+pub const CreateOpts = struct { allow_provided_id: bool = false };
+
+/// Sanity gate for an import-preserved record id: non-empty, at most 255 bytes, and
+/// every byte a printable, non-space ASCII character (URL/JSON-safe). This is NOT the
+/// id GENERATOR's alphabet — an imported dataset may carry ids minted by another
+/// system — and NOT the injection barrier (the id binds as a `?1` parameter, never
+/// interpolated). It only rejects obviously-bogus ids (control chars, whitespace,
+/// absurd length) before they land in the primary key.
+pub fn isPlausibleRecordId(s: []const u8) bool {
+    if (s.len == 0 or s.len > 255) return false;
+    for (s) |ch| {
+        if (ch <= ' ' or ch >= 127) return false;
+    }
+    return true;
+}
 
 /// Hard cap on the length of an attacker-supplied `?filter=`/`?sort=` string. Rejected
 /// before lexing so a giant or deeply-nested expression can't exhaust CPU/stack.
@@ -573,13 +595,23 @@ test "coerce: non-object data is returned as-is" {
 }
 
 pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value) RecordError!std.json.Value {
-    return createInTxn(alloc, io, w, col, data);
+    return createInTxnOpts(alloc, io, w, col, data, .{});
 }
 
 /// Insert a record on `w` WITHOUT opening a transaction. The caller must already
 /// be inside one (or accept autocommit). Applies the same column/JSON handling as
-/// the former createImpl but performs no begin/commit/guard.
+/// the former createImpl but performs no begin/commit/guard. The server always
+/// generates the record id (a client-supplied `id` is ignored) — see `createInTxnOpts`.
 pub fn createInTxn(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value) RecordError!std.json.Value {
+    return createInTxnOpts(alloc, io, w, col, data, .{});
+}
+
+/// The single insert implementation behind `create`/`createInTxn`. `opts.allow_provided_id`
+/// is **import-only** (see `CreateOpts`): when set AND `data` carries a non-empty string
+/// `"id"`, that id is preserved (after `isPlausibleRecordId` validation) instead of
+/// generating one. With the default `.{}` a client-supplied `id` is silently ignored and
+/// the server generates the id — the invariant every HTTP/route/hook create relies on.
+pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value, opts: CreateOpts) RecordError!std.json.Value {
     last_errors = null;
     if (data != .object) return error.NotObject;
     var errs: std.ArrayList(schema.ValidationError) = .empty;
@@ -625,12 +657,24 @@ pub fn createInTxn(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.
     }
 
     const rcols = try columnList(alloc, col);
-    var gen_id = id_gen.collectionId(io);
+    // The id bound at ?1. Default: a freshly-generated id (client `id` ignored). Import-only:
+    // when `opts.allow_provided_id` is set the source record's own non-empty `id` is preserved
+    // (validated by isPlausibleRecordId first). `gen_id` outlives the bind/step below.
+    const gen_id = id_gen.collectionId(io);
+    var id_slice: []const u8 = &gen_id;
+    if (opts.allow_provided_id) {
+        if (data.object.get("id")) |idv| {
+            if (idv == .string and idv.string.len > 0) {
+                if (!isPlausibleRecordId(idv.string)) return error.InvalidId;
+                id_slice = idv.string;
+            }
+        }
+    }
 
     const sql = try std.fmt.allocPrintSentinel(alloc, "INSERT INTO \"{s}\" ({s}) VALUES ({s}) RETURNING {s};", .{ col.name, cols.items, vals.items, rcols }, 0);
     var st = try prep(alloc, w, sql);
     defer st.finalize();
-    try st.bindText(1, &gen_id);
+    try st.bindText(1, id_slice);
     for (binds.items) |b| {
         values.bindValue(alloc, &st, b.idx, b.field, b.value) catch |e| {
             try errs.append(alloc, .{ .field = b.field.name, .code = convCode(e), .message = "Invalid value." });
@@ -651,6 +695,56 @@ fn seedPosts(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
         .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
     };
     return collections.create(a, std.testing.io, d, .{ .id = "", .name = "posts", .fields = &fields });
+}
+
+test "createInTxnOpts: default IGNORES a client-supplied id (server always generates)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "id", .{ .string = "client-forced-id" });
+    try obj.put(a, "title", .{ .string = "hi" });
+    // Default opts (the HTTP/route/hook path): the client id must be thrown away.
+    const rec = try create(a, std.testing.io, &d, col, .{ .object = obj });
+    try std.testing.expect(!std.mem.eql(u8, "client-forced-id", rec.object.get("id").?.string));
+    try std.testing.expectEqual(@as(usize, 15), rec.object.get("id").?.string.len);
+}
+
+test "createInTxnOpts: allow_provided_id PRESERVES a valid id; rejects an implausible one" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try seedPosts(&d, a);
+    // A valid provided id is preserved verbatim.
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "id", .{ .string = "my-imported-id-01" });
+    try obj.put(a, "title", .{ .string = "hi" });
+    const rec = try createInTxnOpts(a, std.testing.io, &d, col, .{ .object = obj }, .{ .allow_provided_id = true });
+    try std.testing.expectEqualStrings("my-imported-id-01", rec.object.get("id").?.string);
+    // An implausible id (embedded space) is rejected fail-closed.
+    var bad: std.json.ObjectMap = .empty;
+    try bad.put(a, "id", .{ .string = "bad id" });
+    try bad.put(a, "title", .{ .string = "x" });
+    try std.testing.expectError(error.InvalidId, createInTxnOpts(a, std.testing.io, &d, col, .{ .object = bad }, .{ .allow_provided_id = true }));
+    // An empty/absent id under allow_provided_id falls back to a generated id.
+    var noid: std.json.ObjectMap = .empty;
+    try noid.put(a, "title", .{ .string = "y" });
+    const gen = try createInTxnOpts(a, std.testing.io, &d, col, .{ .object = noid }, .{ .allow_provided_id = true });
+    try std.testing.expectEqual(@as(usize, 15), gen.object.get("id").?.string.len);
+}
+
+test "isPlausibleRecordId gate" {
+    try std.testing.expect(isPlausibleRecordId("abc123"));
+    try std.testing.expect(isPlausibleRecordId("a1b2c3d4e5f6g7h"));
+    try std.testing.expect(!isPlausibleRecordId(""));
+    try std.testing.expect(!isPlausibleRecordId("has space"));
+    try std.testing.expect(!isPlausibleRecordId("tab\ther"));
+    try std.testing.expect(!isPlausibleRecordId("newline\n"));
 }
 
 test "list tenant scoping: only the active account's rows; superuser sees all; off = unchanged" {
