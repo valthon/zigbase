@@ -60,6 +60,14 @@ exe_mod.addImport("zigbase", zb.module("zigbase"));
 Your `exe_mod` must be created with `.link_libc = true` (the `zigbase` module
 itself is built with `link_libc` and the bundled SQLite amalgamation + zap).
 
+zigbase is pinned to a single Zig minor series (currently **0.16.0**, see
+`build.zig.zon`'s `minimum_zig_version` and `mise.toml`). Building against an
+unsupported Zig version fails at **compile time** with a clear required-vs-actual
+message (e.g. `zigbase requires Zig 0.16.x … but you are building with 0.17.0`)
+instead of an opaque deep-compilation error, so a toolchain mismatch is obvious.
+Install the pinned toolchain with `mise install`, or invoke
+`mise exec zig@0.16.0 -- zig build`.
+
 Minimal `src/main.zig`:
 
 ```zig
