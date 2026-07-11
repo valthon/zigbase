@@ -20,6 +20,7 @@ const events = @import("../events.zig");
 const features = @import("../features.zig");
 const emit = @import("emit_kotlin.zig");
 const guards = @import("guards.zig");
+const gen_client = @import("gen_client.zig");
 
 const W = std.ArrayList(u8);
 
@@ -136,7 +137,7 @@ pub fn generate(
         \\}}
         \\
         \\
-    , .{ schemaHash(cols), TYPED_CORE_VERSION }));
+    , .{ gen_client.schemaHash(cols), TYPED_CORE_VERSION }));
 
     for (cols) |c| try emit.emitSelectEnums(alloc, &w, c);
     for (cols) |c| try emit.emitRecord(alloc, &w, cols, c);
@@ -153,43 +154,6 @@ pub fn generate(
     try emit.emitClient(alloc, &w, cols, client_name, auth_collection);
 
     return w.toOwnedSlice(alloc);
-}
-
-/// FNV-1a over a canonical serialization of the collections (declared order).
-/// Duplicated from gen_client.schemaHash (kept local so this file has no
-/// dependency on the TS-specific generator) — same algorithm, same output.
-fn schemaHash(cols: []const schema.Collection) u64 {
-    var h = std.hash.Fnv1a_64.init();
-    for (cols) |c| {
-        h.update(c.name);
-        h.update("|");
-        h.update(@tagName(c.type));
-        for (c.fields) |f| {
-            h.update("\x00");
-            h.update(f.name);
-            h.update(":");
-            h.update(@tagName(std.meta.activeTag(f.options)));
-            if (f.required) h.update("!");
-            if (f.isMultiValue()) h.update("*");
-            if (f.searchable) h.update("?");
-            switch (f.options) {
-                .select => |o| for (o.values) |v| {
-                    h.update(",");
-                    h.update(v);
-                },
-                .relation => |o| {
-                    h.update(",");
-                    h.update(o.targetCollectionId);
-                },
-                .number => |o| {
-                    h.update(",");
-                    h.update(@tagName(o.mode));
-                },
-                else => {},
-            }
-        }
-    }
-    return h.final();
 }
 
 test "generate emits a valid-looking Kotlin client for a mini blog" {
