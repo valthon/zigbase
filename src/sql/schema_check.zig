@@ -44,6 +44,10 @@
 
 const std = @import("std");
 const schema = @import("../schema.zig");
+const ident = @import("schema_ident.zig");
+
+/// Case-insensitive identifier compare — shared with the query builder (single source of truth).
+const eqIC = ident.eqIC;
 
 pub const SqlCheckOptions = struct {
     /// Tables that legitimately appear in raw SQL but are NOT comptime collections: engine
@@ -167,10 +171,6 @@ const Lexer = struct {
     }
 };
 
-fn eqIC(a: []const u8, b: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(a, b);
-}
-
 /// True if `t` is the (unquoted) keyword `kw`.
 fn kwEq(t: Tok, kw: []const u8) bool {
     return t.kind == .ident and !t.quoted and eqIC(t.text, kw);
@@ -244,8 +244,7 @@ const Analyzer = struct {
 
     /// Index of the collection whose name matches `name` (real collections only — NOT fts/cte).
     fn collectionIndex(self: *Analyzer, name: []const u8) ?usize {
-        for (self.cols, 0..) |c, i| if (eqIC(name, c.name)) return i;
-        return null;
+        return ident.collectionIndexByName(self.cols, name);
     }
 
     fn isKnownTable(self: *Analyzer, name: []const u8) bool {
@@ -267,18 +266,11 @@ const Analyzer = struct {
         return null;
     }
 
-    /// Whether `name` is a valid column of collection `ci`. View collections are NOT column-checked
-    /// (their columns come from an arbitrary query), so any column on a view resolves as valid.
+    /// Whether `name` is a valid column of collection `ci`. Delegates to the shared valid-column
+    /// set (built-ins ∪ auth system cols ∪ fields; views accept any column) that the query builder
+    /// uses too, so the two features can never disagree on what a collection's columns are.
     fn columnValid(self: *Analyzer, ci: usize, name: []const u8) bool {
-        const c = self.cols[ci];
-        if (c.type == .view) return true;
-        if (eqIC(name, "id") or eqIC(name, "created") or eqIC(name, "updated")) return true;
-        if (c.type == .auth) {
-            // Backend.collections does NOT inject the auth system fields — synthesize them.
-            for (schema.authSystemFields()) |f| if (eqIC(name, f.name)) return true;
-        }
-        for (c.fields) |f| if (eqIC(name, f.name)) return true;
-        return false;
+        return ident.isValidColumn(self.cols[ci], name);
     }
 
     // -- pass A: collect CTE names ------------------------------------------
@@ -441,16 +433,8 @@ fn knownTablesMsg(comptime cols: []const schema.Collection, comptime opts: SqlCh
 
 fn columnsMsg(comptime cols: []const schema.Collection, comptime table: []const u8) []const u8 {
     comptime {
-        for (cols) |c| {
-            if (!eqIC(c.name, table)) continue;
-            var s: []const u8 = "id, created, updated";
-            if (c.type == .auth) {
-                for (schema.authSystemFields()) |f| s = s ++ ", " ++ f.name;
-            }
-            for (c.fields) |f| s = s ++ ", " ++ f.name;
-            return s;
-        }
-        return "";
+        const c = ident.collectionByName(cols, table) orelse return "";
+        return ident.columnsList(c);
     }
 }
 
