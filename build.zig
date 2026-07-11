@@ -156,6 +156,22 @@ pub fn build(b: *std.Build) void {
     const auth2_srv_step = b.step("auth2-server", "Build the auth-round-2 e2e fixture server (table sessions + beforeAuthSuccess)");
     auth2_srv_step.dependOn(&b.addInstallArtifact(auth2_srv_exe, .{}).step);
 
+    // --- import-fixture: offline-import e2e fixture (#283) ------------------------
+    // Comptime .collections with an auth collection (password hashing) and a base
+    // collection carrying an .encrypted field (at-rest envelope), so tests/admin/test_import.py
+    // can drive `zigbase import` against a real boot (provisioning + cipher stamping) and
+    // verify the round-trip + ciphertext-at-rest + hashed password over REST. Links libc.
+    const import_fix_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/import/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    import_fix_mod.addImport("zigbase", zigbase_mod);
+    const import_fix_exe = b.addExecutable(.{ .name = "import-fixture", .root_module = import_fix_mod });
+    const import_fix_step = b.step("import-fixture", "Build the offline-import e2e fixture server (#283)");
+    import_fix_step.dependOn(&b.addInstallArtifact(import_fix_exe, .{}).step);
+
     // --- features-fixture: demo flags/experiments server for the browser suite ---
     const features_fix_mod = b.createModule(.{
         .root_source_file = b.path("fixtures/features/main.zig"),

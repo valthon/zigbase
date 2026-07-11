@@ -61,6 +61,8 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build auth2-server -Dcpu=baseline
       - name: Build features-fixture (demo flags/experiments browser fixture)
         run: mise exec zig@0.16.0 -- zig build features-fixture -Dcpu=baseline
+      - name: Build import-fixture (offline-import e2e fixture, #283)
+        run: mise exec zig@0.16.0 -- zig build import-fixture -Dcpu=baseline
       - name: Build lean gating fixture
         run: mise exec zig@0.16.0 -- zig build minimal-server
       - name: Build full gating fixture (positive control; also the browser suite's analytics-enabled fixture)
@@ -116,6 +118,7 @@ jobs:
             zig-out/bin/dating-server
             zig-out/bin/auth2-server
             zig-out/bin/features-fixture
+            zig-out/bin/import-fixture
             zig-out/bin/full-fixture
             examples/blog/zig-out/bin/blog
             examples/golfsim/zig-out/bin/golfsim
@@ -365,6 +368,8 @@ jobs:
           echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/features-fixture
           echo "ZIGBASE_FEATURES_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/features-fixture" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/import-fixture
+          echo "ZIGBASE_TEST_IMPORT_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/import-fixture" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/full-fixture
           echo "ZIGBASE_TEST_FULL_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/full-fixture" >> "$GITHUB_ENV"
       - name: Install Python test deps + resolve Playwright version
