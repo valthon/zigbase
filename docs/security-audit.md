@@ -511,3 +511,77 @@ All of the above ship with regression tests; `zig build` succeeds and all unit t
 
 The one residual hardening (a per-field body-size limit within the global 50 MiB body cap) is left
 as a recommendation and intentionally **not** half-implemented here.
+
+## Dependency version transparency & supply-chain auditing
+
+A ZigBase binary bakes in a **vendored SQLite C amalgamation** (`vendor/sqlite`), an optional
+**sqlite-vec** amalgamation (`vendor/sqlite-vec`, only with `-Dvector`), and the **`zap`/facil.io**
+HTTP server (fetched via `build.zig.zon`). Because these are compiled in, an operator needs a way to
+know *which* versions a given binary ships and to check them against known advisories. ZigBase
+surfaces the pinned versions on four channels and ships an in-repo audit path (#282).
+
+### Where the versions come from (single source of truth)
+
+At **configure time**, `build.zig` aggregates the pinned versions into `build_options` (zero runtime
+cost — each becomes a compiled-in string constant):
+
+- **SQLite** — read straight from `#define SQLITE_VERSION` / `SQLITE_SOURCE_ID` in
+  `vendor/sqlite/sqlite3.h`, so a bumped amalgamation flows through automatically.
+- **sqlite-vec** — read from `#define SQLITE_VEC_VERSION` in `vendor/sqlite-vec/sqlite-vec.h`
+  (reported as "not linked" unless the binary was built with `-Dvector`).
+- **zap** — version is a curated constant kept in sync with the `build.zig.zon` pin; the exact
+  commit is parsed from the dependency URL.
+- **facil.io** — a curated constant. facil.io ships *bundled inside* the pinned `zap` and has no
+  in-tree header, so it is tied to the `zap` pin and bumped whenever `zap` is re-pinned.
+- **zigbase** itself — `.version` from `build.zig.zon`, plus the git commit captured at build time.
+
+### Transparency surfaces
+
+- **`zigbase --version`** — prints the build provenance *and* a "Vendored/native components" block
+  (SQLite + source id, sqlite-vec + linked/not-linked note, zap + commit, facil.io).
+- **`zig build versions`** — a build step that runs the freshly-built binary with `--version`, so a
+  contributor can read the exact versions a build would ship without launching a server.
+- **Startup log** — `zigbase serve` emits a single `versions: …` `INFO` line at boot, so an
+  operator can audit a *running* binary from its logs. `sqlite` here is the **live linked** version
+  (`sqlite3_libversion()`), which must match the vendored header.
+- **`GET /api/health`** — returns a `versions` object alongside the backend badge:
+  `{"status":"ok","backend":"sqlite","versions":{"zigbase":"…","commit":"…","sqlite":"…","sqliteVec":"…","zap":"…","facil":"…"}}`.
+  These are non-secret build provenance only — no connection string, host, path, or credential is
+  ever exposed here (same discipline as the `backend` badge).
+
+### The `zig build audit` workflow
+
+`zig build audit` runs `scripts/audit-deps.sh`, which:
+
+1. Resolves the pinned version of each dependency from the **same sources** the build uses
+   (the vendored headers, the curated `zap`/facil.io constants, and `build.zig.zon`).
+2. Parses the curated advisory table in **`docs/security-advisories.md`**.
+3. Flags a dependency as **AFFECTED** (and exits non-zero) if its pinned version is strictly below
+   the `Min safe version` of any advisory row; prints an OK report and exits 0 otherwise.
+
+The advisory table is **manually curated** — advisories are not machine-discoverable from inside the
+repo, so a human adds a row when a relevant CVE lands. The header comment in
+`docs/security-advisories.md` documents the row format and the update rules. Two real historical
+SQLite CVEs are seeded as worked examples (the current 3.53.2 pin sits safely above both fixed-in
+versions, so they report OK) to demonstrate the mechanism honestly.
+
+### Update process for a vendored C / dependency security fix
+
+When SQLite, sqlite-vec, `zap`, or facil.io publishes a security release:
+
+1. **Bump the dependency.**
+   - *SQLite / sqlite-vec:* replace the vendored amalgamation under `vendor/` with the fixed
+     release (headers + `.c`). The version surfaces update automatically — `build.zig` reads the
+     new `#define` from the header; there is nothing else to edit for the version string.
+   - *zap:* re-pin it in `build.zig.zon` (url + hash), then update the curated `zap_version`
+     constant in `build.zig` (and the mirror in `scripts/audit-deps.sh`) to match. If the new `zap`
+     bundles a different facil.io, **also bump the curated `facil_version` constant** in `build.zig`
+     and `scripts/audit-deps.sh`.
+2. **Record the advisory (if it now applies to a range you shipped).** Add a row to
+   `docs/security-advisories.md` with the affected range and the fixed-in `Min safe version`.
+3. **Run `zig build audit`** and confirm it exits 0 (all pins clear). If it reports AFFECTED, the
+   bump is incomplete — finish the upgrade until it is clean.
+4. **Rebuild and verify** with `zig build versions` that the new versions are what you expect.
+5. **Add a changelog fragment** under `changelog.d/` with a `### Security` bullet describing the
+   dependency bump and the CVE(s) it addresses.
+6. **Release** per `scripts/release.sh` (the fragment is assembled into the changelog).
