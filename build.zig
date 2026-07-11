@@ -21,10 +21,17 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     // Build provenance for `zigbase --version`. The server version is single-sourced
-    // from build.zig.zon; the commit is captured at configure time.
+    // from build.zig.zon; the commit is captured at configure time. `-Dcommit=<sha>` lets
+    // CI/release inject a deterministic SHA (used verbatim); otherwise `gitCommit` tries
+    // `git rev-parse` and, if that's unavailable (sandboxed configure step, no git on PATH),
+    // falls back to a spawn-free parse of `.git` (worktree-aware) before giving up.
+    const commit_override = b.option([]const u8, "commit", "Commit SHA to bake into --version (CI/release inject the real SHA; default: auto-detect from git)");
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
-    build_options.addOption([]const u8, "commit", gitCommit(b));
+    // Single-source the required Zig version so the compile-time guard in
+    // src/zig_compat.zig can reject an unsupported compiler with a clear message.
+    build_options.addOption([]const u8, "min_zig_version", @import("build.zig.zon").minimum_zig_version);
+    build_options.addOption([]const u8, "commit", commit_override orelse gitCommit(b));
     // Dev-only seams (injectable clock, seeded entropy, test-capture, fake field-crypto).
     // Compiled in ONLY when this is true so a production binary can never use any of them.
     // Defaults to on in Debug, off in any release/optimized build; the release script
@@ -67,6 +74,24 @@ pub fn build(b: *std.Build) void {
     // feature and is NOT gated by this flag.
     const fts5 = b.option(bool, "fts5", "Compile SQLite FTS5 full-text search into the binary (default true; -Dfts5=false for lean builds without .searchable fields)") orelse true;
     build_options.addOption(bool, "fts5", fts5);
+
+    // --- Vendored/native component version transparency (#282) ---------------------
+    // Single-source the pinned versions of the vendored/native dependencies at CONFIGURE
+    // time so `--version`, `zig build versions`, the startup log, and `GET /api/health`
+    // can surface exactly what is baked into this binary — with zero runtime cost (each
+    // becomes a build_options string constant). SQLite + sqlite-vec are read straight from
+    // their vendored headers (so a bumped amalgamation flows through automatically). zap is
+    // read from the build.zig.zon pin (version curated, commit parsed from the url); facil.io
+    // ships bundled inside the pinned zap and has no in-tree header, so it is a curated const
+    // tied to the zap pin — bump it when re-pinning zap. See docs/security-advisories.md and
+    // docs/security-audit.md ("Dependency version transparency & supply-chain auditing").
+    build_options.addOption([]const u8, "sqlite_version", readCDefineStr(b, "vendor/sqlite/sqlite3.h", "SQLITE_VERSION"));
+    build_options.addOption([]const u8, "sqlite_source_id", readCDefineStr(b, "vendor/sqlite/sqlite3.h", "SQLITE_SOURCE_ID"));
+    build_options.addOption([]const u8, "sqlite_vec_version", readCDefineStr(b, "vendor/sqlite-vec/sqlite-vec.h", "SQLITE_VEC_VERSION"));
+    build_options.addOption([]const u8, "zap_version", "0.10.6"); // curated: matches the zap pin in build.zig.zon
+    build_options.addOption([]const u8, "zap_commit", zapPinnedCommit());
+    build_options.addOption([]const u8, "facil_version", "0.7.4"); // curated: facil.io bundled inside the pinned zap (bump on zap re-pin)
+
     zigbase_mod.addOptions("build_options", build_options);
 
     zigbase_mod.addIncludePath(b.path("vendor/sqlite"));
@@ -127,6 +152,24 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zigbase");
     run_step.dependOn(&run_cmd.step);
 
+    // --- versions: print every baked-in component version (#282) ------------------
+    // Runs the freshly-built binary with `--version`, whose enriched output lists
+    // zigbase + commit, SQLite + source id, sqlite-vec, zap + commit, facil.io, and the
+    // Zig compiler. Single command, no drift: the same string the running server reports.
+    const versions_run = b.addRunArtifact(exe);
+    versions_run.addArg("--version");
+    const versions_step = b.step("versions", "Print baked-in component versions (SQLite, sqlite-vec, zap, facil.io, zigbase)");
+    versions_step.dependOn(&versions_run.step);
+
+    // --- audit: compare pinned dep versions against the curated advisory table (#282)
+    // Runs scripts/audit-deps.sh, which reads the pinned versions from vendor/ + the
+    // curated consts and checks them against docs/security-advisories.md. Exits non-zero
+    // if any pinned version falls in a listed affected range.
+    const audit_cmd = b.addSystemCommand(&.{"bash"});
+    audit_cmd.addFileArg(b.path("scripts/audit-deps.sh"));
+    const audit_step = b.step("audit", "Audit pinned dependency versions against docs/security-advisories.md");
+    audit_step.dependOn(&audit_cmd.step);
+
     // --- dating-server: the dating fixture compiled as a runnable server ----------
     // Plan 2: the e2e harness spawns THIS binary so client and server share the exact
     // comptime schema the dating client was generated from. Links libc (facil.io C deps).
@@ -155,6 +198,22 @@ pub fn build(b: *std.Build) void {
     const auth2_srv_exe = b.addExecutable(.{ .name = "auth2-server", .root_module = auth2_srv_mod });
     const auth2_srv_step = b.step("auth2-server", "Build the auth-round-2 e2e fixture server (table sessions + beforeAuthSuccess)");
     auth2_srv_step.dependOn(&b.addInstallArtifact(auth2_srv_exe, .{}).step);
+
+    // --- import-fixture: offline-import e2e fixture (#283) ------------------------
+    // Comptime .collections with an auth collection (password hashing) and a base
+    // collection carrying an .encrypted field (at-rest envelope), so tests/admin/test_import.py
+    // can drive `zigbase import` against a real boot (provisioning + cipher stamping) and
+    // verify the round-trip + ciphertext-at-rest + hashed password over REST. Links libc.
+    const import_fix_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/import/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    import_fix_mod.addImport("zigbase", zigbase_mod);
+    const import_fix_exe = b.addExecutable(.{ .name = "import-fixture", .root_module = import_fix_mod });
+    const import_fix_step = b.step("import-fixture", "Build the offline-import e2e fixture server (#283)");
+    import_fix_step.dependOn(&b.addInstallArtifact(import_fix_exe, .{}).step);
 
     // --- features-fixture: demo flags/experiments server for the browser suite ---
     const features_fix_mod = b.createModule(.{
@@ -319,14 +378,127 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_gen_test.step);
 }
 
+/// Read a `#define <macro> "value"` string constant out of a vendored C header at
+/// configure time (#282). Single-sources the pinned SQLite / sqlite-vec versions from
+/// the headers themselves so a bumped amalgamation flows through to every version
+/// surface automatically. Panics loudly if the macro or its quoted value is absent, so
+/// a header reshuffle fails the build rather than silently shipping a wrong version.
+fn readCDefineStr(b: *std.Build, rel_path: []const u8, macro: []const u8) []const u8 {
+    const data = b.build_root.handle.readFileAlloc(b.graph.io, rel_path, b.allocator, .unlimited) catch |e|
+        std.debug.panic("version aggregation: cannot read '{s}': {s}", .{ rel_path, @errorName(e) });
+    // The whole header (sqlite3.h is ~600 KB) is read into this buffer; we only dupe the
+    // matched substring out, so free the buffer before returning.
+    defer b.allocator.free(data);
+    var it = std.mem.tokenizeScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "#define")) continue;
+        const rest = std.mem.trimStart(u8, trimmed["#define".len..], " \t");
+        if (!std.mem.startsWith(u8, rest, macro)) continue;
+        // Require the token to be exactly `macro` (the next char must be whitespace),
+        // so SQLITE_VERSION doesn't match SQLITE_VERSION_NUMBER.
+        const after = rest[macro.len..];
+        if (after.len == 0 or (after[0] != ' ' and after[0] != '\t')) continue;
+        const q1 = std.mem.indexOfScalar(u8, after, '"') orelse continue;
+        const q2 = std.mem.indexOfScalarPos(u8, after, q1 + 1, '"') orelse continue;
+        return b.allocator.dupe(u8, after[q1 + 1 .. q2]) catch @panic("OOM");
+    }
+    std.debug.panic("version aggregation: '#define {s} \"...\"' not found in '{s}'", .{ macro, rel_path });
+}
+
+/// The pinned zap dependency's git commit, parsed from its `build.zig.zon` url
+/// (`git+https://…#<commit>`). "unknown" if the url carries no `#<commit>` fragment.
+fn zapPinnedCommit() []const u8 {
+    const url = @import("build.zig.zon").dependencies.zap.url;
+    const hash = std.mem.indexOfScalar(u8, url, '#') orelse return "unknown";
+    return url[hash + 1 ..];
+}
+
 /// Capture the short git commit at configure time; "unknown" outside a repo.
+///
+/// Two strategies, in order: (1) `git rev-parse --short HEAD` — works in a normal checkout
+/// with git on PATH; but a sandboxed configure step (e.g. an agent harness) can block the
+/// spawn, so (2) fall back to a spawn-free filesystem parse of `.git` that also handles the
+/// linked-worktree case (`.git` is a *file* pointing at the real gitdir, whose branch refs
+/// live in the shared common dir). Both failing → "unknown" (graceful, never a crash).
 fn gitCommit(b: *std.Build) []const u8 {
     const root = b.build_root.path orelse ".";
     var code: u8 = undefined;
-    const stdout = b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "--short", "HEAD" }, &code, .ignore) catch return "unknown";
-    if (code != 0) return "unknown";
-    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
-    return if (trimmed.len == 0) "unknown" else trimmed;
+    if (b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "--short", "HEAD" }, &code, .ignore)) |stdout| {
+        if (code == 0) {
+            const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+            if (trimmed.len > 0) return trimmed;
+        }
+    } else |_| {}
+    return gitCommitFromFs(b) orelse "unknown";
+}
+
+/// Spawn-free short-SHA detection by parsing `.git` directly (sandbox- and worktree-proof).
+/// Returns null on any read/parse failure so the caller degrades to "unknown".
+fn gitCommitFromFs(b: *std.Build) ?[]const u8 {
+    const io = b.graph.io;
+    const alloc = b.allocator;
+    const cwd = std.Io.Dir.cwd();
+    const root = b.build_root.path orelse return null;
+    const small: std.Io.Limit = .limited(64 * 1024);
+
+    // 1. Resolve the git dir. `.git` is a directory (normal repo) or a file
+    //    "gitdir: <path>" (linked worktree / submodule). readFileAlloc errors on a dir.
+    const dot_git = b.fmt("{s}/.git", .{root});
+    const git_dir: []const u8 = blk: {
+        const contents = cwd.readFileAlloc(io, dot_git, alloc, small) catch break :blk dot_git;
+        const trimmed = std.mem.trim(u8, contents, " \t\r\n");
+        const gd = "gitdir:";
+        if (std.mem.startsWith(u8, trimmed, gd)) {
+            const p = std.mem.trim(u8, trimmed[gd.len..], " \t\r\n");
+            break :blk if (std.fs.path.isAbsolute(p)) p else b.fmt("{s}/{s}", .{ root, p });
+        }
+        break :blk dot_git;
+    };
+
+    // 2. Read HEAD. Either "ref: refs/heads/<branch>" or a detached raw SHA.
+    const head = cwd.readFileAlloc(io, b.fmt("{s}/HEAD", .{git_dir}), alloc, small) catch return null;
+    const head_trim = std.mem.trim(u8, head, " \t\r\n");
+    const rp = "ref:";
+    if (!std.mem.startsWith(u8, head_trim, rp)) return shortSha(b, head_trim);
+    const ref = std.mem.trim(u8, head_trim[rp.len..], " \t\r\n"); // e.g. refs/heads/main
+
+    // 3. Branch refs live in the COMMON dir. In a linked worktree, gitdir/commondir points
+    //    at it (relative to gitdir); a normal repo has no commondir, so gitdir IS the common dir.
+    const common_dir: []const u8 = blk: {
+        const cd = cwd.readFileAlloc(io, b.fmt("{s}/commondir", .{git_dir}), alloc, small) catch break :blk git_dir;
+        const cd_trim = std.mem.trim(u8, cd, " \t\r\n");
+        break :blk if (std.fs.path.isAbsolute(cd_trim)) cd_trim else b.fmt("{s}/{s}", .{ git_dir, cd_trim });
+    };
+
+    // 3a. Loose ref file.
+    if (cwd.readFileAlloc(io, b.fmt("{s}/{s}", .{ common_dir, ref }), alloc, small)) |loose| {
+        return shortSha(b, std.mem.trim(u8, loose, " \t\r\n"));
+    } else |_| {}
+
+    // 3b. Packed refs: lines are "<sha> <refname>" (skip comments and "^" peel lines).
+    if (cwd.readFileAlloc(io, b.fmt("{s}/packed-refs", .{common_dir}), alloc, .unlimited)) |packed_refs| {
+        var it = std.mem.tokenizeScalar(u8, packed_refs, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+            const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            if (std.mem.eql(u8, std.mem.trim(u8, line[sp + 1 ..], " \t\r\n"), ref)) {
+                return shortSha(b, line[0..sp]);
+            }
+        }
+    } else |_| {}
+    return null;
+}
+
+/// Validate that `full` looks like a hex object id and return a short (first 12 chars)
+/// duplicated copy; null if it isn't hex or is too short to be a SHA.
+fn shortSha(b: *std.Build, full: []const u8) ?[]const u8 {
+    if (full.len < 7) return null;
+    for (full) |ch| {
+        const is_hex = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
+        if (!is_hex) return null;
+    }
+    return b.allocator.dupe(u8, full[0..@min(full.len, 12)]) catch null;
 }
 
 // ---------------------------------------------------------------------------

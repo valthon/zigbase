@@ -228,6 +228,39 @@ Notes:
 
 ---
 
+## Recipe: seed records offline with `zigbase import`
+
+The HTTP loop above needs a running server and posts one record at a time. For bulk
+seeding or migrating a dataset, `zigbase import` loads **NDJSON** (one JSON object per
+line) **offline — no server — through the record engine**, so validation, defaults, the
+`.encrypted` envelope, and auth password hashing all still apply, and it **preserves each
+row's `id`** so relations stay intact:
+
+```sh
+# users.ndjson — one auth record per line (password is hashed on import):
+#   {"id":"host000000001","email":"host@example.com","password":"hostpassword","name":"Demo Host"}
+# simulators.ndjson — references the preserved user id as its owner:
+#   {"id":"sim0000000001","label":"Bay 1 — TrackMan","owner":"host000000001"}
+
+# Seed the referenced rows (owners) FIRST, then the rows that point at them by id:
+zigbase import --collection users      --data-dir ./zb_data users.ndjson
+zigbase import --collection simulators --data-dir ./zb_data simulators.ndjson
+
+# Idempotent re-seed: match on a unique field and UPDATE in place instead of duplicating.
+zigbase import --collection users --upsert-key email --data-dir ./zb_data users.ndjson
+
+# Pipe from stdin with `-`:
+cat dump.ndjson | zigbase import --collection simulators --data-dir ./zb_data -
+```
+
+A bad row (malformed JSON, validation failure, duplicate id) **fails fast**, rolls back the
+in-flight batch, and names the offending line; batches committed before it persist (fix the
+file and re-run, ideally with `--upsert-key`). Id preservation is **import-only** — the HTTP
+create path always generates the id and never honors a client-supplied one. See
+[docs/framework.md](docs/framework.md) → "Offline bulk import" and `examples/golfsim/seed/`.
+
+---
+
 ## Recipe: user registration (signup)
 
 ZigBase has no separate "register" endpoint. **Signup is a normal record create on

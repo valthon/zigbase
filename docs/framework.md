@@ -60,6 +60,14 @@ exe_mod.addImport("zigbase", zb.module("zigbase"));
 Your `exe_mod` must be created with `.link_libc = true` (the `zigbase` module
 itself is built with `link_libc` and the bundled SQLite amalgamation + zap).
 
+zigbase is pinned to a single Zig minor series (currently **0.16.0**, see
+`build.zig.zon`'s `minimum_zig_version` and `mise.toml`). Building against an
+unsupported Zig version fails at **compile time** with a clear required-vs-actual
+message (e.g. `zigbase requires Zig 0.16.x … but you are building with 0.17.0`)
+instead of an opaque deep-compilation error, so a toolchain mismatch is obvious.
+Install the pinned toolchain with `mise install`, or invoke
+`mise exec zig@0.16.0 -- zig build`.
+
 Minimal `src/main.zig`:
 
 ```zig
@@ -3633,6 +3641,76 @@ generated output, not authoritative configuration.
 > cleanly, but a hand-rolled schema using `serial`/`enum`/extension columns or those SQLite objects
 > may not re-run into a bare database.
 
+#### Offline bulk import (`zigbase import`)
+
+`zigbase import` bulk-loads records from an **NDJSON** file (one JSON object per line) into a
+collection **offline — the HTTP server is not running** — yet routes every row **through the
+record engine**, so a hand-written `INSERT` never bypasses validation or the encryption
+envelope again:
+
+```sh
+# Import into an existing collection (created via .collections or the admin UI).
+zigbase import --collection posts --data-dir ./zb_data seed.ndjson
+
+# Idempotent re-import: match each row on a (recommended-unique) field and UPDATE it if present.
+zigbase import --collection users --upsert-key email --data-dir ./zb_data users.ndjson
+
+# Read NDJSON from stdin with a file path of `-`.
+cat dump.ndjson | zigbase import --collection posts --data-dir ./zb_data -
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--collection NAME` | Target collection (required). Must already exist. |
+| `--upsert-key FIELD` | Match each row on `FIELD`; UPDATE if present, else create. `FIELD` must be a scalar, **non-encrypted**, existing field; a unique constraint is recommended (a non-unique key logs a warning). |
+| `--batch-size N` | Rows per transaction (default `500`; must be ≥ 1). |
+| `--data-dir PATH` | Data directory (also `ZIGBASE_DATA_DIR`, default `./zb_data`). |
+| `<file.ndjson>` | Positional NDJSON path; `-` reads stdin. |
+
+**Through-engine guarantees.** Import performs the SAME full boot as `serve` (minus the socket):
+system migrations run, your comptime `.collections` are provisioned (so the target collection is
+guaranteed to exist), and the `.encrypted` field cipher is stamped onto the writer connection.
+Each row therefore gets: **field validation** and **required checks**, **autodate defaults**
+(`created`/`updated`), the **`.encrypted` at-rest envelope** (the same `ZIGBASE_FIELD_KEY` is
+required — plaintext is never written, and a missing key fails closed), and, for an **auth**
+collection, the credential transforms (**password hashing**, `tokenKey` generation,
+`verified=false` — a client-supplied `verified` is never trusted).
+
+**Streaming + batching + fail-fast.** Lines are read one at a time (the whole file is never
+slurped; a single record line must fit a 1 MiB buffer). Rows commit in batches of `--batch-size`.
+A bad row — malformed JSON, a validation failure, or a duplicate id — **fails fast**: the
+in-flight (uncommitted) batch is rolled back and the error names the offending 1-based line.
+Batches committed **before** the failure persist, so a large import that trips near the end is a
+resumable checkpoint (fix the file and re-run, ideally with `--upsert-key`). Blank lines are
+skipped. On completion it logs `created`, `updated`, and `total` counts.
+
+**Id preservation (import-only).** By default each row's own `id` is **preserved** — essential
+for migrations, because relations reference records by id and an exported dataset must keep those
+ids intact. Seed the referenced rows (owners) first, then the rows that reference them. This
+id-honoring behavior is reachable **only** from import: the HTTP / custom-route / hook create
+path always generates a fresh id and **ignores** any client-supplied `id`, so a client can never
+choose a record's id. (An imported id is sanity-checked — non-empty, ≤ 255 printable non-space
+bytes — and binds as a parameter, never interpolated.)
+
+**Library entrypoint.** The same engine is exposed as `zigbase.Import` for a small consumer
+migration/seed binary that wants to load data programmatically:
+
+```zig
+const zigbase = @import("zigbase");
+// ... obtain a booted App + writer (e.g. inside a custom CLI) ...
+var reader = std.Io.Reader.fixed(ndjson_bytes); // or a file/stdin reader
+const report = try zigbase.Import.run(app, writer, io, &reader, .{
+    .collection = "posts",
+    .upsert_key = "slug",   // optional
+    .batch_size = 500,
+    .preserve_ids = true,
+});
+std.log.info("imported {d} ({d} new, {d} updated)", .{ report.total, report.created, report.updated });
+```
+
+See `examples/golfsim/seed/` for a worked seeding example (hosts + the simulators that reference
+them by preserved id).
+
 #### Cross-backend migrations (SQLite **and** Postgres)
 
 The same migration runs on whichever backend the server was started with (SQLite by
@@ -4538,6 +4616,34 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres.md](./postgres.md) |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
+
+## Version transparency & dependency auditing
+
+A ZigBase binary bakes in a vendored SQLite C amalgamation, an optional sqlite-vec amalgamation
+(`-Dvector`), and the `zap`/facil.io server. The pinned versions of all of these — plus zigbase
+itself — are aggregated at build time (zero runtime cost) and surfaced four ways (#282):
+
+- **`zigbase --version`** prints build provenance *and* a "Vendored/native components" block:
+  SQLite (+ source id), sqlite-vec (+ a linked / not-linked note), zap (+ pinned commit), facil.io.
+- **`zig build versions`** runs the freshly-built binary with `--version`, so you can read exactly
+  what a build would ship without launching a server.
+- **Startup log** — `zigbase serve` emits one `versions: …` `INFO` line at boot (the `sqlite`
+  value there is the live linked library version).
+- **`GET /api/health`** returns a `versions` object next to the backend badge:
+
+  ```json
+  { "status": "ok", "backend": "sqlite",
+    "versions": { "zigbase": "0.11.0", "commit": "…", "sqlite": "3.53.2",
+                  "sqliteVec": "v0.1.6", "zap": "0.10.6", "facil": "0.7.4" } }
+  ```
+
+  These are non-secret build provenance only — no connection string, host, or credential is exposed.
+
+**`zig build audit`** compares the pinned versions against a curated in-repo advisory table
+(`docs/security-advisories.md`) and exits non-zero if any pin falls in a known-affected range. The
+transparency sources, the audit workflow, and the update process for a vendored C / dependency
+security fix are documented in [docs/security-audit.md](./security-audit.md) →
+"Dependency version transparency & supply-chain auditing".
 
 ## Exported names reference
 

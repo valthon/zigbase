@@ -582,6 +582,34 @@ curl -s http://127.0.0.1:8090/api/golfsim/health
 # -> {"status":"ok","app":"golfsim"}
 ```
 
+### Seeding demo data offline — `zigbase import`
+
+`serve` is not the only way to load records. The built-in `import` subcommand bulk-loads
+NDJSON (one JSON object per line) **offline — no running server — through the record engine**,
+so every row still gets field validation, defaults, the `.encrypted` envelope, and (for auth
+collections) password hashing. It also **preserves each row's `id`**, which is exactly what
+relation integrity needs: seed the owners first, then the rows that reference them by id.
+
+```sh
+# Provision the schema without serving (import also boots + provisions, but this is explicit):
+./zig-out/bin/golfsim migrate --data-dir ./data
+
+# 1. Seed the host accounts (auth collection): passwords are hashed, tokenKey generated.
+#    `verified` is NOT trusted from the file — import always forces verified=false, so these
+#    demo hosts must verify their email before they can log in (the security model holds).
+./zig-out/bin/golfsim import --collection users      --data-dir ./data seed/users.ndjson
+
+# 2. Seed simulators that reference those preserved user ids as their owner.
+./zig-out/bin/golfsim import --collection simulators --data-dir ./data seed/simulators.ndjson
+# -> info: import complete: 3 created, 0 updated, 3 total (collection 'simulators')
+
+# Re-running is easy to make idempotent with --upsert-key (match on a unique field):
+#   ./zig-out/bin/golfsim import --collection simulators --upsert-key label --data-dir ./data seed/simulators.ndjson
+```
+
+Pipe from stdin with `-` (e.g. `cat dump.ndjson | ./zig-out/bin/golfsim import --collection simulators - `).
+See `docs/framework.md` → "Offline bulk import" for the full flag/semantics reference.
+
 ## Using ZigBase in your own project
 
 ```sh

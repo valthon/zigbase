@@ -30,7 +30,8 @@ interfaces, pass `--http-host 0.0.0.0` (front it with a firewall / reverse proxy
 On first `serve` with no `ZIGBASE_JWT_SECRET`, a strong random secret is generated and
 persisted at `<data-dir>/.jwt_secret` (mode 0600), then reused on later runs. Your `zig`
 must be 0.16.0 — either activate mise (`eval "$(mise activate bash)"`) or prefix commands
-with `mise exec zig@0.16.0 --`.
+with `mise exec zig@0.16.0 --`. Building with an unsupported Zig version fails at compile
+time with a clear required-vs-actual message rather than a confusing deep-compile error.
 
 ## Docker
 
@@ -115,8 +116,8 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-`runCli` gives your binary the same `serve` / `migrate` / `superuser create` / `help`
-commands as the stock server. Beyond hooks, `App(.{...})` also accepts a comptime
+`runCli` gives your binary the same `serve` / `migrate` / `import` / `superuser create` /
+`help` commands as the stock server. Beyond hooks, `App(.{...})` also accepts a comptime
 **schema** (`.collections` + `.migrations`, provisioned at startup with additive
 auto-migration), **pluggable backends** (`.storage` / `.mailer`), and **footprint
 levers** (`.pools`). See [docs/framework.md](docs/framework.md) and the worked
@@ -133,10 +134,16 @@ an Astro + React frontend demonstrating a different static-files mode.
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
               [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
 zigbase migrate [--data-dir PATH]
+zigbase import --collection NAME [--upsert-key FIELD] [--batch-size N] [--data-dir PATH] <file.ndjson>
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase version
 zigbase help
 ```
+
+`import` bulk-loads NDJSON records **offline (no running server)** through the record
+engine — validation, defaults, the `.encrypted` envelope, and auth password hashing all
+apply — with optional `--upsert-key` idempotency and source-id preservation. See
+[docs/framework.md](docs/framework.md) → "Offline bulk import".
 
 Running `zigbase` with no recognised command prints usage.
 

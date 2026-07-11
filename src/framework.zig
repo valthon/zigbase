@@ -33,6 +33,7 @@ const pagination = @import("pagination.zig");
 const registry = @import("auth/registry.zig");
 const field_policy = @import("field_policy.zig");
 const rewrap = @import("rewrap.zig");
+const import_mod = @import("import.zig");
 const features = @import("features.zig");
 const ctx_mod = @import("ctx.zig");
 const queue = @import("queue/queue.zig");
@@ -1807,6 +1808,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .typegen => printTypegenUsage(init.io, std.Io.File.stdout()),
             .migrate_db => printMigrateDbUsage(init.io, std.Io.File.stdout()),
             .vapid_keygen => printVapidKeygenUsage(init.io, std.Io.File.stdout()),
+            .import => printImportUsage(init.io, std.Io.File.stdout()),
         },
         .version => printVersion(init.io, std.Io.File.stdout()),
         .serve => |sa| {
@@ -1820,6 +1822,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .dump => try migrateDumpImpl(allocator, init.io, init.environ_map, ma),
         },
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
+        .import => |ia| try importImpl(allocator, init.io, init.environ_map, ia, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
         .vapid_keygen => try vapidKeygenImpl(allocator, init.io),
@@ -1884,6 +1887,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  migrate             Apply database migrations, then exit. `status` reports; `rollback [N]` reverses; `dump` dumps the live schema.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
+        \\  import              Bulk-import NDJSON records offline (through the engine: validation + encryption).
         \\  superuser create    Create an admin (superuser) account.
         \\  vapid-keygen        Generate a VAPID (Web Push) keypair for ctx.push().
         \\  help                Show this help. Also: --help, -h, or no arguments.
@@ -2016,14 +2020,27 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
     , .{});
 }
 
-/// Print build provenance (for `--version`) to stdout. emit() keeps it prefix-free.
+/// Human-readable note on whether the sqlite-vec amalgamation is actually linked into
+/// this binary (it is compiled in ONLY with `-Dvector`), so `--version` never implies a
+/// vendored version is active when the default build folds it away.
+const sqlite_vec_note = if (build_options.vector) "linked" else "not linked; build -Dvector to enable";
+
+/// Print build provenance + baked-in component versions (for `--version`) to stdout (#282).
+/// emit() keeps it prefix-free. The component block mirrors the `versions:` startup log line
+/// and the `versions` object on `GET /api/health` — one source of truth (build_options).
 fn printVersion(io: std.Io, file: std.Io.File) void {
     emit(io, file,
         \\zigbase {s}
-        \\commit:  {s}
-        \\build:   {s}
-        \\target:  {s}-{s}-{s}
-        \\zig:     {s}
+        \\commit:      {s}
+        \\build:       {s}
+        \\target:      {s}-{s}-{s}
+        \\zig:         {s}
+        \\
+        \\Vendored/native components:
+        \\  sqlite:     {s} (source {s})
+        \\  sqlite-vec: {s} ({s})
+        \\  zap:        {s} (commit {s})
+        \\  facil.io:   {s}
         \\
     , .{
         build_options.version,
@@ -2033,6 +2050,13 @@ fn printVersion(io: std.Io, file: std.Io.File) void {
         @tagName(builtin.target.os.tag),
         @tagName(builtin.target.abi),
         builtin.zig_version_string,
+        build_options.sqlite_version,
+        build_options.sqlite_source_id,
+        build_options.sqlite_vec_version,
+        sqlite_vec_note,
+        build_options.zap_version,
+        build_options.zap_commit,
+        build_options.facil_version,
     });
 }
 
@@ -2162,6 +2186,48 @@ fn printRewrapUsage(io: std.Io, file: std.Io.File) void {
         \\EXAMPLE (rotate from key gen 1 to gen 2):
         \\  ZIGBASE_FIELD_KEY=newkey ZIGBASE_FIELD_KEY_GENERATION=2 ZIGBASE_FIELD_KEY_V1=oldkey \
         \\    zigbase rewrap --data-dir ./zb_data
+        \\
+    , .{});
+}
+
+fn printImportUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase import — offline, encryption-aware bulk NDJSON record import.
+        \\
+        \\USAGE:
+        \\  zigbase import --collection NAME [--upsert-key FIELD] [--batch-size N]
+        \\                 [--data-dir PATH] <file.ndjson>
+        \\  (use - as the file path to read NDJSON from stdin)
+        \\
+        \\FLAGS:
+        \\  --collection NAME  Target collection (required). Must already exist (declared in
+        \\                     .collections or created via the admin UI).
+        \\  --upsert-key FIELD Match each row on FIELD and UPDATE it if present, else create
+        \\                     (idempotent re-import). FIELD must be a scalar, non-encrypted,
+        \\                     existing field; a unique constraint is recommended.
+        \\  --batch-size N     Rows per transaction (default 500; must be >= 1).
+        \\  --data-dir PATH    SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\
+        \\WHAT IT DOES:
+        \\  Streams an NDJSON file (one JSON object per line) into the collection THROUGH THE
+        \\  RECORD ENGINE, WITHOUT starting the HTTP server. Every row therefore gets field
+        \\  validation, autodate/required defaults, the `.encrypted` at-rest envelope (the same
+        \\  ZIGBASE_FIELD_KEY is required — plaintext is never written), and, for an auth
+        \\  collection, the credential transforms (password hashing, tokenKey, verified=false).
+        \\  Rows commit in batches; a bad row (malformed JSON, validation failure, duplicate id)
+        \\  FAILS FAST — the in-flight batch is rolled back and the offending line is named.
+        \\  Batches committed before the failure persist (a resumable checkpoint).
+        \\
+        \\  By default each row's own `id` is PRESERVED (so relations across an exported dataset
+        \\  stay intact). This is import-only: the HTTP/route/hook create path never honors a
+        \\  client-supplied id.
+        \\
+        \\  Blank lines are skipped. A single record line must fit the 1 MiB line buffer.
+        \\
+        \\EXAMPLES:
+        \\  zigbase import --collection posts --data-dir ./zb_data seed.ndjson
+        \\  zigbase import --collection users --upsert-key email users.ndjson
+        \\  cat dump.ndjson | zigbase import --collection posts -
         \\
     , .{});
 }
@@ -2425,6 +2491,90 @@ fn rewrapImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.proc
         "rewrap {s}: {d} collection(s), {d} field(s); {d} re-encrypted, {d} plaintext migrated, {d} already current",
         .{ if (ra.dry_run) "dry-run complete" else "complete", stats.collections, stats.fields, stats.rewrapped, stats.plaintext_migrated, stats.skipped },
     );
+}
+
+/// `zigbase import --collection <name> [--upsert-key <field>] [--batch-size N] <file.ndjson>`:
+/// offline, encryption-aware bulk NDJSON record import (issue #283). Boots the FULL application
+/// WITHOUT binding a socket via `bootApp` — so migrations run, the comptime `.collections` are
+/// provisioned (the target collection is guaranteed present), and the `.encrypted` field cipher
+/// is stamped on every pooled connection — then streams the file (or stdin when the path is `-`)
+/// through the record engine on the writer connection. Every row gets validation, defaults, the
+/// `.encrypted` at-rest envelope, and (for an auth collection) password hashing. See
+/// `src/import.zig` for the streaming/batch/txn/id-preservation/upsert contract.
+fn importImpl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    ia: cli.ImportArgs,
+    dispatch: *const events.Dispatch,
+    jobs: []const scheduler.RuntimeJob,
+    pool_size: usize,
+    schema_collections: []const schema.Collection,
+    schema_migrations: []const provision.Migration,
+    comptime opts: ServeOpts,
+) !void {
+    const collection = ia.collection orelse {
+        std.log.err("import: --collection <name> is required", .{});
+        return error.MissingCollection;
+    };
+    const file = ia.file orelse {
+        std.log.err("import: a <file.ndjson> path is required (use - to read stdin)", .{});
+        return error.MissingImportFile;
+    };
+    const cfg = try loadCfg(environ, .{ .data_dir = ia.data_dir });
+
+    // Full offline boot: migrations + comptime provisioning + field-cipher stamping, socket-free.
+    const holder = try bootApp(allocator, io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, environ);
+    defer holder.deinit();
+
+    const w = holder.pool.acquireWriter();
+    defer holder.pool.releaseWriter();
+
+    const run_opts = import_mod.Options{
+        .collection = collection,
+        .upsert_key = ia.upsert_key,
+        .batch_size = ia.batch_size,
+    };
+
+    // A generous heap line buffer (a single NDJSON record must fit it). Heap, not stack — 1 MiB.
+    const line_buf = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(line_buf);
+
+    const report = blk: {
+        if (std.mem.eql(u8, file, "-")) {
+            var fr = std.Io.File.stdin().readerStreaming(io, line_buf);
+            break :blk import_mod.run(&holder.app, w, io, &fr.interface, run_opts) catch |e| return reportImportError(collection, e);
+        } else {
+            const f = std.Io.Dir.cwd().openFile(io, file, .{}) catch |e| {
+                std.log.err("import: cannot open '{s}': {s}", .{ file, @errorName(e) });
+                return e;
+            };
+            defer f.close(io);
+            var fr = f.readerStreaming(io, line_buf);
+            break :blk import_mod.run(&holder.app, w, io, &fr.interface, run_opts) catch |e| return reportImportError(collection, e);
+        }
+    };
+    std.log.info("import complete: {d} created, {d} updated, {d} total (collection '{s}')", .{ report.created, report.updated, report.total, collection });
+}
+
+/// Present an `import.run` failure at the CLI boundary (the library itself emits no `.err`
+/// logs). Uses `import_mod.last_error_line` for the offending row and the pre-captured
+/// `import_mod.last_error_detail` for extra context (e.g. the failing field on a validation
+/// error) — never dereferencing the engine's arena-freed `records.last_errors`. Re-returns the
+/// error so the process exits non-zero. Batches committed before the failing one persist (a
+/// resumable checkpoint).
+fn reportImportError(collection: []const u8, e: anyerror) anyerror {
+    const line = import_mod.last_error_line;
+    const detail = import_mod.last_error_detail;
+    if (line > 0) {
+        if (detail.len > 0)
+            std.log.err("import into '{s}' failed at line {d}: {s} — {s}", .{ collection, line, @errorName(e), detail })
+        else
+            std.log.err("import into '{s}' failed at line {d}: {s}", .{ collection, line, @errorName(e) });
+    } else {
+        std.log.err("import into '{s}' failed: {s}", .{ collection, @errorName(e) });
+    }
+    return e;
 }
 
 /// `zigbase migrate-db --from <data.db> --to <postgres://…>`: copy an existing SQLite instance
@@ -3140,6 +3290,24 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     defer holder.deinit();
     const app = &holder.app;
     const cfg = holder.cfg;
+
+    // Emit the baked-in component versions once at boot (#282) — the same block `--version`
+    // and `GET /api/health` report, so an operator can see (and audit) what a running binary
+    // vendors straight from the logs. sqlite is the LIVE linked version; the rest come from
+    // build_options (single source of truth).
+    std.log.info(
+        "versions: zigbase {s} ({s}) | sqlite {s} | sqlite-vec {s} ({s}) | zap {s} | facil.io {s} | zig {s}",
+        .{
+            build_options.version,
+            build_options.commit,
+            db.libVersion(),
+            build_options.sqlite_vec_version,
+            sqlite_vec_note,
+            build_options.zap_version,
+            build_options.facil_version,
+            builtin.zig_version_string,
+        },
+    );
 
     const Ctx = @import("ctx.zig").Ctx;
     if (dispatch.on_before_serve) |h| {

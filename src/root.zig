@@ -1,5 +1,12 @@
 const std = @import("std");
 
+// Force the compile-time Zig-version guard on every build. Building against an
+// unsupported compiler fails here with a clear required-vs-actual message rather
+// than a confusing deep-compilation error downstream (see src/zig_compat.zig).
+comptime {
+    _ = @import("zig_compat.zig");
+}
+
 // ---- Public API (grows over this plan) -------------------------------------
 pub const App = @import("framework.zig").App; // comptime application builder
 pub const Runtime = @import("app.zig").App; // runtime app context struct
@@ -205,6 +212,13 @@ pub const SqlCheckOptions = @import("sql/schema_check.zig").SqlCheckOptions;
 /// docs/framework.md. Namespaced under `Query` to keep `select`/`Op`/`Dir` off the root.
 pub const Query = @import("sql/query_builder.zig");
 
+/// Offline, encryption-aware bulk NDJSON record import (issue #283). Backs the `zigbase import`
+/// CLI subcommand and is usable directly from a small consumer migration/seed binary:
+/// `zigbase.Import.run(app, writer, io, reader, .{ .collection = "posts" })` streams NDJSON
+/// through the record engine (validation + defaults + `.encrypted` envelope + auth hashing),
+/// batching on the writer connection, with optional `--upsert-key` idempotency and source-id
+/// preservation. See `Import.Options` / `Import.Report` and docs/framework.md.
+pub const Import = @import("import.zig");
 // ---- General outbound HTTP client -----------------------------------------
 // HttpMethod/HttpHeader use the Http-prefix to avoid collision with http.zig's
 // Method/Header enums (which are already accessible via `zigbase.http.Method`).
@@ -278,6 +292,7 @@ pub const codegen = struct {
 // so its `test {}` blocks are analyzed and run (matches pre-restructure behavior
 // where main.zig's import graph reached them).
 test {
+    _ = @import("zig_compat.zig");
     _ = @import("app.zig");
     _ = @import("config.zig");
     _ = @import("ratelimit.zig");
@@ -315,6 +330,7 @@ test {
     _ = @import("aead.zig");
     _ = @import("field_policy.zig");
     _ = @import("rewrap.zig");
+    _ = @import("import.zig");
     _ = @import("jwt.zig");
     _ = @import("push/encrypt.zig");
     _ = @import("push/vapid.zig");
