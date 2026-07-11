@@ -77,6 +77,7 @@ const RowOutcome = enum { created, updated };
 /// `db.DbError`. On a row-specific failure `last_error_line` is set to the offending 1-based
 /// line before the error is returned; config errors leave it 0. The CLI presents them.
 pub const ImportError = error{
+    InvalidBatchSize,
     InvalidCollectionName,
     UnknownCollection,
     InvalidUpsertKey,
@@ -126,17 +127,23 @@ fn bindScalar(st: *db.Stmt, idx: c_int, v: std.json.Value) !void {
     }
 }
 
-/// Look up an existing record id by the upsert key's value. Returns null (⇒ create) when the
-/// row omits the key or nothing matches. `col.name` + `key` are identifier-gated by the caller.
-fn findExistingId(a: std.mem.Allocator, w: *db.Db, col: schema.Collection, key: []const u8, data: std.json.Value) !?[]const u8 {
+/// Look up an existing record id by the upsert key's value on the RE-USED lookup statement `st`
+/// (prepared once per `run`). Returns null (⇒ create) when the row omits the key or nothing
+/// matches. The statement is reset before binding and again after reading, so it never holds a
+/// row cursor across the batch's commit boundary. The returned id is duped into `a` (the per-row
+/// arena) BEFORE the reset, since `columnText` borrows statement-owned memory that reset frees.
+fn findExistingId(a: std.mem.Allocator, st: *db.Stmt, key: []const u8, data: std.json.Value) !?[]const u8 {
     const key_val = data.object.get(key) orelse return null;
     if (key_val == .null) return null;
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT \"id\" FROM \"{s}\" WHERE \"{s}\"=?1 LIMIT 1;", .{ col.name, key }, 0);
-    var st = try prep(a, w, sql);
-    defer st.finalize();
-    try bindScalar(&st, 1, key_val);
-    if (!try st.step()) return null;
-    return try a.dupe(u8, st.columnText(0));
+    st.reset();
+    try bindScalar(st, 1, key_val);
+    if (!try st.step()) {
+        st.reset();
+        return null;
+    }
+    const id = try a.dupe(u8, st.columnText(0));
+    st.reset(); // release the row cursor so the next commit isn't blocked by an active statement
+    return id;
 }
 
 /// True if `data` carries a non-empty string `id`.
@@ -164,10 +171,25 @@ fn createRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema
     _ = try records.createInTxnOpts(a, io, w, col, prepped, opts);
 }
 
+/// The two per-run reused lookup statements, prepared ONCE (after the collection + upsert key are
+/// resolved) and reused for every row via reset/re-bind — avoiding an N+1 prepare per row. Exactly
+/// one is non-null: `upsert` when `--upsert-key` is set, `dup_check` when preserving ids without a
+/// key (the duplicate-id precheck). Both read statements are connection-scoped and survive the
+/// batch commit/begin boundaries (they only ever hold a row cursor briefly, between reset calls).
+const Lookups = struct {
+    upsert: ?db.Stmt = null,
+    dup_check: ?db.Stmt = null,
+
+    fn finalize(self: *Lookups) void {
+        if (self.upsert) |*s| s.finalize();
+        if (self.dup_check) |*s| s.finalize();
+    }
+};
+
 /// Import a single already-parsed JSON object. The caller records the 1-based line on failure.
-fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema.Collection, data: std.json.Value, opts: Options) !RowOutcome {
+fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema.Collection, data: std.json.Value, opts: Options, lookups: *Lookups) !RowOutcome {
     if (opts.upsert_key) |key| {
-        if (try findExistingId(a, w, col, key, data)) |existing_id| {
+        if (try findExistingId(a, &lookups.upsert.?, key, data)) |existing_id| {
             // Update the matched row's provided fields. Note: an auth `password` on UPDATE is
             // not re-hashed (there is no `password` column) — same as the Data.update path;
             // credential rotation is not an import-update concern.
@@ -180,13 +202,15 @@ fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema
         // Fall through to create (no existing match).
     } else if (opts.preserve_ids) {
         // No upsert key: a provided id that already exists would hit the PK constraint. Detect
-        // it up front for a clean error instead of a raw SQLite constraint failure.
+        // it up front for a clean error instead of a raw SQLite constraint failure — on the
+        // per-run reused statement (reset before/after so no cursor spans the commit boundary).
         if (hasProvidedId(data)) |id| {
-            const sql = try std.fmt.allocPrintSentinel(a, "SELECT 1 FROM \"{s}\" WHERE \"id\"=?1 LIMIT 1;", .{col.name}, 0);
-            var st = try prep(a, w, sql);
-            defer st.finalize();
+            const st = &lookups.dup_check.?;
+            st.reset();
             try st.bindText(1, id);
-            if (try st.step()) return ImportError.DuplicateId;
+            const exists = try st.step();
+            st.reset();
+            if (exists) return ImportError.DuplicateId;
         }
     }
     try createRow(app, w, io, a, col, data, opts.preserve_ids);
@@ -196,7 +220,10 @@ fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema
 /// Stream NDJSON from `reader` into `opts.collection` on writer `w`. Returns the row counts.
 /// See the file header for the streaming/batch/txn/id/upsert contract.
 pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Options) !Report {
-    std.debug.assert(opts.batch_size >= 1);
+    // Runtime check, not std.debug.assert: `run` is a public library entrypoint and asserts are
+    // compiled out in ReleaseFast/ReleaseSmall, where a 0 would divide the loop into never-committing
+    // batches. Fail with a stable error instead.
+    if (opts.batch_size < 1) return ImportError.InvalidBatchSize;
 
     // Resolve the target collection ONCE into a run-lived arena (never per row — that would
     // leak collections.get's allocations each row and re-hit the DB).
@@ -210,6 +237,14 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
     if (!schema.isValidIdentifier(opts.collection)) return ImportError.InvalidCollectionName;
     const col = (try collections.get(ca, w, opts.collection)) orelse return ImportError.UnknownCollection;
 
+    // Prepare the per-run lookup statement(s) ONCE — reused for every row (reset + re-bind) so a
+    // large import doesn't re-format + re-`prepare` a statement per row (an N+1 that ~doubles DB
+    // work). The table/column are fixed for the whole run, so the identifier gate runs once here,
+    // at prepare time, before interpolation. Read statements are connection-scoped and safely
+    // survive the batch commit/begin boundaries.
+    var lookups: Lookups = .{};
+    defer lookups.finalize();
+
     if (opts.upsert_key) |key| {
         if (!schema.isValidIdentifier(key)) return ImportError.InvalidUpsertKey;
         const f = findField(col, key) orelse return ImportError.UnknownUpsertKey;
@@ -218,6 +253,11 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
             // Operational heads-up (warn is not counted as a test-failing error log).
             std.log.warn("import: --upsert-key '{s}' is not backed by a unique constraint; a non-unique key may update the wrong row", .{key});
         }
+        const sql = try std.fmt.allocPrintSentinel(ca, "SELECT \"id\" FROM \"{s}\" WHERE \"{s}\"=?1 LIMIT 1;", .{ col.name, key }, 0);
+        lookups.upsert = try prep(ca, w, sql);
+    } else if (opts.preserve_ids) {
+        const sql = try std.fmt.allocPrintSentinel(ca, "SELECT 1 FROM \"{s}\" WHERE \"id\"=?1 LIMIT 1;", .{col.name}, 0);
+        lookups.dup_check = try prep(ca, w, sql);
     }
 
     // Per-row scratch arena, reset (retaining capacity) after each row so memory stays bounded
@@ -264,7 +304,7 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
             return ImportError.RowNotObject;
         }
 
-        const outcome = importRow(app, w, io, a, col, parsed, opts) catch |e| {
+        const outcome = importRow(app, w, io, a, col, parsed, opts, &lookups) catch |e| {
             last_error_line = line_no;
             // Capture the failing field detail NOW, while records.last_errors is still valid
             // (it points into `a` = row_arena, which this function's defer will free).
@@ -523,6 +563,54 @@ test "import: upsert create-then-update by key" {
     _ = try st.step();
     try std.testing.expectEqualStrings("v2", st.columnText(0));
     try std.testing.expect(!try st.step()); // only one row
+}
+
+test "import: multi-row upsert reuses the lookup statement across a batch boundary" {
+    // batch_size=1 forces a commit+begin between every row, so the reused upsert lookup
+    // statement (prepared once) must keep working across those transaction boundaries. Mixes
+    // creates and updates in one stream, spanning multiple batches.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+
+    // Seed two distinct slugs, then re-touch one and add a third — 4 lines, batch_size 1.
+    const ndjson =
+        \\{"title":"a1","slug":"a"}
+        \\{"title":"b1","slug":"b"}
+        \\{"title":"a2","slug":"a"}
+        \\{"title":"c1","slug":"c"}
+    ;
+    const rep = try runNdjson(&app, &d, io, ndjson, .{ .collection = "posts", .upsert_key = "slug", .batch_size = 1 });
+    try std.testing.expectEqual(@as(usize, 3), rep.created); // a, b, c
+    try std.testing.expectEqual(@as(usize, 1), rep.updated); // a again
+    try std.testing.expectEqual(@as(usize, 4), rep.total);
+
+    // Three distinct rows; slug 'a' holds the updated title.
+    var cst = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer cst.finalize();
+    _ = try cst.step();
+    try std.testing.expectEqual(@as(i64, 3), cst.columnInt(0));
+    var ast = try d.prepare("SELECT title FROM posts WHERE slug='a';");
+    defer ast.finalize();
+    _ = try ast.step();
+    try std.testing.expectEqualStrings("a2", ast.columnText(0));
+}
+
+test "import: batch_size of 0 is rejected (runtime check, not a debug assert)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+    try std.testing.expectError(error.InvalidBatchSize, runNdjson(&app, &d, io, "{\"title\":\"x\",\"slug\":\"x\"}", .{ .collection = "posts", .batch_size = 0 }));
 }
 
 test "import: validation error reports the failing 1-based line" {
