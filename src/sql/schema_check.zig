@@ -261,9 +261,21 @@ const Analyzer = struct {
         return false;
     }
 
+    /// Resolve a qualifier `name` to its collection index, or null if it isn't a known collection
+    /// alias/table — OR if it is AMBIGUOUS. `checkTables`/`checkColumns` scan the whole statement
+    /// (CTE bodies, subqueries), so the same alias can be introduced in multiple scopes bound to
+    /// DIFFERENT collections; resolving to the first match could validate `name.col` against the
+    /// wrong collection → a false positive. So a name defined more than once anywhere is treated as
+    /// ambiguous and its columns are not checked (table validation is unaffected).
     fn aliasCollection(self: *Analyzer, name: []const u8) ?usize {
-        for (self.alias[0..self.alias_len]) |e| if (eqIC(name, e.alias)) return e.coll_index;
-        return null;
+        var found: ?usize = null;
+        for (self.alias[0..self.alias_len]) |e| {
+            if (eqIC(name, e.alias)) {
+                if (found != null) return null; // defined >1× → ambiguous → skip column check
+                found = e.coll_index;
+            }
+        }
+        return found;
     }
 
     /// Whether `name` is a valid column of collection `ci`. Delegates to the shared valid-column
@@ -319,7 +331,19 @@ const Analyzer = struct {
                     }
                     break;
                 }
-            } else if (kwEq(t, "join") or kwEq(t, "into") or kwEq(t, "update")) {
+            } else if (kwEq(t, "join") or kwEq(t, "into")) {
+                if (self.parseTableRef(&lex)) |f| return f;
+            } else if (kwEq(t, "update")) {
+                // SQLite allows an optional conflict clause before the table:
+                // `UPDATE OR REPLACE|ROLLBACK|ABORT|FAIL|IGNORE <table> SET ...`. Skip the
+                // `OR <action>` pair so the table token (not `OR`) is what gets validated.
+                // Valid `UPDATE OR ...` always has a real action word after OR, so consuming both
+                // tokens unconditionally cannot flag a valid statement. A quoted `"or"` table name
+                // is a non-keyword token (kwEq is false for quoted idents) and is left untouched.
+                if (kwEq(lex.peek(), "or")) {
+                    _ = lex.next(); // OR
+                    _ = lex.next(); // conflict action
+                }
                 if (self.parseTableRef(&lex)) |f| return f;
             }
         }
@@ -555,6 +579,26 @@ test "positive: UPDATE / INSERT INTO / DELETE FROM with valid tables" {
     try expectOk("DELETE FROM posts WHERE id = ?1");
 }
 
+test "positive: UPDATE OR <conflict-action> <table> is not flagged" {
+    // The conflict clause sits between UPDATE and the table; the table (not `OR`/the action) must
+    // be what gets validated. Cover every SQLite conflict action, upper- and mixed-case.
+    try expectOk("UPDATE OR REPLACE posts SET title = ?1 WHERE id = ?2");
+    try expectOk("UPDATE OR ROLLBACK posts SET title = ?1");
+    try expectOk("UPDATE OR ABORT posts SET title = ?1");
+    try expectOk("UPDATE OR FAIL posts SET title = ?1");
+    try expectOk("UPDATE OR IGNORE posts SET title = ?1");
+    try expectOk("update or replace posts set title = ?1"); // case-insensitive keywords
+}
+
+test "positive: ambiguous alias (same name, two collections) is not column-checked" {
+    // `x` is bound to `users` in one CTE body and `orders` in another. Both tables are valid, so
+    // table checking passes; `x.total` is valid on orders but NOT users. Resolving `x` to the
+    // first binding would falsely flag it — instead a duplicate alias is ambiguous and skipped.
+    try expectOk(
+        "WITH ca AS (SELECT x.total FROM users x), cb AS (SELECT x.total FROM orders x) SELECT * FROM ca",
+    );
+}
+
 test "positive: extra_tables opt-out (internal + migration-owned)" {
     try expectOkOpts("SELECT v FROM _kv WHERE k = ?1", .{ .extra_tables = &.{"_kv"} });
     try expectOkOpts(
@@ -605,6 +649,11 @@ test "negative: unknown table after INSERT INTO" {
 
 test "negative: unknown table after UPDATE" {
     try expectUnknownTable("UPDATE postts SET title = ?1", "postts");
+}
+
+test "negative: UPDATE OR <action> still flags a bad table" {
+    // Skipping the conflict clause must not skip validating the table after it.
+    try expectUnknownTable("UPDATE OR REPLACE nonexistent SET title = ?1", "nonexistent");
 }
 
 test "negative: unknown table after DELETE FROM" {
