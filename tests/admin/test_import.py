@@ -76,18 +76,36 @@ def run_import(binary, data, collection, ndjson_path, *extra, stdin=None):
 
 
 def _serve(binary, data):
+    """Launch `serve` and return (proc, base_url) only once the port accepts connections.
+
+    Fails fast rather than returning a proc nothing is listening on: if the server exits early
+    or never binds within the deadline, terminate/kill it and pytest.fail with its captured
+    stderr, so a boot failure surfaces here instead of as opaque connection-refused later.
+    """
     port = _free_port()
-    proc = subprocess.Popen(
-        [binary, "serve", "--insecure-cookies", "--http-port", str(port)],
-        env=_env(data), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    log_path = os.path.join(data, "serve.log")
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen(
+            [binary, "serve", "--insecure-cookies", "--http-port", str(port)],
+            env=_env(data), stdout=log, stderr=subprocess.STDOUT,
+        )
     for _ in range(50):
+        if proc.poll() is not None:
+            break  # process already exited; stop polling and fail below
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                break
+                return proc, f"http://127.0.0.1:{port}"
         except OSError:
             time.sleep(0.1)
-    return proc, f"http://127.0.0.1:{port}"
+    # Never became reachable — clean up the subprocess and fail loudly with its output.
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+    output = pathlib.Path(log_path).read_text(errors="replace") if pathlib.Path(log_path).exists() else "<no output captured>"
+    pytest.fail(f"serve on port {port} never became reachable (exit={proc.returncode}):\n{output}")
 
 
 def _get_json(url):
