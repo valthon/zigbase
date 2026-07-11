@@ -44,8 +44,8 @@ pub fn isValidColumn(c: schema.Collection, name: []const u8) bool {
 }
 
 /// Emit `name` as a double-quoted SQL identifier. Field/collection names are always valid
-/// identifiers (`schema.isValidIdentifier`: alnum + `_`), so no embedded `"` is possible — the
-/// simple wrap is safe.
+/// identifiers (`schema.isValidIdentifier`: a leading ASCII-alphabetic character followed by ASCII
+/// alphanumerics or `_`), so no embedded `"` is possible — the simple wrap is safe.
 pub fn quoteIdent(comptime name: []const u8) []const u8 {
     return "\"" ++ name ++ "\"";
 }
