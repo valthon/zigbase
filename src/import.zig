@@ -230,6 +230,10 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
     var in_batch: usize = 0;
 
     try w.begin();
+    // `batch_open` tracks whether a transaction is actually open, so the errdefer only rolls back
+    // when there is something to roll back. It is cleared the instant a commit succeeds and re-set
+    // the instant the next begin succeeds — so a `begin` that fails after a successful `commit`
+    // leaves it false, and the errdefer does NOT attempt a spurious rollback on a closed txn.
     var batch_open = true;
     errdefer if (batch_open) {
         w.rollback() catch |e| std.log.err("import: rollback of the in-flight batch failed: {s}", .{@errorName(e)});
@@ -284,8 +288,10 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
 
         if (in_batch >= opts.batch_size) {
             try w.commit();
+            batch_open = false; // txn closed; if the begin below fails, errdefer must NOT roll back
             in_batch = 0;
             try w.begin();
+            batch_open = true;
         }
     }
 
@@ -385,6 +391,35 @@ test "import: batch boundary smaller than row count commits every batch" {
     defer st.finalize();
     _ = try st.step();
     try std.testing.expectEqual(@as(i64, 5), st.columnInt(0));
+}
+
+test "import: batch_size=1 commits every row (commit/begin cycle bookkeeping)" {
+    // batch_size=1 hits the commit-then-begin boundary after EVERY row, exercising the
+    // `batch_open` flag flip (clear-after-commit, set-after-begin) on every iteration. All
+    // rows must still persist and the final commit must leave no open transaction dangling.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+
+    const ndjson =
+        \\{"title":"1","slug":"b1"}
+        \\{"title":"2","slug":"b2"}
+        \\{"title":"3","slug":"b3"}
+    ;
+    const rep = try runNdjson(&app, &d, io, ndjson, .{ .collection = "posts", .batch_size = 1 });
+    try std.testing.expectEqual(@as(usize, 3), rep.created);
+    try std.testing.expectEqual(@as(usize, 3), rep.total);
+    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 3), st.columnInt(0));
+    // A subsequent write must succeed — proving no transaction was left open by the import.
+    _ = try runNdjson(&app, &d, io, "{\"title\":\"4\",\"slug\":\"b4\"}", .{ .collection = "posts", .batch_size = 1 });
 }
 
 test "import: id preservation on vs off" {
