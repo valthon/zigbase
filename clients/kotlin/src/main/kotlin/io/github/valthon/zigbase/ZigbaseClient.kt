@@ -5,6 +5,9 @@ import io.github.valthon.zigbase.auth.MemoryAuthStore
 import io.github.valthon.zigbase.internal.RequestSpec
 import io.github.valthon.zigbase.internal.Transport
 import io.github.valthon.zigbase.internal.ensureObjectBody
+import io.github.valthon.zigbase.realtime.KtorWebSocketConnector
+import io.github.valthon.zigbase.realtime.RealtimeConnection
+import io.github.valthon.zigbase.realtime.RealtimeService
 import io.ktor.client.HttpClient
 import io.ktor.client.statement.HttpResponse
 import io.ktor.http.HttpMethod
@@ -66,6 +69,7 @@ class ZigbaseClient(
     lang: String? = null,
     maxRetries: Int = 3,
     httpClient: HttpClient? = null,
+    onRealtimeError: ((String) -> Unit)? = null,
 ) : AutoCloseable {
     /** The normalized base URL (no trailing slash). */
     val baseUrl: String = normalizeBaseUrl(baseUrl)
@@ -77,6 +81,7 @@ class ZigbaseClient(
     private val authCollection = authCollection
     private val lang = lang
     private val maxRetries = maxRetries
+    private val onRealtimeError = onRealtimeError
     private val ownsClient = httpClient == null
     private val transport: Transport =
         Transport(
@@ -99,6 +104,55 @@ class ZigbaseClient(
     /** The underlying `HttpClient`, exposed module-internally for test identity assertions. Not part of the public SDK surface. */
     internal val httpClientForTesting: HttpClient
         get() = transport.httpClient
+
+    // Set (only) when `realtime` builds its own default connector -- i.e.
+    // `realtimeConnectorForTesting` was unset at first access -- so `close`
+    // knows there's an owned `HttpClient` to tear down. `@Volatile`: written
+    // once inside `realtimeDelegate`'s synchronized initializer, read from
+    // `close()` on (potentially) a different thread.
+    @Volatile
+    private var realtimeConnectorOwned: KtorWebSocketConnector? = null
+
+    /**
+     * Test-only connector injection point, mirroring [httpClientForTesting]:
+     * `realtimeConnector` cannot be a public constructor parameter (its type
+     * names the internal [RealtimeConnection]), so a test sets this field
+     * BEFORE ever touching [realtime] to swap in a fake connector. `null`
+     * (the default) uses the production ktor-CIO WebSocket connector.
+     */
+    internal var realtimeConnectorForTesting: (suspend (String) -> RealtimeConnection)? = null
+
+    // `LazyThreadSafetyMode.SYNCHRONIZED` (not the unsynchronized pattern the
+    // other lazily-cached services above use): a duplicated [RealtimeService]
+    // on a concurrent-first-access race would leak a whole coroutine scope,
+    // unlike the other services above, which are cheap, stateless wrappers
+    // where a duplicate is harmless. The initializer itself never suspends
+    // (constructing [KtorWebSocketConnector]/[RealtimeService] is plain
+    // object setup), so nothing suspends while this lock is held.
+    private val realtimeDelegate =
+        lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            val injected = realtimeConnectorForTesting
+            val connector: suspend (String) -> RealtimeConnection =
+                if (injected != null) {
+                    injected
+                } else {
+                    val owned = KtorWebSocketConnector()
+                    realtimeConnectorOwned = owned
+                    owned.connect
+                }
+            RealtimeService(baseUrl, transport.authStore, connector, onRealtimeError)
+        }
+
+    /**
+     * Lazily-created, cached [RealtimeService] -- the same instance on every
+     * access. Uses the injected [realtimeConnectorForTesting] connector when
+     * set (test-only); otherwise the production ktor-CIO WebSocket connector,
+     * whose backing `HttpClient` this instance then owns and closes in
+     * [close]. A [withAccount] sibling gets its own, independent instance
+     * (its own scope, its own connection).
+     */
+    val realtime: RealtimeService
+        get() = realtimeDelegate.value
 
     /**
      * A [CollectionService] bound to [name]. Matches `client.ts`/
@@ -170,16 +224,31 @@ class ZigbaseClient(
             lang = lang,
             maxRetries = maxRetries,
             httpClient = transport.httpClient,
-        )
+            onRealtimeError = onRealtimeError,
+        ).also { it.realtimeConnectorForTesting = realtimeConnectorForTesting }
 
     /**
-     * Closes the underlying `HttpClient`, but only if this instance created
-     * it (no `httpClient` was passed in, including every [withAccount]
-     * sibling). Idempotent.
+     * Tears down [realtime] (if it was ever created) before closing the
+     * underlying `HttpClient` -- but only if this instance created it (no
+     * `httpClient` was passed in, including every [withAccount] sibling).
+     * Idempotent.
+     *
+     * [realtime]'s own [RealtimeService.close] is `suspend`; this method
+     * isn't (it overrides `AutoCloseable.close`), so it calls
+     * [RealtimeService.shutdown] instead -- see that method's doc. When
+     * [realtime] built the default connector (no test connector was
+     * injected), the owned [KtorWebSocketConnector] is closed right after:
+     * that's what actually severs the live WebSocket connection for the
+     * production path (an injected fake connector, by contrast, owns no
+     * resource of its own to close here).
      */
     override fun close() {
         if (closed) return
         closed = true
+        if (realtimeDelegate.isInitialized()) {
+            realtimeDelegate.value.shutdown()
+            realtimeConnectorOwned?.close()
+        }
         if (ownsClient) transport.close()
     }
 }

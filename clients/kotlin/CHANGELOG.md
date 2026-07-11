@@ -44,6 +44,14 @@ coroutines-first, `suspend fun` API (JDK 17+).
 - **Senders.** `SendersService.list`/`create`/`verify` for verified From-address management.
 - **Files.** `FilesService.getUrl`/`getUrlFor`/`getToken`; `create`/`update` bodies
   auto-switch to `multipart/form-data` when they contain a `FileArg`.
+- **Realtime.** `RealtimeService` (`zb.realtime`): ack-gated `subscribe`/`subscribeTopic`
+  (both return an unsubscribe function), `stream()`/`streamTopic()` cold `Flow`s, custom
+  broadcast topics (`signal`/`message`), automatic re-auth from `authStore` on
+  login/logout/refresh, and bounded-exponential-backoff reconnection with full resubscribe.
+  Ships on the bundled ktor WebSocket connector (`ktor-client-websockets` + CIO) — no extra
+  dependency needed. The service owns its own `CoroutineScope`, a deliberate divergence from
+  the Python/TypeScript/Dart ports; `zb.close()` tears it down before the underlying
+  `HttpClient`.
 - **Escape hatch.** `send()` (parsed JSON, auth/retry/error-mapping applied) and
   `rawRequest()` (the raw Ktor `HttpResponse`, no parsing or error mapping) for any endpoint
   the typed surface doesn't cover.
@@ -53,8 +61,6 @@ coroutines-first, `suspend fun` API (JDK 17+).
 
 ### Known limitations
 
-- **No realtime tier yet.** WebSocket subscriptions and the live-store
-  (`LiveRecord`/`LiveList`) observables ship in a follow-up SDK milestone (KSP2).
 - **No typed codegen tier yet.** The generated-schema client (typed record models, an
   injection-safe fluent filter builder, typed collection services) that the Python/Dart SDKs
   ship follows in a later milestone (KSP3).
