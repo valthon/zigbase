@@ -1081,19 +1081,32 @@ class RealtimeService internal constructor(
                 reconnectAttempts += 1
                 computed
             }
+        var delayElapsed = false
         try {
             try {
                 delayFn(delayMs)
+                delayElapsed = true
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                // A misbehaving injected delay is treated as elapsed (reported
+                // via onError, the backoff simply counted as done) rather than
+                // wedging every future reconnect attempt.
                 onError(e.message ?: e.toString())
+                delayElapsed = true
             }
         } finally {
             withContext(NonCancellable) {
                 mutex.withLock {
                     reconnectPending = false
-                    connecting = true
+                    // Only hand `connecting` on to the [connectOnce] call below
+                    // when the backoff actually elapsed. If this coroutine was
+                    // cancelled DURING `delayFn` (close() cancelling the scope
+                    // mid-backoff -- the common cancellation point), the
+                    // CancellationException propagates past the `if (closedByUser)`
+                    // block below, so `connectOnce` never runs; leaving
+                    // `connecting = true` here would then wedge it `true` forever.
+                    connecting = delayElapsed
                 }
             }
         }

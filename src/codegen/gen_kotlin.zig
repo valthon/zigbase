@@ -32,6 +32,32 @@ const W = std.ArrayList(u8);
 /// by hand (mirrors gen_python.zig's own TYPED_CORE_VERSION constant).
 const TYPED_CORE_VERSION = "0.1.0";
 
+/// Validates a `--package` value: a non-empty, dot-separated sequence of Kotlin
+/// identifier segments (each segment starts with a letter or `_`, then
+/// letters/digits/`_`). The value is emitted verbatim into the generated
+/// `package` line, so anything else — newlines, `;`, `{`, quotes — would inject
+/// arbitrary source into the output. Rejects leading/trailing/consecutive dots
+/// and digit-leading segments too.
+fn validatePackageName(name: []const u8) !void {
+    if (name.len == 0) return error.EmptyPackageName;
+    var seg_start = true;
+    for (name) |c| {
+        if (c == '.') {
+            if (seg_start) return error.InvalidPackageName;
+            seg_start = true;
+            continue;
+        }
+        const ok = switch (c) {
+            'a'...'z', 'A'...'Z', '_' => true,
+            '0'...'9' => !seg_start,
+            else => false,
+        };
+        if (!ok) return error.InvalidPackageName;
+        seg_start = false;
+    }
+    if (seg_start) return error.InvalidPackageName;
+}
+
 /// The pure Kotlin generator core: collections -> full file text.
 ///
 /// Signature mirrors gen_python.generate/gen_dart.generate so the CLI/build
@@ -67,6 +93,11 @@ pub fn generate(
     _ = experiments;
     _ = in_repo;
     _ = api_prefix;
+
+    // `package_name` is interpolated straight into the generated `package`
+    // line, so a value with newlines/braces/semicolons would inject arbitrary
+    // source into the output — validate it is a well-formed dotted identifier.
+    try validatePackageName(package_name);
 
     var report = guards.GuardReport{ .message = "" };
     try guards.checkOperatorNames(alloc, cols, &report);
@@ -479,4 +510,31 @@ test "generate emits the caller-supplied package name, overriding the dating def
 
     try std.testing.expect(std.mem.indexOf(u8, out, "package com.example.app") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "package io.github.valthon.zigbase.codegen.dating") == null);
+}
+
+test "generate rejects an empty or injection-y --package value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "posts", .fields = &.{
+            .{ .id = "", .name = "title", .options = .{ .text = .{} } },
+        } },
+    };
+    const gen = struct {
+        fn call(al: std.mem.Allocator, c: []const schema.Collection, pkg: []const u8) ![]const u8 {
+            return generate(al, c, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api", pkg);
+        }
+    }.call;
+    try std.testing.expectError(error.EmptyPackageName, gen(a, &cols, ""));
+    // Injection vectors: semicolon, newline+code, braces/quotes.
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "com.example;evil"));
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "com.example\npublic fun x() {}"));
+    // Malformed dotted identifiers.
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, ".leading"));
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "trailing."));
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "a..b"));
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "1abc.def"));
+    // A well-formed package still generates.
+    _ = try gen(a, &cols, "com.example.app_2");
 }
