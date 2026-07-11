@@ -445,6 +445,23 @@ fn auditSweepJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void 
     const published_count: i64 = if (rows.len > 0) rows[0].n else 0;
     std.log.info("[audit-sweep] published_posts={d}", .{published_count});
 
+    // The typed SELECT builder (#281, option 2) is the "constructed SQL" counterpart to the
+    // hand-written `checkedSql` above: `zigbase.Query.select` VALIDATES every table/column against
+    // `Backend.collections` at comptime and EMITS the SQL + positional binds, so a typo'd column
+    // (`.col = "titel"`) or table is a build error, and the `?N` binds are positional by
+    // construction. `RecentPosts.sql` here is
+    //   SELECT "id", "title" FROM "posts" WHERE "status" = ?1 ORDER BY "created" DESC LIMIT 5
+    // and `RecentPosts.bind_count == 1`, matching the single-element `.{ "published" }` tuple.
+    const PostRow = struct { id: []const u8, title: []const u8 };
+    const RecentPosts = zigbase.Query.select(Backend.collections, "posts", .{
+        .columns = &.{ "id", "title" },
+        .where = &.{.{ .col = "status", .op = .eq }},
+        .order = &.{.{ .col = "created", .dir = .desc }},
+        .limit = 5,
+    });
+    const recent = try ctx.records().queryAs(PostRow, RecentPosts.sql, .{"published"});
+    if (recent.len > 0) std.log.info("[audit-sweep] most-recent published post: {s}", .{recent[0].title});
+
     // `plugin_audit_log` is a migration-owned table (not a comptime collection), so it
     // is written with raw SQL on the pooled writer rather than via `ctx.records()`. It is
     // unknown to the schema, so the comptime check needs `.extra_tables` to opt it in --

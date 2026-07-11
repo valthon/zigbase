@@ -197,6 +197,14 @@ pub const checkedSql = @import("sql/schema_check.zig").checkedSql;
 pub const checkSqlOpts = @import("sql/schema_check.zig").checkSqlOpts;
 pub const SqlCheckOptions = @import("sql/schema_check.zig").SqlCheckOptions;
 
+/// Typed single-table SELECT builder (#281, option 2). `Query.select(App(cfg).collections,
+/// "table", .{ .columns, .where, .order, .limit, .offset, .distinct })` returns a type whose
+/// `.sql` is a comptime-validated `[:0]const u8` (`?N`-parameterized) and whose `.bind_count`
+/// is the number of positional binds — feed both to `queryAs`/`prepare`. Unknown table/column
+/// is a build error. SELECT-only, single-table in v1 (joins/writes/`in` are future). See
+/// docs/framework.md. Namespaced under `Query` to keep `select`/`Op`/`Dir` off the root.
+pub const Query = @import("sql/query_builder.zig");
+
 // ---- General outbound HTTP client -----------------------------------------
 // HttpMethod/HttpHeader use the Http-prefix to avoid collision with http.zig's
 // Method/Header enums (which are already accessible via `zigbase.http.Method`).
@@ -361,7 +369,9 @@ test {
     _ = @import("files/serve_file.zig");
     _ = @import("files/config.zig");
     _ = @import("data.zig");
+    _ = @import("sql/schema_ident.zig");
     _ = @import("sql/schema_check.zig");
+    _ = @import("sql/query_builder.zig");
     _ = @import("events.zig");
     _ = @import("report/reporter.zig");
     _ = @import("report/log.zig");

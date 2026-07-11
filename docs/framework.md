@@ -633,6 +633,49 @@ subset and skips anything it cannot confidently classify.
   `FROM (subquery)` bodies. So this catches the common typo classes, not every possible mistake —
   it is a strict-tables / best-effort-columns net, not a full SQL type-checker.
 
+#### Typed SELECT builder — `Query.select`
+
+Where `checkedSql` validates SQL you *hand-wrote*, **`zigbase.Query.select`** *constructs* it from a
+config struct — validating every table and column against the schema as it builds, and **emitting**
+a validated `[:0]const u8` plus positional binds. It does not execute or decode; the output feeds
+the same `queryAs`/`prepare` path:
+
+```zig
+const Backend = zigbase.App(.{ .collections = .{ .orders = .{ ... } } });
+
+const Q = zigbase.Query.select(Backend.collections, "orders", .{
+    .columns = &.{ "id", "total" },
+    .where   = &.{ .{ .col = "total", .op = .gt }, .{ .col = "status", .op = .eq } },
+    .order   = &.{ .{ .col = "created", .dir = .desc } },
+    .limit   = 50,
+});
+// Q.sql        == `SELECT "id", "total" FROM "orders" WHERE "total" > ?1 AND "status" = ?2 ORDER BY "created" DESC LIMIT 50`
+// Q.bind_count == 2
+const rows = try ctx.records().queryAs(OrderRow, Q.sql, .{ min_total, "open" });
+```
+
+`select(cols, table, spec)` returns a type exposing `pub const sql: [:0]const u8` (the validated,
+`?N`-parameterized string) and `pub const bind_count: usize` (== `spec.where.len`). `SelectSpec`:
+
+- `columns: []const []const u8` — projected columns; **empty ⇒ `SELECT *`**. Use an explicit list
+  when you decode into a struct so the projection is stable.
+- `where: []const Cond` — `{ col, op }` conditions, ANDed. Each binds one placeholder `?1..?N` in
+  slice order (so binds are **positional by construction** — the tuple you pass to `queryAs` lines
+  up left-to-right). `Op` is `eq | ne | lt | le | gt | ge | like`; **all single-bind** (`like`
+  emits `"col" LIKE ?N`).
+- `order: []const OrderBy` — `{ col, dir }` terms (`asc`/`desc`), emitted with an explicit direction.
+- `limit`, `offset` — `offset` is only valid **with** `limit` (SQLite has no bare `OFFSET`); setting
+  it alone is a build error. `distinct` → `SELECT DISTINCT`.
+
+**Compile-time guarantees.** An unknown `table`, or any column (in `columns`/`where`/`order`) that
+isn't a valid column of that collection, is a `@compileError` naming the identifier and listing the
+valid options — the *same* valid-column set as `checkSql` (built-ins `id`/`created`/`updated` + auth
+system columns + your fields). Identifiers are double-quoted in the emitted SQL.
+
+**Scope (v1).** Single-table `SELECT` reads only — **no joins, no writes** (INSERT/UPDATE/DELETE),
+no GROUP BY/aggregates, and **no `in`** (a variadic-bind predicate, deferred as future work). For
+anything past this, drop to hand-written SQL guarded by `checkedSql`.
+
 > **Auth collections:** `ctx.records().create(collection, fields)` on an auth collection runs
 > the same credential transforms as the HTTP layer (generates the per-record `tokenKey`,
 > forces `verified=false`, and hashes `password` if one is supplied). A `password` is
