@@ -900,7 +900,7 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
     else if (want_python)
         gen_python.generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix)
     else if (want_kotlin)
-        gen_kotlin.generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix)
+        gen_kotlin.generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix, "io.github.valthon.zigbase.codegen.dating")
     else
         generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix)) catch |e| {
         // guard messages are printed via the report; re-run path for the message:

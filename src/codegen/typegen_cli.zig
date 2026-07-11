@@ -57,6 +57,11 @@ pub const Options = struct {
     admin_email: ?[]const u8 = null,
     admin_password: ?[]const u8 = null,
     lang: Lang = .ts,
+    /// Kotlin-only: the `package` declaration emitted at the top of the
+    /// generated file. Defaults to the dating fixture's namespace so the
+    /// committed golden and `zig build gen-dating-kotlin-client` stay
+    /// byte-stable; override with `--package` for a real consumer app.
+    kotlin_package: []const u8 = "io.github.valthon.zigbase.codegen.dating",
 };
 
 /// First auth collection's name (mirrors gen_client's private helper; computed
@@ -111,7 +116,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, opts: Options) !void {
         .ts => gen_client.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix),
         .dart => gen_dart.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix),
         .python => gen_python.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix),
-        .kotlin => gen_kotlin.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix),
+        .kotlin => gen_kotlin.generate(alloc, cols, &.{}, &.{}, &.{}, &.{}, opts.in_repo, authCollectionName(cols), opts.client_name, opts.api_prefix, opts.kotlin_package),
     } catch |e| {
         std.log.err("typegen: code generation failed: {s}", .{@errorName(e)});
         return e;
