@@ -67,6 +67,24 @@ pub fn build(b: *std.Build) void {
     // feature and is NOT gated by this flag.
     const fts5 = b.option(bool, "fts5", "Compile SQLite FTS5 full-text search into the binary (default true; -Dfts5=false for lean builds without .searchable fields)") orelse true;
     build_options.addOption(bool, "fts5", fts5);
+
+    // --- Vendored/native component version transparency (#282) ---------------------
+    // Single-source the pinned versions of the vendored/native dependencies at CONFIGURE
+    // time so `--version`, `zig build versions`, the startup log, and `GET /api/health`
+    // can surface exactly what is baked into this binary — with zero runtime cost (each
+    // becomes a build_options string constant). SQLite + sqlite-vec are read straight from
+    // their vendored headers (so a bumped amalgamation flows through automatically). zap is
+    // read from the build.zig.zon pin (version curated, commit parsed from the url); facil.io
+    // ships bundled inside the pinned zap and has no in-tree header, so it is a curated const
+    // tied to the zap pin — bump it when re-pinning zap. See docs/security-advisories.md and
+    // docs/security-audit.md ("Dependency version transparency & supply-chain auditing").
+    build_options.addOption([]const u8, "sqlite_version", readCDefineStr(b, "vendor/sqlite/sqlite3.h", "SQLITE_VERSION"));
+    build_options.addOption([]const u8, "sqlite_source_id", readCDefineStr(b, "vendor/sqlite/sqlite3.h", "SQLITE_SOURCE_ID"));
+    build_options.addOption([]const u8, "sqlite_vec_version", readCDefineStr(b, "vendor/sqlite-vec/sqlite-vec.h", "SQLITE_VEC_VERSION"));
+    build_options.addOption([]const u8, "zap_version", "0.10.6"); // curated: matches the zap pin in build.zig.zon
+    build_options.addOption([]const u8, "zap_commit", zapPinnedCommit());
+    build_options.addOption([]const u8, "facil_version", "0.7.4"); // curated: facil.io bundled inside the pinned zap (bump on zap re-pin)
+
     zigbase_mod.addOptions("build_options", build_options);
 
     zigbase_mod.addIncludePath(b.path("vendor/sqlite"));
@@ -126,6 +144,24 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run zigbase");
     run_step.dependOn(&run_cmd.step);
+
+    // --- versions: print every baked-in component version (#282) ------------------
+    // Runs the freshly-built binary with `--version`, whose enriched output lists
+    // zigbase + commit, SQLite + source id, sqlite-vec, zap + commit, facil.io, and the
+    // Zig compiler. Single command, no drift: the same string the running server reports.
+    const versions_run = b.addRunArtifact(exe);
+    versions_run.addArg("--version");
+    const versions_step = b.step("versions", "Print baked-in component versions (SQLite, sqlite-vec, zap, facil.io, zigbase)");
+    versions_step.dependOn(&versions_run.step);
+
+    // --- audit: compare pinned dep versions against the curated advisory table (#282)
+    // Runs scripts/audit-deps.sh, which reads the pinned versions from vendor/ + the
+    // curated consts and checks them against docs/security-advisories.md. Exits non-zero
+    // if any pinned version falls in a listed affected range.
+    const audit_cmd = b.addSystemCommand(&.{"bash"});
+    audit_cmd.addFileArg(b.path("scripts/audit-deps.sh"));
+    const audit_step = b.step("audit", "Audit pinned dependency versions against docs/security-advisories.md");
+    audit_step.dependOn(&audit_cmd.step);
 
     // --- dating-server: the dating fixture compiled as a runnable server ----------
     // Plan 2: the e2e harness spawns THIS binary so client and server share the exact
@@ -317,6 +353,39 @@ pub fn build(b: *std.Build) void {
     gen_test_step.dependOn(&run_gen_test.step);
     // Wire into the main test_step so `zig build test` also runs the golden assertion.
     test_step.dependOn(&run_gen_test.step);
+}
+
+/// Read a `#define <macro> "value"` string constant out of a vendored C header at
+/// configure time (#282). Single-sources the pinned SQLite / sqlite-vec versions from
+/// the headers themselves so a bumped amalgamation flows through to every version
+/// surface automatically. Panics loudly if the macro or its quoted value is absent, so
+/// a header reshuffle fails the build rather than silently shipping a wrong version.
+fn readCDefineStr(b: *std.Build, rel_path: []const u8, macro: []const u8) []const u8 {
+    const data = b.build_root.handle.readFileAlloc(b.graph.io, rel_path, b.allocator, .unlimited) catch |e|
+        std.debug.panic("version aggregation: cannot read '{s}': {s}", .{ rel_path, @errorName(e) });
+    var it = std.mem.tokenizeScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "#define")) continue;
+        const rest = std.mem.trimStart(u8, trimmed["#define".len..], " \t");
+        if (!std.mem.startsWith(u8, rest, macro)) continue;
+        // Require the token to be exactly `macro` (the next char must be whitespace),
+        // so SQLITE_VERSION doesn't match SQLITE_VERSION_NUMBER.
+        const after = rest[macro.len..];
+        if (after.len == 0 or (after[0] != ' ' and after[0] != '\t')) continue;
+        const q1 = std.mem.indexOfScalar(u8, after, '"') orelse continue;
+        const q2 = std.mem.indexOfScalarPos(u8, after, q1 + 1, '"') orelse continue;
+        return b.allocator.dupe(u8, after[q1 + 1 .. q2]) catch @panic("OOM");
+    }
+    std.debug.panic("version aggregation: '#define {s} \"...\"' not found in '{s}'", .{ macro, rel_path });
+}
+
+/// The pinned zap dependency's git commit, parsed from its `build.zig.zon` url
+/// (`git+https://…#<commit>`). "unknown" if the url carries no `#<commit>` fragment.
+fn zapPinnedCommit() []const u8 {
+    const url = @import("build.zig.zon").dependencies.zap.url;
+    const hash = std.mem.indexOfScalar(u8, url, '#') orelse return "unknown";
+    return url[hash + 1 ..];
 }
 
 /// Capture the short git commit at configure time; "unknown" outside a repo.
