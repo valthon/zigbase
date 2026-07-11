@@ -569,6 +569,70 @@ Get a `conn` for the free function from `ctx.connForRead()` (a pooled reader) or
 `ctx.app.pool.acquireWriter()` (for a raw write); inside a `ctx.tx` / `before*` hook the
 `ctx.records().queryAs` wrapper binds the active transaction connection automatically.
 
+#### Comptime-checked raw SQL — `checkSql` / `checkedSql`
+
+Raw SQL (`queryAs`, `conn.prepare(...)`) names tables and columns as bare strings, so a typo —
+`FROM postts`, `p.stauts` — is invisible until the query runs. `zigbase.checkedSql` /
+`zigbase.checkSql` close that gap: they validate the identifiers in a SQL string against your
+comptime `.collections` schema and **fail the build** on an unknown table or a mistyped qualified
+column, with a message naming the offending identifier and the valid options.
+
+To reach the lowered schema, **name the App type** (rather than building it inline in `main`) so
+you can pass `Backend.collections`:
+
+```zig
+const Backend = zigbase.App(.{ .collections = .{ .posts = .{ ... }, .orders = .{ ... } } });
+
+pub fn main(init: std.process.Init) !void { return Backend.runCli(init); }
+
+fn report(ctx: *zigbase.Ctx) !void {
+    const Row = struct { id: []const u8, title: []const u8 };
+    // checkedSql validates AND returns the string, so it wraps the argument in place:
+    const rows = try ctx.records().queryAs(Row,
+        zigbase.checkedSql(Backend.collections,
+            "SELECT p.id, p.title FROM posts p WHERE p.status = ?1"),
+        .{ "published" });
+    // ...
+}
+```
+
+Three forms are exported:
+
+- `checkSql(cols, sql)` — comptime check only (returns `void`); use it as a `comptime` statement.
+- `checkedSql(cols, sql) [:0]const u8` — checks then **returns `sql`**, so you can wrap the exact
+  string handed to `queryAs`/`prepare`.
+- `checkSqlOpts(cols, sql, opts)` — the same check with `SqlCheckOptions`:
+  - `extra_tables: []const []const u8` — tables that legitimately appear in raw SQL but are **not**
+    comptime collections: engine internals (`_kv`, `_events`, `_sessions`, `_queue_jobs`) and
+    **migration-owned** tables (a table your own `.migrations` created). List them here so they
+    count as known instead of being flagged.
+  - `check_columns: bool = true` — disable qualified-column checking (tables are always checked).
+
+```zig
+// A migration-owned table opted into the known set:
+comptime zigbase.checkSqlOpts(Backend.collections,
+    "INSERT INTO plugin_audit_log(note) VALUES('x')",
+    .{ .extra_tables = &.{"plugin_audit_log"} });
+```
+
+**What is validated (and what is not) — by design.** The overriding rule is **zero false positives**:
+a checker that rejects valid SQL gets deleted, so it validates only a narrow, high-confidence
+subset and skips anything it cannot confidently classify.
+
+- **Tables are checked strictly** — the name after `FROM` / `JOIN` / `INTO` / `UPDATE`. Known =
+  your collection names ∪ `<collection>_fts` (for a `.searchable` collection's shadow table) ∪ CTE
+  names (`WITH x AS (...)`) ∪ `extra_tables`. A subquery `FROM (SELECT ...)` is never treated as a
+  table.
+- **Qualified columns are best-effort** — `alias.column` / `table.column` is checked **only** when
+  the qualifier resolves to a known collection (via the `FROM`/`JOIN` alias map). The valid-column
+  set is `id, created, updated` + your fields, plus the auth system columns (`email`, `username`,
+  `passwordHash`, `tokenKey`, `verified`, `token_epoch`) for an `auth` collection. `view`
+  collections are not column-checked.
+- **Never checked** (to avoid false errors): unqualified columns, function names, computed `AS`
+  aliases, `alias.*`, expression tokens, and the contents of string literals, comments, and
+  `FROM (subquery)` bodies. So this catches the common typo classes, not every possible mistake —
+  it is a strict-tables / best-effort-columns net, not a full SQL type-checker.
+
 > **Auth collections:** `ctx.records().create(collection, fields)` on an auth collection runs
 > the same credential transforms as the HTTP layer (generates the per-record `tokenKey`,
 > forces `verified=false`, and hashes `password` if one is supplied). A `password` is
