@@ -17,7 +17,7 @@
 #      The script only uses `Component` and `Min safe version`; a `Min safe version` of `-`
 #      is an informational row and is skipped.
 #   3. For every actionable row, flags the dependency as AFFECTED if its pinned version is
-#      STRICTLY BELOW the row's `Min safe version` (semver compare via `sort -V`).
+#      STRICTLY BELOW the row's `Min safe version` (pure-bash dotted-numeric compare).
 #
 # Exit status: 0 if all pins are clear; 1 if any pinned version is in a listed affected range;
 # 2 on a usage/parse/setup error. Version comparison strips a leading `v`.
@@ -25,7 +25,7 @@
 # Assumptions (kept deliberately simple/robust):
 #   - The advisory table is a GitHub-flavored Markdown pipe table; data rows start with `|`.
 #   - Component names in the table match the labels above (case-insensitive).
-#   - Versions are dotted numeric semver-ish strings comparable with `sort -V`.
+#   - Versions are dotted-numeric semver-ish strings (compared segment-by-segment in pure bash).
 set -euo pipefail
 
 # Resolve repo root from this script's location so it works regardless of CWD.
@@ -59,12 +59,28 @@ read_define() {
 # Strip a leading 'v' for comparison (sqlite-vec tags are like v0.1.6).
 norm() { printf '%s' "${1#v}"; }
 
-# True (0) if $1 < $2 as semver (sort -V). Equal or greater → false (1).
+# True (0) if $1 < $2 as a dotted-numeric version, false (1) otherwise.
+#
+# Pure bash — NO `sort -V`, which is a GNU coreutils extension not available on macOS/BSD
+# `sort` (zigbase supports macOS). Compares segment by segment: each segment is coerced to
+# its leading numeric value (a trailing non-numeric suffix like "6-rc" -> 6 is stripped, an
+# empty/absent segment is treated as 0), so versions with unequal segment counts still
+# compare correctly. bash-3.2-compatible (macOS default bash): plain arrays + `10#` decimal
+# coercion (also stops "08"/"09" from being read as invalid octal). Callers pass values
+# through norm() first to drop any leading 'v'.
 ver_lt() {
   [ "$1" = "$2" ] && return 1
-  local smallest
-  smallest="$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)"
-  [ "$smallest" = "$1" ]
+  local IFS=.
+  local a=($1) b=($2) i va vb
+  for ((i = 0; i < ${#a[@]} || i < ${#b[@]}; i++)); do
+    va="${a[i]:-0}"; vb="${b[i]:-0}"
+    va="${va%%[^0-9]*}"; vb="${vb%%[^0-9]*}"   # keep leading numeric prefix only
+    va="${va:-0}"; vb="${vb:-0}"               # empty (pure-suffix) segment -> 0
+    if ((10#$va < 10#$vb)); then return 0
+    elif ((10#$va > 10#$vb)); then return 1
+    fi
+  done
+  return 1
 }
 
 SQLITE_VERSION="$(read_define "$SQLITE_H" SQLITE_VERSION)"
