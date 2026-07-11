@@ -428,26 +428,53 @@ fn beforeCreateComment(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!voi
 // ---------------------------------------------------------------------------
 fn auditSweepJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     _ = ev;
-    // Collection reads go through the ctx capability object (pooled reader managed
-    // for us); the framework releases the connection when the job's ctx is torn down.
-    const result = try ctx.records().list("posts", .{
-        .filter = "status = \"published\"",
-        .perPage = 1,
-    });
-    const published_count = result.totalItems orelse 0;
+    // Complex read via raw SQL, comptime-checked against the schema (#281). `zigbase.checkedSql`
+    // validates the raw-SQL table / qualified-column identifiers against `Backend.collections`
+    // and returns the string unchanged -- so a typo (`FROM postts`, `p.titel`, `p.stauts`) fails
+    // the BUILD with a message naming the bad identifier, instead of erroring at runtime. The
+    // pooled reader + invocation arena are managed for us by the ctx capability object.
+    const CountRow = struct { n: i64 };
+    const rows = try ctx.records().queryAs(
+        CountRow,
+        zigbase.checkedSql(
+            Backend.collections,
+            "SELECT count(*) AS n FROM posts p WHERE p.status = ?1",
+        ),
+        .{"published"},
+    );
+    const published_count: i64 = if (rows.len > 0) rows[0].n else 0;
     std.log.info("[audit-sweep] published_posts={d}", .{published_count});
 
+    // The typed SELECT builder (#281, option 2) is the "constructed SQL" counterpart to the
+    // hand-written `checkedSql` above: `zigbase.Query.select` VALIDATES every table/column against
+    // `Backend.collections` at comptime and EMITS the SQL + positional binds, so a typo'd column
+    // (`.col = "titel"`) or table is a build error, and the `?N` binds are positional by
+    // construction. `RecentPosts.sql` here is
+    //   SELECT "id", "title" FROM "posts" WHERE "status" = ?1 ORDER BY "created" DESC LIMIT 5
+    // and `RecentPosts.bind_count == 1`, matching the single-element `.{ "published" }` tuple.
+    const PostRow = struct { id: []const u8, title: []const u8 };
+    const RecentPosts = zigbase.Query.select(Backend.collections, "posts", .{
+        .columns = &.{ "id", "title" },
+        .where = &.{.{ .col = "status", .op = .eq }},
+        .order = &.{.{ .col = "created", .dir = .desc }},
+        .limit = 5,
+    });
+    const recent = try ctx.records().queryAs(PostRow, RecentPosts.sql, .{"published"});
+    if (recent.len > 0) std.log.info("[audit-sweep] most-recent published post: {s}", .{recent[0].title});
+
     // `plugin_audit_log` is a migration-owned table (not a comptime collection), so it
-    // is written with raw SQL on the pooled writer rather than via `ctx.records()`.
+    // is written with raw SQL on the pooled writer rather than via `ctx.records()`. It is
+    // unknown to the schema, so the comptime check needs `.extra_tables` to opt it in --
+    // the motivating case for that option. (The `{d}` lives inside a '...' string literal,
+    // which the checker skips, so the format string checks cleanly.)
+    const insert_fmt = "INSERT INTO plugin_audit_log(note) VALUES('sweep: published_posts={d}');";
+    comptime zigbase.checkSqlOpts(Backend.collections, insert_fmt, .{ .extra_tables = &.{"plugin_audit_log"} });
+
     const w = ctx.app.pool.acquireWriter();
     defer ctx.app.pool.releaseWriter();
 
     var buf: [256]u8 = undefined;
-    const insert_sql = std.fmt.bufPrintZ(
-        &buf,
-        "INSERT INTO plugin_audit_log(note) VALUES('sweep: published_posts={d}');",
-        .{published_count},
-    ) catch return;
+    const insert_sql = std.fmt.bufPrintZ(&buf, insert_fmt, .{published_count}) catch return;
     w.exec(insert_sql) catch |e| {
         std.log.warn("[audit-sweep] audit insert failed: {s}", .{@errorName(e)});
     };
@@ -508,8 +535,10 @@ fn addAuditNoteIndex(m: *zigbase.Migrator) anyerror!void {
 // the auth handler, the record hooks, the cron job, and the pool levers, then
 // `runCli` exposes `serve` / `migrate` / `help`.
 // ---------------------------------------------------------------------------
-pub fn main(init: std.process.Init) !void {
-    return zigbase.App(.{
+// The App type is named `Backend` (rather than built inline in `main`) so its lowered comptime
+// schema is reachable as `Backend.collections` -- which the audit-sweep job passes to
+// `zigbase.checkedSql` / `checkSqlOpts` (#281) to comptime-check its raw SQL against the schema.
+const Backend = zigbase.App(.{
         // 1. Custom storage plugin -- wraps LocalStorage with audit logging.
         .storage = AuditStorage,
 
@@ -673,5 +702,8 @@ pub fn main(init: std.process.Init) !void {
         .static_routes = &.{
             .{ .match = "/app/**", .serve = "/index.html" },
         },
-    }).runCli(init);
+});
+
+pub fn main(init: std.process.Init) !void {
+    return Backend.runCli(init);
 }
