@@ -872,6 +872,16 @@ class RealtimeService internal constructor(
                     if (!success && adopted && activeConnection === conn) {
                         activeConnection = null
                         opened = false
+                        // Roll back the receive-loop handle too, so an
+                        // unsuccessful connect leaves no dangling `receiveJob`
+                        // beside a null `activeConnection`: receiveLoop's own
+                        // finally will NOT clear it (it gates on
+                        // `activeConnection === conn`, already false after the
+                        // null-out just above). The launched loop still
+                        // terminates on its own once `conn.close()` (below) ends
+                        // `conn.incoming`; this only keeps the tracked handle
+                        // consistent with the rolled-back connection state.
+                        receiveJob = null
                     }
                 }
                 // Close the socket on ANY unsuccessful exit -- not just the
