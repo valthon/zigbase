@@ -67,8 +67,22 @@ pub const TypegenArgs = struct {
     lang: []const u8 = "ts",
 };
 
+/// `import`: offline, encryption-aware bulk NDJSON record import (issue #283). Streams a
+/// file (or stdin when the path is `-`) through the record engine into an existing collection.
+pub const ImportArgs = struct {
+    data_dir: ?[]const u8 = null,
+    /// Target collection (required).
+    collection: ?[]const u8 = null,
+    /// Optional upsert-by-field: match each row on this field, UPDATE if present else create.
+    upsert_key: ?[]const u8 = null,
+    /// Rows per transaction (default 500; must be >= 1).
+    batch_size: usize = 500,
+    /// Positional NDJSON file path (required); `-` reads stdin.
+    file: ?[]const u8 = null,
+};
+
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen };
+pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -83,6 +97,7 @@ pub const Command = union(enum) {
     migrate_db: MigrateDbArgs,
     /// `vapid-keygen` -> generate a fresh VAPID (Web Push) keypair, print it, and exit.
     vapid_keygen: void,
+    import: ImportArgs,
 };
 
 /// True when an arg is a help flag (`--help` or `-h`).
@@ -180,6 +195,38 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             return ParseError.UnknownFlag;
         }
         return .{ .vapid_keygen = {} };
+    }
+    if (std.mem.eql(u8, args[0], "import")) {
+        var ia = ImportArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .import };
+            } else if (std.mem.eql(u8, a, "--data-dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.data_dir = args[i];
+            } else if (std.mem.eql(u8, a, "--collection")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.collection = args[i];
+            } else if (std.mem.eql(u8, a, "--upsert-key")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.upsert_key = args[i];
+            } else if (std.mem.eql(u8, a, "--batch-size")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.batch_size = std.fmt.parseInt(usize, args[i], 10) catch return ParseError.BadValue;
+                if (ia.batch_size == 0) return ParseError.BadValue;
+            } else if (std.mem.eql(u8, a, "-") or !std.mem.startsWith(u8, a, "-")) {
+                // Positional NDJSON file path (`-` = stdin). Only one is allowed.
+                if (ia.file != null) return ParseError.BadValue;
+                ia.file = a;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .import = ia };
     }
     if (std.mem.eql(u8, args[0], "rewrap")) {
         var ra = RewrapArgs{};
@@ -464,6 +511,39 @@ test "vapid-keygen parses and routes --help to its topic" {
     try std.testing.expectEqual(.vapid_keygen, std.meta.activeTag(try parse(&.{"vapid-keygen"}, .{})));
     try std.testing.expectEqual(HelpTopic.vapid_keygen, (try parse(&.{ "vapid-keygen", "--help" }, .{})).help);
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "vapid-keygen", "--nope" }, .{}));
+}
+
+test "import parses positional file + flags" {
+    const cmd = try parse(&.{ "import", "--collection", "posts", "--data-dir", "/tmp/zb", "--upsert-key", "slug", "--batch-size", "100", "seed.ndjson" }, .{});
+    try std.testing.expect(std.meta.activeTag(cmd) == .import);
+    try std.testing.expectEqualStrings("posts", cmd.import.collection.?);
+    try std.testing.expectEqualStrings("/tmp/zb", cmd.import.data_dir.?);
+    try std.testing.expectEqualStrings("slug", cmd.import.upsert_key.?);
+    try std.testing.expectEqual(@as(usize, 100), cmd.import.batch_size);
+    try std.testing.expectEqualStrings("seed.ndjson", cmd.import.file.?);
+}
+
+test "import default batch size is 500 and file precedes flags" {
+    const cmd = try parse(&.{ "import", "data.ndjson", "--collection", "c" }, .{});
+    try std.testing.expectEqualStrings("data.ndjson", cmd.import.file.?);
+    try std.testing.expectEqual(@as(usize, 500), cmd.import.batch_size);
+}
+
+test "import reads stdin via '-'" {
+    const cmd = try parse(&.{ "import", "--collection", "c", "-" }, .{});
+    try std.testing.expectEqualStrings("-", cmd.import.file.?);
+}
+
+test "import --help routes to its help topic" {
+    try std.testing.expectEqual(HelpTopic.import, (try parse(&.{ "import", "--help" }, .{})).help);
+}
+
+test "import rejects unknown flags, missing values, bad + zero batch size, and a second positional" {
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "import", "--nope" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "import", "--collection" }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--batch-size", "abc", "f" }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--batch-size", "0", "f" }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "a.ndjson", "b.ndjson" }, .{}));
 }
 
 test "unknown command errors" {

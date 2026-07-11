@@ -3534,6 +3534,76 @@ generated output, not authoritative configuration.
 > cleanly, but a hand-rolled schema using `serial`/`enum`/extension columns or those SQLite objects
 > may not re-run into a bare database.
 
+#### Offline bulk import (`zigbase import`)
+
+`zigbase import` bulk-loads records from an **NDJSON** file (one JSON object per line) into a
+collection **offline — the HTTP server is not running** — yet routes every row **through the
+record engine**, so a hand-written `INSERT` never bypasses validation or the encryption
+envelope again:
+
+```sh
+# Import into an existing collection (created via .collections or the admin UI).
+zigbase import --collection posts --data-dir ./zb_data seed.ndjson
+
+# Idempotent re-import: match each row on a (recommended-unique) field and UPDATE it if present.
+zigbase import --collection users --upsert-key email --data-dir ./zb_data users.ndjson
+
+# Read NDJSON from stdin with a file path of `-`.
+cat dump.ndjson | zigbase import --collection posts --data-dir ./zb_data -
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--collection NAME` | Target collection (required). Must already exist. |
+| `--upsert-key FIELD` | Match each row on `FIELD`; UPDATE if present, else create. `FIELD` must be a scalar, **non-encrypted**, existing field; a unique constraint is recommended (a non-unique key logs a warning). |
+| `--batch-size N` | Rows per transaction (default `500`; must be ≥ 1). |
+| `--data-dir PATH` | Data directory (also `ZIGBASE_DATA_DIR`, default `./zb_data`). |
+| `<file.ndjson>` | Positional NDJSON path; `-` reads stdin. |
+
+**Through-engine guarantees.** Import performs the SAME full boot as `serve` (minus the socket):
+system migrations run, your comptime `.collections` are provisioned (so the target collection is
+guaranteed to exist), and the `.encrypted` field cipher is stamped onto the writer connection.
+Each row therefore gets: **field validation** and **required checks**, **autodate defaults**
+(`created`/`updated`), the **`.encrypted` at-rest envelope** (the same `ZIGBASE_FIELD_KEY` is
+required — plaintext is never written, and a missing key fails closed), and, for an **auth**
+collection, the credential transforms (**password hashing**, `tokenKey` generation,
+`verified=false` — a client-supplied `verified` is never trusted).
+
+**Streaming + batching + fail-fast.** Lines are read one at a time (the whole file is never
+slurped; a single record line must fit a 1 MiB buffer). Rows commit in batches of `--batch-size`.
+A bad row — malformed JSON, a validation failure, or a duplicate id — **fails fast**: the
+in-flight (uncommitted) batch is rolled back and the error names the offending 1-based line.
+Batches committed **before** the failure persist, so a large import that trips near the end is a
+resumable checkpoint (fix the file and re-run, ideally with `--upsert-key`). Blank lines are
+skipped. On completion it logs `created`, `updated`, and `total` counts.
+
+**Id preservation (import-only).** By default each row's own `id` is **preserved** — essential
+for migrations, because relations reference records by id and an exported dataset must keep those
+ids intact. Seed the referenced rows (owners) first, then the rows that reference them. This
+id-honoring behavior is reachable **only** from import: the HTTP / custom-route / hook create
+path always generates a fresh id and **ignores** any client-supplied `id`, so a client can never
+choose a record's id. (An imported id is sanity-checked — non-empty, ≤ 255 printable non-space
+bytes — and binds as a parameter, never interpolated.)
+
+**Library entrypoint.** The same engine is exposed as `zigbase.Import` for a small consumer
+migration/seed binary that wants to load data programmatically:
+
+```zig
+const zigbase = @import("zigbase");
+// ... obtain a booted App + writer (e.g. inside a custom CLI) ...
+var reader = std.Io.Reader.fixed(ndjson_bytes); // or a file/stdin reader
+const report = try zigbase.Import.run(app, writer, io, &reader, .{
+    .collection = "posts",
+    .upsert_key = "slug",   // optional
+    .batch_size = 500,
+    .preserve_ids = true,
+});
+std.log.info("imported {d} ({d} new, {d} updated)", .{ report.total, report.created, report.updated });
+```
+
+See `examples/golfsim/seed/` for a worked seeding example (hosts + the simulators that reference
+them by preserved id).
+
 #### Cross-backend migrations (SQLite **and** Postgres)
 
 The same migration runs on whichever backend the server was started with (SQLite by
