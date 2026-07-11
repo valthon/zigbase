@@ -1,0 +1,600 @@
+//! Offline, encryption-aware bulk record import (issue #283).
+//!
+//! Streams an NDJSON file (one JSON object per line) into a target collection **through the
+//! record engine** — the same create/update path an HTTP request takes — WITHOUT the HTTP
+//! server running. Every row therefore gets: field validation, autodate/required defaults,
+//! the `.encrypted` at-rest envelope (fail-closed if a key is missing), and, for an auth
+//! collection, the credential transforms (password hashing, `tokenKey`, `verified=false`).
+//! This closes the "hand-written SQL bypasses validation + encryption" foot-gun called out
+//! in the issue: the only way in is the engine.
+//!
+//! Design notes:
+//!   - **Streaming.** Lines are read one at a time via a buffered `std.Io.Reader`; the whole
+//!     file is never slurped. A single record line must fit the caller's line buffer.
+//!   - **Batched transactions.** Rows are committed in batches of `batch_size` on the writer
+//!     connection. A bad row (malformed JSON, validation failure, duplicate id) FAILS FAST:
+//!     the current (uncommitted) batch is rolled back and a line-numbered error is returned.
+//!     Batches committed before the failure persist (a resumable checkpoint).
+//!   - **Id preservation.** By default the source record's own `id` is preserved (relations
+//!     across an exported dataset stay intact). This routes through the IMPORT-ONLY
+//!     `records.createInTxnOpts(.{ .allow_provided_id = true })`; the HTTP/route/hook create
+//!     path can never reach it (it uses the plain `create`, which always generates the id).
+//!   - **Upsert.** With `--upsert-key <field>` each row is matched by that field's value and
+//!     UPDATEd if present, else created (idempotent re-import). The key field name and the
+//!     collection name are gated through `schema.isValidIdentifier` before interpolation
+//!     (the SQL-injection chokepoint); the key's value binds as a parameter. An encrypted
+//!     field can never be an upsert key (its ciphertext is non-filterable) — rejected.
+//!
+//! Library entrypoint: `run` (re-exported as `zigbase.Import.run`). The `zigbase import` CLI
+//! subcommand (framework.zig `importImpl`) boots the app offline via `bootApp` and calls it.
+
+const std = @import("std");
+const db = @import("db.zig");
+const schema = @import("schema.zig");
+const collections = @import("collections.zig");
+const records = @import("records.zig");
+const auth = @import("auth.zig");
+const param_sink = @import("sql/param_sink.zig");
+const app_mod = @import("app.zig");
+
+pub const App = app_mod.App;
+
+/// Import options. `preserve_ids` defaults true (see the id-preservation note above).
+pub const Options = struct {
+    /// Target collection name (must already exist; `bootApp` provisions comptime `.collections`).
+    collection: []const u8,
+    /// When set, upsert by this field instead of always inserting. Must be a scalar,
+    /// non-encrypted, existing field; identifier-gated before interpolation.
+    upsert_key: ?[]const u8 = null,
+    /// Rows per transaction. Must be >= 1.
+    batch_size: usize = 500,
+    /// Preserve each row's own `id` when present (relation integrity across a dataset).
+    preserve_ids: bool = true,
+};
+
+/// Row counts reported at completion.
+pub const Report = struct { created: usize = 0, updated: usize = 0, total: usize = 0 };
+
+/// The 1-based line number of the row that caused the most recent `run` failure (0 when the
+/// failure was not row-specific, e.g. a config/collection error). Mirrors `records.last_errors`:
+/// a threadlocal the CLI reads AFTER `run` returns an error, to compose a line-numbered message
+/// (field-level detail on `error.Validation` comes from `records.last_errors`). Keeping the
+/// library free of `.err`-level logging is deliberate — the Zig test runner fails any test that
+/// emits one, so presentation lives at the CLI boundary (`framework.importImpl`).
+pub threadlocal var last_error_line: usize = 0;
+
+/// Backing store + view for a human-readable detail of the most recent `run` failure (e.g. the
+/// failing field on `error.Validation`), captured INSIDE `run` while the engine's arena-owned
+/// `records.last_errors` is still alive — the CLI must NOT dereference `records.last_errors`
+/// after `run` returns (that memory is freed with `run`'s per-row arena). Empty when there is no
+/// extra detail beyond the error name.
+threadlocal var last_error_detail_buf: [256]u8 = undefined;
+pub threadlocal var last_error_detail: []const u8 = "";
+
+const RowOutcome = enum { created, updated };
+
+/// Import errors surfaced by `run` beyond the engine's own `records.RecordError` /
+/// `db.DbError`. On a row-specific failure `last_error_line` is set to the offending 1-based
+/// line before the error is returned; config errors leave it 0. The CLI presents them.
+pub const ImportError = error{
+    InvalidCollectionName,
+    UnknownCollection,
+    InvalidUpsertKey,
+    UnknownUpsertKey,
+    EncryptedUpsertKey,
+    UnsupportedUpsertKeyValue,
+    MalformedJson,
+    RowNotObject,
+    DuplicateId,
+    RowVanishedMidImport,
+    LineTooLong,
+};
+
+/// Renumber `?N` placeholders for the active backend before preparing (SQLite verbatim,
+/// Postgres `$n`) — mirrors the private `prep` helper in records.zig so import statements
+/// work on both backends.
+fn prep(a: std.mem.Allocator, w: *db.Db, sql: [:0]const u8) !db.Stmt {
+    return w.prepare(try param_sink.renumberZ(a, db.dbDialect(w), sql));
+}
+
+fn findField(col: schema.Collection, name: []const u8) ?schema.Field {
+    for (col.fields) |f| if (std.mem.eql(u8, f.name, name)) return f;
+    return null;
+}
+
+/// Best-effort uniqueness check for an upsert key: the field's own `.unique`, or a unique
+/// index over exactly this one field. Used only to WARN (a non-unique key can silently
+/// update the wrong row); never fatal.
+fn fieldLooksUnique(col: schema.Collection, name: []const u8) bool {
+    if (findField(col, name)) |f| if (f.unique) return true;
+    for (col.indexes) |ix| {
+        if (ix.unique and ix.fields.len == 1 and std.mem.eql(u8, ix.fields[0], name)) return true;
+    }
+    return false;
+}
+
+/// Bind a scalar JSON value as the upsert-key lookup parameter. Only scalar shapes are
+/// filterable; a multi-value/object key is rejected (matches the "not filterable" contract).
+fn bindScalar(st: *db.Stmt, idx: c_int, v: std.json.Value) !void {
+    switch (v) {
+        .string => |s| try st.bindText(idx, s),
+        .integer => |n| try st.bindInt(idx, n),
+        .float => |x| try st.bindDouble(idx, x),
+        .bool => |b| try st.bindInt(idx, if (b) 1 else 0),
+        .null => try st.bindNull(idx),
+        else => return ImportError.UnsupportedUpsertKeyValue,
+    }
+}
+
+/// Look up an existing record id by the upsert key's value. Returns null (⇒ create) when the
+/// row omits the key or nothing matches. `col.name` + `key` are identifier-gated by the caller.
+fn findExistingId(a: std.mem.Allocator, w: *db.Db, col: schema.Collection, key: []const u8, data: std.json.Value) !?[]const u8 {
+    const key_val = data.object.get(key) orelse return null;
+    if (key_val == .null) return null;
+    const sql = try std.fmt.allocPrintSentinel(a, "SELECT \"id\" FROM \"{s}\" WHERE \"{s}\"=?1 LIMIT 1;", .{ col.name, key }, 0);
+    var st = try prep(a, w, sql);
+    defer st.finalize();
+    try bindScalar(&st, 1, key_val);
+    if (!try st.step()) return null;
+    return try a.dupe(u8, st.columnText(0));
+}
+
+/// True if `data` carries a non-empty string `id`.
+fn hasProvidedId(data: std.json.Value) ?[]const u8 {
+    if (data.object.get("id")) |idv| {
+        if (idv == .string and idv.string.len > 0) return idv.string;
+    }
+    return null;
+}
+
+/// Create one row through the engine, preserving its id when asked. Auth collections take the
+/// same provisioning path as `Data.create` (password hashing, `tokenKey`, `verified=false`) so
+/// imported accounts are immediately usable — the "awesome" auth-parity choice from the issue.
+fn createRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema.Collection, data: std.json.Value, preserve_ids: bool) !void {
+    const opts = records.CreateOpts{ .allow_provided_id = preserve_ids };
+    if (col.type != .auth) {
+        _ = try records.createInTxnOpts(a, io, w, col, data, opts);
+        return;
+    }
+    // Auth parity: hash password, generate tokenKey, force verified=false. applyProvision
+    // does NOT strip `id`, so a preserved id still flows through to createInTxnOpts. `a` is a
+    // per-row arena, so the duped keys/creds are freed by the arena reset (no freeProvisioned).
+    _ = app; // app reserved for future auth-collection lookups; unused today.
+    const prepped = try auth.applyProvision(io, a, data, col.options.auth.minPasswordLength);
+    _ = try records.createInTxnOpts(a, io, w, col, prepped, opts);
+}
+
+/// Import a single already-parsed JSON object. The caller records the 1-based line on failure.
+fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema.Collection, data: std.json.Value, opts: Options) !RowOutcome {
+    if (opts.upsert_key) |key| {
+        if (try findExistingId(a, w, col, key, data)) |existing_id| {
+            // Update the matched row's provided fields. Note: an auth `password` on UPDATE is
+            // not re-hashed (there is no `password` column) — same as the Data.update path;
+            // credential rotation is not an import-update concern.
+            _ = (try records.updateInTxn(a, w, col, existing_id, data)) orelse
+                // The SELECT saw it a statement ago inside this same txn; a null here would be a
+                // genuine engine inconsistency, not a normal miss.
+                return ImportError.RowVanishedMidImport;
+            return .updated;
+        }
+        // Fall through to create (no existing match).
+    } else if (opts.preserve_ids) {
+        // No upsert key: a provided id that already exists would hit the PK constraint. Detect
+        // it up front for a clean error instead of a raw SQLite constraint failure.
+        if (hasProvidedId(data)) |id| {
+            const sql = try std.fmt.allocPrintSentinel(a, "SELECT 1 FROM \"{s}\" WHERE \"id\"=?1 LIMIT 1;", .{col.name}, 0);
+            var st = try prep(a, w, sql);
+            defer st.finalize();
+            try st.bindText(1, id);
+            if (try st.step()) return ImportError.DuplicateId;
+        }
+    }
+    try createRow(app, w, io, a, col, data, opts.preserve_ids);
+    return .created;
+}
+
+/// Stream NDJSON from `reader` into `opts.collection` on writer `w`. Returns the row counts.
+/// See the file header for the streaming/batch/txn/id/upsert contract.
+pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Options) !Report {
+    std.debug.assert(opts.batch_size >= 1);
+
+    // Resolve the target collection ONCE into a run-lived arena (never per row — that would
+    // leak collections.get's allocations each row and re-hit the DB).
+    var col_arena = std.heap.ArenaAllocator.init(app.allocator);
+    defer col_arena.deinit();
+    const ca = col_arena.allocator();
+
+    last_error_line = 0; // reset; set to the offending 1-based line on a row failure.
+    last_error_detail = "";
+
+    if (!schema.isValidIdentifier(opts.collection)) return ImportError.InvalidCollectionName;
+    const col = (try collections.get(ca, w, opts.collection)) orelse return ImportError.UnknownCollection;
+
+    if (opts.upsert_key) |key| {
+        if (!schema.isValidIdentifier(key)) return ImportError.InvalidUpsertKey;
+        const f = findField(col, key) orelse return ImportError.UnknownUpsertKey;
+        if (f.encrypted) return ImportError.EncryptedUpsertKey;
+        if (!fieldLooksUnique(col, key)) {
+            // Operational heads-up (warn is not counted as a test-failing error log).
+            std.log.warn("import: --upsert-key '{s}' is not backed by a unique constraint; a non-unique key may update the wrong row", .{key});
+        }
+    }
+
+    // Per-row scratch arena, reset (retaining capacity) after each row so memory stays bounded
+    // by the largest single record regardless of file/batch size.
+    var row_arena = std.heap.ArenaAllocator.init(app.allocator);
+    defer row_arena.deinit();
+
+    var report: Report = .{};
+    var line_no: usize = 0;
+    var in_batch: usize = 0;
+
+    try w.begin();
+    var batch_open = true;
+    errdefer if (batch_open) {
+        w.rollback() catch |e| std.log.err("import: rollback of the in-flight batch failed: {s}", .{@errorName(e)});
+    };
+
+    while (true) {
+        const maybe = reader.takeDelimiter('\n') catch |e| switch (e) {
+            error.StreamTooLong => {
+                last_error_line = line_no + 1;
+                return ImportError.LineTooLong;
+            },
+            else => |other| return other, // ReadFailed
+        };
+        const raw = maybe orelse break; // null = EOF
+        line_no += 1;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue; // skip blank lines
+
+        _ = row_arena.reset(.retain_capacity);
+        const a = row_arena.allocator();
+
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, line, .{}) catch {
+            last_error_line = line_no;
+            return ImportError.MalformedJson;
+        };
+        if (parsed != .object) {
+            last_error_line = line_no;
+            return ImportError.RowNotObject;
+        }
+
+        const outcome = importRow(app, w, io, a, col, parsed, opts) catch |e| {
+            last_error_line = line_no;
+            // Capture the failing field detail NOW, while records.last_errors is still valid
+            // (it points into `a` = row_arena, which this function's defer will free).
+            last_error_detail = "";
+            if (e == error.Validation) {
+                if (records.last_errors) |errs| {
+                    if (errs.len > 0) {
+                        const ve = errs[0];
+                        last_error_detail = std.fmt.bufPrint(&last_error_detail_buf, "{s}: {s} ({s})", .{ ve.field, ve.message, ve.code }) catch "";
+                    }
+                }
+            }
+            return e;
+        };
+        switch (outcome) {
+            .created => report.created += 1,
+            .updated => report.updated += 1,
+        }
+        report.total += 1;
+        in_batch += 1;
+
+        if (in_batch >= opts.batch_size) {
+            try w.commit();
+            in_batch = 0;
+            try w.begin();
+        }
+    }
+
+    try w.commit();
+    batch_open = false;
+    return report;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+const migrations = @import("migrations.zig");
+const field_policy = @import("field_policy.zig");
+
+/// Build a minimal App wrapping a pool-less writer for tests (mirrors data.zig's test setup:
+/// only `.allocator` is read by import.run). The connection is passed separately to run().
+fn testApp(alloc: std.mem.Allocator, io: std.Io) App {
+    return App{ .allocator = alloc, .io = io, .pool = undefined };
+}
+
+fn seedPosts(d: *db.Db, a: std.mem.Allocator, io: std.Io) !schema.Collection {
+    try migrations.run(d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "slug", .unique = true, .options = .{ .text = .{} } },
+    };
+    return collections.create(a, io, d, .{ .id = "", .name = "posts", .fields = &fields });
+}
+
+fn runNdjson(app: *App, w: *db.Db, io: std.Io, ndjson: []const u8, opts: Options) !Report {
+    var reader = std.Io.Reader.fixed(ndjson);
+    return run(app, w, io, &reader, opts);
+}
+
+test "import: multi-row NDJSON creates all rows through the engine (defaults applied)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+
+    const ndjson =
+        \\{"title":"first","slug":"a"}
+        \\{"title":"second","slug":"b"}
+        \\{"title":"third","slug":"c"}
+    ;
+    const rep = try runNdjson(&app, &d, io, ndjson, .{ .collection = "posts" });
+    try std.testing.expectEqual(@as(usize, 3), rep.created);
+    try std.testing.expectEqual(@as(usize, 0), rep.updated);
+    try std.testing.expectEqual(@as(usize, 3), rep.total);
+
+    // Rows are actually persisted and carry engine-set created/updated defaults.
+    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 3), st.columnInt(0));
+}
+
+test "import: blank lines are skipped" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+
+    const ndjson = "{\"title\":\"x\",\"slug\":\"x\"}\n\n   \n{\"title\":\"y\",\"slug\":\"y\"}\n";
+    const rep = try runNdjson(&app, &d, io, ndjson, .{ .collection = "posts" });
+    try std.testing.expectEqual(@as(usize, 2), rep.total);
+}
+
+test "import: batch boundary smaller than row count commits every batch" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+
+    const ndjson =
+        \\{"title":"1","slug":"s1"}
+        \\{"title":"2","slug":"s2"}
+        \\{"title":"3","slug":"s3"}
+        \\{"title":"4","slug":"s4"}
+        \\{"title":"5","slug":"s5"}
+    ;
+    const rep = try runNdjson(&app, &d, io, ndjson, .{ .collection = "posts", .batch_size = 2 });
+    try std.testing.expectEqual(@as(usize, 5), rep.created);
+    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 5), st.columnInt(0));
+}
+
+test "import: id preservation on vs off" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+
+    // preserve_ids = true (default): the provided id survives.
+    _ = try runNdjson(&app, &d, io, "{\"id\":\"keepme01\",\"title\":\"t\",\"slug\":\"k\"}", .{ .collection = "posts" });
+    {
+        var st = try d.prepare("SELECT COUNT(*) FROM posts WHERE id='keepme01';");
+        defer st.finalize();
+        _ = try st.step();
+        try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
+    }
+    // preserve_ids = false: the provided id is ignored, a new id generated.
+    _ = try runNdjson(&app, &d, io, "{\"id\":\"ignored99\",\"title\":\"t2\",\"slug\":\"k2\"}", .{ .collection = "posts", .preserve_ids = false });
+    {
+        var st = try d.prepare("SELECT COUNT(*) FROM posts WHERE id='ignored99';");
+        defer st.finalize();
+        _ = try st.step();
+        try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+    }
+}
+
+test "import: duplicate preserved id fails fast and names the line" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+
+    const ndjson =
+        \\{"id":"dupe0001","title":"a","slug":"a"}
+        \\{"id":"dupe0001","title":"b","slug":"b"}
+    ;
+    try std.testing.expectError(error.DuplicateId, runNdjson(&app, &d, io, ndjson, .{ .collection = "posts" }));
+    // First row committed? It is in the SAME batch (default 500), so the failing batch — which
+    // includes row 1 — rolled back: zero rows.
+    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "import: malformed JSON line fails with its line number" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+
+    const ndjson = "{\"title\":\"ok\",\"slug\":\"ok\"}\n{not json}\n";
+    try std.testing.expectError(error.MalformedJson, runNdjson(&app, &d, io, ndjson, .{ .collection = "posts" }));
+}
+
+test "import: a non-object line is rejected" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+    try std.testing.expectError(error.RowNotObject, runNdjson(&app, &d, io, "[1,2,3]", .{ .collection = "posts" }));
+}
+
+test "import: upsert create-then-update by key" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+
+    // First import creates.
+    const r1 = try runNdjson(&app, &d, io, "{\"title\":\"v1\",\"slug\":\"same\"}", .{ .collection = "posts", .upsert_key = "slug" });
+    try std.testing.expectEqual(@as(usize, 1), r1.created);
+    try std.testing.expectEqual(@as(usize, 0), r1.updated);
+    // Re-import with the same key updates.
+    const r2 = try runNdjson(&app, &d, io, "{\"title\":\"v2\",\"slug\":\"same\"}", .{ .collection = "posts", .upsert_key = "slug" });
+    try std.testing.expectEqual(@as(usize, 0), r2.created);
+    try std.testing.expectEqual(@as(usize, 1), r2.updated);
+    // Exactly one row, updated title.
+    var st = try d.prepare("SELECT title FROM posts WHERE slug='same';");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqualStrings("v2", st.columnText(0));
+    try std.testing.expect(!try st.step()); // only one row
+}
+
+test "import: validation error reports the failing 1-based line" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } }};
+    _ = try collections.create(a, io, &d, .{ .id = "", .name = "notes", .fields = &fields });
+    var app = testApp(std.testing.allocator, io);
+
+    // Row 2 is missing the required `title`.
+    const ndjson = "{\"title\":\"ok\"}\n{}\n";
+    try std.testing.expectError(error.Validation, runNdjson(&app, &d, io, ndjson, .{ .collection = "notes" }));
+}
+
+test "import: unknown collection and injection-guarded bad names are rejected" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    _ = try seedPosts(&d, a, io);
+    var app = testApp(std.testing.allocator, io);
+
+    try std.testing.expectError(error.UnknownCollection, runNdjson(&app, &d, io, "{}", .{ .collection = "nope" }));
+    // A weird collection name never reaches SQL — the identifier gate rejects it first.
+    try std.testing.expectError(error.InvalidCollectionName, runNdjson(&app, &d, io, "{}", .{ .collection = "posts; DROP TABLE posts;--" }));
+    // A weird upsert key is likewise gated.
+    try std.testing.expectError(error.InvalidUpsertKey, runNdjson(&app, &d, io, "{}", .{ .collection = "posts", .upsert_key = "slug\" OR 1=1--" }));
+    // A non-existent upsert key field is rejected.
+    try std.testing.expectError(error.UnknownUpsertKey, runNdjson(&app, &d, io, "{}", .{ .collection = "posts", .upsert_key = "nosuch" }));
+}
+
+test "import: an .encrypted field is sealed at rest (ciphertext, not plaintext)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    try migrations.run(&d);
+    // Stamp a field cipher on the connection, as bootApp's pool does in the real flow.
+    var cipher = field_policy.Cipher.fromEnv(io, "import-field-key");
+    db.dbSetFieldCipher(&d, @ptrCast(&cipher));
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "plain", .options = .{ .text = .{} } },
+    };
+    const col = try collections.create(a, io, &d, .{ .id = "", .name = "vault", .fields = &fields });
+    var app = testApp(std.testing.allocator, io);
+
+    _ = try runNdjson(&app, &d, io, "{\"id\":\"vaultrow01\",\"secret\":\"topsecret\",\"plain\":\"visible\"}", .{ .collection = "vault" });
+
+    // Raw cell holds a v1 envelope, never the plaintext.
+    var st = try d.prepare("SELECT secret FROM vault WHERE id='vaultrow01';");
+    defer st.finalize();
+    _ = try st.step();
+    const raw = st.columnText(0);
+    try std.testing.expect(std.mem.startsWith(u8, raw, "v1:"));
+    try std.testing.expect(std.mem.indexOf(u8, raw, "topsecret") == null);
+    // Read-back through the engine decrypts transparently.
+    const got = (try records.get(a, &d, col, "vaultrow01")).?;
+    try std.testing.expectEqualStrings("topsecret", got.object.get("secret").?.string);
+}
+
+test "import: an encrypted field cannot be an upsert key" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    try migrations.run(&d);
+    var cipher = field_policy.Cipher.fromEnv(io, "k");
+    db.dbSetFieldCipher(&d, @ptrCast(&cipher));
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "secret", .encrypted = true, .options = .{ .text = .{} } }};
+    _ = try collections.create(a, io, &d, .{ .id = "", .name = "vault2", .fields = &fields });
+    var app = testApp(std.testing.allocator, io);
+    try std.testing.expectError(error.EncryptedUpsertKey, runNdjson(&app, &d, io, "{}", .{ .collection = "vault2", .upsert_key = "secret" }));
+}
+
+test "import: auth collection hashes the password (never stored plaintext)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const users = try collections.create(a, io, &d, .{ .id = "", .name = "members", .type = .auth, .fields = &.{} });
+    _ = users;
+    var app = testApp(std.testing.allocator, io);
+
+    _ = try runNdjson(&app, &d, io, "{\"id\":\"member0001\",\"email\":\"a@b.c\",\"password\":\"supersecret\"}", .{ .collection = "members" });
+
+    var st = try d.prepare("SELECT passwordHash, tokenKey, verified FROM members WHERE id='member0001';");
+    defer st.finalize();
+    _ = try st.step();
+    const hash = st.columnText(0);
+    // Argon2id PHC string, and definitely not the plaintext.
+    try std.testing.expect(std.mem.startsWith(u8, hash, "$argon2"));
+    try std.testing.expect(std.mem.indexOf(u8, hash, "supersecret") == null);
+    try std.testing.expect(st.columnText(1).len > 0); // tokenKey generated
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(2)); // verified forced false
+}
