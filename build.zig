@@ -24,6 +24,9 @@ pub fn build(b: *std.Build) void {
     // from build.zig.zon; the commit is captured at configure time.
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    // Single-source the required Zig version so the compile-time guard in
+    // src/zig_compat.zig can reject an unsupported compiler with a clear message.
+    build_options.addOption([]const u8, "min_zig_version", @import("build.zig.zon").minimum_zig_version);
     build_options.addOption([]const u8, "commit", gitCommit(b));
     // Dev-only seams (injectable clock, seeded entropy, test-capture, fake field-crypto).
     // Compiled in ONLY when this is true so a production binary can never use any of them.
