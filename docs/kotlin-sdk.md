@@ -10,8 +10,9 @@ Android/Kotlin Multiplatform are not yet targets — see [Requirements](#require
 Like the [TypeScript](typescript-sdk.md), [Dart](dart-sdk.md), and [Python](python-sdk.md)
 SDKs, this is a straight behavioral port of the same client contract — same wire format, same
 filter-escaping rules, same cursor-pagination semantics — with a few deliberate divergences
-called out in [Divergences and what's next](#divergences-and-whats-next). Realtime and a
-generated typed tier are **not** in this release — see that section.
+called out in [Divergences and what's next](#divergences-and-whats-next), including
+[realtime](#realtime)'s scope-ownership divergence. A generated typed tier is **not** in this
+release — see that section.
 
 ## Install
 
@@ -499,6 +500,175 @@ throws a 429 `ZigbaseException`. `verify()` returns the `verified` flag from the
 on success; a wrong token, wrong account, or wrong id throws a 404 `ZigbaseException` — a
 deliberate non-oracle that never distinguishes the three.
 
+## Realtime
+
+WebSocket subscriptions need **no extra dependency**. Unlike the Python SDK's
+`zigbase[realtime]` extra, `ktor-client-websockets` (plus the CIO engine) ships as a plain
+runtime dependency of `zigbase-client` itself — there is nothing to add to your own
+`build.gradle.kts`.
+
+```kotlin
+import io.github.valthon.zigbase.RealtimeEvent
+
+val unsub =
+    zb.realtime.subscribe("posts", filter = "status = 'published'") { event ->
+        event.action           // "create" | "update" | "delete"
+        event.record.getString("title")
+    }
+...
+unsub()   // stop this callback
+
+// a single record's own topic
+zb.realtime.subscribe("posts/$recordId") { event -> handle(event) }
+```
+
+`zb.realtime` lazily builds **one `RealtimeService`** per `ZigbaseClient` on first access; it
+opens a single WebSocket to `<baseUrl>/api/realtime` (`http`/`https` mapped to `ws`/`wss`) on
+the first `subscribe`/`subscribeTopic` call and multiplexes every subscription over it — a
+`withAccount` sibling gets its **own**, independent `RealtimeService` (own scope, own socket).
+It:
+
+- **auto-reconnects** with bounded exponential backoff (see [Reconnect](#reconnect) below),
+- **re-authenticates** from the `AuthStore` on login, logout, and refresh,
+- **resubscribes** every surviving subscription after a reconnect.
+
+Anonymous subscriptions are allowed only for collections with a `@public` view rule
+(server-enforced, never pre-gated client-side) — a rejected `subscribe`/`subscribeTopic`
+throws a `ZigbaseException` out of the call itself. **Known wire-protocol limitation:** the
+server keys one subscription per topic per *connection* — subscribing to the same topic
+twice with two different filters makes the second filter silently overwrite the first
+server-side, so both callbacks then receive the second filter's events.
+
+**Scope ownership (a deliberate Kotlin divergence).** Unlike the Python/TypeScript/Dart ports,
+which piggyback on a caller-supplied event loop or scope, `RealtimeService` owns a **private**
+`CoroutineScope(SupervisorJob() + Dispatchers.Default)` for its receive loop and
+reconnect/re-auth work — you never construct or pass one in. `zb.close()` (non-suspend,
+`AutoCloseable`) tears the realtime service down via its non-suspend `shutdown()` before
+closing the underlying `HttpClient`. If you're managing a `RealtimeService` directly and want
+to `await` its teardown (e.g. in a test), `zb.realtime.close()` — a `suspend fun` — is
+available too.
+
+### `unsubscribe`
+
+```kotlin
+zb.realtime.unsubscribe("posts", onEvent)   // this callback, every filter variant
+zb.realtime.unsubscribe("posts", onEvent, filter = "status = 'published'")   // one exact variant
+```
+
+Every `subscribe`/`subscribeTopic` call also returns an unsubscribe function —
+`unsub()` is equivalent and saves holding onto the callback/filter yourself.
+
+### `stream()` — cold `Flow`
+
+```kotlin
+zb.realtime.stream("posts", filter = "status = 'published'")
+    .collect { event -> println("${event.action} ${event.record.id}") }
+
+// stop after the first few events -- unsubscribes automatically on completion:
+zb.realtime.stream("posts").take(3).collect { event -> handle(event) }
+```
+
+`stream()` subscribes on the **first `collect`**, not at call time (calling it does no I/O by
+itself), and unsubscribes when collection ends for any reason: normal completion (`take(n)`),
+the collecting coroutine being cancelled, or the whole service being torn down. A subscribe
+rejected by the server throws the `ZigbaseException` out of `collect { }` — matching
+`subscribe`'s own contract — while a service-initiated `close()`/`shutdown()` ends the flow
+**cleanly** instead (no exception). The internal buffer between the subscribe callback and
+your collector is **unbounded** — see [Backpressure](#backpressure).
+
+### Custom topics — `subscribeTopic`
+
+```kotlin
+import io.github.valthon.zigbase.TopicMessage
+
+val unsub =
+    zb.realtime.subscribeTopic("availability") { msg ->
+        msg.kind   // "signal" | "message"
+        if (msg.kind == "message") {
+            msg.data   // the broadcast payload (JsonElement?)
+        }
+    }
+zb.realtime.unsubscribeTopic("availability")
+
+// or as a Flow:
+zb.realtime.streamTopic("availability").collect { msg -> handle(msg) }
+```
+
+`kind` mirrors the wire frame's `type` field verbatim: `signal` is a re-fetch hint with
+`data = null`; `message` carries a payload from a custom route's
+`ctx.realtime().broadcast(...)`. Topic subscriptions reuse the same shared-socket machinery
+(ack/pending/resubscribe/backoff) as record subscriptions, but take no `filter`.
+
+### Auth lifecycle
+
+On connect, a present `authStore.token` is sent as an `auth` frame **before** any
+resubscribe, and every resubscribe is gated on that `auth` reply **settling** — whether the
+server's `status` comes back `ok` or `error` — not on it succeeding, so a `@public`
+subscription still resubscribes even when auth itself fails. An anonymous open (no token)
+resubscribes immediately. Once open, the service's own `authStore.onChange` listener
+(registered internally — you never wire this yourself) automatically re-sends a fresh `auth`
+frame whenever the token changes: a login re-authenticates the socket, and a logout sends an
+empty token (`auth("")`), which de-auths the connection server-side.
+
+**Token expiry is silent.** The server checks the connection's identity against the token's
+`exp` claim on every event, but sends no frame when it lapses — the connection just quietly
+starts being evaluated as anonymous (or, under multi-tenancy, loses its account scope). If a
+session can outlive its token, refresh proactively — e.g. call
+`zb.collection("users").authRefresh()` on a timer well before `exp`, rather than waiting for a
+rejected read to notice. `authRefresh()` updates the `AuthStore`, and the `onChange` listener
+above turns that into a fresh `auth` frame automatically.
+
+Realtime errors — an auth failure, a rejected subscribe, a socket-level error — are all
+surfaced through the `onRealtimeError` callback passed to the `ZigbaseClient` constructor
+(default: a `System.Logger` warning, so nothing is ever silently dropped):
+
+```kotlin
+val zb = ZigbaseClient(url, onRealtimeError = { msg -> logger.warn("realtime: $msg") })
+```
+
+This matches the Python SDK's posture — a realtime failure is always routed through
+`onRealtimeError`, never by rejecting a `subscribe()`/`subscribeTopic()` call after it has
+already returned — and diverges from the TypeScript/Dart SDKs, which swallow a realtime auth
+failure silently.
+
+### Reconnect
+
+An unexpected drop (not an explicit `close()`/`shutdown()`) schedules a reconnect after
+`min(10_000, 250 shl attempts)` ms — `250ms, 500ms, 1s, 2s, 4s, 8s, 10s, 10s, …` — reset to
+the first step after a successful connect. Reconnecting is gated on there being at least one
+live subscription left to resurrect the socket for — an idle connection every caller has
+already unsubscribed from is never reopened; it re-authenticates first, then resends every
+surviving subscription's frame, matching the TypeScript/Dart/Python SDKs.
+
+**There is no event replay.** Any create/update/delete that happened on the server during the
+gap is never redelivered on resubscribe, so treat a reconnect as a cue to re-fetch (e.g.
+`getList()`/`getFullList()`) rather than assuming the stream picked up exactly where it left
+off.
+
+### Backpressure
+
+`stream()`/`streamTopic()`'s internal buffer (between the subscribe callback and your
+`collect { }`) is unbounded — a consumer that falls behind the server just grows memory
+rather than applying backpressure to sibling subscriptions sharing the same receive loop. The
+server already disconnects slow consumers outright, so this is accepted behavior, not an
+oversight — matching the Python/TypeScript/Dart SDKs.
+
+### Known limitations
+
+- A still-pending (unacked) `subscribe()`/`subscribeTopic()` call whose subscription is
+  removed by a concurrent `unsubscribe()`/`unsubscribeTopic()` to the same topic/filter
+  before the server's ack arrives never settles — most often during a reconnect backoff
+  window (the entry vanishes before the reconnect can resend its frame), but it can equally
+  happen on an already-open, healthy connection.
+- Cancelling the coroutine awaiting `subscribe()`/`subscribeTopic()` (e.g. a `withTimeout`
+  wrapping it, or the enclosing `Job` being cancelled) while it's still awaiting its ack does
+  **not** undo the callback registration — call `unsubscribe()`/`unsubscribeTopic()` explicitly
+  to remove it once you're done.
+- Callback dispatch is serialized on the service's single receive loop: it awaits each
+  callback before decoding the next frame. A callback that itself calls
+  `subscribe()`/`subscribeTopic()` for a topic that hasn't been acked yet deadlocks — that ack
+  can only be processed by the same receive loop, which is blocked awaiting the callback.
+
 ## Error handling
 
 Every non-2xx response throws `ZigbaseException`, carrying `status`, `message`, `url`, and
@@ -574,8 +744,6 @@ concurrently.
 This is a straight behavioral port of the TypeScript SDK (the wire truth), cross-checked
 against the Python and Dart SDKs, but a few things differ by design or aren't here yet:
 
-- **No realtime tier yet.** WebSocket subscriptions and the Dart/TypeScript/Python SDKs'
-  subscribe/live-store surface are deferred to a follow-up SDK milestone.
 - **No typed codegen tier yet.** The TypeScript/Dart/Python SDKs' generated-schema client
   (typed record models, an injection-safe fluent filter builder, typed collection services)
   is deferred to a later milestone. Records stay a `ZbRecord` wrapper over a raw `JsonObject`.
@@ -596,8 +764,8 @@ against the Python and Dart SDKs, but a few things differ by design or aren't he
   difference in practice — flagged here for completeness rather than as a compatibility
   concern.
 
-These are planned follow-ups, not permanent gaps — track them alongside the TypeScript, Dart,
-and Python SDKs, which reached realtime and typed tiers first.
+The typed tier is a planned follow-up, not a permanent gap — track it alongside the
+TypeScript, Dart, and Python SDKs, which reached one first.
 
 ## Integration-test recipe
 

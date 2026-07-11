@@ -6,9 +6,9 @@ pagination, and files. A single, coroutine-first `ZigbaseClient` over
 (Kotlin/JVM; Android/Kotlin Multiplatform are not yet targets — see
 [Requirements](#requirements)).
 
-KSP1 (this package's first shipping increment) ships records, auth, files, and the
-multi-tenancy/analytics/senders surface. Realtime and a typed codegen tier are **not** in
-this release — see [Divergences and what's next](#divergences-and-whats-next).
+Ships records, auth, files, the multi-tenancy/analytics/senders surface, and a realtime
+tier (`zb.realtime` — WebSocket subscriptions, no extra dependency needed). A typed codegen
+tier is **not** in this release — see [Divergences and what's next](#divergences-and-whats-next).
 
 ## Install
 
@@ -243,6 +243,30 @@ val url2 = zb.files.getUrlFor("posts", rec.id, "cover.png", download = true)
 into the request body — a 429-retry can resend the buffered bytes without touching the
 filesystem again.
 
+## Realtime
+
+WebSocket subscriptions need **no extra dependency** — `ktor-client-websockets` ships
+transitively with `zigbase-client`, unlike the Python SDK's `zigbase[realtime]` extra.
+
+```kotlin
+val unsub =
+    zb.realtime.subscribe("posts", filter = "status = 'published'") { event ->
+        println("${event.action} ${event.record.getString("title")}")   // "create" | "update" | "delete"
+    }
+unsub()   // stop this callback
+
+// or consume it as a cold Flow -- subscribes on first collect, unsubscribes on completion/cancellation:
+zb.realtime.stream("posts").collect { event -> handle(event) }
+```
+
+`zb.realtime` lazily builds one `RealtimeService` per client (its own `CoroutineScope`, torn
+down by `zb.close()`), auto-reconnects with bounded exponential backoff, re-authenticates
+from `authStore` on login/logout/refresh, and resubscribes everything after a reconnect. A
+`withAccount` sibling gets its own independent `RealtimeService` — separate scope, separate
+connection. See [docs/kotlin-sdk.md#realtime](../../docs/kotlin-sdk.md#realtime) for custom
+topics (`subscribeTopic`), the auth lifecycle (including the silent-token-expiry caveat),
+reconnect/backpressure behavior, and known limitations.
+
 ## Error handling
 
 Every non-2xx response throws `ZigbaseException`, carrying `status`, `message`, `url`, and
@@ -338,9 +362,6 @@ share the same store) is safe to call from multiple coroutines concurrently.
 This is a straight behavioral port of the TypeScript SDK (the wire truth), cross-checked
 against the Python and Dart SDKs, but a few things differ by design or aren't here yet:
 
-- **No realtime tier yet.** WebSocket subscriptions and the Dart/TypeScript SDKs'
-  `realtime.collection()`/`LiveRecord`/`LiveList` observables are deferred to a follow-up SDK
-  milestone (KSP2).
 - **No typed codegen tier yet.** The Python/Dart/TypeScript SDKs' generated-schema client
   (typed record models, an injection-safe fluent filter builder, typed collection services)
   is deferred to a later milestone (KSP3).
