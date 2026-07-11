@@ -952,3 +952,124 @@ class RealtimeServiceResubscribeStompTest {
             }
         }
 }
+
+/**
+ * Regression for the gemini KSP2 finding on [RealtimeService]'s
+ * `sendSubscribeIfNeeded`: its `CancellationException` catch used to rethrow
+ * WITHOUT resetting `sub.inflight`, while the sibling `Exception` catch does.
+ * So a `subscribe()` cancelled while parked in `conn.send` left the shared
+ * [Subscription] stuck `inflight = true` forever; a later subscribe to the
+ * same topic/filter (which shares that `Subscription`) then hit the
+ * `inflight` gate, never sent its own frame, and hung (bounded only by
+ * `close()`). The fix resets `inflight` under `NonCancellable` before
+ * rethrowing.
+ *
+ * The gated send here is the one fired DIRECTLY from `subscribe()` on an
+ * ALREADY-open connection -- deliberately not the `resubscribeAll` send
+ * inside `connectOnce`, whose own (Finding 2) teardown would tear the socket
+ * down and mask this by resetting `inflight` at the next commit.
+ */
+class RealtimeServiceSubscribeSendCancelledTest {
+    @Test
+    fun `a subscribe cancelled mid-send resets inflight so a later subscribe to the same topic still sends`() =
+        runTest {
+            withContext(Dispatchers.Default) {
+                val (service, factory) = makeService()
+
+                // Establish a healthy, fully-open connection first, so the
+                // send cancelled below is `subscribe()`'s own direct
+                // `sendSubscribeIfNeeded` call -- connectOnce has already
+                // returned by this point.
+                val seed = async { service.subscribe("seed") { } }
+                awaitTrue { factory.connections.isNotEmpty() && factory.last.subscribeFrames.isNotEmpty() }
+                factory.last.push(ackFrame("seed"))
+                seed.await()
+
+                // Park the NEXT send on this live connection -- it will be the
+                // "posts" subscribe frame.
+                val sendEntered = CompletableDeferred<Unit>()
+                factory.last.sendEntered = sendEntered
+                factory.last.sendGate = CompletableDeferred()
+
+                val jobA = async { service.subscribe("posts") { } }
+                withTimeout(1_000) { sendEntered.await() }
+
+                // Cancel jobA while it is parked in `conn.send` with
+                // `sub.inflight` already marked `true`.
+                jobA.cancel()
+                jobA.join()
+
+                // A second subscribe to the SAME topic shares that
+                // Subscription. Pre-fix it hits the stuck `inflight` gate,
+                // never sends a frame, and hangs on an ack that never comes;
+                // post-fix the reset lets its frame go out and the ack settle
+                // it.
+                val jobB = async { service.subscribe("posts") { } }
+                awaitTrue { factory.last.subscribeFrames.any { it == subscribeFrame("posts") } }
+                factory.last.push(ackFrame("posts"))
+                withTimeout(1_000) { jobB.await() }
+                service.close()
+            }
+        }
+}
+
+/**
+ * Regression for the gemini KSP2 finding on [RealtimeService.connectOnce]: a
+ * connect cancelled (or throwing) AFTER the `activeConnection`/`opened`
+ * commit but BEFORE [RealtimeService] finished wiring the connection up left
+ * a half-initialized socket -- `activeConnection` non-null and `opened` true,
+ * yet auth/resubscribe never ran. Worst case (pinned here via
+ * [RealtimeService.testHookAfterCommit]), the cancellation lands in the gap
+ * AFTER commit but BEFORE the receive loop is even launched: a genuinely dead
+ * half-open socket with no receive loop, which the old `finally` neither
+ * closed (`adopted` was `true`) nor rolled back -- so `ensureConnected` saw a
+ * non-null `activeConnection`, never reconnected, and every later subscribe
+ * hung. The fix tracks a `success` flag and transactionally undoes the commit
+ * (null `activeConnection`, clear `opened`, close the socket) on any
+ * unsuccessful exit.
+ */
+class RealtimeServiceConnectCancelledAfterCommitTest {
+    @Test
+    fun `a connect cancelled after commit is rolled back so a later subscribe reconnects`() =
+        runTest {
+            withContext(Dispatchers.Default) {
+                val (service, factory) = makeService()
+                val hookEntered = CompletableDeferred<Unit>()
+                val releaseHook = CompletableDeferred<Unit>()
+                service.testHookAfterCommit = {
+                    hookEntered.complete(Unit)
+                    releaseHook.await()
+                }
+
+                // job1 parks right after connectOnce commits
+                // `activeConnection`/`opened` but BEFORE the receive loop is
+                // launched -- the dead-half-open window.
+                val job1 = async { service.subscribe("posts") { } }
+                withTimeout(1_000) { hookEntered.await() }
+                assertEquals(1, factory.connections.size)
+
+                // Cancel job1 while parked: connectOnce unwinds through its
+                // `finally`. Pre-fix, `adopted == true` keeps
+                // `activeConnection`/`opened` set and never closes the socket,
+                // wedging the service on a receive-loop-less connection.
+                job1.cancel()
+                job1.join()
+
+                // Clear the hook so the fresh connect below is not parked too.
+                service.testHookAfterCommit = null
+
+                // Post-fix, the commit was rolled back, so this subscribe
+                // opens a brand-new connection. Pre-fix, `ensureConnected`
+                // sees the stale non-null `activeConnection`, never connects,
+                // and this hangs on an ack nothing will deliver.
+                val job2 = async { service.subscribe("posts") { } }
+                awaitTrue { factory.connections.size == 2 }
+                factory.last.push(ackFrame("posts"))
+                withTimeout(1_000) { job2.await() }
+
+                // The rolled-back socket was torn down, not leaked.
+                assertEquals(1, factory.connections[0].closeCount)
+                service.close()
+            }
+        }
+}

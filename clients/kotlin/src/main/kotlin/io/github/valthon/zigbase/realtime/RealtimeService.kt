@@ -786,6 +786,19 @@ class RealtimeService internal constructor(
         // the TOCTOU window a concurrent `ensureConnected()` used to slip
         // through -- see `RealtimeServiceConnectToctouRaceTest`.
         var adopted = false
+        // Flips to `true` only once [onOpen] has fully returned -- i.e. the
+        // connection is not merely committed but wired up (auth sent+settled,
+        // every surviving subscription resubscribed). A cancellation or throw
+        // anywhere after the commit but before this point leaves a
+        // half-initialized connection: `activeConnection`/`opened` are set,
+        // but [resubscribeAll]/auth never finished, so the socket would block
+        // every future reconnect ([ensureConnected] sees a non-null
+        // `activeConnection`) while delivering nothing -- worst of all when
+        // cancelled in the narrow gap AFTER commit but BEFORE the receive loop
+        // is even launched, a genuinely dead half-open socket nothing would
+        // ever close. The `finally` uses this to transactionally roll the
+        // commit back. See `RealtimeServiceConnectCancelledAfterCommitTest`.
+        var success = false
         try {
             testHookAfterConnect?.invoke()
 
@@ -838,11 +851,57 @@ class RealtimeService internal constructor(
             mutex.withLock { receiveJob = job }
 
             onOpen()
+            success = true
         } finally {
             withContext(NonCancellable) {
-                mutex.withLock { connecting = false }
+                mutex.withLock {
+                    connecting = false
+                    // Transactional rollback of a commit that never finished
+                    // wiring up (see `success`'s doc): undo the
+                    // `activeConnection`/`opened` publish so a later
+                    // `subscribe()` opens a fresh socket rather than adopting
+                    // this dead half-open one. Guarded by `activeConnection
+                    // === conn` so it can only ever null OUT this connect's own
+                    // connection, never a newer one -- though none can exist
+                    // yet, since `connecting` stays `true` until this very
+                    // section. `connecting = false` and the null-out happen in
+                    // ONE locked section, so no concurrent `ensureConnected`
+                    // ever sees an intermediate state. Serialized with
+                    // `close()`'s own `activeConnection` read/clear by this
+                    // same `mutex`.
+                    if (!success && adopted && activeConnection === conn) {
+                        activeConnection = null
+                        opened = false
+                        // Roll back the receive-loop handle too, so an
+                        // unsuccessful connect leaves no dangling `receiveJob`
+                        // beside a null `activeConnection`: receiveLoop's own
+                        // finally will NOT clear it (it gates on
+                        // `activeConnection === conn`, already false after the
+                        // null-out just above). The launched loop still
+                        // terminates on its own once `conn.close()` (below) ends
+                        // `conn.incoming`; this only keeps the tracked handle
+                        // consistent with the rolled-back connection state.
+                        receiveJob = null
+                    }
+                }
+                // Close the socket on ANY unsuccessful exit -- not just the
+                // never-adopted case. A commit that failed to finish wiring up
+                // (rolled back just above) owns closing its own connection too:
+                // otherwise an adopted-but-unwired socket leaks (nothing else
+                // holds a reference to `.close()` it). Idempotent + `runCatching`,
+                // so a double close racing `close()`'s own teardown is harmless.
+                //
+                // MUST run INSIDE `withContext(NonCancellable)` (but outside the
+                // `mutex.withLock`, to avoid holding the lock across I/O):
+                // `conn.close()` is a suspend fn, and this finally's whole reason
+                // to exist is the cancellation path. Left outside NonCancellable,
+                // `close()` would throw `CancellationException` at its first
+                // suspension point in the already-cancelled coroutine and
+                // `runCatching` would swallow it -- so the socket would never
+                // actually close, leaking exactly the connection we are here to
+                // reclaim.
+                if (!success) runCatching { conn.close() }
             }
-            if (!adopted) runCatching { conn.close() }
         }
     }
 
@@ -1255,6 +1314,20 @@ class RealtimeService internal constructor(
         try {
             conn.send(encodeSubscribe(sub.topic, sub.filter))
         } catch (e: CancellationException) {
+            // The sending coroutine was cancelled mid-send (e.g. a caller
+            // cancelled its own `subscribe()` while parked here). The frame
+            // may not have gone out, so undo the inflight mark BEFORE
+            // rethrowing -- same rationale as the `Exception` branch below --
+            // or `inflight` stays stuck `true` forever on this subscription
+            // and a later subscribe to the same topic/filter (which shares
+            // this `Subscription`) hits `sendSubscribeIfNeeded`'s `inflight`
+            // gate, never sends its own frame, and hangs (bounded only by
+            // `close()`). The reset MUST run under `NonCancellable`: a bare
+            // `mutex.withLock` (a suspend call) inside an already-cancelled
+            // coroutine would itself throw `CancellationException` before the
+            // reset ran. `sub.pending`'s futures are left untouched, exactly
+            // as in the `Exception` branch.
+            withContext(NonCancellable) { mutex.withLock { sub.inflight = false } }
             throw e
         } catch (e: Exception) {
             // The frame never went out -- undo the inflight mark so the

@@ -3,6 +3,7 @@ package io.github.valthon.zigbase.realtime
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -47,6 +48,24 @@ internal class FakeConnection : RealtimeConnection {
      */
     var sendException: Exception? = null
 
+    /**
+     * When set, the NEXT [send] parks on this (after signalling
+     * [sendEntered]) before recording the frame, letting a test observe a
+     * send in flight and cancel the sending coroutine while it's parked.
+     * One-shot: captured and cleared back to `null` on the first [send] that
+     * observes it (so a later send on the same connection is not gated). The
+     * gate is never required to complete -- cancelling the parked coroutine
+     * frees it (the `await` is cancellable).
+     */
+    var sendGate: CompletableDeferred<Unit>? = null
+
+    /**
+     * Completed by [send] the instant it parks on [sendGate], so a test can
+     * deterministically wait for the send to be in flight before cancelling
+     * the sending coroutine (rather than racing a wall-clock sleep).
+     */
+    var sendEntered: CompletableDeferred<Unit>? = null
+
     /** Incremented on every [close] call, so a test can assert exactly-once transport teardown. */
     var closeCount: Int = 0
         private set
@@ -54,6 +73,12 @@ internal class FakeConnection : RealtimeConnection {
     private val channel = Channel<String>(Channel.UNLIMITED)
 
     override suspend fun send(text: String) {
+        val gate = sendGate
+        if (gate != null) {
+            sendGate = null
+            sendEntered?.complete(Unit)
+            gate.await()
+        }
         val exception = sendException
         if (exception != null) {
             sendException = null
@@ -65,6 +90,15 @@ internal class FakeConnection : RealtimeConnection {
     override val incoming: ReceiveChannel<String> get() = channel
 
     override suspend fun close() {
+        // A real (ktor) close() suspends, so model a suspension point here.
+        // This makes a close() mistakenly invoked in an already-cancelled
+        // coroutine (i.e. outside `withContext(NonCancellable)`) observably
+        // throw rather than silently completing -- which is what lets
+        // RealtimeServiceConnectCancelledAfterCommitTest actually catch a
+        // leaked socket on connectOnce's cancellation path. A synchronous
+        // fake close would run to completion even under cancellation and hide
+        // the leak.
+        yield()
         closeCount += 1
         channel.close()
     }
@@ -111,6 +145,17 @@ internal class FakeConnectorFactory {
      */
     var nextSendException: Exception? = null
 
+    /**
+     * Primes the NEXT connection built with a one-shot [FakeConnection
+     * .sendGate] (and its paired [FakeConnection.sendEntered] signal), for
+     * tests that need the first send on a freshly-opened connection -- e.g.
+     * the on-open subscribe frame fired from `resubscribeAll` -- to park
+     * mid-flight so the sending coroutine can be cancelled while it's in
+     * send. Both are consumed (reset to `null`) as soon as they're applied.
+     */
+    var nextSendGate: CompletableDeferred<Unit>? = null
+    var nextSendEntered: CompletableDeferred<Unit>? = null
+
     suspend fun connect(url: String): RealtimeConnection {
         gate?.await()
         if (pendingFailures > 0) {
@@ -121,6 +166,12 @@ internal class FakeConnectorFactory {
         nextSendException?.let {
             connection.sendException = it
             nextSendException = null
+        }
+        nextSendGate?.let {
+            connection.sendGate = it
+            connection.sendEntered = nextSendEntered
+            nextSendGate = null
+            nextSendEntered = null
         }
         connections.add(connection)
         return connection
