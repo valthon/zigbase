@@ -21,10 +21,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     // Build provenance for `zigbase --version`. The server version is single-sourced
-    // from build.zig.zon; the commit is captured at configure time.
+    // from build.zig.zon; the commit is captured at configure time. `-Dcommit=<sha>` lets
+    // CI/release inject a deterministic SHA (used verbatim); otherwise `gitCommit` tries
+    // `git rev-parse` and, if that's unavailable (sandboxed configure step, no git on PATH),
+    // falls back to a spawn-free parse of `.git` (worktree-aware) before giving up.
+    const commit_override = b.option([]const u8, "commit", "Commit SHA to bake into --version (CI/release inject the real SHA; default: auto-detect from git)");
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
-    build_options.addOption([]const u8, "commit", gitCommit(b));
+    build_options.addOption([]const u8, "commit", commit_override orelse gitCommit(b));
     // Dev-only seams (injectable clock, seeded entropy, test-capture, fake field-crypto).
     // Compiled in ONLY when this is true so a production binary can never use any of them.
     // Defaults to on in Debug, off in any release/optimized build; the release script
@@ -363,6 +367,9 @@ pub fn build(b: *std.Build) void {
 fn readCDefineStr(b: *std.Build, rel_path: []const u8, macro: []const u8) []const u8 {
     const data = b.build_root.handle.readFileAlloc(b.graph.io, rel_path, b.allocator, .unlimited) catch |e|
         std.debug.panic("version aggregation: cannot read '{s}': {s}", .{ rel_path, @errorName(e) });
+    // The whole header (sqlite3.h is ~600 KB) is read into this buffer; we only dupe the
+    // matched substring out, so free the buffer before returning.
+    defer b.allocator.free(data);
     var it = std.mem.tokenizeScalar(u8, data, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trimStart(u8, line, " \t");
@@ -389,13 +396,90 @@ fn zapPinnedCommit() []const u8 {
 }
 
 /// Capture the short git commit at configure time; "unknown" outside a repo.
+///
+/// Two strategies, in order: (1) `git rev-parse --short HEAD` — works in a normal checkout
+/// with git on PATH; but a sandboxed configure step (e.g. an agent harness) can block the
+/// spawn, so (2) fall back to a spawn-free filesystem parse of `.git` that also handles the
+/// linked-worktree case (`.git` is a *file* pointing at the real gitdir, whose branch refs
+/// live in the shared common dir). Both failing → "unknown" (graceful, never a crash).
 fn gitCommit(b: *std.Build) []const u8 {
     const root = b.build_root.path orelse ".";
     var code: u8 = undefined;
-    const stdout = b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "--short", "HEAD" }, &code, .ignore) catch return "unknown";
-    if (code != 0) return "unknown";
-    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
-    return if (trimmed.len == 0) "unknown" else trimmed;
+    if (b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "--short", "HEAD" }, &code, .ignore)) |stdout| {
+        if (code == 0) {
+            const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+            if (trimmed.len > 0) return trimmed;
+        }
+    } else |_| {}
+    return gitCommitFromFs(b) orelse "unknown";
+}
+
+/// Spawn-free short-SHA detection by parsing `.git` directly (sandbox- and worktree-proof).
+/// Returns null on any read/parse failure so the caller degrades to "unknown".
+fn gitCommitFromFs(b: *std.Build) ?[]const u8 {
+    const io = b.graph.io;
+    const alloc = b.allocator;
+    const cwd = std.Io.Dir.cwd();
+    const root = b.build_root.path orelse return null;
+    const small: std.Io.Limit = .limited(64 * 1024);
+
+    // 1. Resolve the git dir. `.git` is a directory (normal repo) or a file
+    //    "gitdir: <path>" (linked worktree / submodule). readFileAlloc errors on a dir.
+    const dot_git = b.fmt("{s}/.git", .{root});
+    const git_dir: []const u8 = blk: {
+        const contents = cwd.readFileAlloc(io, dot_git, alloc, small) catch break :blk dot_git;
+        const trimmed = std.mem.trim(u8, contents, " \t\r\n");
+        const gd = "gitdir:";
+        if (std.mem.startsWith(u8, trimmed, gd)) {
+            const p = std.mem.trim(u8, trimmed[gd.len..], " \t\r\n");
+            break :blk if (std.fs.path.isAbsolute(p)) p else b.fmt("{s}/{s}", .{ root, p });
+        }
+        break :blk dot_git;
+    };
+
+    // 2. Read HEAD. Either "ref: refs/heads/<branch>" or a detached raw SHA.
+    const head = cwd.readFileAlloc(io, b.fmt("{s}/HEAD", .{git_dir}), alloc, small) catch return null;
+    const head_trim = std.mem.trim(u8, head, " \t\r\n");
+    const rp = "ref:";
+    if (!std.mem.startsWith(u8, head_trim, rp)) return shortSha(b, head_trim);
+    const ref = std.mem.trim(u8, head_trim[rp.len..], " \t\r\n"); // e.g. refs/heads/main
+
+    // 3. Branch refs live in the COMMON dir. In a linked worktree, gitdir/commondir points
+    //    at it (relative to gitdir); a normal repo has no commondir, so gitdir IS the common dir.
+    const common_dir: []const u8 = blk: {
+        const cd = cwd.readFileAlloc(io, b.fmt("{s}/commondir", .{git_dir}), alloc, small) catch break :blk git_dir;
+        const cd_trim = std.mem.trim(u8, cd, " \t\r\n");
+        break :blk if (std.fs.path.isAbsolute(cd_trim)) cd_trim else b.fmt("{s}/{s}", .{ git_dir, cd_trim });
+    };
+
+    // 3a. Loose ref file.
+    if (cwd.readFileAlloc(io, b.fmt("{s}/{s}", .{ common_dir, ref }), alloc, small)) |loose| {
+        return shortSha(b, std.mem.trim(u8, loose, " \t\r\n"));
+    } else |_| {}
+
+    // 3b. Packed refs: lines are "<sha> <refname>" (skip comments and "^" peel lines).
+    if (cwd.readFileAlloc(io, b.fmt("{s}/packed-refs", .{common_dir}), alloc, .unlimited)) |packed_refs| {
+        var it = std.mem.tokenizeScalar(u8, packed_refs, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+            const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            if (std.mem.eql(u8, std.mem.trim(u8, line[sp + 1 ..], " \t\r\n"), ref)) {
+                return shortSha(b, line[0..sp]);
+            }
+        }
+    } else |_| {}
+    return null;
+}
+
+/// Validate that `full` looks like a hex object id and return a short (first 12 chars)
+/// duplicated copy; null if it isn't hex or is too short to be a SHA.
+fn shortSha(b: *std.Build, full: []const u8) ?[]const u8 {
+    if (full.len < 7) return null;
+    for (full) |ch| {
+        const is_hex = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
+        if (!is_hex) return null;
+    }
+    return b.allocator.dupe(u8, full[0..@min(full.len, 12)]) catch null;
 }
 
 // ---------------------------------------------------------------------------
