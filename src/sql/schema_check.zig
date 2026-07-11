@@ -182,11 +182,11 @@ fn kwEq(t: Tok, kw: []const u8) bool {
 fn isAliasStopword(t: Tok) bool {
     if (t.kind != .ident or t.quoted) return false;
     const kws = [_][]const u8{
-        "on",     "where",  "join",   "inner",     "left",   "right",
-        "full",   "outer",  "cross",  "natural",   "using",  "group",
-        "order",  "having", "limit",  "offset",    "union",  "intersect",
-        "except", "set",    "values", "returning", "and",    "or",
-        "not",    "window", "as",     "when",      "then",   "else",
+        "on",     "where",  "join",   "inner",     "left",  "right",
+        "full",   "outer",  "cross",  "natural",   "using", "group",
+        "order",  "having", "limit",  "offset",    "union", "intersect",
+        "except", "set",    "values", "returning", "and",   "or",
+        "not",    "window", "as",     "when",      "then",  "else",
         "end",    "from",
     };
     for (kws) |k| if (eqIC(t.text, k)) return true;
