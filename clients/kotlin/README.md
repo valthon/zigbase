@@ -366,7 +366,8 @@ typed expand, and typed `Flow`-based realtime, over a new
 `io.github.valthon.zigbase.typed` runtime — no extra dependency needed.
 
 ```bash
-zigbase typegen --data-dir ./zb_data --out ZbaseGen.kt --lang kotlin
+zigbase typegen --data-dir ./zb_data --out ZbaseGen.kt --lang kotlin \
+  --package io.github.valthon.zigbase.codegen.myapp
 ```
 
 ```kotlin

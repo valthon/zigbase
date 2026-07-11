@@ -159,6 +159,31 @@ class TypedRealtimeSubscribeTest {
         }
 
     @Test
+    fun `when both where and filter are given, where wins`() =
+        runTest {
+            withContext(Dispatchers.Default) {
+                val (rt, client, factory) = makeTypedRealtime()
+                val where = StringFieldExpr("title").eq("Hi")
+
+                val job = async { rt.subscribe(where = where, filter = "title = 'other'") { } }
+                awaitTrue { factory.connections.isNotEmpty() && factory.last.subscribeFrames.isNotEmpty() }
+                assertEquals(
+                    listOf(
+                        buildJsonObject {
+                            put("action", "subscribe")
+                            put("topic", "posts")
+                            put("filter", where.compile())
+                        },
+                    ),
+                    factory.last.subscribeFrames,
+                )
+                factory.last.push(ackFrame("posts"))
+                job.await()
+                client.close()
+            }
+        }
+
+    @Test
     fun `a plain filter string passes through when no where is given`() =
         runTest {
             withContext(Dispatchers.Default) {
@@ -283,6 +308,32 @@ class TypedRealtimeStreamTest {
                 val where = StringFieldExpr("title").eq("Hi")
 
                 val collectJob = launch { rt.stream(where = where).collect { } }
+                awaitTrue { factory.connections.isNotEmpty() && factory.last.subscribeFrames.isNotEmpty() }
+                assertEquals(
+                    listOf(
+                        buildJsonObject {
+                            put("action", "subscribe")
+                            put("topic", "posts")
+                            put("filter", where.compile())
+                        },
+                    ),
+                    factory.last.subscribeFrames,
+                )
+
+                collectJob.cancel()
+                collectJob.join()
+                client.close()
+            }
+        }
+
+    @Test
+    fun `when both where and filter are given, where wins on the stream's subscribe frame`() =
+        runTest {
+            withContext(Dispatchers.Default) {
+                val (rt, client, factory) = makeTypedRealtime()
+                val where = StringFieldExpr("title").eq("Hi")
+
+                val collectJob = launch { rt.stream(where = where, filter = "title = 'other'").collect { } }
                 awaitTrue { factory.connections.isNotEmpty() && factory.last.subscribeFrames.isNotEmpty() }
                 assertEquals(
                     listOf(

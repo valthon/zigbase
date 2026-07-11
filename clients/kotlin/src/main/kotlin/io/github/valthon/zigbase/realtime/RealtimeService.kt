@@ -502,6 +502,15 @@ class RealtimeService internal constructor(
                     // ack, so `closeWatcher` is guaranteed to close the
                     // channel -- just wait for it. No unsubscribe is owed:
                     // `close()` already cleared the subscription map.
+                    //
+                    // By design, this can't tell a close()-induced failure
+                    // apart from a genuine server rejection that happens to
+                    // land in this exact instant `closedByUser` flips true --
+                    // both throw here, and both take this branch. That's
+                    // intentional, not a bug: the service is closing either
+                    // way, so surfacing the rejection instead would gain
+                    // nothing and risks this path hanging on a connection
+                    // that will never reply again.
                     closeWatcher.join()
                     return@callbackFlow
                 }
@@ -537,7 +546,9 @@ class RealtimeService internal constructor(
                 if (e !is CancellationException && closedByUser) {
                     // Same service-close-vs-genuine-rejection distinction as
                     // `stream()`'s catch block above -- see there for the
-                    // full rationale.
+                    // full rationale, including why a genuine rejection
+                    // landing in this exact instant is by-design swallowed
+                    // as a clean close rather than surfaced.
                     closeWatcher.join()
                     return@callbackFlow
                 }
@@ -1070,24 +1081,45 @@ class RealtimeService internal constructor(
                 reconnectAttempts += 1
                 computed
             }
+        var delayElapsed = false
         try {
             try {
                 delayFn(delayMs)
+                delayElapsed = true
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                // A misbehaving injected delay is treated as elapsed (reported
+                // via onError, the backoff simply counted as done) rather than
+                // wedging every future reconnect attempt.
                 onError(e.message ?: e.toString())
+                delayElapsed = true
             }
         } finally {
             withContext(NonCancellable) {
                 mutex.withLock {
                     reconnectPending = false
-                    connecting = true
+                    // Only hand `connecting` on to the [connectOnce] call below
+                    // when the backoff actually elapsed. If this coroutine was
+                    // cancelled DURING `delayFn` (close() cancelling the scope
+                    // mid-backoff -- the common cancellation point), the
+                    // CancellationException propagates past the `if (closedByUser)`
+                    // block below, so `connectOnce` never runs; leaving
+                    // `connecting = true` here would then wedge it `true` forever.
+                    connecting = delayElapsed
                 }
             }
         }
         if (closedByUser) {
-            mutex.withLock { connecting = false }
+            // Wrapped in `NonCancellable`, matching every other
+            // cleanup-under-cancellation `finally` in this file: a
+            // cancellation landing exactly here (between the `closedByUser`
+            // read and the `connecting = false` write) must not leave
+            // `connecting` stuck `true` -- inert post-close in practice
+            // (`raiseIfClosed` already gates every reader), but this closes
+            // the cancellation window rather than leaving it open by
+            // omission.
+            withContext(NonCancellable) { mutex.withLock { connecting = false } }
             return
         }
         connectOnce()

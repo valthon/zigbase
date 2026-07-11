@@ -32,6 +32,32 @@ const W = std.ArrayList(u8);
 /// by hand (mirrors gen_python.zig's own TYPED_CORE_VERSION constant).
 const TYPED_CORE_VERSION = "0.1.0";
 
+/// Validates a `--package` value: a non-empty, dot-separated sequence of Kotlin
+/// identifier segments (each segment starts with a letter or `_`, then
+/// letters/digits/`_`). The value is emitted verbatim into the generated
+/// `package` line, so anything else — newlines, `;`, `{`, quotes — would inject
+/// arbitrary source into the output. Rejects leading/trailing/consecutive dots
+/// and digit-leading segments too.
+fn validatePackageName(name: []const u8) !void {
+    if (name.len == 0) return error.EmptyPackageName;
+    var seg_start = true;
+    for (name) |c| {
+        if (c == '.') {
+            if (seg_start) return error.InvalidPackageName;
+            seg_start = true;
+            continue;
+        }
+        const ok = switch (c) {
+            'a'...'z', 'A'...'Z', '_' => true,
+            '0'...'9' => !seg_start,
+            else => false,
+        };
+        if (!ok) return error.InvalidPackageName;
+        seg_start = false;
+    }
+    if (seg_start) return error.InvalidPackageName;
+}
+
 /// The pure Kotlin generator core: collections -> full file text.
 ///
 /// Signature mirrors gen_python.generate/gen_dart.generate so the CLI/build
@@ -43,6 +69,11 @@ const TYPED_CORE_VERSION = "0.1.0";
 /// `in_repo`; Kotlin emits no RPC methods that would need `api_prefix`).
 /// `client_name`/`auth_collection` drive the `ZbClient` façade + its
 /// `createClient` factory (Task 6).
+///
+/// `package_name` is Kotlin-specific (the other generators have no `package`
+/// concept), so it is appended LAST rather than folded into the shared
+/// prefix — this generator's signature legitimately diverges from
+/// gen_dart.generate/gen_python.generate here.
 pub fn generate(
     alloc: std.mem.Allocator,
     cols: []const schema.Collection,
@@ -54,6 +85,7 @@ pub fn generate(
     auth_collection: []const u8,
     client_name: []const u8,
     api_prefix: []const u8,
+    package_name: []const u8,
 ) ![]const u8 {
     _ = routes;
     _ = custom_auth;
@@ -61,6 +93,11 @@ pub fn generate(
     _ = experiments;
     _ = in_repo;
     _ = api_prefix;
+
+    // `package_name` is interpolated straight into the generated `package`
+    // line, so a value with newlines/braces/semicolons would inject arbitrary
+    // source into the output — validate it is a well-formed dotted identifier.
+    try validatePackageName(package_name);
 
     var report = guards.GuardReport{ .message = "" };
     try guards.checkOperatorNames(alloc, cols, &report);
@@ -81,7 +118,7 @@ pub fn generate(
         \\// trailing `_` on the KOTLIN side only (field `class` -> member
         \\// `class_`); wire keys are unchanged (a `@SerialName` carries the
         \\// original wire key whenever it differs from the sanitized member).
-        \\package io.github.valthon.zigbase.codegen.dating
+        \\package {s}
         \\
         \\import io.github.valthon.zigbase.AuthResponse
         \\import io.github.valthon.zigbase.FileArg
@@ -137,7 +174,7 @@ pub fn generate(
         \\}}
         \\
         \\
-    , .{ gen_client.schemaHash(cols), TYPED_CORE_VERSION }));
+    , .{ gen_client.schemaHash(cols), TYPED_CORE_VERSION, package_name }));
 
     for (cols) |c| try emit.emitSelectEnums(alloc, &w, c);
     for (cols) |c| try emit.emitRecord(alloc, &w, cols, c);
@@ -172,7 +209,7 @@ test "generate emits a valid-looking Kotlin client for a mini blog" {
             .{ .id = "", .name = "cover", .options = .{ .file = .{ .maxSelect = 1 } } },
         } },
     };
-    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api");
+    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating");
 
     // Byte-exact fragment: the enum class in full (Step 1's "byte-exact
     // expected fragment for one small collection").
@@ -222,7 +259,7 @@ test "generate emits fields builders, meta, typed services, realtime, and the Zb
             .{ .id = "", .name = "cover", .options = .{ .file = .{ .maxSelect = 1 } } },
         } },
     };
-    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api");
+    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating");
 
     // Byte-exact fragment: PostFields in full — covers every FieldExpr
     // subclass the generator emits (String/Enum/Number/Rel here; Bool is
@@ -369,7 +406,7 @@ test "json field type is single-nullable everywhere (record AND payload) — not
             .{ .id = "", .name = "metadata", .options = .{ .json = .{} } },
         } },
     };
-    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api");
+    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating");
     try std.testing.expect(std.mem.indexOf(u8, out, "val metadata: JsonElement?,\n") != null); // record (required)
     try std.testing.expect(std.mem.indexOf(u8, out, "val metadata: JsonElement? = null,\n") != null); // Create/Update (optional)
     try std.testing.expect(std.mem.indexOf(u8, out, "JsonElement??") == null);
@@ -390,7 +427,7 @@ test "Kotlin keywords are sanitized (wire keys unchanged)" {
             .{ .id = "", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } },
         } },
     };
-    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api");
+    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating");
     // Record members: keyword-sanitized Kotlin identifier, wire key untouched via @SerialName.
     try std.testing.expect(std.mem.indexOf(u8, out, "    val class_: String,\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    val object_: Long,\n") != null);
@@ -421,7 +458,7 @@ test "select values differing only in case collide into one Kotlin enum entry �
     };
     try std.testing.expectError(
         error.KotlinIdentCollision,
-        generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api"),
+        generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating"),
     );
 }
 
@@ -437,7 +474,7 @@ test "two schema names mapping to one Kotlin identifier is a generation error" {
     };
     try std.testing.expectError(
         error.KotlinIdentCollision,
-        generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api"),
+        generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating"),
     );
 }
 
@@ -452,10 +489,52 @@ test "a collection with no eligible payload field emits a plain class, not an in
             .{ .id = "", .name = "secret", .hidden = true, .options = .{ .text = .{} } },
         } },
     };
-    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api");
+    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating");
 
     try std.testing.expect(std.mem.indexOf(u8, out, "class GhostCreate {\n    fun toMap(): Map<String, Any?> = emptyMap()\n}\n\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "class GhostUpdate {\n    fun toMap(): Map<String, Any?> = emptyMap()\n}\n\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "data class GhostCreate(") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "data class GhostUpdate(") == null);
+}
+
+test "generate emits the caller-supplied package name, overriding the dating default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "posts", .fields = &.{
+            .{ .id = "", .name = "title", .options = .{ .text = .{} } },
+        } },
+    };
+    const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api", "com.example.app");
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "package com.example.app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "package io.github.valthon.zigbase.codegen.dating") == null);
+}
+
+test "generate rejects an empty or injection-y --package value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "posts", .fields = &.{
+            .{ .id = "", .name = "title", .options = .{ .text = .{} } },
+        } },
+    };
+    const gen = struct {
+        fn call(al: std.mem.Allocator, c: []const schema.Collection, pkg: []const u8) ![]const u8 {
+            return generate(al, c, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api", pkg);
+        }
+    }.call;
+    try std.testing.expectError(error.EmptyPackageName, gen(a, &cols, ""));
+    // Injection vectors: semicolon, newline+code, braces/quotes.
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "com.example;evil"));
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "com.example\npublic fun x() {}"));
+    // Malformed dotted identifiers.
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, ".leading"));
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "trailing."));
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "a..b"));
+    try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "1abc.def"));
+    // A well-formed package still generates.
+    _ = try gen(a, &cols, "com.example.app_2");
 }

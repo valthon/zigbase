@@ -1848,6 +1848,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
                     .admin_email = ta.admin_email,
                     .admin_password = ta.admin_password,
                     .lang = lang,
+                    .kotlin_package = ta.package,
                 });
             } else {
                 std.log.err("typegen: this binary was not built with .enable_typegen = true", .{});
@@ -3420,10 +3421,15 @@ fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const
 fn printTypegenUsage(io: std.Io, file: std.Io.File) void {
     emit(io, file,
         \\Usage: <app> typegen (--data-dir <path> | --url <origin>) --out <file>
+        \\                     [--lang ts|dart|python|kotlin]
         \\                     [--api-prefix <prefix>] [--client-name <name>] [--check]
+        \\                     [--package <name>]                        (--lang kotlin only)
         \\                     [--admin-email <e> --admin-password <p>]   (with --url)
         \\
-        \\Generates a typed TypeScript client from a running instance's schema.
+        \\Generates a typed client from a running instance's schema. --lang selects
+        \\the target language (default ts). --package overrides the Kotlin `package`
+        \\declaration (default io.github.valthon.zigbase.codegen.dating); ignored for
+        \\every other --lang.
         \\
     , .{});
 }

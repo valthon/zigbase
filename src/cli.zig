@@ -65,6 +65,10 @@ pub const TypegenArgs = struct {
     check: bool = false,
     /// Output language: "ts" (default) or "dart".
     lang: []const u8 = "ts",
+    /// Kotlin-only: the `package` declaration for the generated file.
+    /// Defaults to the dating fixture's namespace (keeps the committed golden
+    /// byte-stable); pass --package for a real consumer app.
+    package: []const u8 = "io.github.valthon.zigbase.codegen.dating",
 };
 
 /// `import`: offline, encryption-aware bulk NDJSON record import (issue #283). Streams a
@@ -301,6 +305,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 ta.lang = args[i];
+            } else if (std.mem.eql(u8, a, "--package")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ta.package = args[i];
             } else if (std.mem.eql(u8, a, "--admin-email")) {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;

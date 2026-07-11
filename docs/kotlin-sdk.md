@@ -763,9 +763,9 @@ The same generator that emits TypeScript/Dart/Python emits Kotlin — pass `--la
 
 ```bash
 # Runtime introspection (no Zig source; reads a provisioned data dir or a live server):
-zigbase typegen --data-dir ./zb_data --out ZbaseGen.kt --lang kotlin
+zigbase typegen --data-dir ./zb_data --out ZbaseGen.kt --lang kotlin --package com.example.app
 zigbase typegen --url https://api.example.com --admin-email admin@x.io --admin-password '…' \
-  --out ZbaseGen.kt --lang kotlin
+  --out ZbaseGen.kt --lang kotlin --package com.example.app
 
 # Comptime (reads your Zig schema) via a build step wired with genClientStep's `lang: "kotlin"`:
 zig build gen-client   # when the consumer's step passes .lang = "kotlin"
@@ -780,11 +780,11 @@ re-run your formatter on the output — this repo formats its own committed gold
 the committed file has drifted from the schema, the same staleness-gate recipe as the
 [TypeScript generator](typescript-sdk.md#staleness-gate-ci).
 
-**The emitted `package` declaration is currently fixed**, regardless of `--out`'s destination
-— today it's always `package io.github.valthon.zigbase.codegen.dating` (the repo's own golden
-fixture's package). After generating into your own project, edit that one line (and move the
-file to match, if your build layout cares) to your app's own package; parameterizing it via a
-future `--package` flag is a natural follow-up.
+**`--package <name>` sets the emitted `package` declaration** (Kotlin-only; ignored for every
+other `--lang`). Defaults to `io.github.valthon.zigbase.codegen.dating` (the repo's own golden
+fixture's package) so an unqualified invocation keeps the committed golden byte-stable — pass
+`--package com.example.app` to target your own project's namespace instead of hand-editing the
+generated file's `package` line afterward.
 
 The header comment stamps a `schema-hash` (a content fingerprint — what `--check` actually
 compares) and a `typed-core-version` — the `io.github.valthon.zigbase.typed.TYPED_CORE_VERSION`
