@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Zig code-review standard — read [`NO_SLOP.md`](NO_SLOP.md).** Before reviewing or writing Zig here, apply the quality bar in **[`NO_SLOP.md`](NO_SLOP.md)** — a research-grounded rubric distilled from Andrew Kelley's positions and the official Zig docs (explicit allocators, guaranteed `defer`/`errdefer`, errors-as-values, no hidden control flow, correctness-over-passing-tests, disciplined comptime), plus an explicit list of what *not* to flag (style/naming is deliberately un-enforced). Judge code properties, never authorship.
+
 ## What this is
 
 ZigBase is a single-binary, PocketBase-inspired (not API-compatible) backend in **Zig 0.16**, backed by an embedded SQLite (vendored amalgamation) and the `zap`/facil.io HTTP server. It is **two things at once**:
