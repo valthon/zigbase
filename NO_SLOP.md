@@ -1,6 +1,6 @@
 # NO_SLOP.md — Zig code-review standard for AI reviewers
 
-> **What this is:** the quality bar every change to this Zig codebase is reviewed against, distilled from Andrew Kelley's own writing, the official Zig docs and `zig zen`, and the Zig project's stated positions. When an AI agent reviews or writes Zig here, *this* is the rubric. A shareable/printable version of this guide is published as an artifact (see the end of this file).
+> **What this is:** the quality bar every change to this Zig codebase is reviewed against, distilled from Andrew Kelley's own writing, the official Zig docs and `zig zen`, and the Zig project's stated positions. When an AI agent reviews or writes Zig here, *this* is the rubric.
 >
 > Every claim below traces to a cited primary or corroborated source (see "Sources"). Findings were adversarially verified; two tempting-but-unsupported claims were dropped and are flagged in "What the evidence does NOT support."
 
@@ -217,4 +217,4 @@ Also note the honest source-strength split: §2–§5 rest on **primary** source
 - JetBrains Blog, *Why Zig Isn't 1.0 (Yet)* — https://blog.jetbrains.com/blog/2026/06/05/why-zig-isn-t-1-0-yet/
 - Sourcegraph, *Revisiting the design approach to Zig* — https://sourcegraph.com/blog/zig-programming-language-revisiting-design-approach
 
-*Methodology: 6 search angles → 21 sources → 72 extracted claims → 25 verified by 3-vote adversarial verification (23 confirmed, 2 refuted). Refuted claims are recorded in §7. A shareable, print-to-PDF version of this guide is published as a Claude artifact.*
+*Methodology: 6 search angles → 21 sources → 72 extracted claims → 25 verified by 3-vote adversarial verification (23 confirmed, 2 refuted). Refuted claims are recorded in §7.*
