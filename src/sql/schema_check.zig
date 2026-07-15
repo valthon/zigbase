@@ -15,7 +15,8 @@
 //!   - TABLE names after `FROM` / `JOIN` / `INTO` / `UPDATE` are validated strictly (the common
 //!     typo). CTE names (`WITH x AS (...)`), `<collection>_fts` shadow tables, and `extra_tables`
 //!     (internal/migration-owned) all count as known. A subquery `FROM (SELECT ...)` is never
-//!     treated as a table.
+//!     treated as a table, and the `UPDATE` in an upsert's `ON CONFLICT ... DO UPDATE SET` is a
+//!     conflict clause with no table operand (issue #290), not an `UPDATE <table>` statement.
 //!   - QUALIFIED columns `alias.column` / `table.column` are validated ONLY when the qualifier
 //!     resolves to a known collection (via the FROM/JOIN alias map). Everything else is skipped:
 //!     unqualified columns, function names, computed `AS` aliases, `alias.*`, expression tokens,
@@ -318,8 +319,14 @@ const Analyzer = struct {
     // -- pass B: validate tables + build alias map --------------------------
     fn checkTables(self: *Analyzer, src: []const u8) ?Finding {
         var lex = Lexer{ .src = src };
+        // The token seen by the PREVIOUS loop iteration. Branches below consume extra tokens
+        // (table refs, aliases) without updating it, but that staleness is safe: it only matters
+        // when `t` is UPDATE, and then `prev` is either genuinely the adjacent token or one of the
+        // branch keywords (FROM/JOIN/INTO/UPDATE) — never a spurious DO.
+        var prev = Tok{ .kind = .other };
         while (true) {
             const t = lex.next();
+            defer prev = t;
             if (t.kind == .eof) break;
             if (kwEq(t, "from")) {
                 // comma-separated table list
@@ -334,6 +341,13 @@ const Analyzer = struct {
             } else if (kwEq(t, "join") or kwEq(t, "into")) {
                 if (self.parseTableRef(&lex)) |f| return f;
             } else if (kwEq(t, "update")) {
+                // Upsert conflict clause: `INSERT ... ON CONFLICT [(...)] DO UPDATE SET ...`.
+                // This UPDATE has NO table operand — the SET assignments target the INSERT's
+                // table (already validated via INTO) — so treating the next token as a table
+                // would misread `SET` as a name. `DO` immediately before UPDATE only occurs in
+                // this clause in valid SQLite, so skip table parsing here. (A quoted `"do"` is
+                // a non-keyword token, so kwEq stays false and a real UPDATE is unaffected.)
+                if (kwEq(prev, "do")) continue;
                 // SQLite allows an optional conflict clause before the table:
                 // `UPDATE OR REPLACE|ROLLBACK|ABORT|FAIL|IGNORE <table> SET ...`. Skip the
                 // `OR <action>` pair so the table token (not `OR`) is what gets validated.
@@ -590,6 +604,27 @@ test "positive: UPDATE OR <conflict-action> <table> is not flagged" {
     try expectOk("update or replace posts set title = ?1"); // case-insensitive keywords
 }
 
+test "positive: ON CONFLICT ... DO UPDATE SET upsert (issue #290)" {
+    // The conflict clause's UPDATE has no table operand — `SET` must not be read as a table.
+    try expectOk(
+        "INSERT INTO orders (total, note) VALUES (?1, ?2) ON CONFLICT(total) DO UPDATE SET note = ?2",
+    );
+    // Quoted identifiers throughout (the shape from the issue report).
+    try expectOk(
+        "INSERT INTO \"orders\"(\"total\", \"note\") VALUES(?1, ?2) ON CONFLICT(\"total\") DO UPDATE SET \"note\" = ?2",
+    );
+    // No conflict target (`ON CONFLICT DO UPDATE`) is also valid SQLite.
+    try expectOk("INSERT INTO orders (total) VALUES (?1) ON CONFLICT DO UPDATE SET total = ?1");
+    // `excluded.<col>` references in the SET/WHERE are skipped (unknown qualifier), not flagged.
+    try expectOk(
+        "INSERT INTO orders (total, note) VALUES (?1, ?2) ON CONFLICT(total) DO UPDATE SET note = excluded.note WHERE excluded.total > 0",
+    );
+    // Case-insensitive keywords.
+    try expectOk("insert into orders (total) values (?1) on conflict(total) do update set total = ?1");
+    // DO NOTHING never had the problem; keep it covered.
+    try expectOk("INSERT INTO orders (total) VALUES (?1) ON CONFLICT DO NOTHING");
+}
+
 test "positive: ambiguous alias (same name, two collections) is not column-checked" {
     // `x` is bound to `users` in one CTE body and `orders` in another. Both tables are valid, so
     // table checking passes; `x.total` is valid on orders but NOT users. Resolving `x` to the
@@ -654,6 +689,23 @@ test "negative: unknown table after UPDATE" {
 test "negative: UPDATE OR <action> still flags a bad table" {
     // Skipping the conflict clause must not skip validating the table after it.
     try expectUnknownTable("UPDATE OR REPLACE nonexistent SET title = ?1", "nonexistent");
+}
+
+test "negative: upsert INSERT target is still validated" {
+    // Skipping the DO UPDATE clause must not skip the INTO table check.
+    try expectUnknownTable(
+        "INSERT INTO orderz (total) VALUES (?1) ON CONFLICT(total) DO UPDATE SET total = ?1",
+        "orderz",
+    );
+}
+
+test "negative: qualified column in DO UPDATE SET resolving to the target is checked" {
+    // `INSERT INTO orders AS o` binds `o` → orders, so `o.nope` in the SET is a real typo.
+    try expectUnknownColumn(
+        "INSERT INTO orders AS o (total) VALUES (?1) ON CONFLICT(total) DO UPDATE SET total = o.nope",
+        "orders",
+        "nope",
+    );
 }
 
 test "negative: unknown table after DELETE FROM" {
