@@ -630,7 +630,8 @@ subset and skips anything it cannot confidently classify.
 - **Tables are checked strictly** — the name after `FROM` / `JOIN` / `INTO` / `UPDATE`. Known =
   your collection names ∪ `<collection>_fts` (for a `.searchable` collection's shadow table) ∪ CTE
   names (`WITH x AS (...)`) ∪ `extra_tables`. A subquery `FROM (SELECT ...)` is never treated as a
-  table.
+  table, and upserts are understood: the `UPDATE` in `ON CONFLICT ... DO UPDATE SET` is a conflict
+  clause with no table operand, so it checks cleanly with no opt-out needed.
 - **Qualified columns are best-effort** — `alias.column` / `table.column` is checked **only** when
   the qualifier resolves to a known collection (via the `FROM`/`JOIN` alias map). The valid-column
   set is `id, created, updated` + your fields, plus the auth system columns (`email`, `username`,
