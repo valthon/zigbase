@@ -42,7 +42,7 @@ fn cronNameToNum(tok: []const u8) ?u32 {
 /// up to ~532k times (minute-by-minute over ~370 days), so a numeric token must not pay for a
 /// scan of the 19 name aliases.
 fn parseCronNum(tok: []const u8) ?u32 {
-    return (std.fmt.parseInt(u32, tok, 10) catch null) orelse cronNameToNum(tok);
+    return std.fmt.parseInt(u32, tok, 10) catch cronNameToNum(tok);
 }
 
 /// Does a single cron field match `value`? Supports `*`, `a`, `a,b,c`, `a-b`, `*/n`, plus
@@ -64,8 +64,16 @@ pub fn cronFieldMatches(field: []const u8, value: u32, min: u32, max: u32) bool 
         }
         if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
             const lo = parseCronNum(part[0..dash]) orelse continue;
-            const hi = parseCronNum(part[dash + 1 ..]) orelse continue;
-            if (value >= lo and value <= hi) return true;
+            // Standard `<lo>-<hi>/<step>` (e.g. "0-23/2"): an optional step over the range.
+            var hi_tok = part[dash + 1 ..];
+            var step: u32 = 1;
+            if (std.mem.indexOfScalar(u8, hi_tok, '/')) |slash| {
+                step = std.fmt.parseInt(u32, hi_tok[slash + 1 ..], 10) catch continue;
+                if (step == 0) continue;
+                hi_tok = hi_tok[0..slash];
+            }
+            const hi = parseCronNum(hi_tok) orelse continue;
+            if (value >= lo and value <= hi and (value - lo) % step == 0) return true;
             continue;
         }
         const n = parseCronNum(part) orelse continue;
@@ -109,7 +117,9 @@ fn cronMatchesAt(expr: []const u8, t: i64) bool {
         cronFieldMatches(f_hour, c.hour, 0, 23) and
         cronFieldMatches(f_dom, c.dom, 1, 31) and
         cronFieldMatches(f_mon, c.month, 1, 12) and
-        cronFieldMatches(f_dow, c.dow, 0, 6);
+        // Day-of-week: 0 and 7 both mean Sunday (standard cron). Retry a Sunday as value 7 so an
+        // expression written with 7 (bare, in a range, or a step) still fires.
+        (cronFieldMatches(f_dow, c.dow, 0, 6) or (c.dow == 0 and cronFieldMatches(f_dow, 7, 0, 7)));
 }
 
 /// Next fire strictly after `after_unix` (all times are UTC):
@@ -133,6 +143,83 @@ pub fn nextFire(sched: Schedule, after_unix: i64) ?i64 {
             }
             return null;
         },
+    }
+}
+
+/// The five cron field names, in order, for build-time error messages.
+const cron_field_names = [_][]const u8{ "minute", "hour", "day-of-month", "month", "day-of-week" };
+
+/// Inclusive valid value range for each cron field, in the same order as `cron_field_names`.
+/// Day-of-week permits 7 (a Sunday alias, matched at runtime by `cronMatchesAt`).
+const cron_field_ranges = [_][2]u32{ .{ 0, 59 }, .{ 0, 23 }, .{ 1, 31 }, .{ 1, 12 }, .{ 0, 7 } };
+
+/// Comptime-validate one comma-list cron sub-part: `*`, `*/n` (n a positive number), a
+/// number/3-letter-name, or a `lo-hi` range thereof — exactly the forms `cronFieldMatches`
+/// can actually match at runtime. `@compileError`s (prefixed with `what`/field name) otherwise.
+fn validateCronPart(comptime part: []const u8, comptime field_name: []const u8, comptime min: u32, comptime max: u32, comptime expr: []const u8, comptime what: []const u8) void {
+    comptime {
+        const prefix = what ++ ": cron " ++ field_name ++ " field '" ++ expr ++ "' ";
+        const range_txt = std.fmt.comptimePrint("{d}-{d}", .{ min, max });
+        if (part.len == 0)
+            @compileError(prefix ++ "has an empty sub-part (a stray or trailing comma)");
+        if (std.mem.eql(u8, part, "*")) return;
+        if (std.mem.startsWith(u8, part, "*/")) {
+            const step = std.fmt.parseInt(u32, part[2..], 10) catch
+                @compileError(prefix ++ "step '" ++ part ++ "' must be '*/<positive number>'");
+            if (step == 0) @compileError(prefix ++ "step '" ++ part ++ "' must be greater than zero");
+            return;
+        }
+        if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
+            // Accept the standard `<lo>-<hi>` and `<lo>-<hi>/<step>` forms.
+            var hi_tok: []const u8 = part[dash + 1 ..];
+            if (std.mem.indexOfScalar(u8, hi_tok, '/')) |slash| {
+                const step = std.fmt.parseInt(u32, hi_tok[slash + 1 ..], 10) catch
+                    @compileError(prefix ++ "range step '" ++ part ++ "' must be '<lo>-<hi>/<positive number>'");
+                if (step == 0) @compileError(prefix ++ "range step '" ++ part ++ "' must be greater than zero");
+                hi_tok = hi_tok[0..slash];
+            }
+            const lo = parseCronNum(part[0..dash]) orelse
+                @compileError(prefix ++ "range '" ++ part ++ "' lower bound must be a number or 3-letter name");
+            const hi = parseCronNum(hi_tok) orelse
+                @compileError(prefix ++ "range '" ++ part ++ "' upper bound must be a number or 3-letter name");
+            if (lo < min or lo > max or hi < min or hi > max)
+                @compileError(prefix ++ "range '" ++ part ++ "' is outside the valid " ++ field_name ++ " range " ++ range_txt);
+            if (lo > hi)
+                @compileError(prefix ++ "range '" ++ part ++ "' has its lower bound above its upper bound");
+            return;
+        }
+        const v = parseCronNum(part) orelse
+            @compileError(prefix ++ "value '" ++ part ++ "' is not a number, a 3-letter name (JAN..DEC / SUN..SAT), '*', '*/n', or a range");
+        if (v < min or v > max)
+            @compileError(prefix ++ "value '" ++ part ++ "' is outside the valid " ++ field_name ++ " range " ++ range_txt);
+    }
+}
+
+/// Comptime-validate a 5-field cron expression, `@compileError`-ing (prefixed with `what`)
+/// on a malformed one: wrong field count, an empty field, or a sub-part that is not `*`,
+/// `*/n`, a number/3-letter-name, or a `lo-hi` range thereof. Reuses the same field-parsing
+/// pieces `cronMatchesAt`/`cronFieldMatches` evaluate at runtime, so an expression that
+/// validates here is one the scheduler can actually fire — catching at build time the
+/// malformed `.cron` strings (`"0 3 * *"`, `"0 0 1 * "`, `"MONDAY"`) that would otherwise make
+/// `nextFire` return null and the job boot-fire once then silently retire.
+pub fn validateCron(comptime expr: []const u8, comptime what: []const u8) void {
+    comptime {
+        // Parsing each sub-token (parseCronNum → parseInt) costs backwards branches; validating
+        // several cron strings in one comptime scope overruns the default 1000-branch budget.
+        @setEvalBranchQuota(10_000);
+        var it = std.mem.splitScalar(u8, expr, ' ');
+        var count: usize = 0;
+        while (it.next()) |field| {
+            if (count == 5)
+                @compileError(what ++ ": cron expression '" ++ expr ++ "' has more than 5 space-separated fields (expected 'minute hour day-of-month month day-of-week')");
+            if (field.len == 0)
+                @compileError(what ++ ": cron expression '" ++ expr ++ "' has an empty " ++ cron_field_names[count] ++ " field (check for a doubled or trailing space)");
+            var parts = std.mem.splitScalar(u8, field, ',');
+            while (parts.next()) |part| validateCronPart(part, cron_field_names[count], cron_field_ranges[count][0], cron_field_ranges[count][1], expr, what);
+            count += 1;
+        }
+        if (count != 5)
+            @compileError(what ++ ": cron expression '" ++ expr ++ "' has " ++ std.fmt.comptimePrint("{d}", .{count}) ++ " fields, expected 5 ('minute hour day-of-month month day-of-week')");
     }
 }
 
@@ -202,9 +289,52 @@ test "cron name ranges and lists" {
     try std.testing.expect(cronFieldMatches("JAN,JUL", 7, 1, 12));
 }
 
+test "cron range-with-step (lo-hi/step) matches step-aligned values within the range" {
+    // "0-23/2" = every even hour.
+    var h: u32 = 0;
+    while (h <= 23) : (h += 1) {
+        try std.testing.expectEqual(h % 2 == 0, cronFieldMatches("0-23/2", h, 0, 23));
+    }
+    // The step aligns to the range's LOW bound, not zero: "1-7/2" = {1,3,5,7}.
+    try std.testing.expect(cronFieldMatches("1-7/2", 1, 0, 59));
+    try std.testing.expect(cronFieldMatches("1-7/2", 3, 0, 59));
+    try std.testing.expect(!cronFieldMatches("1-7/2", 2, 0, 59));
+    try std.testing.expect(!cronFieldMatches("1-7/2", 8, 0, 59));
+}
+
+test "cron day-of-week 7 is Sunday (standard 0/7 alias)" {
+    const sunday: i64 = 1672531200; // 2023-01-01 00:00:00 UTC is a Sunday (dow 0)
+    try std.testing.expect(cronMatchesAt("0 0 * * 7", sunday)); // 7 = Sunday
+    try std.testing.expect(cronMatchesAt("0 0 * * 0", sunday)); // 0 = Sunday
+    try std.testing.expect(cronMatchesAt("0 0 * * 5-7", sunday)); // Fri-Sun range includes Sunday
+    try std.testing.expect(!cronMatchesAt("0 0 * * 7", sunday + 86400)); // Monday must not match
+}
+
+test "validateCron accepts the full standard grammar (range-with-step, dow 7)" {
+    comptime {
+        validateCron("0-23/2 * * * *", "t"); // range-with-step
+        validateCron("0 0 * * 7", "t"); // dow 7 = Sunday alias
+        validateCron("*/15 0-23/2 1-15 JAN-DEC MON-FRI", "t"); // combined forms
+    }
+    // Out-of-range values (minute 60, hour 24, month 13, dom 0, dow 8) @compileError at build time,
+    // so they cannot be exercised at runtime — their rejection is enforced by the compiler.
+}
+
 test "cron steps stay numeric and unknown tokens are skipped" {
     try std.testing.expect(cronFieldMatches("*/2", 4, 0, 59));
     try std.testing.expect(!cronFieldMatches("FOO", 3, 0, 59));
+}
+
+test "validateCron accepts well-formed expressions" {
+    // A malformed expression would @compileError (can't be asserted from a unit test); this
+    // confirms the validator does NOT reject the grammar `cronFieldMatches` actually accepts.
+    comptime {
+        validateCron("* * * * *", "t");
+        validateCron("0 3 * * *", "t");
+        validateCron("*/15 0 1,15 JAN-DEC MON-FRI", "t");
+        validateCron("0 0 1 JAN *", "t");
+        validateCron("0 0 30 2 *", "t"); // grammatically valid though the date never occurs
+    }
 }
 
 test "nextFire cron: name-based month equals numeric equivalent" {

@@ -35,6 +35,14 @@ assembled and validated when your program compiles:
 - An unknown key on a `.collections` collection or field spec (e.g. `.requied`,
   `.encrypte`, `.ttl_filed`, or a misspelled rule under `.rules`) is a
   **compile error** — the message lists the recognized keys for that spec.
+- An unknown/typo'd key on any other list-shaped config surface is a **compile
+  error** too, rather than being silently ignored: route specs
+  (`.rate_limit`/`.rate_limit_key`/etc.), background job specs, `.auth.methods` and
+  each built-in method's options (`.magic_link`/`.otp`/`.password`/`.webauthn`),
+  `.auth.oauth2` and its provider literals (e.g. `.tokenURL`), collection `.indexes`
+  entries (`.unique`/`.collation`/`.where`), the `.pools` tuning group, and
+  `.migrations` entries. A duplicate or empty `.migrations` id is also a compile
+  error.
 
 So a misconfigured extension never reaches runtime — it fails the build loudly.
 
@@ -91,7 +99,7 @@ error.**
 | `routes` | Custom HTTP routes. | always — routing plumbing is core; a route's code is only in your binary because you wrote it. |
 | `onAuth` | Notify-only: fires *after* a session is issued (login / oauth2). | always — auth lifecycle plumbing is core. |
 | `beforeAuthSuccess` | Writable, transactional, abortable hook that runs *before* the session is issued (claim records on first login; veto a login). | always — auth lifecycle plumbing is core. |
-| `auth` | Auth config group: `.hooks` (lifecycle hooks — before/after `register`/`logout`/`refresh`/`password-change`), `.methods` (built-in auth-method set + custom `AuthMethod` types), `.captcha` (`.{ .provider, .secret }`), and `.session` (`.store = .epoch`\|`.table`, `.gc_cron`). See [Auth methods](#auth-methods-pluggable), [CAPTCHA](#captcha-verification-ctxverifycaptcha), and [Revoking sessions](#revoking-sessions-99). | mixed — the hook dispatch is core (empty when unset); a deselected `.methods` built-in, `.captcha`, and `.session = .{ .store = .table }`'s extra store/GC machinery are each *excluded* until configured. |
+| `auth` | Auth config group: `.hooks` (lifecycle hooks — before/after `register`/`logout`/`refresh`/`password-change`), `.methods` (built-in auth-method set + custom `AuthMethod` types), `.captcha` (`.{ .provider, .secret }`), and `.session` (`.store = .epoch`\|`.table`, `.gc_cron`, `.rotation_grace_s`). See [Auth methods](#auth-methods-pluggable), [CAPTCHA](#captcha-verification-ctxverifycaptcha), and [Revoking sessions](#revoking-sessions-99). | mixed — the hook dispatch is core (empty when unset); a deselected `.methods` built-in, `.captcha`, and `.session = .{ .store = .table }`'s extra store/GC machinery are each *excluded* until configured. |
 | `onFileServe` | Fires before serving a file download (may deny). | always — file-serving plumbing is core. |
 | `onFileUpload` | Fires after a file upload. | always — file-upload plumbing is core. |
 | `onBootstrap` | Lifecycle: after bootstrap. | always — lifecycle dispatch is core. |
@@ -2196,7 +2204,7 @@ There are three tiers:
 
 > **What lives under `.auth` (comptime) vs env.** The comptime `.auth` config group holds
 > the *structure/behavior* knobs: `.hooks`, `.methods`, `.captcha`, and `.session`
-> (`.store`/`.gc_cron`). The deploy-varying **runtime** auth knobs stay env-configured and are
+> (`.store`/`.gc_cron`/`.rotation_grace_s`). The deploy-varying **runtime** auth knobs stay env-configured and are
 > deliberately **not** under `.auth`: token TTLs (`ZIGBASE_AUTH_TOKEN_TTL`), the server-side
 > OAuth `state` store (`ZIGBASE_OAUTH_STATE_*`), cookie security (`ZIGBASE_COOKIE_SECURE` /
 > `--insecure-cookies`), and rate-limiting (`ZIGBASE_RATE_LIMIT_*`). See the env table in the
@@ -2703,6 +2711,16 @@ row; `revokeAllSessions` clears all of the principal's rows (and bumps the epoch
 last token *refresh*, not every request** — verify never writes the session table, so an
 authenticated request stays one read (no per-request write amplification on the single writer).
 
+**Rotation grace (`.rotation_grace_s`, HTTP `auth-refresh` only).** When the `POST
+/api/collections/:col/auth-refresh` endpoint rotates a session, the predecessor row is not
+deleted outright — its `expires` is clamped to `now + rotation_grace_s` so requests already in
+flight with the old cookie don't `403` through the rotation window (an SPA whose guard refreshes
+on navigation races its own data fetches). The graced rows are reaped by the GC sweep below. The
+default is **30** seconds; set `.auth.session = .{ .store = .table, .rotation_grace_s = 0 }` to
+restore an immediate delete (validated at comptime: negative is a `@compileError`, and the key has
+no effect — also a `@compileError` — outside `.table` mode). The in-process `ctx.auth().refresh()`
+/ `ctx.auth().rotate()` helpers do **not** use the grace path; they delete the old row immediately.
+
 **Expired-session GC.** Enabling `.table` auto-installs a framework-internal recurring job
 (`_session_gc`) that deletes expired `_sessions` rows (those whose `expires` has passed; NULL =
 never expires) in bounded batches on the writer — no opt-in needed, and **nothing is installed
@@ -2784,10 +2802,15 @@ The scheduler is intentionally simple (see
 
 - **Single-process** — no distributed coordination.
 - **UTC** — all cron/interval evaluation is in UTC.
-- **Cron** — UTC, minute-granularity; supports `*`, `a`, `a,b,c`, `a-b`, `*/n`,
-  and case-insensitive 3-letter month (`JAN`..`DEC`) / day-of-week (`SUN`..`SAT`)
-  names (steps stay numeric). A malformed sub-part is silently skipped rather than
-  rejected, so a typo'd field may match unexpectedly.
+- **Cron** — UTC, minute-granularity; supports the full standard grammar: `*`, `a`,
+  `a,b,c`, `a-b`, `*/n`, `a-b/n` (a step over a range, e.g. `0-23/2` for every other
+  hour), and case-insensitive 3-letter month (`JAN`..`DEC`) / day-of-week
+  (`SUN`..`SAT`) names (steps stay numeric). Day-of-week `7` is a Sunday alias — `0`
+  and `7` both mean Sunday. A `.cron` string is **validated at compile time**: a
+  malformed expression (wrong field count, a full day name like `MONDAY`, a trailing
+  or doubled space) or an out-of-range value (minute > 59, hour > 23, month > 12,
+  day-of-month `0`, day-of-week > 7) is a **build error**, not a job that silently
+  never fires. The same validation covers `.auth.session.gc_cron`.
 - **Day-of-month and day-of-week are ANDed** (not Vixie cron's OR semantics).
 - **Minute granularity** — the smallest schedule resolution is one minute.
 - **Interval drift** — interval schedules measure the next fire from the

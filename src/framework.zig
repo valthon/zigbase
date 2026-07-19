@@ -343,6 +343,24 @@ fn validateMigration(comptime id: []const u8, comptime has_change: bool, comptim
     if (has_down and !has_up and !has_change) @compileError("migration '" ++ id ++ "': .down needs a forward step");
 }
 
+/// Comptime-check that every migration id is non-empty and unique across the whole list.
+/// `runMigrations` records each entry under `prov:<id>` and skips an already-applied name,
+/// so two entries sharing an id (or an empty id, all colliding under `prov:`) would make the
+/// second one silently skipped on EVERY environment forever — the whole list is comptime-known,
+/// so we reject it at build time like the duplicate-route-name guard (events.zig).
+fn validateMigrationIds(comptime migs: []const provision.Migration) void {
+    comptime {
+        for (migs, 0..) |m, i| {
+            if (m.id.len == 0)
+                @compileError("migration at index " ++ std.fmt.comptimePrint("{d}", .{i}) ++ " has an empty .id (ids are recorded as 'prov:<id>' and must be non-empty and unique)");
+            for (migs[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.id, m.id))
+                    @compileError("duplicate migration id '" ++ m.id ++ "'; each '.migrations' entry needs a distinct .id (it keys the applied-ledger row, so a duplicate is silently skipped forever)");
+            }
+        }
+    }
+}
+
 /// §C.2: one rule for the comptime default AND the runtime override — non-empty,
 /// <= 256 bytes, CR/LF-free (header-injection guard; the value goes on the wire
 /// verbatim as the Cache-Control header value).
@@ -502,6 +520,19 @@ pub fn App(comptime cfg: anytype) type {
                         if (!std.mem.eql(u8, sf.name, "store") and !std.mem.eql(u8, sf.name, "gc_cron") and !std.mem.eql(u8, sf.name, "rotation_grace_s"))
                             @compileError(".auth.session: unknown key '." ++ sf.name ++ "' (recognized: .store, .gc_cron, .rotation_grace_s)");
                     }
+                }
+            }
+            // Validate the `.pools` group's own sub-keys: only the four tuning knobs are read
+            // (via `@hasField`), so a typo (e.g. `.stack_sizes`, `.reader`, `.cache_kb`) would
+            // otherwise be silently dropped and the default kept — mirror the sibling groups.
+            if (@hasField(@TypeOf(cfg), "pools")) {
+                const PT = @TypeOf(cfg.pools);
+                if (@typeInfo(PT) != .@"struct")
+                    @compileError(".pools must be a config group struct: .pools = .{ .jobs = N, .readers = N, .stack_size = N, .cache_kib = N }");
+                for (std.meta.fields(PT)) |pf| {
+                    const pok = std.mem.eql(u8, pf.name, "jobs") or std.mem.eql(u8, pf.name, "readers") or
+                        std.mem.eql(u8, pf.name, "stack_size") or std.mem.eql(u8, pf.name, "cache_kib");
+                    if (!pok) @compileError(".pools: unknown key '." ++ pf.name ++ "' (recognized: .jobs, .readers, .stack_size, .cache_kib)");
                 }
             }
             var d = events.Dispatch{};
@@ -912,7 +943,12 @@ pub fn App(comptime cfg: anytype) type {
             // when the user EXPLICITLY set the key — the default-unset case stays fine.
             if (@hasField(@TypeOf(auth_session_cfg), "gc_cron") and session_store_config != .table)
                 @compileError(".auth.session.gc_cron has no effect without .auth.session.store = .table");
-            break :blk if (@hasField(@TypeOf(auth_session_cfg), "gc_cron")) auth_session_cfg.gc_cron else "0 * * * *";
+            const c = if (@hasField(@TypeOf(auth_session_cfg), "gc_cron")) auth_session_cfg.gc_cron else "0 * * * *";
+            // Validate the cron grammar at build time: a malformed override (wrong field count,
+            // a full day name, a trailing space) would otherwise make the GC job boot-fire once
+            // and then silently retire, so the expired-session sweep never runs on schedule.
+            schedule.validateCron(c, ".auth.session.gc_cron");
+            break :blk c;
         };
 
         /// Predecessor-session grace (seconds) after an HTTP auth-refresh rotation — the old
@@ -1339,6 +1375,7 @@ pub fn App(comptime cfg: anytype) type {
                 // Typed slice / array ptr — no lowering, but run the same forward-step
                 // validation (exactly one of .change/.up; .down needs a forward step).
                 for (raw) |entry| validateMigration(entry.id, entry.change != null, entry.up != null, entry.down != null);
+                validateMigrationIds(raw);
                 break :blk raw;
             }
             // Bare-tuple form (E1): lower each entry to a Migration, mirroring .static_routes.
@@ -1351,6 +1388,20 @@ pub fn App(comptime cfg: anytype) type {
             for (0..n) |i| {
                 const entry = raw[i];
                 const ET = @TypeOf(entry);
+                // Reject a typo'd key (`.transational`, `.donw`, `.chnage`) at compile time
+                // rather than silently dropping it — the same unknown-key gate every other
+                // list-shaped config key carries (see `.static_routes` above).
+                if (@typeInfo(ET) != .@"struct")
+                    @compileError(".migrations: each entry must be '.{ .id = \"...\", .change = fn }' (or '.up = fn')");
+                for (std.meta.fields(ET)) |mf| {
+                    const known = std.mem.eql(u8, mf.name, "id") or std.mem.eql(u8, mf.name, "change") or
+                        std.mem.eql(u8, mf.name, "up") or std.mem.eql(u8, mf.name, "down") or
+                        std.mem.eql(u8, mf.name, "transactional");
+                    if (!known)
+                        @compileError(".migrations: unknown key '." ++ mf.name ++ "' (recognized: .id, .change, .up, .down, .transactional)");
+                }
+                if (!@hasField(ET, "id"))
+                    @compileError(".migrations: each entry needs an .id (a stable unique string)");
                 const has_change = @hasField(ET, "change");
                 const has_up = @hasField(ET, "up");
                 const has_down = @hasField(ET, "down");
@@ -1364,6 +1415,7 @@ pub fn App(comptime cfg: anytype) type {
                 };
             }
             const final = out;
+            validateMigrationIds(&final);
             break :blk &final;
         };
 
@@ -2289,8 +2341,17 @@ fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.C
     return cfg;
 }
 
+/// Ensure the data dir exists before opening files under it. A genuine failure (EACCES on a
+/// system path, a read-only filesystem, ENOSPC) would otherwise be swallowed and later surface
+/// only as an opaque `OpenFailed` with no path — log the actionable cause here so boot
+/// diagnostics name the real problem. Best-effort: the subsequent open reports the fatal error.
+fn ensureDataDir(io: std.Io, data_dir: []const u8) void {
+    std.Io.Dir.cwd().createDirPath(io, data_dir) catch |e|
+        std.log.warn("cannot create data dir '{s}': {s} (the database/secret open below will fail)", .{ data_dir, @errorName(e) });
+}
+
 fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions) !db.Pool {
-    std.Io.Dir.cwd().createDirPath(io, cfg.data_dir) catch {};
+    ensureDataDir(io, cfg.data_dir);
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/data.db", .{cfg.data_dir}, 0);
     defer allocator.free(db_path);
     return db.Pool.initOpts(allocator, io, db_path, options);
@@ -2693,7 +2754,7 @@ fn resolveJwtSecret(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config
     }
     // Unset: persist a per-deployment secret under the data dir so "unset" is never
     // a shared, guessable default. Ensure the data dir exists first.
-    std.Io.Dir.cwd().createDirPath(io, cfg.data_dir) catch {};
+    ensureDataDir(io, cfg.data_dir);
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.data_dir, jwt_secret_filename });
     defer allocator.free(path);
     if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096))) |existing| {
@@ -2844,6 +2905,26 @@ fn BootedApp(comptime opts: ServeOpts) type {
 /// pointers reference stable sibling fields (never a stack local). On any failure the errdefers
 /// unwind exactly the resources initialized so far; on success ownership transfers to the caller,
 /// who must eventually call `holder.deinit()`.
+/// When the built-in webhook job kind is registered, warn about every declared queue whose
+/// `visibility_timeout_s` sits below `webhook.minSafeVisibilityTimeoutS()` — the worst-case time a
+/// default webhook delivery can occupy a worker (in-handler retry backoff + all HTTP attempts). A
+/// shorter timeout lets `reclaimStale` re-dispatch an in-flight delivery as a concurrent DUPLICATE.
+/// The active queue's timeout is not reachable from the delivery's job `Ctx`, so this startup check
+/// (fail-open: warn, never refuse) is the seam where a low value is surfaced. See the FOLLOW-UP note
+/// on `webhook.deliver`.
+fn warnUnsafeWebhookQueues(reg: *const queue.Registry) void {
+    if (reg.jobByKind(webhook.job_kind) == null) return; // webhooks not compiled in
+    const floor_s = webhook.minSafeVisibilityTimeoutS();
+    for (reg.queues) |q| {
+        if (q.visibility_timeout_s < floor_s) {
+            std.log.warn(
+                "queue '{s}' has visibility_timeout_s={d}s, below the {d}s a webhook delivery can occupy a worker (in-handler retry backoff up to {d}ms + HTTP attempts). If you deliver webhooks on it, reclaimStale may re-dispatch an in-flight delivery as a concurrent DUPLICATE. Raise this queue's visibility_timeout_s, or lower the per-webhook retries/backoff.",
+                .{ q.name, q.visibility_timeout_s, floor_s, webhook.max_total_backoff_ms },
+            );
+        }
+    }
+}
+
 fn bootApp(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2885,6 +2966,13 @@ fn bootApp(
     if (cfg.realtime_allowed_origins.len == 0) {
         std.log.info("realtime: no allowed Origins configured; cross-origin browser WebSocket upgrades are DENIED (set ZIGBASE_REALTIME_ORIGINS)", .{});
     }
+    // When the built-in webhook job kind is compiled in, warn at startup about any declared queue
+    // whose `visibility_timeout_s` is too small to safely host a webhook delivery's in-handler
+    // retry backoff (else `reclaimStale` can re-dispatch an in-flight delivery as a concurrent
+    // duplicate — see `webhook.minSafeVisibilityTimeoutS`). Fail-open (warn, never refuse): the
+    // queue may never actually carry a webhook, and the delivery's own budget still abandons rather
+    // than overrunning unboundedly.
+    if (opts.queues) |reg| warnUnsafeWebhookQueues(reg);
     if (cfg.sse_heartbeat_seconds != 0 and cfg.sse_heartbeat_seconds > 255) {
         std.log.err("refusing to start: ZIGBASE_SSE_HEARTBEAT_SECONDS/--sse-heartbeat-seconds must be 0 (inherit) or 1..=255, got {d}", .{cfg.sse_heartbeat_seconds});
         return error.InvalidSseHeartbeat;
