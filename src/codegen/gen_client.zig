@@ -73,11 +73,16 @@ pub fn generate(
     client_name: []const u8,
     api_prefix: []const u8,
 ) ![]const u8 {
-    // Validate that every route path starts with the given api_prefix.
+    // Validate that every *typed* route path starts with the given api_prefix.
+    // Untyped routes (`*Ctx`→`http.Response`: ICS/webhook feeds, magic-link
+    // redirects, HTML endpoints) are never emitted into the client (the RPC
+    // renderer skips them), so they legitimately live outside the api_prefix and
+    // must not fail generation — only routes that actually become RPC methods
+    // need to share the prefix.
     // Must use `inline for` because RouteMeta contains `Input: type` (comptime-only field).
     inline for (routes) |r| {
-        if (!std.mem.startsWith(u8, r.path, api_prefix)) {
-            std.log.err("gen_client: route '{s}' does not start with --api-prefix '{s}'; the framework route prefix and the generator prefix disagree.", .{ r.path, api_prefix });
+        if (!r.untyped and !std.mem.startsWith(u8, r.path, api_prefix)) {
+            std.log.err("gen_client: typed route '{s}' does not start with --api-prefix '{s}'; the framework route prefix and the generator prefix disagree.", .{ r.path, api_prefix });
             return error.RoutePrefixMismatch;
         }
     }
@@ -1000,6 +1005,25 @@ test "--check diff: stale buffer differs from fresh output" {
     const stale = try std.fmt.allocPrint(a, "{s}\n// drift\n", .{fresh});
     try std.testing.expect(!std.mem.eql(u8, fresh, stale)); // --check would exit non-zero
     try std.testing.expect(std.mem.eql(u8, fresh, fresh)); // --check would exit zero
+}
+
+test "route prefix: untyped routes outside api_prefix are skipped, typed ones still error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try miniBlog(a);
+    // An untyped feed/redirect outside /api (ICS feed, magic-link) is never
+    // emitted into the client, so it must NOT fail generation.
+    const untyped_out = [_]events.RouteMeta{
+        .{ .method = .GET, .path = "/cal/:secret/bookings.ics", .name = "icsFeed", .auth = .public, .Input = void, .Output = void, .untyped = true },
+    };
+    _ = try generate(a, cols, &untyped_out, &.{}, &.{}, &.{}, true, "users", "BlogClient", "/api");
+    // A *typed* route outside /api is a genuine prefix misconfiguration → error.
+    const Named = struct { x: i64 };
+    const typed_out = [_]events.RouteMeta{
+        .{ .method = .POST, .path = "/oops/typed", .name = "oops", .auth = .public, .Input = Named, .Output = Named, .untyped = false },
+    };
+    try std.testing.expectError(error.RoutePrefixMismatch, generate(a, cols, &typed_out, &.{}, &.{}, &.{}, true, "users", "BlogClient", "/api"));
 }
 
 test "guards run inside generate: operator-named relation target errors" {
