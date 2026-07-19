@@ -51,7 +51,11 @@ fn resolveTarget(alloc: std.mem.Allocator, conn: *db.Db, pc: ?*PageCache, target
 fn canView(alloc: std.mem.Allocator, conn: *db.Db, pc: ?*PageCache, target: schema.Collection, id: []const u8, rctx: *const request.RequestContext) ExpandError!bool {
     if (pc) |c| {
         const key = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ target.id, id });
-        if (c.views.get(key)) |v| return v;
+        if (c.views.get(key)) |v| {
+            alloc.free(key); // probe key not stored on a hit — free it
+            return v;
+        }
+        errdefer alloc.free(key); // owned by the map only once `put` succeeds
         const v = try policy.authorizes(alloc, conn, target, .view, id, rctx);
         try c.views.put(alloc, key, v);
         return v;
@@ -78,6 +82,14 @@ pub fn expand(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, re
 /// byte-identical to calling `expand` on it individually (records are re-fetched fresh per item).
 pub fn expandItems(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, items: []std.json.Value, spec: []const u8, depth: usize, rctx: *const request.RequestContext) ExpandError!void {
     var pc: PageCache = .{};
+    // `cols` keys are borrowed collection ids; `views` keys are owned (allocPrint'd), so free them.
+    // A no-op under a request arena, but keeps the cache correct under any allocator (jobs/CLI/tests).
+    defer {
+        var it = pc.views.keyIterator();
+        while (it.next()) |k| alloc.free(k.*);
+        pc.views.deinit(alloc);
+        pc.cols.deinit(alloc);
+    }
     for (items) |*item| try expandInner(alloc, conn, col, item, spec, depth, rctx, &pc);
 }
 

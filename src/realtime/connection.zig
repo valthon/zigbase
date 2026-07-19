@@ -129,6 +129,7 @@ pub const Conn = struct {
     pub fn updateFilter(self: *Conn, alloc: std.mem.Allocator, topic: []const u8, filter: ?[]const u8) !bool {
         const vp = self.subs.getPtr(topic) orelse return false;
         if (filtersEqual(vp.*, filter)) return true;
+        if (vp.*) |old| alloc.free(old); // release the replaced filter before overwriting it
         vp.* = if (filter) |f| try alloc.dupe(u8, f) else null;
         return true;
     }
