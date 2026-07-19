@@ -74,13 +74,19 @@ pub fn generate(
     client_name: []const u8,
     api_prefix: []const u8,
 ) ![]const u8 {
-    // Validate that every route path starts with the given api_prefix.
+    // Validate that every *typed* route path starts with the given api_prefix.
+    // Untyped routes (`*Ctx`→`http.Response`: ICS/webhook feeds, magic-link
+    // redirects, HTML endpoints) are never emitted into the client (the RPC
+    // renderer skips them), so they legitimately live outside the api_prefix and
+    // must not fail generation — only routes that actually become RPC methods
+    // need to share the prefix.
     // Must use `inline for` because RouteMeta contains `Input: type` (comptime-only field).
+    // Return the error WITHOUT logging here (like the guards below): `generate`
+    // is the unit-tested core, and a `std.log.err` inside it makes the --listen
+    // test runner count the expected-error path as a failure. mainWithCollections
+    // re-derives and logs the offending route at the CLI boundary.
     inline for (routes) |r| {
-        if (!std.mem.startsWith(u8, r.path, api_prefix)) {
-            std.log.err("gen_client: route '{s}' does not start with --api-prefix '{s}'; the framework route prefix and the generator prefix disagree.", .{ r.path, api_prefix });
-            return error.RoutePrefixMismatch;
-        }
+        if (!r.untyped and !std.mem.startsWith(u8, r.path, api_prefix)) return error.RoutePrefixMismatch;
     }
 
     var report = guards.GuardReport{ .message = "" };
@@ -374,6 +380,14 @@ fn emitClientFactory(
 /// string-literal union of its declared variants. Empty groups map to
 /// `Record<string, never>` (the precise empty-object type the server returns).
 /// Flag/experiment names are Zig identifiers, so they need no quoting.
+/// A TS object-key literal: the bare name if it's a valid identifier, else a
+/// quoted string. Flag/experiment names are user-defined and may contain
+/// hyphens (e.g. "client-intake") — unquoted, those are a syntax error.
+fn tsKey(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
+    if (ident.isValidTsIdent(name)) return name;
+    return std.fmt.allocPrint(alloc, "\"{s}\"", .{name});
+}
+
 fn emitFeatureState(
     alloc: std.mem.Allocator,
     w: *W,
@@ -385,7 +399,7 @@ fn emitFeatureState(
         try w.appendSlice(alloc, "  flags: Record<string, never>;\n");
     } else {
         try w.appendSlice(alloc, "  flags: {\n");
-        for (flags) |f| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: boolean;\n", .{f.name}));
+        for (flags) |f| try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: boolean;\n", .{try tsKey(alloc, f.name)}));
         try w.appendSlice(alloc, "  };\n");
     }
     if (experiments.len == 0) {
@@ -393,7 +407,7 @@ fn emitFeatureState(
     } else {
         try w.appendSlice(alloc, "  experiments: {\n");
         for (experiments) |e| {
-            try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: ", .{e.name}));
+            try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s}: ", .{try tsKey(alloc, e.name)}));
             for (e.variants, 0..) |v, i| {
                 if (i > 0) try w.appendSlice(alloc, " | ");
                 try w.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\"", .{v}));
@@ -908,6 +922,11 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
         guards.checkOperatorNames(a, cols, &report) catch {};
         guards.checkIdentifiers(a, cols, &report) catch {};
         if (report.message.len > 0) std.log.err("{s}", .{report.message});
+        // Actionable message for a prefix mismatch (generate() stays log-free).
+        if (e == error.RoutePrefixMismatch) inline for (routes) |r| {
+            if (!r.untyped and !std.mem.startsWith(u8, r.path, args.api_prefix))
+                std.log.err("gen_client: typed route '{s}' does not start with --api-prefix '{s}'; the framework route prefix and the generator prefix disagree.", .{ r.path, args.api_prefix });
+        };
         return e;
     };
 
@@ -1004,6 +1023,25 @@ test "--check diff: stale buffer differs from fresh output" {
     const stale = try std.fmt.allocPrint(a, "{s}\n// drift\n", .{fresh});
     try std.testing.expect(!std.mem.eql(u8, fresh, stale)); // --check would exit non-zero
     try std.testing.expect(std.mem.eql(u8, fresh, fresh)); // --check would exit zero
+}
+
+test "route prefix: untyped routes outside api_prefix are skipped, typed ones still error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try miniBlog(a);
+    // An untyped feed/redirect outside /api (ICS feed, magic-link) is never
+    // emitted into the client, so it must NOT fail generation.
+    const untyped_out = [_]events.RouteMeta{
+        .{ .method = .GET, .path = "/cal/:secret/bookings.ics", .name = "icsFeed", .auth = .public, .Input = void, .Output = void, .untyped = true },
+    };
+    _ = try generate(a, cols, &untyped_out, &.{}, &.{}, &.{}, true, "users", "BlogClient", "/api");
+    // A *typed* route outside /api is a genuine prefix misconfiguration → error.
+    const Named = struct { x: i64 };
+    const typed_out = [_]events.RouteMeta{
+        .{ .method = .POST, .path = "/oops/typed", .name = "oops", .auth = .public, .Input = Named, .Output = Named, .untyped = false },
+    };
+    try std.testing.expectError(error.RoutePrefixMismatch, generate(a, cols, &typed_out, &.{}, &.{}, &.{}, true, "users", "BlogClient", "/api"));
 }
 
 test "guards run inside generate: operator-named relation target errors" {
@@ -1251,6 +1289,26 @@ test "feature state: typed zb.flags.resolveAll emits named booleans + variant un
         "    resolveAll(subject: string): Promise<FeatureState>;",
         "base.send<FeatureState>(\"GET\", `/api/state?subject=${encodeURIComponent(subject)}`)",
     }) |needle| try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
+}
+
+test "feature state: non-identifier flag/experiment names are quoted (kebab-case)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try miniBlog(a);
+    const flags = [_]features.FlagDef{
+        .{ .name = "client-intake", .default = false }, // hyphen → must be quoted
+        .{ .name = "canBook", .default = true }, // valid ident → bare
+    };
+    const experiments = [_]features.ExperimentDef{
+        .{ .name = "promo-banner", .variants = &.{ "control", "treatment" }, .weights = &.{ 50, 50 } },
+    };
+    const out = try generate(a, cols, &.{}, &.{}, &flags, &experiments, true, "users", "ZbClient", "/api");
+    try std.testing.expect(std.mem.indexOf(u8, out, "    \"client-intake\": boolean;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    canBook: boolean;") != null); // valid ident stays bare
+    try std.testing.expect(std.mem.indexOf(u8, out, "    \"promo-banner\": \"control\" | \"treatment\";") != null);
+    // the broken unquoted form must NOT appear
+    try std.testing.expect(std.mem.indexOf(u8, out, "    client-intake: boolean;") == null);
 }
 
 test "feature state: surface is omitted when no flags/experiments are declared" {
