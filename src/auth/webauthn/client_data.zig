@@ -11,6 +11,7 @@
 // by the caller to form the signature base. This module only does the field checks.
 
 const std = @import("std");
+const crypto = @import("../../crypto.zig");
 
 pub const ClientData = struct {
     type: []const u8,
@@ -84,21 +85,6 @@ pub fn b64urlNoPad(alloc: std.mem.Allocator, raw: []const u8) std.mem.Allocator.
     return buf;
 }
 
-/// Constant-time comparison of two byte slices.
-/// Returns true iff a.len == b.len AND every byte is identical.
-/// The comparison loop always runs to completion; no early exit on mismatch.
-fn timingSafeEqlSlices(a: []const u8, b: []const u8) bool {
-    // Length mismatch is not a timing-sensitive branch: both sides' lengths are
-    // known quantities that do not carry secret information here (the base64url
-    // challenge string is deterministic in length from the stored raw size).
-    if (a.len != b.len) return false;
-    var diff: u8 = 0;
-    for (a, b) |x, y| {
-        diff |= x ^ y;
-    }
-    return diff == 0;
-}
-
 /// Verify a parsed ClientData against expected ceremony parameters.
 ///
 ///   expected_type         — "webauthn.create" or "webauthn.get"
@@ -127,7 +113,10 @@ pub fn verifyClientData(
     const expected_challenge = try b64urlNoPad(alloc, stored_challenge_raw);
     defer alloc.free(expected_challenge);
 
-    if (!timingSafeEqlSlices(cd.challenge, expected_challenge)) return error.ChallengeMismatch;
+    // Constant-time compare via the shared slice helper (#20). A length mismatch short-circuits
+    // and is not timing-sensitive here: the base64url challenge length is deterministic from the
+    // stored raw size and carries no secret.
+    if (!crypto.timingSafeEql(cd.challenge, expected_challenge)) return error.ChallengeMismatch;
 }
 
 // ---------------------------------------------------------------------------
@@ -355,8 +344,8 @@ test "verifyClientData: fails on wrong challenge (different stored_raw)" {
 test "verifyClientData: challenge comparison is constant-time (no early exit)" {
     // This test exercises the constant-time property by feeding strings that share
     // a common prefix. If the compare had an early exit, we could not distinguish
-    // from outside Zig's test runner, but we verify the *implementation* by reading
-    // the timingSafeEqlSlices function's XOR-accumulator pattern — we test behavior.
+    // from outside Zig's test runner, but the challenge check routes through
+    // crypto.timingSafeEql (XOR-accumulator, no early exit) — we test behavior.
     const alloc = std.testing.allocator;
 
     // Two challenges that differ only in the last byte — both must be rejected.

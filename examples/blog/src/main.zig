@@ -96,8 +96,10 @@ fn computeReadingTime(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void
         }
     }
     const minutes = if (word_count == 0) 1 else @max(1, (word_count + 199) / 200);
-    // int/fixed-mode number fields take a decimal STRING on the wire (see docs/fields.md
-    // and src/values.zig bindValue) — a raw JSON integer fails type validation.
+    // int/fixed-mode number fields use a decimal STRING as their canonical wire form — that's
+    // what reads return (see docs/fields.md and src/values.zig readValue), so we write one here
+    // for symmetry. A raw JSON integer is also accepted on write (values.zig bindValue binds it
+    // directly), so binding `minutes` straight would work too.
     const rt = try std.fmt.allocPrint(ev.arena, "{d}", .{minutes});
     try ev.record.object.put(ev.arena, "reading_time", .{ .string = rt });
 }

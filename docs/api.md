@@ -177,12 +177,24 @@ Record endpoints operate on a collection by name (`:col`).
 | --- | --- | --- |
 | GET | `/api/collections/:col/records` | List records (paginated). |
 | GET | `/api/collections/:col/records/:id` | Get one record. |
+| GET | `/api/collections/:col/records/:id/abilities` | What the current principal may do with this record — see [abilities.md](abilities.md). |
 | POST | `/api/collections/:col/records` | Create a record. |
 | PATCH | `/api/collections/:col/records/:id` | Update a record. |
 | DELETE | `/api/collections/:col/records/:id` | Delete a record. |
 
 Access to each operation is governed by the collection's
 [access rules](#access-rules).
+
+A create (`POST`) or update (`PATCH`) that violates a database integrity
+constraint — most commonly a duplicate value on a `unique` field, such as
+signing up with an already-registered email — returns **`409 Conflict`**
+(`"A record with these values already exists."`), not `500`, so a client or SDK
+can tell a routine user conflict apart from a genuine server fault.
+
+The `abilities` endpoint returns a JSON object of booleans introspecting what the current principal
+may do with the record — e.g. `{"view": true, "update": false, "delete": false}`. It requires view
+access (404 otherwise, so it never leaks a record's existence), which is why `"view"` is always
+`true` on a `200`. See [abilities.md](abilities.md) for the full model.
 
 ### Update: changing a password on an auth collection
 
@@ -392,6 +404,15 @@ account in @request.account.ids
 > per-row-nonce ciphertext, so referencing it in `filter` or `sort` returns
 > **`400`** (`"Cannot filter or sort by an encrypted field."`). The same applies to an
 > access rule comparing an encrypted field — it can only ever match against ciphertext.
+>
+> **Hidden fields are not filterable or sortable from client input either.** A
+> client-supplied `?filter=` or `?sort=` that references a hidden field
+> (`passwordHash`, `tokenKey`, `token_epoch`, or any field marked `hidden`) is
+> rejected closed with **`400`** (`"Cannot filter or sort by a hidden field."`),
+> matching exactly the set of columns the API never serializes — so it can never
+> become a boolean oracle over a non-serialized secret. A **trusted, operator-authored
+> access rule** *may* still gate on a hidden field: a rule is a server-side `WHERE`
+> clause whose truth is never returned to the client, so it is no oracle.
 
 ### sort
 
@@ -660,6 +681,11 @@ The `request-verification` and `request-password-reset` endpoints mint a token a
 deliver it via the configured mailer, then return `204` (they never reveal whether
 the email exists). The matching `confirm-*` endpoint takes that `token` in its body and
 also returns `204` (no body) on success.
+
+The token email is **delivered on a background queue**, so the endpoint returns `204`
+with identical status *and timing* whether or not the email matches a record — a
+mailer outage or a slow SMTP round-trip is never observable, so neither latency nor a
+send failure can be used to enumerate which addresses are registered.
 
 - **With SMTP configured** (`ZIGBASE_SMTP_HOST` + friends — see the
   [README config table](../README.md#configuration)), the token is **emailed** over
@@ -1391,15 +1417,33 @@ configured outbound high-water-mark). `401` unauthenticated, `403` non-superuser
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/health` | Liveness probe + the active database backend. No auth. |
+| GET | `/api/health` | Liveness probe + the active database backend + component versions. No auth. |
 
 ```json
-{ "status": "ok", "backend": "sqlite" }
+{
+  "status": "ok",
+  "backend": "sqlite",
+  "versions": {
+    "zigbase": "0.10.0",
+    "commit": "abc1234",
+    "sqlite": "3.46.0",
+    "sqliteVec": "0.1.6",
+    "zap": "0.10.6",
+    "facil": "0.7.0"
+  }
+}
 ```
 
 `backend` is `"sqlite"` or `"postgres"` — the *kind* of database the server is running on. It is
 deliberately read-only and carries **no** secrets: the connection string, host, and credentials are
 never exposed. The admin UI reads this to show a small backend badge in the sidebar.
+
+`versions` reports the baked-in component versions of the running binary (`sqlite` is the live
+linked version; the rest come from the build) — non-secret build provenance for auditing a deployed
+server over HTTP, the same values as `--version` and the boot log. Since the endpoint is
+unauthenticated, treat these as publicly disclosed. See
+[framework.md § Version transparency](framework.md#version-transparency--dependency-auditing) for
+the full list.
 
 ---
 
@@ -1407,5 +1451,7 @@ never exposed. The admin UI reads this to show a small backend badge in the side
 
 - [tutorial.md](tutorial.md) — build an app on ZigBase, end to end.
 - [fields.md](fields.md) — the complete field-type & options catalog.
+- [abilities.md](abilities.md) — per-record ability flags and the `abilities` endpoint.
+- [tenancy.md](tenancy.md) — multi-tenancy, account scopes, and the account-activate endpoint.
 - [recipes.md](recipes.md) — provisioning, access rules, hooks, custom routes, jobs.
 - [framework.md](framework.md) — embedding ZigBase as a Zig library.

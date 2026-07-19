@@ -27,7 +27,10 @@ object is identical in both directions:
 }
 ```
 
-`required` and `unique` are common to every type and both default to `false`. A third
+`required` and `unique` are common to every type and both default to `false`. A create or
+update that would duplicate a `unique` value is rejected with **`409 Conflict`** (not `500`),
+so a client can tell the conflict apart from a server fault — see [api.md → Records](api.md#records).
+A third
 common boolean, `encrypted` (default `false`), stores the value encrypted at rest and is
 valid only on `text`/`editor`/`json` fields — see [Encryption at rest](#encryption-at-rest-encrypted).
 A fourth, `searchable` (default `false`), mirrors a `text`/`editor` field's text into the
@@ -238,6 +241,14 @@ A numeric column. **The `mode` decides storage and precision.**
 - **`fixed`** — fixed-point decimal stored as `INTEGER` (scaled by `10^scale`).
   **`scale` is mandatory and must be 1..8.** Use this for money and other values
   where binary-float rounding is unacceptable.
+
+> **Wire representation (the mode changes it).** A `float` field is a JSON **number**
+> in responses (and on write). An `int` or `fixed` field is a **decimal string** in
+> responses — `"seats": "3"`, `"price_per_hour": "5.00"` — to preserve exact integer /
+> fixed-point precision across JSON parsers. On write, that decimal string is the
+> canonical form, but a raw JSON number is **also** accepted (`3` and `"3"` both bind).
+> So read an `int`/`fixed` field as a string and parse it — `record.seats + 1` does
+> string concatenation in JavaScript, not arithmetic.
 
 > **Validation gotcha:** `mode: "fixed"` **without** a valid `scale` (1..8) is a
 > `400` (`validation_invalid_scale`: "fixed number requires scale 1..8."). A `float`

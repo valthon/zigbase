@@ -64,7 +64,7 @@ pub const AuthCtx = struct {
     /// `auto_create` is false, returns null. When `auto_create` is true and the
     /// identity is not found, inserts a minimal auth record (identity field(s) set to
     /// `identity`, passwordHash = "", fresh tokenKey, verified = false) and returns
-    /// its id. If insert fails with a unique constraint race (StepFailed), retries
+    /// its id. If insert fails with a unique-constraint race (error.Constraint), retries
     /// findByIdentity once and returns whatever is there.
     pub fn resolveOrCreate(
         ac: *AuthCtx,
@@ -89,8 +89,10 @@ pub const AuthCtx = struct {
         try data.put(ac.ctx.allocator, "verified", .{ .bool = false });
 
         // 3. Insert. Two create errors are folded into the same enumeration-safe recovery:
-        //    - error.StepFailed: a SQLite UNIQUE collision from a concurrent initiate for the
-        //      same identity — the other request already created the record, so re-read it.
+        //    - error.Constraint: a UNIQUE collision from a concurrent initiate for the same
+        //      identity — the other request already created the record, so re-read it. (This is
+        //      the distinct constraint class; a UNIQUE violation is no longer StepFailed, so a
+        //      genuine StepFailed now propagates as the infra failure it is, never masked here.)
         //    - error.Validation: the supplied identity is malformed (e.g. the system `email`
         //      field rejects bad format). A malformed identity can never be a stored record,
         //      so findByIdentity returns null and initiate then silently returns 204. This
@@ -104,7 +106,7 @@ pub const AuthCtx = struct {
             ac.collection,
             std.json.Value{ .object = data },
         ) catch |err| {
-            if (err == error.StepFailed or err == error.Validation) {
+            if (err == error.Constraint or err == error.Validation) {
                 return try ac.findByIdentity(conn, identity);
             }
             return err;

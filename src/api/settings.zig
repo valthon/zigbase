@@ -33,10 +33,11 @@ fn isSuperuser(ctx: *http.RequestCtx) bool {
     return authed.is_superuser;
 }
 
-fn requireSuperuser(ctx: *http.RequestCtx) ?http.Response {
+fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
     if (isSuperuser(ctx)) return null;
-    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator) catch
-        ApiError.internal().toResponse(ctx.allocator) catch unreachable;
+    // Building the 403 body allocates (JSON on the request arena), so OutOfMemory is reachable —
+    // propagate it to the server's 500 backstop rather than `catch unreachable` (#29).
+    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
 }
 
 fn dataOnWriter(ctx: *http.RequestCtx) Data {
@@ -55,7 +56,7 @@ fn entryJson(alloc: std.mem.Allocator, e: Data.KvEntry) !std.json.Value {
 
 /// GET /api/settings — list every setting (superuser only).
 pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
-    if (requireSuperuser(ctx)) |resp| return resp;
+    if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const d = dataOnWriter(ctx);
     defer app.pool.releaseWriter();
@@ -70,7 +71,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
 
 /// GET /api/settings/:key — fetch one setting (superuser only). 404 if absent.
 pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
-    if (requireSuperuser(ctx)) |resp| return resp;
+    if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const key = ctx.param("key") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const d = dataOnWriter(ctx);
@@ -91,7 +92,7 @@ const PutBody = struct { value: []const u8 };
 
 /// PUT /api/settings/:key — upsert a setting (superuser only). Body: {"value":"..."}.
 pub fn put(ctx: *http.RequestCtx) anyerror!http.Response {
-    if (requireSuperuser(ctx)) |resp| return resp;
+    if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const key = ctx.param("key") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const parsed = std.json.parseFromSlice(PutBody, ctx.allocator, ctx.body, .{ .ignore_unknown_fields = true }) catch
@@ -112,7 +113,7 @@ pub fn put(ctx: *http.RequestCtx) anyerror!http.Response {
 
 /// DELETE /api/settings/:key — remove a setting (superuser only). 404 if absent.
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
-    if (requireSuperuser(ctx)) |resp| return resp;
+    if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const key = ctx.param("key") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const d = dataOnWriter(ctx);

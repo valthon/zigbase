@@ -79,6 +79,12 @@ fn emitFileUploads(app: *app_mod.App, rctx: *const request.RequestContext, col_n
 }
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
+    // `records.last_errors` holds slices allocated from THIS request's arena, which is freed when
+    // the request ends. Null it once consumed so the worker thread's threadlocal never outlives the
+    // arena it points into — otherwise a later reader on the same thread would dereference freed
+    // memory (NO_SLOP §3, "spooky action"). The field/code/message copied into `fes` are the
+    // arena-owned strings, still live for the toResponse render below (same request scope).
+    defer records.last_errors = null;
     const verrs = records.last_errors orelse &[_]schema.ValidationError{};
     const fes = try ctx.allocator.alloc(FieldError, verrs.len);
     for (verrs, 0..) |e, i| fes[i] = .{ .field = e.field, .code = e.code, .message = e.message };
@@ -173,12 +179,23 @@ fn writeUploads(ctx: *http.RequestCtx, col: schema.Collection, record_id: []cons
     var written: usize = 0;
     for (writes) |wr| {
         storage.put(app.io, col.name, record_id, wr.filename, wr.bytes) catch {
-            for (writes[0..written]) |dw| storage.delete(app.io, col.name, record_id, dw.filename) catch {};
+            deleteWrites(app, col.name, record_id, writes[0..written]);
             return error.StorageFailed;
         };
         written += 1;
     }
-    for (deletes) |d| storage.delete(app.io, col.name, record_id, d) catch {};
+    for (deletes) |d| storage.delete(app.io, col.name, record_id, d) catch |e|
+        std.log.warn("replaced-file cleanup failed for {s}/{s}/{s}: {s}", .{ col.name, record_id, d, @errorName(e) });
+}
+
+/// Best-effort removal of just-written upload bytes when a create/update did NOT commit, so a
+/// rolled-back row never leaves orphaned files in storage. The request already failed, so a delete
+/// error here is logged, never propagated — silently swallowing it would leak files unboundedly
+/// with no signal for an operator (NO_SLOP §2.3).
+fn deleteWrites(app: *app_mod.App, col_name: []const u8, record_id: []const u8, writes: []const file_plan.FieldWrite) void {
+    const storage = app.storage orelse return;
+    for (writes) |wr| storage.delete(app.io, col_name, record_id, wr.filename) catch |e|
+        std.log.warn("orphaned upload cleanup failed for {s}/{s}/{s}: {s}", .{ col_name, record_id, wr.filename, @errorName(e) });
 }
 
 pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -347,6 +364,13 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
             w.rollback() catch {};
             return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator);
         },
+        // A UNIQUE/CHECK/NOT NULL/FK violation (e.g. a duplicate email on signup) is a client
+        // error, not a server fault — 409, never 500. No files have been written yet on the
+        // create path (writeUploads runs after the INSERT), so an explicit rollback is enough.
+        error.Constraint => {
+            w.rollback() catch {};
+            return ApiError.conflict("A record with these values already exists.").toResponse(ctx.allocator);
+        },
         else => return e, // errdefer rolls back
     };
     // Access-rule guard evaluated INSIDE the transaction:
@@ -365,7 +389,14 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return ApiError.internal().toResponse(ctx.allocator);
     };
+    // The upload bytes are now durable but the row is not until COMMIT succeeds. A commit
+    // failure (SQLITE_FULL/IOERR) rolls the INSERT back via the errdefer above, so without
+    // this guard the files would be orphaned under a record id that never existed — and, with
+    // no orphan-file GC, be permanently unreclaimable. Flip on success so kept files stay.
+    var committed = false;
+    errdefer if (!committed) deleteWrites(app, col.name, rid, all.writes);
     try w.commit();
+    committed = true;
 
     // after-hooks and the realtime broadcast run AFTER commit (side effects).
     emitFileUploads(app, &rctx, col.name, rid, all.writes);
@@ -496,34 +527,44 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         var written: usize = 0;
         for (all.writes) |wr| {
             storage.put(app.io, col.name, rid, wr.filename, wr.bytes) catch {
-                for (all.writes[0..written]) |dw| storage.delete(app.io, col.name, rid, dw.filename) catch {};
+                deleteWrites(app, col.name, rid, all.writes[0..written]);
                 w.rollback() catch {};
                 return ApiError.internal().toResponse(ctx.allocator);
             };
             written += 1;
         }
     }
+    // The upload bytes are durable but the row is not until COMMIT. Every exit before commit —
+    // whether it returns an error (via `try` on the guard/session paths or a failing commit,
+    // which the errdefer above rolls back) or an error RESPONSE value (validation/not-found/
+    // guard-miss below) — must remove the just-written files, or a rolled-back UPDATE leaks
+    // them in storage. One guard replaces the cleanup that was copy-pasted into each branch.
+    var committed = false;
+    defer if (!committed) deleteWrites(app, col.name, rid, all.writes);
 
     // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
     // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
     const updated = records.updateInTxn(ctx.allocator, w, col, rid, data_mut) catch |e| switch (e) {
+        // The `committed`-guarded defer above deletes the written files on each of these
+        // pre-commit exits, so no branch repeats the storage cleanup.
         error.Validation => {
             w.rollback() catch {};
-            // Files were written before the UPDATE (above); a validation failure must not
-            // leave them orphaned in storage (mirrors the not-found / guard-miss branches).
-            if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
             return validationResponse(ctx);
         },
         error.NotObject => {
             w.rollback() catch {};
-            if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
             return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator);
+        },
+        // A UNIQUE/CHECK/NOT NULL/FK violation is a client error → 409, not 500. This is a
+        // value-return, so the `committed`-guarded defer above deletes the just-written files.
+        error.Constraint => {
+            w.rollback() catch {};
+            return ApiError.conflict("A record with these values already exists.").toResponse(ctx.allocator);
         },
         else => return e, // errdefer rolls back
     };
     const ur = updated orelse {
         w.rollback() catch {};
-        if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
         return ApiError.notFound().toResponse(ctx.allocator);
     };
     // Access-rule guard evaluated INSIDE the transaction on the UPDATED row:
@@ -532,7 +573,6 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         const guard = (try policy.compilePredicate(ctx.allocator, w, col, .update, &rctx)).?;
         if (!try records.guardPasses(ctx.allocator, w, col, rid, guard)) {
             w.rollback() catch {};
-            if (ctx.app.?.storage) |storage| for (all.writes) |wr| storage.delete(app.io, col.name, rid, wr.filename) catch {};
             return ApiError.notFound().toResponse(ctx.allocator);
         }
     }
@@ -542,9 +582,11 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     if (col.type == .auth and pw_change and app.session_store == .table)
         try api_auth.deleteSessionsForPrincipal(w, col.name, rid);
     try w.commit();
+    committed = true; // row is durable — the write-cleanup defer must NOT fire past here
 
     // Side effects AFTER commit: drop replaced files, fire file/after-update hooks, broadcast.
-    if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch {};
+    if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch |e|
+        std.log.warn("replaced-file cleanup failed for {s}/{s}/{s}: {s}", .{ col.name, rid, d, @errorName(e) });
     emitFileUploads(app, &rctx, col.name, rid, all.writes);
     // Self-service password change: "keep this device, log out everywhere else". The old
     // token (incl. the caller's) died with the tokenKey rotation; re-issue ONE fresh session
@@ -628,8 +670,11 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     }
     try w.commit();
 
-    // Side effects AFTER commit.
-    if (app.storage) |storage| storage.deleteRecord(app.io, col.name, rid) catch {};
+    // Side effects AFTER commit. Best-effort file removal: the row is already gone and the
+    // request must succeed, but a silent failure (e.g. transient S3 error) would orphan the
+    // record's files with no signal — log so orphan accumulation is diagnosable (NO_SLOP §2.3).
+    if (app.storage) |storage| storage.deleteRecord(app.io, col.name, rid) catch |e|
+        std.log.warn("orphaned file cleanup failed for deleted record {s}/{s}: {s}", .{ col.name, rid, @errorName(e) });
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .after_delete) catch {};
     // F4: pass the deleted row's snapshot so subscribers to an owner/expression-scoped collection
     // can re-authorize the delete event (the live row is gone). The snapshot rides in the published
@@ -725,6 +770,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
             error.CursorFilter => return ApiError.badRequest("Cursor does not match the requested filter.").toResponse(ctx.allocator),
             error.BadCursor => return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator),
             error.EncryptedField => return ApiError.badRequest("Cannot filter or sort by an encrypted field.").toResponse(ctx.allocator),
+            error.HiddenField => return ApiError.badRequest("Cannot filter or sort by a hidden field.").toResponse(ctx.allocator),
             error.NotSearchable => return ApiError.badRequest("This collection has no searchable fields; `search` is not supported here.").toResponse(ctx.allocator),
             error.SearchDisabled => return ApiError.badRequest("Full-text search is not enabled in this build.").toResponse(ctx.allocator),
             error.VectorDisabled => return ApiError.badRequest("Vector search is not enabled in this build.").toResponse(ctx.allocator),
@@ -745,7 +791,13 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
                     return ApiError.badRequest("Vector search is unavailable: the pgvector extension is not installed on this database (run `CREATE EXTENSION vector`).").toResponse(ctx.allocator);
                 return ApiError.badRequest("Invalid vector search query: the query embedding's dimension may not match the stored embeddings (or a stored embedding is malformed).").toResponse(ctx.allocator);
             },
-            error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep => return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
+            // Overflow/BadNumber/TooPrecise are `values.ValueError`s raised when a numeric literal
+            // is malformed or out of i64 range. They reach here from two client-controlled inputs:
+            // a filter/sort literal (compiler.zig binds `price=99999999999999999999` via
+            // decimalToScaledInt) and a cursor boundary value (keyset.jsonToParam, same path). Both
+            // are bad input, not a server fault — a 400, never a 500. (A source-level split that
+            // returns the sharper "Invalid cursor." for the cursor case belongs in keyset.zig.)
+            error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.Overflow, error.BadNumber, error.TooPrecise, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep => return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
             else => return e,
         }
     };
@@ -756,7 +808,9 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     }
 
     if (qp.get("expand")) |exp| if (exp.len > 0) {
-        for (result.items) |*item| try expand_mod.expand(ctx.allocator, &r, col, item, exp, 0, &rctx);
+        // Batch the whole page through one PageCache: the target-collection schema is parsed once
+        // (not per row) and each (target,id) view decision is memoized (not re-authorized per row).
+        try expand_mod.expandItems(ctx.allocator, &r, col, result.items, exp, 0, &rctx);
     };
 
     // `fields=` response projection: parse ONCE, apply to EACH record (never the envelope). It is a

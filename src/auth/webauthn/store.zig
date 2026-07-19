@@ -35,8 +35,8 @@ pub const CredentialStore = struct {
     conn: *db.Db,
 
     /// Insert a new credential row. `credential_id_b64` and `cose_pubkey_b64` must already be
-    /// base64(url)-encoded strings. Returns `error.StepFailed` (propagated from SQLite) when the
-    /// `credentialId` UNIQUE constraint fires (i.e. the credential is already registered).
+    /// base64(url)-encoded strings. Returns `error.Constraint` (propagated from the backend) when
+    /// the `credentialId` UNIQUE constraint fires (i.e. the credential is already registered).
     pub fn insert(
         self: CredentialStore,
         alloc: std.mem.Allocator,
@@ -195,7 +195,7 @@ test "CredentialStore: insert / getByCredentialId / existsCredentialId / updateS
 
     // --- second insert with same credentialId must fail (UNIQUE constraint) ---
     try std.testing.expectError(
-        error.StepFailed,
+        error.Constraint,
         store.insert(alloc, io, "users", "rec002", "cred_b64url", "other_key", -7, 0, "", ""),
     );
 }

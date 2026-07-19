@@ -33,6 +33,11 @@ pub const ConnError = error{
     AuthFailed,
     UnsupportedAuth,
     QueryFailed,
+    /// An integrity-constraint violation (SQLSTATE class 23: unique / foreign-key / not-null /
+    /// check / exclusion). A caller-recoverable class the API layer maps to 409, kept distinct
+    /// from the catch-all `QueryFailed`. Only surfaced from the extended (prepared-statement)
+    /// path — the SQLite backend mirrors this by mapping `SQLITE_CONSTRAINT` at `step()`.
+    Constraint,
     EndOfStream,
     OutOfMemory,
     /// An identifier that must be interpolated (e.g. a LISTEN channel — not parameterizable)
@@ -96,6 +101,10 @@ pub const Conn = struct {
     read_buf: std.ArrayList(u8) = .empty, // reused backing store for one message body
     scratch: std.ArrayList(u8) = .empty, // reused MsgBuilder scratch
     last_error: std.ArrayList(u8) = .empty, // owned text of the most recent ErrorResponse
+    /// True when the most recent ErrorResponse carried a SQLSTATE in class 23
+    /// (integrity_constraint_violation). Read by `execExtended` to surface `ConnError.Constraint`
+    /// instead of `QueryFailed`. Reset on every `captureError`.
+    last_error_is_constraint: bool = false,
 
     backend_pid: i32 = 0,
     backend_secret: i32 = 0,
@@ -524,14 +533,21 @@ pub const Conn = struct {
 
     fn captureError(self: *Conn, body: []const u8) void {
         // ErrorResponse: a sequence of (field-type byte, cstr value), ended by a 0 byte.
-        // 'M' is the human-readable message.
+        // 'M' is the human-readable message; 'C' is the 5-char SQLSTATE code.
         self.last_error.clearRetainingCapacity();
+        self.last_error_is_constraint = false;
         var cur = Cursor{ .buf = body };
         while (cur.byte()) |field_type| {
             if (field_type == 0) break;
             const val = cur.cstr() orelse break;
-            if (field_type == 'M') {
-                self.last_error.appendSlice(self.gpa, val) catch {};
+            switch (field_type) {
+                'M' => self.last_error.appendSlice(self.gpa, val) catch {},
+                // SQLSTATE class 23 is integrity_constraint_violation (23xxx: unique_violation,
+                // foreign_key_violation, not_null_violation, check_violation, exclusion_violation)
+                // — the recoverable class the API maps to 409. Flag it so the prepared-statement
+                // path returns a distinct `ConnError.Constraint`.
+                'C' => self.last_error_is_constraint = std.mem.startsWith(u8, val, "23"),
+                else => {},
             }
         }
     }
@@ -651,7 +667,12 @@ pub const Conn = struct {
                 },
                 proto.Backend.ready_for_query => {
                     if (msg.body.len >= 1) self.tx_status = msg.body[0];
-                    if (failed) return ConnError.QueryFailed;
+                    // A constraint violation drains cleanly to ReadyForQuery (the connection is
+                    // NOT broken), so it is a normal, recoverable error: surface the distinct
+                    // Constraint (→ 409) rather than the catch-all QueryFailed (→ 500). Only the
+                    // prepared-statement path narrows this; `simpleExec` (DDL / transaction
+                    // control, incl. deferred-constraint failures at COMMIT) keeps QueryFailed.
+                    if (failed) return if (self.last_error_is_constraint) ConnError.Constraint else ConnError.QueryFailed;
                     result.rows = arena.dupe([]?[]const u8, rows.items) catch return ConnError.OutOfMemory;
                     return result;
                 },

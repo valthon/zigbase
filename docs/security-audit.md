@@ -341,9 +341,10 @@ in-root file still serves) and `withinRoot: prefix must be '/'-bounded` (`src/st
 
 ---
 
-### F11 — OAuth `state` delegated to the client (FIXED — opt-in server-side store)
+### F11 — OAuth `state` delegated to the client (FIXED — server-side store, on by default)
 
-**Location:** `src/api/oauth.zig` (`oauth2Init`, `authWithOAuth2Impl`, `issueState`/`consumeState`),
+**Location:** `src/auth/methods/oauth2.zig` (`initiateImpl`/`completeImpl`),
+`src/api/oauth.zig` (`issueState`/`consumeState`),
 `src/config.zig` / `src/app.zig` (`oauth_state_server`, `oauth_state_ttl_s`),
 `src/migrations.zig` (`0005_oauth_states`).
 
@@ -353,19 +354,19 @@ a per-provider **exact-match allowlist** (`redirectAllowed`), (b) **https-only**
 provider endpoints (`resolveProvider` → `isHttps`), and (c) requires the `codeVerifier` on
 exchange (PKCE). CSRF on the OAuth flow therefore depended on the client honoring `state`.
 
-**Fix.** Added an **opt-in server-side `state` store** (`ZIGBASE_OAUTH_STATE_SERVER=true`, default
-**off** to preserve the documented client-driven flow). When enabled, `POST .../oauth2-init` mints
-a random `state` into `_oauthStates` (migration `0005`, keyed by `state` with a TTL `expires`),
-scoped to (collection, provider). `auth-with-oauth2` then **requires** a `state` in the body and
+**Fix.** Added a **server-side `state` store, on by default** (`oauth_state_server`, `bool = true`;
+set `ZIGBASE_OAUTH_STATE_SERVER=false` to opt **out** and restore the client-only flow). When
+active, `POST /api/collections/:col/auth/oauth2/initiate` mints a random `state` into `_oauthStates`
+(migration `0005`, keyed by `state` with a TTL `expires`), scoped to (collection, provider).
+`POST /api/collections/:col/auth/oauth2/complete` then **requires** a `state` in the body and
 verifies+consumes it via a single `DELETE ... RETURNING` (single-use) **before** contacting the
 provider — so a missing, mismatched, expired, or **replayed** state is rejected with `400` without
-burning the authorization code. PKCE remains mandatory in both modes. Default-on was rejected
-because the documented flow does not send `state` to the backend; opt-in lets integrators who
-can't guarantee a correct SPA get server-enforced CSRF protection without breaking existing
-clients. Regression tests: *F11: server-side state — valid accepted; missing/mismatched/replayed
-rejected*, *F11: oauth2-init 404 when server-side state disabled*, *F11: client-driven flow still
-works when server-side state is disabled*. Docs: `docs/api.md` (OAuth2 → CSRF on the OAuth flow),
-`README.md` (env vars).
+burning the authorization code. PKCE remains mandatory in both modes. The secure default was chosen
+because most integrators can't guarantee a correct SPA; the opt-out lets a client that manages its
+own CSRF `state` end-to-end keep the purely client-driven flow. Regression tests: *F11:
+server-side state — valid accepted; missing/mismatched/replayed rejected*, *F11: initiate 404 when
+server-side state disabled*, *F11: client-driven flow still works when server-side state is
+disabled*. Docs: `docs/api.md` (OAuth2 → CSRF on the OAuth flow), `README.md` (env vars).
 
 ---
 
@@ -508,9 +509,9 @@ Auth token lifecycle & OAuth (PR C):
 - **F7** — strictly single-use verification/reset tokens via a random `jti` claim recorded in a new
   `_consumedTokens` table (migration `0004`), enforced in the confirm handlers — independent of the
   tokenKey-rotation side effect. Three regression tests.
-- **F11** — opt-in **server-side OAuth `state`** store (migration `0005`, `oauth2-init` endpoint,
-  `ZIGBASE_OAUTH_STATE_SERVER`, default off), single-use and verified before the provider exchange.
-  Three regression tests; docs updated.
+- **F11** — **server-side OAuth `state`** store, **on by default** (migration `0005`,
+  `/auth/oauth2/initiate` endpoint, `ZIGBASE_OAUTH_STATE_SERVER=false` to opt out), single-use and
+  verified before the provider exchange. Three regression tests; docs updated.
 
 All of the above ship with regression tests; `zig build` succeeds and all unit tests pass.
 

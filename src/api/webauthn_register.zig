@@ -219,8 +219,11 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
             return (ApiError{ .status = 409, .message = "Credential already registered." }).toResponse(ctx.allocator);
         }
 
-        // Insert the credential. record_ref = authed user id (never body-supplied).
-        try cred_store.insert(
+        // Insert the credential. record_ref = authed user id (never body-supplied). The pre-check
+        // above catches the common duplicate; the UNIQUE index is the last-line guard, and a
+        // credentialId that races in between resolves to the SAME 409 (error.Constraint) rather
+        // than a 500 — any other DB error still propagates.
+        cred_store.insert(
             ctx.allocator,
             app.io,
             col_name,
@@ -231,7 +234,10 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
             reg_result.sign_count,
             aaguid_b64,
             "", // transports: not parsed from body in v1
-        );
+        ) catch |e| switch (e) {
+            error.Constraint => return (ApiError{ .status = 409, .message = "Credential already registered." }).toResponse(ctx.allocator),
+            else => return e,
+        };
     }
 
     return http.Response{ .status = 204, .body = "" };

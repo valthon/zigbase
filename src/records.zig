@@ -1399,15 +1399,15 @@ fn effectiveSortString(alloc: std.mem.Allocator, terms: []const sort.SortTerm) !
     return out.toOwnedSlice(alloc);
 }
 
-/// Reject keyset boundaries that can't be read back from a record's JSON object: a relation-path
-/// sort (e.g. `author.name`, which lives under `expand`, not the row root) or a HIDDEN field
-/// (stripped from the row by `rowToObject`). Either would mint a cursor whose boundary value is
-/// silently null and corrupt the keyset window — fail loudly instead. Returns BadCursorSort so
-/// the handler can return a clear 400 BEFORE any rows are fetched.
+/// Reject a relation-path sort (e.g. `author.name`, which lives under `expand`, not the row root)
+/// as a keyset boundary: its value can't be read back from the row's JSON object, so it would mint
+/// a cursor whose boundary is silently null and corrupt the keyset window — fail loudly instead.
+/// Returns BadCursorSort so the handler returns a clear 400 BEFORE any rows are fetched. Hidden and
+/// encrypted sort fields never reach here: the joiner rejects them (`error.HiddenField` /
+/// `EncryptedField`) when the sort spec is resolved, which is the single chokepoint for that class.
 fn validateCursorSort(terms: []const sort.SortTerm) keyset.DecodeError!void {
     for (terms) |t| {
         if (std.mem.indexOfScalar(u8, t.path, '.') != null) return error.BadCursorSort;
-        if (t.field) |f| if (f.hidden) return error.BadCursorSort;
     }
 }
 
@@ -1696,6 +1696,29 @@ test "gcExpiredRecords deletes past rows, keeps future rows, ignores non-ttl col
     try std.testing.expectEqual(@as(i64, 1), try Counter.count(&d, "SELECT COUNT(*) FROM posts;"));
 }
 
+test "gcExpiredRecords: no scratch leak on a non-arena (GPA) caller" {
+    // Regression: the sweep once freed only the DELETE text and leaked the collections list plus
+    // the per-collection quoted-field and predicate strings whenever the caller passed a real GPA.
+    // Call it with the leak-DETECTING testing allocator DIRECTLY (not an arena) — the internal
+    // arena must free every allocation, or the test framework flags the leak.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const sfields = [_]schema.Field{
+        .{ .id = "f1", .name = "token", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+    try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
+
+    // The load-bearing line: gcExpiredRecords receives the leak-checked GPA, not the arena `a`.
+    const deleted = try gcExpiredRecords(std.testing.allocator, &d);
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+}
+
 test "gcExpiredRecords compares ttl as an instant, not lexically (offsets/date-only/space)" {
     // Regression: `.date` values are stored RAW and the validator accepts non-canonical
     // ISO-8601 (offsets, date-only, space separator). A naive lexical `tf <= '...Z'`
@@ -1797,16 +1820,22 @@ test "gcExpiredRecords is resilient: a drifted collection does not abort the swe
 /// ttl value yields `NULL <= x` → NULL → the row is NOT deleted (fail-safe). The
 /// outer `IS NOT NULL` keeps an unset (optional) ttl column from ever being reaped.
 pub fn gcExpiredRecords(alloc: std.mem.Allocator, w: *db.Db) !usize {
-    const cols = try collections.list(alloc, w);
+    // Every allocation below (the collections list, and per collection the quoted field, the
+    // dialect predicate, and the DELETE text) is throwaway scratch freed together at return. An
+    // internal arena frees it all in one shot, keeping the sweep leak-free for ANY caller allocator
+    // (arena OR GPA) with no per-allocation bookkeeping — mirrors `provision.applySpecs`.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const cols = try collections.list(a, w);
     var total: usize = 0;
     for (cols) |col| {
         const tf = col.options.ttl_field orelse continue;
         if (!schema.isValidIdentifier(col.name)) continue;
         if (!schema.isValidIdentifier(tf)) continue;
-        const qtf = try std.fmt.allocPrint(alloc, "\"{s}\"", .{tf});
-        const expired = try db.dbDialect(w).ttlExpiredDeletePredicate(alloc, qtf);
-        const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE {s};", .{ col.name, expired }, 0);
-        defer alloc.free(sql); // no-op for arena callers; protects any future GPA caller
+        const qtf = try std.fmt.allocPrint(a, "\"{s}\"", .{tf});
+        const expired = try db.dbDialect(w).ttlExpiredDeletePredicate(a, qtf);
+        const sql = try std.fmt.allocPrintSentinel(a, "DELETE FROM \"{s}\" WHERE {s};", .{ col.name, expired }, 0);
         // Resilient per-collection: a single drifted collection (e.g. the table was
         // dropped but its `_collections` metadata remains) must not abort the whole
         // sweep and silence GC for every later collection. Log and skip to the next.
@@ -1993,6 +2022,11 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         params = try merged.toOwnedSlice(alloc);
     };
     if (q.rule) |rstr| if (rstr.len > 0) {
+        // The list rule is operator-authored and trusted: permit references to hidden fields (a
+        // server-side WHERE clause, never serialized), then restore the client-input default so the
+        // sort below still rejects a hidden sort key.
+        j.allow_hidden = true;
+        defer j.allow_hidden = false;
         const rtoks = try lexer.lex(alloc, rstr);
         const rast = try parser.parse(alloc, rtoks);
         const rc = try compiler.compile(alloc, &j, rast, q.rctx, dialect, &.{});
@@ -2471,7 +2505,7 @@ test "cursor: stateful token stores state, walks pages, and 410s on unknown id" 
     try std.testing.expectError(error.CursorState, list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = "deadbeefdeadbeefdeadbeefdeadbeef", .cursorToken = .stateful, .io = std.testing.io, .writer = &d }));
 }
 
-test "cursor: a hidden sort field is rejected (BadCursorSort), not silently null" {
+test "cursor: a hidden sort field is rejected (HiddenField) end-to-end, not silently null" {
     var d = try db.Db.openMemory();
     defer d.close();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2484,8 +2518,10 @@ test "cursor: a hidden sort field is rejected (BadCursorSort), not silently null
     };
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &fields });
     try d.exec("INSERT INTO notes (id,created,updated,title,secret) VALUES ('r1','t','t','a','x');");
-    // Sorting a cursor walk by the hidden field must fail loudly rather than mint a null boundary.
-    try std.testing.expectError(error.BadCursorSort, list(a, &d, col, .{ .sort = "secret", .cursorMode = true, .limit = 2 }));
+    // Sorting a cursor walk by a hidden field must fail loudly rather than mint a null boundary. The
+    // joiner rejects it (HiddenField) as the sort spec resolves — the single chokepoint — so this
+    // asserts the end-to-end behavior through list(), before any rows are fetched.
+    try std.testing.expectError(error.HiddenField, list(a, &d, col, .{ .sort = "secret", .cursorMode = true, .limit = 2 }));
 }
 
 test "cursor: a relation-path sort is rejected (BadCursorSort)" {

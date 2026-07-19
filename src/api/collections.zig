@@ -52,19 +52,19 @@ fn isSuperuser(ctx: *http.RequestCtx) bool {
     return authed.is_superuser;
 }
 
-fn requireSuperuser(ctx: *http.RequestCtx) ?http.Response {
+fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
     if (isSuperuser(ctx)) return null;
-    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator) catch
-        ApiError.internal().toResponse(ctx.allocator) catch unreachable;
+    // Building the 403 body allocates (JSON on the request arena), so OutOfMemory is reachable —
+    // propagate it to the server's 500 backstop rather than `catch unreachable` (#29).
+    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
 }
 
 /// Frozen-collection-metadata mode (issue #234): when `app.collections_frozen` is set the
 /// runtime collection-DDL endpoints are categorically disabled (schema evolves via
 /// `.migrations` + a redeploy). Returns a 403 response to short-circuit; null when not frozen.
-fn rejectIfFrozen(ctx: *http.RequestCtx, app: *app_mod.App) ?http.Response {
+fn rejectIfFrozen(ctx: *http.RequestCtx, app: *app_mod.App) !?http.Response {
     if (!app.collections_frozen) return null;
-    return (ApiError{ .status = 403, .message = "Collections are frozen (`.collections_frozen`); schema changes require a migration and a redeploy." }).toResponse(ctx.allocator) catch
-        ApiError.internal().toResponse(ctx.allocator) catch unreachable;
+    return try (ApiError{ .status = 403, .message = "Collections are frozen (`.collections_frozen`); schema changes require a migration and a redeploy." }).toResponse(ctx.allocator);
 }
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
@@ -75,7 +75,7 @@ fn validationResponse(ctx: *http.RequestCtx) !http.Response {
 }
 
 pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
-    if (requireSuperuser(ctx)) |resp| return resp;
+    if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
@@ -92,9 +92,9 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
-    if (requireSuperuser(ctx)) |resp| return resp;
+    if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
-    if (rejectIfFrozen(ctx, app)) |resp| return resp;
+    if (try rejectIfFrozen(ctx, app)) |resp| return resp;
     const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
         return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
     // Fail-closed: can't create an encrypted field with no field key configured
@@ -109,7 +109,9 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator);
     const created = collections.create(ctx.allocator, app.io, w, def_mut) catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
-        error.Conflict => return ApiError.conflict("Collection already exists.").toResponse(ctx.allocator),
+        // The pre-check (`get() != null`) catches the common duplicate; error.Constraint covers a
+        // duplicate that races in between the pre-check and the write — still a 409, never a 500.
+        error.Conflict, error.Constraint => return ApiError.conflict("Collection already exists.").toResponse(ctx.allocator),
         else => return e,
     };
     if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache
@@ -117,7 +119,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
-    if (requireSuperuser(ctx)) |resp| return resp;
+    if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
@@ -127,9 +129,9 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
-    if (requireSuperuser(ctx)) |resp| return resp;
+    if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
-    if (rejectIfFrozen(ctx, app)) |resp| return resp;
+    if (try rejectIfFrozen(ctx, app)) |resp| return resp;
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
         return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
@@ -144,7 +146,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const updated = collections.update(ctx.allocator, app.io, w, key, def_mut) catch |e| switch (e) {
         error.NotFound => return ApiError.notFound().toResponse(ctx.allocator),
         error.Validation => return validationResponse(ctx),
-        error.Conflict => return ApiError.conflict("Conflict.").toResponse(ctx.allocator),
+        error.Conflict, error.Constraint => return ApiError.conflict("Conflict.").toResponse(ctx.allocator),
         else => return e,
     };
     if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache
@@ -152,9 +154,9 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
-    if (requireSuperuser(ctx)) |resp| return resp;
+    if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
-    if (rejectIfFrozen(ctx, app)) |resp| return resp;
+    if (try rejectIfFrozen(ctx, app)) |resp| return resp;
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();

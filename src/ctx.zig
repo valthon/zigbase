@@ -37,6 +37,14 @@ const push_send = @import("push/send.zig");
 const analytics = @import("analytics/analytics.zig");
 const report_reporter = @import("report/reporter.zig");
 
+/// Allocation-free last-resort 500 for the error path when even rendering the error envelope
+/// fails (OOM). Byte-for-byte the envelope `ApiError.internal().renderBody` produces, so a client
+/// or SDK parsing the `{code,message,data}` shape sees the same body it would on any other 500.
+const static_internal_response = http_mod.Response{
+    .status = 500,
+    .body = "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}",
+};
+
 pub const Ctx = struct {
     app: *App,
     arena: std.mem.Allocator,
@@ -622,12 +630,18 @@ pub const Ctx = struct {
             error.NotFound => error_mod.ApiError.notFound(),
             error.BadRequest => error_mod.ApiError.badRequest("Bad request."),
             error.Conflict => error_mod.ApiError.conflict("Conflict."),
+            // A DB integrity-constraint violation (e.g. a duplicate unique value) propagated out
+            // of a custom route's `ctx.records()` write is a client conflict, not a server fault.
+            error.Constraint => error_mod.ApiError.conflict("A record with these values already exists."),
             error.Forbidden => error_mod.ApiError.forbidden(),
             error.Unauthorized => error_mod.ApiError.unauthorized(),
             else => error_mod.ApiError.internal(),
         };
-        return ae.toResponse(self.arena) catch
-            error_mod.ApiError.internal().toResponse(self.arena) catch unreachable;
+        // Rendering the envelope allocates; on OOM the retry would hit the SAME exhausted arena,
+        // so `catch unreachable` here is a REACHABLE unreachable that panics the server (ReleaseSafe)
+        // or is UB (ReleaseFast) on the error path of any request under memory pressure. Fall back to
+        // a preallocated static 500 body — no allocation, so it cannot fail.
+        return ae.toResponse(self.arena) catch static_internal_response;
     }
 
     // -----------------------------------------------------------------------
@@ -859,9 +873,8 @@ pub const Records = struct {
         if (opts.expand) |spec| if (spec.len > 0) {
             const conn = try self.ctx.connForRead();
             if (try collections.get(self.ctx.arena, conn, collection)) |col| {
-                for (result.items) |*item| {
-                    try expand_mod.expand(self.ctx.arena, conn, col, item, spec, 0, &self.ctx.rctx);
-                }
+                // Batch the page through one PageCache (schema parsed once, view decisions memoized).
+                try expand_mod.expandItems(self.ctx.arena, conn, col, result.items, spec, 0, &self.ctx.rctx);
             }
         };
         return result;
@@ -1560,6 +1573,16 @@ const CtxTestEnv = struct {
         ga.destroy(env);
     }
 };
+
+test "errorResponse static 500 fallback matches the rendered internal envelope byte-for-byte" {
+    // The allocation-free fallback that `errorResponse` returns when even rendering the error
+    // envelope runs out of memory must be indistinguishable from a normal 500, so a client or SDK
+    // parsing the `{code,message,data}` shape never chokes. Guard the two against drifting apart.
+    const rendered = try error_mod.ApiError.internal().renderBody(std.testing.allocator);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings(rendered, static_internal_response.body);
+    try std.testing.expectEqual(@as(u16, 500), static_internal_response.status);
+}
 
 test "ctx.setAppData/appData round-trips a typed app-scoped handle (#245)" {
     const env = try CtxTestEnv.init();
