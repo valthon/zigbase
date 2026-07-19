@@ -133,7 +133,12 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
         // from the physical schema if the source binary is older. Leave the target ledger intact.
         if (std.mem.eql(u8, tname, "_migrations")) continue;
         const n = try copyTable(a, source, target, tname);
-        try reports.append(gpa, .{ .name = try gpa.dupe(u8, tname), .rows = n });
+        // Dupe into a local with its own errdefer BEFORE appending: if `append` fails (OOM growing
+        // the list), the name is in neither `reports.items` (so the outer errdefer can't free it)
+        // nor owned locally — a partial-construction leak. The errdefer covers exactly that window.
+        const name = try gpa.dupe(u8, tname);
+        errdefer gpa.free(name);
+        try reports.append(gpa, .{ .name = name, .rows = n });
         total += n;
     }
 

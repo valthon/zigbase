@@ -32,8 +32,10 @@ fn init_0001(m: *Migrator) db.DbError!void {
 }
 
 fn init_0002(m: *Migrator) db.DbError!void {
-    // add the options column (ignore the duplicate-column error if somehow re-run)
-    m.execLowered(collections_options_column_sql) catch {};
+    // add the options column (additive; skip when it already exists so a real ALTER failure is
+    // propagated instead of being swallowed alongside the benign duplicate-column case)
+    if (!try columnExists(m, "_collections", "options"))
+        try m.execLowered(collections_options_column_sql);
     // _superusers system auth collection: its physical table + its _collections row
     try m.execLowered(
         \\CREATE TABLE IF NOT EXISTS "_superusers" (
@@ -175,40 +177,62 @@ fn init_0010_token_epoch(m: *Migrator) db.DbError!void {
     // column from `schema.authSystemFields()` at create time). `NOT NULL DEFAULT 0` so
     // existing rows + omitted inserts read as epoch 0, matching the default JWT claim.
     // `execLowered` maps the INTEGER type keyword to the backend (BIGINT on Postgres).
-    m.execLowered("ALTER TABLE \"_superusers\" ADD COLUMN \"token_epoch\" INTEGER NOT NULL DEFAULT 0;") catch {};
+    if (!try columnExists(m, "_superusers", "token_epoch"))
+        try m.execLowered("ALTER TABLE \"_superusers\" ADD COLUMN \"token_epoch\" INTEGER NOT NULL DEFAULT 0;");
 
     // Collect user auth-collection names FIRST: an ALTER TABLE bumps SQLite's schema
     // version and invalidates any open statement, so we cannot ALTER while iterating the
-    // _collections cursor. page_allocator (one-shot, startup) keeps this dependency-free.
-    const a = std.heap.page_allocator;
+    // _collections cursor. The run-scoped arena (`m.arena`, freed when `run` returns) owns these —
+    // no manual per-name frees, and the allocations stay visible to the test allocator's leak
+    // detection (page_allocator would have hidden them).
+    const a = m.arena;
     const int_ty = m.dialect.sqlType(.integer);
     var names: std.ArrayList([]u8) = .empty;
-    defer {
-        for (names.items) |n| a.free(n);
-        names.deinit(a);
-    }
     {
         // No placeholders → portable across backends; prepare directly.
         var st = try m.db.prepare("SELECT \"name\" FROM \"_collections\" WHERE \"type\"='auth' AND \"name\" != '_superusers';");
         defer st.finalize();
         while (try st.step()) {
             const nm = a.dupe(u8, st.columnText(0)) catch return error.ExecFailed;
-            names.append(a, nm) catch {
-                a.free(nm);
-                return error.ExecFailed;
-            };
+            names.append(a, nm) catch return error.ExecFailed;
         }
     }
     for (names.items) |nm| {
         if (!isSafeIdent(nm)) continue; // defensive: never interpolate an unvalidated name
+        if (try columnExists(m, nm, "token_epoch")) continue; // already migrated (or a newer collection)
         // Allocate the ALTER (no fixed buffer) so a long-but-valid collection name is never
         // stranded without the column — `schema.isValidIdentifier` has no length cap, so a
         // 251+ char name passes creation and MUST also be migrated here. The column type comes
         // from the dialect (BIGINT on Postgres, INTEGER on SQLite).
         const sql = std.fmt.allocPrintSentinel(a, "ALTER TABLE \"{s}\" ADD COLUMN \"token_epoch\" {s} NOT NULL DEFAULT 0;", .{ nm, int_ty }, 0) catch return error.ExecFailed;
-        defer a.free(sql);
-        m.db.exec(sql) catch {}; // ignore "duplicate column" when the column already exists
+        // Propagate a genuine DDL failure (lock timeout, disk full, …); the columnExists guard
+        // above already skipped the benign already-migrated case, so there is nothing to swallow.
+        try m.db.exec(sql);
     }
+}
+
+/// True when `col` exists on `table`. This is what makes the additive `ADD COLUMN` system
+/// migrations idempotent WITHOUT a blanket `catch {}` that would also swallow a GENUINE DDL failure
+/// (lock timeout, disk full, connection drop). A real failure must propagate so the migration is NOT
+/// recorded as applied with the column still missing — which would permanently break every feature
+/// that column backs, with no migration-based repair.
+///
+/// It queries the backend's catalog (SQLite `pragma_table_info`, Postgres `information_schema`)
+/// rather than probing a `SELECT "col" …`: a probe that references a missing column fails at
+/// prepare, and on Postgres a failed statement ABORTS the surrounding migration transaction — which
+/// would poison the very ALTER this guard precedes. A catalog COUNT returns 0 rows instead, on both
+/// backends. `table` is trusted (a constant system table, or an `isSafeIdent`-validated name), so
+/// interpolating it is safe; `col` is bound. Mirrors the introspection in `dumpload.zig`.
+fn columnExists(m: *Migrator, table: []const u8, col: []const u8) db.DbError!bool {
+    const sql = switch (m.dialect.kind) {
+        .sqlite => std.fmt.allocPrintSentinel(m.arena, "SELECT COUNT(*) FROM pragma_table_info('{s}') WHERE \"name\" = ?1;", .{table}, 0),
+        .postgres => std.fmt.allocPrintSentinel(m.arena, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '{s}' AND column_name = ?1;", .{table}, 0),
+    } catch return error.PrepareFailed;
+    var st = try m.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, col);
+    if (!try st.step()) return false; // COUNT always yields a row; defensive
+    return st.columnInt(0) > 0;
 }
 
 /// Local identifier guard for migration 0010's dynamic ALTER (avoids importing schema.zig).
@@ -546,9 +570,11 @@ fn init_0019_bulk_mail(m: *Migrator) db.DbError!void {
     try m.execLowered("CREATE INDEX IF NOT EXISTS \"idx_mail_batch_rcpt_status\" ON \"_mail_batch_recipients\" (\"batch\",\"status\");");
 
     // Retrofit: 0016 shipped _suppressions WITHOUT an `updated` column, so browsing it
-    // through the records API (base-column SELECT) errors. Additive, default ''.
-    // `catch {}` mirrors 0002's ALTER idempotence pattern (ADD COLUMN has no IF NOT EXISTS).
-    m.execLowered("ALTER TABLE \"_suppressions\" ADD COLUMN \"updated\" TEXT NOT NULL DEFAULT '';") catch {};
+    // through the records API (base-column SELECT) errors. Additive, default ''. Guarded by a
+    // column-existence probe (not a blanket `catch {}`) so a real ALTER failure propagates rather
+    // than being swallowed and the migration wrongly recorded as applied.
+    if (!try columnExists(m, "_suppressions", "updated"))
+        try m.execLowered("ALTER TABLE \"_suppressions\" ADD COLUMN \"updated\" TEXT NOT NULL DEFAULT '';");
 
     // Seed the two `_collections` rows (system=1). id/created/updated are implicit base
     // columns and are NOT listed. Rules NULL = Locked (superusers only) — the superuser
@@ -680,6 +706,21 @@ test "migrations apply once and are idempotent" {
     var c = try d.prepare("SELECT COUNT(*) FROM \"_collections\";");
     defer c.finalize();
     try std.testing.expect((try c.step()));
+}
+
+test "columnExists detects present/absent columns (the additive ADD COLUMN idempotence guard)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var m = Migrator{ .db = &d, .dialect = db.dbDialect(&d), .arena = arena.allocator(), .io = undefined };
+    try d.exec("CREATE TABLE t (a INTEGER, b TEXT);");
+    try std.testing.expect(try columnExists(&m, "t", "a"));
+    try std.testing.expect(try columnExists(&m, "t", "b"));
+    // A missing column, or a missing table, both probe false (prepare fails) — so the guarded
+    // ALTER runs, and any real failure it then hits propagates rather than being swallowed.
+    try std.testing.expect(!(try columnExists(&m, "t", "missing")));
+    try std.testing.expect(!(try columnExists(&m, "nosuchtable", "a")));
 }
 
 test "0002 adds options column and seeds _superusers" {

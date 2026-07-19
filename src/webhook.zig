@@ -128,10 +128,25 @@ pub fn webhookJobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
 
 /// Run the full delivery lifecycle for `job`: attempt, classify, back off, retry, and on a
 /// terminal rejection or exhausted attempts fire `.onError` (phase `.webhook`).
+///
+/// FOLLOW-UP (queue-side, out of this module's reach): the retries + backoff sleeps run INSIDE the
+/// handler, so a slow delivery keeps its worker busy and its durable row `claimed` for the whole
+/// sequence. The `max_total_backoff_ms` budget below bounds that so it can't overrun the queue's
+/// `visibility_timeout_s` and be re-dispatched as a concurrent duplicate — but the RIGHT design is
+/// to not sleep here at all: do ONE attempt per invocation and let the queue reschedule the next via
+/// its `run_at`/backoff. That needs the queue engine to (1) expose the current attempt number + the
+/// active queue's `visibility_timeout_s` on the job `Ctx` (queue/durable.zig builds it with neither);
+/// (2) accept a handler-supplied reschedule delay so a 429 `Retry-After` can flow into `run_at`
+/// (today pollOnce computes `run_at` itself from `backoffMs`); (3) carry the webhook's own
+/// `opts.retries` onto the `_queue_jobs.max_attempts` column (enqueue currently freezes the QUEUE
+/// def's `max_attempts`, not the per-webhook value); and (4) let a background failure carry phase
+/// `.webhook` on exhaustion instead of the queue's generic `.job`. Until those land, retrying here is
+/// the only way to preserve the documented per-webhook retries/Retry-After/`.webhook`-phase contract.
 pub fn deliver(ctx: *Ctx, job: WebhookJob) !void {
     const pol = job.policy();
     const max: u32 = if (job.max_attempts == 0) 1 else job.max_attempts;
     var attempt: u32 = 1;
+    var slept_ms: u64 = 0; // cumulative in-handler backoff, bounded by max_total_backoff_ms
     while (true) : (attempt += 1) {
         switch (try attemptOnce(ctx, job)) {
             .ok => return,
@@ -148,8 +163,17 @@ pub fn deliver(ctx: *Ctx, job: WebhookJob) !void {
                 }
                 const raw_delay = retry_after_ms orelse queue.backoffMs(pol, attempt, randomU64(ctx.app.io));
                 const delay_ms = cappedDelayMs(raw_delay, job.max_ms);
+                if (wouldExceedSleepBudget(slept_ms, delay_ms, max_total_backoff_ms)) {
+                    // Sleeping this long would keep the worker/claim past the queue's
+                    // visibility_timeout_s, inviting reclaimStale to re-deliver concurrently. Abandon
+                    // the delivery instead (same exhausted-delivery signal as running out of attempts).
+                    const msg = std.fmt.allocPrint(ctx.arena, "webhook POST {s} abandoned after {d} attempt(s): retry backoff would exceed the {d}ms in-handler budget (raise the queue visibility_timeout_s or lower the backoff)", .{ job.url, attempt, max_total_backoff_ms }) catch "webhook delivery abandoned (retry budget exceeded)";
+                    fireOnError(ctx, error.WebhookDeliveryFailed, msg);
+                    return;
+                }
                 if (delay_ms > 0)
                     ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
+                slept_ms += delay_ms;
             },
         }
     }
@@ -179,6 +203,49 @@ fn attemptOnce(ctx: *Ctx, job: WebhookJob) !Disposition {
         return .{ .retryable = null };
     };
     return classify(res.status, retryAfterMs(res.headers));
+}
+
+/// The maximum TOTAL time one `deliver()` invocation may spend sleeping between retries before it
+/// abandons the delivery (firing the same exhausted-delivery `.onError`). This bounds how long a
+/// single durable job can keep its worker occupied and its `_queue_jobs` row `claimed`.
+///
+/// WHY A TOTAL BUDGET (not just the per-attempt `cappedDelayMs`): the retry sleeps run INSIDE the
+/// handler, so their sum is how long the row stays `claimed`. The queue's `reclaimStale`
+/// (queue/durable.zig) resets any job still `claimed` past its queue's `visibility_timeout_s`
+/// (default 300s) back to `pending`; a second worker then re-claims and delivers the SAME webhook
+/// concurrently. Left unbounded, `retries=5 × max_ms=300s = ~20min` of in-handler sleeping blows
+/// far past the 300s default timeout, guaranteeing duplicate concurrent deliveries plus multi-minute
+/// starvation of every other job on that worker. Capping the cumulative sleep well under the default
+/// timeout keeps a single delivery from overrunning it. 120s leaves generous margin below 300s even
+/// after the per-attempt HTTP timeouts (default 5 × 10s) are added.
+///
+/// This is a HARM-REDUCTION bound, not the full fix. The correct design is to stop sleeping in the
+/// handler entirely and let the queue reschedule each attempt via its `run_at`/backoff — see the
+/// FOLLOW-UP note on `deliver()` for the exact queue-side changes that requires.
+pub const max_total_backoff_ms: u64 = 120_000;
+
+/// The smallest queue `visibility_timeout_s` that comfortably exceeds the WORST-CASE time a single
+/// DEFAULT webhook delivery can occupy its worker: the in-handler sleep budget (`max_total_backoff_ms`)
+/// PLUS every HTTP attempt (`retries × per-attempt timeout`, from the `WebhookOpts` defaults). A queue
+/// whose `visibility_timeout_s` is below this can have `reclaimStale` (queue/durable.zig) reset a
+/// still-running delivery back to `pending` and re-dispatch it as a CONCURRENT DUPLICATE. The active
+/// queue's real `visibility_timeout_s` is not reachable from the job `Ctx` (queue/durable.zig builds
+/// it with neither the attempt number nor the timeout — see the FOLLOW-UP on `deliver`), so the budget
+/// cannot be derived per-delivery; instead `framework.zig` warns at startup for any declared queue that
+/// falls below this floor while the webhook job kind is registered.
+pub fn minSafeVisibilityTimeoutS() i64 {
+    const d = WebhookOpts{}; // the documented defaults (retries = 5, timeout_s = 10)
+    const http_ms: u64 = @as(u64, d.retries) * (@as(u64, d.timeout_s) * 1000);
+    const total_ms = max_total_backoff_ms + http_ms;
+    return @intCast((total_ms + 999) / 1000); // ceil to whole seconds
+}
+
+/// True when adding `delay_ms` to the cumulative in-handler backoff (`already_slept_ms`) would push
+/// this single delivery's total sleeping past `budget_ms` — the point at which `deliver()` gives up
+/// early rather than occupying the worker long enough for `reclaimStale` to re-dispatch it as a
+/// concurrent duplicate. (Pure + separated for direct testing.)
+fn wouldExceedSleepBudget(already_slept_ms: u64, delay_ms: u32, budget_ms: u64) bool {
+    return already_slept_ms + delay_ms > budget_ms;
 }
 
 /// Cap a retry wait at the policy's `max_ms`. The delivery TARGET controls the
@@ -304,6 +371,29 @@ test "cappedDelayMs clamps a huge Retry-After to max_ms (worker-stall DoS guard)
     try testing.expectEqual(@as(u32, 2_000), cappedDelayMs(2_000, 300_000));
     try testing.expectEqual(@as(u32, 300_000), cappedDelayMs(300_000, 300_000));
     try testing.expectEqual(@as(u32, 0), cappedDelayMs(0, 300_000));
+}
+
+test "wouldExceedSleepBudget stops a delivery before it overruns the visibility timeout" {
+    // Within budget: keep sleeping.
+    try testing.expect(!wouldExceedSleepBudget(0, 1_000, 120_000));
+    try testing.expect(!wouldExceedSleepBudget(119_000, 1_000, 120_000)); // exactly at the budget is OK
+    // A single hostile Retry-After (already clamped to max_ms=300s) alone blows a 120s budget →
+    // abandon on the FIRST retry rather than parking the worker for 300s.
+    try testing.expect(wouldExceedSleepBudget(0, 300_000, 120_000));
+    // Cumulative: several moderate backoffs eventually cross the line.
+    try testing.expect(wouldExceedSleepBudget(119_500, 1_000, 120_000));
+    // The real default budget is comfortably under the default visibility_timeout_s (300s).
+    try testing.expect(max_total_backoff_ms < 300_000);
+}
+
+test "minSafeVisibilityTimeoutS covers the sleep budget PLUS every default HTTP attempt" {
+    // Defaults: retries=5, timeout_s=10 → 50s of HTTP; + 120s sleep budget = 170s.
+    try testing.expectEqual(@as(i64, 170), minSafeVisibilityTimeoutS());
+    // The DEFAULT queue visibility timeout (300s) is safely above the floor; a low one is not — the
+    // exact split the startup warning keys on.
+    const default_visibility_s: i64 = 300;
+    try testing.expect(default_visibility_s >= minSafeVisibilityTimeoutS());
+    try testing.expect(@as(i64, 60) < minSafeVisibilityTimeoutS()); // a 60s queue would (correctly) warn
 }
 
 // --- Loopback integration ---------------------------------------------------
