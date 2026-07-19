@@ -31,13 +31,25 @@ pub fn exchangeCode(
     code_verifier: []const u8,
     redirect_uri: []const u8,
 ) ClientError![]const u8 {
+    // Callers pass a request arena in practice, but this owns its scratch either way: each
+    // percent-encoded field, the form body, and the JSON tree are released on every exit path.
+    // (`resp.body` is deliberately NOT freed — it belongs to the Transport, and the production
+    // one returns a sub-slice of a larger fixed buffer, so freeing it would be an invalid free.)
+    const enc_code = try urlenc.percentEncode(alloc, code);
+    defer alloc.free(enc_code);
+    const enc_redirect = try urlenc.percentEncode(alloc, redirect_uri);
+    defer alloc.free(enc_redirect);
+    const enc_verifier = try urlenc.percentEncode(alloc, code_verifier);
+    defer alloc.free(enc_verifier);
+    const enc_client_id = try urlenc.percentEncode(alloc, client_id);
+    defer alloc.free(enc_client_id);
+    const enc_secret = try urlenc.percentEncode(alloc, client_secret);
+    defer alloc.free(enc_secret);
+
     const body = try std.fmt.allocPrint(alloc, "grant_type=authorization_code&code={s}&redirect_uri={s}&code_verifier={s}&client_id={s}&client_secret={s}", .{
-        try urlenc.percentEncode(alloc, code),
-        try urlenc.percentEncode(alloc, redirect_uri),
-        try urlenc.percentEncode(alloc, code_verifier),
-        try urlenc.percentEncode(alloc, client_id),
-        try urlenc.percentEncode(alloc, client_secret),
+        enc_code, enc_redirect, enc_verifier, enc_client_id, enc_secret,
     });
+    defer alloc.free(body);
     const headers = [_]Header{
         .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
         .{ .name = "accept", .value = "application/json" },
@@ -46,6 +58,7 @@ pub fn exchangeCode(
     if (!is2xx(resp.status)) return error.ProviderError;
 
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, resp.body, .{}) catch return error.InvalidResponse;
+    defer parsed.deinit(); // the returned token is duped below, so it outlives the tree
     if (parsed.value != .object) return error.InvalidResponse;
     const at = parsed.value.object.get("access_token") orelse return error.InvalidResponse;
     if (at != .string) return error.InvalidResponse;
