@@ -1,16 +1,31 @@
 //! Live SASLprep/SCRAM tests (SP3 Theme A item 2). Require a reachable PostgreSQL whose
 //! host auth is scram-sha-256 (both CI jobs force it via POSTGRES_HOST_AUTH_METHOD /
-//! --auth-host); the superuser suite role creates throwaway login roles. Skips without PG.
+//! --auth-host); the suite role creates throwaway login roles, so it needs CREATEROLE (CI's
+//! is a superuser). Skips when EITHER precondition is missing — no reachable PG, or a suite
+//! role without CREATEROLE. To run these locally against an unprivileged suite role, point
+//! `ZIGBASE_PG_TEST_URL` at a privileged one, e.g.
+//! `postgres://postgres:postgres@[::1]:5432/zbpgtest?sslmode=require`.
 
 const std = @import("std");
 const pg = @import("postgres.zig");
 const pgtests = @import("tests.zig");
 
 fn adminOrSkip(a: std.mem.Allocator, io: std.Io) !?pg.Db {
-    return pg.Db.open(a, io, pgtests.testUrl()) catch |e| switch (e) {
-        error.OpenFailed => null,
-        else => e,
+    var db = pg.Db.open(a, io, pgtests.testUrl()) catch |e| switch (e) {
+        error.OpenFailed => return null,
+        else => return e,
     };
+    // The fixtures below CREATE/DROP throwaway login roles, which needs CREATEROLE (CI's suite
+    // role is a superuser). Probe that privilege HERE: `DROP ROLE IF EXISTS` on an absent role
+    // is a no-op when permitted and "permission denied to drop role" otherwise, so it tests the
+    // privilege without creating anything. Skipping keeps a perfectly valid server whose suite
+    // role simply isn't privileged (a plain dev Postgres) from failing these tests with an
+    // opaque ExecFailed out of the SETUP DDL — which reads like a SCRAM bug and is not one.
+    db.exec("DROP ROLE IF EXISTS zb_sasl_privilege_probe;") catch {
+        db.close();
+        return null;
+    };
+    return db;
 }
 
 /// The suite URL with the userinfo swapped for `user:pass` (verbatim splice; the fixture
