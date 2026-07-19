@@ -80,11 +80,12 @@ pub fn generate(
     // must not fail generation — only routes that actually become RPC methods
     // need to share the prefix.
     // Must use `inline for` because RouteMeta contains `Input: type` (comptime-only field).
+    // Return the error WITHOUT logging here (like the guards below): `generate`
+    // is the unit-tested core, and a `std.log.err` inside it makes the --listen
+    // test runner count the expected-error path as a failure. mainWithCollections
+    // re-derives and logs the offending route at the CLI boundary.
     inline for (routes) |r| {
-        if (!r.untyped and !std.mem.startsWith(u8, r.path, api_prefix)) {
-            std.log.err("gen_client: typed route '{s}' does not start with --api-prefix '{s}'; the framework route prefix and the generator prefix disagree.", .{ r.path, api_prefix });
-            return error.RoutePrefixMismatch;
-        }
+        if (!r.untyped and !std.mem.startsWith(u8, r.path, api_prefix)) return error.RoutePrefixMismatch;
     }
 
     var report = guards.GuardReport{ .message = "" };
@@ -917,6 +918,11 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
         guards.checkOperatorNames(a, cols, &report) catch {};
         guards.checkIdentifiers(a, cols, &report) catch {};
         if (report.message.len > 0) std.log.err("{s}", .{report.message});
+        // Actionable message for a prefix mismatch (generate() stays log-free).
+        if (e == error.RoutePrefixMismatch) inline for (routes) |r| {
+            if (!r.untyped and !std.mem.startsWith(u8, r.path, args.api_prefix))
+                std.log.err("gen_client: typed route '{s}' does not start with --api-prefix '{s}'; the framework route prefix and the generator prefix disagree.", .{ r.path, args.api_prefix });
+        };
         return e;
     };
 
