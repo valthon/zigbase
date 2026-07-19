@@ -21,10 +21,11 @@ fn isSuperuser(ctx: *http.RequestCtx) bool {
     return authed.is_superuser;
 }
 
-fn requireSuperuser(ctx: *http.RequestCtx) ?http.Response {
+fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
     if (isSuperuser(ctx)) return null;
-    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator) catch
-        ApiError.internal().toResponse(ctx.allocator) catch unreachable;
+    // Building the 403 body allocates (JSON on the request arena), so OutOfMemory is reachable
+    // here — propagate it to the server's 500 backstop rather than `catch unreachable` (#29).
+    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
 }
 
 fn dataOnWriter(ctx: *http.RequestCtx) Data {
@@ -52,7 +53,7 @@ fn dataOnWriter(ctx: *http.RequestCtx) Data {
 /// }
 /// ```
 pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
-    if (requireSuperuser(ctx)) |resp| return resp;
+    if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
 
     // Declared registry: threaded in at comptime, null when no flags/experiments declared.

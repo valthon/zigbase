@@ -1,5 +1,6 @@
 const std = @import("std");
 const providers = @import("providers.zig");
+const urlenc = @import("../url.zig");
 
 pub const Method = enum { GET, POST };
 pub const Header = struct { name: []const u8, value: []const u8 };
@@ -19,25 +20,6 @@ fn is2xx(status: u16) bool {
     return status >= 200 and status < 300;
 }
 
-/// URL-encode `s` (RFC 3986 unreserved kept; everything else %XX).
-fn urlEncode(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    const hex = "0123456789ABCDEF";
-    for (s) |ch| {
-        const unreserved = (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or
-            (ch >= '0' and ch <= '9') or ch == '-' or ch == '_' or ch == '.' or ch == '~';
-        if (unreserved) {
-            try out.append(alloc, ch);
-        } else {
-            try out.append(alloc, '%');
-            try out.append(alloc, hex[ch >> 4]);
-            try out.append(alloc, hex[ch & 0x0f]);
-        }
-    }
-    return out.toOwnedSlice(alloc);
-}
-
 /// Exchange an authorization code for an access token (form-encoded POST to tokenURL).
 pub fn exchangeCode(
     transport: Transport,
@@ -50,11 +32,11 @@ pub fn exchangeCode(
     redirect_uri: []const u8,
 ) ClientError![]const u8 {
     const body = try std.fmt.allocPrint(alloc, "grant_type=authorization_code&code={s}&redirect_uri={s}&code_verifier={s}&client_id={s}&client_secret={s}", .{
-        try urlEncode(alloc, code),
-        try urlEncode(alloc, redirect_uri),
-        try urlEncode(alloc, code_verifier),
-        try urlEncode(alloc, client_id),
-        try urlEncode(alloc, client_secret),
+        try urlenc.percentEncode(alloc, code),
+        try urlenc.percentEncode(alloc, redirect_uri),
+        try urlenc.percentEncode(alloc, code_verifier),
+        try urlenc.percentEncode(alloc, client_id),
+        try urlenc.percentEncode(alloc, client_secret),
     });
     const headers = [_]Header{
         .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
