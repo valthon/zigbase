@@ -17,8 +17,20 @@ const std = @import("std");
 const schema = @import("../schema.zig");
 const kt = @import("kotlin_type.zig");
 const ident = @import("identifiers.zig");
+const sq = @import("schema_query.zig");
 
 const W = std.ArrayList(u8);
+
+/// Language-neutral schema queries shared with the other emitters (see
+/// schema_query.zig). File/select detection and the Kotlin identifier policy
+/// stay local (they route through kotlin_type.kindOf / the Kotlin keyword set).
+const isReadOnlySystem = sq.isReadOnlySystem;
+const isAuthSynthesized = sq.isAuthSynthesized;
+const inSet = sq.inSet;
+const collectionExists = sq.collectionExists;
+const hasResolvableRelations = sq.hasResolvableRelations;
+const appendVisibleAuthFields = sq.appendVisibleAuthFields;
+const recordFields = sq.recordFields;
 
 fn put(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
     try w.appendSlice(alloc, s);
@@ -47,21 +59,6 @@ fn putKtString(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
     try w.append(alloc, '"');
 }
 
-fn isReadOnlySystem(name: []const u8) bool {
-    return std.mem.eql(u8, name, "id") or
-        std.mem.eql(u8, name, "created") or
-        std.mem.eql(u8, name, "updated");
-}
-/// A schema field name that duplicates one of the auth-synthesized visible
-/// fields (`email`/`username`/`verified`) already appended by
-/// `appendVisibleAuthFields`/`emitFields`'s own auth-only block — skipped to
-/// avoid emitting the same fluent accessor twice.
-fn isAuthSynthesized(name: []const u8) bool {
-    return std.mem.eql(u8, name, "email") or
-        std.mem.eql(u8, name, "username") or
-        std.mem.eql(u8, name, "verified");
-}
-
 // ---------------------------------------------------------------------------
 // Kotlin identifier sanitizer
 //
@@ -86,11 +83,6 @@ fn isKotlinKeyword(name: []const u8) bool {
         "try",    "typealias", "typeof", "val",      "var",       "when",  "while",
     };
     for (kws) |k| if (std.mem.eql(u8, name, k)) return true;
-    return false;
-}
-
-fn inSet(name: []const u8, set: []const []const u8) bool {
-    for (set) |s| if (std.mem.eql(u8, name, s)) return true;
     return false;
 }
 
@@ -127,31 +119,9 @@ fn memberIdent(alloc: std.mem.Allocator, name: []const u8, reserved: []const []c
 /// Generation-time duplicate-identifier check: two distinct schema names that
 /// sanitize to the same Kotlin identifier (e.g. fields `class` and `class_`)
 /// would emit a duplicate data-class member. Errors with the colliding names.
+/// Delegates to the shared scan, supplying the Kotlin log prefix and error.
 fn checkDuplicateIdents(idents: []const []const u8, names: []const []const u8, scope: []const u8) !void {
-    for (idents, 0..) |a, i| {
-        for (idents[i + 1 ..], i + 1..) |b, j| {
-            if (std.mem.eql(u8, a, b)) {
-                std.log.warn(
-                    "gen_kotlin: schema names '{s}' and '{s}' both map to Kotlin identifier '{s}' in {s} — rename one of them",
-                    .{ names[i], names[j], a, scope },
-                );
-                return error.KotlinIdentCollision;
-            }
-        }
-    }
-}
-
-fn collectionExists(cols: []const schema.Collection, name: []const u8) bool {
-    for (cols) |c| if (std.mem.eql(u8, c.name, name)) return true;
-    return false;
-}
-
-fn hasResolvableRelations(cols: []const schema.Collection, c: schema.Collection) bool {
-    for (c.fields) |f| {
-        if (f.options != .relation) continue;
-        if (collectionExists(cols, f.options.relation.targetCollectionId)) return true;
-    }
-    return false;
+    return sq.checkDuplicateIdents("gen_kotlin", "Kotlin", error.KotlinIdentCollision, idents, names, scope);
 }
 
 fn hasFileField(c: schema.Collection) bool {
@@ -185,27 +155,6 @@ pub fn anySelectFields(cols: []const schema.Collection) bool {
 pub fn anyAuthCollections(cols: []const schema.Collection) bool {
     for (cols) |c| if (c.type == .auth) return true;
     return false;
-}
-
-fn appendVisibleAuthFields(alloc: std.mem.Allocator, list: *std.ArrayList(schema.Field)) !void {
-    try list.append(alloc, .{ .id = "_email", .name = "email", .options = .{ .email = .{} } });
-    try list.append(alloc, .{ .id = "_username", .name = "username", .options = .{ .text = .{} } });
-    try list.append(alloc, .{ .id = "_verified", .name = "verified", .options = .{ .bool = .{} } });
-}
-
-/// Record fields in emission order: id, (auth visible), user fields, created, updated.
-fn recordFields(alloc: std.mem.Allocator, c: schema.Collection) ![]schema.Field {
-    var list: std.ArrayList(schema.Field) = .empty;
-    try list.append(alloc, .{ .id = "_id", .name = "id", .options = .{ .text = .{} } });
-    if (c.type == .auth) try appendVisibleAuthFields(alloc, &list);
-    for (c.fields) |f| {
-        if (f.hidden) continue;
-        if (isReadOnlySystem(f.name)) continue;
-        try list.append(alloc, f);
-    }
-    try list.append(alloc, .{ .id = "_created", .name = "created", .options = .{ .autodate = .{} } });
-    try list.append(alloc, .{ .id = "_updated", .name = "updated", .options = .{ .autodate = .{} } });
-    return list.toOwnedSlice(alloc);
 }
 
 // ---------------------------------------------------------------------------

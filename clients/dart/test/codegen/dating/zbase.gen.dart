@@ -3,8 +3,9 @@
 //
 // A thin, schema-aware wrapper over the base Dart SDK. Import both this
 // file and package:zigbase_client/typed.dart (the generic typed runtime).
-// Regenerate with `zig build gen-dating-dart-client`, then `dart format` it
-// with the consuming package's language version (resolved from the package
+// Regenerate with your server's `typegen --lang dart` command (or the
+// build-time comptime gen-client build step), then `dart format` it with
+// the consuming package's language version (resolved from the package
 // config; without one, pass --language-version — style differs by version).
 //
 // Identifier mapping: a schema name that is a Dart reserved word or would

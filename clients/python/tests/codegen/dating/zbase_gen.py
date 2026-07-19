@@ -3,9 +3,9 @@
 # typed-core-version: 0.1.0
 #
 # A thin, schema-aware wrapper over the base Python SDK's generic typed
-# runtime (zigbase.typed, imported below as `zbt`). Regenerate with
-# `zig build gen-dating-python-client`, then `ruff format` it from
-# clients/python (its config governs formatting).
+# runtime (zigbase.typed, imported below as `zbt`). Regenerate with your
+# server's `typegen --lang python` command (or the build-time comptime
+# gen-client build step), then `ruff format` it with your project's config.
 #
 # Identifier mapping: a schema name that is a Python keyword gets a
 # trailing `_` on the PYTHON side only (field `class` -> member

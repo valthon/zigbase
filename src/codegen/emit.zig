@@ -4,6 +4,7 @@ const std = @import("std");
 const schema = @import("../schema.zig");
 const tt = @import("ts_type.zig");
 const ident = @import("identifiers.zig");
+const sq = @import("schema_query.zig");
 
 /// Growable byte buffer backing every emit helper.
 const W = std.ArrayList(u8);
@@ -35,24 +36,15 @@ fn putTsString(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
     try w.append(alloc, '"');
 }
 
-/// Returns true for the synthesized read-only system field names that are NOT
-/// user-declared fields: id, created, updated.  Used in emitRecord / emitMeta
-/// to avoid duplicating the fields that are always appended at the end.
-fn isReadOnlySystem(name: []const u8) bool {
-    return std.mem.eql(u8, name, "id") or
-        std.mem.eql(u8, name, "created") or
-        std.mem.eql(u8, name, "updated");
-}
-
-/// Returns true for the three visible auth fields that emitWhere / emitFields
-/// synthesize at the top for .auth collections.  Guards against double-emission
-/// when a caller passes a collection whose .fields already contain these names
-/// (e.g. after injectAuthFields).
-fn isAuthSynthesized(name: []const u8) bool {
-    return std.mem.eql(u8, name, "email") or
-        std.mem.eql(u8, name, "username") or
-        std.mem.eql(u8, name, "verified");
-}
+/// Language-neutral schema queries shared with the Dart/Kotlin/Python emitters
+/// (see schema_query.zig): read-only-system / auth-synthesized field name tests,
+/// collection lookup, and the record-field ordering (id, auth visible, user,
+/// created, updated) whose auth subset derives from schema.authSystemFields().
+const isReadOnlySystem = sq.isReadOnlySystem;
+const isAuthSynthesized = sq.isAuthSynthesized;
+const collectionExists = sq.collectionExists;
+const appendVisibleAuthFields = sq.appendVisibleAuthFields;
+const recordFields = sq.recordFields;
 
 /// Returns true for the system fields that emitWhere / emitFields synthesize
 /// after user-declared fields.  Guards against double-emission when a user
@@ -116,33 +108,6 @@ fn vectorLine(alloc: std.mem.Allocator, c: schema.Collection) ![]const u8 {
         try u.append(alloc, '"');
     }
     return std.fmt.allocPrint(alloc, "    vector?: {{ field: {s}; metric?: \"cosine\" | \"l2\"; values: number[] }};\n", .{u.items});
-}
-
-/// The visible synthesized auth fields for an auth collection record.
-/// Always emits email + username + verified (B3: unconditional synthesis —
-/// buildCollections does not propagate identityFields at comptime, so we cannot
-/// gate username; the dating snapshot is the authority for the full set).
-fn appendVisibleAuthFields(alloc: std.mem.Allocator, list: *std.ArrayList(schema.Field)) !void {
-    try list.append(alloc, .{ .id = "_email", .name = "email", .options = .{ .email = .{} } });
-    try list.append(alloc, .{ .id = "_username", .name = "username", .options = .{ .text = .{} } });
-    try list.append(alloc, .{ .id = "_verified", .name = "verified", .options = .{ .bool = .{} } });
-}
-
-/// The record fields, in emission order: id, (auth visible fields), user fields,
-/// created, updated.  User-declared fields named id/created/updated are deduplicated
-/// (isReadOnlySystem) since we always append them at the end.
-fn recordFields(alloc: std.mem.Allocator, c: schema.Collection) ![]schema.Field {
-    var list: std.ArrayList(schema.Field) = .empty;
-    try list.append(alloc, .{ .id = "_id", .name = "id", .options = .{ .text = .{} } });
-    if (c.type == .auth) try appendVisibleAuthFields(alloc, &list);
-    for (c.fields) |f| {
-        if (f.hidden) continue;
-        if (isReadOnlySystem(f.name)) continue; // dedup: created/updated always appended below
-        try list.append(alloc, f);
-    }
-    try list.append(alloc, .{ .id = "_created", .name = "created", .options = .{ .autodate = .{} } });
-    try list.append(alloc, .{ .id = "_updated", .name = "updated", .options = .{ .autodate = .{} } });
-    return list.toOwnedSlice(alloc);
 }
 
 // ---------------------------------------------------------------------------
@@ -225,11 +190,6 @@ pub fn emitUpdate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
 // ---------------------------------------------------------------------------
 // Where types
 // ---------------------------------------------------------------------------
-
-fn collectionExists(cols: []const schema.Collection, name: []const u8) bool {
-    for (cols) |c| if (std.mem.eql(u8, c.name, name)) return true;
-    return false;
-}
 
 pub fn emitWhere(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, c: schema.Collection) !void {
     const wn = try ident.whereName(alloc, c.name);
@@ -775,6 +735,13 @@ fn blogPosts() schema.Collection {
 
 fn contains(hay: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, hay, needle) != null;
+}
+
+// Pull the shared schema-query module into the test graph. root.zig references
+// this emitter (not schema_query.zig directly), so this is where its tests are
+// discovered.
+test {
+    _ = @import("schema_query.zig");
 }
 
 test "emitRecord matches Post shape" {
