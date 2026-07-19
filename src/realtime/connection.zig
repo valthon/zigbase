@@ -67,6 +67,13 @@ pub fn outboundOverHwm(pending: usize, hwm: u32) bool {
     return hwm != 0 and pending > hwm;
 }
 
+/// Two optional filter expressions are equal (both absent, or both present with equal bytes).
+fn filtersEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a) |x| if (b) |y| return std.mem.eql(u8, x, y);
+    return false;
+}
+
 /// A verified connection identity. `exp` is the token's unix expiry; past it the connection is
 /// treated as anonymous until a fresh `auth` message.
 pub const AuthIdentity = struct {
@@ -110,6 +117,20 @@ pub const Conn = struct {
         const k = try alloc.dupe(u8, topic);
         const f: ?[]const u8 = if (filter) |x| try alloc.dupe(u8, x) else null;
         try self.subs.put(alloc, k, f);
+    }
+
+    /// Update the stored filter for an ALREADY-subscribed `topic` in place, returning false when
+    /// the topic isn't subscribed (the caller then does a fresh `addSub` + transport subscribe).
+    /// This is the dedup path for a REPEATED subscribe (#3): it reuses the existing subscription
+    /// slot and the single transport-side subscription instead of stacking a second one — which
+    /// bypassed `MAX_SUBS` (`subs.put` overwrote the entry, so the count never grew) and made every
+    /// published event fan out N× to the same client. It re-dupes the filter ONLY when it actually
+    /// changed, so a client re-subscribing to the same topic+filter in a loop allocates nothing.
+    pub fn updateFilter(self: *Conn, alloc: std.mem.Allocator, topic: []const u8, filter: ?[]const u8) !bool {
+        const vp = self.subs.getPtr(topic) orelse return false;
+        if (filtersEqual(vp.*, filter)) return true;
+        vp.* = if (filter) |f| try alloc.dupe(u8, f) else null;
+        return true;
     }
     pub fn removeSub(self: *Conn, topic: []const u8) bool {
         return self.subs.remove(topic);
@@ -155,6 +176,33 @@ test "subscriptions add/remove/get filter" {
     try std.testing.expect(conn.removeSub("posts"));
     try std.testing.expect(!conn.hasSub("posts"));
     try std.testing.expect(!conn.removeSub("missing"));
+}
+
+test "updateFilter: dedup path replaces the filter in place without growing subs.count (#3)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = Conn{};
+    // A topic that isn't subscribed yet: updateFilter is a no-op miss (caller does addSub).
+    try std.testing.expect(!(try conn.updateFilter(a, "posts", "status='x'")));
+    try std.testing.expectEqual(@as(usize, 0), conn.subs.count());
+
+    try conn.addSub(a, "posts", "status='x'");
+    try std.testing.expectEqual(@as(usize, 1), conn.subs.count());
+
+    // Re-subscribe with the SAME filter: hit, count unchanged, filter unchanged.
+    try std.testing.expect(try conn.updateFilter(a, "posts", "status='x'"));
+    try std.testing.expectEqual(@as(usize, 1), conn.subs.count());
+    try std.testing.expectEqualStrings("status='x'", conn.subFilter("posts").?.*.?);
+
+    // Re-subscribe with a DIFFERENT filter: hit, count still unchanged, filter replaced.
+    try std.testing.expect(try conn.updateFilter(a, "posts", "status='y'"));
+    try std.testing.expectEqual(@as(usize, 1), conn.subs.count());
+    try std.testing.expectEqualStrings("status='y'", conn.subFilter("posts").?.*.?);
+
+    // Re-subscribe dropping the filter (null): hit, filter cleared.
+    try std.testing.expect(try conn.updateFilter(a, "posts", null));
+    try std.testing.expect(conn.subFilter("posts").?.* == null);
 }
 
 test "requestContext: anonymous, authed, expired" {

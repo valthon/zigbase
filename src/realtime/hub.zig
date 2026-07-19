@@ -74,30 +74,87 @@ fn recordIdOf(rec: std.json.Value) []const u8 {
 /// The `auth` verb body (moved from ws.onMessage, #156): verify the token on a pooled reader,
 /// install/clear the connection identity, resolve + cache the tenancy scope. Returns the
 /// {"type":"auth","status":"ok"|"error"} outcome; the CALLER writes the frame on its own
-/// transport. `durable_alloc` MUST be the connection-durable arena (the auth record and
-/// resolved memberships persist across frames). `requested_account` is the handshake-captured
-/// account request (header/signed-cookie), verified here against _memberships — an unverified
-/// value never grants scope. A pool-acquire failure is an auth failure (false), matching the
-/// old inline behavior (authFrame(false)).
-pub fn authVerb(app: *App, conn: *Conn, durable_alloc: std.mem.Allocator, token: []const u8, requested_account: []const u8) bool {
+/// transport. `requested_account` is the handshake-captured account request (header/signed-cookie),
+/// verified here against _memberships — an unverified value never grants scope. A pool-acquire
+/// failure is an auth failure (false), matching the old inline behavior (authFrame(false)).
+///
+/// `identity_arena` is a DEDICATED per-connection arena that holds ONLY the active identity (the
+/// cloned auth record + resolved account_id/memberships). It is RESET on every auth frame so the
+/// prior identity's bytes are reclaimed — a valid-token re-auth loop (a client spamming
+/// {"action":"auth"} with a live JWT) can therefore no longer grow per-connection memory without
+/// bound (#11 residual). It MUST be separate from the connection-durable arena (which also holds
+/// subscription keys/filters/sub_ids/requested_account that must survive a re-auth), and callers
+/// MUST NOT alias identity bytes into a long-lived delivery snapshot: WS callbacks are
+/// fio-serialized (a delivery never overlaps a re-auth), and the SSE delivery path snapshots a
+/// DEEP COPY of the identity (`sse.snapshotForDelivery`) so no in-flight lock-free delivery reads
+/// the bytes this reset releases.
+pub fn authVerb(app: *App, conn: *Conn, identity_arena: *std.heap.ArenaAllocator, token: []const u8, requested_account: []const u8) bool {
     var r = app.pool.acquireReader() catch return false;
     defer app.pool.releaseReader(&r);
-    if (auth.verifyToken(durable_alloc, app, &r, token)) |v| {
-        conn.setAuth(.{ .record = v.record, .is_superuser = v.is_superuser, .exp = v.exp });
-        // #156: resolve + cache the active account scope against _memberships (durable
-        // allocator → persists across frames). Superusers bypass tenancy. A failed/absent
-        // resolution leaves account_id="" → tenant-owned delivery fails closed (deny).
+    // #11: verify on a THROWAWAY scratch arena, never the identity one. `verifyToken` allocates the
+    // parsed JWT claims, the collection lookup, and the full record JSON into the allocator it is
+    // handed — and `jwt.peekClaims` base64-decodes + JSON-parses the payload BEFORE any validation,
+    // so even a GARBAGE token allocates. Only a SUCCESSFUL identity is persisted below (deep-cloned
+    // into the freshly-reset identity arena); the scratch (incl. every failed-token allocation) is
+    // reclaimed on return.
+    var scratch = std.heap.ArenaAllocator.init(app.allocator);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    if (auth.verifyToken(sa, app, &r, token)) |v| {
+        // #11 residual: reclaim the PRIOR identity's bytes before cloning the new one, so a re-auth
+        // loop can't grow this arena. Safe: the active identity is fully replaced below, and (see
+        // the doc comment) no in-flight delivery aliases the released bytes.
+        _ = identity_arena.reset(.retain_capacity);
+        const ia = identity_arena.allocator();
+        // Deep-clone the verified record onto the identity arena (the scratch arena that backs `v`
+        // is about to be freed). Re-materialize via stringify→parse — a self-contained deep copy.
+        const record = cloneJson(ia, v.record) catch {
+            conn.clearAuth();
+            return false;
+        };
+        conn.setAuth(.{ .record = record, .is_superuser = v.is_superuser, .exp = v.exp });
+        // Reset the account scope to static empties on EVERY re-auth: the `identity_arena.reset`
+        // above reclaimed the bytes backing the prior `account_id`/`memberships`, and the tenancy
+        // branch below refreshes them onto the fresh arena ONLY for a non-superuser tenant. Without
+        // this, a superuser (or tenancy-off, or unresolved) re-auth on the same socket would leave
+        // both fields dangling into the reset arena — and `sse.snapshotForDelivery` reads
+        // `memberships` unconditionally, so cloning that stale slice is a wild-pointer copy.
+        conn.setTenancyScope("", &.{});
+        // #156: resolve + cache the active account scope against _memberships. Superusers bypass
+        // tenancy. A failed/absent resolution leaves account_id="" → tenant-owned delivery fails
+        // closed (deny). The resolution runs on scratch, then its identity-scoped state is duped.
         if (conn.tenancy_enabled and !v.is_superuser) {
-            const uid = recordIdOf(v.record);
+            const uid = recordIdOf(record);
             if (uid.len > 0) {
-                const res = tenancy.resolve(durable_alloc, &r, v.collection, uid, requested_account) catch tenancy.Resolution{};
-                conn.setTenancyScope(res.account_id, res.memberships);
+                const res = tenancy.resolve(sa, &r, v.collection, uid, requested_account) catch tenancy.Resolution{};
+                const acc = ia.dupe(u8, res.account_id) catch "";
+                const ms = cloneMemberships(ia, res.memberships) catch &.{};
+                conn.setTenancyScope(acc, ms);
             }
         }
         return true;
     }
+    // A FAILED auth drops the identity AND reclaims its bytes (clear the refs first, then reset).
     conn.clearAuth();
+    _ = identity_arena.reset(.retain_capacity);
     return false;
+}
+
+/// Deep-copy a JSON value onto `alloc` (independent of the source arena) via stringify→parse — the
+/// canonical self-contained clone; the result owns all its bytes. Public so the SSE delivery
+/// snapshot can deep-copy the identity off the resettable identity arena (see `authVerb`).
+pub fn cloneJson(alloc: std.mem.Allocator, v: std.json.Value) !std.json.Value {
+    const json = try std.json.Stringify.valueAlloc(alloc, v, .{});
+    return std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{});
+}
+
+/// Deep-copy the resolved membership slice (account/role strings) onto `alloc`. Public for the same
+/// reason as `cloneJson` — the SSE delivery snapshot reuses it.
+pub fn cloneMemberships(alloc: std.mem.Allocator, src: []const request.Membership) ![]const request.Membership {
+    if (src.len == 0) return &.{};
+    const out = try alloc.alloc(request.Membership, src.len);
+    for (src, out) |m, *o| o.* = .{ .account = try alloc.dupe(u8, m.account), .role = try alloc.dupe(u8, m.role) };
+    return out;
 }
 
 /// The `subscribe` authorization body (moved from ws.onMessage, F5/#143): MAX_SUBS cap, the
@@ -106,7 +163,12 @@ pub fn authVerb(app: *App, conn: *Conn, durable_alloc: std.mem.Allocator, token:
 /// non-collection custom topics). Pure decision — the caller performs the transport-side
 /// subscription + reply. `alloc` is per-call scratch (the collection lookup borrows it).
 pub fn subscribeCheck(app: *App, conn: *const Conn, alloc: std.mem.Allocator, topic: []const u8) SubscribeOutcome {
-    if (conn.subs.count() >= connection.MAX_SUBS) return .limit;
+    // #3: a re-subscribe to an already-held topic is a REPLACE (the transports take the
+    // `Conn.updateFilter` path) — it reuses the existing subscription slot and never grows
+    // `subs.count()`, so it must not trip the cap. Only a genuinely NEW topic counts against
+    // MAX_SUBS. Without the `hasSub` guard the cap was double-broken: duplicate subscribes both
+    // bypassed it (count never grew) AND could be spuriously rejected once at the cap.
+    if (!conn.hasSub(topic) and conn.subs.count() >= connection.MAX_SUBS) return .limit;
     const t = protocol.parseTopic(topic);
     // The feature-management signal channel is PUBLIC and is not a collection.
     if (std.mem.eql(u8, t.collection, FEATURES_CHANNEL)) return .ok;
@@ -203,13 +265,48 @@ pub fn shouldDeliver(
     return policy.matchesRule(alloc, reader, col, record_id, combined, &rctx);
 }
 
-/// Evaluate `rule` against a single deleted-record `snapshot` (F4). Builds a throwaway in-memory
-/// DB (a MINIMAL schema: just the _collections registry — R1-3), recreates `col`'s table, inserts
-/// ONLY the snapshot row (id + its stored columns preserved
-/// verbatim), and runs the standard guarded SELECT. Reuses the exact rule machinery without
-/// touching the (now row-less) live DB. Relation-traversing rules resolve against empty target
-/// tables in the temp DB and therefore won't match — a conservative (deny) failure for delete
-/// events, which is the safe direction.
+/// A built delete-authz sandbox: a `:memory:` DB carrying the minimal `_collections` registry, a
+/// recreation of the deleted row's collection, and the single snapshot row. It depends ONLY on
+/// (collection, snapshot) — NOT on any subscriber — so it is reusable across every subscriber of one
+/// delete event. `key` is the exact `<collection>\x00<canonical snapshot JSON>` bytes it was built
+/// for; a reuse is gated on an EXACT `mem.eql` match (never a hash) so a cached sandbox can only
+/// ever authorize the SAME (collection, snapshot) it was built from — no collision could authorize a
+/// delete against the wrong row. Everything (key, schema, row) lives on `arena`; `db` is the live
+/// SQLite handle. `deinit` closes both.
+const SnapshotSandbox = struct {
+    arena: std.heap.ArenaAllocator,
+    db: db.Db,
+    live_col: schema.Collection,
+    key: []const u8,
+    fn deinit(self: *SnapshotSandbox) void {
+        self.db.close();
+        self.arena.deinit();
+    }
+};
+
+/// #18 hoist: a THREAD-LOCAL single-slot reuse of the delete sandbox across ONE delete event's
+/// per-subscriber fan-out. The sandbox depends only on (collection, snapshot), which is IDENTICAL
+/// for every subscriber of a given delete event — but facil.io owns the fan-out loop and invokes
+/// the per-subscriber delivery callback (`frameForDelivery`) once per subscriber, with no shared
+/// per-event scope we own. This slot lets all of an event's deliveries that land on the same
+/// reactor thread reuse a SINGLE build: T sandbox builds for T reactor threads instead of one per
+/// subscriber (once-per-event when the fan-out is single-threaded). It is lock-free by construction
+/// — each thread owns its slot and its SQLite handle, which is only ever touched by that thread and
+/// only for read-only SELECTs (`policy.matchesRule`), sequentially — and memory-bounded to one
+/// sandbox per reactor thread (a key miss `deinit`s the prior build before replacing it). A
+/// backing `std.heap.page_allocator` keeps the slot off any request/test arena so a lingering
+/// last-event sandbox is reclaimed by the OS at process exit, never flagged as a leak. A FULLY
+/// cross-thread single build would require owning the fan-out loop (facil.io owns it) — out of
+/// scope for a realtime-only change.
+threadlocal var snapshot_sandbox: ?SnapshotSandbox = null;
+
+/// Evaluate `rule` against a single deleted-record `snapshot` (F4), reusing a thread-local sandbox
+/// across a delete event's subscribers (#18). The sandbox is a throwaway in-memory DB (a MINIMAL
+/// schema: just the _collections registry — R1-3) with `col`'s table recreated and ONLY the snapshot
+/// row inserted (id + its stored columns preserved verbatim); the standard guarded SELECT then runs
+/// per subscriber. Reuses the exact rule machinery without touching the (now row-less) live DB.
+/// Relation-traversing rules resolve against empty target tables in the temp DB and therefore won't
+/// match — a conservative (deny) failure for delete events, which is the safe direction.
 ///
 /// BACKEND-AGNOSTIC (#159, PR-6): the sandbox is `db.Db.openMemory()`, which is ALWAYS the SQLite
 /// union arm (SQLite is compiled into every build; Postgres has no `:memory:` analog). So this
@@ -237,15 +334,51 @@ fn matchesSnapshot(
     rctx: *const request.RequestContext,
 ) !bool {
     if (snapshot != .object) return false;
+    if (snapshot.object.get("id")) |rid| {
+        if (rid != .string) return false;
+    } else return false;
+    const sandbox = try snapshotSandbox(io, col, snapshot);
+    // ONLY the guarded SELECT is per-subscriber; the sandbox build above is shared across the
+    // event's fan-out on this reactor thread (#18). `rctx` is this subscriber's identity, so the
+    // decision stays per-subscriber even though the single-row input is shared.
+    return policy.matchesRule(alloc, &sandbox.db, sandbox.live_col, record_id, rule, rctx) catch false;
+}
+
+/// Build — or reuse from the thread-local slot — the delete sandbox for (col, snapshot). The
+/// caller has already validated `snapshot` is an object with a string `id`.
+fn snapshotSandbox(io: std.Io, col: schema.Collection, snapshot: std.json.Value) !*SnapshotSandbox {
+    // Compute the exact cache key on a throwaway arena first: "<id>\x00<name>\x00<canonical JSON>".
+    // The stable collection id keys the SCHEMA (so two collections that share a name + snapshot can
+    // never reuse each other's sandbox — the schema build depends on the id's fields), the name
+    // keys the INSERT target, and the canonical snapshot JSON keys the row. Canonical JSON of the
+    // deleted row is far cheaper than the schema build it guards, so forming the key per delivery
+    // still leaves the reuse a net win.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const snap_json = try std.json.Stringify.valueAlloc(sa, snapshot, .{});
+    const key = try std.fmt.allocPrint(sa, "{s}\x00{s}\x00{s}", .{ col.id, col.name, snap_json });
+
+    if (snapshot_sandbox) |*cached| {
+        if (std.mem.eql(u8, cached.key, key)) return cached; // hit: same (collection, snapshot)
+        cached.deinit(); // miss: evict the prior event's build before replacing it
+        snapshot_sandbox = null;
+    }
+
+    // Build a fresh sandbox that OWNS its key + schema + row on its own arena (page-allocator
+    // backed, so it outlives the per-delivery arena and never touches a tracked test allocator).
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    errdefer arena.deinit();
+    const aa = arena.allocator();
+    const owned_key = try aa.dupe(u8, key);
+
     var tmp = try db.Db.openMemory();
-    defer tmp.close();
+    errdefer tmp.close();
     // R1-3: the sandbox needs ONLY the `_collections` registry (+ its `options` column) —
     // collections.create below reads and writes it — plus the one collection table that
-    // create() builds. The full migration suite (~28 CREATE TABLEs) ran here before, ONCE
-    // PER SUBSCRIBER PER DELETE EVENT: the dominant fan-out cost. Semantics are unchanged:
-    // tenancy/ability predicates compile to columns on the target table + bound params,
-    // and relation-traversing rules already resolved against an EMPTY `_collections`
-    // (conservative deny) because user collections were never present in the sandbox.
+    // create() builds. Semantics are unchanged: tenancy/ability predicates compile to columns
+    // on the target table + bound params, and relation-traversing rules resolve against an EMPTY
+    // `_collections` (conservative deny) because user collections were never present in the sandbox.
     try tmp.exec(migrations.collections_table_sql);
     try tmp.exec(migrations.collections_options_column_sql);
     // Recreate the collection table (fresh id; we never persist relation FKs, so an isolated
@@ -253,7 +386,7 @@ fn matchesSnapshot(
     var spec = col;
     spec.id = "";
     spec.indexes = &.{}; // unique indexes are irrelevant for a single-row authz probe
-    const live_col = try collections.create(alloc, io, &tmp, spec);
+    const live_col = try collections.create(aa, io, &tmp, spec);
 
     // Direct INSERT preserving the snapshot's real id + stored scalar columns, binding each value
     // by its JSON type. (We bypass records.create on purpose: it regenerates the id and re-runs
@@ -262,8 +395,8 @@ fn matchesSnapshot(
     var ph_sql: std.ArrayList(u8) = .empty;
     const Bind = struct { v: std.json.Value };
     var binds: std.ArrayList(Bind) = .empty;
-    try cols_sql.appendSlice(alloc, "\"id\",\"created\",\"updated\"");
-    try ph_sql.appendSlice(alloc, "?1,'',''");
+    try cols_sql.appendSlice(aa, "\"id\",\"created\",\"updated\"");
+    try ph_sql.appendSlice(aa, "?1,'',''");
     var n: c_int = 2;
     var it = snapshot.object.iterator();
     while (it.next()) |e| {
@@ -274,19 +407,17 @@ fn matchesSnapshot(
             .string, .integer, .float, .bool, .number_string => {},
             else => continue, // null/object/array: leave column NULL
         }
-        try cols_sql.append(alloc, ',');
-        try cols_sql.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\"", .{name}));
-        try ph_sql.append(alloc, ',');
-        try ph_sql.appendSlice(alloc, try std.fmt.allocPrint(alloc, "?{d}", .{n}));
-        try binds.append(alloc, .{ .v = e.value_ptr.* });
+        try cols_sql.append(aa, ',');
+        try cols_sql.appendSlice(aa, try std.fmt.allocPrint(aa, "\"{s}\"", .{name}));
+        try ph_sql.append(aa, ',');
+        try ph_sql.appendSlice(aa, try std.fmt.allocPrint(aa, "?{d}", .{n}));
+        try binds.append(aa, .{ .v = e.value_ptr.* });
         n += 1;
     }
-    const sql = try std.fmt.allocPrintSentinel(alloc, "INSERT INTO \"{s}\" ({s}) VALUES ({s});", .{ col.name, cols_sql.items, ph_sql.items }, 0);
+    const sql = try std.fmt.allocPrintSentinel(aa, "INSERT INTO \"{s}\" ({s}) VALUES ({s});", .{ col.name, cols_sql.items, ph_sql.items }, 0);
     var st = try tmp.prepare(sql);
     defer st.finalize();
-    const rid = (snapshot.object.get("id") orelse return false);
-    if (rid != .string) return false;
-    try st.bindText(1, rid.string);
+    try st.bindText(1, snapshot.object.get("id").?.string);
     var bi: c_int = 2;
     for (binds.items) |b| {
         switch (b.v) {
@@ -300,7 +431,11 @@ fn matchesSnapshot(
         bi += 1;
     }
     _ = try st.step();
-    return policy.matchesRule(alloc, &tmp, live_col, record_id, rule, rctx) catch false;
+
+    // Publish into the thread-local slot and return a pointer to it. No errdefer fires past this
+    // point, so the moved-in `arena`/`tmp` are owned solely by the slot (no double-free).
+    snapshot_sandbox = .{ .arena = arena, .db = tmp, .live_col = live_col, .key = owned_key };
+    return &snapshot_sandbox.?;
 }
 
 pub const EventFrames = struct {
@@ -379,21 +514,29 @@ pub fn frameForDelivery(
     defer col_lease.release();
     const col = col_lease.col orelse return message;
 
-    const parsed = std.json.parseFromSlice(std.json.Value, a, message, .{}) catch return null;
-    if (parsed.value != .object) return null;
-    const obj = parsed.value.object;
-    const av = obj.get("action") orelse return null;
-    if (av != .string) return null;
-    const action: protocol.Action = if (std.mem.eql(u8, av.string, "create")) .create else if (std.mem.eql(u8, av.string, "update")) .update else if (std.mem.eql(u8, av.string, "delete")) .delete else return null;
-    const rv = obj.get("record") orelse return null;
-    if (rv != .object) return null;
-    const idv = rv.object.get("id") orelse return null;
-    if (idv != .string) return null;
-    const record_id = idv.string;
+    // #17: parse ONLY the three envelope fields the delivery decision needs — `action`,
+    // `record.id`, and (delete only) the private `_deleteSnapshot` — with a TYPED parse +
+    // `ignore_unknown_fields`, so the (arbitrarily large) record body is tokenized past but NEVER
+    // materialized into a per-subscriber `ObjectMap` tree. This function runs once per SUBSCRIBER
+    // per event; the old `parseFromSlice(Value)` built + discarded the whole record on every one of
+    // them (10 KiB record × 1000 subscribers = ~10 MiB of throwaway allocation per event). For
+    // create/update the record body is returned to the client VERBATIM below — never inspected.
+    const env = std.json.parseFromSliceLeaky(DeliveryEnvelope, a, message, .{ .ignore_unknown_fields = true }) catch return null;
+    const action: protocol.Action = if (std.mem.eql(u8, env.action, "create"))
+        .create
+    else if (std.mem.eql(u8, env.action, "update"))
+        .update
+    else if (std.mem.eql(u8, env.action, "delete"))
+        .delete
+    else
+        return null;
+    const record_id = env.record.id;
+    if (record_id.len == 0) return null;
 
-    // F4: the deleted-record authorization snapshot rides the published frame under a private
-    // key. Pull it out for per-subscriber authz, then strip it so the client frame is id-only.
-    const delete_snapshot: ?std.json.Value = if (action == .delete) rv.object.get(delete_snapshot_key) else null;
+    // F4: the deleted-record authorization snapshot rides the published frame under a private key.
+    // It is materialized (deletes only) for per-subscriber authz, then stripped so the client frame
+    // is id-only.
+    const delete_snapshot: ?std.json.Value = if (action == .delete) env.record._deleteSnapshot else null;
 
     const now = auth.nowUnixPub(&r) catch return null;
     const deliver = shouldDeliver(a, app.io, &r, col, conn, now, action, record_id, sub_filter, delete_snapshot) catch return null;
@@ -402,11 +545,23 @@ pub fn frameForDelivery(
     if (action == .delete and delete_snapshot != null) {
         // Re-serialize an id-only delete frame so the private snapshot never reaches the client.
         var clean: std.json.ObjectMap = .empty;
-        clean.put(a, "id", idv) catch return null;
+        clean.put(a, "id", .{ .string = record_id }) catch return null;
         return protocol.serializeEvent(a, channel, .delete, .{ .object = clean }) catch null;
     }
     return message;
 }
+
+/// The minimal shape `frameForDelivery` extracts from a published record frame (#17). Every other
+/// envelope + record field is skipped by `ignore_unknown_fields` — no full-tree materialization.
+const DeliveryEnvelope = struct {
+    action: []const u8 = "",
+    record: struct {
+        id: []const u8 = "",
+        /// The private per-subscriber delete-authz snapshot (delete frames only; stripped before
+        /// the client sees the id-only frame). Materialized only when actually present.
+        _deleteSnapshot: ?std.json.Value = null,
+    } = .{},
+};
 
 const TestDb = struct {
     d: db.Db,
@@ -555,6 +710,50 @@ test "F4: owner-scoped delete only notifies the owner (snapshot authz)" {
     try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .delete, "GONE", null, snapshot));
     // No snapshot at all -> conservative deny, even for the would-be owner.
     try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner, 0, .delete, "GONE", null, null));
+}
+
+test "#18 hoist: the thread-local delete sandbox is reused per-subscriber AND rebuilt per event, with no cross-subscriber/cross-event leak" {
+    // The sandbox depends only on (collection, snapshot); it is cached thread-locally and reused
+    // across a delete event's subscribers, then rebuilt when the (collection, snapshot) changes.
+    // This drives the reuse path (same snapshot, many subscribers) and the rebuild path (a second
+    // snapshot, then back to the first) and asserts the per-subscriber authz decision is ALWAYS
+    // computed from that subscriber's own rctx — never leaked from a prior cache occupant.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try tdb.mkColl(a, "notes", "owner = @request.auth.id");
+
+    var snap1: std.json.ObjectMap = .empty;
+    try snap1.put(a, "id", .{ .string = "R1" });
+    try snap1.put(a, "owner", .{ .string = "u1" });
+    const s1: std.json.Value = .{ .object = snap1 };
+    var snap2: std.json.ObjectMap = .empty;
+    try snap2.put(a, "id", .{ .string = "R2" });
+    try snap2.put(a, "owner", .{ .string = "u2" });
+    const s2: std.json.Value = .{ .object = snap2 };
+
+    var owner1 = try authedConn(a, "u1", false); // owns R1
+    var owner2 = try authedConn(a, "u2", false); // owns R2
+    var anon = Conn{};
+
+    // Event 1 (snapshot owned by u1): first call BUILDS the sandbox, the next two REUSE it. Each
+    // subscriber's decision comes from its own identity — a reused sandbox must not carry u1's
+    // "allow" over to u2/anon.
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner1, 0, .delete, "R1", null, s1));
+    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner2, 0, .delete, "R1", null, s1));
+    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .delete, "R1", null, s1));
+
+    // Event 2 (different snapshot owned by u2): the key changes -> REBUILD. Now u2 is the owner and
+    // u1 is denied — proving the rebuild swapped in the new row and did not reuse event 1's row.
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner2, 0, .delete, "R2", null, s2));
+    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner1, 0, .delete, "R2", null, s2));
+
+    // Back to event 1's snapshot: another rebuild; u1 allowed, u2 denied again. Interleaving proves
+    // the cache never stalely authorizes against the wrong event's row.
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner1, 0, .delete, "R1", null, s1));
+    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner2, 0, .delete, "R1", null, s1));
 }
 
 test "tenant scoping: a subscriber receives ONLY its account's frames; unresolved account gets nothing" {
@@ -841,6 +1040,38 @@ test "subscribeCheck decision table: limit / __features / unknown / auth_require
     try std.testing.expectEqual(SubscribeOutcome.limit, subscribeCheck(&app, &full, a, "one_more"));
 }
 
+test "cloneJson / cloneMemberships: deep copy is independent of the source arena (#11)" {
+    // The #11 fix verifies the token on a THROWAWAY arena, then deep-clones the identity onto the
+    // durable one. Prove the clone survives after the source arena is freed.
+    const ga = std.testing.allocator;
+    var durable = std.heap.ArenaAllocator.init(ga);
+    defer durable.deinit();
+    const da = durable.allocator();
+
+    var record: std.json.Value = undefined;
+    var mss: []const request.Membership = undefined;
+    {
+        var src = std.heap.ArenaAllocator.init(ga);
+        defer src.deinit(); // free the SOURCE before we read the clones
+        const sa = src.allocator();
+        var obj: std.json.ObjectMap = .empty;
+        try obj.put(sa, "id", .{ .string = "u1" });
+        try obj.put(sa, "name", .{ .string = "Ada" });
+        record = try cloneJson(da, .{ .object = obj });
+        const src_ms = try sa.alloc(request.Membership, 1);
+        src_ms[0] = .{ .account = try sa.dupe(u8, "accA"), .role = try sa.dupe(u8, "admin") };
+        mss = try cloneMemberships(da, src_ms);
+    }
+    // Source arena is gone; the durable clones must still be intact.
+    try std.testing.expectEqualStrings("u1", recordIdOf(record));
+    try std.testing.expectEqualStrings("Ada", record.object.get("name").?.string);
+    try std.testing.expectEqual(@as(usize, 1), mss.len);
+    try std.testing.expectEqualStrings("accA", mss[0].account);
+    try std.testing.expectEqualStrings("admin", mss[0].role);
+    // Empty memberships clone to the empty slice (no allocation).
+    try std.testing.expectEqual(@as(usize, 0), (try cloneMemberships(da, &.{})).len);
+}
+
 test "authVerb: bad token clears auth and returns false (transport-neutral)" {
     var env = try PoolEnv.init();
     defer env.deinit();
@@ -849,11 +1080,13 @@ test "authVerb: bad token clears auth and returns false (transport-neutral)" {
     const a = arena.allocator();
     var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
     var c = Conn{};
+    var id_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer id_arena.deinit();
     // Pre-install an identity to prove a failed auth CLEARS it (the ws contract).
     var rec: std.json.ObjectMap = .empty;
     try rec.put(a, "id", .{ .string = "u1" });
     c.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
-    try std.testing.expect(!authVerb(&app, &c, a, "not-a-jwt", ""));
+    try std.testing.expect(!authVerb(&app, &c, &id_arena, "not-a-jwt", ""));
     try std.testing.expect(c.auth == null);
 }
 

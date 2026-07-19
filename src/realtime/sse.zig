@@ -52,10 +52,15 @@ pub const SseConn = struct {
     /// is testable without facil.io.
     handle: ?sse_fio.Handle = null,
     sub_ids: std.StringHashMapUnmanaged(usize) = .empty, // topic -> fio sub id; guarded by mu
-    /// Durable per-connection arena: auth record, memberships, subscription keys/filters.
-    /// Allocations only under mu; freed at last unref — NEVER earlier, which is what keeps
-    /// post-unlock delivery snapshots readable (clearAuth only nulls references).
+    /// Durable per-connection arena: subscription keys/filters, sub_ids, requested_account.
+    /// Allocations only under mu; freed at last unref — NEVER earlier.
     durable: std.heap.ArenaAllocator,
+    /// Identity-only arena: the active auth record + resolved account/memberships. RESET on every
+    /// auth frame (hub.authVerb, #11 residual) so a re-auth loop can't grow memory without bound.
+    /// Because the uplink (which resets this) races lock-free deliveries, `snapshotForDelivery`
+    /// takes a DEEP COPY of the identity onto the per-delivery arena — a delivery NEVER aliases
+    /// these bytes after unlock, so the reset is safe. Freed at last unref.
+    identity: std.heap.ArenaAllocator,
     app: *App,
     /// The uplink capability: 32 CSPRNG base36 chars, delivered only on the Origin-gated
     /// stream (connect frame). The registry key is this buffer's slice.
@@ -71,7 +76,11 @@ var registry: std.StringHashMapUnmanaged(*SseConn) = .empty; // clientId -> conn
 /// ref and must either reach on_open (which registers it) or destroy via `unref`.
 pub fn create(app: *App) !*SseConn {
     const sc = try app.allocator.create(SseConn);
-    sc.* = .{ .app = app, .durable = std.heap.ArenaAllocator.init(app.allocator) };
+    sc.* = .{
+        .app = app,
+        .durable = std.heap.ArenaAllocator.init(app.allocator),
+        .identity = std.heap.ArenaAllocator.init(app.allocator),
+    };
     id_mod.generate(app.io, &sc.client_id);
     return sc;
 }
@@ -110,6 +119,7 @@ pub fn unref(sc: *SseConn) void {
     const app = sc.app;
     sc.sub_ids = .empty; // keys/values live on the durable arena
     sc.durable.deinit();
+    sc.identity.deinit();
     if (sc.handle) |h| sse_fio.free(h);
     app.allocator.destroy(sc);
 }
@@ -158,7 +168,7 @@ pub fn handleUplink(sc: *SseConn, a: std.mem.Allocator, body: []const u8) !?Repl
     const da = sc.durable.allocator();
     switch (msg) {
         .auth => |m| {
-            const ok = hub.authVerb(sc.app, &sc.conn, da, m.token, sc.requested_account);
+            const ok = hub.authVerb(sc.app, &sc.conn, &sc.identity, m.token, sc.requested_account);
             return .{ .status = 200, .frame = try protocol.authFrame(a, ok) };
         },
         .subscribe => |m| {
@@ -168,12 +178,33 @@ pub fn handleUplink(sc: *SseConn, a: std.mem.Allocator, body: []const u8) !?Repl
                 .auth_required => return .{ .status = 200, .frame = try protocol.errorFrame(a, "authentication required to subscribe") },
                 .ok => {},
             }
+            // #3: replace-in-place on a repeat subscribe (mirrors ws.zig) — reuse the single fio
+            // subscription instead of stacking a second, which bypassed MAX_SUBS and duplicated
+            // every delivered frame.
+            if (try sc.conn.updateFilter(da, m.topic, m.filter)) {
+                return .{ .status = 200, .frame = try protocol.ackFrame(a, "subscribe", m.topic) };
+            }
             // Same durable-dupe discipline as WS (the m.topic buffer dies with this request).
             const channel = try da.dupe(u8, m.topic);
             try sc.conn.addSub(da, m.topic, m.filter);
             if (sc.handle) |h| {
                 const sub_id = sse_fio.subscribe(h, channel, onChannelMessage, sc);
-                if (sub_id != 0) sc.sub_ids.put(da, channel, sub_id) catch {};
+                if (sub_id == 0) {
+                    // #30: don't ack a failed fio subscribe as success — roll back + surface an error.
+                    _ = sc.conn.removeSub(m.topic);
+                    std.log.warn("realtime: SSE subscribe to \"{s}\" failed (fio subscribe returned 0)", .{m.topic});
+                    return .{ .status = 200, .frame = try protocol.errorFrame(a, "subscribe failed") };
+                }
+                sc.sub_ids.put(da, channel, sub_id) catch {
+                    // #30: fio subscribe SUCCEEDED but recording its id failed — without the id a
+                    // later unsubscribe can't cancel it, stranding a live fio subscription the
+                    // client can't drop. Roll back (fio-unsubscribe + drop the logical sub) and
+                    // surface an error instead of acking a success we can't honor (mirror sub_id==0).
+                    sse_fio.unsubscribe(h, sub_id);
+                    _ = sc.conn.removeSub(m.topic);
+                    std.log.warn("realtime: SSE subscribe to \"{s}\" failed (sub_id store OOM)", .{m.topic});
+                    return .{ .status = 200, .frame = try protocol.errorFrame(a, "subscribe failed") };
+                };
             }
             return .{ .status = 200, .frame = try protocol.ackFrame(a, "subscribe", m.topic) };
         },
@@ -189,11 +220,13 @@ pub fn handleUplink(sc: *SseConn, a: std.mem.Allocator, body: []const u8) !?Repl
 
 // Delivery-decision inputs, copied OUT of the locked conn so hub.frameForDelivery (DB work)
 /// runs with NO lock held. `identity` is an identity-only Conn (subs deliberately empty —
-/// frameForDelivery never reads them; hasSub/filter are resolved here). The shallow-copied
-/// auth record / memberships / account_id point into the durable arena, which never frees
-/// before the last unref, and fio serializes this delivery against on_close — so they stay
-/// readable after unlock. An auth/unsubscribe landing between snapshot and write mirrors the
-/// WS status quo (an in-flight frame is decided under the identity current at decision time).
+/// frameForDelivery never reads them; hasSub/filter are resolved here). The identity (auth record
+/// / memberships / account_id) is DEEP-COPIED onto the per-delivery arena `a`, NOT aliased from the
+/// connection's identity arena: that arena is RESET on re-auth (hub.authVerb, #11 residual), and a
+/// re-auth on the uplink thread can land while this delivery does its lock-free DB work, so a
+/// shallow alias would dangle. The deep copy makes the snapshot self-contained. An auth/unsubscribe
+/// landing between snapshot and write mirrors the WS status quo (an in-flight frame is decided
+/// under the identity current at decision time).
 pub const DeliverySnapshot = struct {
     identity: connection.Conn,
     sub_filter: ?[]const u8,
@@ -211,12 +244,21 @@ pub fn snapshotForDelivery(sc: *SseConn, a: std.mem.Allocator, channel: []const 
         (if (p.*) |s| (a.dupe(u8, s) catch return null) else null)
     else
         null;
+    // DEEP-COPY the identity onto `a` (see the struct doc): the source bytes live on the
+    // identity arena, which a concurrent re-auth may reset out from under the lock-free delivery.
+    const auth_copy: ?connection.AuthIdentity = if (sc.conn.auth) |ident| .{
+        .record = hub.cloneJson(a, ident.record) catch return null,
+        .is_superuser = ident.is_superuser,
+        .exp = ident.exp,
+    } else null;
+    const account_copy = a.dupe(u8, sc.conn.account_id) catch return null;
+    const memberships_copy = hub.cloneMemberships(a, sc.conn.memberships) catch return null;
     return .{
         .identity = .{
-            .auth = sc.conn.auth,
+            .auth = auth_copy,
             .tenancy_enabled = sc.conn.tenancy_enabled,
-            .account_id = sc.conn.account_id,
-            .memberships = sc.conn.memberships,
+            .account_id = account_copy,
+            .memberships = memberships_copy,
         },
         .sub_filter = filter,
     };

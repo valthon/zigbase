@@ -217,17 +217,28 @@ pub fn decodeAny(a: std.mem.Allocator, payload: []const u8) ?Payload {
 /// Also GCs expired tokens (cheap piggyback). Returns null on any error (cross-instance delete
 /// then degrades to no remote delivery — local subscribers are unaffected).
 pub fn storeDeleteSnapshot(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, snapshot: std.json.Value) ?[]const u8 {
-    const token = crypto.genToken(io, alloc, 32) catch return null;
-    const snap_json = std.json.Stringify.valueAlloc(alloc, snapshot, .{}) catch return null;
+    // #39: keep the degrade-to-no-remote-delivery `?`-return, but do NOT collapse every failure to
+    // a silent null — a persistent store failure (table dropped, permission change, degraded
+    // connection) would otherwise stop ALL cross-instance deletes with zero operator-visible signal.
+    return storeDeleteSnapshotInner(alloc, io, w, snapshot) catch |e| {
+        std.log.warn("realtime: cross-instance delete-snapshot store failed (remote subscribers will miss this delete): {s}", .{@errorName(e)});
+        return null;
+    };
+}
+
+fn storeDeleteSnapshotInner(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, snapshot: std.json.Value) ![]const u8 {
+    const token = try crypto.genToken(io, alloc, 32);
+    const snap_json = try std.json.Stringify.valueAlloc(alloc, snapshot, .{});
     // GC orphaned tokens first (writers whose listeners never consumed them). Bounds the table to
     // ~the TTL window of deletes; native PG interval compare on the indexed `created` column.
+    // Best-effort: a GC failure must not fail the store itself.
     w.exec("DELETE FROM \"_rt_delete_snapshots\" WHERE \"created\" < now() - interval '" ++
         std.fmt.comptimePrint("{d}", .{snapshot_ttl_seconds}) ++ " seconds';") catch {};
-    var st = w.prepare("INSERT INTO \"_rt_delete_snapshots\" (\"token\",\"snapshot\") VALUES ($1,$2);") catch return null;
+    var st = try w.prepare("INSERT INTO \"_rt_delete_snapshots\" (\"token\",\"snapshot\") VALUES ($1,$2);");
     defer st.finalize();
-    st.bindText(1, token) catch return null;
-    st.bindText(2, snap_json) catch return null;
-    _ = st.step() catch return null;
+    try st.bindText(1, token);
+    try st.bindText(2, snap_json);
+    _ = try st.step();
     return token;
 }
 
@@ -236,15 +247,27 @@ pub fn storeDeleteSnapshot(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, snap
 /// no token row → no delivery). The caller feeds the (ciphertext-preserving) snapshot to the
 /// delete authz; the delivered frame is id-only, so nothing is decrypted here.
 pub fn readDeleteSnapshot(alloc: std.mem.Allocator, r: *db.Db, token: []const u8) ?std.json.Value {
-    var st = r.prepare("SELECT \"snapshot\" FROM \"_rt_delete_snapshots\" WHERE \"token\" = $1;") catch return null;
+    // #39: a MISSING row (forged/expired token) is a legitimate silent fail-closed drop, but a real
+    // DB/parse error is an operator-visible fault — collapsing both to a silent null made an
+    // undelivered remote delete indistinguishable from a forged token. Split them: no-row → null
+    // (quiet), any error → logged null.
+    return (readDeleteSnapshotInner(alloc, r, token) catch |e| {
+        std.log.warn("realtime: cross-instance delete-snapshot read failed (remote delete not delivered): {s}", .{@errorName(e)});
+        return null;
+    });
+}
+
+/// Returns null (NOT an error) when the token has no side-table row — the forged/expired-token
+/// fail-closed drop. Real DB/parse failures propagate so the wrapper can log them.
+fn readDeleteSnapshotInner(alloc: std.mem.Allocator, r: *db.Db, token: []const u8) !?std.json.Value {
+    var st = try r.prepare("SELECT \"snapshot\" FROM \"_rt_delete_snapshots\" WHERE \"token\" = $1;");
     defer st.finalize();
-    st.bindText(1, token) catch return null;
-    const has = st.step() catch return null;
-    if (!has) return null;
+    try st.bindText(1, token);
+    if (!(try st.step())) return null; // no row: forged/expired token — quiet drop
     // Dupe before finalize — `columnText` aliases stmt-owned memory, and the JSON parser may keep
     // references into its input for string values.
-    const json = alloc.dupe(u8, st.columnText(0)) catch return null;
-    return std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{}) catch null;
+    const json = try alloc.dupe(u8, st.columnText(0));
+    return try std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{});
 }
 
 // ---- emit (writer → NOTIFY) -------------------------------------------------
@@ -355,14 +378,22 @@ pub fn emitMessage(app: *App, bound_conn: ?*db.Db, topic: []const u8, frame: []c
 /// or guessed token cannot alias a real row.
 pub const Broadcast = struct { topic: []const u8, frame: []const u8 };
 pub fn readBroadcast(alloc: std.mem.Allocator, r: *db.Db, token: []const u8) ?Broadcast {
-    var st = r.prepare("SELECT \"topic\",\"frame\" FROM \"_rt_broadcasts\" WHERE \"token\" = $1;") catch return null;
+    // #39: same split as readDeleteSnapshot — no row (forged/expired) is a quiet fail-closed drop;
+    // a real DB error is logged rather than silently indistinguishable from a forged token.
+    return (readBroadcastInner(alloc, r, token) catch |e| {
+        std.log.warn("realtime: cross-instance broadcast read failed (remote broadcast not delivered): {s}", .{@errorName(e)});
+        return null;
+    });
+}
+
+fn readBroadcastInner(alloc: std.mem.Allocator, r: *db.Db, token: []const u8) !?Broadcast {
+    var st = try r.prepare("SELECT \"topic\",\"frame\" FROM \"_rt_broadcasts\" WHERE \"token\" = $1;");
     defer st.finalize();
-    st.bindText(1, token) catch return null;
-    const has = st.step() catch return null;
-    if (!has) return null;
+    try st.bindText(1, token);
+    if (!(try st.step())) return null; // no row: forged/expired token — quiet drop
     // Dupe before finalize — `columnText` aliases stmt-owned memory.
-    const topic = alloc.dupe(u8, st.columnText(0)) catch return null;
-    const frame = alloc.dupe(u8, st.columnText(1)) catch return null;
+    const topic = try alloc.dupe(u8, st.columnText(0));
+    const frame = try alloc.dupe(u8, st.columnText(1));
     return .{ .topic = topic, .frame = frame };
 }
 
@@ -396,23 +427,53 @@ fn openListenConn(app: *App) !db.Db {
     return conn;
 }
 
+const backoff_min_ms: u64 = 250;
+const backoff_cap_ms: u64 = 30_000;
+/// A session that stayed connected at least this long is "proven healthy" (#43): its backoff
+/// resets to the floor. A shorter session is treated as flapping.
+const healthy_session_ms: u64 = 5_000;
+
+/// Pure backoff policy (#43): given how long the just-ended LISTEN session lasted, decide whether
+/// to sleep before reconnecting and what the next backoff is. A session that lasted at least
+/// `healthy_session_ms` is proven healthy → reset to the floor with NO sleep. A shorter one (a
+/// proxy/failover peer that ACCEPTS the connect + LISTEN but drops on the first wait) is flapping →
+/// sleep the current backoff and grow it, so reconnects have a real floor instead of spinning
+/// connect/LISTEN cycles at full rate. The OLD code reset the backoff the instant a connect
+/// succeeded and never slept post-drop, so that flapping case was an unthrottled reconnect loop.
+fn nextBackoff(session_ms: u64, cur_backoff_ms: u64) struct { sleep_ms: u64, next_ms: u64 } {
+    if (session_ms >= healthy_session_ms) return .{ .sleep_ms = 0, .next_ms = backoff_min_ms };
+    return .{ .sleep_ms = cur_backoff_ms, .next_ms = @min(cur_backoff_ms * 2, backoff_cap_ms) };
+}
+
 fn listenerLoop(ctx: *ListenerCtx) void {
     defer ctx.app.allocator.destroy(ctx);
-    const backoff_min_ms: u64 = 250;
-    const backoff_cap_ms: u64 = 30_000;
     var backoff_ms: u64 = backoff_min_ms;
     while (true) {
         var conn = openListenConn(ctx.app) catch |e| {
             std.log.err("realtime: PG LISTEN connect failed: {s}; retrying in {d}ms", .{ @errorName(e), backoff_ms });
-            ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
+            // backoff_ms is bounded to [backoff_min_ms, backoff_cap_ms] (30s), well within i64.
+            ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(@intCast(backoff_ms)), .awake) catch {};
             backoff_ms = @min(backoff_ms * 2, backoff_cap_ms);
             continue;
         };
-        backoff_ms = backoff_min_ms; // reset after a successful (re)connect
         std.log.info("realtime: PG LISTEN bridge connected on \"{s}\"", .{channel});
+        // Time the session so the backoff resets ONLY after a connection has proven healthy, not
+        // the instant a (possibly-flapping) connect succeeds (#43). Uses the same monotonic clock
+        // the rest of the codebase reads (`std.Io.Timestamp.now`, cf. http_client.zig).
+        const started_ns = std.Io.Timestamp.now(ctx.app.io, .awake).nanoseconds;
         processUntilDrop(ctx, &conn);
         conn.close();
-        std.log.err("realtime: PG LISTEN connection dropped; reconnecting (events during the gap are missed)", .{});
+        const elapsed_ns = std.Io.Timestamp.now(ctx.app.io, .awake).nanoseconds - started_ns;
+        const session_ms: u64 = @intCast(@max(0, @divTrunc(elapsed_ns, std.time.ns_per_ms)));
+        const b = nextBackoff(session_ms, backoff_ms);
+        backoff_ms = b.next_ms;
+        if (b.sleep_ms == 0) {
+            std.log.err("realtime: PG LISTEN connection dropped; reconnecting (events during the gap are missed)", .{});
+        } else {
+            std.log.err("realtime: PG LISTEN connection dropped after {d}ms; backing off {d}ms before reconnect (events during the gap are missed)", .{ session_ms, b.sleep_ms });
+            // b.sleep_ms is a prior backoff value, bounded to backoff_cap_ms (30s), well within i64.
+            ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(@intCast(b.sleep_ms)), .awake) catch {};
+        }
     }
 }
 
@@ -498,6 +559,28 @@ test "s/m kinds: encode/decode round-trip; NO payload bytes on the message wire"
     // decodeAny still decodes record payloads (all three kinds through one entry).
     const rec = try encode(a, "o2", "posts", .create, "R1", null);
     try std.testing.expectEqualStrings("posts", decodeAny(a, rec).?.record.collection);
+}
+
+test "nextBackoff: a healthy session resets; a flapping session floors + grows the reconnect (#43)" {
+    // A session that lasted past the healthy threshold: reset to the floor, no pre-reconnect sleep.
+    {
+        const b = nextBackoff(healthy_session_ms, backoff_cap_ms);
+        try std.testing.expectEqual(@as(u64, 0), b.sleep_ms);
+        try std.testing.expectEqual(backoff_min_ms, b.next_ms);
+    }
+    // A session that dropped almost immediately (accept + LISTEN then drop on first wait): sleep the
+    // CURRENT backoff before reconnecting and double it — this is the anti-spin floor.
+    {
+        const b = nextBackoff(0, backoff_min_ms);
+        try std.testing.expectEqual(backoff_min_ms, b.sleep_ms);
+        try std.testing.expectEqual(backoff_min_ms * 2, b.next_ms);
+    }
+    // Growth is capped.
+    {
+        const b = nextBackoff(healthy_session_ms - 1, backoff_cap_ms);
+        try std.testing.expectEqual(backoff_cap_ms, b.sleep_ms);
+        try std.testing.expectEqual(backoff_cap_ms, b.next_ms);
+    }
 }
 
 test "rolling-upgrade tolerance: the OLD record decoder returns null on s/m payloads" {
