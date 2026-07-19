@@ -4,7 +4,7 @@ const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
 const ddl = @import("../ddl.zig");
 
-pub const JoinError = error{ UnknownField, NotARelation, MultiRelationTraversal, EncryptedField } || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".return_type.?).error_union.error_set;
+pub const JoinError = error{ UnknownField, NotARelation, MultiRelationTraversal, EncryptedField, HiddenField } || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".return_type.?).error_union.error_set;
 
 /// A resolved column reference. `nocase` is true when the column is covered by a `.nocase` index
 /// on its (possibly joined) collection — the compiler then lowers an equality/IN compare so it
@@ -18,6 +18,11 @@ pub const Joiner = struct {
     joins: std.ArrayList([]const u8) = .empty,
     seen: std.ArrayList(Seen) = .empty,
     counter: usize = 0,
+    /// When true, references to hidden fields are permitted. Set ONLY for trusted, operator-authored
+    /// access rules (a server-side WHERE clause whose truth is never serialized to the client, so it
+    /// is no boolean oracle). Client-controlled `?filter=`/`?sort=` leave this false so a hidden field
+    /// is still rejected closed. Encrypted fields stay rejected regardless (they can never match).
+    allow_hidden: bool = false,
 
     const Seen = struct { prefix: []const u8, alias: []const u8, col: schema.Collection };
 
@@ -39,11 +44,25 @@ pub const Joiner = struct {
                 if (field == null and !isSystemCol(seg)) return error.UnknownField;
                 // Encrypted fields are stored as per-row-nonce ciphertext, so a
                 // filter/sort over them can never match correctly — reject closed.
-                if (field) |fl| if (fl.encrypted) return error.EncryptedField;
+                //
+                // Hidden fields (passwordHash, tokenKey, token_epoch, any `.hidden`
+                // user field) are never serialized (`rowToObject` strips them), so a
+                // CLIENT filter/sort that references one would let match/no-match presence
+                // act as a boolean oracle over a secret the API deliberately withholds —
+                // reject closed. Trusted, operator-authored rules set `allow_hidden` (their
+                // truth is never serialized), so a `.hidden` field can still gate access.
+                if (field) |fl| {
+                    if (fl.encrypted) return error.EncryptedField;
+                    if (fl.hidden and !self.allow_hidden) return error.HiddenField;
+                }
                 const ref = try std.fmt.allocPrint(self.alloc, "{s}.\"{s}\"", .{ cur_alias, seg });
                 return .{ .sql = ref, .field = field, .nocase = ddl.isNocaseField(cur_col, seg) };
             }
             const rf = schema.fieldByName(cur_col, seg) orelse return error.UnknownField;
+            // A hidden relation is non-serialized too: traversing THROUGH it would still let a
+            // client filter oracle its foreign key. Reject closed here (trusted rules excepted,
+            // symmetric with the leaf check).
+            if (rf.hidden and !self.allow_hidden) return error.HiddenField;
             if (rf.fieldType() != .relation) return error.NotARelation;
             if (rf.isMultiValue()) return error.MultiRelationTraversal;
             if (prefix_buf.items.len > 0) try prefix_buf.append(self.alloc, '.');
@@ -117,4 +136,33 @@ test "joiner rejects filtering/sorting on an encrypted field" {
     // A normal field resolves; an encrypted field is rejected closed.
     _ = try j.resolve("title");
     try std.testing.expectError(error.EncryptedField, j.resolve("secret"));
+}
+
+test "joiner rejects filtering/sorting on a hidden field (no boolean oracle over non-serialized secrets)" {
+    const migrations = @import("../migrations.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "name", .options = .{ .text = .{} } },
+        // A hidden field mirrors passwordHash/tokenKey on auth collections: stored but
+        // never serialized, so it must not be referenceable in filter/sort/rule.
+        .{ .id = "f2", .name = "secret", .hidden = true, .options = .{ .text = .{} } },
+    };
+    const users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users2", .fields = &fields });
+    var j = Joiner.init(a, &d, users);
+    // A visible field resolves; a hidden field is rejected closed (no partial leak).
+    _ = try j.resolve("name");
+    try std.testing.expectError(error.HiddenField, j.resolve("secret"));
+    // System columns (id/created/updated) remain filterable — the block is exactly the hidden set.
+    _ = try j.resolve("id");
+
+    // A TRUSTED, operator-authored rule (allow_hidden) MAY gate access on that hidden field: its
+    // truth is a server-side WHERE clause, never serialized, so it is no boolean oracle.
+    var jr = Joiner.init(a, &d, users);
+    jr.allow_hidden = true;
+    _ = try jr.resolve("secret");
 }

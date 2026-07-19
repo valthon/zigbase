@@ -31,19 +31,21 @@ pub const connectionCount = connection.connectionCount;
 
 /// Live per-connection state: the pure 7a `Conn` plus the zap handle / settings / app.
 ///
-/// Two arenas: `durable` holds state that must persist across frames (auth record, subscription
-/// keys/filters, sub_args, sub_ids); `frame` is per-callback scratch reset at the top of each
-/// callback. facil.io serializes a connection's callbacks on one thread, so resetting `frame`
-/// per callback is safe.
+/// Three arenas: `durable` holds state that must persist across frames (subscription keys/filters,
+/// sub_ids, requested_account); `identity` holds ONLY the active auth identity (record +
+/// account/memberships) and is RESET on every auth frame so a re-auth loop can't grow memory
+/// without bound (#11 residual — see hub.authVerb); `frame` is per-callback scratch reset at the
+/// top of each callback. facil.io serializes a connection's callbacks on one thread, so resetting
+/// `frame` per callback (and `identity` on re-auth without racing a delivery) is safe.
 pub const LiveConn = struct {
     conn: connection.Conn = .{},
     handle: zap.WebSockets.WsHandle = null,
     settings: WS.WebSocketSettings = undefined, // facil.io holds &settings; must outlive the conn
     app: *App,
     durable: std.heap.ArenaAllocator,
+    identity: std.heap.ArenaAllocator,
     frame: std.heap.ArenaAllocator,
     client_id: [15]u8 = undefined,
-    sub_args: std.ArrayList(*WS.SubscribeArgs) = .empty,
     sub_ids: std.StringHashMapUnmanaged(usize) = .empty, // topic -> facil.io subscription id
     /// The account the subscriber asked to act within, captured from the HTTP handshake
     /// (`X-Account-Id` header or the signed `zb_account` cookie) and duped onto `durable`. It is
@@ -145,6 +147,7 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
     lc.* = .{
         .app = app,
         .durable = std.heap.ArenaAllocator.init(app.allocator),
+        .identity = std.heap.ArenaAllocator.init(app.allocator),
         .frame = std.heap.ArenaAllocator.init(app.allocator),
     };
     const cid = id.collectionId(app.io);
@@ -200,7 +203,7 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
     };
     switch (msg) {
         .auth => |m| {
-            const ok = hub.authVerb(lc.app, &lc.conn, da, m.token, lc.requested_account);
+            const ok = hub.authVerb(lc.app, &lc.conn, &lc.identity, m.token, lc.requested_account);
             WS.write(handle, try protocol.authFrame(fa, ok), true) catch {};
         },
         .subscribe => |m| {
@@ -219,15 +222,42 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
                 },
                 .ok => {},
             }
-            // fio-side residue (UNCHANGED — ws.zig:328-341): durable channel dupe, conn.addSub,
-            // SubscribeArgs, WS.subscribe, sub_ids bookkeeping, ack write.
+            // #3: a re-subscribe to a topic we already hold REPLACES in place — update only the
+            // stored filter (no new durable allocation for an identical re-subscribe, no second fio
+            // subscription) and re-ack. Without this, `addSub` overwrote the hashmap entry (count
+            // never grew, so MAX_SUBS was bypassed) while `WS.subscribe` stacked a fresh fio
+            // subscription each time — N× frame fan-out to the client and N-1 orphaned fio ids.
+            if (lc.conn.updateFilter(da, m.topic, m.filter) catch false) {
+                WS.write(handle, try protocol.ackFrame(fa, "subscribe", m.topic), true) catch {};
+                return;
+            }
             const channel = da.dupe(u8, m.topic) catch return;
             lc.conn.addSub(da, m.topic, m.filter) catch return;
             const args = da.create(WS.SubscribeArgs) catch return;
             args.* = .{ .channel = channel, .on_message = onChannelMessage, .context = lc };
             const sub_id = WS.subscribe(handle, args) catch 0;
-            lc.sub_args.append(da, args) catch {};
-            if (sub_id != 0) lc.sub_ids.put(da, channel, sub_id) catch {};
+            if (sub_id == 0) {
+                // #30: a failed fio subscribe must NOT be acked as success — that stranded the
+                // client in a silent dead subscription (zero events until it happened to reconnect).
+                // Roll back the logical sub, log, and reply with an error frame so it can retry.
+                _ = lc.conn.removeSub(m.topic);
+                std.log.warn("realtime: WS subscribe to \"{s}\" failed (fio subscribe returned 0)", .{m.topic});
+                WS.write(handle, try protocol.errorFrame(fa, "subscribe failed"), true) catch {};
+                return;
+            }
+            lc.sub_ids.put(da, channel, sub_id) catch {
+                // #30: the fio subscribe SUCCEEDED but we couldn't record its id. Without the id
+                // a later `unsubscribe` can't cancel it (`sub_ids.fetchRemove` misses) — the topic
+                // stays in `conn.subs`, the client believes it acked a subscription, and the live
+                // fio subscription is stranded until the socket closes. Roll it back exactly like
+                // the sub_id==0 path: fio-unsubscribe the just-created sub, drop the logical sub,
+                // and surface an error frame so the client can retry instead of being told "ok".
+                fio.websocket_unsubscribe(handle, sub_id);
+                _ = lc.conn.removeSub(m.topic);
+                std.log.warn("realtime: WS subscribe to \"{s}\" failed (sub_id store OOM)", .{m.topic});
+                WS.write(handle, try protocol.errorFrame(fa, "subscribe failed"), true) catch {};
+                return;
+            };
             WS.write(handle, try protocol.ackFrame(fa, "subscribe", m.topic), true) catch {};
         },
         .unsubscribe => |m| {
@@ -268,6 +298,7 @@ fn onClose(context: ?*LiveConn, uuid: isize) anyerror!void {
     const lc = context orelse return;
     const app = lc.app;
     lc.durable.deinit();
+    lc.identity.deinit();
     lc.frame.deinit();
     app.allocator.destroy(lc);
     connection.releaseConnectionSlot(); // F9: free the global connection slot
@@ -330,7 +361,13 @@ fn publishFrames(collection: []const u8, action: protocol.Action, record_id: []c
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const ef = hub.buildEventFrames(a, collection, action, record_id, record) catch return;
+    const ef = hub.buildEventFrames(a, collection, action, record_id, record) catch |e| {
+        // #36: a build failure (OOM) drops the ENTIRE broadcast for a write that already committed
+        // — every subscriber misses the event with no replay. Log it (matching the remote paths'
+        // convention) so a client-reported "missed update" is correlatable; std.log never allocates.
+        std.log.err("realtime: dropped broadcast for {s}/{s} ({s}): {s}", .{ collection, record_id, @tagName(action), @errorName(e) });
+        return;
+    };
     WS.publish(.{ .channel = ef.collection_channel, .message = ef.frame_collection });
     WS.publish(.{ .channel = ef.record_channel, .message = ef.frame_record });
 }
@@ -349,7 +386,10 @@ fn onRemotePayload(app: *App, p: pg_bridge.Payload) void {
         .signal => |s| {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
-            const frame = signalFrameAlloc(arena.allocator(), s.topic) catch return;
+            const frame = signalFrameAlloc(arena.allocator(), s.topic) catch |e| {
+                std.log.err("realtime: dropped remote signal for topic \"{s}\": {s}", .{ s.topic, @errorName(e) });
+                return;
+            };
             WS.publish(.{ .channel = s.topic, .message = frame });
         },
         .message => |m| {
@@ -477,7 +517,10 @@ pub fn broadcastTopic(app: *App, bound_conn: ?*db.Db, topic: []const u8, data_js
     if (!active) return; // reactor not running (tests/CLI): no-op
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const frame = messageEnvelopeAlloc(arena.allocator(), topic, data_json) catch return;
+    const frame = messageEnvelopeAlloc(arena.allocator(), topic, data_json) catch |e| {
+        std.log.err("realtime: dropped broadcast for topic \"{s}\": {s}", .{ topic, @errorName(e) });
+        return;
+    };
     WS.publish(.{ .channel = topic, .message = frame });
     // #188 theme: on Postgres, fan the ENVELOPED frame out via token + _rt_broadcasts —
     // never payload bytes on the NOTIFY wire. Byte-identical no-op on SQLite.
@@ -495,7 +538,10 @@ pub fn signalTopic(app: *App, topic: []const u8) void {
     if (!active) return; // reactor not running (tests/CLI): no-op
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const frame = signalFrameAlloc(arena.allocator(), topic) catch return;
+    const frame = signalFrameAlloc(arena.allocator(), topic) catch |e| {
+        std.log.err("realtime: dropped signal for topic \"{s}\": {s}", .{ topic, @errorName(e) });
+        return;
+    };
     WS.publish(.{ .channel = topic, .message = frame });
     pg_bridge.emitSignal(app, topic); // payload-less: only the topic name rides the wire
 }
@@ -530,6 +576,7 @@ test "WS upgrade-failure teardown: facil's on_close frees the LiveConn + release
     lc.* = .{
         .app = &app,
         .durable = std.heap.ArenaAllocator.init(app.allocator),
+        .identity = std.heap.ArenaAllocator.init(app.allocator),
         .frame = std.heap.ArenaAllocator.init(app.allocator),
     };
     _ = connection.reserveConnectionSlot(); // handleUpgrade reserved the slot before WS.upgrade

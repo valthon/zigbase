@@ -3,9 +3,10 @@
 // typed-core-version: 0.1.0
 //
 // A thin, schema-aware wrapper generating @Serializable data classes over
-// the io.github.valthon.zigbase.typed runtime. Regenerate with
-// `zig build gen-dating-kotlin-client`, then `spotlessApply` it from
-// clients/kotlin (its ktlint config governs formatting).
+// the io.github.valthon.zigbase.typed runtime. Regenerate with your server's
+// `typegen --lang kotlin --package <your.package>` command (or the build-time
+// comptime gen-client build step), then run your project's Kotlin formatter
+// (e.g. spotlessApply/ktlint) over it.
 //
 // Identifier mapping: a schema name that is a Kotlin keyword gets a
 // trailing `_` on the KOTLIN side only (field `class` -> member

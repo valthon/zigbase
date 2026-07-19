@@ -1,7 +1,12 @@
 //! Pure-Zig Dart client generator: collections -> a zbase.gen.dart that
 //! instantiates the runtime in clients/dart/lib/typed.dart into concrete typed
-//! classes. The Dart counterpart of gen_client.generate; shares the acquisition,
-//! identifier, and guard layers (language-neutral) and branches only in emission.
+//! classes. The Dart counterpart of gen_client.generate; shares the acquisition
+//! layer and the guard bar (guards.checkIdentifiers), and branches only in
+//! emission. NB: that guard bar is TS-derived (TS identifier validity + the TS
+//! typed-core reserved-name set), applied to every language as a conservative
+//! lowest common denominator — NOT a language-neutral check. The Dart-specific
+//! keyword/member sanitizing that keeps THIS output legal lives in
+//! emit_dart.zig's memberIdent/checkDuplicateIdents.
 const std = @import("std");
 const schema = @import("../schema.zig");
 const events = @import("../events.zig");
@@ -55,8 +60,9 @@ pub fn generate(
         \\//
         \\// A thin, schema-aware wrapper over the base Dart SDK. Import both this
         \\// file and package:zigbase_client/typed.dart (the generic typed runtime).
-        \\// Regenerate with `zig build gen-dating-dart-client`, then `dart format` it
-        \\// with the consuming package's language version (resolved from the package
+        \\// Regenerate with your server's `typegen --lang dart` command (or the
+        \\// build-time comptime gen-client build step), then `dart format` it with
+        \\// the consuming package's language version (resolved from the package
         \\// config; without one, pass --language-version — style differs by version).
         \\//
         \\// Identifier mapping: a schema name that is a Dart reserved word or would

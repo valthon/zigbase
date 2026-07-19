@@ -217,7 +217,13 @@ pub const App = struct {
     /// CLI — the historical error name is kept for compatibility) and error.QueueFull when
     /// the bounded ring is full (reject-not-block; see queue/memory.zig for the policy).
     pub fn submit(self: *App, name: []const u8, task: @import("events.zig").JobTask) !void {
+        // `Pool.stop` clears `submit_fn` then `memory_pool`; a submit racing teardown could pass the
+        // `submit_fn` gate and then deref a just-nulled `memory_pool` (a TOCTOU null-deref that
+        // panics on whatever background thread enqueued the job). Null-check the pool instead of
+        // `.?`: a captured non-null pool is safe to call — a stopped pool rejects the enqueue under
+        // its own lock.
         const f = self.submit_fn orelse return error.SchedulerUnavailable;
-        return f(self.memory_pool.?, name, task);
+        const pool = self.memory_pool orelse return error.SchedulerUnavailable;
+        return f(pool, name, task);
     }
 };

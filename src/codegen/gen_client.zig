@@ -832,6 +832,13 @@ const Args = struct {
     check: bool = false,
     /// Output language: "ts" (default) or "dart".
     lang: []const u8 = "ts",
+    /// Kotlin-only: the `package` declaration emitted at the top of the generated
+    /// file. Mirrors `typegen --package`. Defaults to the dating fixture's
+    /// namespace so the committed golden and `zig build gen-dating-kotlin-client`
+    /// stay byte-stable; a consumer's gen-client step passes `--package
+    /// your.app` to target its own namespace instead of the unoverridable
+    /// hardcode this used to bake in.
+    kotlin_package: []const u8 = "io.github.valthon.zigbase.codegen.dating",
 };
 
 /// Parse CLI args from the Zig 0.16 argv slice ([]const [:0]const u8).
@@ -854,6 +861,10 @@ fn parseArgsSlice(alloc: std.mem.Allocator, argv: []const [:0]const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingLangValue;
             args.lang = try alloc.dupe(u8, argv[i]);
+        } else if (std.mem.eql(u8, a, "--package")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingPackageValue;
+            args.kotlin_package = try alloc.dupe(u8, argv[i]);
         } else {
             std.log.warn("gen_client: ignoring unknown arg '{s}'", .{a});
         }
@@ -914,7 +925,7 @@ pub fn mainWithCollections(init: std.process.Init, cols: []const schema.Collecti
     else if (want_python)
         gen_python.generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix)
     else if (want_kotlin)
-        gen_kotlin.generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix, "io.github.valthon.zigbase.codegen.dating")
+        gen_kotlin.generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix, args.kotlin_package)
     else
         generate(a, cols, routes, custom_auth, flags, experiments, in_repo, authCollectionName(cols), client_name, args.api_prefix)) catch |e| {
         // guard messages are printed via the report; re-run path for the message:

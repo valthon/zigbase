@@ -542,12 +542,46 @@ fn guardPathSecret(cx: *Ctx, ctx: *http.RequestCtx, g: events.RouteAuthGuard) !?
     }
 }
 
+/// Route patterns already warned about (see `warnUnkeyedRouteLimitOnce`). Warning once *per
+/// process* silently hid every unprotected route after the first; keying on the pattern reports
+/// each DISTINCT route exactly once instead. The keys are the comptime-static `rt.pattern` slices
+/// (process-lifetime), so they are stored by reference — no dup, nothing to free. Guarded by a
+/// spinlock (`std.atomic.Mutex`, the same precedent as `colcache`/the reader pool).
+var unkeyed_route_limit_mu: std.atomic.Mutex = .unlocked;
+var unkeyed_route_limit_warned: std.StringHashMapUnmanaged(void) = .empty;
+
+/// Warn a single time PER ROUTE PATTERN that a `.custom` route limit cannot identify clients (no
+/// `rate_limit_key`, no trusted-proxy IP, and the request is anonymous), so it is being skipped
+/// rather than collapsed into a shared global bucket. Per-request logging would flood, so each
+/// distinct pattern fires only the first time it is seen. `.warn` (not `.err`) so the Zig test
+/// runner's "logged errors" check is not tripped.
+fn warnUnkeyedRouteLimitOnce(pattern: []const u8) void {
+    {
+        while (!unkeyed_route_limit_mu.tryLock()) std.atomic.spinLoopHint();
+        defer unkeyed_route_limit_mu.unlock();
+        // A static pattern needs no dup. On the (tiny) map's OOM, fall through and warn without
+        // recording — a duplicate log line is strictly better than swallowing the warning.
+        const gop = unkeyed_route_limit_warned.getOrPut(std.heap.page_allocator, pattern) catch null;
+        if (gop) |g| {
+            if (g.found_existing) return;
+        }
+    }
+    std.log.warn(
+        "per-route rate limit on \"{s}\" cannot identify the client (no rate_limit_key, and the client IP is unknown because ZIGBASE_TRUST_PROXY is off) — skipping the limit for unidentifiable requests rather than sharing one global bucket. Set a rate_limit_key, or run behind a trusted proxy with ZIGBASE_TRUST_PROXY set, to enforce it per client.",
+        .{pattern},
+    );
+}
+
 /// Guard step (3): per-route rate limit (#142). Only `.custom` engages a bucket — `.default`
-/// and `.off` leave the route unthrottled (routes are opt-in for limiting). The bucket is
-/// keyed `route:<pattern>:…` by the app-supplied `rate_limit_key(ctx)` when present, else by
-/// the client IP (`ctx.remote_ip`, which honors `ZIGBASE_TRUST_PROXY` via `clientIpFrom` — a
-/// spoofed X-Forwarded-For yields "" when proxies are untrusted, so it cannot evade/poison a
-/// per-IP bucket). On deny: 429 + `Retry-After: <window_s>`.
+/// and `.off` leave the route unthrottled (routes are opt-in for limiting). The bucket is keyed
+/// `route:<pattern>:…` per CLIENT, resolving the client identity in order: the app-supplied
+/// `rate_limit_key(cx)` (always trusted) → the client IP (`ctx.remote_ip`, non-empty only when a
+/// trusted proxy set it — `ZIGBASE_TRUST_PROXY`; a spoofed X-Forwarded-For yields "" when proxies
+/// are untrusted, so it cannot poison a bucket) → the authenticated principal id. When NONE of
+/// these distinguishes the caller (no key fn, untrusted/absent IP, anonymous), the per-client
+/// guarantee is unmeetable: rather than key every client into ONE empty bucket — which would let a
+/// single caller 429 the route for everyone (a trivial DoS) with zero isolation — the limit is
+/// SKIPPED (fail open) with a one-time warning. On deny: 429 + `Retry-After: <window_s>`.
 fn guardRateLimit(cx: *Ctx, ctx: *http.RequestCtx, rt: events.RuntimeRoute) !?http.Response {
     const c = switch (rt.rate_limit) {
         .custom => |c| c,
@@ -555,10 +589,18 @@ fn guardRateLimit(cx: *Ctx, ctx: *http.RequestCtx, rt: events.RuntimeRoute) !?ht
     };
     const app = ctx.app orelse return null;
     const limiter = app.rate_limiter orelse return null;
-    const key = if (rt.rate_limit_key) |kf| blk: {
-        if (kf(cx)) |subject| break :blk try std.fmt.allocPrint(ctx.allocator, "route:{s}:key:{s}", .{ rt.pattern, subject });
-        break :blk try std.fmt.allocPrint(ctx.allocator, "route:{s}:ip:{s}", .{ rt.pattern, ctx.remote_ip });
-    } else try std.fmt.allocPrint(ctx.allocator, "route:{s}:ip:{s}", .{ rt.pattern, ctx.remote_ip });
+    const key: []const u8 = blk: {
+        if (rt.rate_limit_key) |kf| {
+            if (kf(cx)) |subject| break :blk try std.fmt.allocPrint(ctx.allocator, "route:{s}:key:{s}", .{ rt.pattern, subject });
+        }
+        if (ctx.remote_ip.len > 0) break :blk try std.fmt.allocPrint(ctx.allocator, "route:{s}:ip:{s}", .{ rt.pattern, ctx.remote_ip });
+        if (cx.user()) |u| {
+            if (u.id.len > 0) break :blk try std.fmt.allocPrint(ctx.allocator, "route:{s}:auth:{s}/{s}", .{ rt.pattern, u.collection, u.id });
+        }
+        // Unidentifiable client — do NOT share a single global bucket (DoS). Skip the limit.
+        warnUnkeyedRouteLimitOnce(rt.pattern);
+        return null;
+    };
     if (limiter.allowCustom(key, clock.nowUnix(app.io), c.max, c.window_s)) return null;
     const retry = try std.fmt.allocPrint(ctx.allocator, "{d}", .{c.window_s});
     var resp = try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator);
@@ -1360,4 +1402,16 @@ test "R2-3: Gates assemble the built-in route table at comptime" {
     try std.testing.expect(!hasRoute(lean.routes, .GET, "/api/collections/:col/auth/magic-link/consume"));
     try std.testing.expect(!hasRoute(lean.routes, .GET, "/api/collections/:col/auth/oauth2/providers"));
     try std.testing.expect(!hasRoute(lean.routes, .DELETE, "/api/collections/:col/records/:id/external-auths/:provider"));
+}
+
+test "warnUnkeyedRouteLimitOnce records each DISTINCT route pattern exactly once" {
+    // The set is a process-global; reset it so the assertion is independent of ordering.
+    unkeyed_route_limit_warned.clearRetainingCapacity();
+    defer unkeyed_route_limit_warned.clearRetainingCapacity();
+    warnUnkeyedRouteLimitOnce("/api/a");
+    warnUnkeyedRouteLimitOnce("/api/a"); // same pattern — must NOT add a second entry
+    warnUnkeyedRouteLimitOnce("/api/b"); // a DISTINCT unprotected route — must be recorded too
+    try std.testing.expectEqual(@as(usize, 2), unkeyed_route_limit_warned.count());
+    try std.testing.expect(unkeyed_route_limit_warned.contains("/api/a"));
+    try std.testing.expect(unkeyed_route_limit_warned.contains("/api/b"));
 }

@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const http_client = @import("http_client.zig");
+const url = @import("url.zig");
 
 /// The four supported CAPTCHA providers.
 pub const Provider = enum {
@@ -54,39 +55,6 @@ pub const Result = struct {
     /// Empty slice when success is true or when the provider returned no error-codes.
     errors: []const []const u8 = &.{},
 };
-
-/// Percent-encode a single byte that is NOT an unreserved URI character.
-/// Unreserved chars per RFC 3986: A-Z a-z 0-9 - _ . ~
-/// Everything else is encoded as %XX (uppercase hex).
-fn isUnreserved(c: u8) bool {
-    return switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~' => true,
-        else => false,
-    };
-}
-
-/// Percent-encode `input` for use as a form field value in
-/// `application/x-www-form-urlencoded`. Allocates the result on `alloc`.
-fn formEncode(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
-    // Count encoded length.
-    var len: usize = 0;
-    for (input) |c| len += if (isUnreserved(c)) @as(usize, 1) else 3; // %XX = 3 chars
-
-    const out = try alloc.alloc(u8, len);
-    var i: usize = 0;
-    for (input) |c| {
-        if (isUnreserved(c)) {
-            out[i] = c;
-            i += 1;
-        } else {
-            out[i] = '%';
-            out[i + 1] = "0123456789ABCDEF"[c >> 4];
-            out[i + 2] = "0123456789ABCDEF"[c & 0x0F];
-            i += 3;
-        }
-    }
-    return out;
-}
 
 /// Parse the provider's JSON response into a `Result`. All strings are arena-owned.
 ///
@@ -217,9 +185,9 @@ pub fn verify(
     // general-purpose allocator (the Ctx call site passes an arena, but the
     // function must not assume it). The parsed `Result` slices reference the
     // response body, NOT these buffers, so freeing them before return is safe.
-    const enc_secret = try formEncode(alloc, secret);
+    const enc_secret = try url.percentEncode(alloc, secret);
     defer alloc.free(enc_secret);
-    const enc_token = try formEncode(alloc, token);
+    const enc_token = try url.percentEncode(alloc, token);
     defer alloc.free(enc_token);
     const body_form = try std.fmt.allocPrint(alloc, "secret={s}&response={s}", .{ enc_secret, enc_token });
     defer alloc.free(body_form);
@@ -272,18 +240,23 @@ test "Provider.verifyUrl maps to distinct, expected URLs" {
     try std.testing.expect(!std.mem.eql(u8, Provider.turnstile.verifyUrl(), Provider.hcaptcha.verifyUrl()));
 }
 
-test "formEncode: unreserved chars pass through; special chars are percent-encoded" {
+// Focused coverage for the shared `url.percentEncode` helper (#46), which this module's
+// `verify` delegates to; registered here because `captcha.zig` is in `root.zig`'s test block.
+test "url.percentEncode: unreserved chars pass through; special chars are percent-encoded" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    try std.testing.expectEqualStrings("abc123", try formEncode(a, "abc123"));
-    try std.testing.expectEqualStrings("hello-world_v2.~", try formEncode(a, "hello-world_v2.~"));
-    try std.testing.expectEqualStrings("%20", try formEncode(a, " "));
-    try std.testing.expectEqualStrings("%2B", try formEncode(a, "+"));
-    try std.testing.expectEqualStrings("%3D", try formEncode(a, "="));
-    try std.testing.expectEqualStrings("%26", try formEncode(a, "&"));
-    try std.testing.expectEqualStrings("secret%3Dvalue%26more", try formEncode(a, "secret=value&more"));
+    try std.testing.expectEqualStrings("abc123", try url.percentEncode(a, "abc123"));
+    try std.testing.expectEqualStrings("hello-world_v2.~", try url.percentEncode(a, "hello-world_v2.~"));
+    try std.testing.expectEqualStrings("", try url.percentEncode(a, "")); // empty input edge case
+    try std.testing.expectEqualStrings("%20", try url.percentEncode(a, " ")); // space is %20, not '+'
+    try std.testing.expectEqualStrings("%2B", try url.percentEncode(a, "+"));
+    try std.testing.expectEqualStrings("%3D", try url.percentEncode(a, "="));
+    try std.testing.expectEqualStrings("%26", try url.percentEncode(a, "&"));
+    try std.testing.expectEqualStrings("%0A", try url.percentEncode(a, "\n"));
+    try std.testing.expectEqualStrings("%C3%A9", try url.percentEncode(a, "\xC3\xA9")); // high (non-ASCII) bytes
+    try std.testing.expectEqualStrings("secret%3Dvalue%26more", try url.percentEncode(a, "secret=value&more"));
 }
 
 test "parseResponse: success=true maps to ok=true; no errors" {

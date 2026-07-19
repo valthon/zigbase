@@ -3,8 +3,12 @@
 //! as `zbt`) into concrete pydantic BaseModel classes, fluent field builders,
 //! per-collection metadata, sync/async typed services, realtime subclasses,
 //! and the `ZbClient`/`AsyncZbClient` façades. The Python counterpart of
-//! gen_dart.generate; shares the acquisition, identifier, and guard layers
-//! (language-neutral) and branches only in emission.
+//! gen_dart.generate; shares the acquisition layer and the guard bar
+//! (guards.checkIdentifiers), and branches only in emission. NB: that guard bar
+//! is TS-derived (TS identifier validity + the TS typed-core reserved-name set),
+//! applied to every language as a conservative lowest common denominator — NOT a
+//! language-neutral check. The Python-specific keyword/member sanitizing that
+//! keeps THIS output legal lives in emit_python.zig.
 const std = @import("std");
 const schema = @import("../schema.zig");
 const events = @import("../events.zig");
@@ -68,9 +72,9 @@ pub fn generate(
         \\# typed-core-version: {s}
         \\#
         \\# A thin, schema-aware wrapper over the base Python SDK's generic typed
-        \\# runtime (zigbase.typed, imported below as `zbt`). Regenerate with
-        \\# `zig build gen-dating-python-client`, then `ruff format` it from
-        \\# clients/python (its config governs formatting).
+        \\# runtime (zigbase.typed, imported below as `zbt`). Regenerate with your
+        \\# server's `typegen --lang python` command (or the build-time comptime
+        \\# gen-client build step), then `ruff format` it with your project's config.
         \\#
         \\# Identifier mapping: a schema name that is a Python keyword gets a
         \\# trailing `_` on the PYTHON side only (field `class` -> member

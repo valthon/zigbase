@@ -14,15 +14,32 @@ pub const RuntimeJob = struct {
     run: *const fn (ctx: *Ctx, ev: *events.JobEvent) anyerror!?schedule.Reactive,
 };
 
-/// `@compileError` on any job spec missing a required field (`.name`/`.schedule`/
-/// `.handler`), mirroring `events.validateRouteSpecs`. The handler type differs by
-/// mode (reactive returns `Reactive`, others `void`), so it is not hard-asserted here.
+/// `@compileError` on a malformed job spec, mirroring `events.validateRouteSpecs`: a missing
+/// required field (`.name`/`.schedule`/`.handler`), an unknown key (a typo that would be
+/// silently dropped), or a malformed `.cron` grammar (which would otherwise make the job
+/// boot-fire and silently retire). The handler type differs by mode (reactive returns
+/// `Reactive`, others `void`), so it is not hard-asserted here.
 fn validateJobSpecs(comptime specs: anytype) void {
     inline for (std.meta.fields(@TypeOf(specs))) |f| {
         const s = @field(specs, f.name);
         if (!@hasField(@TypeOf(s), "name")) @compileError("job spec is missing '.name' (expected .{ .name = \"...\", .schedule = ..., .handler = fn })");
         if (!@hasField(@TypeOf(s), "schedule")) @compileError("job spec is missing '.schedule' (expected .{ .name = \"...\", .schedule = ..., .handler = fn })");
         if (!@hasField(@TypeOf(s), "handler")) @compileError("job spec is missing '.handler' (expected .{ .name = \"...\", .schedule = ..., .handler = fn })");
+        // Fail loud on a typo'd key (only .name/.schedule/.handler are read) so a misspelling
+        // isn't silently dropped, mirroring the unknown-key gates on collections/fields/routes.
+        inline for (std.meta.fields(@TypeOf(s))) |sf| {
+            comptime var ok = false;
+            inline for ([_][]const u8{ "name", "schedule", "handler" }) |a| {
+                if (comptime std.mem.eql(u8, sf.name, a)) ok = true;
+            }
+            if (!ok) @compileError("job spec '" ++ s.name ++ "': unknown key '." ++ sf.name ++
+                "' (recognized keys: .name, .schedule, .handler)");
+        }
+        // Validate a comptime-known cron grammar so a malformed expression (wrong field
+        // count, a full day name, a trailing space) fails at build time instead of silently
+        // firing at every boot and never on schedule (see schedule.validateCron).
+        const sched: schedule.Schedule = s.schedule;
+        if (sched == .cron) schedule.validateCron(sched.cron, "job spec '" ++ s.name ++ "'");
     }
 }
 
@@ -212,7 +229,22 @@ pub const Scheduler = struct {
         errdefer allocator.free(state);
         const now = unixNow(app.io);
         for (state, 0..) |*s, i| {
-            s.* = .{ .status = .idle, .next_fire = schedule.nextFire(jobs[i].schedule, now) orelse now };
+            const sched = jobs[i].schedule;
+            if (schedule.nextFire(sched, now)) |nf| {
+                s.* = .{ .status = .idle, .next_fire = nf };
+            } else switch (sched) {
+                // Reactive jobs have no schedule-derived fire; they intentionally run once at
+                // boot (their handler's returned `Reactive` drives every subsequent fire).
+                .reactive => s.* = .{ .status = .idle, .next_fire = now },
+                // A cron/interval with no future fire (e.g. an impossible cron like Feb 30)
+                // must NOT be aliased onto the reactive boot-fire path — that would run the
+                // handler at an arbitrary boot time and never on schedule. Retire it and log
+                // why, so it isn't a silent no-op.
+                else => {
+                    std.log.warn("scheduler: job '{s}' has no future fire time (impossible schedule); retiring it without running", .{jobs[i].name});
+                    s.* = .{ .status = .stopped, .next_fire = now };
+                },
+            }
         }
         const queue = try allocator.alloc(usize, jobs.len);
         return .{ .allocator = allocator, .app = app, .jobs = jobs, .pool_size = pool_size, .stack_size = @max(stack_size, min_job_stack_size), .state = state, .queue = queue };
@@ -308,7 +340,13 @@ pub const Scheduler = struct {
                 const now = unixNow(self.app.io);
                 self.lock();
                 completeJob(&self.state[idx], job.schedule, result, now);
+                const retired_no_fire = result == null and self.state[idx].status == .stopped;
                 self.unlock();
+                // A cron/interval job (result == null) that completeJob retired has no further
+                // fire time — surface it instead of letting the job vanish silently. A reactive
+                // `.stop` (result != null) is an intentional retirement and stays quiet.
+                if (retired_no_fire)
+                    std.log.warn("scheduler: job '{s}' completed with no future fire time; retired (status=stopped)", .{job.name});
             } else |e| {
                 // FAILURE: report this failure, then retry with exponential backoff.
                 var err_ev = events.ErrorEvent{ .app = self.app, .ctx = null, .err = e, .phase = .cron, .message = @errorName(e) };
@@ -452,6 +490,36 @@ test "reactive job that errors retries with backoff (not retired)" {
     var s = JobState{ .status = .running, .next_fire = 0, .failures = 0 };
     completeJobError(&s, 5000); // an errored reactive job is NOT stopped; it backs off
     try std.testing.expect(s.status == .idle and s.failures == 1 and s.next_fire == 5001);
+}
+
+test "initSized: valid cron schedules a future fire, reactive fires at boot, impossible cron is retired" {
+    const H = struct {
+        fn noop(ctx: *Ctx, ev: *events.JobEvent) anyerror!void {
+            _ = ctx;
+            _ = ev;
+        }
+        fn react(ctx: *Ctx, ev: *events.JobEvent) anyerror!schedule.Reactive {
+            _ = ctx;
+            _ = ev;
+            return .stop;
+        }
+    };
+    const jobs = buildJobs(.{
+        .{ .name = "daily", .schedule = schedule.Schedule{ .cron = "0 3 * * *" }, .handler = H.noop },
+        .{ .name = "boot", .schedule = schedule.Schedule.reactive, .handler = H.react },
+        // Grammatically valid but impossible (Feb 30) — nextFire yields null; it must NOT be
+        // aliased onto the reactive boot-fire path, it must be retired.
+        .{ .name = "feb30", .schedule = schedule.Schedule{ .cron = "0 0 30 2 *" }, .handler = H.noop },
+    });
+    var app: App = undefined;
+    app.io = std.testing.io;
+    app.allocator = std.testing.allocator;
+    var sched = try Scheduler.initSized(std.testing.allocator, &app, jobs, 1, min_job_stack_size);
+    defer sched.deinit();
+    const now = clock.nowUnix(app.io);
+    try std.testing.expect(sched.state[0].status == .idle and sched.state[0].next_fire > now);
+    try std.testing.expect(sched.state[1].status == .idle and sched.state[1].next_fire <= now);
+    try std.testing.expect(sched.state[2].status == .stopped);
 }
 
 test "Scheduler runs a due reactive job then stops cleanly" {

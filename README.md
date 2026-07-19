@@ -22,7 +22,7 @@ zig build                                        # -> zig-out/bin/zigbase   (or:
 # --insecure-cookies: local dev is over plain HTTP, and auth cookies are Secure by default.
 ./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
 # open http://127.0.0.1:8090/_/  (admin UI) and sign in as the superuser
-curl http://127.0.0.1:8090/api/health           # {"status":"ok"}
+curl http://127.0.0.1:8090/api/health           # {"status":"ok","backend":"sqlite","versions":{...}}
 ```
 
 The default bind is `127.0.0.1:8090` (loopback only). To expose ZigBase on all
@@ -116,8 +116,9 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-`runCli` gives your binary the same `serve` / `migrate` / `import` / `superuser create` /
-`help` commands as the stock server. Beyond hooks, `App(.{...})` also accepts a comptime
+`runCli` gives your binary the same commands as the stock server — `serve`, `migrate`,
+`migrate-db`, `import`, `superuser create`, `rewrap`, `vapid-keygen`, `version`, and `help`
+(plus `typegen` when built with `.enable_typegen = true`). Beyond hooks, `App(.{...})` also accepts a comptime
 **schema** (`.collections` + `.migrations`, provisioned at startup with additive
 auto-migration), **pluggable backends** (`.storage` / `.mailer`), and **footprint
 levers** (`.pools`). See [docs/framework.md](docs/framework.md) and the worked
@@ -133,12 +134,25 @@ an Astro + React frontend demonstrating a different static-files mode.
 ```
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
               [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
-zigbase migrate [--data-dir PATH]
+zigbase migrate [status | rollback [N] | dump [--out FILE]] [--data-dir PATH]
+zigbase migrate-db --from SQLITE_PATH --to POSTGRES_URL [--force]
 zigbase import --collection NAME [--upsert-key FIELD] [--batch-size N] [--data-dir PATH] <file.ndjson>
 zigbase superuser create --email E --password P [--data-dir PATH]
+zigbase typegen [--data-dir PATH | --url URL] [--out FILE] [--lang L] [--check] [...]
+zigbase rewrap [--data-dir PATH] [--dry-run]
+zigbase vapid-keygen
 zigbase version
 zigbase help
 ```
+
+`migrate` defaults to applying pending migrations; `status` reports the ledger without
+changing anything, `rollback [N]` reverses the last N applied, and `dump` writes the live
+schema as a canonical migration. `migrate-db` copies an existing SQLite database into a
+PostgreSQL target. `typegen` emits a typed SDK for a running (`--url`) or offline
+(`--data-dir`) server — `--lang` picks the target language, `--check` verifies the output is
+up to date without writing (run `zigbase typegen --help` for the full flag set). `rewrap`
+rotates field-encryption keys (`--dry-run` reports without rewriting), and `vapid-keygen`
+prints a fresh Web Push VAPID keypair.
 
 `import` bulk-loads NDJSON records **offline (no running server)** through the record
 engine — validation, defaults, the `.encrypted` envelope, and auth password hashing all

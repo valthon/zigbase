@@ -555,6 +555,12 @@ pub const S3Storage = struct {
     fn fetchImpl(ctx: *anyopaque, io: std.Io, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!?[]const u8 {
         const self: *S3Storage = @ptrCast(@alignCast(ctx));
         const path = try std.fs.path.join(alloc, &.{ self.cache_dir, col, record_id, filename });
+        // `path` is the caller's to free on every non-success exit (a non-arena consumer relies on
+        // this — see Storage.fetch's contract). Guard the whole miss-fill window, where the dir
+        // create / file create / arena allocPrints can propagate an error before `path` is either
+        // returned or freed. Success exits (spool hit + fill) return `path` and DON'T fire this;
+        // the 404 `return null` frees it manually (a success-typed return errdefer can't cover).
+        errdefer alloc.free(path);
         if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
             if (st.kind == .file) {
                 // Approximate last-access LRU: bump the entry's mtime to now on a
@@ -588,30 +594,26 @@ pub const S3Storage = struct {
         const status = self.client.getToWriter(io, a, key, &fwriter.interface) catch |e| {
             f.close(io);
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            alloc.free(path); // not returned to the caller on this path — ours to free
-            return e;
+            return e; // `path` freed by errdefer
         };
         fwriter.interface.flush() catch |e| {
             f.close(io);
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            alloc.free(path); // not returned to the caller on this path — ours to free
-            return e;
+            return e; // `path` freed by errdefer
         };
         f.close(io);
         if (status == 404) {
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            alloc.free(path);
+            alloc.free(path); // success-typed `return null`: errdefer won't fire, free manually
             return null;
         }
         if (status != 200) {
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            alloc.free(path);
-            return error.S3RequestFailed;
+            return error.S3RequestFailed; // `path` freed by errdefer
         }
         std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io) catch |e| { // atomic fill
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            alloc.free(path); // not returned to the caller on this path — ours to free
-            return e;
+            return e; // `path` freed by errdefer
         };
         self.evictIfOver(io);
         return path;
@@ -636,7 +638,13 @@ pub const S3Storage = struct {
         const a = arena.allocator();
         const prefix = try std.fmt.allocPrint(a, "{s}{s}/{s}/", .{ self.client.key_prefix, col, record_id });
         const keys = try self.client.listKeys(io, a, prefix);
-        for (keys) |k| self.client.delete(io, a, k) catch {};
+        for (keys) |k| self.client.delete(io, a, k) catch |e| {
+            // Best-effort (a record delete must not fail on remote-cleanup hygiene), but log the
+            // orphaned key: a failed DELETE (expired creds / bucket-policy change / network blip)
+            // leaves an object billed + retained after its DB record is gone. Without this line
+            // the skip is undiscoverable — the key was enumerated but recorded nowhere (#34).
+            std.log.warn("[s3] failed to delete object '{s}': {s}; object orphaned", .{ k, @errorName(e) });
+        };
         const spool_dir = try std.fs.path.join(a, &.{ self.cache_dir, col, record_id });
         std.Io.Dir.cwd().deleteTree(io, spool_dir) catch {};
     }
@@ -651,9 +659,18 @@ pub const S3Storage = struct {
         const Entry = struct { path: []const u8, mtime: i96, size: u64 };
         var entries: std.ArrayList(Entry) = .empty;
         var total: u64 = 0;
-        var dir = std.Io.Dir.cwd().openDir(io, self.cache_dir, .{ .iterate = true }) catch return;
+        var dir = std.Io.Dir.cwd().openDir(io, self.cache_dir, .{ .iterate = true }) catch |e| {
+            // Best-effort, but log it: a cache dir that becomes unlistable at runtime (permission
+            // drift) permanently disables LRU eviction, so the spool grows past cache_max_bytes
+            // until the disk fills — silently, without this line (#34).
+            std.log.warn("[s3] spool eviction skipped: cannot open cache dir '{s}': {s}", .{ self.cache_dir, @errorName(e) });
+            return;
+        };
         defer dir.close(io);
-        var walker = dir.walk(a) catch return;
+        var walker = dir.walk(a) catch |e| {
+            std.log.warn("[s3] spool eviction skipped: cannot walk cache dir '{s}': {s}", .{ self.cache_dir, @errorName(e) });
+            return;
+        };
         defer walker.deinit();
         while (walker.next(io) catch null) |entry| {
             if (entry.kind != .file) continue;

@@ -293,8 +293,9 @@ test "pg: .nocase identity — case-insensitive lookup + case-variant duplicate 
     try data2.put(al, "email", .{ .string = "bob@x.com" });
     try data2.put(al, "password", .{ .string = "another good passphrase" });
     const prepared2 = try auth_core.applyCreate(std.testing.io, al, .{ .object = data2 }, col.options.auth.minPasswordLength);
-    // The INSERT … RETURNING is a PREPARED statement, so the unique violation surfaces at step().
-    try std.testing.expectError(error.StepFailed, records.create(al, std.testing.io, w, col, prepared2));
+    // The INSERT … RETURNING is a PREPARED statement, so the unique violation surfaces at step()
+    // as the distinct integrity-constraint class (SQLSTATE 23505 → error.Constraint → HTTP 409).
+    try std.testing.expectError(error.Constraint, records.create(al, std.testing.io, w, col, prepared2));
 }
 
 // ---------------------------------------------------------------------------

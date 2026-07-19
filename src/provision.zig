@@ -269,13 +269,13 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
             rejectUnknownKeys(spec.auth, &.{ "methods", "require_verified", "oauth2" }, "collection '" ++ name ++ "' .auth");
             const A = @TypeOf(spec.auth);
             if (@hasField(A, "methods")) {
-                col.options.auth.methods = buildMethodsOptions(spec.auth.methods);
+                col.options.auth.methods = buildMethodsOptions("collection '" ++ name ++ "' .auth.methods", spec.auth.methods);
             }
             if (@hasField(A, "require_verified")) {
                 col.options.auth.require_verified = spec.auth.require_verified;
             }
             if (@hasField(A, "oauth2")) {
-                col.options.auth.oauth2 = buildOAuth2Options(spec.auth.oauth2);
+                col.options.auth.oauth2 = buildOAuth2Options("collection '" ++ name ++ "' .auth.oauth2", spec.auth.oauth2);
             }
         }
         if (@hasField(S, "indexes")) col.indexes = buildIndexes(name, spec.indexes);
@@ -342,20 +342,25 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
 /// existing call sites below read unchanged.
 const buildRateLimitOpt = schema.buildRateLimitOpt;
 
-fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
+fn buildMethodsOptions(comptime what: []const u8, comptime m: anytype) schema.MethodsOptions {
     const M = @TypeOf(m);
+    // Fail loud on a typo'd method name (e.g. `.magiclink`) — an unknown key would otherwise
+    // be silently dropped and the method left unconfigured, mirroring the collection/field gates.
+    rejectUnknownKeys(m, &.{ "password", "magic_link", "otp", "webauthn", "custom" }, what);
     var out = schema.MethodsOptions{};
     // Each optional built-in method field in the comptime literal is an anonymous
     // struct (not a typed optional), so we use @hasField to detect presence and
     // treat it as "enabled with those settings".
     if (@hasField(M, "password")) {
         const pw = m.password;
+        rejectUnknownKeys(pw, &.{"rate_limit"}, what ++ ".password");
         var p = schema.PasswordMethodOpts{};
         if (@hasField(@TypeOf(pw), "rate_limit")) p.rate_limit = buildRateLimitOpt(pw.rate_limit);
         out.password = p;
     }
     if (@hasField(M, "magic_link")) {
         const ml = m.magic_link;
+        rejectUnknownKeys(ml, &.{ "ttl_s", "auto_create", "rate_limit", "redirect_default", "redirect_allow" }, what ++ ".magic_link");
         var p = schema.MagicLinkMethodOpts{};
         if (@hasField(@TypeOf(ml), "ttl_s")) p.ttl_s = ml.ttl_s;
         if (@hasField(@TypeOf(ml), "auto_create")) p.auto_create = ml.auto_create;
@@ -366,6 +371,7 @@ fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
     }
     if (@hasField(M, "otp")) {
         const otp = m.otp;
+        rejectUnknownKeys(otp, &.{ "length", "ttl_s", "auto_create", "rate_limit" }, what ++ ".otp");
         var p = schema.OtpMethodOpts{};
         if (@hasField(@TypeOf(otp), "length")) p.length = otp.length;
         if (@hasField(@TypeOf(otp), "ttl_s")) p.ttl_s = otp.ttl_s;
@@ -375,6 +381,7 @@ fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
     }
     if (@hasField(M, "webauthn")) {
         const wa = m.webauthn;
+        rejectUnknownKeys(wa, &.{ "rp_id", "rp_name", "origin", "credentials_collection", "require_uv", "rate_limit" }, what ++ ".webauthn");
         var p = schema.WebAuthnMethodOpts{};
         if (@hasField(@TypeOf(wa), "rp_id")) p.rp_id = wa.rp_id;
         if (@hasField(@TypeOf(wa), "rp_name")) p.rp_name = wa.rp_name;
@@ -388,9 +395,11 @@ fn buildMethodsOptions(comptime m: anytype) schema.MethodsOptions {
     return out;
 }
 
-fn buildOAuth2Options(comptime o: anytype) schema.OAuth2Options {
+fn buildOAuth2Options(comptime what: []const u8, comptime o: anytype) schema.OAuth2Options {
     comptime {
         const O = @TypeOf(o);
+        // Fail loud on a typo'd `.oauth2` key so it isn't silently dropped.
+        rejectUnknownKeys(o, &.{ "enabled", "providers" }, what);
         var out = schema.OAuth2Options{};
         if (@hasField(O, "enabled")) out.enabled = o.enabled;
         if (@hasField(O, "providers")) {
@@ -423,6 +432,10 @@ fn buildOAuth2Provider(comptime p: anytype) schema.OAuth2Provider {
         if (!@hasField(P, "name"))
             @compileError(".auth.oauth2 provider is missing .name");
         const pname: []const u8 = p.name;
+        // Fail loud on a typo'd provider key (e.g. `.tokenUrl` for `.tokenURL`) — an unknown
+        // key would otherwise be dropped, leaving the endpoint null and every login failing at
+        // runtime instead of at build time.
+        rejectUnknownKeys(p, &.{ "name", "clientId", "clientSecret", "enabled", "redirectUrls", "authURL", "tokenURL", "userinfoURL", "scopes", "discoveryURL" }, "oauth2 provider '" ++ pname ++ "'");
         if (!schema.isValidIdentifier(pname))
             @compileError("oauth2 provider name '" ++ pname ++ "' must be a valid identifier (it is used as a slug and uppercased into an env var name)");
         var out = schema.OAuth2Provider{ .name = pname };
@@ -670,6 +683,10 @@ fn buildIndexes(comptime col_name: []const u8, comptime t: anytype) []const sche
                 @compileError("an index in collection '" ++ col_name ++ "' is missing .name");
             if (!@hasField(I, "fields"))
                 @compileError("an index in collection '" ++ col_name ++ "' is missing .fields");
+            // Fail loud on a typo'd key (e.g. `.uniqe`): the builder reads .unique/.collation/
+            // .where via @hasField, so a misspelling would be silently dropped and silently
+            // change index semantics (a non-unique index, a full instead of partial one).
+            rejectUnknownKeys(idx, &.{ "name", "fields", "unique", "collation", "where" }, "index in collection '" ++ col_name ++ "'");
             const iname: []const u8 = idx.name;
             if (!schema.isValidIdentifier(iname))
                 @compileError("index name '" ++ iname ++ "' in collection '" ++ col_name ++ "' is not a valid identifier");

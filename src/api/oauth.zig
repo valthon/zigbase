@@ -12,6 +12,7 @@ const auth_api = @import("auth.zig");
 const secrets = @import("../oauth/secrets.zig");
 const id = @import("../id.zig");
 const param_sink = @import("../sql/param_sink.zig");
+const common = @import("common.zig");
 
 /// Lower + renumber a curated `_oauthStates`/`_externalAuths` statement for `conn`'s backend, then
 /// prepare it. SQLite gets verbatim `?N`/`datetime('now')` (zero-cost); Postgres gets `$n` +
@@ -169,18 +170,10 @@ pub fn insertLink(io: std.Io, alloc: std.mem.Allocator, conn: *db.Db, collection
     _ = try st.step();
 }
 
-fn parseBody(ctx: *http.RequestCtx) ?std.json.Value {
-    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch return null;
-    if (parsed.value != .object) return null;
-    return parsed.value;
-}
-fn strField(obj: std.json.Value, key: []const u8) ?[]const u8 {
-    const v = obj.object.get(key) orelse return null;
-    return switch (v) {
-        .string => |s| s,
-        else => null,
-    };
-}
+// The JSON request-body plumbing lives once in `api/common.zig` (#47); these aliases keep the
+// existing call sites unchanged while routing them through the single shared implementation.
+const parseBody = common.parseBody;
+const strField = common.strField;
 
 /// Create a new password-less auth record from a provider identity. Returns its id.
 fn createOAuthRecord(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, identity: providers.Identity) ![]const u8 {

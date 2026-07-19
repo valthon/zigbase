@@ -232,7 +232,8 @@ test "pg dumpload: SQLite -> Postgres round-trips records, an encrypted field, a
     {
         var bad = try target.prepare("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"title\",\"author\") VALUES ('no2','t','t','x','MISSING');");
         defer bad.finalize();
-        try std.testing.expectError(error.StepFailed, bad.step());
+        // A foreign-key violation is SQLSTATE class 23 → error.Constraint (prepared-statement path).
+        try std.testing.expectError(error.Constraint, bad.step());
     }
 
     // ---- _collections metadata copied verbatim: the authors id is preserved -----------------
@@ -297,8 +298,10 @@ test "pg dumpload: a mid-load failure rolls the whole load back to zero migrated
     try source.exec("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"title\") VALUES ('ok','t','t','good');");
     try source.exec("INSERT INTO \"notes\" (\"id\",\"created\",\"updated\",\"title\") VALUES (NULL,'t','t','bad');");
 
-    // The load fails partway (the NULL-id INSERT) and the whole transaction rolls back.
-    try std.testing.expectError(error.StepFailed, dumpload.run(a, &source, &target, .{}));
+    // The load fails partway (the NULL-id INSERT) and the whole transaction rolls back. The
+    // per-row INSERTs are prepared statements, so the NOT NULL violation (SQLSTATE 23502) on the
+    // target surfaces as error.Constraint.
+    try std.testing.expectError(error.Constraint, dumpload.run(a, &source, &target, .{}));
 
     // The target is left CLEAN: the provisioned `notes` table exists but holds ZERO rows (the
     // committed-before-failure `ok` row was rolled back), and the verbatim `_collections` copy was

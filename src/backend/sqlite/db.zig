@@ -26,7 +26,7 @@ test "sqlite library links and reports a 3.x version" {
     try std.testing.expect(std.mem.startsWith(u8, v, "3."));
 }
 
-pub const DbError = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed, WalNotEnabled };
+pub const DbError = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed, Constraint, WalNotEnabled };
 
 pub const Db = struct {
     handle: *c.sqlite3,
@@ -148,7 +148,13 @@ pub const Stmt = struct {
         return switch (c.sqlite3_step(self.handle)) {
             c.SQLITE_ROW => true,
             c.SQLITE_DONE => false,
-            else => DbError.StepFailed,
+            // A constraint violation (UNIQUE / PRIMARY KEY / NOT NULL / CHECK / FK) is a
+            // caller-recoverable class the HTTP layer maps to 409 — it must not collapse into
+            // the catch-all StepFailed (which becomes a 500). sqlite3_step returns the primary
+            // result code SQLITE_CONSTRAINT (19) for every constraint kind; the extended codes
+            // are `19 | (subcode << 8)`, so masking to the low byte catches both forms whether
+            // or not extended result codes are enabled. BUSY/FULL/CORRUPT/IOERR stay StepFailed.
+            else => |rc| if (rc & 0xff == c.SQLITE_CONSTRAINT) DbError.Constraint else DbError.StepFailed,
         };
     }
 
@@ -217,6 +223,46 @@ test "exec returns ExecFailed on invalid SQL" {
     var db = try Db.openMemory();
     defer db.close();
     try std.testing.expectError(DbError.ExecFailed, db.exec("NOT VALID SQL;"));
+}
+
+test "step maps a UNIQUE violation to Constraint (not StepFailed)" {
+    var db = try Db.openMemory();
+    defer db.close();
+    try db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE);");
+    {
+        var ins = try db.prepare("INSERT INTO t (id, email) VALUES (?1, ?2);");
+        defer ins.finalize();
+        try ins.bindInt(1, 1);
+        try ins.bindText(2, "a@x.io");
+        try std.testing.expect(!try ins.step());
+    }
+    // A second row with the same email trips the UNIQUE index at step() → error.Constraint,
+    // the distinct class the API layer maps to 409 (not the catch-all StepFailed → 500).
+    var dup = try db.prepare("INSERT INTO t (id, email) VALUES (?1, ?2);");
+    defer dup.finalize();
+    try dup.bindInt(1, 2);
+    try dup.bindText(2, "a@x.io");
+    try std.testing.expectError(DbError.Constraint, dup.step());
+}
+
+test "step maps a NOT NULL / CHECK violation to Constraint" {
+    var db = try Db.openMemory();
+    defer db.close();
+    try db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL CHECK (n > 0));");
+    // NOT NULL violation.
+    {
+        var ins = try db.prepare("INSERT INTO t (id, n) VALUES (?1, ?2);");
+        defer ins.finalize();
+        try ins.bindInt(1, 1);
+        try ins.bindNull(2);
+        try std.testing.expectError(DbError.Constraint, ins.step());
+    }
+    // CHECK violation.
+    var chk = try db.prepare("INSERT INTO t (id, n) VALUES (?1, ?2);");
+    defer chk.finalize();
+    try chk.bindInt(1, 2);
+    try chk.bindInt(2, 0);
+    try std.testing.expectError(DbError.Constraint, chk.step());
 }
 
 test "prepared insert with bound params, then read back" {

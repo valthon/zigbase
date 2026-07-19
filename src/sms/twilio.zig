@@ -8,13 +8,15 @@
 //! other status is an error so the queue's retry/terminal policy (or a synchronous caller) sees
 //! the failure. Modeled on how `mail/postmark.zig` issues its POST (same `http_client`).
 //!
-//! SECURITY: each form value is percent-encoded via `formEncode` before it goes into the body —
-//! a `&`, `=`, space, or newline in the `Body` cannot smuggle an extra form parameter. `to`/`from`
-//! are additionally guaranteed E.164 (digits only) by `sms/send.zig` before they reach here.
+//! SECURITY: each form value is percent-encoded via `urlenc.percentEncode` before it goes into the
+//! body — a `&`, `=`, space, or newline in the `Body` cannot smuggle an extra form parameter.
+//! `to`/`from` are additionally guaranteed E.164 (digits only) by `sms/send.zig` before they
+//! reach here.
 
 const std = @import("std");
 const sender_mod = @import("sender.zig");
 const http_client = @import("../http_client.zig");
+const urlenc = @import("../url.zig");
 
 const Sms = sender_mod.Sms;
 
@@ -87,42 +89,14 @@ pub fn basicAuthHeader(alloc: std.mem.Allocator, account_sid: []const u8, auth_t
 /// Build the `application/x-www-form-urlencoded` request body. Pure (no I/O), so it is
 /// unit-testable by asserting the exact bytes. Every value is percent-encoded.
 pub fn buildBody(alloc: std.mem.Allocator, from: []const u8, sms: Sms) ![]u8 {
-    const to_enc = try formEncode(alloc, sms.to);
+    // A space becomes `%20` (not `+`); Twilio decodes both, and `%20` is unambiguous.
+    const to_enc = try urlenc.percentEncode(alloc, sms.to);
     defer alloc.free(to_enc);
-    const from_enc = try formEncode(alloc, from);
+    const from_enc = try urlenc.percentEncode(alloc, from);
     defer alloc.free(from_enc);
-    const body_enc = try formEncode(alloc, sms.body);
+    const body_enc = try urlenc.percentEncode(alloc, sms.body);
     defer alloc.free(body_enc);
     return std.fmt.allocPrint(alloc, "To={s}&From={s}&Body={s}", .{ to_enc, from_enc, body_enc });
-}
-
-/// RFC 3986 unreserved set — everything else is percent-encoded (uppercase hex). A space
-/// becomes `%20` (not `+`); Twilio decodes both, and `%20` is unambiguous.
-fn isUnreserved(c: u8) bool {
-    return switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~' => true,
-        else => false,
-    };
-}
-
-/// Percent-encode `input` for a form-urlencoded field value. Allocates on `alloc`.
-pub fn formEncode(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
-    var len: usize = 0;
-    for (input) |c| len += if (isUnreserved(c)) @as(usize, 1) else 3;
-    const out = try alloc.alloc(u8, len);
-    var i: usize = 0;
-    for (input) |c| {
-        if (isUnreserved(c)) {
-            out[i] = c;
-            i += 1;
-        } else {
-            out[i] = '%';
-            out[i + 1] = "0123456789ABCDEF"[c >> 4];
-            out[i + 2] = "0123456789ABCDEF"[c & 0x0F];
-            i += 3;
-        }
-    }
-    return out;
 }
 
 // ---------------------------------------------------------------------------

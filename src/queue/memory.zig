@@ -460,3 +460,37 @@ test "enqueue from INSIDE a pool worker returns promptly (reject-not-block, no s
     try testing.expect(outer_result == .ok or outer_result == .queue_full); // rejected, not blocked
     pool.stop();
 }
+
+test "app.submit racing Pool.stop does not deref a nulled pool (TOCTOU)" {
+    // Regression guard: `Pool.stop` clears `submit_fn` then `memory_pool`; a submit that passed the
+    // `submit_fn` gate must not then deref a just-nulled `memory_pool`. Many rounds of external
+    // threads hammering `app.submit` while `stop` runs reliably hit that two-store window (it
+    // panicked on `memory_pool.?` before the null-check fix in `App.submit`).
+    const R = struct {
+        fn noop(cx: *Ctx, ev: *events.JobEvent) anyerror!void {
+            _ = cx;
+            _ = ev;
+        }
+        fn spam(a: *App, go: *std.atomic.Value(bool)) void {
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            var i: usize = 0;
+            while (i < 20_000) : (i += 1) a.submit("x", noop) catch {};
+        }
+    };
+    var round: usize = 0;
+    while (round < 300) : (round += 1) {
+        var app = testApp();
+        var pool = Pool.init(&app);
+        pool.install(&app);
+        var go = std.atomic.Value(bool).init(false);
+        var threads: [4]std.Thread = undefined;
+        var spawned: usize = 0;
+        for (&threads) |*t| {
+            t.* = std.Thread.spawn(.{}, R.spam, .{ &app, &go }) catch break;
+            spawned += 1;
+        }
+        go.store(true, .release);
+        pool.stop(); // clears submit_fn then memory_pool while spammers hammer app.submit
+        for (threads[0..spawned]) |t| t.join();
+    }
+}

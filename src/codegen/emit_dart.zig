@@ -5,8 +5,20 @@ const std = @import("std");
 const schema = @import("../schema.zig");
 const dt = @import("dart_type.zig");
 const ident = @import("identifiers.zig");
+const sq = @import("schema_query.zig");
 
 const W = std.ArrayList(u8);
+
+/// Language-neutral schema queries shared with the other emitters (see
+/// schema_query.zig). File/select detection and the Dart identifier policy stay
+/// local (they route through dart_type.kindOf / the Dart keyword set).
+const isReadOnlySystem = sq.isReadOnlySystem;
+const isAuthSynthesized = sq.isAuthSynthesized;
+const inSet = sq.inSet;
+const collectionExists = sq.collectionExists;
+const hasResolvableRelations = sq.hasResolvableRelations;
+const appendVisibleAuthFields = sq.appendVisibleAuthFields;
+const recordFields = sq.recordFields;
 
 fn put(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
     try w.appendSlice(alloc, s);
@@ -31,17 +43,6 @@ fn putDartString(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
         else => try w.append(alloc, ch),
     };
     try w.append(alloc, '\'');
-}
-
-fn isReadOnlySystem(name: []const u8) bool {
-    return std.mem.eql(u8, name, "id") or
-        std.mem.eql(u8, name, "created") or
-        std.mem.eql(u8, name, "updated");
-}
-fn isAuthSynthesized(name: []const u8) bool {
-    return std.mem.eql(u8, name, "email") or
-        std.mem.eql(u8, name, "username") or
-        std.mem.eql(u8, name, "verified");
 }
 
 // ---------------------------------------------------------------------------
@@ -79,11 +80,6 @@ fn isObjectMember(name: []const u8) bool {
     return false;
 }
 
-fn inSet(name: []const u8, set: []const []const u8) bool {
-    for (set) |s| if (std.mem.eql(u8, name, s)) return true;
-    return false;
-}
-
 /// Context-reserved member sets (the generated class's own members that a
 /// schema name must not shadow).
 const record_reserved: []const []const u8 = &.{ "expand", "fromRecord", "fromJson" };
@@ -105,38 +101,14 @@ fn memberIdent(alloc: std.mem.Allocator, name: []const u8, reserved: []const []c
 
 /// Generation-time duplicate-identifier check: two distinct schema names that
 /// sanitize to the same Dart identifier (e.g. fields `default` and `default_`)
-/// would emit a duplicate member. Errors with the colliding names.
+/// would emit a duplicate member. Errors with the colliding names. Delegates to
+/// the shared scan, supplying the Dart log prefix and collision error.
 fn checkDuplicateIdents(idents: []const []const u8, names: []const []const u8, scope: []const u8) !void {
-    for (idents, 0..) |a, i| {
-        for (idents[i + 1 ..], i + 1..) |b, j| {
-            if (std.mem.eql(u8, a, b)) {
-                // warn (not err): the returned error is the failure signal and the
-                // CLI layer logs err at top level; std.log.err inside would also
-                // fail the Zig test runner in the expectError coverage test.
-                std.log.warn(
-                    "gen_dart: schema names '{s}' and '{s}' both map to Dart identifier '{s}' in {s} — rename one of them",
-                    .{ names[i], names[j], a, scope },
-                );
-                return error.DartIdentCollision;
-            }
-        }
-    }
-}
-
-fn collectionExists(cols: []const schema.Collection, name: []const u8) bool {
-    for (cols) |c| if (std.mem.eql(u8, c.name, name)) return true;
-    return false;
+    return sq.checkDuplicateIdents("gen_dart", "Dart", error.DartIdentCollision, idents, names, scope);
 }
 
 fn hasRelations(c: schema.Collection) bool {
     for (c.fields) |f| if (f.options == .relation) return true;
-    return false;
-}
-fn hasResolvableRelations(cols: []const schema.Collection, c: schema.Collection) bool {
-    for (c.fields) |f| {
-        if (f.options != .relation) continue;
-        if (collectionExists(cols, f.options.relation.targetCollectionId)) return true;
-    }
     return false;
 }
 fn hasSingleFileFields(c: schema.Collection) bool {
@@ -148,27 +120,6 @@ fn hasSingleFileFields(c: schema.Collection) bool {
 pub fn anyFileFields(cols: []const schema.Collection) bool {
     for (cols) |c| for (c.fields) |f| if (dt.kindOf(f) == .file_name) return true;
     return false;
-}
-
-fn appendVisibleAuthFields(alloc: std.mem.Allocator, list: *std.ArrayList(schema.Field)) !void {
-    try list.append(alloc, .{ .id = "_email", .name = "email", .options = .{ .email = .{} } });
-    try list.append(alloc, .{ .id = "_username", .name = "username", .options = .{ .text = .{} } });
-    try list.append(alloc, .{ .id = "_verified", .name = "verified", .options = .{ .bool = .{} } });
-}
-
-/// Record fields in emission order: id, (auth visible), user fields, created, updated.
-fn recordFields(alloc: std.mem.Allocator, c: schema.Collection) ![]schema.Field {
-    var list: std.ArrayList(schema.Field) = .empty;
-    try list.append(alloc, .{ .id = "_id", .name = "id", .options = .{ .text = .{} } });
-    if (c.type == .auth) try appendVisibleAuthFields(alloc, &list);
-    for (c.fields) |f| {
-        if (f.hidden) continue;
-        if (isReadOnlySystem(f.name)) continue;
-        try list.append(alloc, f);
-    }
-    try list.append(alloc, .{ .id = "_created", .name = "created", .options = .{ .autodate = .{} } });
-    try list.append(alloc, .{ .id = "_updated", .name = "updated", .options = .{ .autodate = .{} } });
-    return list.toOwnedSlice(alloc);
 }
 
 // ---------------------------------------------------------------------------

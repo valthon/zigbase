@@ -3,8 +3,12 @@
 //! clients/kotlin/src/main/kotlin/io/github/valthon/zigbase/typed/*.kt into
 //! concrete `@Serializable` data classes, select enums, and Create/Update
 //! payload models. The Kotlin counterpart of gen_python.generate; shares the
-//! acquisition, identifier, and guard layers (language-neutral) and branches
-//! only in emission.
+//! acquisition layer and the guard bar (guards.checkIdentifiers), and branches
+//! only in emission. NB: that guard bar is TS-derived (TS identifier validity +
+//! the TS typed-core reserved-name set), applied to every language as a
+//! conservative lowest common denominator — NOT a language-neutral check. The
+//! Kotlin-specific keyword/member sanitizing that keeps THIS output legal lives
+//! in emit_kotlin.zig.
 //!
 //! Task 5 emitted the DATA half only (records/enums/payloads). Task 6 adds
 //! the BEHAVIOR half: fluent field builders, per-collection metadata, typed
@@ -110,9 +114,10 @@ pub fn generate(
         \\// typed-core-version: {s}
         \\//
         \\// A thin, schema-aware wrapper generating @Serializable data classes over
-        \\// the io.github.valthon.zigbase.typed runtime. Regenerate with
-        \\// `zig build gen-dating-kotlin-client`, then `spotlessApply` it from
-        \\// clients/kotlin (its ktlint config governs formatting).
+        \\// the io.github.valthon.zigbase.typed runtime. Regenerate with your server's
+        \\// `typegen --lang kotlin --package <your.package>` command (or the build-time
+        \\// comptime gen-client build step), then run your project's Kotlin formatter
+        \\// (e.g. spotlessApply/ktlint) over it.
         \\//
         \\// Identifier mapping: a schema name that is a Kotlin keyword gets a
         \\// trailing `_` on the KOTLIN side only (field `class` -> member

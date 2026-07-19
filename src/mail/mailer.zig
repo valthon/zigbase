@@ -510,7 +510,14 @@ const TlsState = struct {
             // Load the system trust store. Captured by pointer below, so the
             // bundle must live as long as the client (it's a field of state,
             // but the handshake reads it during init only).
-            try state.bundle.rescan(alloc, io, now);
+            //
+            // rescan can propagate a non-FileNotFound error (a malformed / unreadable cert in the
+            // store, OOM) AFTER partially populating bundle.bytes/map. `have_bundle` is still false
+            // and the client.init cleanup below can't reach it, so free the partial bundle here (#24).
+            state.bundle.rescan(alloc, io, now) catch |e| {
+                state.bundle.deinit(alloc);
+                return e;
+            };
             state.have_bundle = true;
             ca_opt = .{ .bundle = .{
                 .gpa = alloc,

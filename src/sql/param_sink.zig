@@ -35,6 +35,33 @@ const dialect_mod = @import("dialect.zig");
 
 pub const Dialect = dialect_mod.Dialect;
 
+/// The error set `rewrite` can produce beyond an allocator failure. A numbered `?N` whose N
+/// overflows a `usize` or exceeds the PostgreSQL bind-parameter cap cannot be rendered as a valid
+/// `$n`, so it is surfaced as a value here instead of panicking. See `max_param_index`.
+pub const RewriteError = std.mem.Allocator.Error || error{BadPlaceholder};
+
+/// The error set the public prepare-boundary helpers (`renumber`/`renumberZ`/`lowerStmtZ`) can
+/// produce. A malformed placeholder is translated to `error.PrepareFailed` — the domain error every
+/// prepare call site already handles — because a `?N` this pass cannot render is exactly a statement
+/// that will not prepare. Keeping the public surface within `Allocator.Error || DbError.PrepareFailed`
+/// is what lets the existing `try`/`catch` call sites keep compiling unchanged.
+pub const PrepareError = std.mem.Allocator.Error || error{PrepareFailed};
+
+/// The largest numbered placeholder `?N` this pass can render as `$N`. PostgreSQL's Bind message
+/// counts parameters in an `i16`, so `$32767` is the ceiling (and "$32767" is 6 bytes, inside
+/// `Dialect.placeholder_buf_len` = 8). A larger — or `usize`-overflowing — N can only come from a
+/// developer typo in raw SQL and is a bad statement, not grounds to panic or overflow the buffer.
+pub const max_param_index: usize = 32767;
+
+/// Translate a `rewrite` failure at the prepare boundary: OOM stays OOM; a malformed placeholder
+/// becomes `error.PrepareFailed` (see `PrepareError`).
+fn toPrepareError(e: RewriteError) PrepareError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadPlaceholder => error.PrepareFailed,
+    };
+}
+
 /// A running placeholder counter bound to a dialect. The whole `$n` rework funnels through one of
 /// these per prepared statement, so emission (the rewritten SQL) and binding (the positional
 /// `bindParams`) share a single source of truth for the next placeholder number.
@@ -64,7 +91,7 @@ pub const ParamSink = struct {
     ///   2. Safety ALSO rests on the broader invariant that all user-supplied values are BOUND, never
     ///      interpolated — so no attacker-controlled `?` (or `'`) ever reaches this generated SQL.
     ///      The scanner is a syntactic renumber, not a sanitizer; it relies on that binding discipline.
-    pub fn rewrite(self: *ParamSink, alloc: std.mem.Allocator, sql: []const u8) std.mem.Allocator.Error![]u8 {
+    pub fn rewrite(self: *ParamSink, alloc: std.mem.Allocator, sql: []const u8) RewriteError![]u8 {
         if (self.dialect.kind == .sqlite) return alloc.dupe(u8, sql);
 
         var out: std.ArrayList(u8) = .empty;
@@ -98,11 +125,24 @@ pub const ParamSink = struct {
                 var j = i + 1;
                 while (j < sql.len and sql[j] >= '0' and sql[j] <= '9') : (j += 1) {}
                 if (j > i + 1) {
-                    const num = std.fmt.parseInt(usize, sql[i + 1 .. j], 10) catch unreachable;
+                    // The digit run is non-empty ASCII digits, but that does NOT prove it fits a
+                    // `usize` (a 20+-digit run overflows) or the PostgreSQL param cap — so reject an
+                    // unrenderable N as a value rather than `catch unreachable`-panicking (overflow)
+                    // or overflowing the fixed placeholder buffer (`$10000000` is 9 bytes).
+                    const num = std.fmt.parseInt(usize, sql[i + 1 .. j], 10) catch return error.BadPlaceholder;
+                    if (num < 1 or num > max_param_index) return error.BadPlaceholder;
                     try out.appendSlice(alloc, self.dialect.placeholder(&pbuf, num));
                     if (num + 1 > self.next) self.next = num + 1;
                     i = j;
                 } else {
+                    // The anonymous running counter is bounded by the SAME cap as a numbered `?N`:
+                    // once `next` exceeds `max_param_index` the value cannot be a valid `$n` (PG's
+                    // i16 param cap) AND `$10000000` (9 bytes) would overflow the 8-byte placeholder
+                    // buffer, panicking `dialect.placeholder`'s `catch unreachable`. Reject it as a
+                    // value instead — the same fix the numbered path already has. This guard is what
+                    // makes that `catch unreachable` genuinely provable: `next <= 32767` ⇒ "$32767"
+                    // (6 bytes) always fits.
+                    if (self.next > max_param_index) return error.BadPlaceholder;
                     try out.appendSlice(alloc, self.dialect.placeholder(&pbuf, self.next));
                     self.next += 1;
                     i += 1;
@@ -119,19 +159,19 @@ pub const ParamSink = struct {
 /// One-shot convenience: renumber `sql` for `dialect` with a fresh counter. SQLite returns the
 /// input slice unchanged (no allocation). Most call sites prepare one statement and want exactly
 /// this.
-pub fn renumber(alloc: std.mem.Allocator, dialect: Dialect, sql: []const u8) std.mem.Allocator.Error![]const u8 {
+pub fn renumber(alloc: std.mem.Allocator, dialect: Dialect, sql: []const u8) PrepareError![]const u8 {
     if (dialect.kind == .sqlite) return sql;
     var sink = ParamSink.init(dialect);
-    return sink.rewrite(alloc, sql);
+    return sink.rewrite(alloc, sql) catch |e| return toPrepareError(e);
 }
 
 /// Sentinel-terminated variant for `db.prepare`, which wants a `[:0]const u8`. SQLite returns the
 /// input slice unchanged (zero-cost in the default build); Postgres allocates the rewritten,
 /// NUL-terminated string.
-pub fn renumberZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8) std.mem.Allocator.Error![:0]const u8 {
+pub fn renumberZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8) PrepareError![:0]const u8 {
     if (dialect.kind == .sqlite) return sql;
     var sink = ParamSink.init(dialect);
-    const rewritten = try sink.rewrite(alloc, sql);
+    const rewritten = sink.rewrite(alloc, sql) catch |e| return toPrepareError(e);
     defer alloc.free(rewritten);
     return std.fmt.allocPrintSentinel(alloc, "{s}", .{rewritten}, 0);
 }
@@ -152,7 +192,7 @@ pub fn renumberZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8) 
 /// analytics time-bucket `strftime('%Y-%m-%d',"occurred_at")`) is NOT a `now` form, is left
 /// untouched here, and its caller dialect-branches it directly. The placeholder renumber relies
 /// on the same scanner invariants documented on `ParamSink.rewrite`.
-pub fn lowerStmtZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8) std.mem.Allocator.Error![:0]const u8 {
+pub fn lowerStmtZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8) PrepareError![:0]const u8 {
     if (dialect.kind == .sqlite) return sql; // byte-identical — nothing to lower
     // Substitute the two server-`now` expressions, but ONLY when actually present:
     // `std.mem.replaceOwned` allocates + copies the whole string even on zero matches, so an
@@ -176,7 +216,7 @@ pub fn lowerStmtZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8)
     }
     // The placeholder renumber always runs on the Postgres arm.
     var sink = ParamSink.init(dialect);
-    const renumbered = try sink.rewrite(alloc, cur);
+    const renumbered = sink.rewrite(alloc, cur) catch |e| return toPrepareError(e);
     defer alloc.free(renumbered);
     return std.fmt.allocPrintSentinel(alloc, "{s}", .{renumbered}, 0);
 }
@@ -284,6 +324,47 @@ test "param_sink: stateful sink runs one counter across rewrite calls" {
     defer testing.allocator.free(b);
     try testing.expectEqualStrings("a = $1, b = $2", a);
     try testing.expectEqualStrings("c = $3", b);
+}
+
+test "param_sink: a valid boundary ?N (max_param_index) still renders as $N" {
+    const sql = "WHERE \"id\"=?32767";
+    const out = try renumber(testing.allocator, Dialect.postgres, sql);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("WHERE \"id\"=$32767", out);
+}
+
+test "param_sink: an overflowing ?N (21+ digits) errors instead of panicking (BadPlaceholder)" {
+    // usize max is 20 digits on 64-bit; a 21-digit run overflows parseInt. Previously a
+    // `catch unreachable` here panicked the process; now it is a value (rewrite: BadPlaceholder;
+    // public boundary: PrepareFailed).
+    var sink = ParamSink.init(Dialect.postgres);
+    try testing.expectError(error.BadPlaceholder, sink.rewrite(testing.allocator, "WHERE a = ?99999999999999999999999"));
+    try testing.expectError(error.PrepareFailed, renumber(testing.allocator, Dialect.postgres, "WHERE a = ?99999999999999999999999"));
+}
+
+test "param_sink: an out-of-range ?N (> max_param_index / == 0) errors (buffer-overflow guard)" {
+    // `$10000000` is 9 bytes and would overflow the 8-byte placeholder buffer; `?0` is not a
+    // valid 1-based bind index. Both are rejected rather than rendered.
+    var sink = ParamSink.init(Dialect.postgres);
+    try testing.expectError(error.BadPlaceholder, sink.rewrite(testing.allocator, "WHERE a = ?10000000"));
+    try testing.expectError(error.PrepareFailed, renumberZ(testing.allocator, Dialect.postgres, "WHERE a = ?0"));
+    // SQLite is verbatim (early return) — the same pathological text never reaches the parser.
+    const lite = try renumberZ(testing.allocator, Dialect.sqlite, "WHERE a = ?10000000");
+    try testing.expectEqual(@as(usize, "WHERE a = ?10000000".len), lite.len);
+}
+
+test "param_sink: the ANONYMOUS running counter is bounded too (no buffer-overflow panic past the cap)" {
+    // A numbered `?32767` advances the anonymous counter to 32768; the very next anonymous `?`
+    // would render as `$32768` — over PG's i16 param cap — and, further out (>=$10000000), would
+    // overflow the 8-byte placeholder buffer and panic `dialect.placeholder`'s `catch unreachable`.
+    // The guard rejects it as a value (BadPlaceholder / PrepareFailed) exactly like the numbered
+    // path, rather than the previous unguarded anonymous emission.
+    var sink = ParamSink.init(Dialect.postgres);
+    try testing.expectError(error.BadPlaceholder, sink.rewrite(testing.allocator, "\"id\"=?32767 AND \"x\"=?"));
+    try testing.expectError(error.PrepareFailed, renumber(testing.allocator, Dialect.postgres, "\"id\"=?32767 AND \"x\"=?"));
+    // SQLite is verbatim (early return) — the pathological counter never runs.
+    const lite = try renumber(testing.allocator, Dialect.sqlite, "\"id\"=?32767 AND \"x\"=?");
+    try testing.expectEqualStrings("\"id\"=?32767 AND \"x\"=?", lite);
 }
 
 test "param_sink: renumberZ produces a NUL-terminated string on PG, same slice on SQLite" {

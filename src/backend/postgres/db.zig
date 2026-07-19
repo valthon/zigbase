@@ -20,6 +20,11 @@ pub const DbError = error{
     PrepareFailed,
     BindFailed,
     StepFailed,
+    /// An integrity-constraint violation surfaced at `Stmt.step()` (SQLSTATE class 23). Kept in
+    /// step with the SQLite backend's `DbError.Constraint` so the seam's unified set and the
+    /// HTTP 409 mapping are backend-uniform. Only the prepared-statement path raises it; the
+    /// `exec` (simple-protocol / COMMIT) path keeps `ExecFailed`.
+    Constraint,
     /// PostgreSQL has no `:memory:` database — `openMemory` is unsupported on this backend.
     Unsupported,
     OutOfMemory,

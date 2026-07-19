@@ -10,7 +10,7 @@ const conn_mod = @import("conn.zig");
 const Conn = conn_mod.Conn;
 const proto = @import("protocol.zig");
 
-pub const StmtError = error{ BindFailed, StepFailed, OutOfMemory };
+pub const StmtError = error{ BindFailed, StepFailed, Constraint, OutOfMemory };
 
 pub const ColumnType = enum { Null, Integer, Float, Text, Blob };
 
@@ -83,8 +83,12 @@ pub const Stmt = struct {
             const params = self.gpa.alloc(conn_mod.Param, self.params.items.len) catch return StmtError.OutOfMemory;
             defer self.gpa.free(params);
             for (self.params.items, 0..) |v, k| params[k] = .{ .value = v };
-            self.result = self.conn.execExtended(self.result_arena.allocator(), self.sql, params) catch
-                return StmtError.StepFailed;
+            self.result = self.conn.execExtended(self.result_arena.allocator(), self.sql, params) catch |e| switch (e) {
+                // Preserve the integrity-constraint class (→ 409) distinctly from every other
+                // execution failure (→ StepFailed → 500), mirroring the SQLite backend.
+                error.Constraint => return StmtError.Constraint,
+                else => return StmtError.StepFailed,
+            };
             self.row_idx = 0;
         }
         const res = self.result.?;

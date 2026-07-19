@@ -16,6 +16,9 @@ const id_gen = @import("../id.zig");
 const Ctx = @import("../ctx.zig").Ctx;
 const ApiError = @import("error.zig").ApiError;
 const param_sink = @import("../sql/param_sink.zig");
+const common = @import("common.zig");
+const queue = @import("../queue/queue.zig");
+const queue_memory = @import("../queue/memory.zig");
 
 /// Lower + renumber a curated auth/session/token statement for `conn`'s backend, then prepare it.
 /// SQLite gets the verbatim `?N`/`datetime('now')` SQL (zero-cost — the same slice); Postgres gets
@@ -33,23 +36,11 @@ fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
     return conn.prepare(lowered);
 }
 
-fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value, cookies: []const http.Cookie) !http.Response {
-    return .{ .status = status, .body = try std.json.Stringify.valueAlloc(ctx.allocator, v, .{}), .cookies = cookies };
-}
-
-fn parseBody(ctx: *http.RequestCtx) ?std.json.Value {
-    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch return null;
-    if (parsed.value != .object) return null;
-    return parsed.value;
-}
-
-fn strField(obj: std.json.Value, key: []const u8) ?[]const u8 {
-    const v = obj.object.get(key) orelse return null;
-    return switch (v) {
-        .string => |s| s,
-        else => null,
-    };
-}
+// The JSON request/response plumbing lives once in `api/common.zig` (#47); these aliases keep
+// the existing call sites unchanged while routing them through the single shared implementation.
+const jsonResponse = common.jsonResponse;
+const parseBody = common.parseBody;
+const strField = common.strField;
 
 /// True iff the record's `verified` field is truthy. Tolerant of the JSON shapes a
 /// bool column can surface as (bool, integer 0/1, or "true"/"false" string).
@@ -112,32 +103,39 @@ pub fn nowUnix(conn: *db.Db) db.DbError!i64 {
     return clock.sqlNowUnix(conn);
 }
 
-/// Try each identity field in order; return the matching non-empty row id, or null.
-///
-/// When an identity field is covered by a `.nocase` index, the comparison is case-INSENSITIVE so
-/// the lookup uses that index and AGREES with its case-insensitive uniqueness (#159), IDENTICALLY
-/// on both backends: Postgres `lower("idf") = lower($1)` (the `lower()` functional index), SQLite
-/// `"idf" COLLATE NOCASE = ?1 COLLATE NOCASE` (the COLLATE NOCASE index). A non-`.nocase` identity
-/// field keeps the exact (case-sensitive) compare on both backends.
-pub fn findByIdentity(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, identity: []const u8) !?[]const u8 {
+/// Look up the non-empty row id whose `field` column equals `value`, or null. When `field` is
+/// covered by a `.nocase` index the comparison is case-INSENSITIVE so the lookup uses that index
+/// and AGREES with its case-insensitive uniqueness (#159), IDENTICALLY on both backends: Postgres
+/// `lower("field") = lower($1)` (the `lower()` functional index), SQLite
+/// `"field" COLLATE NOCASE = ?1 COLLATE NOCASE` (the COLLATE NOCASE index). A non-`.nocase` field
+/// keeps the exact (case-sensitive) compare on both backends. Shared by `findByIdentity` (looped
+/// over the identity fields) and `findByEmail` (#45) so the subtle nocase / guarded-free handling
+/// exists in exactly one place.
+fn findByField(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, field: []const u8, value: []const u8) !?[]const u8 {
     const d = db.dbDialect(conn);
+    const col_quoted = try std.fmt.allocPrint(alloc, "\"{s}\"", .{field});
+    defer alloc.free(col_quoted);
+    const ci = ddl.isNocaseField(col, field);
+    // `lhs`/`rhs` are freshly allocated ONLY on the `ci` arm (nocaseEqOperand allocates on both
+    // backends); otherwise they borrow `col_quoted` / a string literal, so the frees are
+    // guarded to `ci` to avoid double-freeing `col_quoted` or freeing a literal.
+    const lhs = if (ci) try d.nocaseEqOperand(alloc, col_quoted) else col_quoted;
+    defer if (ci) alloc.free(lhs);
+    const rhs = if (ci) try d.nocaseEqOperand(alloc, "?1") else "?1";
+    defer if (ci) alloc.free(rhs);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE {s} = {s} AND \"{s}\" != '' LIMIT 1;", .{ col.name, lhs, rhs, field }, 0);
+    defer alloc.free(sql);
+    var st = try prep(conn, sql);
+    defer st.finalize();
+    try st.bindText(1, value);
+    if (try st.step()) return try alloc.dupe(u8, st.columnText(0));
+    return null;
+}
+
+/// Try each identity field in order; return the matching non-empty row id, or null.
+pub fn findByIdentity(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, identity: []const u8) !?[]const u8 {
     for (col.options.auth.identityFields) |idf| {
-        const col_quoted = try std.fmt.allocPrint(alloc, "\"{s}\"", .{idf});
-        defer alloc.free(col_quoted);
-        const ci = ddl.isNocaseField(col, idf);
-        // `lhs`/`rhs` are freshly allocated ONLY on the `ci` arm (nocaseEqOperand allocates on both
-        // backends); otherwise they borrow `col_quoted` / a string literal, so the frees are
-        // guarded to `ci` to avoid double-freeing `col_quoted` or freeing a literal.
-        const lhs = if (ci) try d.nocaseEqOperand(alloc, col_quoted) else col_quoted;
-        defer if (ci) alloc.free(lhs);
-        const rhs = if (ci) try d.nocaseEqOperand(alloc, "?1") else "?1";
-        defer if (ci) alloc.free(rhs);
-        const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE {s} = {s} AND \"{s}\" != '' LIMIT 1;", .{ col.name, lhs, rhs, idf }, 0);
-        defer alloc.free(sql);
-        var st = try prep(conn, sql);
-        defer st.finalize();
-        try st.bindText(1, identity);
-        if (try st.step()) return try alloc.dupe(u8, st.columnText(0));
+        if (try findByField(alloc, conn, col, idf, identity)) |rid| return rid;
     }
     return null;
 }
@@ -186,7 +184,7 @@ test "findByIdentity: a .nocase email index makes the SQLite lookup case-insensi
     try data2.put(a, "email", .{ .string = "bob@x.com" });
     try data2.put(a, "password", .{ .string = "another good passphrase" });
     const prepared2 = try auth.applyCreate(std.testing.io, a, .{ .object = data2 }, col.options.auth.minPasswordLength);
-    try std.testing.expectError(error.StepFailed, records.create(a, std.testing.io, &d, col, prepared2));
+    try std.testing.expectError(error.Constraint, records.create(a, std.testing.io, &d, col, prepared2));
 }
 
 pub fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
@@ -876,24 +874,11 @@ pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
 // Email verification & password reset
 // ----------------------------------------------------------------------------
 
+/// Resolve the row id for `email` (verification / password-reset lookup). Targets the "email"
+/// column even when it is not an identity field, sharing the exact nocase + guarded-free
+/// semantics of the login lookup via `findByField` (#45).
 fn findByEmail(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, email: []const u8) !?[]const u8 {
-    // Case-insensitive when `email` is `.nocase`-indexed, mirroring findByIdentity (#159): PG
-    // `lower("email") = lower($1)`; SQLite `"email" COLLATE NOCASE = ?1 COLLATE NOCASE` — both use
-    // the `.nocase` index. `lhs`/`rhs` allocate only on the `ci` arm; the frees are guarded to it
-    // (otherwise they borrow string literals).
-    const d = db.dbDialect(conn);
-    const ci = ddl.isNocaseField(col, "email");
-    const lhs = if (ci) try d.nocaseEqOperand(alloc, "\"email\"") else "\"email\"";
-    defer if (ci) alloc.free(lhs);
-    const rhs = if (ci) try d.nocaseEqOperand(alloc, "?1") else "?1";
-    defer if (ci) alloc.free(rhs);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE {s} = {s} AND \"email\" != '' LIMIT 1;", .{ col.name, lhs, rhs }, 0);
-    defer alloc.free(sql);
-    var st = try prep(conn, sql);
-    defer st.finalize();
-    try st.bindText(1, email);
-    if (try st.step()) return try alloc.dupe(u8, st.columnText(0));
-    return null;
+    return findByField(alloc, conn, col, "email", email);
 }
 
 /// Deliver a verification/reset token to `email` via the configured mailer. The
@@ -907,6 +892,53 @@ pub fn deliverToken(app: *@import("../app.zig").App, alloc: std.mem.Allocator, e
     } else {
         std.log.info("[mail:fallback] to={s} subject={s} body={s}", .{ email, subject, body });
     }
+}
+
+/// Memory-only, single-attempt queue that carries verification / password-reset token mail
+/// off the request path. Not a declared queue — token mail bypasses the registry so it can
+/// never land on a durable (DB-writer) backend (mirrors `report/send.zig`). `max_attempts = 1`
+/// because the handler swallows failures anyway (see `tokenMailHandler`).
+const token_mail_queue = queue.QueueDef{
+    .name = "__token_mail",
+    .backend = .memory,
+    .retry = .{ .max_attempts = 1, .base_ms = 0, .jitter = false },
+};
+
+/// The (recipient, subject, body) triple serialized onto the token-mail queue.
+const TokenMail = struct { to: []const u8, subject: []const u8, body: []const u8 };
+
+/// Enqueue a verification/reset token email for NON-BLOCKING delivery (#13). This is the seam
+/// that makes `request-verification` / `request-password-reset` resistant to account
+/// enumeration: the request returns 204 with identical timing and status whether or not the
+/// email matched a record, because the SMTP send (its latency AND any failure) happens on the
+/// background worker, not inline. With the worker pool installed (serving) the enqueue copies
+/// the payload and returns immediately; without one (unit tests / CLI) it runs inline but the
+/// handler still swallows errors, so no send failure is ever observable on the response.
+/// Best-effort: a serialize/enqueue failure is logged and the mail dropped.
+fn enqueueTokenMail(app: *@import("../app.zig").App, to: []const u8, subject: []const u8, body: []const u8) void {
+    const payload = std.json.Stringify.valueAlloc(app.allocator, TokenMail{ .to = to, .subject = subject, .body = body }, .{}) catch |e| {
+        std.log.warn("[mail:token] failed to serialize ({s}); dropping", .{@errorName(e)});
+        return;
+    };
+    defer app.allocator.free(payload);
+    queue_memory.enqueue(app, token_mail_queue, tokenMailHandler, payload) catch |e| {
+        std.log.warn("[mail:token] enqueue failed ({s}); dropping", .{@errorName(e)});
+    };
+}
+
+/// Token-mail queue handler: deserialize the triple and deliver via the configured mailer on
+/// the worker thread. NEVER surfaces an error — the send happens after the request's 204, so a
+/// propagated failure would (a) be un-actionable and (b) only ever occur for existing accounts,
+/// re-opening the enumeration oracle. A delivery failure is logged and the job completes.
+fn tokenMailHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
+    const parsed = std.json.parseFromSlice(TokenMail, ctx.arena, payload, .{}) catch |e| {
+        std.log.warn("[mail:token] failed to parse payload ({s}); dropping", .{@errorName(e)});
+        return;
+    };
+    const m = parsed.value;
+    deliverToken(ctx.app, ctx.arena, m.to, m.subject, m.body) catch |e| {
+        std.log.warn("[mail:token] delivery failed: {s}", .{@errorName(e)});
+    };
 }
 
 /// Mint a single-use token. `payload` binds an opaque value into the signed `pl` claim;
@@ -967,35 +999,65 @@ pub fn verifyTyped(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, 
     return verified;
 }
 
-pub fn requestVerification(ctx: *http.RequestCtx) anyerror!http.Response {
+/// Shared flow for the two enumeration-resistant token-mail endpoints (`request-verification`
+/// and `request-password-reset`), which differ only in the rate-limit scope, token type, TTL,
+/// mail subject, and body template (#44). Parses the body ONCE (reused for both the rate-limit
+/// identity and the email lookup), gates on the rate limiter, then — under the writer lock —
+/// resolves the account and mints a single-use token, and finally hands the mail to the
+/// background queue.
+///
+/// Account-enumeration resistance (#13): the endpoint ALWAYS returns 204 with the SAME status
+/// and timing whether or not `email` matched a record. The mail rides the memory queue
+/// (`enqueueTokenMail`), so neither the SMTP round-trip latency nor a send failure is observable
+/// on the request — closing the timing and status oracles a synchronous `try deliverToken` left
+/// open. Delivery for real accounts is preserved (the worker sends it).
+fn requestEmailToken(
+    ctx: *http.RequestCtx,
+    scope: []const u8,
+    tt: jwt.TokenType,
+    ttl: i64,
+    subject: []const u8,
+    comptime body_fmt: []const u8,
+) anyerror!http.Response {
     const app = ctx.app.?;
+    // Parse the body ONCE; reuse it for the rate-limit identity AND the email lookup below.
+    const body = parseBody(ctx);
     // Rate-limit gate (email-bombing defense): per client IP, falling back to the
     // submitted email. Gated BEFORE the writer lock so a limited request never holds it.
-    const rl_email = if (parseBody(ctx)) |b| (strField(b, "email") orelse "") else "";
-    if (try rateLimited(ctx, "verify", rl_email)) |resp| return resp;
-    // Strings are arena-allocated (ctx.allocator), so they outlive the scoped
-    // writer block below and remain valid for the post-lock SMTP send.
+    const rl_email = if (body) |b| (strField(b, "email") orelse "") else "";
+    if (try rateLimited(ctx, scope, rl_email)) |resp| return resp;
+    // Strings are arena-allocated (ctx.allocator), so they outlive the scoped writer block.
     var pending: ?struct { email: []const u8, mail_body: []const u8 } = null;
     {
         const w = app.pool.acquireWriter();
         defer app.pool.releaseWriter();
         const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-        const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-        if (strField(body, "email")) |email| {
+        const parsed = body orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+        if (strField(parsed, "email")) |email| {
             if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
                 if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
-                    const token = try mintToken(ctx, w, col.name, rid, tk, .verification, app.verification_ttl_s, "");
-                    const mail_body = try std.fmt.allocPrint(ctx.allocator, "Verify your email ({s}). Your verification token:\n\n{s}\n", .{ col.name, token });
+                    const token = try mintToken(ctx, w, col.name, rid, tk, tt, ttl, "");
+                    const mail_body = try std.fmt.allocPrint(ctx.allocator, body_fmt, .{ col.name, token });
                     pending = .{ .email = email, .mail_body = mail_body };
                 }
             }
         }
     }
-    // Writer lock released: do the blocking SMTP send outside the global lock.
-    if (pending) |p| {
-        try deliverToken(app, ctx.allocator, p.email, "Verify your email", p.mail_body);
-    }
+    // Writer lock released. Hand the mail to the background queue so its latency and any
+    // failure stay off the request path (enumeration resistance, #13).
+    if (pending) |p| enqueueTokenMail(app, p.email, subject, p.mail_body);
     return .{ .status = 204, .body = "" };
+}
+
+pub fn requestVerification(ctx: *http.RequestCtx) anyerror!http.Response {
+    return requestEmailToken(
+        ctx,
+        "verify",
+        .verification,
+        ctx.app.?.verification_ttl_s,
+        "Verify your email",
+        "Verify your email ({s}). Your verification token:\n\n{s}\n",
+    );
 }
 
 pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -1019,34 +1081,14 @@ pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn requestPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app.?;
-    // Rate-limit gate (email-bombing defense): per client IP, falling back to the
-    // submitted email. Gated BEFORE the writer lock so a limited request never holds it.
-    const rl_email = if (parseBody(ctx)) |b| (strField(b, "email") orelse "") else "";
-    if (try rateLimited(ctx, "reset", rl_email)) |resp| return resp;
-    // Strings are arena-allocated (ctx.allocator), so they outlive the scoped
-    // writer block below and remain valid for the post-lock SMTP send.
-    var pending: ?struct { email: []const u8, mail_body: []const u8 } = null;
-    {
-        const w = app.pool.acquireWriter();
-        defer app.pool.releaseWriter();
-        const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-        const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-        if (strField(body, "email")) |email| {
-            if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
-                if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
-                    const token = try mintToken(ctx, w, col.name, rid, tk, .password_reset, app.password_reset_ttl_s, "");
-                    const mail_body = try std.fmt.allocPrint(ctx.allocator, "Reset your password ({s}). Your password-reset token:\n\n{s}\n", .{ col.name, token });
-                    pending = .{ .email = email, .mail_body = mail_body };
-                }
-            }
-        }
-    }
-    // Writer lock released: do the blocking SMTP send outside the global lock.
-    if (pending) |p| {
-        try deliverToken(app, ctx.allocator, p.email, "Reset your password", p.mail_body);
-    }
-    return .{ .status = 204, .body = "" };
+    return requestEmailToken(
+        ctx,
+        "reset",
+        .password_reset,
+        ctx.app.?.password_reset_ttl_s,
+        "Reset your password",
+        "Reset your password ({s}). Your password-reset token:\n\n{s}\n",
+    );
 }
 
 pub fn confirmPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -1353,10 +1395,12 @@ test "F7: consumeToken classifies replay by jti presence, not by any INSERT fail
     // Regression: a NON-replay INSERT failure (here a CHECK violation on a fresh jti) must
     // PROPAGATE as a DB error, not be misreported as error.AlreadyConsumed — the old
     // `step() catch return error.AlreadyConsumed` swallowed every failure (disk-full, I/O, …).
+    // A CHECK violation is an integrity constraint, so it surfaces as error.Constraint (still a
+    // propagated DB error, still NOT the replay sentinel).
     var d2 = try db.Db.openMemory();
     defer d2.close();
     try d2.exec("CREATE TABLE \"_consumedTokens\" (\"jti\" TEXT PRIMARY KEY CHECK(length(\"jti\") < 3), \"expires\" INTEGER, \"consumed\" TEXT);");
-    try std.testing.expectError(error.StepFailed, consumeToken(&d2, claims));
+    try std.testing.expectError(error.Constraint, consumeToken(&d2, claims));
 
     // An empty jti is rejected outright (cannot be tracked single-use).
     const nojti = jwt.Claims{ .id = "u1", .collection = "users", .type = .verification, .jti = "", .iat = 0, .exp = 1 };

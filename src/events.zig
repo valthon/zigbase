@@ -558,11 +558,26 @@ pub const JobTask = *const fn (ctx: *Ctx, ev: *JobEvent) anyerror!void;
 /// `route_types.HandlerInput`/`HandlerOutput`'s own `@compileError`s when `routeMeta`
 /// reflects it — so no raw-Response coercion check is performed here.
 fn validateRouteSpecs(comptime specs: anytype) void {
+    // The exact keys read by `routeMeta`/`buildRoutes` (and the auth helpers). Kept in
+    // lock-step with those readers — a key read there must appear here or a valid spec
+    // would falsely @compileError.
+    const allowed = [_][]const u8{ "method", "path", "handler", "auth", "name", "rate_limit", "rate_limit_key" };
     inline for (std.meta.fields(@TypeOf(specs))) |f| {
         const s = @field(specs, f.name);
         if (!@hasField(@TypeOf(s), "method")) @compileError("route spec is missing '.method' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "path")) @compileError("route spec is missing '.path' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "handler")) @compileError("route spec is missing '.handler' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
+        // Fail loud on a typo'd optional key (e.g. `.rate_limt`, `.rate_limit_ky`) which the
+        // `@hasField`-gated readers would otherwise silently ignore, shipping the route with
+        // NO rate limit / default keying the developer believed they had configured.
+        inline for (std.meta.fields(@TypeOf(s))) |sf| {
+            comptime var ok = false;
+            inline for (allowed) |a| {
+                if (comptime std.mem.eql(u8, sf.name, a)) ok = true;
+            }
+            if (!ok) @compileError("route spec (path '" ++ s.path ++ "'): unknown key '." ++ sf.name ++
+                "' (recognized keys: .method, .path, .handler, .auth, .name, .rate_limit, .rate_limit_key)");
+        }
     }
 }
 

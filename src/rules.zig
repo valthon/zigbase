@@ -42,6 +42,7 @@ pub fn compileGuard(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collecti
     const toks = try lexer.lex(alloc, rule);
     const ast = try parser.parse(alloc, toks);
     var j = joiner.Joiner.init(alloc, conn, col);
+    j.allow_hidden = true; // operator-authored rule: may gate access on a hidden field (trusted, not serialized)
     const c = try compiler.compile(alloc, &j, ast, rctx, db.dbDialect(conn), &.{});
     return .{ .where_sql = c.where_sql, .joins = j.joins.items, .params = c.params };
 }

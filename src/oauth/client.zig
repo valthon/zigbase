@@ -1,5 +1,6 @@
 const std = @import("std");
 const providers = @import("providers.zig");
+const urlenc = @import("../url.zig");
 
 pub const Method = enum { GET, POST };
 pub const Header = struct { name: []const u8, value: []const u8 };
@@ -19,25 +20,6 @@ fn is2xx(status: u16) bool {
     return status >= 200 and status < 300;
 }
 
-/// URL-encode `s` (RFC 3986 unreserved kept; everything else %XX).
-fn urlEncode(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    const hex = "0123456789ABCDEF";
-    for (s) |ch| {
-        const unreserved = (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or
-            (ch >= '0' and ch <= '9') or ch == '-' or ch == '_' or ch == '.' or ch == '~';
-        if (unreserved) {
-            try out.append(alloc, ch);
-        } else {
-            try out.append(alloc, '%');
-            try out.append(alloc, hex[ch >> 4]);
-            try out.append(alloc, hex[ch & 0x0f]);
-        }
-    }
-    return out.toOwnedSlice(alloc);
-}
-
 /// Exchange an authorization code for an access token (form-encoded POST to tokenURL).
 pub fn exchangeCode(
     transport: Transport,
@@ -49,13 +31,25 @@ pub fn exchangeCode(
     code_verifier: []const u8,
     redirect_uri: []const u8,
 ) ClientError![]const u8 {
+    // Callers pass a request arena in practice, but this owns its scratch either way: each
+    // percent-encoded field, the form body, and the JSON tree are released on every exit path.
+    // (`resp.body` is deliberately NOT freed — it belongs to the Transport, and the production
+    // one returns a sub-slice of a larger fixed buffer, so freeing it would be an invalid free.)
+    const enc_code = try urlenc.percentEncode(alloc, code);
+    defer alloc.free(enc_code);
+    const enc_redirect = try urlenc.percentEncode(alloc, redirect_uri);
+    defer alloc.free(enc_redirect);
+    const enc_verifier = try urlenc.percentEncode(alloc, code_verifier);
+    defer alloc.free(enc_verifier);
+    const enc_client_id = try urlenc.percentEncode(alloc, client_id);
+    defer alloc.free(enc_client_id);
+    const enc_secret = try urlenc.percentEncode(alloc, client_secret);
+    defer alloc.free(enc_secret);
+
     const body = try std.fmt.allocPrint(alloc, "grant_type=authorization_code&code={s}&redirect_uri={s}&code_verifier={s}&client_id={s}&client_secret={s}", .{
-        try urlEncode(alloc, code),
-        try urlEncode(alloc, redirect_uri),
-        try urlEncode(alloc, code_verifier),
-        try urlEncode(alloc, client_id),
-        try urlEncode(alloc, client_secret),
+        enc_code, enc_redirect, enc_verifier, enc_client_id, enc_secret,
     });
+    defer alloc.free(body);
     const headers = [_]Header{
         .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
         .{ .name = "accept", .value = "application/json" },
@@ -64,6 +58,7 @@ pub fn exchangeCode(
     if (!is2xx(resp.status)) return error.ProviderError;
 
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, resp.body, .{}) catch return error.InvalidResponse;
+    defer parsed.deinit(); // the returned token is duped below, so it outlives the tree
     if (parsed.value != .object) return error.InvalidResponse;
     const at = parsed.value.object.get("access_token") orelse return error.InvalidResponse;
     if (at != .string) return error.InvalidResponse;
