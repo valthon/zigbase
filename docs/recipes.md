@@ -372,7 +372,7 @@ Two patterns:
        if (ev.record.* != .object) return;
        const uid = ev.rctx.resolveMacro("@request.auth.id") orelse "";
        if (uid.len == 0) return error.Unauthenticated; // reject anonymous creates -> 400
-       try ev.record.object.put(ev.arena, "owner", .{ .string = uid }); // ev.arena
+       try ev.record.object.put(ev.arena.a, "owner", .{ .string = uid }); // ev.arena.a
    }
    ```
    Register it as `.hooks = .{ .simulators = .{ .beforeCreate = setOwner } }`. See
@@ -443,7 +443,7 @@ const std = @import("std");
 const zigbase = @import("zigbase");
 
 /// before_create on "bookings": reject overlaps with a confirmed booking and
-/// compute a derived duration field. Allocations that land in ev.record use ev.arena.
+/// compute a derived duration field. Allocations that land in ev.record use ev.arena.a.
 fn validateBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     if (ev.record.* != .object) return; // framework guards non-objects already
 
@@ -453,7 +453,7 @@ fn validateBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
     // 1) Conflict check: any CONFIRMED booking for this listing that overlaps?
     //    ctx.records().list runs a curated query on the request's connection.
-    const filter = try std.fmt.allocPrint(ev.arena,
+    const filter = try std.fmt.allocPrint(ev.arena.a,
         "listing = \"{s}\" && status = \"confirmed\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing, ends, starts },
     );
@@ -462,7 +462,7 @@ fn validateBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
     // 2) Compute a derived numeric field from the two timestamps (illustrative).
     const minutes = durationMinutes(starts, ends);
-    try ev.record.object.put(ev.arena, "duration_minutes", .{ .integer = minutes });
+    try ev.record.object.put(ev.arena.a, "duration_minutes", .{ .integer = minutes });
 }
 
 fn strField(rec: *std.json.Value, name: []const u8) ?[]const u8 {
@@ -484,9 +484,11 @@ Register it:
 
 Key points:
 
-- **Use `ev.arena`** for anything stored into `ev.record` (the request-scoped
-  allocator that owns the record's JSON). See
-  [framework.md → Always allocate record data with ev.arena](framework.md#always-allocate-record-data-with-evarena).
+- **Use `ev.arena.a`** for anything stored into `ev.record`. `ev.arena` is a typed
+  `RequestArena` rather than a bare `std.mem.Allocator`, so a general-purpose
+  allocator can't reach an arena-scoped API by accident; `.a` is the request-scoped
+  allocator inside it, the one that owns the record's JSON. See
+  [framework.md → Always allocate record data with ev.arena.a](framework.md#always-allocate-record-data-with-evarenaa).
 - **`ctx.records().list(collection, opts)`** returns a `ListResult` with `totalItems`
   (a `?i64` — `orelse 0` it) and `items`; the `opts` is a `ListOptions` (`.filter`,
   `.sort`, `.page`, `.perPage`). `ctx.records()` also offers `get`, `create`, `update`, `delete`.
@@ -517,7 +519,7 @@ const zigbase = @import("zigbase");
 
 /// POST /api/bookings/:id/confirm — host confirms a pending booking.
 fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
-    const a = ctx.arena; // request arena
+    const a = ctx.arena.a; // the request arena's allocator
     const id = ctx.request.?.param("id") orelse
         return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
 
@@ -564,7 +566,7 @@ Key points:
 - **Built-in routes win** over custom routes matching the same method+path, so namespace
   your routes (`/api/bookings/:id/confirm`, not a path that shadows a built-in).
 - Return any `zigbase.http.Response`; the body is a JSON string you allocate from
-  `ctx.arena`.
+  `ctx.arena.a`.
 
 ---
 
@@ -694,7 +696,7 @@ const MagicConfirmBody = struct { token: []const u8 };
 /// Always returns 204 — enumeration-safe. If the email matches a record, mints a
 /// single-use link token (TTL 900 s) and mails it. Rate-limited per IP/email.
 fn magicRequest(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
-    const a = ctx.arena;
+    const a = ctx.arena.a;
 
     // 1) Parse the request body first so we can key the rate limit on the parsed
     //    email rather than the raw body (whitespace/key-order variants of the same
@@ -747,7 +749,7 @@ fn magicRequest(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 /// Verifies the single-use link token, consumes it (replay → 400), issues a
 /// real session, and returns 200 with the auth cookies set. onAuth fires here.
 fn magicConfirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
-    const a = ctx.arena;
+    const a = ctx.arena.a;
 
     const parsed = std.json.parseFromSlice(MagicConfirmBody, a, ctx.request.?.body, .{}) catch
         return .{ .status = 400, .body = "{\"message\":\"Invalid request body.\"}" };
@@ -901,7 +903,7 @@ const ApiKeyMethod = struct {
 
         // Parse {"apiKey":"..."} from the request body.
         const parsed = std.json.parseFromSlice(
-            struct { apiKey: []const u8 }, ac.ctx.allocator, body, .{},
+            struct { apiKey: []const u8 }, ac.ctx.allocator.a, body, .{},
         ) catch return .{ .fail = .{ .status = 400, .message = "Missing apiKey." } };
         defer parsed.deinit();
 

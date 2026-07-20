@@ -16,6 +16,7 @@
 //! byte-identical to the pre-tenancy engine (pinned in `policy.zig`).
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const schema = @import("../schema.zig");
 const request = @import("../request.zig");
 const compiler = @import("../query/compiler.zig");
@@ -227,7 +228,7 @@ fn resolveRequestInner(
     const id_v = a.record.object.get("id") orelse return;
     if (id_v != .string) return;
     const requested = requestedAccount(ctx, app) orelse "";
-    const res = try resolve(ctx.allocator, conn, a.collection, id_v.string, requested);
+    const res = try resolve(ctx.allocator.a, conn, a.collection, id_v.string, requested);
     rctx.account_id = res.account_id;
     rctx.account_role = res.account_role;
     rctx.memberships = res.memberships;
@@ -342,7 +343,7 @@ test "requestedAccount: header wins over the signed cookie; unsigned/bad cookie 
 
     // Neither header nor cookie -> null.
     {
-        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator) };
         try std.testing.expect(requestedAccount(&ctx, &app) == null);
     }
     // Header present -> wins outright (even with a cookie also present).
@@ -353,7 +354,7 @@ test "requestedAccount: header wins over the signed cookie; unsigned/bad cookie 
         var ctx = http.RequestCtx{
             .method = .GET,
             .path = "/",
-            .allocator = std.testing.allocator,
+            .allocator = RequestArena.forTest(std.testing.allocator),
             .headers = &hdrs,
         };
         // cookie name is "zb_account"; wrap it as "zb_account=<signed>" for the cookie parser.
@@ -368,7 +369,7 @@ test "requestedAccount: header wins over the signed cookie; unsigned/bad cookie 
         defer std.testing.allocator.free(signed);
         const cookie_hdr = try std.fmt.allocPrint(std.testing.allocator, "{s}={s}", .{ account_cookie, signed });
         defer std.testing.allocator.free(cookie_hdr);
-        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .cookie_header = cookie_hdr };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator), .cookie_header = cookie_hdr };
         try std.testing.expectEqualStrings("acc-cookie", requestedAccount(&ctx, &app).?);
     }
     // No header, tampered cookie (wrong secret's signature) -> null (fail closed, not the forged id).
@@ -377,7 +378,7 @@ test "requestedAccount: header wins over the signed cookie; unsigned/bad cookie 
         defer std.testing.allocator.free(forged);
         const cookie_hdr = try std.fmt.allocPrint(std.testing.allocator, "{s}={s}", .{ account_cookie, forged });
         defer std.testing.allocator.free(cookie_hdr);
-        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .cookie_header = cookie_hdr };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator), .cookie_header = cookie_hdr };
         try std.testing.expect(requestedAccount(&ctx, &app) == null);
     }
 }
@@ -411,7 +412,7 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
     {
         var off = app;
         off.tenancy = .{};
-        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = alloc };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena) };
         var rctx = request.RequestContext{};
         const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
         resolveRequest(&ctx, &d, &off, a, &rctx);
@@ -425,7 +426,7 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
     // themselves (as senders.zig does), this helper's contract is just "don't force a query".
     {
         var hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "acc1" }};
-        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = alloc, .headers = &hdrs };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .headers = &hdrs };
         var rctx = request.RequestContext{};
         const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = true };
         resolveRequest(&ctx, &d, &app, a, &rctx);
@@ -436,7 +437,7 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
     // Non-superuser, requested account is an ACTIVE membership -> scope granted.
     {
         var hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "acc1" }};
-        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = alloc, .headers = &hdrs };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .headers = &hdrs };
         var rctx = request.RequestContext{};
         const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
         resolveRequest(&ctx, &d, &app, a, &rctx);
@@ -448,7 +449,7 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
     // scope), never an error surfaced.
     {
         var hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "acc2" }};
-        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = alloc, .headers = &hdrs };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .headers = &hdrs };
         var rctx = request.RequestContext{};
         const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
         resolveRequest(&ctx, &d, &app, a, &rctx);
@@ -457,7 +458,7 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
 
     // No header/cookie at all -> no active scope (unresolved, fail closed).
     {
-        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = alloc };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena) };
         var rctx = request.RequestContext{};
         const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
         resolveRequest(&ctx, &d, &app, a, &rctx);

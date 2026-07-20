@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const App = @import("app.zig").App;
 const db = @import("db.zig");
 const request = @import("request.zig");
@@ -47,7 +48,7 @@ const static_internal_response = http_mod.Response{
 
 pub const Ctx = struct {
     app: *App,
-    arena: std.mem.Allocator,
+    arena: RequestArena,
     rctx: request.RequestContext = .{},
     /// Non-null inside a record hook: the hook's in-transaction connection. When set,
     /// ALL reads and writes use it (acquiring the pool writer here would deadlock).
@@ -238,8 +239,8 @@ pub const Ctx = struct {
     /// typed `App.flag` accessor and by `flagByName`.
     pub fn resolveDeclaredFlag(self: *Ctx, def: features.FlagDef) bool {
         const conn = self.connForRead() catch return def.default;
-        const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena };
-        const key = std.fmt.allocPrint(self.arena, "flag:{s}", .{def.name}) catch return def.default;
+        const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena.a };
+        const key = std.fmt.allocPrint(self.arena.a, "flag:{s}", .{def.name}) catch return def.default;
         const ov = self.readOverride(data, key) catch return def.default;
         const value = features_resolver.resolveFlag(ov, def);
         // Notify-only exposure seam (zero-cost when no .onFeatureExposure handler).
@@ -276,14 +277,14 @@ pub const Ctx = struct {
     /// PERSISTED assignment (reader-first — see `stickyConns`; only a first-time miss
     /// touches the writer). Used by the typed `App.experiment` accessor.
     pub fn resolveDeclaredExperiment(self: *Ctx, def: features.ExperimentDef, subject: []const u8) ![]const u8 {
-        const key = try std.fmt.allocPrint(self.arena, "exp:{s}:weights", .{def.name});
+        const key = try std.fmt.allocPrint(self.arena.a, "exp:{s}:weights", .{def.name});
         const sticky = def.sticky and subject.len > 0;
         const sc: ?features_resolver.StickyConns = if (sticky) try self.stickyConns() else null;
         // The weight-override read uses the sticky read conn when present (else a reader).
         const read_conn = if (sc) |s| s.read else try self.connForRead();
-        const data = Data{ .app = self.app, .conn = read_conn, .io = self.app.io, .alloc = self.arena };
+        const data = Data{ .app = self.app, .conn = read_conn, .io = self.app.io, .alloc = self.arena.a };
         const ov = try self.readOverride(data, key);
-        const variant = try features_resolver.resolveExperiment(self.arena, sc, ov, def, subject);
+        const variant = try features_resolver.resolveExperiment(self.arena.a, sc, ov, def, subject);
         // Notify-only exposure seam, fired on the RESOLVED variant (after the reader-first
         // sticky lookup). Zero-cost when no .onFeatureExposure handler is registered.
         events.dispatchExperimentExposure(self.app, self.app.dispatch, def.name, subject, variant);
@@ -293,7 +294,7 @@ pub const Ctx = struct {
     /// Write a `flag:<name>` override (`"true"`/`"false"`) into `_kv`. Used by the
     /// typed `App.setFlag` accessor (the App-side enum guarantees `name` is declared).
     pub fn writeFlagOverride(self: *Ctx, name: []const u8, enabled: bool) !void {
-        const key = try std.fmt.allocPrint(self.arena, "flag:{s}", .{name});
+        const key = try std.fmt.allocPrint(self.arena.a, "flag:{s}", .{name});
         try self.kv().set(key, if (enabled) "true" else "false");
         // Invalidate the feature-override cache (#230) so the next resolution on THIS
         // instance re-scans and sees the write. Called unconditionally — NOT gated on the
@@ -390,7 +391,7 @@ pub const Ctx = struct {
 
     /// Returns an outbound HTTP client bound to this Ctx's arena and the app's io.
     pub fn http(self: *Ctx) http_client.HttpClient {
-        return .{ .alloc = self.arena, .io = self.app.io };
+        return .{ .alloc = self.arena.a, .io = self.app.io };
     }
 
     /// Returns the outbound-mail namespace (`ctx.mail()`, #141): `send` (synchronous,
@@ -501,7 +502,7 @@ pub const Ctx = struct {
                 return error.CaptchaProviderMismatch;
             }
         }
-        return captcha_mod.verify(provider, self.app.captcha_secret, token, self.arena, self.http());
+        return captcha_mod.verify(provider, self.app.captcha_secret, token, self.arena.a, self.http());
     }
 
     // -----------------------------------------------------------------------
@@ -604,7 +605,7 @@ pub const Ctx = struct {
         const T = @TypeOf(payload);
         // Already-serialized JSON text passes through unchanged.
         if (T == []const u8 or T == []u8) return payload;
-        return std.json.Stringify.valueAlloc(self.arena, payload, .{});
+        return std.json.Stringify.valueAlloc(self.arena.a, payload, .{});
     }
 
     /// Sentinel error type returned by fail/invalid so callers can propagate.
@@ -641,7 +642,7 @@ pub const Ctx = struct {
         // so `catch unreachable` here is a REACHABLE unreachable that panics the server (ReleaseSafe)
         // or is UB (ReleaseFast) on the error path of any request under memory pressure. Fall back to
         // a preallocated static 500 body — no allocation, so it cannot fail.
-        return ae.toResponse(self.arena) catch static_internal_response;
+        return ae.toResponse(self.arena.a) catch static_internal_response;
     }
 
     // -----------------------------------------------------------------------
@@ -662,7 +663,7 @@ pub const Ctx = struct {
     /// handler, hook, job, or cron via the same `*Ctx`. Its own allocation failure is
     /// swallowed (the message falls back to `@errorName(err)`), so it can never throw.
     pub fn reportError(self: *Ctx, err: anyerror, comptime fmt: []const u8, args: anytype) void {
-        const msg = std.fmt.allocPrint(self.arena, fmt, args) catch @errorName(err);
+        const msg = std.fmt.allocPrint(self.arena.a, fmt, args) catch @errorName(err);
         var ev = events.ErrorEvent{
             .app = self.app,
             // Attach the request identity only when there IS a request (route handler);
@@ -691,18 +692,18 @@ pub const Ctx = struct {
     /// Deferred response mutation: queue a cookie to be set on whatever Response this
     /// handler ultimately returns (success OR error). Allocated/owned by the ctx arena.
     pub fn setCookie(self: *Ctx, cookie: http_mod.Cookie) !void {
-        try self.pending_cookies.append(self.arena, cookie);
+        try self.pending_cookies.append(self.arena.a, cookie);
     }
 
     /// Deferred response mutation: queue an extra response header (merged like cookies).
     pub fn addHeader(self: *Ctx, header: http_mod.Header) !void {
-        try self.pending_headers.append(self.arena, header);
+        try self.pending_headers.append(self.arena.a, header);
     }
 
     /// Build a `200`/`status` JSON response by serializing `value` (any std.json-encodable
     /// value, incl. a `std.json.Value`) onto the ctx arena.
     pub fn json(self: *Ctx, status: u16, value: anytype) !http_mod.Response {
-        const body = try std.json.Stringify.valueAlloc(self.arena, value, .{});
+        const body = try std.json.Stringify.valueAlloc(self.arena.a, value, .{});
         return .{ .status = status, .content_type = "application/json", .body = body };
     }
 
@@ -711,8 +712,8 @@ pub const Ctx = struct {
     /// envelope (`ctx.errorResponse`) — use it for machine-readable code-only errors.
     pub fn jsonError(self: *Ctx, status: u16, code: []const u8) !http_mod.Response {
         var obj: std.json.ObjectMap = .empty;
-        try obj.put(self.arena, "error", .{ .string = code });
-        const body = try std.json.Stringify.valueAlloc(self.arena, std.json.Value{ .object = obj }, .{});
+        try obj.put(self.arena.a, "error", .{ .string = code });
+        const body = try std.json.Stringify.valueAlloc(self.arena.a, std.json.Value{ .object = obj }, .{});
         return .{ .status = status, .content_type = "application/json", .body = body };
     }
 
@@ -726,13 +727,13 @@ pub const Ctx = struct {
     /// Build a redirect response (e.g. `302`/`307`) with a `Location` header pointing at
     /// `location`. The header slice is arena-owned.
     pub fn redirect(self: *Ctx, status: u16, location: []const u8) !http_mod.Response {
-        const headers = try self.arena.dupe(http_mod.Header, &.{.{ .name = "Location", .value = location }});
+        const headers = try self.arena.a.dupe(http_mod.Header, &.{.{ .name = "Location", .value = location }});
         return .{ .status = status, .content_type = "text/html; charset=utf-8", .body = "", .extra_headers = headers };
     }
 
     /// Build the canonical `404 Not found.` JSON envelope (a shortcut for the common case).
     pub fn notFound(self: *Ctx) !http_mod.Response {
-        return error_mod.ApiError.notFound().toResponse(self.arena);
+        return error_mod.ApiError.notFound().toResponse(self.arena.a);
     }
 
     /// Constant-time check that the route path param `param` equals `stored` (#139 escape
@@ -755,19 +756,19 @@ pub const Ctx = struct {
     pub fn query(self: *Ctx) !query_params.Params {
         if (self.query_cache) |q| return q;
         const raw = if (self.request) |r| r.query else "";
-        const parsed = try query_params.parse(self.arena, raw);
+        const parsed = try query_params.parse(self.arena.a, raw);
         self.query_cache = parsed;
         return parsed;
     }
 
     /// A random base36 token of `n` chars (`[0-9a-z]`), arena-owned. Wraps `crypto.genToken`.
     pub fn randomToken(self: *Ctx, n: usize) ![]const u8 {
-        return crypto.genToken(self.app.io, self.arena, n);
+        return crypto.genToken(self.app.io, self.arena.a, n);
     }
 
     /// A random lowercase-hex token of `n` chars (`[0-9a-f]`), arena-owned. Wraps `crypto.genHex`.
     pub fn randomHex(self: *Ctx, n: usize) ![]const u8 {
-        return crypto.genHex(self.app.io, self.arena, n);
+        return crypto.genHex(self.app.io, self.arena.a, n);
     }
 
     /// Read-or-mint an opaque per-visitor "subject" id stored in cookie `name` (#137).
@@ -847,7 +848,7 @@ pub const Records = struct {
     ctx: *Ctx,
 
     fn dataRead(self: Records) !Data {
-        return .{ .app = self.ctx.app, .conn = try self.ctx.connForRead(), .io = self.ctx.app.io, .alloc = self.ctx.arena };
+        return .{ .app = self.ctx.app, .conn = try self.ctx.connForRead(), .io = self.ctx.app.io, .alloc = self.ctx.arena.a };
     }
 
     pub fn get(self: Records, collection: []const u8, id: []const u8, opts: GetOptions) !?std.json.Value {
@@ -872,9 +873,9 @@ pub const Records = struct {
         const result = try (try self.dataRead()).list(collection, q);
         if (opts.expand) |spec| if (spec.len > 0) {
             const conn = try self.ctx.connForRead();
-            if (try collections.get(self.ctx.arena, conn, collection)) |col| {
+            if (try collections.get(self.ctx.arena.a, conn, collection)) |col| {
                 // Batch the page through one PageCache (schema parsed once, view decisions memoized).
-                try expand_mod.expandItems(self.ctx.arena, conn, col, result.items, spec, 0, &self.ctx.rctx);
+                try expand_mod.expandItems(self.ctx.arena.a, conn, col, result.items, spec, 0, &self.ctx.rctx);
             }
         };
         return result;
@@ -882,26 +883,26 @@ pub const Records = struct {
 
     pub fn create(self: Records, collection: []const u8, value: std.json.Value) !std.json.Value {
         if (self.ctx.bound_conn) |c|
-            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).create(collection, value);
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).create(collection, value);
         const c = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).create(collection, value);
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).create(collection, value);
     }
 
     pub fn update(self: Records, collection: []const u8, id: []const u8, value: std.json.Value) !?std.json.Value {
         if (self.ctx.bound_conn) |c|
-            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).update(collection, id, value);
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).update(collection, id, value);
         const c = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).update(collection, id, value);
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).update(collection, id, value);
     }
 
     pub fn delete(self: Records, collection: []const u8, id: []const u8) !bool {
         if (self.ctx.bound_conn) |c|
-            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).delete(collection, id);
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).delete(collection, id);
         const c = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).delete(collection, id);
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).delete(collection, id);
     }
 
     // --- Typed record I/O (#238) -------------------------------------------
@@ -915,10 +916,10 @@ pub const Records = struct {
     /// Create a record from an anon-struct literal of writable fields and return it as `T`.
     pub fn createAs(self: Records, comptime T: type, collection: []const u8, input: anytype) !T {
         if (self.ctx.bound_conn) |c|
-            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).createAs(T, collection, input);
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).createAs(T, collection, input);
         const c = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).createAs(T, collection, input);
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).createAs(T, collection, input);
     }
 
     /// Fetch a record by id parsed into `T`, or `null` if the collection/record is missing.
@@ -935,17 +936,17 @@ pub const Records = struct {
     /// type-mapping and NULL contract.
     pub fn queryAs(self: Records, comptime T: type, sql: [:0]const u8, args: anytype) ![]T {
         const conn = if (self.ctx.bound_conn) |c| c else try self.ctx.connForRead();
-        return data_mod.queryAs(T, conn, self.ctx.arena, sql, args);
+        return data_mod.queryAs(T, conn, self.ctx.arena.a, sql, args);
     }
 
     /// Patch a record with an anon-struct literal of the changed fields and return it as `T`
     /// (or `null` if missing).
     pub fn updateAs(self: Records, comptime T: type, collection: []const u8, id: []const u8, patch: anytype) !?T {
         if (self.ctx.bound_conn) |c|
-            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).updateAs(T, collection, id, patch);
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).updateAs(T, collection, id, patch);
         const c = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).updateAs(T, collection, id, patch);
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).updateAs(T, collection, id, patch);
     }
 
     /// Resolve the collection and run expand on `rec` in-place.
@@ -956,8 +957,8 @@ pub const Records = struct {
         const s = spec orelse return;
         if (s.len == 0) return;
         const conn = try self.ctx.connForRead();
-        const col = (try collections.get(self.ctx.arena, conn, collection)) orelse return;
-        try expand_mod.expand(self.ctx.arena, conn, col, rec, s, 0, &self.ctx.rctx);
+        const col = (try collections.get(self.ctx.arena.a, conn, collection)) orelse return;
+        try expand_mod.expand(self.ctx.arena.a, conn, col, rec, s, 0, &self.ctx.rctx);
     }
 };
 
@@ -1000,7 +1001,7 @@ pub const AuthApi = struct {
     ///   return .{ .status = 204, .body = "", .cookies = try ctx.auth().clearSession() };
     pub fn clearSession(self: AuthApi) ![]const http_mod.Cookie {
         const cleared = session.clearedCookies(self.ctx.app.cookie_secure);
-        return self.ctx.arena.dupe(http_mod.Cookie, &cleared);
+        return self.ctx.arena.a.dupe(http_mod.Cookie, &cleared);
     }
 
     /// The current authenticated principal (collection + id), or error.Unauthorized.
@@ -1018,13 +1019,13 @@ pub const AuthApi = struct {
         const u = try self.principal();
         const table = self.ctx.app.session_store == .table;
         if (self.ctx.bound_conn) |c| {
-            _ = try api_auth.bumpTokenEpoch(self.ctx.arena, c, u.collection, u.id);
+            _ = try api_auth.bumpTokenEpoch(self.ctx.arena.a, c, u.collection, u.id);
             if (table) try api_auth.deleteSessionsForPrincipal(c, u.collection, u.id);
             return;
         }
         const w = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
+        _ = try api_auth.bumpTokenEpoch(self.ctx.arena.a, w, u.collection, u.id);
         if (table) try api_auth.deleteSessionsForPrincipal(w, u.collection, u.id);
     }
 
@@ -1040,9 +1041,9 @@ pub const AuthApi = struct {
         if (self.ctx.bound_conn) |c| {
             // Carry the old row's `created` forward (session-start time) onto the new row,
             // whose `lastSeen` is set to now by issue() — see carrySessionCreated.
-            const old_created = if (table and cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, c, cur) else null;
+            const old_created = if (table and cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena.a, c, cur) else null;
             const issued = try auth_helpers.issueSession(req, c, u.collection, u.id);
-            if (table) try api_auth.carrySessionCreated(self.ctx.arena, c, issued.token, old_created);
+            if (table) try api_auth.carrySessionCreated(self.ctx.arena.a, c, issued.token, old_created);
             return issued;
         }
         const w = self.ctx.app.pool.acquireWriter();
@@ -1053,9 +1054,9 @@ pub const AuthApi = struct {
         if (!table) return auth_helpers.issueSession(req, w, u.collection, u.id);
         try w.beginImmediate();
         errdefer w.rollback() catch {};
-        const old_created = if (cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, w, cur) else null;
+        const old_created = if (cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena.a, w, cur) else null;
         const issued = try auth_helpers.issueSession(req, w, u.collection, u.id);
-        try api_auth.carrySessionCreated(self.ctx.arena, w, issued.token, old_created);
+        try api_auth.carrySessionCreated(self.ctx.arena.a, w, issued.token, old_created);
         w.commit() catch |e| {
             w.rollback() catch {};
             return e;
@@ -1073,10 +1074,10 @@ pub const AuthApi = struct {
         const table = self.ctx.app.session_store == .table;
         const cur = self.ctx.rctx.session_id;
         if (self.ctx.bound_conn) |c| {
-            _ = try api_auth.bumpTokenEpoch(self.ctx.arena, c, u.collection, u.id);
-            const old_created = if (table and cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, c, cur) else null;
+            _ = try api_auth.bumpTokenEpoch(self.ctx.arena.a, c, u.collection, u.id);
+            const old_created = if (table and cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena.a, c, cur) else null;
             const issued = try auth_helpers.issueSession(req, c, u.collection, u.id);
-            if (table) try api_auth.carrySessionCreated(self.ctx.arena, c, issued.token, old_created);
+            if (table) try api_auth.carrySessionCreated(self.ctx.arena.a, c, issued.token, old_created);
             return issued;
         }
         const w = self.ctx.app.pool.acquireWriter();
@@ -1086,15 +1087,15 @@ pub const AuthApi = struct {
         // bump + delete-old + insert-new (in issue) into ONE transaction so a mid-way failure
         // never leaves the device's row deleted without a replacement (silent logout).
         if (!table) {
-            _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
+            _ = try api_auth.bumpTokenEpoch(self.ctx.arena.a, w, u.collection, u.id);
             return auth_helpers.issueSession(req, w, u.collection, u.id);
         }
         try w.beginImmediate();
         errdefer w.rollback() catch {};
-        _ = try api_auth.bumpTokenEpoch(self.ctx.arena, w, u.collection, u.id);
-        const old_created = if (cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena, w, cur) else null;
+        _ = try api_auth.bumpTokenEpoch(self.ctx.arena.a, w, u.collection, u.id);
+        const old_created = if (cur.len > 0) try api_auth.deleteSessionReturningCreated(self.ctx.arena.a, w, cur) else null;
         const issued = try auth_helpers.issueSession(req, w, u.collection, u.id);
-        try api_auth.carrySessionCreated(self.ctx.arena, w, issued.token, old_created);
+        try api_auth.carrySessionCreated(self.ctx.arena.a, w, issued.token, old_created);
         w.commit() catch |e| {
             w.rollback() catch {};
             return e;
@@ -1110,9 +1111,9 @@ pub const AuthApi = struct {
         if (self.ctx.app.session_store != .table) return error.SessionStoreNotEnabled;
         const u = try self.principal();
         const conn = if (self.ctx.bound_conn) |c| c else try self.ctx.connForRead();
-        const rows = try api_auth.listSessions(self.ctx.arena, conn, u.collection, u.id);
+        const rows = try api_auth.listSessions(self.ctx.arena.a, conn, u.collection, u.id);
         const cur = self.ctx.rctx.session_id;
-        const out = try self.ctx.arena.alloc(Session, rows.len);
+        const out = try self.ctx.arena.a.alloc(Session, rows.len);
         for (rows, 0..) |row, i| out[i] = .{
             .id = row.id,
             .created = row.created,
@@ -1142,7 +1143,7 @@ pub const AuthApi = struct {
     /// A non-owner is given the SAME `error.NotFound` as a missing row — collapsing the
     /// owner-mismatch and absent-row cases so revoke can't probe other users' session ids.
     fn revokeOn(self: AuthApi, conn: *db.Db, u: Ctx.User, session_id: []const u8) !void {
-        const owner = (try api_auth.sessionOwner(self.ctx.arena, conn, session_id)) orelse return error.NotFound;
+        const owner = (try api_auth.sessionOwner(self.ctx.arena.a, conn, session_id)) orelse return error.NotFound;
         const is_owner = std.mem.eql(u8, owner.collection, u.collection) and std.mem.eql(u8, owner.record, u.id);
         if (!u.is_superuser and !is_owner) return error.NotFound; // indistinguishable from absent
         _ = try api_auth.deleteSession(conn, session_id);
@@ -1157,26 +1158,26 @@ pub const KeyValue = struct {
 
     /// Fetch `key`'s value, or null if absent. Result lives on the ctx arena.
     pub fn get(self: KeyValue, key: []const u8) !?[]const u8 {
-        const data = Data{ .app = self.ctx.app, .conn = try self.ctx.connForRead(), .io = self.ctx.app.io, .alloc = self.ctx.arena };
+        const data = Data{ .app = self.ctx.app, .conn = try self.ctx.connForRead(), .io = self.ctx.app.io, .alloc = self.ctx.arena.a };
         return data.kvGet(key);
     }
 
     /// Upsert `key`→`value` (preserves `created`).
     pub fn set(self: KeyValue, key: []const u8, value: []const u8) !void {
         if (self.ctx.bound_conn) |c|
-            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).kvSet(key, value);
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).kvSet(key, value);
         const c = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).kvSet(key, value);
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).kvSet(key, value);
     }
 
     /// Delete `key`. Returns whether a row existed.
     pub fn delete(self: KeyValue, key: []const u8) !bool {
         if (self.ctx.bound_conn) |c|
-            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).kvDelete(key);
+            return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).kvDelete(key);
         const c = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena }).kvDelete(key);
+        return (Data{ .app = self.ctx.app, .conn = c, .io = self.ctx.app.io, .alloc = self.ctx.arena.a }).kvDelete(key);
     }
 };
 
@@ -1194,20 +1195,20 @@ pub const FlagsApi = struct {
         // scan reads on `sc.read`, and a `.sticky` experiment returns its PERSISTED
         // variant (only a first-time miss briefly borrows the writer).
         const sc = try self.ctx.stickyConns();
-        const data = Data{ .app = self.ctx.app, .conn = sc.read, .io = self.ctx.app.io, .alloc = self.ctx.arena };
+        const data = Data{ .app = self.ctx.app, .conn = sc.read, .io = self.ctx.app.io, .alloc = self.ctx.arena.a };
         // Serve the `flag:*`/`exp:*` override set from the feature cache (#230) on the
         // pooled-reader path; a BOUND (in-tx) read or a cache scan error falls back to a
         // direct scan (byte-identical to the pre-cache path). The snapshot is held only
         // long enough to copy the pairs onto the ctx arena, then released.
         const pairs = try self.overridePairs(data);
-        return features_resolver.resolveAll(self.ctx.arena, reg.*, pairs, subject, sc);
+        return features_resolver.resolveAll(self.ctx.arena.a, reg.*, pairs, subject, sc);
     }
 
     /// Build the `flag:*`/`exp:*` override pairs for `resolveAll`, from the feature cache
     /// when available (pooled-reader path), else a direct `_kv` scan. Copies key/value onto
     /// the ctx arena so the result outlives any released snapshot.
     fn overridePairs(self: FlagsApi, data: Data) ![]features_resolver.KvPair {
-        return feature_cache.overridePairs(self.ctx.arena, self.ctx.app.io, self.ctx.app.feature_cache, self.ctx.bound_conn != null, data);
+        return feature_cache.overridePairs(self.ctx.arena.a, self.ctx.app.io, self.ctx.app.feature_cache, self.ctx.bound_conn != null, data);
     }
 };
 
@@ -1261,7 +1262,7 @@ pub const MailApi = struct {
     /// / `error.EmptyBody` on a bad message, `error.SenderNotVerified` / `error.RecipientSuppressed`
     /// when send-time enforcement is on (#154), or a backend failure.
     pub fn send(self: MailApi, msg: Message) !void {
-        return mail_send.send(self.ctx.app, self.ctx.arena, self.withScope(msg));
+        return mail_send.send(self.ctx.app, self.ctx.arena.a, self.withScope(msg));
     }
 
     /// Validate `msg`, then enqueue it as a background `"mail"` job on `opts.queue`.
@@ -1313,7 +1314,7 @@ pub const MailApi = struct {
             defer self.ctx.app.pool.releaseWriter();
             break :blk try queue_durable.enqueue(w, io, q, "mail", payload, run_at);
         };
-        return self.ctx.arena.dupe(u8, &jid);
+        return self.ctx.arena.a.dupe(u8, &jid);
     }
 
     /// Cancel a still-pending scheduled job by the id `deliverAt` returned. True when
@@ -1337,10 +1338,10 @@ pub const MailApi = struct {
     pub fn sendBulk(self: MailApi, b: BulkSend) ![]const u8 {
         const account = b.account orelse self.ctx.rctx.account_id; // withScope parity: explicit wins
         const reg = queue_mod.registryFromApp(self.ctx.app) orelse return error.QueuesUnavailable;
-        if (self.ctx.bound_conn) |c| return mail_bulk.sendBulk(self.ctx.app, self.ctx.arena, reg, c, false, b, account);
+        if (self.ctx.bound_conn) |c| return mail_bulk.sendBulk(self.ctx.app, self.ctx.arena.a, reg, c, false, b, account);
         const w = self.ctx.app.pool.acquireWriter();
         defer self.ctx.app.pool.releaseWriter();
-        return mail_bulk.sendBulk(self.ctx.app, self.ctx.arena, reg, w, true, b, account);
+        return mail_bulk.sendBulk(self.ctx.app, self.ctx.arena.a, reg, w, true, b, account);
     }
 
     /// Cancel every still-pending recipient of a batch (idempotent; stray queued item
@@ -1354,7 +1355,7 @@ pub const MailApi = struct {
 
     /// The durable per-recipient send-report, aggregated.
     pub fn batchStatus(self: MailApi, batch_id: []const u8) !BatchReport {
-        return mail_bulk.batchStatus(self.ctx.app, self.ctx.arena, batch_id);
+        return mail_bulk.batchStatus(self.ctx.app, self.ctx.arena.a, batch_id);
     }
 
     /// Escape hatch for hand-rolled list mail: the signed one-click unsubscribe URL for
@@ -1363,7 +1364,7 @@ pub const MailApi = struct {
     pub fn unsubscribeUrl(self: MailApi, account: []const u8, list: []const u8, recipient: []const u8) ![]const u8 {
         const base = self.ctx.app.mail.unsubscribe_base_url;
         if (base.len == 0) return error.UnsubscribeNotConfigured;
-        return mail_unsubscribe.buildUrl(self.ctx.arena, base, self.ctx.app.jwt_secret, account, list, recipient);
+        return mail_unsubscribe.buildUrl(self.ctx.arena.a, base, self.ctx.app.jwt_secret, account, list, recipient);
     }
 };
 
@@ -1395,7 +1396,7 @@ pub const SmsApi = struct {
     /// none is wired). Errors: `error.InvalidPhoneNumber` / `error.EmptyBody` on a bad message, or a
     /// backend failure.
     pub fn send(self: SmsApi, msg: Message) !void {
-        return sms_send.send(self.ctx.app, self.ctx.arena, msg);
+        return sms_send.send(self.ctx.app, self.ctx.arena.a, msg);
     }
 
     /// Normalize `msg`, then enqueue it as a background `"sms"` job on `opts.queue`. Normalizing
@@ -1404,7 +1405,7 @@ pub const SmsApi = struct {
     /// (without one the "sms" kind is not compiled in and this fails with `error.UnknownJobKind`)
     /// and a wired queue registry (`error.QueuesUnavailable` otherwise).
     pub fn enqueue(self: SmsApi, msg: Message, opts: EnqueueOpts) !void {
-        const normalized = try sms_send.normalize(self.ctx.arena, msg, self.ctx.app.sms.default_region);
+        const normalized = try sms_send.normalize(self.ctx.arena.a, msg, self.ctx.app.sms.default_region);
         // Explicit per-call queue wins; otherwise the configured `.sms.queue` default.
         const queue = opts.queue orelse self.ctx.app.sms.queue;
         return self.ctx.enqueueByName(queue, "sms", normalized);
@@ -1448,7 +1449,7 @@ pub const RealtimeApi = struct {
     /// unordered) via a random-token side table — never payload bytes on the NOTIFY wire — so
     /// every instance's subscribers of `topic` receive it. On SQLite it is delivered in-process.
     pub fn broadcast(self: RealtimeApi, topic: []const u8, payload: anytype) !void {
-        const data_json = try std.json.Stringify.valueAlloc(self.ctx.arena, payload, .{});
+        const data_json = try std.json.Stringify.valueAlloc(self.ctx.arena.a, payload, .{});
         // Thread `bound_conn` through: if this Ctx is already bound to the writer (a record
         // hook, or inside `ctx.tx`), the Postgres side-table write MUST reuse it rather than
         // acquire a second writer — the pool writer is a single non-reentrant lock.
@@ -1468,7 +1469,7 @@ pub const Tx = struct {
     /// The transaction's request/invocation arena — use this to allocate values you
     /// put into records inside the callback.
     pub fn arena(self: *Tx) std.mem.Allocator {
-        return self.inner.arena;
+        return self.inner.arena.a;
     }
 };
 
@@ -1589,7 +1590,7 @@ test "ctx.setAppData/appData round-trips a typed app-scoped handle (#245)" {
     defer env.deinit();
     const AppData = struct { count: u32, label: []const u8 };
     var data = AppData{ .count = 7, .label = "hello" };
-    var cx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer cx.deinit();
 
     try cx.setAppData(AppData, &data);
@@ -1616,7 +1617,7 @@ test "ctx.setAppData is single-set: a second call errors (#245)" {
     const AppData = struct { n: u8 };
     var first = AppData{ .n = 1 };
     var second = AppData{ .n = 2 };
-    var cx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer cx.deinit();
 
     try cx.setAppData(AppData, &first);
@@ -1637,11 +1638,11 @@ test "App defaults app_context to null when unset — construct is unaffected (#
 test "ctx.user() reflects the resolved auth identity; anonymous is null" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var anon = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var anon = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer anon.deinit();
     try std.testing.expect(anon.user() == null);
     // A superuser rctx yields a User with is_superuser=true.
-    var su = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{ .is_superuser = true } };
+    var su = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{ .is_superuser = true } };
     defer su.deinit();
     try std.testing.expect(su.user().?.is_superuser);
     // An authed rctx with a collection forwards the collection name.
@@ -1650,7 +1651,7 @@ test "ctx.user() reflects the resolved auth identity; anonymous is null" {
     defer auth_obj.deinit(std.testing.allocator);
     var authed = Ctx{
         .app = &env.app,
-        .arena = env.arena.allocator(),
+        .arena = RequestArena.from(&env.arena),
         .rctx = .{ .auth = .{ .object = auth_obj }, .is_superuser = false, .collection = "users" },
     };
     defer authed.deinit();
@@ -1663,8 +1664,7 @@ test "ctx.user() reflects the resolved auth identity; anonymous is null" {
 test "#86 ctx.auth().clearSession returns arena cookies matching the framework's logout policy" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
-    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     const cookies = try ctx.auth().clearSession();
@@ -1710,7 +1710,7 @@ test "ctx.records.list returns created rows; get fetches one by id" {
         break :blk try a.dupe(u8, c1.object.get("id").?.string);
     };
 
-    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     const page = try ctx.records().list("posts", .{ .sort = "title" });
@@ -1746,7 +1746,7 @@ test "ctx.records() allocates results on the ctx arena, not app.allocator (no GP
     env.app.allocator = std.testing.allocator;
 
     var job_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    var ctx = Ctx{ .app = &env.app, .arena = job_arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&job_arena), .rctx = .{}, .request = null, .bound_conn = null };
     {
         defer ctx.deinit(); // releases the pooled reader first
         const page = try ctx.records().list("posts", .{ .sort = "title" });
@@ -1766,7 +1766,7 @@ test "Ctx(bound) uses the bound connection and never acquires from the pool" {
 
     var ctx = Ctx{
         .app = &env.app,
-        .arena = env.arena.allocator(),
+        .arena = RequestArena.from(&env.arena),
         .rctx = .{},
         .bound_conn = w,
         .reader = null,
@@ -1784,7 +1784,7 @@ test "ctx.records create/update/delete round-trips and releases the writer" {
     defer env.deinit();
     const a = env.arena.allocator();
 
-    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     var o: std.json.ObjectMap = .empty;
@@ -1808,7 +1808,7 @@ test "ctx.records create/update/delete round-trips and releases the writer" {
 test "ctx.kv set/get round-trips; delete removes" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     try std.testing.expect((try ctx.kv().get("k")) == null);
@@ -1838,7 +1838,7 @@ test "ctx flags: declared default returned when unset; override wins; flagByName
     const env = try CtxTestEnv.init();
     defer env.deinit();
     env.app.features = &flag_test_registry;
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     // Unset declared flag → declared default.
@@ -1866,7 +1866,7 @@ test "#230 ctx feature cache: setFlag is instantly visible; flagByName/resolveAl
     var cache = feature_cache.FeatureOverrideCache.init(std.testing.allocator);
     defer cache.deinit();
     env.app.feature_cache = &cache; // install the cache on the pooled-reader path
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     // Cache-served defaults (byte-identical to the direct-read path).
@@ -1897,7 +1897,7 @@ test "#230 ctx feature cache: setFlag inside ctx.tx is visible after commit (pos
     var cache = feature_cache.FeatureOverrideCache.init(std.testing.allocator);
     defer cache.deinit();
     env.app.feature_cache = &cache;
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     // Warm the cache (snapshot published) so a stale entry would otherwise mask the write.
@@ -1912,7 +1912,7 @@ test "ctx.flags().resolveAll returns all declared flags + experiments via the ba
     const env = try CtxTestEnv.init();
     defer env.deinit();
     env.app.features = &flag_test_registry;
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     // One flag override in _kv; everything else falls back to declared defaults.
@@ -1966,7 +1966,7 @@ test "feature exposure hook fires on flag read + experiment resolve; zero-cost w
     H.flag_calls = 0;
     H.exp_calls = 0;
 
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     // Zero-cost path: no dispatch wired -> resolving must NOT invoke any handler.
@@ -2022,7 +2022,7 @@ test "ctx.setFlag works inside ctx.tx (bound_conn path)" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
     env.app.features = &flag_test_registry;
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     try ctx.tx(void, txnSetFlag);
@@ -2034,7 +2034,7 @@ test "#129 ctx sticky experiment persists + survives a weight change (writer pat
     const env = try CtxTestEnv.init();
     defer env.deinit();
     env.app.features = &flag_test_registry;
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     const sticky_def = features.ExperimentDef{
@@ -2065,7 +2065,7 @@ test "#129 ctx sticky experiment persists + survives a weight change (writer pat
 test "ctx.http() returns a client bound to the ctx arena and io" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     const client = ctx.http();
     // Assert the client is bound to the app's io (same userdata pointer).
@@ -2074,13 +2074,13 @@ test "ctx.http() returns a client bound to the ctx arena and io" {
     const client2 = ctx.http();
     try std.testing.expect(client.alloc.ptr == client2.alloc.ptr);
     // Assert the allocator pointer matches the ctx's arena allocator.
-    try std.testing.expect(client.alloc.ptr == ctx.arena.ptr);
+    try std.testing.expect(client.alloc.ptr == ctx.arena.a.ptr);
 }
 
 test "errorResponse maps known errors to status codes, unknown to 500" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     try std.testing.expectEqual(@as(u16, 404), ctx.errorResponse(error.NotFound).status);
@@ -2117,7 +2117,7 @@ test "ctx.records expand nests the related record under \"expand\"" {
         break :blk try a.dupe(u8, post.object.get("id").?.string);
     };
 
-    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     const post = (try ctx.records().get("posts", post_id, .{ .expand = "author" })).?;
@@ -2146,7 +2146,7 @@ test "ctx.records list expand nests the related record under \"expand\" for each
         }
     }
 
-    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     const page = try ctx.records().list("posts", .{ .expand = "author" });
@@ -2170,8 +2170,7 @@ fn txnTwoInserts(t: *Tx) anyerror!void {
 test "ctx.tx commits all writes atomically" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
-    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     try ctx.tx(void, txnTwoInserts);
@@ -2196,7 +2195,7 @@ fn txnNested(t: *Tx) anyerror!void {
 test "ctx.tx rolls back on error and rejects nesting" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     try std.testing.expectError(error.Boom, ctx.tx(void, txnInsertThenFail));
@@ -2218,7 +2217,7 @@ fn txnInsertFromPayload(t: *Tx, payload: *const TxWithPayload) anyerror!void {
 test "#237 ctx.txWith threads a payload into the callback; the write commits and is readable" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     const payload = TxWithPayload{ .title = "from-payload" };
@@ -2240,7 +2239,7 @@ fn txnInsertFromPayloadThenFail(t: *Tx, payload: *const TxWithPayload) anyerror!
 test "#237 ctx.txWith rolls back on error; the payload-sourced write is not visible" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     const payload = TxWithPayload{ .title = "doomed" };
@@ -2256,7 +2255,7 @@ fn txnWithNested(t: *Tx, payload: *const TxWithPayload) anyerror!void {
 test "#237 ctx.txWith rejects nesting" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     const payload = TxWithPayload{ .title = "x" };
@@ -2270,7 +2269,7 @@ test "#237 ctx.txWith rejects nesting" {
 test "#138 ctx response builders: shapes + content-types" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     // json: serialized body + application/json.
@@ -2307,7 +2306,7 @@ test "#138 ctx response builders: shapes + content-types" {
 test "#138 ctx.setCookie/addHeader accumulate on the Ctx" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     try ctx.setCookie(.{ .name = "a", .value = "1" });
@@ -2322,9 +2321,8 @@ test "#138 ctx.setCookie/addHeader accumulate on the Ctx" {
 test "#138 ctx.query() lazily decodes (+ and %XX) and caches" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
-    var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .query = "q=a+b&pct=%41&n=2" };
-    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &req };
+    var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&env.arena), .query = "q=a+b&pct=%41&n=2" };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{}, .request = &req };
     defer ctx.deinit();
 
     const q = try ctx.query();
@@ -2338,7 +2336,7 @@ test "#138 ctx.query() lazily decodes (+ and %XX) and caches" {
     try std.testing.expect(q.pairs.ptr == q2.pairs.ptr);
 
     // No request -> empty params, no error.
-    var jobctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    var jobctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer jobctx.deinit();
     try std.testing.expect((try jobctx.query()).get("q") == null);
 }
@@ -2346,7 +2344,7 @@ test "#138 ctx.query() lazily decodes (+ and %XX) and caches" {
 test "#138 ctx.randomToken length + base36 charset; randomHex hex charset" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     const t = try ctx.randomToken(24);
@@ -2361,12 +2359,11 @@ test "#138 ctx.randomToken length + base36 charset; randomHex hex charset" {
 test "#137 ctx.subjectCookie mints once, is idempotent, and reads back an existing value" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
 
     // Mint path: no incoming cookie -> a fresh id + exactly one queued Set-Cookie.
     {
-        var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = a };
-        var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &req };
+        var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&env.arena) };
+        var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{}, .request = &req };
         defer ctx.deinit();
 
         const id1 = try ctx.subjectCookie("sid", .{});
@@ -2388,8 +2385,8 @@ test "#137 ctx.subjectCookie mints once, is idempotent, and reads back an existi
 
     // Read-back path: a well-formed incoming cookie wins (no mint, no Set-Cookie).
     {
-        var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .cookie_header = "sid=abc123xyz" };
-        var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &req };
+        var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&env.arena), .cookie_header = "sid=abc123xyz" };
+        var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{}, .request = &req };
         defer ctx.deinit();
         const id = try ctx.subjectCookie("sid", .{});
         try std.testing.expectEqualStrings("abc123xyz", id);
@@ -2398,8 +2395,8 @@ test "#137 ctx.subjectCookie mints once, is idempotent, and reads back an existi
 
     // Malformed incoming value (contains a space) -> re-mint.
     {
-        var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .cookie_header = "sid=bad value" };
-        var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &req };
+        var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&env.arena), .cookie_header = "sid=bad value" };
+        var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{}, .request = &req };
         defer ctx.deinit();
         const id = try ctx.subjectCookie("sid", .{});
         try std.testing.expectEqual(Ctx.subject_token_len, id.len);
@@ -2410,11 +2407,10 @@ test "#137 ctx.subjectCookie mints once, is idempotent, and reads back an existi
 test "#139 ctx.verifyPathSecret constant-time path param check" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
 
     const params = [_]http_mod.Param{.{ .key = "token", .value = "s3cr3t" }};
-    var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .params = &params };
-    var ctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &req };
+    var req = http_mod.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&env.arena), .params = &params };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{}, .request = &req };
     defer ctx.deinit();
 
     // Correct secret matches; wrong secret and empty stored fail.
@@ -2424,7 +2420,7 @@ test "#139 ctx.verifyPathSecret constant-time path param check" {
     try std.testing.expect(!ctx.verifyPathSecret("missing", "s3cr3t")); // absent param
 
     // No request context -> false (no panic).
-    var jobctx = Ctx{ .app = &env.app, .arena = a, .rctx = .{} };
+    var jobctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer jobctx.deinit();
     try std.testing.expect(!jobctx.verifyPathSecret("token", "s3cr3t"));
 }
@@ -2459,7 +2455,7 @@ test "ctx.enqueue durable round-trips: serializes payload into a _queue_jobs row
     };
     env.app.queues = @ptrCast(&reg);
 
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     try ctx.enqueue(.default, .echo, .{ .n = 7 });
 
@@ -2488,7 +2484,7 @@ test "ctx.enqueue memory round-trips: runs the handler on the bounded pool" {
     var pool = queue_memory.Pool.init(&app);
     pool.install(&app);
 
-    var ctx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &app, .arena = RequestArena.from(&arena), .rctx = .{} };
     defer ctx.deinit();
     try ctx.enqueueByName("default", "echo", .{ .v = "hi" });
 
@@ -2500,7 +2496,7 @@ test "ctx.enqueue memory round-trips: runs the handler on the bounded pool" {
 test "ctx.enqueue errors on unknown queue / kind / no registry" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     // No registry wired.
     try std.testing.expectError(error.QueuesUnavailable, ctx.enqueueByName("default", "echo", .{}));
@@ -2539,7 +2535,7 @@ test "#141 ctx.mail().send delivers via the mailer and is captured by testcaptur
     defer testcapture.mail.reset();
     testcapture.mail.enable(true); // capture + suppress real delivery
 
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     try ctx.mail().send(.{
         .to = "user@example.com",
@@ -2558,7 +2554,7 @@ test "#141 ctx.mail().send delivers via the mailer and is captured by testcaptur
 test "#141 ctx.mail().send rejects a malformed address / header injection up front" {
     const env = try CtxTestEnv.init();
     defer env.deinit();
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     try std.testing.expectError(error.InvalidAddress, ctx.mail().send(.{ .to = "not-an-email", .subject = "s", .text = "b" }));
     try std.testing.expectError(error.HeaderInjection, ctx.mail().send(.{ .to = "u@x.io\r\nBcc: e@evil.io", .subject = "s", .text = "b" }));
@@ -2569,7 +2565,7 @@ test "ctx.mail().unsubscribeUrl builds a token that verifies to (account, list, 
     const env = try CtxTestEnv.init();
     defer env.deinit();
     env.app.jwt_secret = "s";
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     try std.testing.expectError(error.UnsubscribeNotConfigured, ctx.mail().unsubscribeUrl("acc1", "news", "u@x.io"));
@@ -2594,7 +2590,7 @@ test "#141 ctx.mail().enqueue durable round-trips into a _queue_jobs 'mail' row"
     };
     env.app.queues = @ptrCast(&reg);
 
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     try ctx.mail().enqueue(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{});
 
@@ -2617,7 +2613,7 @@ test "#141 ctx.mail().enqueue validates before enqueueing (bad address never per
         .jobs = &.{mail_job_reg},
     };
     env.app.queues = @ptrCast(&reg);
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     try std.testing.expectError(error.InvalidAddress, ctx.mail().enqueue(.{ .to = "bad", .subject = "s", .text = "b" }, .{}));
 
@@ -2648,7 +2644,7 @@ test "#141 ctx.mail().enqueue memory round-trips: built-in handler delivers + is
     defer testcapture.mail.reset();
     testcapture.mail.enable(true);
 
-    var ctx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &app, .arena = RequestArena.from(&arena), .rctx = .{} };
     defer ctx.deinit();
     try ctx.mail().enqueue(.{ .to = "queued@example.com", .subject = "Async", .text = "later" }, .{});
 
@@ -2670,7 +2666,7 @@ test "ctx.mail().deliverAt on a durable queue returns the job id + persists run_
     };
     env.app.queues = @ptrCast(&reg);
 
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     const now = clock.nowUnix(env.app.io);
     const jid = try ctx.mail().deliverAt(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{ .at = now + 3600 });
@@ -2695,7 +2691,7 @@ test "ctx.mail().deliverAt requires a durable queue and rejects a conflicting sc
     };
     env.app.queues = @ptrCast(&reg);
 
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     try std.testing.expectError(error.ScheduleRequiresDurable, ctx.mail().deliverAt(
         .{ .to = "user@example.com", .subject = "Hi", .text = "body" },
@@ -2716,7 +2712,7 @@ test "ctx.mail().cancel: pending -> true, then already-canceled -> false" {
     };
     env.app.queues = @ptrCast(&reg);
 
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     const now = clock.nowUnix(env.app.io);
     const jid = try ctx.mail().deliverAt(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{ .at = now + 3600 });
@@ -2733,7 +2729,7 @@ test "ctx.mail().enqueue with .delay_s schedules a future run_at" {
     };
     env.app.queues = @ptrCast(&reg);
 
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
     const now = clock.nowUnix(env.app.io);
     try ctx.mail().enqueue(.{ .to = "user@example.com", .subject = "Hi", .text = "body" }, .{ .delay_s = 60 });
@@ -2755,7 +2751,7 @@ test "#140 ctx.verifyCaptcha dev-bypass: empty captcha_secret returns ok=true wi
     defer env.deinit();
     // Default app has captcha_secret = "" (dev-bypass active).
     try std.testing.expectEqualStrings("", env.app.captcha_secret);
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     // All four providers bypass when secret is empty — no network, no error.
@@ -2783,7 +2779,7 @@ test "#140 ctx.verifyCaptcha with mock: uses app.captcha_secret and forwards to 
     const env = try CtxTestEnv.init();
     defer env.deinit();
     env.app.captcha_secret = "my-server-secret";
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     const r = try ctx.verifyCaptcha(.recaptcha_v3, "user-token");
@@ -2810,7 +2806,7 @@ test "#140 ctx.verifyCaptcha network error propagates (fails-closed by default)"
     const env = try CtxTestEnv.init();
     defer env.deinit();
     env.app.captcha_secret = "real-secret";
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     // Network failure propagates — handler can catch and decide fail-open vs fail-closed.
@@ -2823,7 +2819,7 @@ test "#140 ctx.verifyCaptcha errors on a provider that differs from the configur
     // Both a secret AND a provider are configured: a mismatched call must fail fast.
     env.app.captcha_secret = "real-secret";
     env.app.captcha_provider = .recaptcha_v3;
-    var ctx = Ctx{ .app = &env.app, .arena = env.arena.allocator(), .rctx = .{} };
+    var ctx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
     defer ctx.deinit();
 
     try std.testing.expectError(error.CaptchaProviderMismatch, ctx.verifyCaptcha(.hcaptcha, "token"));
@@ -2837,7 +2833,7 @@ test "#140 ctx.verifyCaptcha errors on a provider that differs from the configur
 test "#143 ctx.realtime(): signal + broadcast serialize and are safe no-ops when the reactor is inactive" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = .{} };
+    var cx = Ctx{ .app = undefined, .arena = RequestArena.from(&arena), .rctx = .{} };
     cx.realtime().signal("availability");
     // Serialization happens at the call site; the publish itself is a no-op (inactive reactor).
     try cx.realtime().broadcast("orders", .{ .kind = "order.shipped", .id = "r1" });
@@ -2892,7 +2888,7 @@ test "#244 ctx.reportError routes through dispatchError to the reporter tagged .
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cx = Ctx{ .app = &app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+    var cx = Ctx{ .app = &app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = null, .bound_conn = null };
     defer cx.deinit();
 
     cx.reportError(error.WidgetExploded, "widget {d} failed: {s}", .{ 7, "overheat" });
@@ -2914,7 +2910,7 @@ test "#244 ctx.reportError never fails even on a pathological/failing arena (fal
 
     // A failing arena makes the message allocPrint fail; reportError must swallow it and
     // fall back to @errorName(err) rather than propagate — it returns void and cannot throw.
-    var cx = Ctx{ .app = &app, .arena = std.testing.failing_allocator, .rctx = .{}, .request = null, .bound_conn = null };
+    var cx = Ctx{ .app = &app, .arena = RequestArena.forTest(std.testing.failing_allocator), .rctx = .{}, .request = null, .bound_conn = null };
     defer cx.deinit();
 
     cx.reportError(error.Boom, "this needs {d} allocation(s)", .{42});

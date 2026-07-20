@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const db = @import("db.zig");
 const schema = @import("schema.zig");
 const crypto = @import("crypto.zig");
@@ -495,7 +496,7 @@ test "authenticate resolves a valid bearer token to its record" {
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
     const key = crypto.deriveKey(app.jwt_secret, "tk-secret");
     const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token}) };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token}) };
     const authed = (try authenticate(app.io, a, &app, &ctx, &d)) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings("users", authed.collection);
     try std.testing.expectEqual(false, authed.is_superuser);
@@ -520,7 +521,7 @@ test "authenticate rejects a token signed with the wrong key (returns null)" {
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
     const wrong = crypto.deriveKey(app.jwt_secret, "different-key");
     const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &wrong);
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token}) };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token}) };
     try std.testing.expect((try authenticate(app.io, a, &app, &ctx, &d)) == null);
 }
 
@@ -542,13 +543,13 @@ test "authenticate requires CSRF on the cookie + unsafe-method path" {
     const key = crypto.deriveKey(app.jwt_secret, "tk-secret");
     const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .csrf = "csrf-abc", .iat = 0, .exp = 9999999999 }, &key);
     const cookie_hdr = try std.fmt.allocPrint(a, "zb_auth={s}", .{token});
-    var bad = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .cookie_header = cookie_hdr };
+    var bad = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&arena), .cookie_header = cookie_hdr };
     try std.testing.expect((try authenticate(app.io, a, &app, &bad, &d)) == null);
-    var mismatch = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .cookie_header = cookie_hdr, .csrf_token = "csrf-WRONG" };
+    var mismatch = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&arena), .cookie_header = cookie_hdr, .csrf_token = "csrf-WRONG" };
     try std.testing.expect((try authenticate(app.io, a, &app, &mismatch, &d)) == null);
-    var ok = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .cookie_header = cookie_hdr, .csrf_token = "csrf-abc" };
+    var ok = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&arena), .cookie_header = cookie_hdr, .csrf_token = "csrf-abc" };
     try std.testing.expect((try authenticate(app.io, a, &app, &ok, &d)) != null);
-    var get = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .cookie_header = cookie_hdr };
+    var get = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .cookie_header = cookie_hdr };
     try std.testing.expect((try authenticate(app.io, a, &app, &get, &d)) != null);
 }
 

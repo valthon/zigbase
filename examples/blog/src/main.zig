@@ -28,9 +28,11 @@ const std = @import("std");
 const zigbase = @import("zigbase");
 
 /// before_create on "posts": derive a URL slug from the title if one isn't set.
-/// NOTE: record mutations MUST allocate with `ev.arena` (the request-scoped
-/// allocator that owns `ev.record`) — mixing allocators on the arena-backed
-/// JSON map is undefined behavior. Need the app itself? Use `ctx.app`.
+/// NOTE: record mutations MUST allocate with `ev.arena.a` — `ev.arena` is a typed
+/// `RequestArena` (so a general-purpose allocator can't be passed in by accident) and
+/// `.a` is the request-scoped `std.mem.Allocator` inside it, the one that owns
+/// `ev.record`. Mixing allocators on the arena-backed JSON map is undefined behavior.
+/// Need the app itself? Use `ctx.app`.
 fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     _ = ctx;
     if (ev.record.* != .object) return; // framework already guards this; defensive
@@ -43,7 +45,7 @@ fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     // Build a clean slug: lowercase alphanumerics, collapse every run of
     // non-alphanumerics into a single '-', and trim leading/trailing dashes.
     // "Hello, World!" -> "hello-world". Output is never longer than the title.
-    const buf = try ev.arena.alloc(u8, title.len);
+    const buf = try ev.arena.a.alloc(u8, title.len);
     var len: usize = 0;
     var in_run = false; // true while we're inside a run of alphanumerics
     for (title) |ch| {
@@ -62,7 +64,7 @@ fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     // Trim a trailing '-' left by a run of non-alphanumerics at the end.
     if (len > 0 and buf[len - 1] == '-') len -= 1;
 
-    try ev.record.object.put(ev.arena, "slug", .{ .string = buf[0..len] });
+    try ev.record.object.put(ev.arena.a, "slug", .{ .string = buf[0..len] });
 }
 
 /// Stamp the author field from the authenticated identity.
@@ -71,8 +73,8 @@ fn setAuthor(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     if (ev.record.* != .object) return;
     if (ev.rctx.auth) |auth| if (auth == .object) {
         if (auth.object.get("id")) |idv| if (idv == .string) {
-            const uid = try ev.arena.dupe(u8, idv.string);
-            try ev.record.object.put(ev.arena, "author", .{ .string = uid });
+            const uid = try ev.arena.a.dupe(u8, idv.string);
+            try ev.record.object.put(ev.arena.a, "author", .{ .string = uid });
         };
     };
 }
@@ -100,8 +102,8 @@ fn computeReadingTime(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void
     // what reads return (see docs/fields.md and src/values.zig readValue), so we write one here
     // for symmetry. A raw JSON integer is also accepted on write (values.zig bindValue binds it
     // directly), so binding `minutes` straight would work too.
-    const rt = try std.fmt.allocPrint(ev.arena, "{d}", .{minutes});
-    try ev.record.object.put(ev.arena, "reading_time", .{ .string = rt });
+    const rt = try std.fmt.allocPrint(ev.arena.a, "{d}", .{minutes});
+    try ev.record.object.put(ev.arena.a, "reading_time", .{ .string = rt });
 }
 
 /// before_create chain for posts: slugify -> setAuthor -> computeReadingTime.
@@ -145,7 +147,7 @@ fn getPostBySlug(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 
     // Read through the per-request capability object — `req.ctx.records()` manages
     // the pooled connection itself (no manual acquireReader / Data wiring).
-    const filter = std.fmt.allocPrint(req.ctx.arena, "slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
+    const filter = std.fmt.allocPrint(req.ctx.arena.a, "slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
     const result = req.ctx.records().list("posts", .{ .filter = filter, .perPage = 1 }) catch return error.RouteFailed;
     if (result.items.len == 0) return error.NotFound;
     return result.items[0];

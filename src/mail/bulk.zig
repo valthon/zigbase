@@ -19,6 +19,7 @@
 //! and the suppression check, exactly like `send()`.
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const db = @import("../db.zig");
 const id_gen = @import("../id.zig");
 const clock = @import("../clock.zig");
@@ -297,7 +298,7 @@ fn markStatus(app: *App, rcpt_id: []const u8, status: []const u8, last_error: []
 /// see the file doc comment. Registered beside the `"mail"` kind in framework.zig.
 pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
     const app = ctx.app;
-    const parsed = try std.json.parseFromSlice(ItemPayload, ctx.arena, payload, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(ItemPayload, ctx.arena.a, payload, .{ .ignore_unknown_fields = true });
     const p = parsed.value;
 
     // 1. Load recipient + batch. Anything already resolved → SUCCESS no-op (dedup).
@@ -314,8 +315,8 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
         try st.bindText(2, p.to);
         if (!try st.step()) return; // row gone — nothing to deliver
         if (!std.mem.eql(u8, st.columnText(1), "pending")) return; // at-least-once dedup
-        rcpt_id = try ctx.arena.dupe(u8, st.columnText(0));
-        vars_json = try ctx.arena.dupe(u8, st.columnText(2));
+        rcpt_id = try ctx.arena.a.dupe(u8, st.columnText(0));
+        vars_json = try ctx.arena.a.dupe(u8, st.columnText(2));
         rcpt_attempts = st.columnInt(3);
 
         var bst = try rd.prepare(
@@ -326,15 +327,15 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
         try bst.bindText(1, p.batch);
         if (!try bst.step()) return; // orphaned job — no-op
         batch = .{
-            .account = try ctx.arena.dupe(u8, bst.columnText(0)),
-            .list = try ctx.arena.dupe(u8, bst.columnText(1)),
-            .queue = try ctx.arena.dupe(u8, bst.columnText(2)),
-            .from_addr = try ctx.arena.dupe(u8, bst.columnText(3)),
-            .reply_to = try ctx.arena.dupe(u8, bst.columnText(4)),
-            .subject_tpl = try ctx.arena.dupe(u8, bst.columnText(5)),
-            .text_tpl = try ctx.arena.dupe(u8, bst.columnText(6)),
-            .html_tpl = try ctx.arena.dupe(u8, bst.columnText(7)),
-            .status = try ctx.arena.dupe(u8, bst.columnText(8)),
+            .account = try ctx.arena.a.dupe(u8, bst.columnText(0)),
+            .list = try ctx.arena.a.dupe(u8, bst.columnText(1)),
+            .queue = try ctx.arena.a.dupe(u8, bst.columnText(2)),
+            .from_addr = try ctx.arena.a.dupe(u8, bst.columnText(3)),
+            .reply_to = try ctx.arena.a.dupe(u8, bst.columnText(4)),
+            .subject_tpl = try ctx.arena.a.dupe(u8, bst.columnText(5)),
+            .text_tpl = try ctx.arena.a.dupe(u8, bst.columnText(6)),
+            .html_tpl = try ctx.arena.a.dupe(u8, bst.columnText(7)),
+            .status = try ctx.arena.a.dupe(u8, bst.columnText(8)),
         };
     }
     if (std.mem.eql(u8, batch.status, "canceled")) return; // canceled batches drain as no-ops
@@ -342,20 +343,20 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
     // 2. Per-recipient render — HTML part escaped by default (renderHtml), subject/
     //    text via renderText. A render failure is hopeless across retries (same vars
     //    every time) → status 'invalid', job SUCCESS (never burn the queue on it).
-    const vars = varsFromJson(ctx.arena, vars_json) catch {
+    const vars = varsFromJson(ctx.arena.a, vars_json) catch {
         return markStatus(app, rcpt_id, "invalid", "BadVarsJson");
     };
-    const subject = template.renderText(ctx.arena, batch.subject_tpl, vars, &.{}) catch |e| {
+    const subject = template.renderText(ctx.arena.a, batch.subject_tpl, vars, &.{}) catch |e| {
         return markStatus(app, rcpt_id, "invalid", @errorName(e));
     };
     const text: ?[]const u8 = if (batch.text_tpl.len > 0)
-        template.renderText(ctx.arena, batch.text_tpl, vars, &.{}) catch |e| {
+        template.renderText(ctx.arena.a, batch.text_tpl, vars, &.{}) catch |e| {
             return markStatus(app, rcpt_id, "invalid", @errorName(e));
         }
     else
         null;
     const html: ?[]const u8 = if (batch.html_tpl.len > 0)
-        template.renderHtml(ctx.arena, batch.html_tpl, vars, &.{}) catch |e| {
+        template.renderHtml(ctx.arena.a, batch.html_tpl, vars, &.{}) catch |e| {
             return markStatus(app, rcpt_id, "invalid", @errorName(e));
         }
     else
@@ -366,7 +367,7 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
     {
         var rd = try app.pool.acquireReader();
         defer app.pool.releaseReader(&rd);
-        if (try suppression.isSuppressed(ctx.arena, &rd, batch.account, p.to, .list)) {
+        if (try suppression.isSuppressed(ctx.arena.a, &rd, batch.account, p.to, .list)) {
             return markStatus(app, rcpt_id, "suppressed", "");
         }
     }
@@ -376,7 +377,7 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
     // RFC 8058 headers ride ONLY list mail, and only when the feature is configured.
     // Emitted even when batch.list == "" (the token just carries an empty list).
     const list_unsub: ?[]const u8 = if (app.mail.unsubscribe_base_url.len > 0)
-        try unsubscribe.buildUrl(ctx.arena, app.mail.unsubscribe_base_url, app.jwt_secret, batch.account, batch.list, p.to)
+        try unsubscribe.buildUrl(ctx.arena.a, app.mail.unsubscribe_base_url, app.jwt_secret, batch.account, batch.list, p.to)
     else
         null;
     const msg = mail_send.MailMessage{
@@ -389,7 +390,7 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
         .account = if (batch.account.len > 0) batch.account else null,
         .list_unsubscribe = list_unsub,
     };
-    mail_send.send(app, ctx.arena, msg) catch |e| switch (e) {
+    mail_send.send(app, ctx.arena.a, msg) catch |e| switch (e) {
         error.RecipientSuppressed => return markStatus(app, rcpt_id, "suppressed", @errorName(e)),
         // Validation outcomes are hopeless across retries (vars/templates won't change).
         error.InvalidAddress, error.HeaderInjection, error.EmptyBody, error.SenderNotVerified => {
@@ -701,7 +702,7 @@ test "jobHandler wires the RFC 8058 List-Unsubscribe URL when configured (round-
     {
         var job_arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer job_arena.deinit();
-        var cx = Ctx{ .app = &env.app, .arena = job_arena.allocator(), .rctx = .{} };
+        var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&job_arena), .rctx = .{} };
         defer cx.deinit();
         try jobHandler(&cx, payload);
     }
@@ -730,7 +731,7 @@ test "jobHandler wires the RFC 8058 List-Unsubscribe URL when configured (round-
     {
         var job_arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer job_arena.deinit();
-        var cx = Ctx{ .app = &env.app, .arena = job_arena.allocator(), .rctx = .{} };
+        var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&job_arena), .rctx = .{} };
         defer cx.deinit();
         try jobHandler(&cx, payload2);
     }
@@ -768,14 +769,14 @@ test "jobHandler is idempotent by row status: same payload twice sends once" {
     {
         var job_arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer job_arena.deinit();
-        var cx = Ctx{ .app = &env.app, .arena = job_arena.allocator(), .rctx = .{} };
+        var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&job_arena), .rctx = .{} };
         defer cx.deinit();
         try jobHandler(&cx, payload);
     }
     {
         var job_arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer job_arena.deinit();
-        var cx = Ctx{ .app = &env.app, .arena = job_arena.allocator(), .rctx = .{} };
+        var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&job_arena), .rctx = .{} };
         defer cx.deinit();
         try jobHandler(&cx, payload); // redelivery — must be a no-op
     }

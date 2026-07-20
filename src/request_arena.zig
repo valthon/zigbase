@@ -17,17 +17,35 @@ pub const RequestArena = struct {
     /// stashing `.a` beyond the request lifetime is the one misuse the type cannot stop.
     a: std.mem.Allocator,
 
-    /// Constructible ONLY from a real arena, at the boundary that owns and deinits it.
-    /// Taking the concrete `*ArenaAllocator` (not an `Allocator`) means a GPA can't flow
-    /// in ACCIDENTALLY through the signature. Zig has no private fields, so a deliberate
-    /// `RequestArena{ .a = some_gpa }` struct literal still compiles — that bypass is not
-    /// prevented, only made greppable and high-friction instead of the default path.
+    /// The production constructor: build from a real arena, at the boundary that owns and
+    /// deinits it. Taking the concrete `*ArenaAllocator` (not an `Allocator`) means a GPA
+    /// can't flow in ACCIDENTALLY through the signature. Zig has no private fields, so a
+    /// deliberate `RequestArena{ .a = some_gpa }` struct literal still compiles — that
+    /// bypass is not prevented, only made greppable and high-friction instead of the
+    /// default path. The one sanctioned non-arena construction is `forTest` below, which
+    /// exists to preserve leak detection in tests and is a review defect anywhere else.
     pub fn from(arena: *std.heap.ArenaAllocator) RequestArena {
         return .{ .a = arena.allocator() };
     }
+
+    /// Install a NON-arena allocator for a test. This exists so a test can keep using
+    /// `std.testing.allocator`, whose leak detection is STRICTLY STRONGER than an arena's:
+    /// an arena frees everything at deinit, so a handler that leaks looks identical to one
+    /// that does not. Wrapping such a test in a real arena to satisfy the type would delete
+    /// that detection -- the exact masking the ownership work removed (see NO_SLOP.md 2.2a).
+    ///
+    /// Correctness note: code under a `RequestArena` must be correct under ANY allocator,
+    /// because contract-1 helpers reached via `.a` are. So running a handler on a GPA is a
+    /// valid, and harsher, execution -- it additionally requires the handler not to leak.
+    ///
+    /// Test-only by convention, not by compiler enforcement; `forTest` in production code
+    /// is a review defect and greppable as one.
+    pub fn forTest(gpa: std.mem.Allocator) RequestArena {
+        return .{ .a = gpa };
+    }
 };
 
-test "RequestArena is constructible only from a real arena and exposes .a" {
+test "RequestArena.from builds from a real arena and exposes .a" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 

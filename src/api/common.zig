@@ -11,7 +11,7 @@ const http = @import("../http.zig");
 /// Parse the request body as a JSON object, or null when it is absent / malformed / not an
 /// object. The parsed value is owned by `ctx.allocator` (the request arena).
 pub fn parseBody(ctx: *http.RequestCtx) ?std.json.Value {
-    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator.a, ctx.body, .{}) catch return null;
     if (parsed.value != .object) return null;
     return parsed.value;
 }
@@ -28,5 +28,5 @@ pub fn strField(obj: std.json.Value, key: []const u8) ?[]const u8 {
 /// A JSON response with an explicit status + cookies; the body is stringified onto
 /// `ctx.allocator`.
 pub fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value, cookies: []const http.Cookie) !http.Response {
-    return .{ .status = status, .body = try std.json.Stringify.valueAlloc(ctx.allocator, v, .{}), .cookies = cookies };
+    return .{ .status = status, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, v, .{}), .cookies = cookies };
 }

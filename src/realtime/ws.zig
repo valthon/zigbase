@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const zap = @import("zap");
 const fio = zap.fio;
 const App = @import("../app.zig").App;
@@ -207,7 +208,7 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
             WS.write(handle, try protocol.authFrame(fa, ok), true) catch {};
         },
         .subscribe => |m| {
-            switch (hub.subscribeCheck(lc.app, &lc.conn, fa, m.topic)) {
+            switch (hub.subscribeCheck(lc.app, &lc.conn, RequestArena.from(&lc.frame), m.topic)) {
                 .limit => {
                     WS.write(handle, try protocol.errorFrame(fa, "subscription limit reached"), true) catch {};
                     return;

@@ -16,6 +16,7 @@
 //! terminal (there is no point retrying a corrupt key).
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const encrypt = @import("encrypt.zig");
 const vapid = @import("vapid.zig");
 const config = @import("config.zig");
@@ -103,22 +104,22 @@ pub fn deliver(ctx: *Ctx, cfg: config.Runtime, sub: PushSubscription, msg: PushM
     io.random(&salt);
 
     // (3) Build + encrypt the payload (RFC 8291 aes128gcm).
-    const payload = try buildPayload(a, msg);
-    const body = encrypt.encrypt(a, io, payload, ua_public, auth_secret, as_public, as_private, salt) catch |e| switch (e) {
+    const payload = try buildPayload(a.a, msg);
+    const body = encrypt.encrypt(a.a, io, payload, ua_public, auth_secret, as_public, as_private, salt) catch |e| switch (e) {
         error.InvalidPublicKey => return error.InvalidSubscriptionKey,
         error.OutOfMemory => return error.OutOfMemory,
     };
 
     // (4) VAPID Authorization header (RFC 8292 ES256 JWT + raw key).
     const now = clock.nowUnix(io);
-    const auth_header = vapid.vapidAuthHeader(a, io, originOf(sub.endpoint), cfg.subject, cfg.vapid_public, cfg.vapid_private, now, now + jwt_ttl_s) catch return error.InvalidSubscriptionKey;
+    const auth_header = vapid.vapidAuthHeader(a.a, io, originOf(sub.endpoint), cfg.subject, cfg.vapid_public, cfg.vapid_private, now, now + jwt_ttl_s) catch return error.InvalidSubscriptionKey;
 
     // (5) POST. A transport error is transient → `.failed`.
     var headers: std.ArrayList(http_client.Header) = .empty;
-    try headers.append(a, .{ .name = "TTL", .value = try std.fmt.allocPrint(a, "{d}", .{msg.ttl_s}) });
-    try headers.append(a, .{ .name = "Content-Encoding", .value = "aes128gcm" });
-    try headers.append(a, .{ .name = "Content-Type", .value = "application/octet-stream" });
-    try headers.append(a, .{ .name = "Authorization", .value = auth_header });
+    try headers.append(a.a, .{ .name = "TTL", .value = try std.fmt.allocPrint(a.a, "{d}", .{msg.ttl_s}) });
+    try headers.append(a.a, .{ .name = "Content-Encoding", .value = "aes128gcm" });
+    try headers.append(a.a, .{ .name = "Content-Type", .value = "application/octet-stream" });
+    try headers.append(a.a, .{ .name = "Authorization", .value = auth_header });
 
     const res = ctx.http().request(.{
         .method = .POST,
@@ -193,7 +194,7 @@ const TestEnv = struct {
         };
     }
     fn ctx(self: *TestEnv) Ctx {
-        return Ctx{ .app = &self.app, .arena = self.arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        return Ctx{ .app = &self.app, .arena = RequestArena.from(&self.arena), .rctx = .{}, .request = null, .bound_conn = null };
     }
     fn deinit(self: *TestEnv) void {
         self.arena.deinit();

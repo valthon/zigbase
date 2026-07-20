@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const rules = @import("../rules.zig");
@@ -56,7 +57,7 @@ pub fn subscribeDecision(col: ?schema.Collection, authed: bool, is_superuser: bo
 /// `__features` behavior). A configured predicate gates private channels: returning false
 /// denies. The predicate receives a lightweight `Ctx` carrying the socket's resolved identity
 /// (`ctx.user()` / `ctx.rctx`); it may acquire its own reader for richer checks.
-pub fn canSubscribeTopic(app: *App, arena: std.mem.Allocator, rctx: request.RequestContext, topic: []const u8) bool {
+pub fn canSubscribeTopic(app: *App, arena: RequestArena, rctx: request.RequestContext, topic: []const u8) bool {
     const d = app.dispatch orelse return true;
     const predicate = d.realtime_can_subscribe orelse return true;
     var cx = Ctx{ .app = app, .arena = arena, .rctx = rctx };
@@ -162,7 +163,7 @@ pub fn cloneMemberships(alloc: std.mem.Allocator, src: []const request.Membershi
 /// collection topic ALWAYS uses per-collection authz; the canSubscribe predicate gates ONLY
 /// non-collection custom topics). Pure decision — the caller performs the transport-side
 /// subscription + reply. `alloc` is per-call scratch (the collection lookup borrows it).
-pub fn subscribeCheck(app: *App, conn: *const Conn, alloc: std.mem.Allocator, topic: []const u8) SubscribeOutcome {
+pub fn subscribeCheck(app: *App, conn: *const Conn, alloc: RequestArena, topic: []const u8) SubscribeOutcome {
     // #3: a re-subscribe to an already-held topic is a REPLACE (the transports take the
     // `Conn.updateFilter` path) — it reuses the existing subscription slot and never grows
     // `subs.count()`, so it must not trip the cap. Only a genuinely NEW topic counts against
@@ -175,7 +176,7 @@ pub fn subscribeCheck(app: *App, conn: *const Conn, alloc: std.mem.Allocator, to
     var r = app.pool.acquireReader() catch return .unknown;
     const now = auth.nowUnixPub(&r) catch 0;
     const rctx = conn.requestContext(now);
-    const lookup = collections.get(alloc, &r, t.collection) catch {
+    const lookup = collections.get(alloc.a, &r, t.collection) catch {
         app.pool.releaseReader(&r);
         return .unknown;
     };
@@ -925,16 +926,15 @@ test "subscribeDecision: collection topics ALWAYS use collection authz, custom t
 test "canSubscribeTopic: default allows any custom topic (public signal channel) (#143)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     var app: App = undefined;
     const anon = request.RequestContext{};
     // No dispatch wired (tests/CLI): custom topics default to PUBLIC signal channels.
     app.dispatch = null;
-    try std.testing.expect(canSubscribeTopic(&app, a, anon, "availability"));
+    try std.testing.expect(canSubscribeTopic(&app, RequestArena.from(&arena), anon, "availability"));
     // Dispatch present but NO predicate -> still public by default.
     var d = @import("../events.zig").Dispatch{};
     app.dispatch = &d;
-    try std.testing.expect(canSubscribeTopic(&app, a, anon, "orders"));
+    try std.testing.expect(canSubscribeTopic(&app, RequestArena.from(&arena), anon, "orders"));
 }
 
 test "canSubscribeTopic: a canSubscribe guard returning false denies (#143)" {
@@ -956,14 +956,14 @@ test "canSubscribeTopic: a canSubscribe guard returning false denies (#143)" {
     var d = @import("../events.zig").Dispatch{ .realtime_can_subscribe = Guard.deny };
     app.dispatch = &d;
     const anon = request.RequestContext{};
-    try std.testing.expect(!canSubscribeTopic(&app, a, anon, "private"));
+    try std.testing.expect(!canSubscribeTopic(&app, RequestArena.from(&arena), anon, "private"));
     // A guard gating on auth: anonymous denied, authenticated allowed.
     d.realtime_can_subscribe = Guard.onlyAuthed;
-    try std.testing.expect(!canSubscribeTopic(&app, a, anon, "private"));
+    try std.testing.expect(!canSubscribeTopic(&app, RequestArena.from(&arena), anon, "private"));
     var rec: std.json.ObjectMap = .empty;
     try rec.put(a, "id", .{ .string = "u1" });
     const authed = request.RequestContext{ .auth = .{ .object = rec }, .is_superuser = false };
-    try std.testing.expect(canSubscribeTopic(&app, a, authed, "private"));
+    try std.testing.expect(canSubscribeTopic(&app, RequestArena.from(&arena), authed, "private"));
 }
 
 const PoolEnv = struct {
@@ -1023,13 +1023,13 @@ test "subscribeCheck decision table: limit / __features / unknown / auth_require
 
     var anon = Conn{};
     // __features: always ok, even anonymous, even at any sub count below the cap.
-    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeCheck(&app, &anon, a, FEATURES_CHANNEL));
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeCheck(&app, &anon, RequestArena.from(&arena), FEATURES_CHANNEL));
     // @public collection: anonymous ok.
-    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeCheck(&app, &anon, a, "pub_posts"));
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeCheck(&app, &anon, RequestArena.from(&arena), "pub_posts"));
     // locked collection: anonymous rejected.
-    try std.testing.expectEqual(SubscribeOutcome.auth_required, subscribeCheck(&app, &anon, a, "locked_posts"));
+    try std.testing.expectEqual(SubscribeOutcome.auth_required, subscribeCheck(&app, &anon, RequestArena.from(&arena), "locked_posts"));
     // non-collection custom topic: default-allowed (public signal channel, #143).
-    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeCheck(&app, &anon, a, "availability"));
+    try std.testing.expectEqual(SubscribeOutcome.ok, subscribeCheck(&app, &anon, RequestArena.from(&arena), "availability"));
     // MAX_SUBS: a conn at the cap is rejected BEFORE any lookup.
     var full = Conn{};
     var i: usize = 0;
@@ -1037,7 +1037,7 @@ test "subscribeCheck decision table: limit / __features / unknown / auth_require
         const topic = try std.fmt.allocPrint(a, "t{d}", .{i});
         try full.addSub(a, topic, null);
     }
-    try std.testing.expectEqual(SubscribeOutcome.limit, subscribeCheck(&app, &full, a, "one_more"));
+    try std.testing.expectEqual(SubscribeOutcome.limit, subscribeCheck(&app, &full, RequestArena.from(&arena), "one_more"));
 }
 
 test "cloneJson / cloneMemberships: deep copy is independent of the source arena (#11)" {

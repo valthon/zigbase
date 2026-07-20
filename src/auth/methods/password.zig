@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../../request_arena.zig").RequestArena;
 const method_mod = @import("../method.zig");
 const AuthMethod = method_mod.AuthMethod;
 const AuthCtx = method_mod.AuthCtx;
@@ -41,7 +42,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
     _ = @as(*PasswordMethod, @ptrCast(@alignCast(ctx)));
 
     // Parse JSON body
-    const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch {
+    const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator.a, ac.ctx.body, .{}) catch {
         return Resolution{ .fail = .{ .status = 400, .message = "identity and password are required." } };
     };
     if (parsed.value != .object) {
@@ -63,18 +64,18 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
 
     // Lookup identity
     const rid = (try ac.findByIdentity(&r.conn, identity)) orelse {
-        crypto.dummyVerify(ac.app.io, ac.ctx.allocator);
+        crypto.dummyVerify(ac.app.io, ac.ctx.allocator.a);
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid credentials." } };
     };
 
     // Fetch the password hash
-    const phc = (try api_auth.passwordHashFor(ac.ctx.allocator, &r.conn, ac.collection.name, rid)) orelse {
-        crypto.dummyVerify(ac.app.io, ac.ctx.allocator);
+    const phc = (try api_auth.passwordHashFor(ac.ctx.allocator.a, &r.conn, ac.collection.name, rid)) orelse {
+        crypto.dummyVerify(ac.app.io, ac.ctx.allocator.a);
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid credentials." } };
     };
 
     // Verify password
-    if (!crypto.verifyPassword(ac.app.io, ac.ctx.allocator, phc, password)) {
+    if (!crypto.verifyPassword(ac.app.io, ac.ctx.allocator.a, phc, password)) {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid credentials." } };
     }
 
@@ -112,7 +113,7 @@ test "PasswordMethod: correct password resolves to record id, wrong password is 
     };
 
     // --- correct password ---
-    var req_ok = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &[_]http.Param{});
+    var req_ok = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &[_]http.Param{});
     var ac_ok = AuthCtx{
         .app = &env.app,
         .ctx = &req_ok,
@@ -132,7 +133,7 @@ test "PasswordMethod: correct password resolves to record id, wrong password is 
     }
 
     // --- wrong password ---
-    var req_bad = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"wrongwrong\"}", &[_]http.Param{});
+    var req_bad = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"wrongwrong\"}", &[_]http.Param{});
     var ac_bad = AuthCtx{
         .app = &env.app,
         .ctx = &req_bad,
@@ -164,7 +165,7 @@ test "PasswordMethod: missing identity/password fields returns .fail 400" {
         break :blk (try collections.get(a, w, "members2")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -201,7 +202,7 @@ test "PasswordMethod: unknown identity returns .fail 400 (timing defense)" {
         break :blk (try collections.get(a, w, "members3")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"identity\":\"nobody@x.io\",\"password\":\"longenough\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"nobody@x.io\",\"password\":\"longenough\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,

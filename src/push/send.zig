@@ -12,6 +12,7 @@
 //! the triggering request: a dead/failing push is the tri-state, not an error.
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const sender = @import("sender.zig");
 const capture = @import("capture.zig");
 const Ctx = @import("../ctx.zig").Ctx;
@@ -81,7 +82,7 @@ pub const PushApi = struct {
 /// An un-decodable subscription key is terminal (logged, no retry). When push is not
 /// configured the handler is a network-free no-op (completes).
 pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
-    const job = std.json.parseFromSliceLeaky(PushJob, ctx.arena, payload, .{ .ignore_unknown_fields = true }) catch {
+    const job = std.json.parseFromSliceLeaky(PushJob, ctx.arena.a, payload, .{ .ignore_unknown_fields = true }) catch {
         // A malformed payload is a programmer error, not a transient failure — drop it (no
         // retry). `warn`, not `err`: `std.log.err` on a path a passing test exercises fails
         // Zig's test runner (see the same note in ctx.enqueueByName / events.zig).
@@ -131,7 +132,7 @@ const JobEnv = struct {
         };
     }
     fn ctx(self: *JobEnv) Ctx {
-        return Ctx{ .app = &self.app, .arena = self.arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        return Ctx{ .app = &self.app, .arena = RequestArena.from(&self.arena), .rctx = .{}, .request = null, .bound_conn = null };
     }
     fn deinit(self: *JobEnv) void {
         self.arena.deinit();

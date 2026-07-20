@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 
 const App = @import("app.zig").App;
 const request = @import("request.zig");
@@ -115,7 +116,7 @@ pub const RecordEvent = struct {
     /// Request-scoped allocator that owns `record`'s JSON storage. Hooks MUST use
     /// this for any allocation that becomes part of `record`. (The old `ev.app`
     /// escape to the WRONG allocator was removed — use `ctx.app` for app access.)
-    arena: std.mem.Allocator,
+    arena: RequestArena,
     collection: []const u8,
     record: *std.json.Value, // mutable in before_*; the persisted record in after_*
     phase: RecordPhase,
@@ -1076,7 +1077,7 @@ test "auth lifecycle dispatcher fires only the matching phase; mutation sticks" 
 
     var rec: std.json.Value = .{ .object = .empty };
     defer rec.object.deinit(std.testing.allocator);
-    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    var ctx = Ctx{ .app = undefined, .arena = RequestArena.forTest(std.testing.allocator), .rctx = .{}, .bound_conn = null };
     defer ctx.deinit();
 
     var ev = AuthLifecycleEvent{ .app = undefined, .collection = "users", .record_id = "", .phase = .before_register, .record = &rec };
@@ -1104,7 +1105,7 @@ test "auth lifecycle before-hook error propagates (abort signal)" {
         }
     };
     const dispatch = buildAuthLifecycleDispatcher(.{ .beforeRegister = H.boom });
-    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    var ctx = Ctx{ .app = undefined, .arena = RequestArena.forTest(std.testing.allocator), .rctx = .{}, .bound_conn = null };
     defer ctx.deinit();
     var ev = AuthLifecycleEvent{ .app = undefined, .collection = "users", .record_id = "", .phase = .before_register, .record = null };
     try std.testing.expectError(error.RegisterRejected, dispatch(&ctx, &ev));
@@ -1144,8 +1145,8 @@ test "record dispatcher fires wildcard then specific, in order, and mutations st
     defer obj.deinit(std.testing.allocator);
     try obj.put(std.testing.allocator, "touched", .{ .bool = false });
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .rctx = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
-    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    var ev = RecordEvent{ .rctx = undefined, .arena = RequestArena.forTest(std.testing.allocator), .collection = "posts", .record = &rec, .phase = .before_create };
+    var ctx = Ctx{ .app = undefined, .arena = RequestArena.forTest(std.testing.allocator), .rctx = .{}, .bound_conn = null };
     defer ctx.deinit();
 
     try dispatch(&ctx, &ev);
@@ -1168,8 +1169,8 @@ test "before hook error aborts (propagates) and unrelated collection is skipped"
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .rctx = undefined, .arena = std.testing.allocator, .collection = "comments", .record = &rec, .phase = .before_create };
-    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    var ev = RecordEvent{ .rctx = undefined, .arena = RequestArena.forTest(std.testing.allocator), .collection = "comments", .record = &rec, .phase = .before_create };
+    var ctx = Ctx{ .app = undefined, .arena = RequestArena.forTest(std.testing.allocator), .rctx = .{}, .bound_conn = null };
     defer ctx.deinit();
     try dispatch(&ctx, &ev); // "comments" not registered -> no-op, no error
 
@@ -1364,8 +1365,8 @@ test "only the matching phase's handler runs" {
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     var rec: std.json.Value = .{ .object = obj };
-    var ev = RecordEvent{ .rctx = undefined, .arena = std.testing.allocator, .collection = "posts", .record = &rec, .phase = .before_create };
-    var ctx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .bound_conn = null };
+    var ev = RecordEvent{ .rctx = undefined, .arena = RequestArena.forTest(std.testing.allocator), .collection = "posts", .record = &rec, .phase = .before_create };
+    var ctx = Ctx{ .app = undefined, .arena = RequestArena.forTest(std.testing.allocator), .rctx = .{}, .bound_conn = null };
     defer ctx.deinit();
     try dispatch(&ctx, &ev); // before_create fired, but only afterCreate is registered -> no call
     try std.testing.expectEqual(@as(usize, 0), H.after_calls);
@@ -1729,7 +1730,7 @@ test "job Ctx writes then reads a committed record and releases the conn on dein
     defer env.deinit();
     const a = env.arena.allocator();
 
-    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = null, .bound_conn = null };
+    var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{}, .request = null, .bound_conn = null };
     defer cx.deinit();
 
     var obj: std.json.ObjectMap = .empty;

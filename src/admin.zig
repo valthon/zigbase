@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const http = @import("http.zig");
 const serve_file = @import("files/serve_file.zig");
 
@@ -81,32 +82,32 @@ pub fn serve(ctx: *http.RequestCtx) http.Response {
 }
 
 test "serve returns index.html for the root and unknown spa paths" {
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/_/", .allocator = std.testing.allocator };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/_/", .allocator = RequestArena.forTest(std.testing.allocator) };
     const r = serve(&ctx);
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expectEqualStrings("text/html", r.content_type);
     try std.testing.expect(std.mem.indexOf(u8, r.body, "<div id=\"app\">") != null);
-    var deep = http.RequestCtx{ .method = .GET, .path = "/_/collections/posts/records", .allocator = std.testing.allocator };
+    var deep = http.RequestCtx{ .method = .GET, .path = "/_/collections/posts/records", .allocator = RequestArena.forTest(std.testing.allocator) };
     try std.testing.expectEqualStrings("text/html", serve(&deep).content_type);
 }
 
 test "serve returns assets with correct content types + nosniff" {
-    var js = http.RequestCtx{ .method = .GET, .path = "/_/assets/app.js", .allocator = std.testing.allocator };
+    var js = http.RequestCtx{ .method = .GET, .path = "/_/assets/app.js", .allocator = RequestArena.forTest(std.testing.allocator) };
     const rjs = serve(&js);
     try std.testing.expectEqualStrings("application/javascript", rjs.content_type);
     try std.testing.expect(rjs.extra_headers.len == 2 and std.mem.eql(u8, rjs.extra_headers[1].name, "X-Content-Type-Options"));
-    var css = http.RequestCtx{ .method = .GET, .path = "/_/assets/style.css", .allocator = std.testing.allocator };
+    var css = http.RequestCtx{ .method = .GET, .path = "/_/assets/style.css", .allocator = RequestArena.forTest(std.testing.allocator) };
     try std.testing.expectEqualStrings("text/css", serve(&css).content_type);
-    var pj = http.RequestCtx{ .method = .GET, .path = "/_/assets/preact.js", .allocator = std.testing.allocator };
+    var pj = http.RequestCtx{ .method = .GET, .path = "/_/assets/preact.js", .allocator = RequestArena.forTest(std.testing.allocator) };
     try std.testing.expectEqualStrings("application/javascript", serve(&pj).content_type);
-    var ed = http.RequestCtx{ .method = .GET, .path = "/_/assets/lib/editor.js", .allocator = std.testing.allocator };
+    var ed = http.RequestCtx{ .method = .GET, .path = "/_/assets/lib/editor.js", .allocator = RequestArena.forTest(std.testing.allocator) };
     try std.testing.expectEqualStrings("application/javascript", serve(&ed).content_type);
-    var unknown = http.RequestCtx{ .method = .GET, .path = "/_/assets/nope.js", .allocator = std.testing.allocator };
+    var unknown = http.RequestCtx{ .method = .GET, .path = "/_/assets/nope.js", .allocator = RequestArena.forTest(std.testing.allocator) };
     try std.testing.expectEqual(@as(u16, 404), serve(&unknown).status);
 }
 
 test "admin assets carry a build-time ETag and answer If-None-Match with 304" {
-    var first = http.RequestCtx{ .method = .GET, .path = "/_/assets/app.js", .allocator = std.testing.allocator };
+    var first = http.RequestCtx{ .method = .GET, .path = "/_/assets/app.js", .allocator = RequestArena.forTest(std.testing.allocator) };
     const r = serve(&first);
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expectEqualStrings("ETag", r.extra_headers[0].name);
@@ -114,31 +115,31 @@ test "admin assets carry a build-time ETag and answer If-None-Match with 304" {
     try std.testing.expectEqual(@as(usize, 10), etag.len); // "xxxxxxxx" quoted
     try std.testing.expect(etag[0] == '"' and etag[9] == '"');
 
-    var revalidate = http.RequestCtx{ .method = .GET, .path = "/_/assets/app.js", .allocator = std.testing.allocator, .if_none_match = etag };
+    var revalidate = http.RequestCtx{ .method = .GET, .path = "/_/assets/app.js", .allocator = RequestArena.forTest(std.testing.allocator), .if_none_match = etag };
     const r2 = serve(&revalidate);
     try std.testing.expectEqual(@as(u16, 304), r2.status);
     try std.testing.expectEqual(@as(usize, 0), r2.body.len);
     try std.testing.expectEqualStrings(etag, r2.extra_headers[0].value); // 304 keeps the headers
     try std.testing.expectEqualStrings("application/javascript", r2.content_type);
 
-    var stale = http.RequestCtx{ .method = .GET, .path = "/_/assets/app.js", .allocator = std.testing.allocator, .if_none_match = "\"deadbeef\"" };
+    var stale = http.RequestCtx{ .method = .GET, .path = "/_/assets/app.js", .allocator = RequestArena.forTest(std.testing.allocator), .if_none_match = "\"deadbeef\"" };
     try std.testing.expectEqual(@as(u16, 200), serve(&stale).status);
 
     // index.html (the SPA shell) revalidates too.
-    var shell = http.RequestCtx{ .method = .GET, .path = "/_/", .allocator = std.testing.allocator };
+    var shell = http.RequestCtx{ .method = .GET, .path = "/_/", .allocator = RequestArena.forTest(std.testing.allocator) };
     const rs = serve(&shell);
-    var shell304 = http.RequestCtx{ .method = .GET, .path = "/_/", .allocator = std.testing.allocator, .if_none_match = rs.extra_headers[0].value };
+    var shell304 = http.RequestCtx{ .method = .GET, .path = "/_/", .allocator = RequestArena.forTest(std.testing.allocator), .if_none_match = rs.extra_headers[0].value };
     try std.testing.expectEqual(@as(u16, 304), serve(&shell304).status);
 }
 
 test "every manifest asset serves 200 with an ETag and 304s on its own etag" {
     for (assets) |a| {
-        var g = http.RequestCtx{ .method = .GET, .path = a.path, .allocator = std.testing.allocator };
+        var g = http.RequestCtx{ .method = .GET, .path = a.path, .allocator = RequestArena.forTest(std.testing.allocator) };
         const r = serve(&g);
         try std.testing.expectEqual(@as(u16, 200), r.status);
         try std.testing.expectEqualStrings("ETag", r.extra_headers[0].name);
         try std.testing.expectEqualStrings("X-Content-Type-Options", r.extra_headers[1].name);
-        var c = http.RequestCtx{ .method = .GET, .path = a.path, .allocator = std.testing.allocator, .if_none_match = a.etag };
+        var c = http.RequestCtx{ .method = .GET, .path = a.path, .allocator = RequestArena.forTest(std.testing.allocator), .if_none_match = a.etag };
         try std.testing.expectEqual(@as(u16, 304), serve(&c).status);
     }
 }

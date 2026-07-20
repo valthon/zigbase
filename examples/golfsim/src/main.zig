@@ -52,8 +52,9 @@ const zigbase = @import("zigbase");
 //    Signature: fn(*zigbase.Ctx, *zigbase.RecordEvent) anyerror!void. Returning an
 //    error REJECTS the write and surfaces as a 400 to the client. DB access is via
 //    `ctx.records()` (bound to the triggering write's in-transaction connection).
-//    Record mutations MUST allocate with `ev.arena` (the request-scoped allocator
-//    that owns `ev.record`). Need the app itself? Use `ctx.app`.
+//    Record mutations MUST allocate with `ev.arena.a` — `ev.arena` is a typed
+//    `RequestArena` and `.a` is the request-scoped allocator inside it, the one that
+//    owns `ev.record`. Need the app itself? Use `ctx.app`.
 // ---------------------------------------------------------------------------
 fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     if (ev.record.* != .object) return error.InvalidBooking;
@@ -90,9 +91,9 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     // Double-booking check: reject if there is already a non-cancelled booking
     // for the same listing whose time window overlaps ours.
     //   overlap condition: existing.starts_at < our ends_at AND existing.ends_at > our starts_at
-    // Allocate the filter in ev.arena (request-scoped).
+    // Allocate the filter in ev.arena.a (the request-scoped allocator).
     const overlap_filter = try std.fmt.allocPrint(
-        ev.arena,
+        ev.arena.a,
         "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing_id, ends_at, starts_at },
     );
@@ -105,21 +106,21 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     const rate = numberField(listing.object, "price_per_hour") orelse return error.ListingMissingRate;
     if (rate < 0) return error.NegativeRate;
     const price_total = hours * rate;
-    try rec.put(ev.arena, "price_total", .{ .float = price_total });
+    try rec.put(ev.arena.a, "price_total", .{ .float = price_total });
 
     // Stamp the guest from the authenticated identity (server-authoritative;
     // never trust a client-supplied guest). `ev.rctx.auth` is the auth record.
     if (ev.rctx.auth) |auth| if (auth == .object) {
         if (auth.object.get("id")) |idv| if (idv == .string) {
-            const guest = try ev.arena.dupe(u8, idv.string);
-            try rec.put(ev.arena, "guest", .{ .string = guest });
+            const guest = try ev.arena.a.dupe(u8, idv.string);
+            try rec.put(ev.arena.a, "guest", .{ .string = guest });
         };
     };
 
     // New bookings always start life as a pending hold; a client cannot
     // pre-confirm. (The select field's allowed values are pending/confirmed/
     // cancelled — see docs/recipes.md.)
-    try rec.put(ev.arena, "status", .{ .string = "pending" });
+    try rec.put(ev.arena.a, "status", .{ .string = "pending" });
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +188,7 @@ fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     // Flip status -> confirmed via a partial update (only the provided field is
     // written). Build the patch in the request arena.
     var patch: std.json.ObjectMap = .empty;
-    patch.put(req.ctx.arena, "status", .{ .string = "confirmed" }) catch return error.RouteFailed;
+    patch.put(req.ctx.arena.a, "status", .{ .string = "confirmed" }) catch return error.RouteFailed;
     const updated = (records.update("bookings", id, .{ .object = patch }) catch return error.RouteFailed) orelse return error.NotFound;
 
     // Fire a booking-confirmation webhook (outbound HTTP via `ctx.http()`). This is the
@@ -227,7 +228,7 @@ fn webhookJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     const url = (ctx.kv().get("booking_webhook_url") catch return) orelse return;
     if (url.len == 0) return;
     const body = std.fmt.allocPrint(
-        ctx.arena,
+        ctx.arena.a,
         "{{\"event\":\"booking.confirmed\",\"booking\":\"{s}\"}}",
         .{booking_id},
     ) catch return;
@@ -271,7 +272,7 @@ fn cancelBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 
     // Update status -> "cancelled".
     var patch: std.json.ObjectMap = .empty;
-    patch.put(req.ctx.arena, "status", .{ .string = "cancelled" }) catch return error.RouteFailed;
+    patch.put(req.ctx.arena.a, "status", .{ .string = "cancelled" }) catch return error.RouteFailed;
     const updated = (records.update("bookings", id, .{ .object = patch }) catch return error.RouteFailed) orelse return error.NotFound;
 
     // Return the updated record; the thunk serializes it as the 200 body.
@@ -295,7 +296,7 @@ fn listingAvailability(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Valu
     // Read through the per-request capability object — `req.ctx.records()` manages
     // the pooled read connection itself (no manual acquireReader / Data wiring).
     const filter = std.fmt.allocPrint(
-        req.ctx.arena,
+        req.ctx.arena.a,
         "listing = \"{s}\" && status != \"cancelled\"",
         .{id},
     ) catch return error.RouteFailed;
@@ -303,10 +304,10 @@ fn listingAvailability(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Valu
 
     // Build the `{"items":[...]}` wrapper as a JSON Value; the thunk serializes it
     // to the 200 body (identical wire shape, including an empty array).
-    var arr = std.json.Array.init(req.ctx.arena);
+    var arr = std.json.Array.init(req.ctx.arena.a);
     for (result.items) |item| arr.append(item) catch return error.RouteFailed;
     var obj: std.json.ObjectMap = .empty;
-    obj.put(req.ctx.arena, "items", .{ .array = arr }) catch return error.RouteFailed;
+    obj.put(req.ctx.arena.a, "items", .{ .array = arr }) catch return error.RouteFailed;
     return .{ .object = obj };
 }
 
@@ -369,7 +370,7 @@ fn convertHold(req: *zigbase.Req(ConvertIn)) zigbase.RouteError!std.json.Value {
 
     // Build the booking object on the request arena (reused by the tx — same arena).
     var b: std.json.ObjectMap = .empty;
-    const a = req.ctx.arena;
+    const a = req.ctx.arena.a;
     b.put(a, "listing", .{ .string = listing_id }) catch return error.RouteFailed;
     b.put(a, "guest", .{ .string = guest_id }) catch return error.RouteFailed;
     b.put(a, "starts_at", .{ .string = req.input.starts_at }) catch return error.RouteFailed;
@@ -405,7 +406,7 @@ fn logoutEverywhere(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 /// `{"items":[ {id,created,last_seen,user_agent,ip,is_current}, ... ]}`.
 fn activeDevices(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
     const sessions = req.ctx.auth().listActiveSessions() catch return error.RouteFailed;
-    const a = req.ctx.arena;
+    const a = req.ctx.arena.a;
     var arr = std.json.Array.init(a);
     for (sessions) |s| {
         var o: std.json.ObjectMap = .empty;
@@ -526,9 +527,9 @@ fn flagStatus(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const name = ctx.request.?.param("name") orelse return ctx.errorResponse(ctx.fail(400, "Missing flag name."));
     const enabled = ctx.flagByName(name) orelse return ctx.errorResponse(ctx.fail(404, "Unknown feature flag."));
     var o: std.json.ObjectMap = .empty;
-    try o.put(ctx.arena, "name", .{ .string = name });
-    try o.put(ctx.arena, "enabled", .{ .bool = enabled });
-    const body = try std.json.Stringify.valueAlloc(ctx.arena, std.json.Value{ .object = o }, .{});
+    try o.put(ctx.arena.a, "name", .{ .string = name });
+    try o.put(ctx.arena.a, "enabled", .{ .bool = enabled });
+    const body = try std.json.Stringify.valueAlloc(ctx.arena.a, std.json.Value{ .object = o }, .{});
     return .{ .status = 200, .body = body };
 }
 
@@ -546,7 +547,7 @@ fn logFileUpload(ev: *zigbase.events.FileEvent) void {
 // 8. Validating before_create hook on `reviews`.
 //
 //    Signature: fn(*zigbase.Ctx, *zigbase.RecordEvent) anyerror!void. Like `prepareBooking`,
-//    record mutations MUST allocate with `ev.arena`. This hook (a) stamps the
+//    record mutations MUST allocate with `ev.arena.a`. This hook (a) stamps the
 //    review's `author` from the authenticated identity (server-authoritative —
 //    a client cannot review *as* someone else), and (b) enforces the review
 //    gate: you may only review a booking that EXISTS, was made by YOU (you were
@@ -586,8 +587,8 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     if (!std.mem.eql(u8, status, "confirmed")) return error.BookingNotConfirmed;
 
     // Stamp the author from the identity (overwriting any client-supplied value).
-    const author_dup = try ev.arena.dupe(u8, author);
-    try rec.put(ev.arena, "author", .{ .string = author_dup });
+    const author_dup = try ev.arena.a.dupe(u8, author);
+    try rec.put(ev.arena.a, "author", .{ .string = author_dup });
 }
 
 /// beforeCreate hook on `holds` — stamps the TTL field SERVER-SIDE. A "hold" is an
@@ -611,7 +612,7 @@ fn prepareHold(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
         };
     };
     const guest = guest_id orelse return error.Unauthenticated;
-    try rec.put(ev.arena, "guest", .{ .string = try ev.arena.dupe(u8, guest) });
+    try rec.put(ev.arena.a, "guest", .{ .string = try ev.arena.a.dupe(u8, guest) });
 
     // Server-stamped expiry (now + 15m), ignoring any client-supplied expires_at.
     // "now" is read from the DATABASE clock (`strftime('%s','now')`) rather than the OS
@@ -621,8 +622,8 @@ fn prepareHold(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     // (see test/golfsim.determinism.e2e.test.ts). A production build never reads
     // the env var, so this is plain wall-clock there.
     const now_s = try dbNowUnix(ctx);
-    const expires_at = try isoFromEpoch(ev.arena, now_s + hold_ttl_seconds);
-    try rec.put(ev.arena, "expires_at", .{ .string = expires_at });
+    const expires_at = try isoFromEpoch(ev.arena.a, now_s + hold_ttl_seconds);
+    try rec.put(ev.arena.a, "expires_at", .{ .string = expires_at });
 }
 
 /// Read the current time (unix seconds) from the DATABASE clock via `strftime('%s','now')`.
@@ -708,7 +709,7 @@ fn epochSeconds(ts: []const u8) !i64 {
 
 /// Format a unix epoch (seconds) as a canonical `YYYY-MM-DDTHH:MM:SSZ` UTC string —
 /// the inverse of `epochSeconds`, using Howard Hinnant's civil_from_days. Allocated
-/// with `alloc` (pass `ev.arena` from a hook). The canonical trailing `Z` form is what
+/// with `alloc` (pass `ev.arena.a` from a hook). The canonical trailing `Z` form is what
 /// ZigBase's TTL GC and date validators expect.
 fn isoFromEpoch(alloc: std.mem.Allocator, secs: i64) ![]u8 {
     const days = @divFloor(secs, 86400);
@@ -759,7 +760,7 @@ fn bumpLoginCount(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyer
         else => 0,
     } else 0;
     var patch: std.json.ObjectMap = .empty;
-    try patch.put(ctx.arena, "loginCount", .{ .integer = prev + 1 });
+    try patch.put(ctx.arena.a, "loginCount", .{ .integer = prev + 1 });
     // ctx.records() reuses the bound transaction connection (do NOT call ctx.tx here).
     _ = try ctx.records().update(ev.collection, ev.record_id, .{ .object = patch });
     std.log.info("auth: {s}/{s} via .{s} (login #{d})", .{ ev.collection, ev.record_id, @tagName(ev.method), prev + 1 });
@@ -774,7 +775,7 @@ fn seedNewUser(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerr
     const rec = ev.record orelse return;
     if (rec.* != .object) return;
     if (rec.object.get("loginCount") == null)
-        try rec.object.put(ctx.arena, "loginCount", .{ .integer = 0 });
+        try rec.object.put(ctx.arena.a, "loginCount", .{ .integer = 0 });
 }
 
 /// One-line logout (#86): `ctx.auth().clearSession()` returns the cleared

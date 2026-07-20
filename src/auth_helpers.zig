@@ -2,6 +2,7 @@
 /// login flows. Each function delegates to the internal api/auth.zig implementation
 /// so consumers never touch raw JWT/DB internals.
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const http = @import("http.zig");
 const db = @import("db.zig");
 const jwt = @import("jwt.zig");
@@ -97,7 +98,7 @@ pub fn mintLinkToken(
     ttl_s: i64,
     opts: MintOptions,
 ) !LinkToken {
-    const tk = (try api_auth.tokenKeyFor(ctx.allocator, conn, collection, record_id)) orelse
+    const tk = (try api_auth.tokenKeyFor(ctx.allocator.a, conn, collection, record_id)) orelse
         return error.NotFound;
     const token = try api_auth.mintToken(ctx, conn, collection, record_id, tk, .magic_link, ttl_s, opts.payload);
     return .{ .token = token };
@@ -111,7 +112,7 @@ pub fn verifyLinkToken(
     collection: []const u8,
     token: []const u8,
 ) !?jwt.Claims {
-    const col = (try collections.get(ctx.allocator, conn, collection)) orelse return null;
+    const col = (try collections.get(ctx.allocator.a, conn, collection)) orelse return null;
     return api_auth.verifyTyped(ctx, conn, col, token, .magic_link);
 }
 
@@ -164,7 +165,7 @@ test "magic-link helpers: mint -> verify -> consume; replay rejected" {
     const col = (try collections.get(a, w, "members")).?;
     const rid = (try api_auth.findByIdentity(a, w, col, "m@x.io")).?;
 
-    var ctx = h.ctx(a, .POST, "", &[_]http.Param{});
+    var ctx = h.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     const lt = try mintLinkToken(&ctx, w, "members", rid, 900, .{});
     const claims = (try verifyLinkToken(&ctx, w, "members", lt.token)).?;
     try consumeLinkToken(w, claims);
@@ -202,7 +203,7 @@ test "data.create provisions a usable auth row: mintLinkToken + issueSession suc
     const tk = (try api_auth.tokenKeyFor(a, w, "members", rid)).?;
     try std.testing.expectEqual(@as(usize, 32), tk.len);
 
-    var ctx = h.ctx(a, .POST, "", &[_]http.Param{});
+    var ctx = h.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     const lt = try mintLinkToken(&ctx, w, "members", rid, 900, .{});
     const claims = (try verifyLinkToken(&ctx, w, "members", lt.token)).?;
     try std.testing.expectEqualStrings(rid, claims.id);
@@ -260,7 +261,7 @@ test "magic-link token type is distinct: email-verification token rejected by ve
     const col = (try collections.get(a, w, "members")).?;
     const rid = (try api_auth.findByIdentity(a, w, col, "ml@x.io")).?;
 
-    var ctx = h.ctx(a, .POST, "", &[_]http.Param{});
+    var ctx = h.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
 
     // Mint a standard EMAIL-VERIFICATION token (type=.verification).
     const ver_token = try api_auth.mintToken(&ctx, w, "members", rid, (try api_auth.tokenKeyFor(a, w, "members", rid)).?, .verification, 900, "");
@@ -288,7 +289,7 @@ test "magic-link payload: opaque bound payload round-trips, is tamper-proof, rep
     const col = (try collections.get(a, w, "members")).?;
     const rid = (try api_auth.findByIdentity(a, w, col, "p@x.io")).?;
 
-    var ctx = h.ctx(a, .POST, "", &[_]http.Param{});
+    var ctx = h.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
 
     // Mint with an opaque payload (e.g. a post-login redirect target).
     const lt = try mintLinkToken(&ctx, w, "members", rid, 900, .{ .payload = "/club/profile" });

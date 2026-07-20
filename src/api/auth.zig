@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const db = @import("../db.zig");
 const collections = @import("../collections.zig");
@@ -71,11 +72,11 @@ pub fn rateLimited(ctx: *http.RequestCtx, scope: []const u8, ident: []const u8) 
     const app = ctx.app.?;
     const limiter = app.rate_limiter orelse return null;
     const key = if (ctx.remote_ip.len > 0)
-        try std.fmt.allocPrint(ctx.allocator, "{s}:ip:{s}", .{ scope, ctx.remote_ip })
+        try std.fmt.allocPrint(ctx.allocator.a, "{s}:ip:{s}", .{ scope, ctx.remote_ip })
     else
-        try std.fmt.allocPrint(ctx.allocator, "{s}:ident:{s}", .{ scope, ident });
+        try std.fmt.allocPrint(ctx.allocator.a, "{s}:ident:{s}", .{ scope, ident });
     if (limiter.allow(key, wallNowUnix(app.io))) return null;
-    return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator);
+    return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator.a);
 }
 
 /// Per-method variant of `rateLimited`: enforces a method-specific `max`/`window_s`
@@ -90,11 +91,11 @@ pub fn rateLimitedCustom(ctx: *http.RequestCtx, scope: []const u8, ident: []cons
     const app = ctx.app.?;
     const limiter = app.rate_limiter orelse return null;
     const key = if (ctx.remote_ip.len > 0)
-        try std.fmt.allocPrint(ctx.allocator, "{s}:ip:{s}", .{ scope, ctx.remote_ip })
+        try std.fmt.allocPrint(ctx.allocator.a, "{s}:ip:{s}", .{ scope, ctx.remote_ip })
     else
-        try std.fmt.allocPrint(ctx.allocator, "{s}:ident:{s}", .{ scope, ident });
+        try std.fmt.allocPrint(ctx.allocator.a, "{s}:ident:{s}", .{ scope, ident });
     if (limiter.allowCustom(key, wallNowUnix(app.io), max, window_s)) return null;
-    return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator);
+    return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator.a);
 }
 
 /// SQL `now` for framework token logic (iat/exp, consumed-token expiry), honoring the
@@ -267,7 +268,7 @@ pub fn recordSession(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8
     const app = ctx.app.?;
     var idbuf: [15]u8 = undefined;
     id_gen.generate(app.io, &idbuf);
-    const sid = try ctx.allocator.dupe(u8, &idbuf);
+    const sid = try ctx.allocator.a.dupe(u8, &idbuf);
     var st = try prep(conn,
         \\INSERT INTO "_sessions" ("id","collectionRef","recordRef","created","lastSeen","expires","userAgent","ip")
         \\ VALUES (?1,?2,?3,datetime('now'),datetime('now'),?4,?5,?6);
@@ -430,7 +431,7 @@ pub const Issued = struct { token: []const u8, cookies: [2]http.Cookie };
 
 pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: []const u8, token_key: []const u8, epoch: i64) !Issued {
     const app = ctx.app.?;
-    const csrf = try crypto.genToken(app.io, ctx.allocator, 32);
+    const csrf = try crypto.genToken(app.io, ctx.allocator.a, 32);
     const now = try nowUnix(conn);
     const exp = now + app.auth_token_ttl_s;
     // `epoch` (#99) is passed in by the caller, folded into the SAME `tokenKey` SELECT every
@@ -457,7 +458,7 @@ pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: [
         .exp = exp,
     };
     const key = crypto.deriveKey(app.jwt_secret, token_key);
-    const token = try jwt.sign(ctx.allocator, claims, &key);
+    const token = try jwt.sign(ctx.allocator.a, claims, &key);
     const max_age: i32 = @intCast(app.auth_token_ttl_s);
     return .{
         .token = token,
@@ -502,13 +503,13 @@ pub fn issueSessionExt(
     method: events.AuthMethod,
     opt_record: ?std.json.Value,
 ) !Issued {
-    const col = (try collections.get(ctx.allocator, conn, collection)) orelse return error.NotFound;
+    const col = (try collections.get(ctx.allocator.a, conn, collection)) orelse return error.NotFound;
     if (col.type != .auth) return error.NotFound;
     // One SELECT for tokenKey + epoch (no separate epoch query) — keeps epoch-mode login at the
     // same query count as before #99.
-    const ke = (try tokenKeyAndEpochFor(ctx.allocator, conn, col.name, record_id)) orelse return error.NotFound;
+    const ke = (try tokenKeyAndEpochFor(ctx.allocator.a, conn, col.name, record_id)) orelse return error.NotFound;
     const issued = try issue(ctx, conn, col.name, record_id, ke.token_key, ke.epoch);
-    const rec: ?std.json.Value = if (opt_record) |r| r else try records.get(ctx.allocator, conn, col, record_id);
+    const rec: ?std.json.Value = if (opt_record) |r| r else try records.get(ctx.allocator.a, conn, col, record_id);
     emitAuth(ctx, col.name, rec, method);
     return issued;
 }
@@ -524,9 +525,9 @@ pub fn issueSessionNoEmit(
     collection: []const u8,
     record_id: []const u8,
 ) !Issued {
-    const col = (try collections.get(ctx.allocator, conn, collection)) orelse return error.NotFound;
+    const col = (try collections.get(ctx.allocator.a, conn, collection)) orelse return error.NotFound;
     if (col.type != .auth) return error.NotFound;
-    const ke = (try tokenKeyAndEpochFor(ctx.allocator, conn, col.name, record_id)) orelse return error.NotFound;
+    const ke = (try tokenKeyAndEpochFor(ctx.allocator.a, conn, col.name, record_id)) orelse return error.NotFound;
     return issue(ctx, conn, col.name, record_id, ke.token_key, ke.epoch);
 }
 
@@ -664,9 +665,9 @@ pub fn emitAuthLifecycle(
 
 pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-    const identity = strField(body, "identity") orelse return ApiError.badRequest("identity is required.").toResponse(ctx.allocator);
-    const password = strField(body, "password") orelse return ApiError.badRequest("password is required.").toResponse(ctx.allocator);
+    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator.a);
+    const identity = strField(body, "identity") orelse return ApiError.badRequest("identity is required.").toResponse(ctx.allocator.a);
+    const password = strField(body, "password") orelse return ApiError.badRequest("password is required.").toResponse(ctx.allocator.a);
 
     // Rate-limit gate (brute-force defense): per client IP, falling back to identity.
     if (try rateLimited(ctx, "login", identity)) |resp| return resp;
@@ -676,28 +677,28 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     // holding the single global writer lock — otherwise every login serializes all writes.
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
-    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const col = (try collections.get(ctx.allocator, &r, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
+    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const col = (try collections.get(ctx.allocator.a, &r, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator.a);
 
-    const rid = (try findByIdentity(ctx.allocator, &r, col, identity)) orelse {
+    const rid = (try findByIdentity(ctx.allocator.a, &r, col, identity)) orelse {
         // Unknown identity: run identity-independent argon2 work so the response time matches
         // the known-identity path (defeats account enumeration via timing). L1 fix.
-        crypto.dummyVerify(app.io, ctx.allocator);
-        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
+        crypto.dummyVerify(app.io, ctx.allocator.a);
+        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a);
     };
-    const phc = (try passwordHashFor(ctx.allocator, &r, col.name, rid)) orelse {
-        crypto.dummyVerify(app.io, ctx.allocator);
-        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
+    const phc = (try passwordHashFor(ctx.allocator.a, &r, col.name, rid)) orelse {
+        crypto.dummyVerify(app.io, ctx.allocator.a);
+        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a);
     };
-    if (!crypto.verifyPassword(app.io, ctx.allocator, phc, password))
-        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
+    if (!crypto.verifyPassword(app.io, ctx.allocator.a, phc, password))
+        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a);
 
-    const rec = (try records.get(ctx.allocator, &r, col, rid)) orelse
-        return ApiError.notFound().toResponse(ctx.allocator);
+    const rec = (try records.get(ctx.allocator.a, &r, col, rid)) orelse
+        return ApiError.notFound().toResponse(ctx.allocator.a);
     // Optional verification gate: refuse to mint a session for an unverified record.
     if (col.options.auth.require_verified and !recordVerified(rec))
-        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator.a);
     // Issuance (three paths):
     //  1. HOOK path (#80, 0.10.0): a registered `beforeAuthSuccess` runs inside a write
     //     transaction so its side-writes commit atomically with issuance and an abort blocks
@@ -725,7 +726,7 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
             const iss = issueSessionNoEmit(ctx, w, col.name, rid) catch |err| switch (err) {
                 error.NotFound => {
                     w.rollback() catch {};
-                    return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
+                    return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a);
                 },
                 else => return err, // errdefer rolls back
             };
@@ -740,20 +741,20 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
             const w = app.pool.acquireWriter();
             defer app.pool.releaseWriter();
             break :blk issueSessionExt(ctx, w, col.name, rid, .password, rec) catch |err| switch (err) {
-                error.NotFound => return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator),
+                error.NotFound => return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a),
                 else => return err,
             };
         }
         break :blk issueSessionExt(ctx, &r, col.name, rid, .password, rec) catch |err| switch (err) {
-            error.NotFound => return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator),
+            error.NotFound => return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a),
             else => return err,
         };
     };
 
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "token", .{ .string = issued.token });
-    try root.put(ctx.allocator, "record", rec);
-    const cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
+    try root.put(ctx.allocator.a, "token", .{ .string = issued.token });
+    try root.put(ctx.allocator.a, "record", rec);
+    const cookies = try ctx.allocator.a.dupe(http.Cookie, &issued.cookies);
     return jsonResponse(ctx, 200, .{ .object = root }, cookies);
 }
 
@@ -761,11 +762,11 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const authed = (try auth.authenticate(app.io, ctx.allocator, app, ctx, w)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
-    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const authed = (try auth.authenticate(app.io, ctx.allocator.a, app, ctx, w)) orelse
+        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     if (!std.mem.eql(u8, authed.collection, col_name))
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
 
     const rid = authed.record.object.get("id").?.string;
 
@@ -803,7 +804,7 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
     const issued = issueSessionNoEmit(ctx, w, col_name, rid) catch |err| switch (err) {
         error.NotFound => {
             w.rollback() catch {};
-            return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+            return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
         },
         else => return err, // errdefer rolls back
     };
@@ -815,9 +816,9 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
     emitAuthLifecycle(ctx, w, col_name, rid, .after_refresh, &rec_mut, rec_mut);
 
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "token", .{ .string = issued.token });
-    try root.put(ctx.allocator, "record", rec_mut);
-    const cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
+    try root.put(ctx.allocator.a, "token", .{ .string = issued.token });
+    try root.put(ctx.allocator.a, "record", rec_mut);
+    const cookies = try ctx.allocator.a.dupe(http.Cookie, &issued.cookies);
     return jsonResponse(ctx, 200, .{ .object = root }, cookies);
 }
 
@@ -845,7 +846,7 @@ pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
         var rid: []const u8 = "";
         var identity: ?std.json.Value = null;
         var sid: []const u8 = "";
-        if (auth.authenticate(app.io, ctx.allocator, app, ctx, w) catch null) |a| {
+        if (auth.authenticate(app.io, ctx.allocator.a, app, ctx, w) catch null) |a| {
             rid = recordId(a.record);
             identity = a.record;
             sid = a.sid;
@@ -858,7 +859,7 @@ pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
         // Table mode: drop this token's server-side session row (per-device logout).
         if (app.session_store == .table and sid.len > 0) _ = try deleteSession(w, sid);
         const cleared = session.clearedCookies(app.cookie_secure);
-        const cookies = try ctx.allocator.dupe(http.Cookie, &cleared);
+        const cookies = try ctx.allocator.a.dupe(http.Cookie, &cleared);
         emitAuthLifecycle(ctx, w, lc_col, rid, .after_logout, null, identity);
         return .{ .status = 204, .body = "", .cookies = cookies };
     }
@@ -866,7 +867,7 @@ pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
     // Fast path (no lifecycle hook, epoch mode): just clear the session cookies. Shared
     // policy: the cleared cookies match what `issue()`/`clearSession` produce.
     const cleared = session.clearedCookies(app.cookie_secure);
-    const cookies = try ctx.allocator.dupe(http.Cookie, &cleared);
+    const cookies = try ctx.allocator.a.dupe(http.Cookie, &cleared);
     return .{ .status = 204, .body = "", .cookies = cookies };
 }
 
@@ -931,12 +932,12 @@ fn enqueueTokenMail(app: *@import("../app.zig").App, to: []const u8, subject: []
 /// propagated failure would (a) be un-actionable and (b) only ever occur for existing accounts,
 /// re-opening the enumeration oracle. A delivery failure is logged and the job completes.
 fn tokenMailHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
-    const parsed = std.json.parseFromSlice(TokenMail, ctx.arena, payload, .{}) catch |e| {
+    const parsed = std.json.parseFromSlice(TokenMail, ctx.arena.a, payload, .{}) catch |e| {
         std.log.warn("[mail:token] failed to parse payload ({s}); dropping", .{@errorName(e)});
         return;
     };
     const m = parsed.value;
-    deliverToken(ctx.app, ctx.arena, m.to, m.subject, m.body) catch |e| {
+    deliverToken(ctx.app, ctx.arena.a, m.to, m.subject, m.body) catch |e| {
         std.log.warn("[mail:token] delivery failed: {s}", .{@errorName(e)});
     };
 }
@@ -952,8 +953,8 @@ pub fn mintToken(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, rid:
     // Random jti makes the token single-use (F7): redemption records it in
     // _consumedTokens; a replay is rejected even within the TTL and independent of
     // the tokenKey-rotation side effect.
-    const jti = try crypto.genToken(app.io, ctx.allocator, 32);
-    return jwt.sign(ctx.allocator, .{ .id = rid, .collection = col_name, .type = tt, .jti = jti, .pl = payload, .iat = now, .exp = now + ttl }, &key);
+    const jti = try crypto.genToken(app.io, ctx.allocator.a, 32);
+    return jwt.sign(ctx.allocator.a, .{ .id = rid, .collection = col_name, .type = tt, .jti = jti, .pl = payload, .iat = now, .exp = now + ttl }, &key);
 }
 
 /// Record a single-use token's `jti` as consumed, or return error.AlreadyConsumed if it
@@ -981,7 +982,7 @@ pub fn consumeToken(conn: *db.Db, claims: jwt.Claims) !void {
 
 fn loadAuthCollection(ctx: *http.RequestCtx, conn: *db.Db) !?schema.Collection {
     const col_name = ctx.param("col") orelse return null;
-    const col = (try collections.get(ctx.allocator, conn, col_name)) orelse return null;
+    const col = (try collections.get(ctx.allocator.a, conn, col_name)) orelse return null;
     if (col.type != .auth) return null;
     return col;
 }
@@ -989,13 +990,13 @@ fn loadAuthCollection(ctx: *http.RequestCtx, conn: *db.Db) !?schema.Collection {
 /// Verify a typed token against the record's derived key. Returns claims on success.
 pub fn verifyTyped(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, token: []const u8, want: jwt.TokenType) !?jwt.Claims {
     const app = ctx.app.?;
-    const claims = jwt.peekClaims(ctx.allocator, token) catch return null;
+    const claims = jwt.peekClaims(ctx.allocator.a, token) catch return null;
     if (claims.type != want) return null;
     if (!std.mem.eql(u8, claims.collection, col.name)) return null;
-    const tk = (try tokenKeyFor(ctx.allocator, conn, col.name, claims.id)) orelse return null;
+    const tk = (try tokenKeyFor(ctx.allocator.a, conn, col.name, claims.id)) orelse return null;
     const key = crypto.deriveKey(app.jwt_secret, tk);
     const now = try nowUnix(conn);
-    const verified = jwt.verify(ctx.allocator, token, &key, now) catch return null;
+    const verified = jwt.verify(ctx.allocator.a, token, &key, now) catch return null;
     return verified;
 }
 
@@ -1031,13 +1032,13 @@ fn requestEmailToken(
     {
         const w = app.pool.acquireWriter();
         defer app.pool.releaseWriter();
-        const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-        const parsed = body orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+        const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+        const parsed = body orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator.a);
         if (strField(parsed, "email")) |email| {
-            if (try findByEmail(ctx.allocator, w, col, email)) |rid| {
-                if (try tokenKeyFor(ctx.allocator, w, col.name, rid)) |tk| {
+            if (try findByEmail(ctx.allocator.a, w, col, email)) |rid| {
+                if (try tokenKeyFor(ctx.allocator.a, w, col.name, rid)) |tk| {
                     const token = try mintToken(ctx, w, col.name, rid, tk, tt, ttl, "");
-                    const mail_body = try std.fmt.allocPrint(ctx.allocator, body_fmt, .{ col.name, token });
+                    const mail_body = try std.fmt.allocPrint(ctx.allocator.a, body_fmt, .{ col.name, token });
                     pending = .{ .email = email, .mail_body = mail_body };
                 }
             }
@@ -1064,15 +1065,15 @@ pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-    const token = strField(body, "token") orelse return ApiError.badRequest("token is required.").toResponse(ctx.allocator);
+    const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator.a);
+    const token = strField(body, "token") orelse return ApiError.badRequest("token is required.").toResponse(ctx.allocator.a);
     const claims = (try verifyTyped(ctx, w, col, token, .verification)) orelse
-        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
+        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator.a);
     // Single-use (F7): redeeming the same token twice fails here even within the TTL.
     consumeToken(w, claims) catch
-        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
-    const sql = try std.fmt.allocPrintSentinel(ctx.allocator, "UPDATE \"{s}\" SET \"verified\" = 1 WHERE \"id\" = ?1;", .{col.name}, 0);
+        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator.a);
+    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "UPDATE \"{s}\" SET \"verified\" = 1 WHERE \"id\" = ?1;", .{col.name}, 0);
     var st = try prep(w, sql);
     defer st.finalize();
     try st.bindText(1, claims.id);
@@ -1095,16 +1096,16 @@ pub fn confirmPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-    const token = strField(body, "token") orelse return ApiError.badRequest("token is required.").toResponse(ctx.allocator);
-    const password = strField(body, "password") orelse return ApiError.badRequest("password is required.").toResponse(ctx.allocator);
+    const col = (try loadAuthCollection(ctx, w)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const body = parseBody(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator.a);
+    const token = strField(body, "token") orelse return ApiError.badRequest("token is required.").toResponse(ctx.allocator.a);
+    const password = strField(body, "password") orelse return ApiError.badRequest("password is required.").toResponse(ctx.allocator.a);
     const claims = (try verifyTyped(ctx, w, col, token, .password_reset)) orelse
-        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
+        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator.a);
     // Validate the new password BEFORE consuming so a too-short password does not burn
     // the (still single-use) token.
     if (password.len < col.options.auth.minPasswordLength)
-        return ApiError.badRequest("Password too short.").toResponse(ctx.allocator);
+        return ApiError.badRequest("Password too short.").toResponse(ctx.allocator.a);
     // Transactional password change (#98): consume + beforePasswordChange + the password
     // UPDATE commit atomically. An aborting `beforePasswordChange` rolls back BOTH the token
     // consumption (the reset link stays usable) and the password update (fail closed).
@@ -1115,28 +1116,28 @@ pub fn confirmPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
     // TTL, before the tokenKey rotation that records.update triggers) is rejected.
     consumeToken(w, claims) catch {
         w.rollback() catch {};
-        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator);
+        return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator.a);
     };
     // Existing record snapshot for the hook (read on the same in-transaction conn).
     // Use `try` (not `catch null`): a genuine DB failure must propagate so the errdefer
     // rolls back (token un-consumed, password unchanged → clean 500) rather than feeding a
     // null record/identity to a `before_password_change` authorization hook. `records.get`
     // returns null only for genuine not-found, so that path is preserved below.
-    var rec_opt = try records.get(ctx.allocator, w, col, claims.id);
+    var rec_opt = try records.get(ctx.allocator.a, w, col, claims.id);
     const rec_ptr: ?*std.json.Value = if (rec_opt) |*r| r else null;
     if (try fireAuthLifecycleBefore(ctx, w, col.name, claims.id, .before_password_change, rec_ptr, rec_opt)) |resp| {
         w.rollback() catch {};
         return resp;
     }
     var data: std.json.ObjectMap = .empty;
-    try data.put(ctx.allocator, "password", .{ .string = password });
-    const updated = auth.applyUpdate(app.io, ctx.allocator, .{ .object = data }, col.options.auth.minPasswordLength) catch {
+    try data.put(ctx.allocator.a, "password", .{ .string = password });
+    const updated = auth.applyUpdate(app.io, ctx.allocator.a, .{ .object = data }, col.options.auth.minPasswordLength) catch {
         w.rollback() catch {};
-        return ApiError.badRequest("Invalid password.").toResponse(ctx.allocator);
+        return ApiError.badRequest("Invalid password.").toResponse(ctx.allocator.a);
     };
-    _ = records.update(ctx.allocator, w, col, claims.id, updated) catch {
+    _ = records.update(ctx.allocator.a, w, col, claims.id, updated) catch {
         w.rollback() catch {};
-        return ApiError.internal().toResponse(ctx.allocator);
+        return ApiError.internal().toResponse(ctx.allocator.a);
     };
     w.commit() catch |e| {
         w.rollback() catch {};
@@ -1208,7 +1209,7 @@ pub const TestEnv = struct {
         _ = try records.create(a, env.app.io, w, col, prepared);
     }
 
-    pub fn ctx(env: *TestEnv, a: std.mem.Allocator, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
+    pub fn ctx(env: *TestEnv, a: RequestArena, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
         return .{ .method = m, .path = "/", .body = body, .allocator = a, .app = &env.app, .params = params };
     }
 
@@ -1286,7 +1287,7 @@ test "auth-with-password issues a token + cookies, wrong password 400" {
     try env.createUser(a, "users", "u@x.io", "longenough");
 
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var ok = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &p);
+    var ok = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &p);
     const res = try authWithPassword(&ok);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"token\":\"") != null);
@@ -1305,7 +1306,7 @@ test "auth-with-password issues a token + cookies, wrong password 400" {
     }
     try std.testing.expect(saw_auth and saw_csrf);
 
-    var bad = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"wrongwrong\"}", &p);
+    var bad = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"wrongwrong\"}", &p);
     try std.testing.expectEqual(@as(u16, 400), (try authWithPassword(&bad)).status);
 }
 
@@ -1314,9 +1315,8 @@ test "auth-logout clears the cookies" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var ctx = env.ctx(a, .POST, "", &p);
+    var ctx = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     const res = try authLogout(&ctx);
     try std.testing.expectEqual(@as(u16, 204), res.status);
     var cleared: usize = 0;
@@ -1334,12 +1334,12 @@ test "auth-with-password then authenticate round-trips the issued token (bearer)
     const a = arena.allocator();
     try env.createUser(a, "users", "rt@x.io", "longenough");
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var login = env.ctx(a, .POST, "{\"identity\":\"rt@x.io\",\"password\":\"longenough\"}", &p);
+    var login = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"rt@x.io\",\"password\":\"longenough\"}", &p);
     const res = try authWithPassword(&login);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, res.body, .{});
     const token = parsed.value.object.get("token").?.string;
     // refresh with the bearer token should succeed (200)
-    var refresh = env.ctx(a, .POST, "", &p);
+    var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
 }
@@ -1353,14 +1353,14 @@ test "verification: request always 204; confirm returns 204 and sets verified=tr
     try env.createUser(a, "users", "v@x.io", "longenough");
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
 
-    var req = env.ctx(a, .POST, "{\"email\":\"v@x.io\"}", &p);
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"email\":\"v@x.io\"}", &p);
     try std.testing.expectEqual(@as(u16, 204), (try requestVerification(&req)).status);
-    var req_missing = env.ctx(a, .POST, "{\"email\":\"nobody@x.io\"}", &p);
+    var req_missing = env.ctx(RequestArena.from(&arena), .POST, "{\"email\":\"nobody@x.io\"}", &p);
     try std.testing.expectEqual(@as(u16, 204), (try requestVerification(&req_missing)).status);
 
     const token = try env.mintTyped(a, "users", "v@x.io", .verification);
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
-    var conf = env.ctx(a, .POST, body, &p);
+    var conf = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmVerification(&conf)).status);
     try std.testing.expect(env.recordVerified(a, "users", "v@x.io"));
 }
@@ -1375,9 +1375,9 @@ test "password reset: confirm changes the password and rotates the token" {
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
     const token = try env.mintTyped(a, "users", "r@x.io", .password_reset);
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
-    var conf = env.ctx(a, .POST, body, &p);
+    var conf = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&conf)).status);
-    var conf2 = env.ctx(a, .POST, body, &p);
+    var conf2 = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 400), (try confirmPasswordReset(&conf2)).status);
 }
 
@@ -1419,11 +1419,11 @@ test "F7: a verification token cannot be redeemed twice (single-use)" {
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
     // First redemption succeeds. Verification does NOT rotate tokenKey, so without the
     // single-use ledger this token would remain replayable for its full TTL.
-    var c1 = env.ctx(a, .POST, body, &p);
+    var c1 = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmVerification(&c1)).status);
     try std.testing.expect(env.recordVerified(a, "users", "v2@x.io"));
     // Second redemption of the very same (still-unexpired) token must fail.
-    var c2 = env.ctx(a, .POST, body, &p);
+    var c2 = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 400), (try confirmVerification(&c2)).status);
 }
 
@@ -1437,10 +1437,10 @@ test "F7: a password-reset token cannot be redeemed twice (single-use)" {
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
     const token = try env.mintTyped(a, "users", "r2@x.io", .password_reset);
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
-    var c1 = env.ctx(a, .POST, body, &p);
+    var c1 = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&c1)).status);
     // Replay rejected even though we re-send the identical valid-window token.
-    var c2 = env.ctx(a, .POST, body, &p);
+    var c2 = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 400), (try confirmPasswordReset(&c2)).status);
 }
 
@@ -1454,11 +1454,11 @@ test "F7: a too-short password does not consume the reset token" {
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
     const token = try env.mintTyped(a, "users", "r3@x.io", .password_reset);
     const short = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"x\"}}", .{token});
-    var bad = env.ctx(a, .POST, short, &p);
+    var bad = env.ctx(RequestArena.from(&arena), .POST, short, &p);
     try std.testing.expectEqual(@as(u16, 400), (try confirmPasswordReset(&bad)).status); // too short
     // The token survives the failed attempt and still works once.
     const ok = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
-    var good = env.ctx(a, .POST, ok, &p);
+    var good = env.ctx(RequestArena.from(&arena), .POST, ok, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&good)).status);
 }
 
@@ -1491,7 +1491,7 @@ test "require_verified gates password login: unverified 403, verified 200" {
     try env.createUser(a, "gated", "g@x.io", "longenough"); // created verified=false
 
     const p = [_]http.Param{.{ .key = "col", .value = "gated" }};
-    var login = env.ctx(a, .POST, "{\"identity\":\"g@x.io\",\"password\":\"longenough\"}", &p);
+    var login = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"g@x.io\",\"password\":\"longenough\"}", &p);
     try std.testing.expectEqual(@as(u16, 403), (try authWithPassword(&login)).status);
 
     // Mark verified, then login succeeds.
@@ -1500,7 +1500,7 @@ test "require_verified gates password login: unverified 403, verified 200" {
         defer env.pool.releaseWriter();
         try w.exec("UPDATE \"gated\" SET \"verified\" = 1 WHERE \"email\" = 'g@x.io';");
     }
-    var login2 = env.ctx(a, .POST, "{\"identity\":\"g@x.io\",\"password\":\"longenough\"}", &p);
+    var login2 = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"g@x.io\",\"password\":\"longenough\"}", &p);
     try std.testing.expectEqual(@as(u16, 200), (try authWithPassword(&login2)).status);
 }
 
@@ -1529,7 +1529,7 @@ test "auth_helpers.issueSession mints a session and fires onAuth(custom)" {
     var disp = events.Dispatch{ .on_auth = Counter.h };
     env.app.dispatch = &disp;
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     const w = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     const issued = try @import("../auth_helpers.zig").issueSession(&hctx, w, "members", rid);
@@ -1557,7 +1557,7 @@ test "#99 epoch bump invalidates outstanding tokens; a freshly issued token veri
     try env.createUser(a, "users", "ep@x.io", "longenough");
     const rid = try ridOf(env, a, "users", "ep@x.io");
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
 
     // Issue a session token at epoch 0; it verifies.
     const issued0 = blk: {
@@ -1615,14 +1615,14 @@ test "#99 ctx.auth().revokeAllSessions invalidates the principal's tokens" {
     const rid = try ridOf(env, a, "users", "rv@x.io");
     const rec = try loadRecord(env, a, "users", rid);
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     const issued = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         break :blk try issueSession(&hctx, w, "users", rid, .password);
     };
 
-    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
+    var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&arena), .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
     defer cx.deinit();
     try cx.auth().revokeAllSessions(); // acquires the writer internally
 
@@ -1641,7 +1641,7 @@ test "#99 ctx.auth().refresh keeps other sessions valid; rotate kills them" {
     const rid = try ridOf(env, a, "users", "rr@x.io");
     const rec = try loadRecord(env, a, "users", rid);
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     // An existing session token (epoch 0).
     const existing = blk: {
         const w = env.pool.acquireWriter();
@@ -1649,7 +1649,7 @@ test "#99 ctx.auth().refresh keeps other sessions valid; rotate kills them" {
         break :blk try issueSession(&hctx, w, "users", rid, .password);
     };
 
-    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
+    var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&arena), .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
     defer cx.deinit();
 
     // refresh: a new token is minted AND the existing one stays valid (same epoch).
@@ -1695,7 +1695,7 @@ test "#99 epoch mode writes NO _sessions row and the token carries no sid (zero 
     // Default mode is .epoch.
     try std.testing.expectEqual(@import("../app.zig").SessionStore.epoch, env.app.session_store);
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     const issued = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -1717,7 +1717,7 @@ test "#99 table mode: login writes a row, token has sid, verify accepts; revoke 
     try env.createUser(a, "users", "t@x.io", "longenough");
     const rid = try ridOf(env, a, "users", "t@x.io");
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     const issued = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -1758,7 +1758,7 @@ test "#99 table mode: authWithPassword (reader->writer) records a session + toke
     try env.createUser(a, "users", "pw@x.io", "longenough");
 
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var login = env.ctx(a, .POST, "{\"identity\":\"pw@x.io\",\"password\":\"longenough\"}", &p);
+    var login = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"pw@x.io\",\"password\":\"longenough\"}", &p);
     const res = try authWithPassword(&login);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     // The full login path (reader for argon2, writer for the session INSERT) wrote one row.
@@ -1783,7 +1783,7 @@ test "#99 table mode: an expired session row is rejected by verify" {
     try env.createUser(a, "users", "exp@x.io", "longenough");
     const rid = try ridOf(env, a, "users", "exp@x.io");
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     const issued = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -1813,11 +1813,11 @@ test "rotation grace: after auth-refresh the predecessor token stays valid until
     defer arena.deinit();
     const a = arena.allocator();
     try env.createUser(a, "users", "gr@x.io", "longenough");
-    const old_token = try loginToken(env, a, "users", "gr@x.io", "longenough");
+    const old_token = try loginToken(env, RequestArena.from(&arena), "users", "gr@x.io", "longenough");
     const old_sid = (try jwt.peekClaims(a, old_token)).sid.?;
 
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var refresh = env.ctx(a, .POST, "", &p);
+    var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{old_token});
     const res = try authRefresh(&refresh);
     try std.testing.expectEqual(@as(u16, 200), res.status);
@@ -1870,10 +1870,10 @@ test "rotation grace 0: auth-refresh deletes the predecessor immediately (legacy
     defer arena.deinit();
     const a = arena.allocator();
     try env.createUser(a, "users", "gz@x.io", "longenough");
-    const old_token = try loginToken(env, a, "users", "gz@x.io", "longenough");
+    const old_token = try loginToken(env, RequestArena.from(&arena), "users", "gz@x.io", "longenough");
 
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var refresh = env.ctx(a, .POST, "", &p);
+    var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{old_token});
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
 
@@ -1896,7 +1896,7 @@ test "#99 table mode: listActiveSessions + is_current; revoke authorizes owner-o
     const other_rid = try ridOf(env, a, "users", "other@x.io");
     const rec = try loadRecord(env, a, "users", rid);
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     // Two sessions for the owner.
     const s1 = blk: {
         const w = env.pool.acquireWriter();
@@ -1911,7 +1911,7 @@ test "#99 table mode: listActiveSessions + is_current; revoke authorizes owner-o
     const sid1 = (try jwt.peekClaims(a, s1.token)).sid.?;
 
     // ctx for the owner, authenticated with session s1.
-    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users", .session_id = sid1 }, .request = &hctx };
+    var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&arena), .rctx = .{ .auth = rec, .collection = "users", .session_id = sid1 }, .request = &hctx };
     defer cx.deinit();
 
     const list = try cx.auth().listActiveSessions();
@@ -1926,7 +1926,7 @@ test "#99 table mode: listActiveSessions + is_current; revoke authorizes owner-o
     // A DIFFERENT user may not revoke the owner's session (fail closed). The error is
     // NotFound (indistinguishable from an absent id) — no existence oracle on others' sids.
     const other_rec = try loadRecord(env, a, "users", other_rid);
-    var other_cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = other_rec, .collection = "users" }, .request = &hctx };
+    var other_cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&arena), .rctx = .{ .auth = other_rec, .collection = "users" }, .request = &hctx };
     defer other_cx.deinit();
     try std.testing.expectError(error.NotFound, other_cx.auth().revoke(sid1));
     // Probing a non-existent id yields the SAME error (proves indistinguishability).
@@ -1949,7 +1949,7 @@ test "#99 table mode: refresh preserves created (session start) and advances las
     const rid = try ridOf(env, a, "users", "rs@x.io");
     const rec = try loadRecord(env, a, "users", rid);
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     const s1 = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -1967,7 +1967,7 @@ test "#99 table mode: refresh preserves created (session start) and advances las
     }
 
     // Refresh rotates the row (delete old + insert new). created must carry forward; last_seen advances.
-    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users", .session_id = sid1 }, .request = &hctx };
+    var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&arena), .rctx = .{ .auth = rec, .collection = "users", .session_id = sid1 }, .request = &hctx };
     defer cx.deinit();
     _ = try cx.auth().refresh();
 
@@ -1996,7 +1996,7 @@ test "#99 table mode: logout deletes the current device's session row" {
     try env.createUser(a, "users", "lo@x.io", "longenough");
     const rid = try ridOf(env, a, "users", "lo@x.io");
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     const issued = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -2006,7 +2006,7 @@ test "#99 table mode: logout deletes the current device's session row" {
 
     // Logout with this token (bearer) deletes the row.
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var lo = env.ctx(a, .POST, "", &p);
+    var lo = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     lo.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{issued.token});
     try std.testing.expectEqual(@as(u16, 204), (try authLogout(&lo)).status);
     try std.testing.expectEqual(@as(i64, 0), try sessionCount(env));
@@ -2023,7 +2023,7 @@ test "#99 table mode: revokeAllSessions clears the principal's rows + bumps epoc
     const rid = try ridOf(env, a, "users", "ra@x.io");
     const rec = try loadRecord(env, a, "users", rid);
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
     var n: usize = 0;
     while (n < 3) : (n += 1) {
         const w = env.pool.acquireWriter();
@@ -2032,7 +2032,7 @@ test "#99 table mode: revokeAllSessions clears the principal's rows + bumps epoc
     }
     try std.testing.expectEqual(@as(i64, 3), try sessionCount(env));
 
-    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
+    var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&arena), .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
     defer cx.deinit();
     try cx.auth().revokeAllSessions();
     try std.testing.expectEqual(@as(i64, 0), try sessionCount(env)); // all rows cleared
@@ -2049,8 +2049,8 @@ test "#99 table mode: an unauthorized revoke (error path) does not poison the wr
     const rid = try ridOf(env, a, "users", "wl@x.io");
     const rec = try loadRecord(env, a, "users", rid);
 
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
-    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
+    var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&arena), .rctx = .{ .auth = rec, .collection = "users" }, .request = &hctx };
     defer cx.deinit();
 
     // Error path: revoking a non-existent session id returns NotFound (acquires + releases
@@ -2137,9 +2137,8 @@ test "#99 epoch-mode per-device verbs report SessionStoreNotEnabled" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
-    var hctx = env.ctx(a, .POST, "", &[_]http.Param{});
-    var cx = Ctx{ .app = &env.app, .arena = a, .rctx = .{}, .request = &hctx };
+    var hctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
+    var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = &hctx };
     defer cx.deinit();
     // Default app.session_store == .epoch -> no per-session inventory.
     try std.testing.expectError(error.SessionStoreNotEnabled, cx.auth().listActiveSessions());
@@ -2168,7 +2167,7 @@ test "issueSession is the mint+emit seam: emits onAuth once with the method tag"
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var login = env.ctx(a, .POST, "{\"identity\":\"seam@x.io\",\"password\":\"longenough\"}", &p);
+    var login = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"seam@x.io\",\"password\":\"longenough\"}", &p);
     const res = try authWithPassword(&login);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expectEqual(@as(usize, 1), Counter.seen);
@@ -2208,12 +2207,12 @@ fn countTable(env: *TestEnv, table: []const u8) !i64 {
 }
 
 /// Login and return the issued bearer token (arena-owned).
-fn loginToken(env: *TestEnv, a: std.mem.Allocator, col: []const u8, identity: []const u8, pw: []const u8) ![]const u8 {
+fn loginToken(env: *TestEnv, a: RequestArena, col: []const u8, identity: []const u8, pw: []const u8) ![]const u8 {
     const p = [_]http.Param{.{ .key = "col", .value = col }};
-    const body = try std.fmt.allocPrint(a, "{{\"identity\":\"{s}\",\"password\":\"{s}\"}}", .{ identity, pw });
+    const body = try std.fmt.allocPrint(a.a, "{{\"identity\":\"{s}\",\"password\":\"{s}\"}}", .{ identity, pw });
     var login = env.ctx(a, .POST, body, &p);
     const res = try authWithPassword(&login);
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, res.body, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, a.a, res.body, .{});
     return parsed.value.object.get("token").?.string;
 }
 
@@ -2224,7 +2223,7 @@ test "#98 refresh: before/after refresh hooks fire on a valid refresh" {
     defer arena.deinit();
     const a = arena.allocator();
     try env.createUser(a, "refreshu", "rf@x.io", "longenough");
-    const token = try loginToken(env, a, "refreshu", "rf@x.io", "longenough");
+    const token = try loginToken(env, RequestArena.from(&arena), "refreshu", "rf@x.io", "longenough");
 
     const Hook = struct {
         var before_seen: usize = 0;
@@ -2252,7 +2251,7 @@ test "#98 refresh: before/after refresh hooks fire on a valid refresh" {
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "refreshu" }};
-    var refresh = env.ctx(a, .POST, "", &p);
+    var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const res = try authRefresh(&refresh);
     try std.testing.expectEqual(@as(u16, 200), res.status);
@@ -2270,13 +2269,13 @@ test "#98 refresh: aborting beforeRefresh blocks the session AND rolls back side
     const a = arena.allocator();
     try env.createUser(a, "refreshb", "rf@x.io", "longenough");
     try createBasePosts(env, a);
-    const token = try loginToken(env, a, "refreshb", "rf@x.io", "longenough");
+    const token = try loginToken(env, RequestArena.from(&arena), "refreshb", "rf@x.io", "longenough");
 
     const Hook = struct {
         fn writeThenAbort(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
             _ = ev;
             var o: std.json.ObjectMap = .empty;
-            try o.put(ctx.arena, "title", .{ .string = "rollme" });
+            try o.put(ctx.arena.a, "title", .{ .string = "rollme" });
             _ = try ctx.records().create("posts", .{ .object = o });
             return ctx.fail(403, "no refresh");
         }
@@ -2285,7 +2284,7 @@ test "#98 refresh: aborting beforeRefresh blocks the session AND rolls back side
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "refreshb" }};
-    var refresh = env.ctx(a, .POST, "", &p);
+    var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const res = try authRefresh(&refresh);
     try std.testing.expectEqual(@as(u16, 403), res.status); // fail closed
@@ -2300,7 +2299,7 @@ test "#98 logout: before/after logout hooks fire; session cookies still cleared"
     defer arena.deinit();
     const a = arena.allocator();
     try env.createUser(a, "logoutu", "lo@x.io", "longenough");
-    const token = try loginToken(env, a, "logoutu", "lo@x.io", "longenough");
+    const token = try loginToken(env, RequestArena.from(&arena), "logoutu", "lo@x.io", "longenough");
 
     const Hook = struct {
         var before_seen: usize = 0;
@@ -2326,7 +2325,7 @@ test "#98 logout: before/after logout hooks fire; session cookies still cleared"
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "logoutu" }};
-    var logout = env.ctx(a, .POST, "", &p);
+    var logout = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     logout.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const res = try authLogout(&logout);
     try std.testing.expectEqual(@as(u16, 204), res.status);
@@ -2345,7 +2344,6 @@ test "#98 logout: aborting beforeLogout returns the mapped status and does NOT c
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     const Hook = struct {
         fn abort(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
@@ -2357,7 +2355,7 @@ test "#98 logout: aborting beforeLogout returns the mapped status and does NOT c
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "logoutb" }};
-    var logout = env.ctx(a, .POST, "", &p);
+    var logout = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     const res = try authLogout(&logout);
     try std.testing.expectEqual(@as(u16, 409), res.status);
     try std.testing.expectEqual(@as(usize, 0), res.cookies.len); // cookies NOT cleared
@@ -2397,7 +2395,7 @@ test "#98 password-change: before/after hooks fire on confirm-password-reset" {
 
     const p = [_]http.Param{.{ .key = "col", .value = "pcu" }};
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
-    var conf = env.ctx(a, .POST, body, &p);
+    var conf = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&conf)).status);
     try std.testing.expectEqual(@as(usize, 1), Hook.before_seen);
     try std.testing.expectEqual(@as(usize, 1), Hook.after_seen);
@@ -2424,19 +2422,19 @@ test "#98 password-change: aborting beforePasswordChange leaves password + reset
 
     const p = [_]http.Param{.{ .key = "col", .value = "pcb" }};
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
-    var conf = env.ctx(a, .POST, body, &p);
+    var conf = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 403), (try confirmPasswordReset(&conf)).status);
 
     // Password unchanged: the old password still authenticates.
     env.app.dispatch = null;
-    const old_token = loginToken(env, a, "pcb", "pc@x.io", "oldpassword") catch "";
+    const old_token = loginToken(env, RequestArena.from(&arena), "pcb", "pc@x.io", "oldpassword") catch "";
     try std.testing.expect(old_token.len > 0);
 
     // Reset token un-consumed: with the hook removed, the SAME token now succeeds.
-    var conf2 = env.ctx(a, .POST, body, &p);
+    var conf2 = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&conf2)).status);
     // And the new password now works.
-    const new_token = loginToken(env, a, "pcb", "pc@x.io", "newpassword") catch "";
+    const new_token = loginToken(env, RequestArena.from(&arena), "pcb", "pc@x.io", "newpassword") catch "";
     try std.testing.expect(new_token.len > 0);
 }
 
@@ -2456,7 +2454,7 @@ test "#80 legacy login: beforeAuthSuccess fires, side-write commits with the ses
             method_seen = ev.method;
             // Side-write through the bound in-transaction connection: commits WITH the login.
             var patch: std.json.ObjectMap = .empty;
-            try patch.put(cx.arena, "bio", .{ .string = "logged-in" });
+            try patch.put(cx.arena.a, "bio", .{ .string = "logged-in" });
             _ = try cx.records().update("lg1", ev.record_id, .{ .object = patch });
         }
     };
@@ -2465,7 +2463,7 @@ test "#80 legacy login: beforeAuthSuccess fires, side-write commits with the ses
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "lg1" }};
-    var login = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"password123\"}", &p);
+    var login = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"password123\"}", &p);
     const res = try authWithPassword(&login);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expectEqual(@as(usize, 1), Hook.seen);
@@ -2493,7 +2491,7 @@ test "#80 legacy login: aborting beforeAuthSuccess blocks the session and rolls 
         fn h(cx: *Ctx, ev: *events.AuthSuccessEvent) anyerror!void {
             // Side-write FIRST, then abort: the write must be rolled back with the login.
             var patch: std.json.ObjectMap = .empty;
-            try patch.put(cx.arena, "bio", .{ .string = "MUST-NOT-PERSIST" });
+            try patch.put(cx.arena.a, "bio", .{ .string = "MUST-NOT-PERSIST" });
             _ = try cx.records().update("lg2", ev.record_id, .{ .object = patch });
             return cx.fail(451, "login vetoed");
         }
@@ -2502,7 +2500,7 @@ test "#80 legacy login: aborting beforeAuthSuccess blocks the session and rolls 
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "lg2" }};
-    var login = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"password123\"}", &p);
+    var login = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"password123\"}", &p);
     const res = try authWithPassword(&login);
     try std.testing.expectEqual(@as(u16, 451), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "token") == null); // no session
@@ -2516,7 +2514,7 @@ test "#80 legacy login: aborting beforeAuthSuccess blocks the session and rolls 
     }
     // Writer not poisoned: with the hook removed, login succeeds cleanly.
     env.app.dispatch = null;
-    const tok = loginToken(env, a, "lg2", "u@x.io", "password123") catch "";
+    const tok = loginToken(env, RequestArena.from(&arena), "lg2", "u@x.io", "password123") catch "";
     try std.testing.expect(tok.len > 0);
 }
 
@@ -2530,7 +2528,7 @@ test "#80 hook-free epoch login never acquires the writer" {
     // env.app.dispatch == null and session_store == .epoch (defaults): the fast path.
     const before = env.pool.writer_acquires;
     const p = [_]http.Param{.{ .key = "col", .value = "lg3" }};
-    var login = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"password123\"}", &p);
+    var login = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"password123\"}", &p);
     try std.testing.expectEqual(@as(u16, 200), (try authWithPassword(&login)).status);
     try std.testing.expectEqual(before, env.pool.writer_acquires); // reader-only login
 }
@@ -2543,7 +2541,7 @@ test "#80 authRefresh: before_refresh then beforeAuthSuccess(.refresh) in ONE tx
     const a = arena.allocator();
     env.app.session_store = .table; // so we can observe the sid row surviving the rollback
     try env.createUser(a, "rf1", "u@x.io", "password123");
-    const tok = try loginToken(env, a, "rf1", "u@x.io", "password123");
+    const tok = try loginToken(env, RequestArena.from(&arena), "rf1", "u@x.io", "password123");
 
     const Order = struct {
         var log: [4]u8 = undefined;
@@ -2573,7 +2571,7 @@ test "#80 authRefresh: before_refresh then beforeAuthSuccess(.refresh) in ONE tx
 
     const p = [_]http.Param{.{ .key = "col", .value = "rf1" }};
     const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
-    var refresh = env.ctx(a, .POST, "", &p);
+    var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     refresh.authorization = bearer;
     const res = try authRefresh(&refresh);
     try std.testing.expectEqual(@as(u16, 403), res.status);
@@ -2582,7 +2580,7 @@ test "#80 authRefresh: before_refresh then beforeAuthSuccess(.refresh) in ONE tx
     try std.testing.expectEqual(events.AuthMethod.refresh, Order.seam_method);
     // Fail closed: the OLD session row is intact (rolled-back delete) and the token still works.
     env.app.dispatch = null;
-    var refresh2 = env.ctx(a, .POST, "", &p);
+    var refresh2 = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     refresh2.authorization = bearer;
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh2)).status);
 }
@@ -2594,7 +2592,7 @@ test "#80 onAuth reports .refresh (not .password) on auth-refresh" {
     defer arena.deinit();
     const a = arena.allocator();
     try env.createUser(a, "rf2", "u@x.io", "password123");
-    const tok = try loginToken(env, a, "rf2", "u@x.io", "password123");
+    const tok = try loginToken(env, RequestArena.from(&arena), "rf2", "u@x.io", "password123");
 
     const Tag = struct {
         var seen: ?events.AuthMethod = null;
@@ -2608,7 +2606,7 @@ test "#80 onAuth reports .refresh (not .password) on auth-refresh" {
 
     const p = [_]http.Param{.{ .key = "col", .value = "rf2" }};
     const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
-    var refresh = env.ctx(a, .POST, "", &p);
+    var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     refresh.authorization = bearer;
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
     try std.testing.expectEqual(events.AuthMethod.refresh, Tag.seen.?);

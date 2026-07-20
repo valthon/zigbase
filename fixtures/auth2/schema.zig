@@ -14,9 +14,9 @@ const zigbase = @import("zigbase");
 fn gateLogin(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!void {
     // Side-write FIRST so the veto path also proves rollback.
     var row: std.json.ObjectMap = .empty;
-    try row.put(ctx.arena, "who", .{ .string = ev.record_id });
-    try row.put(ctx.arena, "col", .{ .string = ev.collection });
-    try row.put(ctx.arena, "method", .{ .string = @tagName(ev.method) });
+    try row.put(ctx.arena.a, "who", .{ .string = ev.record_id });
+    try row.put(ctx.arena.a, "col", .{ .string = ev.collection });
+    try row.put(ctx.arena.a, "method", .{ .string = @tagName(ev.method) });
     _ = try ctx.records().create("loginAudit", .{ .object = row });
     if (ev.record == .object) if (ev.record.object.get("email")) |em| if (em == .string) {
         if (std.mem.startsWith(u8, em.string, "blocked")) return ctx.fail(403, "login blocked by hook");

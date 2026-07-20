@@ -7,6 +7,7 @@
 //! record the outcome.
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const db = @import("../db.zig");
 const clock = @import("../clock.zig");
 const id = @import("../id.zig");
@@ -354,7 +355,7 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
         if (reg_job) |rj| {
             var arena = std.heap.ArenaAllocator.init(app.allocator);
             defer arena.deinit();
-            var cx = Ctx{ .app = app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+            var cx = Ctx{ .app = app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = null, .bound_conn = null };
             defer cx.deinit();
             rj.handler(&cx, job.payload) catch |e| {
                 run_err = e;

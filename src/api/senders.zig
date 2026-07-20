@@ -12,6 +12,7 @@
 //! sender enforcement), never returned in the API response.
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const app_mod = @import("../app.zig");
 const auth = @import("../auth.zig");
@@ -25,16 +26,16 @@ const db = @import("../db.zig");
 const Scope = struct { account: []const u8, is_superuser: bool };
 
 fn unauthorized(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator);
+    return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator.a);
 }
 fn forbidden(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 403, .message = "Not a member of this account." }).toResponse(ctx.allocator);
+    return (ApiError{ .status = 403, .message = "Not a member of this account." }).toResponse(ctx.allocator.a);
 }
 
 /// Resolve the account this request may manage senders for. Returns null + a stashed response on a
 /// failure (401/403) that the caller should return.
 fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, reader: *db.Db, out: *?http.Response) !?Scope {
-    const a = (auth.authenticate(app.io, ctx.allocator, app, ctx, reader) catch null) orelse {
+    const a = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, reader) catch null) orelse {
         out.* = try unauthorized(ctx);
         return null;
     };
@@ -60,7 +61,7 @@ fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, reader: *db.Db, out: *
         return null;
     }
     const requested = tenancy.requestedAccount(ctx, app) orelse "";
-    const res = try tenancy.resolve(ctx.allocator, reader, a.collection, id_v.string, requested);
+    const res = try tenancy.resolve(ctx.allocator.a, reader, a.collection, id_v.string, requested);
     if (res.account_id.len == 0) {
         out.* = try forbidden(ctx);
         return null;
@@ -88,31 +89,31 @@ fn listBody(alloc: std.mem.Allocator, ids: []const senders.Identity) ![]const u8
 
 /// GET /api/senders — list the active account's sender identities.
 pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
 
     var early: ?http.Response = null;
     const scope = (try resolveScope(ctx, app, &r, &early)) orelse return early.?;
 
-    const ids = try senders.listForAccount(ctx.allocator, &r, scope.account);
+    const ids = try senders.listForAccount(ctx.allocator.a, &r, scope.account);
     return .{
         .status = 200,
         .content_type = "application/json",
-        .body = try listBody(ctx.allocator, ids),
+        .body = try listBody(ctx.allocator.a, ids),
     };
 }
 
 /// POST /api/senders {"email":"…"} — request verification (mints a token, emails it).
 pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator.a);
 
     const email = blk: {
-        const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch
-            return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-        if (parsed.value != .object) return ApiError.badRequest("Expected a JSON object.").toResponse(ctx.allocator);
-        const e = parsed.value.object.get("email") orelse return ApiError.badRequest("Missing 'email'.").toResponse(ctx.allocator);
-        if (e != .string) return ApiError.badRequest("'email' must be a string.").toResponse(ctx.allocator);
+        const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator.a, ctx.body, .{}) catch
+            return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator.a);
+        if (parsed.value != .object) return ApiError.badRequest("Expected a JSON object.").toResponse(ctx.allocator.a);
+        const e = parsed.value.object.get("email") orelse return ApiError.badRequest("Missing 'email'.").toResponse(ctx.allocator.a);
+        if (e != .string) return ApiError.badRequest("'email' must be a string.").toResponse(ctx.allocator.a);
         break :blk e.string;
     };
 
@@ -122,10 +123,10 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     var early: ?http.Response = null;
     const scope = (try resolveScope(ctx, app, w, &early)) orelse return early.?;
 
-    const req = senders.requestVerification(app.io, ctx.allocator, w, scope.account, email) catch |e| switch (e) {
-        error.InvalidSenderEmail => return ApiError.badRequest("Invalid sender email.").toResponse(ctx.allocator),
+    const req = senders.requestVerification(app.io, ctx.allocator.a, w, scope.account, email) catch |e| switch (e) {
+        error.InvalidSenderEmail => return ApiError.badRequest("Invalid sender email.").toResponse(ctx.allocator.a),
         // Rate-limited (I3): a (re)send was requested again within the window — do not re-issue/email.
-        error.VerificationThrottled => return (ApiError{ .status = 429, .message = "Verification email already sent recently; try again later." }).toResponse(ctx.allocator),
+        error.VerificationThrottled => return (ApiError{ .status = 429, .message = "Verification email already sent recently; try again later." }).toResponse(ctx.allocator.a),
         else => return e,
     };
 
@@ -133,8 +134,8 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // so it bypasses verified-sender enforcement (chicken-and-egg). Best-effort: a mail failure must
     // not lose the already-persisted pending identity, so we swallow it (the operator can re-request).
     if (!req.already_verified and req.token.len > 0) {
-        const text = std.fmt.allocPrint(ctx.allocator, "Confirm you can send from {s} by submitting this token to /api/senders/{s}/verify:\n\n{s}\n", .{ req.email, req.id, req.token }) catch "";
-        mail_send.send(app, ctx.allocator, .{
+        const text = std.fmt.allocPrint(ctx.allocator.a, "Confirm you can send from {s} by submitting this token to /api/senders/{s}/verify:\n\n{s}\n", .{ req.email, req.id, req.token }) catch "";
+        mail_send.send(app, ctx.allocator.a, .{
             .to = req.email,
             .subject = "Verify your sender address",
             .text = text,
@@ -142,27 +143,27 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     }
 
     var o: std.json.ObjectMap = .empty;
-    try o.put(ctx.allocator, "id", .{ .string = req.id });
-    try o.put(ctx.allocator, "email", .{ .string = req.email });
-    try o.put(ctx.allocator, "status", .{ .string = if (req.already_verified) senders.status_verified else senders.status_pending });
+    try o.put(ctx.allocator.a, "id", .{ .string = req.id });
+    try o.put(ctx.allocator.a, "email", .{ .string = req.email });
+    try o.put(ctx.allocator.a, "status", .{ .string = if (req.already_verified) senders.status_verified else senders.status_pending });
     return .{
         .status = if (req.already_verified) 200 else 201,
         .content_type = "application/json",
-        .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = o }, .{}),
+        .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = o }, .{}),
     };
 }
 
 /// POST /api/senders/:id/verify {"token":"…"} — confirm a pending identity.
 pub fn verify(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const identity_id = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const identity_id = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
 
     const token = blk: {
-        const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch
-            return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
-        if (parsed.value != .object) return ApiError.badRequest("Expected a JSON object.").toResponse(ctx.allocator);
-        const t = parsed.value.object.get("token") orelse return ApiError.badRequest("Missing 'token'.").toResponse(ctx.allocator);
-        if (t != .string) return ApiError.badRequest("'token' must be a string.").toResponse(ctx.allocator);
+        const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator.a, ctx.body, .{}) catch
+            return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator.a);
+        if (parsed.value != .object) return ApiError.badRequest("Expected a JSON object.").toResponse(ctx.allocator.a);
+        const t = parsed.value.object.get("token") orelse return ApiError.badRequest("Missing 'token'.").toResponse(ctx.allocator.a);
+        if (t != .string) return ApiError.badRequest("'token' must be a string.").toResponse(ctx.allocator.a);
         break :blk t.string;
     };
 
@@ -172,17 +173,17 @@ pub fn verify(ctx: *http.RequestCtx) anyerror!http.Response {
     var early: ?http.Response = null;
     const scope = (try resolveScope(ctx, app, w, &early)) orelse return early.?;
 
-    const ok = try senders.confirm(ctx.allocator, w, scope.account, identity_id, token);
+    const ok = try senders.confirm(ctx.allocator.a, w, scope.account, identity_id, token);
     if (!ok) {
         // Indistinguishable: wrong token, wrong account, or absent id all collapse to 404 (no oracle).
-        return ApiError.notFound().toResponse(ctx.allocator);
+        return ApiError.notFound().toResponse(ctx.allocator.a);
     }
     var o: std.json.ObjectMap = .empty;
-    try o.put(ctx.allocator, "verified", .{ .bool = true });
+    try o.put(ctx.allocator.a, "verified", .{ .bool = true });
     return .{
         .status = 200,
         .content_type = "application/json",
-        .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = o }, .{}),
+        .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = o }, .{}),
     };
 }
 
@@ -217,7 +218,7 @@ test "verify requires authentication (401 without auth)" {
     var ctx = http.RequestCtx{
         .method = .POST,
         .path = "/api/senders/abc/verify",
-        .allocator = arena.allocator(),
+        .allocator = RequestArena.from(&arena),
         .app = &app,
         .body = "{\"token\":\"x\"}",
         .params = &.{.{ .key = "id", .value = "abc" }},

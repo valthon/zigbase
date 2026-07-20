@@ -23,6 +23,7 @@
 //! v1: a second reap path racing on_close is precisely the double-free hazard this design
 //! eliminates; the registry cannot leak, and a closed-but-briefly-pinned entry answers 404.
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const zap = @import("zap");
 const sse_fio = @import("sse_fio.zig");
 const ws = @import("ws.zig");
@@ -158,31 +159,31 @@ pub const Reply = struct { status: u16, frame: []const u8 };
 /// closed=true (the named race, spec §1.3). Returns null when the conn is already closed:
 /// the caller's 404 is byte-identical to an unknown id (non-oracle).
 /// The verb bodies are hub.authVerb / hub.subscribeCheck — the SAME code WS runs.
-pub fn handleUplink(sc: *SseConn, a: std.mem.Allocator, body: []const u8) !?Reply {
+pub fn handleUplink(sc: *SseConn, a: RequestArena, body: []const u8) !?Reply {
     lockMu(&sc.mu);
     defer sc.mu.unlock();
     if (sc.closed) return null;
-    const msg = protocol.parseClient(a, body) catch {
-        return .{ .status = 400, .frame = try protocol.errorFrame(a, "bad message") };
+    const msg = protocol.parseClient(a.a, body) catch {
+        return .{ .status = 400, .frame = try protocol.errorFrame(a.a, "bad message") };
     };
     const da = sc.durable.allocator();
     switch (msg) {
         .auth => |m| {
             const ok = hub.authVerb(sc.app, &sc.conn, &sc.identity, m.token, sc.requested_account);
-            return .{ .status = 200, .frame = try protocol.authFrame(a, ok) };
+            return .{ .status = 200, .frame = try protocol.authFrame(a.a, ok) };
         },
         .subscribe => |m| {
             switch (hub.subscribeCheck(sc.app, &sc.conn, a, m.topic)) {
-                .limit => return .{ .status = 200, .frame = try protocol.errorFrame(a, "subscription limit reached") },
-                .unknown => return .{ .status = 200, .frame = try protocol.errorFrame(a, "unknown collection") },
-                .auth_required => return .{ .status = 200, .frame = try protocol.errorFrame(a, "authentication required to subscribe") },
+                .limit => return .{ .status = 200, .frame = try protocol.errorFrame(a.a, "subscription limit reached") },
+                .unknown => return .{ .status = 200, .frame = try protocol.errorFrame(a.a, "unknown collection") },
+                .auth_required => return .{ .status = 200, .frame = try protocol.errorFrame(a.a, "authentication required to subscribe") },
                 .ok => {},
             }
             // #3: replace-in-place on a repeat subscribe (mirrors ws.zig) — reuse the single fio
             // subscription instead of stacking a second, which bypassed MAX_SUBS and duplicated
             // every delivered frame.
             if (try sc.conn.updateFilter(da, m.topic, m.filter)) {
-                return .{ .status = 200, .frame = try protocol.ackFrame(a, "subscribe", m.topic) };
+                return .{ .status = 200, .frame = try protocol.ackFrame(a.a, "subscribe", m.topic) };
             }
             // Same durable-dupe discipline as WS (the m.topic buffer dies with this request).
             const channel = try da.dupe(u8, m.topic);
@@ -193,7 +194,7 @@ pub fn handleUplink(sc: *SseConn, a: std.mem.Allocator, body: []const u8) !?Repl
                     // #30: don't ack a failed fio subscribe as success — roll back + surface an error.
                     _ = sc.conn.removeSub(m.topic);
                     std.log.warn("realtime: SSE subscribe to \"{s}\" failed (fio subscribe returned 0)", .{m.topic});
-                    return .{ .status = 200, .frame = try protocol.errorFrame(a, "subscribe failed") };
+                    return .{ .status = 200, .frame = try protocol.errorFrame(a.a, "subscribe failed") };
                 }
                 sc.sub_ids.put(da, channel, sub_id) catch {
                     // #30: fio subscribe SUCCEEDED but recording its id failed — without the id a
@@ -203,17 +204,17 @@ pub fn handleUplink(sc: *SseConn, a: std.mem.Allocator, body: []const u8) !?Repl
                     sse_fio.unsubscribe(h, sub_id);
                     _ = sc.conn.removeSub(m.topic);
                     std.log.warn("realtime: SSE subscribe to \"{s}\" failed (sub_id store OOM)", .{m.topic});
-                    return .{ .status = 200, .frame = try protocol.errorFrame(a, "subscribe failed") };
+                    return .{ .status = 200, .frame = try protocol.errorFrame(a.a, "subscribe failed") };
                 };
             }
-            return .{ .status = 200, .frame = try protocol.ackFrame(a, "subscribe", m.topic) };
+            return .{ .status = 200, .frame = try protocol.ackFrame(a.a, "subscribe", m.topic) };
         },
         .unsubscribe => |m| {
             if (sc.sub_ids.fetchRemove(m.topic)) |kv| {
                 if (sc.handle) |h| sse_fio.unsubscribe(h, kv.value);
             }
             _ = sc.conn.removeSub(m.topic);
-            return .{ .status = 200, .frame = try protocol.ackFrame(a, "unsubscribe", m.topic) };
+            return .{ .status = 200, .frame = try protocol.ackFrame(a.a, "unsubscribe", m.topic) };
         },
     }
 }
@@ -474,26 +475,25 @@ test "handleUplink: closed conn returns null (non-oracle); bad body 400; unsubsc
     var app = testApp();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const sc = try create(&app);
     _ = connection.reserveConnectionSlot();
     try registryInsert(sc);
     defer registryReset(std.testing.allocator);
 
     // Bad body -> 400 + the exact WS error frame.
-    const bad = (try handleUplink(sc, a, "not json")).?;
+    const bad = (try handleUplink(sc, RequestArena.from(&arena), "not json")).?;
     try std.testing.expectEqual(@as(u16, 400), bad.status);
     try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"bad message\"}", bad.frame);
 
     // Unsubscribe of an unknown topic: 200 + ack (WS parity — unsubscribe is idempotent).
-    const un = (try handleUplink(sc, a, "{\"action\":\"unsubscribe\",\"topic\":\"nope\"}")).?;
+    const un = (try handleUplink(sc, RequestArena.from(&arena), "{\"action\":\"unsubscribe\",\"topic\":\"nope\"}")).?;
     try std.testing.expectEqual(@as(u16, 200), un.status);
     try std.testing.expect(std.mem.indexOf(u8, un.frame, "\"action\":\"unsubscribe\"") != null);
 
     const pinned = pin(sc.client_id[0..]).?;
     markClosedAndRelease(sc);
     // Closed: the verb reports null — the api layer maps it to the SAME 404 as unknown.
-    try std.testing.expect((try handleUplink(pinned, a, "{\"action\":\"unsubscribe\",\"topic\":\"x\"}")) == null);
+    try std.testing.expect((try handleUplink(pinned, RequestArena.from(&arena), "{\"action\":\"unsubscribe\",\"topic\":\"x\"}")) == null);
     unref(pinned);
 }
 
@@ -530,18 +530,18 @@ test "handleUplink: subscribe/auth run the SHARED hub verbs (pool-backed decisio
     defer registryReset(ga);
 
     // Anonymous subscribe to @public: 200 + ack; the sub is registered on the conn.
-    const ok = (try handleUplink(sc, a, "{\"action\":\"subscribe\",\"topic\":\"sse_pub\"}")).?;
+    const ok = (try handleUplink(sc, RequestArena.from(&arena), "{\"action\":\"subscribe\",\"topic\":\"sse_pub\"}")).?;
     try std.testing.expectEqual(@as(u16, 200), ok.status);
     try std.testing.expect(std.mem.indexOf(u8, ok.frame, "\"type\":\"ack\"") != null);
     try std.testing.expect(sc.conn.hasSub("sse_pub"));
     // Anonymous subscribe to locked: 200 + the exact WS error frame; no sub registered.
-    const deny = (try handleUplink(sc, a, "{\"action\":\"subscribe\",\"topic\":\"sse_locked\"}")).?;
+    const deny = (try handleUplink(sc, RequestArena.from(&arena), "{\"action\":\"subscribe\",\"topic\":\"sse_locked\"}")).?;
     try std.testing.expectEqual(@as(u16, 200), deny.status);
     try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"authentication required to subscribe\"}", deny.frame);
     try std.testing.expect(!sc.conn.hasSub("sse_locked"));
     // Unknown collection... is a CUSTOM topic (#143 default-public) -> ack; a garbage auth
     // token -> {"type":"auth","status":"error"}.
-    const auth_bad = (try handleUplink(sc, a, "{\"action\":\"auth\",\"token\":\"garbage\"}")).?;
+    const auth_bad = (try handleUplink(sc, RequestArena.from(&arena), "{\"action\":\"auth\",\"token\":\"garbage\"}")).?;
     try std.testing.expectEqualStrings("{\"type\":\"auth\",\"status\":\"error\"}", auth_bad.frame);
 
     markClosedAndRelease(sc);

@@ -30,6 +30,7 @@
 //! own tests under `std.testing.allocator` so a leak across boot → requests → deinit FAILS.
 
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 
 const config = @import("config.zig");
 const http = @import("http.zig");
@@ -259,8 +260,8 @@ pub fn Harness(comptime AppType: type) type {
             if (self.owns_tmp) self.tmp.cleanup();
         }
 
-        /// Allocate a fresh tracked arena; its allocator is valid until `deinit`.
-        fn newArena(self: *Self) !std.mem.Allocator {
+        /// Allocate a fresh tracked arena; it is valid until `deinit`.
+        fn newArena(self: *Self) !*std.heap.ArenaAllocator {
             const ap = try self.allocator.create(std.heap.ArenaAllocator);
             ap.* = std.heap.ArenaAllocator.init(self.allocator);
             errdefer {
@@ -268,7 +269,7 @@ pub fn Harness(comptime AppType: type) type {
                 self.allocator.destroy(ap);
             }
             try self.arenas.append(self.allocator, ap);
-            return ap.allocator();
+            return ap;
         }
 
         /// Inject a request through the full socketless pipeline. `opts` is an anonymous struct;
@@ -289,7 +290,8 @@ pub fn Harness(comptime AppType: type) type {
                         "' (allowed: json, body, auth, headers, query, content_type, cookie)");
                 }
             }
-            const a = try self.newArena();
+            const ap = try self.newArena();
+            const a = ap.allocator();
 
             // Body + content-type: `.json` wins over `.body`.
             var body: []const u8 = "";
@@ -332,7 +334,7 @@ pub fn Harness(comptime AppType: type) type {
                 .path = req_path,
                 .query = req_query,
                 .body = body,
-                .allocator = a,
+                .allocator = RequestArena.from(ap),
                 .app = &self.booted.app,
                 .headers = headers,
             };
@@ -404,7 +406,8 @@ pub fn Harness(comptime AppType: type) type {
             // anything. `isCollectionName` permits the leading underscore of system collections
             // (`_superusers`) while keeping the charset `[A-Za-z0-9_]`.
             if (!isCollectionName(collection)) return error.InvalidCollection;
-            const a = try self.newArena();
+            const ap = try self.newArena();
+            const a = ap.allocator();
             const the_app = &self.booted.app;
             var r = try the_app.pool.acquireReader();
             defer the_app.pool.releaseReader(&r);
@@ -426,7 +429,8 @@ pub fn Harness(comptime AppType: type) type {
         /// Full-fidelity: runs the rate limiter, argon2 verify, verification gate, and
         /// `beforeAuthSuccess`/`onAuth` hooks exactly as a socket login does.
         pub fn loginPassword(self: *Self, collection: []const u8, identity: []const u8, password: []const u8) ![]const u8 {
-            const a = try self.newArena();
+            const ap = try self.newArena();
+            const a = ap.allocator();
             const path = try std.fmt.allocPrint(a, "/api/collections/{s}/auth-with-password", .{collection});
             const resp = try self.request(.POST, path, .{ .json = .{ .identity = identity, .password = password } });
             if (resp.status != 200) return error.LoginFailed;
@@ -445,7 +449,8 @@ pub fn Harness(comptime AppType: type) type {
         /// The id is owned by a harness arena. Password is argon2id-hashed; a random `tokenKey` is
         /// generated so the account works with `loginSuperuser`.
         pub fn createSuperuser(self: *Self, email: []const u8, password: []const u8) ![]const u8 {
-            const a = try self.newArena();
+            const ap = try self.newArena();
+            const a = ap.allocator();
             const the_app = &self.booted.app;
             const phc = try crypto.hashPassword(the_app.io, a, password);
             const tk = try crypto.genToken(the_app.io, a, 32);
@@ -469,7 +474,8 @@ pub fn Harness(comptime AppType: type) type {
         /// collections get a generated `tokenKey` + hashed `password`). `value` is any type
         /// serializable to a JSON object. Returns the persisted record (arena-owned).
         pub fn createRecord(self: *Self, collection: []const u8, value: anytype) !std.json.Value {
-            const a = try self.newArena();
+            const ap = try self.newArena();
+            const a = ap.allocator();
             const the_app = &self.booted.app;
             const json_bytes = try std.json.Stringify.valueAlloc(a, value, .{});
             const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, json_bytes, .{});
@@ -542,7 +548,7 @@ fn echoHandler(ctx: *Ctx) anyerror!http.Response {
         .h = rc.header("x-custom") orelse "",
         .c = rc.cookie("sess") orelse "",
     };
-    const body = try std.json.Stringify.valueAlloc(ctx.arena, out, .{});
+    const body = try std.json.Stringify.valueAlloc(ctx.arena.a, out, .{});
     return .{
         .status = 200,
         .body = body,

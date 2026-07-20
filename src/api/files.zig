@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
@@ -69,12 +70,12 @@ fn cacheControlFor(col: schema.Collection) []const u8 {
 /// `api/records.zig`'s `buildContext`, the other REST chokepoints that resolve tenant scope.
 fn fileIdentity(ctx: *http.RequestCtx, conn: *db.Db) ?auth.Authed {
     const app = ctx.app.?;
-    const qp = params_mod.parse(ctx.allocator, ctx.query) catch null;
+    const qp = params_mod.parse(ctx.allocator.a, ctx.query) catch null;
     if (qp) |p| if (p.get("token")) |tok| {
-        if (auth.verifyTokenOfTypes(ctx.allocator, app, conn, tok, &.{ .auth, .file })) |v|
+        if (auth.verifyTokenOfTypes(ctx.allocator.a, app, conn, tok, &.{ .auth, .file })) |v|
             return .{ .record = v.record, .collection = v.collection, .is_superuser = v.is_superuser, .sid = v.sid };
     };
-    return auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null;
+    return auth.authenticate(app.io, ctx.allocator.a, app, ctx, conn) catch null;
 }
 
 /// GET /api/files/:col/:rec/:name
@@ -82,14 +83,14 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
-    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rid = ctx.param("rec") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const name = ctx.param("name") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if (name.len == 0) return ApiError.notFound().toResponse(ctx.allocator);
+    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const rid = ctx.param("rec") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const name = ctx.param("name") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    if (name.len == 0) return ApiError.notFound().toResponse(ctx.allocator.a);
 
-    const col = (try collections.get(ctx.allocator, &r, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rec = (try records.get(ctx.allocator, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if (!recordReferencesFile(col, rec, name)) return ApiError.notFound().toResponse(ctx.allocator);
+    const col = (try collections.get(ctx.allocator.a, &r, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const rec = (try records.get(ctx.allocator.a, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    if (!recordReferencesFile(col, rec, name)) return ApiError.notFound().toResponse(ctx.allocator.a);
 
     const ident = fileIdentity(ctx, &r);
     var rctx = request.RequestContext{
@@ -114,19 +115,19 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         rctx.role_ranking = app.role_ranking;
     }
     switch (policy.decide(col, .view, &rctx)) {
-        .deny_locked => return ApiError.notFound().toResponse(ctx.allocator),
+        .deny_locked => return ApiError.notFound().toResponse(ctx.allocator.a),
         .allow => {},
-        .check => if (!try policy.authorizes(ctx.allocator, &r, col, .view, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
+        .check => if (!try policy.authorizes(ctx.allocator.a, &r, col, .view, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator.a),
     }
 
     // file.beforeServe runs only on files the requester may already access; a handler
     // returning an error denies the download as 404 (hides existence, like viewRule).
     if (app.dispatch) |d| if (d.on_file_serve) |h| {
         var fev = events.FileEvent{ .app = app, .ctx = &rctx, .collection = col_name, .record_id = rid, .filename = name };
-        h(&fev) catch return ApiError.notFound().toResponse(ctx.allocator);
+        h(&fev) catch return ApiError.notFound().toResponse(ctx.allocator.a);
     };
 
-    const storage = app.storage orelse return ApiError.internal().toResponse(ctx.allocator);
+    const storage = app.storage orelse return ApiError.internal().toResponse(ctx.allocator.a);
 
     // Presigned-redirect mode (opt-in via `App(.{ .files = .{ .s3_presign_redirect = true } })`,
     // S3-only). Authorization above has ALREADY run per-request; here we offload the byte transfer
@@ -139,8 +140,8 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     // or a build without -Ds3), so we fall through to the unchanged proxy path. A HEAD is honored
     // too — the 302 carries no body. A signing failure propagates (→ 500), not a silent fallback.
     if (app.files.presign_redirect) {
-        if (try storage.presignGetUrl(app.io, ctx.allocator, col.name, rid, name, app.files.presign_ttl_s)) |url| {
-            const hs = try ctx.allocator.dupe(http.Header, &.{.{ .name = "Location", .value = url }});
+        if (try storage.presignGetUrl(app.io, ctx.allocator.a, col.name, rid, name, app.files.presign_ttl_s)) |url| {
+            const hs = try ctx.allocator.a.dupe(http.Header, &.{.{ .name = "Location", .value = url }});
             return .{ .status = 302, .body = "", .content_type = "text/plain", .extra_headers = hs };
         }
     }
@@ -148,24 +149,24 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     // §D.5: null = the DB references an object the backend has lost — hide existence
     // (404) but SCREAM in the logs; a transport/backend error (post retry-once inside
     // the backend) = transient -> 500.
-    const maybe_path = storage.fetch(app.io, ctx.allocator, col.name, rid, name) catch |e| {
+    const maybe_path = storage.fetch(app.io, ctx.allocator.a, col.name, rid, name) catch |e| {
         std.log.err("storage.fetch failed for {s}/{s}/{s}: {s}", .{ col.name, rid, name, @errorName(e) });
-        return ApiError.internal().toResponse(ctx.allocator);
+        return ApiError.internal().toResponse(ctx.allocator.a);
     };
     const path = maybe_path orelse {
         std.log.err("storage backend has no object for referenced file {s}/{s}/{s}", .{ col.name, rid, name });
-        return ApiError.notFound().toResponse(ctx.allocator);
+        return ApiError.notFound().toResponse(ctx.allocator.a);
     };
     // The backend reported success but the fetched path is unreadable/unstattable: 404
     // (hide existence), matching the old sendFile-catch behavior — but planned here so
     // the conditional headers below never describe a file we can't stat.
     const st = std.Io.Dir.cwd().statFile(app.io, path, .{}) catch
-        return ApiError.notFound().toResponse(ctx.allocator);
+        return ApiError.notFound().toResponse(ctx.allocator.a);
 
     // §B.2/§B.3: plan status + byte window from the request's conditional headers.
     // Authorization (above) already completed — no plan output can leak denied bytes.
-    const etag = try serve_file.fileEtag(ctx.allocator, col.name, rid, name);
-    const p = try serve_file.plan(ctx.allocator, .{
+    const etag = try serve_file.fileEtag(ctx.allocator.a, col.name, rid, name);
+    const p = try serve_file.plan(ctx.allocator.a, .{
         .size = st.size,
         .etag = etag,
         .range = ctx.header("range") orelse "",
@@ -181,14 +182,14 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         // RFC 9110 §15.4.5: a 304 replays the validator + cache policy only, but the
         // Content-Type still applies to the (unsent) representation — omitting it lets
         // the server fall back to its default application/json, which is wrong here.
-        const hs304 = try ctx.allocator.dupe(http.Header, &.{
+        const hs304 = try ctx.allocator.a.dupe(http.Header, &.{
             .{ .name = "ETag", .value = etag },
             .{ .name = "Cache-Control", .value = cache },
         });
         return .{ .status = 304, .body = "", .content_type = content_type, .extra_headers = hs304 };
     }
 
-    const qp = params_mod.parse(ctx.allocator, ctx.query) catch null;
+    const qp = params_mod.parse(ctx.allocator.a, ctx.query) catch null;
     const force_download = if (qp) |pq| (pq.get("download") != null) else false;
     // Only render inline for known-safe types; everything else downloads
     // (neutralizes HTML/SVG/JS XSS). ?download and ?token compose orthogonally
@@ -199,10 +200,10 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     };
     const inline_safe = isInlineSafeExt(ext);
     const disp_kind: []const u8 = if (force_download or !inline_safe) "attachment" else "inline";
-    const disposition = try std.fmt.allocPrint(ctx.allocator, "{s}; filename=\"{s}\"", .{ disp_kind, name });
+    const disposition = try std.fmt.allocPrint(ctx.allocator.a, "{s}; filename=\"{s}\"", .{ disp_kind, name });
 
     var hs: std.ArrayList(http.Header) = .empty;
-    try hs.appendSlice(ctx.allocator, &.{
+    try hs.appendSlice(ctx.allocator.a, &.{
         .{ .name = "Referrer-Policy", .value = "no-referrer" },
         .{ .name = "X-Content-Type-Options", .value = "nosniff" },
         .{ .name = "Content-Security-Policy", .value = "default-src 'none'; sandbox" },
@@ -211,20 +212,20 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         .{ .name = "ETag", .value = etag },
         .{ .name = "Accept-Ranges", .value = "bytes" },
     });
-    if (p.content_range) |cr| try hs.append(ctx.allocator, .{ .name = "Content-Range", .value = cr });
+    if (p.content_range) |cr| try hs.append(ctx.allocator.a, .{ .name = "Content-Range", .value = cr });
     if (p.status == 416) {
-        return .{ .status = 416, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator) };
+        return .{ .status = 416, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator.a) };
     }
     if (ctx.method == .HEAD) {
         // facil.io's http1_sendfile does NOT strip bodies for HEAD, so mirror
         // facil.io's own static HEAD handling (http.c:585-590): explicit
         // Content-Length + empty body — http_send_body's add_content_length is
         // set-if-missing, so the real length survives while zero bytes are sent.
-        try hs.append(ctx.allocator, .{
+        try hs.append(ctx.allocator.a, .{
             .name = "Content-Length",
-            .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{p.len}),
+            .value = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{p.len}),
         });
-        return .{ .status = p.status, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator) };
+        return .{ .status = p.status, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator.a) };
     }
     // 200 or 206: ALWAYS set len (the planner computed it even for the full body), so
     // this route deterministically takes server.zig's owned http_sendfile path.
@@ -233,7 +234,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         .body = "",
         .content_type = content_type,
         .file = .{ .path = path, .offset = p.offset, .len = p.len },
-        .extra_headers = try hs.toOwnedSlice(ctx.allocator),
+        .extra_headers = try hs.toOwnedSlice(ctx.allocator.a),
     };
 }
 
@@ -393,7 +394,7 @@ test "serve: header emission — exactly one Cache-Control, ETag, Accept-Ranges;
         .{ .key = "col", .value = "docs" }, .{ .key = "rec", .value = "r1" }, .{ .key = "name", .value = "a_0000000000.png" },
     };
     // Plain GET: 200, exactly one Cache-Control, ETag + Accept-Ranges, owned file ref.
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .app = &app, .params = &params };
     const r200 = try serve(&ctx);
     try std.testing.expectEqual(@as(u16, 200), r200.status);
     try std.testing.expect(r200.file != null);
@@ -410,21 +411,21 @@ test "serve: header emission — exactly one Cache-Control, ETag, Accept-Ranges;
 
     // Range GET: 206 window + Content-Range.
     const range_hdrs = [_]http.Param{.{ .key = "range", .value = "bytes=100-" }};
-    var ctx206 = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params, .headers = &range_hdrs };
+    var ctx206 = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .app = &app, .params = &params, .headers = &range_hdrs };
     const r206 = try serve(&ctx206);
     try std.testing.expectEqual(@as(u16, 206), r206.status);
     try std.testing.expectEqual(@as(u64, 100), r206.file.?.offset);
     try std.testing.expectEqual(@as(?u64, 900), r206.file.?.len);
 
     // Conditional GET with the minted ETag: 304 with ETag + Cache-Control ONLY.
-    var ctx304 = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params, .if_none_match = etag_val };
+    var ctx304 = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .app = &app, .params = &params, .if_none_match = etag_val };
     const r304 = try serve(&ctx304);
     try std.testing.expectEqual(@as(u16, 304), r304.status);
     try std.testing.expectEqual(@as(usize, 2), r304.extra_headers.len);
 
     // Unsatisfiable range: 416 + `bytes */1000`, security headers intact, no file ref.
     const bad = [_]http.Param{.{ .key = "range", .value = "bytes=5000-" }};
-    var ctx416 = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params, .headers = &bad };
+    var ctx416 = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .app = &app, .params = &params, .headers = &bad };
     const r416 = try serve(&ctx416);
     try std.testing.expectEqual(@as(u16, 416), r416.status);
     try std.testing.expect(r416.file == null);
@@ -436,7 +437,7 @@ test "serve: header emission — exactly one Cache-Control, ETag, Accept-Ranges;
     try std.testing.expect(got_cr);
 
     // HEAD mirrors GET: explicit Content-Length, empty body, no file ref.
-    var ctxh = http.RequestCtx{ .method = .HEAD, .path = "/", .allocator = a, .app = &app, .params = &params };
+    var ctxh = http.RequestCtx{ .method = .HEAD, .path = "/", .allocator = RequestArena.from(&arena), .app = &app, .params = &params };
     const rh = try serve(&ctxh);
     try std.testing.expectEqual(@as(u16, 200), rh.status);
     try std.testing.expect(rh.file == null);
@@ -514,7 +515,7 @@ test "serve: presign_redirect issues a 302 Location; default (off) still proxies
     // presign_redirect = true → 302 to the presigned URL (authorization ran first).
     {
         var app = app_mod.App{ .allocator = ga, .io = std.testing.io, .pool = &pool, .storage = &storage_iface, .files = .{ .presign_redirect = true, .presign_ttl_s = 900 } };
-        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .app = &app, .params = &params };
         const r = try serve(&ctx);
         try std.testing.expectEqual(@as(u16, 302), r.status);
         try std.testing.expect(r.file == null);
@@ -528,7 +529,7 @@ test "serve: presign_redirect issues a 302 Location; default (off) still proxies
     // A HEAD in presign mode still 302s (the redirect carries no body).
     {
         var app = app_mod.App{ .allocator = ga, .io = std.testing.io, .pool = &pool, .storage = &storage_iface, .files = .{ .presign_redirect = true } };
-        var ctxh = http.RequestCtx{ .method = .HEAD, .path = "/", .allocator = a, .app = &app, .params = &params };
+        var ctxh = http.RequestCtx{ .method = .HEAD, .path = "/", .allocator = RequestArena.from(&arena), .app = &app, .params = &params };
         const rh = try serve(&ctxh);
         try std.testing.expectEqual(@as(u16, 302), rh.status);
     }
@@ -536,7 +537,7 @@ test "serve: presign_redirect issues a 302 Location; default (off) still proxies
     // Default (presign_redirect = false) → the unchanged proxy path: 200 with an owned file ref, no Location.
     {
         var app = app_mod.App{ .allocator = ga, .io = std.testing.io, .pool = &pool, .storage = &storage_iface };
-        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = a, .app = &app, .params = &params };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .app = &app, .params = &params };
         const r = try serve(&ctx);
         try std.testing.expectEqual(@as(u16, 200), r.status);
         try std.testing.expect(r.file != null);
@@ -549,17 +550,17 @@ pub fn token(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const authed = (try auth.authenticate(app.io, ctx.allocator, app, ctx, w)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+    const authed = (try auth.authenticate(app.io, ctx.allocator.a, app, ctx, w)) orelse
+        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
     const rid = authed.record.object.get("id").?.string;
     const table = if (authed.is_superuser) "_superusers" else authed.collection;
-    const tk = (try auth_api.tokenKeyFor(ctx.allocator, w, table, rid)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+    const tk = (try auth_api.tokenKeyFor(ctx.allocator.a, w, table, rid)) orelse
+        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
     const now = try auth.nowUnixPub(w);
     const key = crypto.deriveKey(app.jwt_secret, tk);
     const claims = jwt.Claims{ .id = rid, .collection = authed.collection, .type = .file, .iat = now, .exp = now + app.file_token_ttl_s };
-    const tok = try jwt.sign(ctx.allocator, claims, &key);
+    const tok = try jwt.sign(ctx.allocator.a, claims, &key);
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "token", .{ .string = tok });
-    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}) };
+    try root.put(ctx.allocator.a, "token", .{ .string = tok });
+    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = root }, .{}) };
 }

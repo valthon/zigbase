@@ -14,6 +14,7 @@
 /// of those paths are permitted. Anything off-origin or off-list falls back to the
 /// configured default (`magic_link.redirect_default`, "/" by default).
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
@@ -110,25 +111,25 @@ fn resolveRedirect(ml: schema.MagicLinkMethodOpts, requested: ?[]const u8) []con
 /// GET /api/collections/:col/auth/magic-link/consume — verify+consume a magic
 /// link token, set the session cookies, and 302 to the (validated) redirect.
 pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator);
+    const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator.a);
 
     // Load collection under a brief reader and gate on magic_link being enabled,
     // mirroring the auth-method dispatch (404 for unknown/non-auth/disabled).
-    const col_name = ctx.param("col") orelse return (ApiError.notFound()).toResponse(ctx.allocator);
+    const col_name = ctx.param("col") orelse return (ApiError.notFound()).toResponse(ctx.allocator.a);
     const col = blk: {
-        var r = app.pool.acquireReader() catch return (ApiError.internal()).toResponse(ctx.allocator);
+        var r = app.pool.acquireReader() catch return (ApiError.internal()).toResponse(ctx.allocator.a);
         defer app.pool.releaseReader(&r);
-        break :blk (try collections.get(ctx.allocator, &r, col_name)) orelse
-            return (ApiError.notFound()).toResponse(ctx.allocator);
+        break :blk (try collections.get(ctx.allocator.a, &r, col_name)) orelse
+            return (ApiError.notFound()).toResponse(ctx.allocator.a);
     };
-    if (col.type != .auth) return (ApiError.notFound()).toResponse(ctx.allocator);
-    const ml = col.options.auth.methods.magic_link orelse return (ApiError.notFound()).toResponse(ctx.allocator);
+    if (col.type != .auth) return (ApiError.notFound()).toResponse(ctx.allocator.a);
+    const ml = col.options.auth.methods.magic_link orelse return (ApiError.notFound()).toResponse(ctx.allocator.a);
 
     // Parse the query string (percent-decoded) for token + redirect.
-    const qp = try params_mod.parse(ctx.allocator, ctx.query);
+    const qp = try params_mod.parse(ctx.allocator.a, ctx.query);
     const target = resolveRedirect(ml, qp.get("redirect"));
     const token = qp.get("token") orelse
-        return (ApiError.badRequest("token is required.")).toResponse(ctx.allocator);
+        return (ApiError.badRequest("token is required.")).toResponse(ctx.allocator.a);
 
     // Verify + consume + the beforeAuthSuccess hook + session issuance all run under ONE
     // writer inside a single transaction. Token consumption is the single-use guard; the
@@ -147,7 +148,7 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
 
     const claims = (try auth_helpers.verifyLinkToken(ctx, w, col.name, token)) orelse {
         w.rollback() catch {};
-        return (ApiError.badRequest("Invalid or expired link.")).toResponse(ctx.allocator);
+        return (ApiError.badRequest("Invalid or expired link.")).toResponse(ctx.allocator.a);
     };
     // Only a genuine replay (the token's jti is already recorded) is a 400. Any
     // other failure (DB prepare/step, I/O) must propagate to the 500 backstop
@@ -155,21 +156,21 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
     auth_helpers.consumeLinkToken(w, claims) catch |err| switch (err) {
         error.AlreadyConsumed => {
             w.rollback() catch {};
-            return (ApiError.badRequest("Link already used.")).toResponse(ctx.allocator);
+            return (ApiError.badRequest("Link already used.")).toResponse(ctx.allocator.a);
         },
         else => return err,
     };
 
     // Fetch the record once for the verification gate, the hook, and session issuance.
-    const rec = (try records.get(ctx.allocator, w, col, claims.id)) orelse {
+    const rec = (try records.get(ctx.allocator.a, w, col, claims.id)) orelse {
         w.rollback() catch {};
-        return (ApiError.notFound()).toResponse(ctx.allocator);
+        return (ApiError.notFound()).toResponse(ctx.allocator.a);
     };
     // Optional verification gate: refuse to mint a session for an unverified
     // record when the collection requires it (parity with `complete`).
     if (col.options.auth.require_verified and !auth.recordVerified(rec)) {
         w.rollback() catch {};
-        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator.a);
     }
 
     if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, claims.id, .magic_link, rec)) |resp| {
@@ -182,8 +183,8 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
     // onAuth fires only AFTER a durable commit (session truly issued).
     auth.emitAuth(ctx, col.name, rec, .magic_link);
 
-    const cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
-    const headers = try ctx.allocator.dupe(http.Header, &[_]http.Header{
+    const cookies = try ctx.allocator.a.dupe(http.Cookie, &issued.cookies);
+    const headers = try ctx.allocator.a.dupe(http.Header, &[_]http.Header{
         .{ .name = "Location", .value = target },
     });
     // 302 Found: the browser follows with a GET, which is what an email link wants.
@@ -311,8 +312,8 @@ fn setupConsumeEnv(name: []const u8, allow: []const []const u8, default_to: []co
 }
 
 /// Build a GET consume RequestCtx with the given query string.
-fn consumeCtx(env: *api_auth.TestEnv, a: std.mem.Allocator, col_name: []const u8, query: []const u8) http.RequestCtx {
-    const params = a.dupe(http.Param, &[_]http.Param{.{ .key = "col", .value = col_name }}) catch unreachable;
+fn consumeCtx(env: *api_auth.TestEnv, a: RequestArena, col_name: []const u8, query: []const u8) http.RequestCtx {
+    const params = a.a.dupe(http.Param, &[_]http.Param{.{ .key = "col", .value = col_name }}) catch unreachable;
     return .{ .method = .GET, .path = "/", .query = query, .allocator = a, .app = &env.app, .params = params };
 }
 
@@ -328,7 +329,7 @@ test "consume: valid token → 302 with session cookies + allowed redirect; repl
     try env.createUser(a, "mlconsume1", "u@x.io", "longenough");
 
     // Mint a magic-link token for the user.
-    var mint_ctx = consumeCtx(env, a, "mlconsume1", "");
+    var mint_ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsume1", "");
     const token = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -339,7 +340,7 @@ test "consume: valid token → 302 with session cookies + allowed redirect; repl
 
     // First consume: 302 + Location=/club/me + both cookies.
     const q1 = try std.fmt.allocPrint(a, "token={s}&redirect=%2Fclub%2Fme", .{token});
-    var ctx1 = consumeCtx(env, a, "mlconsume1", q1);
+    var ctx1 = consumeCtx(env, RequestArena.from(&arena), "mlconsume1", q1);
     const res1 = try consume(&ctx1);
     try std.testing.expectEqual(@as(u16, 302), res1.status);
     try std.testing.expectEqualStrings("/club/me", locationHeader(res1).?);
@@ -353,7 +354,7 @@ test "consume: valid token → 302 with session cookies + allowed redirect; repl
 
     // Replay: same token must be rejected (single-use), 400, no redirect.
     const q2 = try std.fmt.allocPrint(a, "token={s}&redirect=%2Fclub%2Fme", .{token});
-    var ctx2 = consumeCtx(env, a, "mlconsume1", q2);
+    var ctx2 = consumeCtx(env, RequestArena.from(&arena), "mlconsume1", q2);
     const res2 = try consume(&ctx2);
     try std.testing.expectEqual(@as(u16, 400), res2.status);
 }
@@ -373,7 +374,7 @@ test "#80 consume: aborting beforeAuthSuccess blocks session AND leaves the link
 
     // Mint a single magic-link token; the same token is reused after the abort to prove
     // the consumption rolled back (the link is still usable).
-    var mint_ctx = consumeCtx(env, a, "mlconsume80", "");
+    var mint_ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsume80", "");
     const token = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -394,7 +395,7 @@ test "#80 consume: aborting beforeAuthSuccess blocks session AND leaves the link
     env.app.dispatch = &disp;
 
     const q1 = try std.fmt.allocPrint(a, "token={s}", .{token});
-    var ctx1 = consumeCtx(env, a, "mlconsume80", q1);
+    var ctx1 = consumeCtx(env, RequestArena.from(&arena), "mlconsume80", q1);
     const res1 = try consume(&ctx1);
     try std.testing.expectEqual(@as(u16, 403), res1.status); // fail closed
     try std.testing.expectEqual(@as(usize, 0), res1.cookies.len); // no session
@@ -403,7 +404,7 @@ test "#80 consume: aborting beforeAuthSuccess blocks session AND leaves the link
     // burned by the aborted attempt, so the consume succeeds (302 + session).
     env.app.dispatch = null;
     const q2 = try std.fmt.allocPrint(a, "token={s}", .{token});
-    var ctx2 = consumeCtx(env, a, "mlconsume80", q2);
+    var ctx2 = consumeCtx(env, RequestArena.from(&arena), "mlconsume80", q2);
     const res2 = try consume(&ctx2);
     try std.testing.expectEqual(@as(u16, 302), res2.status);
     var saw_auth = false;
@@ -414,7 +415,7 @@ test "#80 consume: aborting beforeAuthSuccess blocks session AND leaves the link
 
     // And now the single-use guard holds: a third attempt with the same token is rejected.
     const q3 = try std.fmt.allocPrint(a, "token={s}", .{token});
-    var ctx3 = consumeCtx(env, a, "mlconsume80", q3);
+    var ctx3 = consumeCtx(env, RequestArena.from(&arena), "mlconsume80", q3);
     const res3 = try consume(&ctx3);
     try std.testing.expectEqual(@as(u16, 400), res3.status);
 }
@@ -430,17 +431,17 @@ test "L1 consume: a DB error after begin rolls back (writer not poisoned)" {
     try env.createUser(a, "mlconsumeL1", "u@x.io", "longenough");
 
     const mintToken = struct {
-        fn go(e: *api_auth.TestEnv, alloc: std.mem.Allocator) ![]const u8 {
+        fn go(e: *api_auth.TestEnv, alloc: RequestArena) ![]const u8 {
             var mc = consumeCtx(e, alloc, "mlconsumeL1", "");
             const w = e.pool.acquireWriter();
             defer e.pool.releaseWriter();
-            const col = (try collections.get(alloc, w, "mlconsumeL1")).?;
-            const rid = (try api_auth.findByIdentity(alloc, w, col, "u@x.io")).?;
+            const col = (try collections.get(alloc.a, w, "mlconsumeL1")).?;
+            const rid = (try api_auth.findByIdentity(alloc.a, w, col, "u@x.io")).?;
             return (try auth_helpers.mintLinkToken(&mc, w, "mlconsumeL1", rid, 900, .{})).token;
         }
     }.go;
 
-    const t1 = try mintToken(env, a);
+    const t1 = try mintToken(env, RequestArena.from(&arena));
 
     // Drop the single-use ledger so consumeLinkToken errors AFTER beginImmediate. Without
     // the errdefer rollback the failed login would leave the writer in an open transaction
@@ -452,7 +453,7 @@ test "L1 consume: a DB error after begin rolls back (writer not poisoned)" {
     }
     {
         const q = try std.fmt.allocPrint(a, "token={s}", .{t1});
-        var ctx = consumeCtx(env, a, "mlconsumeL1", q);
+        var ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsumeL1", q);
         // The error propagates (it is not a replay); we only care that the writer is left clean.
         if (consume(&ctx)) |_| {} else |_| {}
     }
@@ -463,9 +464,9 @@ test "L1 consume: a DB error after begin rolls back (writer not poisoned)" {
         defer env.pool.releaseWriter();
         try w.exec("CREATE TABLE \"_consumedTokens\" (\"jti\" TEXT PRIMARY KEY, \"expires\" INTEGER, \"consumed\" TEXT);");
     }
-    const t2 = try mintToken(env, a);
+    const t2 = try mintToken(env, RequestArena.from(&arena));
     const q2 = try std.fmt.allocPrint(a, "token={s}", .{t2});
-    var ctx2 = consumeCtx(env, a, "mlconsumeL1", q2);
+    var ctx2 = consumeCtx(env, RequestArena.from(&arena), "mlconsumeL1", q2);
     const res = try consume(&ctx2);
     try std.testing.expectEqual(@as(u16, 302), res.status);
 }
@@ -481,7 +482,7 @@ test "consume: non-whitelisted redirect falls back to default (no open redirect)
 
     try env.createUser(a, "mlconsume2", "u@x.io", "longenough");
 
-    var mint_ctx = consumeCtx(env, a, "mlconsume2", "");
+    var mint_ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsume2", "");
     const token = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -493,7 +494,7 @@ test "consume: non-whitelisted redirect falls back to default (no open redirect)
     // redirect points off-list (and a protocol-relative open-redirect attempt):
     // both must degrade to the configured default, never the attacker's target.
     const q = try std.fmt.allocPrint(a, "token={s}&redirect=%2F%2Fevil.example.com", .{token});
-    var ctx = consumeCtx(env, a, "mlconsume2", q);
+    var ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsume2", q);
     const res = try consume(&ctx);
     try std.testing.expectEqual(@as(u16, 302), res.status);
     try std.testing.expectEqualStrings("/club/welcome", locationHeader(res).?);
@@ -517,7 +518,7 @@ test "consume: traversal redirect cannot escape an allowed prefix" {
         "%2Ffoo%2F..%5Cadmin", // /foo/..\admin (backslash)
     };
     for (attacks) |atk| {
-        var mint_ctx = consumeCtx(env, a, "mlconsume5", "");
+        var mint_ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsume5", "");
         const token = blk: {
             const w = env.pool.acquireWriter();
             defer env.pool.releaseWriter();
@@ -526,7 +527,7 @@ test "consume: traversal redirect cannot escape an allowed prefix" {
             break :blk (try auth_helpers.mintLinkToken(&mint_ctx, w, "mlconsume5", rid, 900, .{})).token;
         };
         const q = try std.fmt.allocPrint(a, "token={s}&redirect={s}", .{ token, atk });
-        var ctx = consumeCtx(env, a, "mlconsume5", q);
+        var ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsume5", q);
         const res = try consume(&ctx);
         // Login still succeeds (302) but the target is forced to the default —
         // never the traversed "/admin".
@@ -538,13 +539,12 @@ test "consume: traversal redirect cannot escape an allowed prefix" {
 test "consume: missing token → 400; magic_link disabled → 404" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     // magic_link enabled, but no token in the query → 400.
     {
         var env = try setupConsumeEnv("mlconsume3", &.{}, "/");
         defer env.deinit();
-        var ctx = consumeCtx(env, a, "mlconsume3", "redirect=%2Fapp");
+        var ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsume3", "redirect=%2Fapp");
         const res = try consume(&ctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
     }
@@ -553,7 +553,7 @@ test "consume: missing token → 400; magic_link disabled → 404" {
     {
         var env = try api_auth.TestEnv.initAuth("mlconsume4");
         defer env.deinit();
-        var ctx = consumeCtx(env, a, "mlconsume4", "token=whatever");
+        var ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsume4", "token=whatever");
         const res = try consume(&ctx);
         try std.testing.expectEqual(@as(u16, 404), res.status);
     }

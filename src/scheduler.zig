@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const schedule = @import("schedule.zig");
 const events = @import("events.zig");
 const clock = @import("clock.zig");
@@ -333,7 +334,7 @@ pub const Scheduler = struct {
             // (LIFO): cx.deinit only releases the pooled reader, arena frees results.
             var arena = std.heap.ArenaAllocator.init(self.app.allocator);
             defer arena.deinit();
-            var cx = Ctx{ .app = self.app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+            var cx = Ctx{ .app = self.app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = null, .bound_conn = null };
             defer cx.deinit();
             if (job.run(&cx, &ev)) |result| {
                 // SUCCESS: resume the normal schedule (resets the backoff counter).
@@ -410,7 +411,7 @@ test "buildJobs assembles cron/interval/reactive into a uniform table" {
 
     // The wrapped run returns ?Reactive: reactive job returns the handler's Reactive; others null.
     var ev = events.JobEvent{ .app = undefined, .name = "x" };
-    var cx = Ctx{ .app = undefined, .arena = std.testing.allocator, .rctx = .{}, .request = null, .bound_conn = null };
+    var cx = Ctx{ .app = undefined, .arena = RequestArena.forTest(std.testing.allocator), .rctx = .{}, .request = null, .bound_conn = null };
     defer cx.deinit();
     const r2 = try jobs[2].run(&cx, &ev);
     try std.testing.expect(r2 != null and r2.?.after.minutes == 5);

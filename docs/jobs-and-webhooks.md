@@ -47,7 +47,7 @@ A job handler receives the JSON payload as bytes and deserializes it:
 
 ```zig
 fn resizeImage(ctx: *zigbase.Ctx, payload: []const u8) anyerror!void {
-    const parsed = try std.json.parseFromSlice(struct { id: []const u8 }, ctx.arena, payload, .{});
+    const parsed = try std.json.parseFromSlice(struct { id: []const u8 }, ctx.arena.a, payload, .{});
     // …do the work; touch the DB via ctx.records() / ctx.app.pool.acquireWriter()…
 }
 ```

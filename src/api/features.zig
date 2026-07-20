@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const auth = @import("../auth.zig");
 const Data = @import("../data.zig").Data;
@@ -17,7 +18,7 @@ fn isSuperuser(ctx: *http.RequestCtx) bool {
     const app = ctx.app orelse return false;
     var r = app.pool.acquireReader() catch return false;
     defer app.pool.releaseReader(&r);
-    const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, &r) catch null) orelse return false;
+    const authed = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, &r) catch null) orelse return false;
     return authed.is_superuser;
 }
 
@@ -25,12 +26,12 @@ fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
     if (isSuperuser(ctx)) return null;
     // Building the 403 body allocates (JSON on the request arena), so OutOfMemory is reachable
     // here — propagate it to the server's 500 backstop rather than `catch unreachable` (#29).
-    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
 }
 
 fn dataOnWriter(ctx: *http.RequestCtx) Data {
     const app = ctx.app.?;
-    return .{ .app = app, .conn = app.pool.acquireWriter(), .io = app.io, .alloc = ctx.allocator };
+    return .{ .app = app, .conn = app.pool.acquireWriter(), .io = app.io, .alloc = ctx.allocator.a };
 }
 
 /// GET /api/features — return the declared flag + experiment registry and each entry's
@@ -66,9 +67,9 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
     const all_kv = try d.kvList();
 
     // ── Flags ──────────────────────────────────────────────────────────────
-    var flags_arr = std.json.Array.init(ctx.allocator);
+    var flags_arr = std.json.Array.init(ctx.allocator.a);
     for (reg.flags) |def| {
-        const key = try std.fmt.allocPrint(ctx.allocator, "flag:{s}", .{def.name});
+        const key = try std.fmt.allocPrint(ctx.allocator.a, "flag:{s}", .{def.name});
         var override_val: ?[]const u8 = null;
         for (all_kv) |e| {
             if (std.mem.eql(u8, e.key, key)) {
@@ -78,21 +79,21 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
         }
 
         var o: std.json.ObjectMap = .empty;
-        try o.put(ctx.allocator, "name", .{ .string = def.name });
-        try o.put(ctx.allocator, "default", .{ .bool = def.default });
-        try o.put(ctx.allocator, "description", .{ .string = def.description });
+        try o.put(ctx.allocator.a, "name", .{ .string = def.name });
+        try o.put(ctx.allocator.a, "default", .{ .bool = def.default });
+        try o.put(ctx.allocator.a, "description", .{ .string = def.description });
         if (override_val) |v| {
-            try o.put(ctx.allocator, "override", .{ .string = v });
+            try o.put(ctx.allocator.a, "override", .{ .string = v });
         } else {
-            try o.put(ctx.allocator, "override", .null);
+            try o.put(ctx.allocator.a, "override", .null);
         }
         try flags_arr.append(.{ .object = o });
     }
 
     // ── Experiments ────────────────────────────────────────────────────────
-    var exps_arr = std.json.Array.init(ctx.allocator);
+    var exps_arr = std.json.Array.init(ctx.allocator.a);
     for (reg.experiments) |def| {
-        const key = try std.fmt.allocPrint(ctx.allocator, "exp:{s}:weights", .{def.name});
+        const key = try std.fmt.allocPrint(ctx.allocator.a, "exp:{s}:weights", .{def.name});
         var weight_override: ?[]const u8 = null;
         for (all_kv) |e| {
             if (std.mem.eql(u8, e.key, key)) {
@@ -101,31 +102,31 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
             }
         }
 
-        var variants_arr = std.json.Array.init(ctx.allocator);
+        var variants_arr = std.json.Array.init(ctx.allocator.a);
         for (def.variants) |v| try variants_arr.append(.{ .string = v });
 
-        var weights_arr = std.json.Array.init(ctx.allocator);
+        var weights_arr = std.json.Array.init(ctx.allocator.a);
         for (def.weights) |w| try weights_arr.append(.{ .integer = @as(i64, w) });
 
         var o: std.json.ObjectMap = .empty;
-        try o.put(ctx.allocator, "name", .{ .string = def.name });
-        try o.put(ctx.allocator, "variants", .{ .array = variants_arr });
-        try o.put(ctx.allocator, "weights", .{ .array = weights_arr });
-        try o.put(ctx.allocator, "sticky", .{ .bool = def.sticky });
-        try o.put(ctx.allocator, "description", .{ .string = def.description });
+        try o.put(ctx.allocator.a, "name", .{ .string = def.name });
+        try o.put(ctx.allocator.a, "variants", .{ .array = variants_arr });
+        try o.put(ctx.allocator.a, "weights", .{ .array = weights_arr });
+        try o.put(ctx.allocator.a, "sticky", .{ .bool = def.sticky });
+        try o.put(ctx.allocator.a, "description", .{ .string = def.description });
         if (weight_override) |w| {
-            try o.put(ctx.allocator, "weight_override", .{ .string = w });
+            try o.put(ctx.allocator.a, "weight_override", .{ .string = w });
         } else {
-            try o.put(ctx.allocator, "weight_override", .null);
+            try o.put(ctx.allocator.a, "weight_override", .null);
         }
         try exps_arr.append(.{ .object = o });
     }
 
     var resp_obj: std.json.ObjectMap = .empty;
-    try resp_obj.put(ctx.allocator, "flags", .{ .array = flags_arr });
-    try resp_obj.put(ctx.allocator, "experiments", .{ .array = exps_arr });
+    try resp_obj.put(ctx.allocator.a, "flags", .{ .array = flags_arr });
+    try resp_obj.put(ctx.allocator.a, "experiments", .{ .array = exps_arr });
     const body = try std.json.Stringify.valueAlloc(
-        ctx.allocator,
+        ctx.allocator.a,
         std.json.Value{ .object = resp_obj },
         .{},
     );
@@ -171,7 +172,7 @@ const TestEnv = struct {
     }
 };
 
-fn ctxFor(env: *TestEnv, arena: std.mem.Allocator, method: http.Method, path: []const u8, params: []const http.Param) http.RequestCtx {
+fn ctxFor(env: *TestEnv, arena: RequestArena, method: http.Method, path: []const u8, params: []const http.Param) http.RequestCtx {
     return .{ .method = method, .path = path, .body = "", .allocator = arena, .app = &env.app, .params = params };
 }
 
@@ -180,7 +181,7 @@ test "GET /api/features requires a superuser" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var ctx = ctxFor(env, arena.allocator(), .GET, "/api/features", &.{});
+    var ctx = ctxFor(env, RequestArena.from(&arena), .GET, "/api/features", &.{});
     const res = try get(&ctx);
     try std.testing.expectEqual(@as(u16, 403), res.status);
 }
@@ -193,7 +194,7 @@ test "GET /api/features returns empty arrays when no registry is wired" {
     const a = arena.allocator();
     const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
 
-    var ctx = ctxFor(env, a, .GET, "/api/features", &.{});
+    var ctx = ctxFor(env, RequestArena.from(&arena), .GET, "/api/features", &.{});
     ctx.authorization = auth_hdr;
     const res = try get(&ctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
@@ -218,7 +219,7 @@ test "GET /api/features returns declared flags with overrides" {
     env.app.features = &reg;
 
     // No override yet → "override":null.
-    var ctx1 = ctxFor(env, a, .GET, "/api/features", &.{});
+    var ctx1 = ctxFor(env, RequestArena.from(&arena), .GET, "/api/features", &.{});
     ctx1.authorization = auth_hdr;
     const r1 = try get(&ctx1);
     try std.testing.expectEqual(@as(u16, 200), r1.status);
@@ -235,7 +236,7 @@ test "GET /api/features returns declared flags with overrides" {
     }
 
     // Now override should be "true".
-    var ctx2 = ctxFor(env, a, .GET, "/api/features", &.{});
+    var ctx2 = ctxFor(env, RequestArena.from(&arena), .GET, "/api/features", &.{});
     ctx2.authorization = auth_hdr;
     const r2 = try get(&ctx2);
     try std.testing.expectEqual(@as(u16, 200), r2.status);
@@ -262,7 +263,7 @@ test "GET /api/features returns declared experiments with weight_override" {
     };
     env.app.features = &reg;
 
-    var ctx1 = ctxFor(env, a, .GET, "/api/features", &.{});
+    var ctx1 = ctxFor(env, RequestArena.from(&arena), .GET, "/api/features", &.{});
     ctx1.authorization = auth_hdr;
     const r1 = try get(&ctx1);
     try std.testing.expectEqual(@as(u16, 200), r1.status);
@@ -278,7 +279,7 @@ test "GET /api/features returns declared experiments with weight_override" {
         try d.kvSet("exp:onboarding:weights", "[90,10]");
     }
 
-    var ctx2 = ctxFor(env, a, .GET, "/api/features", &.{});
+    var ctx2 = ctxFor(env, RequestArena.from(&arena), .GET, "/api/features", &.{});
     ctx2.authorization = auth_hdr;
     const r2 = try get(&ctx2);
     try std.testing.expectEqual(@as(u16, 200), r2.status);

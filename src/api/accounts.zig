@@ -18,16 +18,16 @@ const ApiError = @import("error.zig").ApiError;
 /// POST /api/accounts/:id/activate — verify membership, set the `zb_account` cookie, return scope.
 pub fn activate(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
-    if (!app.tenancy.enabled) return ApiError.notFound().toResponse(ctx.allocator);
+    if (!app.tenancy.enabled) return ApiError.notFound().toResponse(ctx.allocator.a);
 
-    const account_id = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if (account_id.len == 0) return ApiError.notFound().toResponse(ctx.allocator);
+    const account_id = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    if (account_id.len == 0) return ApiError.notFound().toResponse(ctx.allocator.a);
 
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
 
-    const a = (auth.authenticate(app.io, ctx.allocator, app, ctx, &r) catch null) orelse
-        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator);
+    const a = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, &r) catch null) orelse
+        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator.a);
     // Superusers are not account members; they operate cross-tenant and don't activate a scope.
     if (a.is_superuser) return forbidden(ctx);
     if (a.record != .object) return forbidden(ctx);
@@ -36,11 +36,11 @@ pub fn activate(ctx: *http.RequestCtx) anyerror!http.Response {
 
     // Verify an ACTIVE membership of the requested account (fail closed): resolve returns a
     // matching account_id only when such a membership exists.
-    const res = try tenancy.resolve(ctx.allocator, &r, a.collection, id_v.string, account_id);
+    const res = try tenancy.resolve(ctx.allocator.a, &r, a.collection, id_v.string, account_id);
     if (res.account_id.len == 0) return forbidden(ctx);
 
     // Set the signed, HttpOnly `zb_account` cookie so browser requests carry the active account.
-    const signed = try tenancy.signAccount(ctx.allocator, app.jwt_secret, res.account_id);
+    const signed = try tenancy.signAccount(ctx.allocator.a, app.jwt_secret, res.account_id);
     const cookie = http.Cookie{
         .name = tenancy.account_cookie,
         .value = signed,
@@ -50,18 +50,18 @@ pub fn activate(ctx: *http.RequestCtx) anyerror!http.Response {
         .same_site = .strict,
         .path = "/",
     };
-    const cookies = try ctx.allocator.dupe(http.Cookie, &.{cookie});
+    const cookies = try ctx.allocator.a.dupe(http.Cookie, &.{cookie});
 
     var obj: std.json.ObjectMap = .empty;
-    try obj.put(ctx.allocator, "account", .{ .string = res.account_id });
-    try obj.put(ctx.allocator, "role", .{ .string = res.account_role });
+    try obj.put(ctx.allocator.a, "account", .{ .string = res.account_id });
+    try obj.put(ctx.allocator.a, "role", .{ .string = res.account_role });
     return .{
         .status = 200,
-        .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = obj }, .{}),
+        .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = obj }, .{}),
         .cookies = cookies,
     };
 }
 
 fn forbidden(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 403, .message = "Not a member of this account." }).toResponse(ctx.allocator);
+    return (ApiError{ .status = 403, .message = "Not a member of this account." }).toResponse(ctx.allocator.a);
 }

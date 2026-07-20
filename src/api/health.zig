@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const db = @import("../db.zig");
 const build_options = @import("build_options");
@@ -26,7 +27,7 @@ fn backendLabel(ctx: *http.RequestCtx) []const u8 {
 /// non-secret build provenance — no config value, path, or credential is ever added here.
 pub fn handle(ctx: *http.RequestCtx) !http.Response {
     const body = try std.json.Stringify.valueAlloc(
-        ctx.allocator,
+        ctx.allocator.a,
         .{
             .status = "ok",
             .backend = backendLabel(ctx),
@@ -50,7 +51,7 @@ test "health returns 200 and ok status with backend badge + versions" {
     var ctx = http.RequestCtx{
         .method = .GET,
         .path = "/api/health",
-        .allocator = arena.allocator(),
+        .allocator = RequestArena.from(&arena),
     };
     const resp = try handle(&ctx);
     try std.testing.expectEqual(@as(u16, 200), resp.status);

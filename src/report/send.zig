@@ -23,6 +23,7 @@
 //! error report risks amplifying a backend outage, and the report is best-effort anyway.)
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const reporter = @import("reporter.zig");
 const report_log = @import("log.zig");
 const App = @import("../app.zig").App;
@@ -78,13 +79,13 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
 /// The fallible core: parse the payload and POST via the reporter. Its errors are caught
 /// (and only logged) by `jobHandler` — they never reach the queue's failure path.
 fn deliver(ctx: *Ctx, payload: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(Report, ctx.arena, payload, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(Report, ctx.arena.a, payload, .{ .ignore_unknown_fields = true });
     const rep = ctx.app.reporter orelse {
         // No reporter wired (un-booted app) — fall back to the log backstop.
         report_log.emit(parsed.value);
         return;
     };
-    try rep.report(ctx.app.io, ctx.arena, parsed.value);
+    try rep.report(ctx.app.io, ctx.arena.a, parsed.value);
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +109,7 @@ const JobEnv = struct {
         };
     }
     fn ctx(self: *JobEnv) Ctx {
-        return Ctx{ .app = &self.app, .arena = self.arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        return Ctx{ .app = &self.app, .arena = RequestArena.from(&self.arena), .rctx = .{}, .request = null, .bound_conn = null };
     }
     fn deinit(self: *JobEnv) void {
         self.arena.deinit();

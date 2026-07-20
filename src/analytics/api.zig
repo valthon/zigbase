@@ -24,6 +24,7 @@
 //! actor are resolved SERVER-SIDE from the verified token — never from a query/body/header value.
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const app_mod = @import("../app.zig");
 const db = @import("../db.zig");
@@ -50,7 +51,7 @@ const Scope = struct {
 /// (the caller turns that into a 401). Mirrors `api/accounts.zig` (fail closed: a resolution error
 /// leaves `account` empty).
 fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, conn: *db.Db) !?Scope {
-    const a = (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null) orelse return null;
+    const a = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, conn) catch null) orelse return null;
     var actor: []const u8 = "";
     if (a.record == .object) {
         if (a.record.object.get("id")) |id_v| {
@@ -60,7 +61,7 @@ fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, conn: *db.Db) !?Scope 
     var account: []const u8 = "";
     if (app.tenancy.enabled and !a.is_superuser and actor.len > 0) {
         const requested = tenancy.requestedAccount(ctx, app) orelse "";
-        const res = tenancy.resolve(ctx.allocator, conn, a.collection, actor, requested) catch
+        const res = tenancy.resolve(ctx.allocator.a, conn, a.collection, actor, requested) catch
             tenancy.Resolution{};
         account = res.account_id;
     }
@@ -120,14 +121,14 @@ fn parseCursor(raw: []const u8) ?struct { occurred_at: []const u8, id: []const u
 /// payloads. This is the intended threat model (the boundary is the tenant, not the role); there is
 /// deliberately no intra-account role gating here.
 pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return ApiError.internal().toResponse(ctx.allocator);
+    const app = ctx.app orelse return ApiError.internal().toResponse(ctx.allocator.a);
     var reader = try app.pool.acquireReader();
     defer app.pool.releaseReader(&reader);
 
     const scope = (try resolveScope(ctx, app, &reader)) orelse
-        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator.a);
 
-    var b = Bound{ .alloc = ctx.allocator };
+    var b = Bound{ .alloc = ctx.allocator.a };
 
     // Base authorization scope (fail closed).
     if (scope.is_superuser) {
@@ -142,7 +143,7 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
     }
 
     // Optional filters.
-    const qp = params_mod.parse(ctx.allocator, ctx.query) catch params_mod.Params{ .pairs = &.{} };
+    const qp = params_mod.parse(ctx.allocator.a, ctx.query) catch params_mod.Params{ .pairs = &.{} };
     if (qp.get("name")) |v| if (v.len > 0) try b.add("\"name\" =", v);
     if (qp.get("actor")) |v| if (v.len > 0) try b.add("\"actor\" =", v);
     if (qp.get("since")) |v| if (v.len > 0) try b.add("\"occurred_at\" >=", v);
@@ -152,25 +153,25 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
     // an OR rather than a SQLite row-value comparison for portability.
     if (qp.get("cursor")) |raw| if (raw.len > 0) {
         const cur = parseCursor(raw) orelse
-            return (ApiError{ .status = 400, .message = "Invalid cursor." }).toResponse(ctx.allocator);
+            return (ApiError{ .status = 400, .message = "Invalid cursor." }).toResponse(ctx.allocator.a);
         const n1 = b.params.items.len + 1;
-        try b.conds.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "(\"occurred_at\" < ?{d} OR (\"occurred_at\" = ?{d} AND \"id\" < ?{d}))", .{ n1, n1 + 1, n1 + 2 }));
-        try b.params.append(ctx.allocator, cur.occurred_at);
-        try b.params.append(ctx.allocator, cur.occurred_at);
-        try b.params.append(ctx.allocator, cur.id);
+        try b.conds.append(ctx.allocator.a, try std.fmt.allocPrint(ctx.allocator.a, "(\"occurred_at\" < ?{d} OR (\"occurred_at\" = ?{d} AND \"id\" < ?{d}))", .{ n1, n1 + 1, n1 + 2 }));
+        try b.params.append(ctx.allocator.a, cur.occurred_at);
+        try b.params.append(ctx.allocator.a, cur.occurred_at);
+        try b.params.append(ctx.allocator.a, cur.id);
     };
 
     const limit = parseLimit(qp.get("limit"));
     const where = try b.whereClause();
     // Fetch one extra row as a hasNext lookahead; trimmed back to `limit` below.
-    const sql = try std.fmt.allocPrintSentinel(ctx.allocator, "SELECT \"id\",\"created\",\"name\",\"payload\",\"actor_collection\",\"actor\",\"account\",\"occurred_at\" " ++
+    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "SELECT \"id\",\"created\",\"name\",\"payload\",\"actor_collection\",\"actor\",\"account\",\"occurred_at\" " ++
         "FROM \"_events\"{s} ORDER BY \"occurred_at\" DESC, \"id\" DESC LIMIT {d};", .{ where, limit + 1 }, 0);
 
     var st = reader.prepare(sql) catch return emptyEventsPage(ctx);
     defer st.finalize();
     try b.bindAll(&st);
 
-    var items = std.json.Array.init(ctx.allocator);
+    var items = std.json.Array.init(ctx.allocator.a);
     var fetched: usize = 0;
     var has_next = false;
     var pending_cursor: ?[]const u8 = null;
@@ -181,18 +182,18 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
             break; // this row is only the lookahead — not part of the page
         }
         var o: std.json.ObjectMap = .empty;
-        const id = try ctx.allocator.dupe(u8, st.columnText(0));
-        try o.put(ctx.allocator, "id", .{ .string = id });
-        try o.put(ctx.allocator, "created", .{ .string = try ctx.allocator.dupe(u8, st.columnText(1)) });
-        try o.put(ctx.allocator, "name", .{ .string = try ctx.allocator.dupe(u8, st.columnText(2)) });
-        try o.put(ctx.allocator, "payload", parsePayload(ctx.allocator, st.columnText(3)));
-        try o.put(ctx.allocator, "actor_collection", .{ .string = try ctx.allocator.dupe(u8, st.columnText(4)) });
-        try o.put(ctx.allocator, "actor", .{ .string = try ctx.allocator.dupe(u8, st.columnText(5)) });
-        try o.put(ctx.allocator, "account", .{ .string = try ctx.allocator.dupe(u8, st.columnText(6)) });
-        const occurred_at = try ctx.allocator.dupe(u8, st.columnText(7));
-        try o.put(ctx.allocator, "occurred_at", .{ .string = occurred_at });
+        const id = try ctx.allocator.a.dupe(u8, st.columnText(0));
+        try o.put(ctx.allocator.a, "id", .{ .string = id });
+        try o.put(ctx.allocator.a, "created", .{ .string = try ctx.allocator.a.dupe(u8, st.columnText(1)) });
+        try o.put(ctx.allocator.a, "name", .{ .string = try ctx.allocator.a.dupe(u8, st.columnText(2)) });
+        try o.put(ctx.allocator.a, "payload", parsePayload(ctx.allocator.a, st.columnText(3)));
+        try o.put(ctx.allocator.a, "actor_collection", .{ .string = try ctx.allocator.a.dupe(u8, st.columnText(4)) });
+        try o.put(ctx.allocator.a, "actor", .{ .string = try ctx.allocator.a.dupe(u8, st.columnText(5)) });
+        try o.put(ctx.allocator.a, "account", .{ .string = try ctx.allocator.a.dupe(u8, st.columnText(6)) });
+        const occurred_at = try ctx.allocator.a.dupe(u8, st.columnText(7));
+        try o.put(ctx.allocator.a, "occurred_at", .{ .string = occurred_at });
         try items.append(.{ .object = o });
-        if (fetched == limit) pending_cursor = try std.fmt.allocPrint(ctx.allocator, "{s}|{s}", .{ occurred_at, id });
+        if (fetched == limit) pending_cursor = try std.fmt.allocPrint(ctx.allocator.a, "{s}|{s}", .{ occurred_at, id });
     }
     return wrapEventsPage(ctx, items, if (has_next) pending_cursor else null, has_next);
 }
@@ -203,8 +204,8 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
 /// role) reads ALL of the account's summary buckets for the rollup. Intended threat model — the
 /// boundary is the tenant, not the role; there is deliberately no intra-account role gating.
 pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return ApiError.internal().toResponse(ctx.allocator);
-    const name = ctx.param("name") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const app = ctx.app orelse return ApiError.internal().toResponse(ctx.allocator.a);
+    const name = ctx.param("name") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
 
     var reader = try app.pool.acquireReader();
     defer app.pool.releaseReader(&reader);
@@ -212,13 +213,13 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
     // AUTHENTICATE FIRST: an anonymous caller always gets 401, BEFORE the registry lookup — otherwise
     // 404 (undeclared) vs 401 (declared) would be a name-enumeration oracle for unauthenticated users.
     const scope = (try resolveScope(ctx, app, &reader)) orelse
-        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator.a);
 
     // The rollup must be DECLARED (and `name` a safe identifier) — else 404 (no table-name oracle).
-    const reg = analytics.registryFromApp(app) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const spec = reg.byName(name) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const reg = analytics.registryFromApp(app) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const spec = reg.byName(name) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
 
-    var b = Bound{ .alloc = ctx.allocator };
+    var b = Bound{ .alloc = ctx.allocator.a };
     if (scope.is_superuser) {
         // superuser sees all buckets
     } else if (app.tenancy.enabled and spec.group_account) {
@@ -227,17 +228,17 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
     } else {
         // A non-account-grouped rollup is a cross-tenant aggregate; tenancy-disabled apps have no
         // per-account separation either. Either way a non-superuser must not read it. Fail closed.
-        return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
     }
 
-    const qp = params_mod.parse(ctx.allocator, ctx.query) catch params_mod.Params{ .pairs = &.{} };
+    const qp = params_mod.parse(ctx.allocator.a, ctx.query) catch params_mod.Params{ .pairs = &.{} };
     if (qp.get("from")) |v| if (v.len > 0) try b.add("\"bucket\" >=", v);
     if (qp.get("to")) |v| if (v.len > 0) try b.add("\"bucket\" <=", v);
 
-    const table = analytics.summaryTable(ctx.allocator, name) catch
-        return ApiError.notFound().toResponse(ctx.allocator);
+    const table = analytics.summaryTable(ctx.allocator.a, name) catch
+        return ApiError.notFound().toResponse(ctx.allocator.a);
     const where = try b.whereClause();
-    const sql = try std.fmt.allocPrintSentinel(ctx.allocator, "SELECT \"bucket\",\"account\",\"actor\",\"value\",\"computed_at\" FROM \"{s}\"{s} " ++
+    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "SELECT \"bucket\",\"account\",\"actor\",\"value\",\"computed_at\" FROM \"{s}\"{s} " ++
         "ORDER BY \"bucket\" DESC, \"account\", \"actor\";", .{ table, where }, 0);
 
     // The summary table is created lazily on the first rollup run; until then, return an empty set.
@@ -245,14 +246,14 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
     defer st.finalize();
     try b.bindAll(&st);
 
-    var items = std.json.Array.init(ctx.allocator);
+    var items = std.json.Array.init(ctx.allocator.a);
     while (try st.step()) {
         var o: std.json.ObjectMap = .empty;
-        try o.put(ctx.allocator, "bucket", .{ .string = try ctx.allocator.dupe(u8, st.columnText(0)) });
-        try o.put(ctx.allocator, "account", .{ .string = try ctx.allocator.dupe(u8, st.columnText(1)) });
-        try o.put(ctx.allocator, "actor", .{ .string = try ctx.allocator.dupe(u8, st.columnText(2)) });
-        try o.put(ctx.allocator, "value", .{ .integer = st.columnInt(3) });
-        try o.put(ctx.allocator, "computed_at", .{ .string = try ctx.allocator.dupe(u8, st.columnText(4)) });
+        try o.put(ctx.allocator.a, "bucket", .{ .string = try ctx.allocator.a.dupe(u8, st.columnText(0)) });
+        try o.put(ctx.allocator.a, "account", .{ .string = try ctx.allocator.a.dupe(u8, st.columnText(1)) });
+        try o.put(ctx.allocator.a, "actor", .{ .string = try ctx.allocator.a.dupe(u8, st.columnText(2)) });
+        try o.put(ctx.allocator.a, "value", .{ .integer = st.columnInt(3) });
+        try o.put(ctx.allocator.a, "computed_at", .{ .string = try ctx.allocator.a.dupe(u8, st.columnText(4)) });
         try items.append(.{ .object = o });
     }
     return wrapItems(ctx, items);
@@ -260,18 +261,18 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
 
 fn wrapItems(ctx: *http.RequestCtx, items: std.json.Array) !http.Response {
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "items", .{ .array = items });
-    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}) };
+    try root.put(ctx.allocator.a, "items", .{ .array = items });
+    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = root }, .{}) };
 }
 
 /// `events`'s house cursor envelope: `items` plus `nextCursor`/`hasNext`, always present (never
 /// omitted, so a caller doesn't have to special-case a page with no more rows).
 fn wrapEventsPage(ctx: *http.RequestCtx, items: std.json.Array, next_cursor: ?[]const u8, has_next: bool) !http.Response {
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "items", .{ .array = items });
-    try root.put(ctx.allocator, "nextCursor", if (next_cursor) |c| .{ .string = c } else .null);
-    try root.put(ctx.allocator, "hasNext", .{ .bool = has_next });
-    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}) };
+    try root.put(ctx.allocator.a, "items", .{ .array = items });
+    try root.put(ctx.allocator.a, "nextCursor", if (next_cursor) |c| .{ .string = c } else .null);
+    try root.put(ctx.allocator.a, "hasNext", .{ .bool = has_next });
+    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = root }, .{}) };
 }
 
 /// Parse the stored payload text back into a JSON value for the response; a non-JSON payload (or an
@@ -404,7 +405,7 @@ const TenantTestEnv = struct {
             ins.finalize();
         }
 
-        var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &env.app };
+        var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&env.arena), .app = &env.app };
         const tok = blk: {
             const w = env.pool.acquireWriter();
             defer env.pool.releaseWriter();
@@ -425,7 +426,6 @@ const TenantTestEnv = struct {
 test "events read is tenant-scoped: a member sees only their account's events" {
     var env = try TenantTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -435,7 +435,7 @@ test "events read is tenant-scoped: a member sees only their account's events" {
     }
     // u1 is an active member of accA only, asking (via the header) to act within accA.
     const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs };
     const res = try events(&ctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     // accA's event is visible; accB's is NOT (no cross-tenant leak).
@@ -461,7 +461,7 @@ test "events read returns distinct string payloads intact across rows (no column
             "('e2','t','t','user.signup','{\"k\":\"bravo\"}','users','u1','accA','2026-01-01T00:00:02Z');");
     }
     const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs };
     const res = try events(&ctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
 
@@ -482,7 +482,6 @@ test "events read returns distinct string payloads intact across rows (no column
 test "events read fails closed: a member who did not activate an account sees nothing" {
     var env = try TenantTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -491,7 +490,7 @@ test "events read fails closed: a member who did not activate an account sees no
     }
     // No X-Account-Id header → no active account resolved → empty (fail closed), even though
     // u1 IS a member of accA. Activation is required to scope.
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer };
     const res = try events(&ctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "eA") == null);
@@ -512,7 +511,7 @@ test "events read paginates with the house cursor: a two-page walk over 3 events
     const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
 
     // Page 1 (limit=2): newest first -> e3, e2; more rows remain.
-    var c1 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "limit=2" };
+    var c1 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "limit=2" };
     const r1 = try events(&c1);
     try std.testing.expectEqual(@as(u16, 200), r1.status);
     const p1 = try std.json.parseFromSlice(std.json.Value, a, r1.body, .{});
@@ -525,7 +524,7 @@ test "events read paginates with the house cursor: a two-page walk over 3 events
 
     // Page 2: fed cursor1 back -> the remaining row (e1), exactly once; no more pages.
     const q2 = try std.fmt.allocPrint(a, "limit=2&cursor={s}", .{cursor1});
-    var c2 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = q2 };
+    var c2 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = q2 };
     const r2 = try events(&c2);
     try std.testing.expectEqual(@as(u16, 200), r2.status);
     const p2 = try std.json.parseFromSlice(std.json.Value, a, r2.body, .{});
@@ -539,9 +538,8 @@ test "events read paginates with the house cursor: a two-page walk over 3 events
 test "events read: a malformed cursor is a 400 \"Invalid cursor.\"" {
     var env = try TenantTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
     const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "cursor=not-a-cursor" };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "cursor=not-a-cursor" };
     const res = try events(&ctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "Invalid cursor.") != null);
@@ -563,14 +561,14 @@ test "events read: rows captured via analytics.insertEvent (the real ctx.track p
     const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
 
     // No filter -> both rows visible.
-    var c0 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs };
+    var c0 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs };
     const r0 = try events(&c0);
     try std.testing.expectEqual(@as(u16, 200), r0.status);
     try std.testing.expect(std.mem.indexOf(u8, r0.body, "user.signup") != null);
     try std.testing.expect(std.mem.indexOf(u8, r0.body, "user.login") != null);
 
     // name filter narrows to the one matching row (and its payload survives the round-trip).
-    var c1 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "name=user.signup" };
+    var c1 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "name=user.signup" };
     const r1 = try events(&c1);
     try std.testing.expectEqual(@as(u16, 200), r1.status);
     const p1 = try std.json.parseFromSlice(std.json.Value, a, r1.body, .{});
@@ -580,13 +578,13 @@ test "events read: rows captured via analytics.insertEvent (the real ctx.track p
     try std.testing.expectEqualStrings("pro", items1[0].object.get("payload").?.object.get("plan").?.string);
 
     // actor filter (matches both, both captured under the same actor).
-    var c2 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "actor=u1" };
+    var c2 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "actor=u1" };
     const r2 = try events(&c2);
     const p2 = try std.json.parseFromSlice(std.json.Value, a, r2.body, .{});
     try std.testing.expectEqual(@as(usize, 2), p2.value.object.get("items").?.array.items.len);
 
     // A `since` far in the future excludes everything captured just now (lower-bound filter).
-    var c3 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "since=2999-01-01T00:00:00Z" };
+    var c3 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = "since=2999-01-01T00:00:00Z" };
     const r3 = try events(&c3);
     try std.testing.expectEqual(@as(u16, 200), r3.status);
     const p3 = try std.json.parseFromSlice(std.json.Value, a, r3.body, .{});
@@ -597,8 +595,7 @@ test "events read: rows captured via analytics.insertEvent (the real ctx.track p
 test "events read requires authentication (anonymous -> 401)" {
     var env = try TenantTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = a, .app = &env.app };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app };
     const res = try events(&ctx);
     try std.testing.expectEqual(@as(u16, 401), res.status);
 }
@@ -606,7 +603,6 @@ test "events read requires authentication (anonymous -> 401)" {
 test "rollups read is tenant-scoped: a member sees only their account's summary rows" {
     var env = try TenantTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -626,7 +622,7 @@ test "rollups read is tenant-scoped: a member sees only their account's summary 
 
     const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
     const params = [_]http.Param{.{ .key = "name", .value = "signups_daily" }};
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/signups_daily", .allocator = a, .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .params = &params };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/signups_daily", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .params = &params };
     const res = try rollups(&ctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     // accA's bucket (value 5) is visible; accB's (value 9) is NOT.
@@ -638,11 +634,10 @@ test "rollups read is tenant-scoped: a member sees only their account's summary 
 test "rollups read 404s for an undeclared rollup name" {
     var env = try TenantTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
     const reg = analytics.Registry{ .rollups = &.{} };
     env.app.analytics = @ptrCast(&reg);
     const params = [_]http.Param{.{ .key = "name", .value = "ghost" }};
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/ghost", .allocator = a, .app = &env.app, .authorization = env.bearer, .params = &params };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/ghost", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .params = &params };
     const res = try rollups(&ctx);
     try std.testing.expectEqual(@as(u16, 404), res.status);
 }
@@ -650,7 +645,6 @@ test "rollups read 404s for an undeclared rollup name" {
 test "rollups read authenticates BEFORE the registry lookup (no name-enumeration oracle)" {
     var env = try TenantTestEnv.init();
     defer env.deinit();
-    const a = env.arena.allocator();
     // Two rollups: one DECLARED, one not. An ANONYMOUS caller must get 401 for BOTH — otherwise the
     // 404 (undeclared) vs 401 (declared) split would leak which rollup names exist to the public.
     const reg = analytics.Registry{ .rollups = &.{.{
@@ -665,10 +659,10 @@ test "rollups read authenticates BEFORE the registry lookup (no name-enumeration
     env.app.analytics = @ptrCast(&reg);
 
     const declared = [_]http.Param{.{ .key = "name", .value = "signups_daily" }};
-    var c1 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/signups_daily", .allocator = a, .app = &env.app, .params = &declared }; // NO Authorization
+    var c1 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/signups_daily", .allocator = RequestArena.from(&env.arena), .app = &env.app, .params = &declared }; // NO Authorization
     try std.testing.expectEqual(@as(u16, 401), (try rollups(&c1)).status);
 
     const undeclared = [_]http.Param{.{ .key = "name", .value = "ghost" }};
-    var c2 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/ghost", .allocator = a, .app = &env.app, .params = &undeclared }; // NO Authorization
+    var c2 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/rollups/ghost", .allocator = RequestArena.from(&env.arena), .app = &env.app, .params = &undeclared }; // NO Authorization
     try std.testing.expectEqual(@as(u16, 401), (try rollups(&c2)).status); // same 401 — no oracle
 }

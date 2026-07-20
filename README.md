@@ -106,7 +106,7 @@ const zigbase = @import("zigbase");
 
 fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     _ = ctx;
-    // mutate ev.record using ev.arena ...
+    // mutate ev.record using ev.arena.a ...
 }
 
 pub fn main(init: std.process.Init) !void {

@@ -13,6 +13,7 @@
 //! for tests, and no code path spawns detached threads anymore.
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const queue = @import("queue.zig");
 const events = @import("../events.zig");
 const App = @import("../app.zig").App;
@@ -37,7 +38,7 @@ pub fn runWithRetry(app: *App, handler: queue.JobHandler, payload: []const u8, p
     while (true) : (attempt += 1) {
         var arena = std.heap.ArenaAllocator.init(app.allocator);
         defer arena.deinit();
-        var cx = Ctx{ .app = app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        var cx = Ctx{ .app = app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
         if (handler(&cx, payload)) |_| {
             return .done;
@@ -74,7 +75,7 @@ const Task = struct {
                 // releases a pooled reader; the arena owns ctx.records() results.
                 var arena = std.heap.ArenaAllocator.init(self.app.allocator);
                 defer arena.deinit();
-                var cx = Ctx{ .app = self.app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+                var cx = Ctx{ .app = self.app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = null, .bound_conn = null };
                 defer cx.deinit();
                 s.task(&cx, &ev) catch |e| {
                     var err_ev = events.ErrorEvent{ .app = self.app, .ctx = null, .err = e, .phase = .job, .message = @errorName(e) };

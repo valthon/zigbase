@@ -33,6 +33,7 @@
 //! short `done_ttl_s`, or DB-at-rest encryption if that is a concern.
 
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const events = @import("events.zig");
 const queue = @import("queue/queue.zig");
 const http_client = @import("http_client.zig");
@@ -117,7 +118,7 @@ const Disposition = union(enum) {
 pub fn webhookJobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
     // `…Leaky` parses directly into `ctx.arena` (which owns every allocation and is freed
     // wholesale at job end) — no nested `Parsed(T)` arena to `deinit`.
-    const job = std.json.parseFromSliceLeaky(WebhookJob, ctx.arena, payload, .{}) catch {
+    const job = std.json.parseFromSliceLeaky(WebhookJob, ctx.arena.a, payload, .{}) catch {
         // A malformed payload is a programmer error, not a transient delivery failure:
         // surface it on the webhook phase and do not retry.
         fireOnError(ctx, error.WebhookPayloadInvalid, "webhook job payload is not valid JSON");
@@ -151,13 +152,13 @@ pub fn deliver(ctx: *Ctx, job: WebhookJob) !void {
         switch (try attemptOnce(ctx, job)) {
             .ok => return,
             .terminal => |status| {
-                const msg = std.fmt.allocPrint(ctx.arena, "webhook POST {s} rejected with HTTP {d} (terminal)", .{ job.url, status }) catch "webhook delivery rejected (terminal)";
+                const msg = std.fmt.allocPrint(ctx.arena.a, "webhook POST {s} rejected with HTTP {d} (terminal)", .{ job.url, status }) catch "webhook delivery rejected (terminal)";
                 fireOnError(ctx, error.WebhookDeliveryFailed, msg);
                 return;
             },
             .retryable => |retry_after_ms| {
                 if (attempt >= max) {
-                    const msg = std.fmt.allocPrint(ctx.arena, "webhook POST {s} failed after {d} attempt(s)", .{ job.url, attempt }) catch "webhook delivery failed (attempts exhausted)";
+                    const msg = std.fmt.allocPrint(ctx.arena.a, "webhook POST {s} failed after {d} attempt(s)", .{ job.url, attempt }) catch "webhook delivery failed (attempts exhausted)";
                     fireOnError(ctx, error.WebhookDeliveryFailed, msg);
                     return;
                 }
@@ -167,7 +168,7 @@ pub fn deliver(ctx: *Ctx, job: WebhookJob) !void {
                     // Sleeping this long would keep the worker/claim past the queue's
                     // visibility_timeout_s, inviting reclaimStale to re-deliver concurrently. Abandon
                     // the delivery instead (same exhausted-delivery signal as running out of attempts).
-                    const msg = std.fmt.allocPrint(ctx.arena, "webhook POST {s} abandoned after {d} attempt(s): retry backoff would exceed the {d}ms in-handler budget (raise the queue visibility_timeout_s or lower the backoff)", .{ job.url, attempt, max_total_backoff_ms }) catch "webhook delivery abandoned (retry budget exceeded)";
+                    const msg = std.fmt.allocPrint(ctx.arena.a, "webhook POST {s} abandoned after {d} attempt(s): retry backoff would exceed the {d}ms in-handler budget (raise the queue visibility_timeout_s or lower the backoff)", .{ job.url, attempt, max_total_backoff_ms }) catch "webhook delivery abandoned (retry budget exceeded)";
                     fireOnError(ctx, error.WebhookDeliveryFailed, msg);
                     return;
                 }
@@ -182,14 +183,14 @@ pub fn deliver(ctx: *Ctx, job: WebhookJob) !void {
 /// Perform ONE POST and classify the outcome. A transport/network error is retryable.
 fn attemptOnce(ctx: *Ctx, job: WebhookJob) !Disposition {
     var headers: std.ArrayList(http_client.Header) = .empty;
-    try headers.append(ctx.arena, .{ .name = "Content-Type", .value = "application/json" });
+    try headers.append(ctx.arena.a, .{ .name = "Content-Type", .value = "application/json" });
     if (job.idempotency_key) |k|
-        try headers.append(ctx.arena, .{ .name = job.idempotency_header, .value = k });
+        try headers.append(ctx.arena.a, .{ .name = job.idempotency_header, .value = k });
     if (job.sign) |s| {
-        const ts = try std.fmt.allocPrint(ctx.arena, "{d}", .{clock.nowUnix(ctx.app.io)});
-        const sig = try signBody(ctx.arena, s.secret, ts, job.body);
-        try headers.append(ctx.arena, .{ .name = s.timestamp_header, .value = ts });
-        try headers.append(ctx.arena, .{ .name = s.signature_header, .value = sig });
+        const ts = try std.fmt.allocPrint(ctx.arena.a, "{d}", .{clock.nowUnix(ctx.app.io)});
+        const sig = try signBody(ctx.arena.a, s.secret, ts, job.body);
+        try headers.append(ctx.arena.a, .{ .name = s.timestamp_header, .value = ts });
+        try headers.append(ctx.arena.a, .{ .name = s.signature_header, .value = sig });
     }
 
     const res = ctx.http().request(.{
@@ -570,7 +571,7 @@ const DeliverEnv = struct {
     }
     fn ctx(self: *DeliverEnv) Ctx {
         self.app.dispatch = &self.dispatch;
-        return Ctx{ .app = &self.app, .arena = self.arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        return Ctx{ .app = &self.app, .arena = RequestArena.from(&self.arena), .rctx = .{}, .request = null, .bound_conn = null };
     }
     fn deinit(self: *DeliverEnv) void {
         self.arena.deinit();

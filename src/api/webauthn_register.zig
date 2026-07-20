@@ -10,6 +10,7 @@
 /// 3. Registration challenges use method key "webauthn_reg" so they cannot be replayed for login.
 /// 4. `existsCredentialId` is checked before insert; duplicates return 409.
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const db = @import("../db.zig");
 const collections = @import("../collections.zig");
@@ -50,7 +51,7 @@ fn b64urlDecode(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
 /// Returns the collection + opts, or a response on failure.
 fn loadWebAuthnCollection(ctx: *http.RequestCtx, conn: *db.Db) !?struct { col: schema.Collection, opts: schema.WebAuthnMethodOpts } {
     const col_name = ctx.param("col") orelse return null;
-    const col = (try collections.get(ctx.allocator, conn, col_name)) orelse return null;
+    const col = (try collections.get(ctx.allocator.a, conn, col_name)) orelse return null;
     if (col.type != .auth) return null;
     const opts = col.options.auth.methods.webauthn orelse return null;
     return .{ .col = col, .opts = opts };
@@ -60,7 +61,7 @@ fn loadWebAuthnCollection(ctx: *http.RequestCtx, conn: *db.Db) !?struct { col: s
 /// Returns null (with a response already returned to the caller) when unauthenticated.
 fn requireAuthed(ctx: *http.RequestCtx, conn: *db.Db) !?[]const u8 {
     const app = ctx.app orelse return null;
-    const authed = (try auth.authenticate(app.io, ctx.allocator, app, ctx, conn)) orelse return null;
+    const authed = (try auth.authenticate(app.io, ctx.allocator.a, app, ctx, conn)) orelse return null;
     const id = authed.record.object.get("id") orelse return null;
     if (id != .string) return null;
     return id.string;
@@ -71,24 +72,24 @@ fn requireAuthed(ctx: *http.RequestCtx, conn: *db.Db) !?[]const u8 {
 /// Requires: authenticated session (the authed user owns the new credential).
 /// Returns: PublicKeyCredentialCreationOptions JSON {rp, user, challenge, pubKeyCredParams, ceremonyId}
 pub fn begin(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator);
+    const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator.a);
 
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
 
     // Authenticate the caller.
     const user_id = (try requireAuthed(ctx, w)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
 
     // Load the collection + webauthn opts.
     const load = (try loadWebAuthnCollection(ctx, w)) orelse
-        return (ApiError.notFound()).toResponse(ctx.allocator);
+        return (ApiError.notFound()).toResponse(ctx.allocator.a);
     const col = load.col;
     const wa_opts = load.opts;
 
     // Guard: reject mis-configured webauthn (empty rp_id or origin).
     if (wa_opts.rp_id.len == 0 or wa_opts.origin.len == 0) {
-        return (ApiError{ .status = 500, .message = "WebAuthn is enabled but not configured (rp_id and origin are required)." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 500, .message = "WebAuthn is enabled but not configured (rp_id and origin are required)." }).toResponse(ctx.allocator.a);
     }
 
     // Generate 32 random challenge bytes.
@@ -100,7 +101,7 @@ pub fn begin(ctx: *http.RequestCtx) anyerror!http.Response {
     // submitted as a login ceremony.
     const cs = ChallengeStore{ .conn = w };
     const cid = try cs.put(
-        ctx.allocator,
+        ctx.allocator.a,
         app.io,
         col.name,
         "webauthn_reg",
@@ -110,12 +111,12 @@ pub fn begin(ctx: *http.RequestCtx) anyerror!http.Response {
     );
 
     // Base64url-encode the challenge for the client.
-    const challenge_b64 = try client_data.b64urlNoPad(ctx.allocator, &challenge_raw);
+    const challenge_b64 = try client_data.b64urlNoPad(ctx.allocator.a, &challenge_raw);
 
     // Build PublicKeyCredentialCreationOptions JSON.
     // pubKeyCredParams: ES256 (-7) and EdDSA (-8).
     const body = try std.fmt.allocPrint(
-        ctx.allocator,
+        ctx.allocator.a,
         "{{\"rp\":{{\"id\":\"{s}\",\"name\":\"{s}\"}},\"user\":{{\"id\":\"{s}\",\"name\":\"{s}\",\"displayName\":\"{s}\"}},\"challenge\":\"{s}\",\"pubKeyCredParams\":[{{\"type\":\"public-key\",\"alg\":-7}},{{\"type\":\"public-key\",\"alg\":-8}}],\"ceremonyId\":\"{s}\",\"timeout\":300000}}",
         .{ wa_opts.rp_id, wa_opts.rp_name, user_id, user_id, user_id, challenge_b64, cid },
     );
@@ -129,25 +130,25 @@ pub fn begin(ctx: *http.RequestCtx) anyerror!http.Response {
 /// Body: { ceremonyId, attestationObject, clientDataJSON }
 /// Returns: 204 No Content on success.
 pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator);
+    const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator.a);
 
     // Parse the request body (no DB / no lock needed).
-    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch {
-        return (ApiError.badRequest("Invalid JSON body.")).toResponse(ctx.allocator);
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator.a, ctx.body, .{}) catch {
+        return (ApiError.badRequest("Invalid JSON body.")).toResponse(ctx.allocator.a);
     };
     if (parsed.value != .object) {
-        return (ApiError.badRequest("Invalid JSON body.")).toResponse(ctx.allocator);
+        return (ApiError.badRequest("Invalid JSON body.")).toResponse(ctx.allocator.a);
     }
     const body = parsed.value;
 
     const ceremony_id = strField(body, "ceremonyId") orelse {
-        return (ApiError.badRequest("ceremonyId is required.")).toResponse(ctx.allocator);
+        return (ApiError.badRequest("ceremonyId is required.")).toResponse(ctx.allocator.a);
     };
     const att_obj_b64 = strField(body, "attestationObject") orelse {
-        return (ApiError.badRequest("attestationObject is required.")).toResponse(ctx.allocator);
+        return (ApiError.badRequest("attestationObject is required.")).toResponse(ctx.allocator.a);
     };
     const cdj_b64 = strField(body, "clientDataJSON") orelse {
-        return (ApiError.badRequest("clientDataJSON is required.")).toResponse(ctx.allocator);
+        return (ApiError.badRequest("clientDataJSON is required.")).toResponse(ctx.allocator.a);
     };
 
     // ---- Phase 1 (writer held): authenticate, load collection, consume the challenge ----
@@ -162,37 +163,37 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         defer app.pool.releaseWriter();
 
         user_id = (try requireAuthed(ctx, w)) orelse
-            return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+            return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
 
         const load = (try loadWebAuthnCollection(ctx, w)) orelse
-            return (ApiError.notFound()).toResponse(ctx.allocator);
+            return (ApiError.notFound()).toResponse(ctx.allocator.a);
         wa_opts = load.opts;
         col_name = load.col.name;
 
         // Guard: reject mis-configured webauthn (empty rp_id or origin).
         if (wa_opts.rp_id.len == 0 or wa_opts.origin.len == 0) {
-            return (ApiError{ .status = 500, .message = "WebAuthn is enabled but not configured (rp_id and origin are required)." }).toResponse(ctx.allocator);
+            return (ApiError{ .status = 500, .message = "WebAuthn is enabled but not configured (rp_id and origin are required)." }).toResponse(ctx.allocator.a);
         }
 
         // Atomically take (consume) the registration challenge.
         // SECURITY: take() filters by method, so a "webauthn" login challenge cannot be consumed
         // by this registration take() that passes "webauthn_reg", and vice versa.
         const cs = ChallengeStore{ .conn = w };
-        challenge_raw_bytes = (try cs.take(ctx.allocator, ceremony_id, "webauthn_reg")) orelse {
-            return (ApiError{ .status = 400, .message = "Invalid or expired ceremony." }).toResponse(ctx.allocator);
+        challenge_raw_bytes = (try cs.take(ctx.allocator.a, ceremony_id, "webauthn_reg")) orelse {
+            return (ApiError{ .status = 400, .message = "Invalid or expired ceremony." }).toResponse(ctx.allocator.a);
         };
     } // writer released — verifyRegistration below runs OFF the lock.
 
     // ---- Phase 2 (NO lock): decode inputs + verify the registration ceremony ----
-    const att_obj_bytes = b64urlDecode(ctx.allocator, att_obj_b64) catch {
-        return (ApiError.badRequest("Invalid attestationObject encoding.")).toResponse(ctx.allocator);
+    const att_obj_bytes = b64urlDecode(ctx.allocator.a, att_obj_b64) catch {
+        return (ApiError.badRequest("Invalid attestationObject encoding.")).toResponse(ctx.allocator.a);
     };
-    const cdj_bytes = b64urlDecode(ctx.allocator, cdj_b64) catch {
-        return (ApiError.badRequest("Invalid clientDataJSON encoding.")).toResponse(ctx.allocator);
+    const cdj_bytes = b64urlDecode(ctx.allocator.a, cdj_b64) catch {
+        return (ApiError.badRequest("Invalid clientDataJSON encoding.")).toResponse(ctx.allocator.a);
     };
 
     const reg_result = register_mod.verifyRegistration(
-        ctx.allocator,
+        ctx.allocator.a,
         wa_opts.rp_id,
         wa_opts.origin,
         challenge_raw_bytes,
@@ -200,13 +201,13 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         att_obj_bytes,
         wa_opts.require_uv,
     ) catch {
-        return (ApiError{ .status = 400, .message = "Registration verification failed." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 400, .message = "Registration verification failed." }).toResponse(ctx.allocator.a);
     };
 
     // Base64url-encode the credential id, COSE public key, and AAGUID for storage.
-    const cred_id_b64 = try client_data.b64urlNoPad(ctx.allocator, reg_result.credential_id);
-    const cose_pubkey_b64 = try client_data.b64urlNoPad(ctx.allocator, reg_result.cose_pubkey);
-    const aaguid_b64 = try client_data.b64urlNoPad(ctx.allocator, &reg_result.aaguid);
+    const cred_id_b64 = try client_data.b64urlNoPad(ctx.allocator.a, reg_result.credential_id);
+    const cose_pubkey_b64 = try client_data.b64urlNoPad(ctx.allocator.a, reg_result.cose_pubkey);
+    const aaguid_b64 = try client_data.b64urlNoPad(ctx.allocator.a, &reg_result.aaguid);
 
     // ---- Phase 3 (writer held): uniqueness check + insert (atomic) ----
     {
@@ -216,7 +217,7 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         const cred_store = CredentialStore{ .conn = w };
         // SECURITY REQUIREMENT 3: check uniqueness BEFORE insert (insert also enforces UNIQUE).
         if (try cred_store.existsCredentialId(cred_id_b64)) {
-            return (ApiError{ .status = 409, .message = "Credential already registered." }).toResponse(ctx.allocator);
+            return (ApiError{ .status = 409, .message = "Credential already registered." }).toResponse(ctx.allocator.a);
         }
 
         // Insert the credential. record_ref = authed user id (never body-supplied). The pre-check
@@ -224,7 +225,7 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         // credentialId that races in between resolves to the SAME 409 (error.Constraint) rather
         // than a 500 — any other DB error still propagates.
         cred_store.insert(
-            ctx.allocator,
+            ctx.allocator.a,
             app.io,
             col_name,
             user_id, // SECURITY: always the authenticated user, not from request body
@@ -235,7 +236,7 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
             aaguid_b64,
             "", // transports: not parsed from body in v1
         ) catch |e| switch (e) {
-            error.Constraint => return (ApiError{ .status = 409, .message = "Credential already registered." }).toResponse(ctx.allocator),
+            error.Constraint => return (ApiError{ .status = 409, .message = "Credential already registered." }).toResponse(ctx.allocator.a),
             else => return e,
         };
     }
@@ -281,7 +282,7 @@ test "webauthn_register begin: returns 200 with challenge + ceremonyId for authe
     };
 
     const params = [_]http.Param{.{ .key = "col", .value = "wrusers1" }};
-    var ctx = env.ctx(a, .POST, "{}", &params);
+    var ctx = env.ctx(RequestArena.from(&arena), .POST, "{}", &params);
     ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
 
     // Writer is released; begin() can now acquire it without deadlocking.
@@ -300,10 +301,9 @@ test "webauthn_register begin: unauthenticated returns 401" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     const params = [_]http.Param{.{ .key = "col", .value = "wrusers2" }};
-    var ctx = env.ctx(a, .POST, "{}", &params);
+    var ctx = env.ctx(RequestArena.from(&arena), .POST, "{}", &params);
     // No authorization header.
 
     const res = try begin(&ctx);
@@ -395,7 +395,7 @@ test "webauthn_register finish: stores credential and returns 204" {
     );
 
     const params = [_]http.Param{.{ .key = "col", .value = "wrusers3" }};
-    var ctx = env.ctx(a, .POST, body_str, &params);
+    var ctx = env.ctx(RequestArena.from(&arena), .POST, body_str, &params);
     ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
 
     // Writer is released; finish() can now acquire it without deadlocking.
@@ -488,7 +488,7 @@ test "webauthn_register begin: webauthn enabled but empty rp_id returns 500" {
     // Writer released; begin() can now acquire it.
 
     const params = [_]http.Param{.{ .key = "col", .value = "wrusers_empty_rp" }};
-    var ctx = env.ctx(a, .POST, "{}", &params);
+    var ctx = env.ctx(RequestArena.from(&arena), .POST, "{}", &params);
     ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
 
     const res = try begin(&ctx);
@@ -578,7 +578,7 @@ test "webauthn_register finish: duplicate credentialId returns 409" {
     );
 
     const params = [_]http.Param{.{ .key = "col", .value = "wrusers4" }};
-    var ctx = env.ctx(a, .POST, body_str, &params);
+    var ctx = env.ctx(RequestArena.from(&arena), .POST, body_str, &params);
     ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
 
     // Writer is released; finish() can now acquire it without deadlocking.
