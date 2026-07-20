@@ -470,27 +470,43 @@ test "sign refuses to mint a token that verify would reject" {
 }
 
 test "scratch_size holds for the largest token max_token_len admits" {
-    // Guards the derivation in `scratch_size`'s doc comment: the constant is only correct
-    // relative to `max_token_len`, and the consumption ratio GROWS with token size, so a
-    // raise to either constant must be re-measured rather than assumed.
+    // Guards the derivation in `scratch_size`'s doc comment. Two properties matter and the
+    // test asserts both at the BOUNDARY rather than somewhere comfortably inside it.
+    //
+    // `pl` of 1450 all-quote bytes is the measured maximum `sign` accepts: every `"` escapes
+    // to `\"` in JSON, doubling the payload, and the result base64s to a token of EXACTLY
+    // `max_token_len`. Escape-heavy is the adversarial case -- it forces std.json to copy
+    // into its arena instead of borrowing from the input, which is what makes consumption
+    // grow super-linearly and is precisely what `scratch_size` is sized against.
+    //
+    // Deliberately NO `catch return` on `sign`. An earlier version of this test swallowed
+    // `error.TokenTooLarge` and returned early; because its payload was in fact too large,
+    // it never reached `verifyInto` and asserted nothing while still passing. If a future
+    // change to `Claims` or `max_token_len` pushes this payload over the ceiling, `try` makes
+    // that a loud failure instead of a silently hollow test.
     const a = std.testing.allocator;
     const key = [_]u8{3} ** 32;
 
-    // Escape-heavy payload: forces std.json to copy into its arena instead of borrowing,
-    // which is the adversarial case scratch_size is sized against.
-    var pl: [1800]u8 = undefined;
+    var pl: [1450]u8 = undefined;
     @memset(&pl, '"');
     const claims = Claims{ .id = "u1", .collection = "users", .type = .auth, .iat = 1000, .exp = 4000, .pl = &pl };
 
-    const token = sign(a, claims, &key) catch |e| switch (e) {
-        // If this payload can't be minted, the ceiling is doing its job; nothing to check.
-        error.TokenTooLarge => return,
-        else => return e,
-    };
+    const token = try sign(a, claims, &key);
     defer a.free(token);
-    try std.testing.expect(token.len <= max_token_len);
+    // If this trips, `pl` is no longer the boundary payload -- re-measure, do not just nudge it.
+    try std.testing.expectEqual(max_token_len, token.len);
 
+    // Verify through the FixedBufferAllocator directly so consumption can be READ, not assumed.
     var scratch: [scratch_size]u8 = undefined;
-    const got = try verifyInto(&scratch, token, &key, 1500);
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const got = try verify(fba.allocator(), token, &key, 1500);
     try std.testing.expectEqualStrings("u1", got.id);
+
+    // The real assertion: worst-case consumption fits, with headroom. Measured 14804/16384.
+    try std.testing.expect(fba.end_index <= scratch_size);
+
+    // And the same token verifies through the public contract-3 entry point.
+    var scratch2: [scratch_size]u8 = undefined;
+    const got2 = try verifyInto(&scratch2, token, &key, 1500);
+    try std.testing.expectEqualStrings("u1", got2.id);
 }
