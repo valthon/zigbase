@@ -56,6 +56,7 @@ collection (with a prominent startup warning for every one).
 | F10 | Static dir mode follows symlinks out of root | Path traversal | Low | A | Low (operator must plant the symlink) | **Fixed** |
 | F11 | OAuth `state` is delegated to the client, not enforced server-side | Auth/OAuth | Low/Med | A | Low (redirect-URI allowlist + PKCE present) | **Fixed** (opt-in server-side store) |
 | F12 | Insecure deployment defaults (bind `0.0.0.0`, `cookie_secure=false`, open WS origins) | Config | Med | A | n/a (posture) | **Fixed** |
+| F13 | Unbounded pre-auth allocation from attacker-supplied JWT length | DoS | Med | A | Moderate (unauthenticated; body path allows a 50 MiB token) | **Fixed** |
 
 Items deliberately re-assessed as **not exploitable**: rule **parse errors fail *closed*** (a
 malformed rule yields a 500, the write never runs — see F3 notes); `expand` **does** re-apply the
@@ -591,3 +592,29 @@ When SQLite, sqlite-vec, `zap`, or facil.io publishes a security release:
 5. **Add a changelog fragment** under `changelog.d/` with a `### Security` bullet describing the
    dependency bump and the CVE(s) it addresses.
 6. **Release** per `scripts/release.sh` (the fragment is assembled into the changelog).
+
+### F13 — Unbounded pre-auth allocation from attacker-supplied JWT length (FIXED)
+
+**Where.** `src/jwt.zig` (`verify`, `peekClaims`, `sign`).
+
+**Description.** No code path bounded the length of a supplied token before decoding it.
+Token extraction is verbatim at every entry point — `src/http.zig` (`bearerToken`, `cookie`),
+`src/api/files.zig` (`token` query param), `src/realtime/protocol.zig` (`token` JSON field) —
+and the only limits were transport-level and uneven: header/query paths are incidentally
+capped near 8 KB by facil.io's `HTTP_MAX_HEADER_LENGTH`, but a request **body** may be
+`max_upload_size` (50 MiB by default, `src/config.zig`) and a realtime frame 256 KiB.
+
+Because a token is base64-decoded and JSON-parsed **before** its signature is checked, an
+unauthenticated request could drive allocation proportional to the bytes it supplied. A
+1,048,618-byte garbage token was measured consuming 1,048,616 bytes before rejection. All
+production call sites used the arena-scoped `verify`/`peekClaims`, so the allocation landed
+on the request arena and was held for the request's lifetime.
+
+**Fix.** `verify` and `peekClaims` reject `token.len > jwt.max_token_len` (4096) as their
+first statement, before any allocation. The check is inside those two functions rather than
+in the `verifyInto`/`peekClaimsInto` wrappers deliberately: the wrappers had *zero*
+production callers, so bounding only them would have left every real path unbounded.
+`sign` enforces the same ceiling so the module cannot mint a token it would refuse.
+
+**Not a full DoS fix on its own.** This bounds per-token amplification, not request volume;
+the rate limiter (F8) and body-size limits remain the controls for that.
