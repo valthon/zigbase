@@ -53,6 +53,25 @@ These are the checks that reflect Zig's actual design guarantees. A violation is
 - **Flag:** `errdefer` missing on the *error* path when an allocation must be rolled back but kept on success (a classic partial-construction leak).
 - **Idiom:** deallocation code directly follows allocation code (`defer`), so both are visible together. Reviewers should be able to see the free next to the alloc.
 
+### 2.2a Ownership contracts — what a function returns and who frees it
+
+§2.1 covers *taking* an allocator and §2.2 covers pairing alloc/free, but the bug
+that survives both is a function that allocates scratch and never frees it —
+correct under a caller's arena, a leak under any other allocator. Every
+allocator-taking function must be exactly one of these, and say which:
+
+| # | Contract | Shape | Promise |
+| - | -------- | ----- | ------- |
+| 1 | **Self-freeing** (default) | `fn f(alloc, …) ![]u8` | Frees all scratch; exactly one allocation escapes — the return. Correct under ANY allocator. |
+| 2 | **Owned-result** | `fn f(alloc, …) !Result` + `Result.deinit(alloc)` | Result owns an internal graph; caller deinits. |
+| 3 | **Caller-buffer** | `fn f(buf: []u8, …) …` | Allocates nothing. Preferred when output is bounded by its input. |
+| 4 | **Arena-scoped** | `fn f(arena: RequestArena, …) !T` | Interlinked graph reclaimed by arena drop. The signature can't accept a GPA by accident — `RequestArena` isn't `Allocator` — but a deliberate `.{ .a = gpa }` struct literal still compiles (Zig has no private fields); the guarantee is against accidental misuse, and any bypass is greppable. Needs a written justification, not just the type. |
+
+- **Flag:** a function that allocates scratch and returns without freeing it, relying on the caller having passed an arena. That is contract 4 without the type — the defect this section exists to stop.
+- **Contract 4 must be earned.** All three must hold: (1) the result is a graph of interlinked allocations, not a single buffer; (2) freeing them individually would be pointer-chasing for no benefit; (3) the lifetime is genuinely request-scoped. "It is currently written that way" and "adding `defer`s is tedious" are NOT justifications.
+- **Reviewer check (mechanical):** *Which contract is this function? Does its test use raw `std.testing.allocator` (leak detection ON)? If it takes `RequestArena`, where is the written justification?*
+- **Wrapping the testing allocator — under either the `std.testing.allocator` or aliased `testing.allocator` spelling — in an arena disables Zig's leak detector** for that test (`ArenaAllocator.init(std.testing.allocator)` and `ArenaAllocator.init(testing.allocator)` are both this). Legitimate only for contract 4, and every instance is listed in `scripts/allocator-allowlist.txt`; `scripts/check-allocator-contracts.sh` fails the build on a new one.
+
 ### 2.3 Errors are values — none may be silently ignored
 - **Rule:** *Errors are values, and may not be ignored.* Every error union is handled with `try`, `catch`, an explicit switch on the error set, or a **deliberate** `unreachable`/`catch unreachable` that is genuinely provable.
 - **Flag:** `catch unreachable` / `catch {}` used to *silence* an error that can actually occur (the #1 AI-code and beginner tell).

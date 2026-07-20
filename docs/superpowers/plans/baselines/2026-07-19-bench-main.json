@@ -1,0 +1,3 @@
+{"name":"smoke/alloc-16","ns_median":10694,"ns_p95":16741,"allocs":1000,"bytes":16000,"peak_live":16,"buckets":[1000,0,0,0,0]}
+{"name":"jwt/sign","ns_median":130219,"ns_p95":162596,"allocs":18000,"bytes":3288000,"peak_live":1454,"buckets":[6000,10000,2000,0,0]}
+{"name":"jwt/verify","ns_median":65766,"ns_p95":78340,"allocs":12000,"bytes":1108000,"peak_live":748129,"buckets":[6000,6000,0,0,0]}

@@ -15,6 +15,11 @@ pub const Server = @import("server.zig").Server;
 pub const http = @import("http.zig");
 pub const events = @import("events.zig");
 pub const schedule = @import("schedule.zig");
+// JWT signing/verification and the HMAC key-derivation helper it uses — named here so
+// bench/main.zig (and any consumer needing to mint/verify tokens directly) can `@import("zigbase")`
+// rather than reach into internal source paths.
+pub const jwt = @import("jwt.zig");
+pub const crypto = @import("crypto.zig");
 // Pagination: the comptime `.pagination` config types + the cursor token-format selector,
 // so a consumer can name `zigbase.CursorToken` when configuring `App(.{ .pagination = ... })`.
 pub const CursorToken = @import("pagination.zig").CursorToken;
@@ -184,6 +189,14 @@ pub const SubjectCookieOpts = @import("ctx.zig").SubjectCookieOpts;
 /// Binds as a literal SQL parameter (never re-parsed as filter grammar) — the injection-safe way
 /// to splice a runtime value into a filter. See the `ctx.records()` section of docs/framework.md.
 pub const FilterArg = @import("records.zig").FilterArg;
+
+/// A request-scoped arena, constructible only from a real `*std.heap.ArenaAllocator`.
+/// Contract 4 of the allocator-ownership design
+/// (docs/superpowers/specs/2026-07-19-allocator-ownership-design.md): taking this type
+/// instead of a plain `std.mem.Allocator` makes an arena-only dependency a compile-time
+/// fact instead of an unstated assumption. See `src/request_arena.zig` for the full
+/// justification requirement before a function may take one.
+pub const RequestArena = @import("request_arena.zig").RequestArena;
 
 /// The `data` facade module. Holds `data.queryAs(T, conn, alloc, sql, args)` — name-mapped
 /// raw-SQL row decoding (#240): each result row is decoded into a struct `T` by matching fields
@@ -489,6 +502,7 @@ test {
     _ = @import("testing.zig");
     _ = @import("captcha.zig");
     _ = @import("webhook.zig");
+    _ = @import("request_arena.zig");
     // Opt-in pure-Zig PostgreSQL backend (#159). The `build_options.postgres` condition is
     // comptime-known, so when it is false (the default) these `@import`s are never analyzed —
     // the driver compiles to nothing and the default build stays byte-identical.
