@@ -36,18 +36,20 @@ git_quiet() {
   fi
 }
 
-declare -A json_file=()
+# ONE definition of the ref->filename mapping, used for both the write (in the
+# loop) and the read (the python invocation), so the two can never disagree —
+# the bug this replaces derived the write path via tr on the full ref but the
+# read path via basename-then-tr, which only match when $rev has no "/" (i.e.
+# is not a branch like "chore/allocator-discipline").
+#
+# Deliberately NOT an associative array: `declare -A` is bash 4+, and macOS
+# still ships bash 3.2. This repo supports macOS, so the script stays 3.2-clean.
+json_for() { printf '%s/%s.json' "$tmp" "$(printf '%s' "$1" | tr '/' '_')"; }
+wt_for() { printf '%s/%s' "$tmp" "$(printf '%s' "$1" | tr '/' '_')"; }
 
 for rev in "$A" "$B"; do
-  # Sanitize once and reuse for both the write (below) and the read (the
-  # python invocation) so the two never disagree on the filename — the
-  # bug this replaces derived the write path via tr on the full ref, but
-  # the read path via basename-then-tr, which only matches when $rev has
-  # no "/" (i.e. is not a branch like "chore/allocator-discipline").
-  safe="$(printf '%s' "$rev" | tr '/' '_')"
-  wt="$tmp/$safe"
-  json="$tmp/$safe.json"
-  json_file["$rev"]="$json"
+  wt="$(wt_for "$rev")"
+  json="$(json_for "$rev")"
 
   created_worktrees+=("$wt")
   git_quiet worktree add --detach "$wt" "$rev"
@@ -58,7 +60,7 @@ for rev in "$A" "$B"; do
   # against an already-removed path is a silent no-op failure.
 done
 
-python3 - "${json_file[$A]}" "${json_file[$B]}" <<'PY'
+python3 - "$(json_for "$A")" "$(json_for "$B")" <<'PY'
 import json, sys
 def load(p):
     out = {}
