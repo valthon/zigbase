@@ -170,6 +170,20 @@ pub fn build(b: *std.Build) void {
     const audit_step = b.step("audit", "Audit pinned dependency versions against docs/security-advisories.md");
     audit_step.dependOn(&audit_cmd.step);
 
+    // --- bench: allocation + timing harness (report-only; see the allocator-ownership spec)
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    bench_mod.addImport("zigbase", zigbase_mod);
+    const bench_exe = b.addExecutable(.{ .name = "zigbase-bench", .root_module = bench_mod });
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| bench_run.addArgs(args);
+    const bench_step = b.step("bench", "Run the benchmark harness (ns/op + allocation profile)");
+    bench_step.dependOn(&bench_run.step);
+
     // --- dating-server: the dating fixture compiled as a runnable server ----------
     // Plan 2: the e2e harness spawns THIS binary so client and server share the exact
     // comptime schema the dating client was generated from. Links libc (facil.io C deps).
@@ -264,6 +278,22 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
+
+    // Wire the bench harness's own test{} blocks (counting_allocator.zig, harness.zig)
+    // into `zig build test`. Without this, nothing in CI ever compiles or runs `bench/`
+    // (this test_step is rooted at src/root.zig, which can't see bench/, and `bench_step`
+    // above is manual and not part of CI) — a jwt/crypto API change could silently break
+    // the harness the allocator-ownership migration depends on. Rooted at harness.zig
+    // (not zigbase-importing main.zig) so counting_allocator.zig's tests come along via
+    // its `@import`, with no libc/facil.io/sqlite recompile needed for a std-only test.
+    const bench_test_mod = b.createModule(.{
+        .root_source_file = b.path("bench/harness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bench_tests = b.addTest(.{ .root_module = bench_test_mod });
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+    test_step.dependOn(&run_bench_tests.step);
 
     // --- codegen: generate the dating fixture's typed client -------------------
     // This is the Plan-1 Definition of Done for Task 7. Uses b.path(...) directly
