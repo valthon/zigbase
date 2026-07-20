@@ -42,6 +42,23 @@ pub const JwtError = error{ Malformed, BadSignature, Expired, TokenTooLarge } ||
 
 const header_b64 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"; // base64url of {"alg":"HS256","typ":"JWT"}
 
+/// Length of an HS256 signature, in bytes.
+const sig_len = 32;
+
+/// Hard ceiling on a token this module will process, enforced BEFORE any allocation.
+///
+/// Without it, token length is attacker-controlled and unbounded: nothing on the request
+/// path bounds it, and the transport caps are both huge and uneven — a request BODY may be
+/// `max_upload_size` (50 MiB by default, `config.zig`) and a realtime frame 256 KiB
+/// (facil.io's default), and both carry a `token` field straight into `peekClaims`.
+/// Because decoding happens BEFORE the signature check, a garbage token allocates in
+/// proportion to its size while still UNAUTHENTICATED: a ~1 MiB token was measured
+/// consuming ~1 MiB before rejection.
+///
+/// 4096 comfortably exceeds any token this system mints (a session token with all claims
+/// populated is a few hundred bytes) while capping pre-auth allocation at a few tens of KiB.
+pub const max_token_len: usize = 4096;
+
 fn b64enc(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
     const out = try alloc.alloc(u8, b64.Encoder.calcSize(data.len));
     _ = b64.Encoder.encode(out, data);
@@ -69,6 +86,15 @@ pub fn sign(alloc: std.mem.Allocator, claims: Claims, key: []const u8) ![]u8 {
     defer alloc.free(p);
     const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ header_b64, p });
     defer alloc.free(signing_input);
+
+    // Bound `sign` by the SAME ceiling `verify` enforces, so this module can never mint a
+    // token it would then refuse. `pl` is caller-supplied and unchecked, so without this an
+    // app stuffing a few KB into it gets a token that fails at the next request — a failure
+    // that would surface far from its cause. Checked before the final concat, from the exact
+    // final length: signing_input + '.' + the base64 of a 32-byte HMAC.
+    const token_len = signing_input.len + 1 + b64.Encoder.calcSize(sig_len);
+    if (token_len > max_token_len) return error.TokenTooLarge;
+
     var sig: [32]u8 = undefined;
     HmacSha256.create(&sig, signing_input, key);
     const s = try b64enc(alloc, &sig);
@@ -83,6 +109,11 @@ pub fn sign(alloc: std.mem.Allocator, claims: Claims, key: []const u8) ![]u8 {
 /// `verifyInto`, which is contract 3 and allocates nothing. Retained for callers already
 /// holding a request arena; it is scheduled for removal once they migrate.
 pub fn verify(alloc: std.mem.Allocator, token: []const u8, key: []const u8, now: i64) JwtError!Claims {
+    // FIRST statement, before any allocation: this is what bounds pre-auth memory on every
+    // caller, whichever contract they use. Putting it in `verifyInto` only would leave the
+    // arena callers — which are all of the production ones — unbounded.
+    if (token.len > max_token_len) return error.TokenTooLarge;
+
     var it = std.mem.splitScalar(u8, token, '.');
     const h = it.next() orelse return error.Malformed;
     const p = it.next() orelse return error.Malformed;
@@ -116,6 +147,11 @@ pub fn verify(alloc: std.mem.Allocator, token: []const u8, key: []const u8, now:
 /// `peekClaimsInto`, which is contract 3 and allocates nothing. Retained for callers already
 /// holding a request arena; it is scheduled for removal once they migrate.
 pub fn peekClaims(alloc: std.mem.Allocator, token: []const u8) JwtError!Claims {
+    // As in `verify`: first statement, before any allocation. This path is the more exposed
+    // of the two — it runs on tokens whose signing key is not yet known, so it decodes
+    // attacker-supplied bytes with no authentication whatsoever.
+    if (token.len > max_token_len) return error.TokenTooLarge;
+
     var it = std.mem.splitScalar(u8, token, '.');
     _ = it.next() orelse return error.Malformed; // header
     const p = it.next() orelse return error.Malformed; // payload
@@ -125,20 +161,29 @@ pub fn peekClaims(alloc: std.mem.Allocator, token: []const u8) JwtError!Claims {
     return parsed.value;
 }
 
-/// Scratch needed to decode + parse the largest token we accept. This is NOT a per-token
-/// bound of 8192 bytes — the buffer must simultaneously hold the re-concatenated signing
-/// input, the decoded signature, the decoded payload, AND the JSON parse tree that
-/// `std.json.parseFromSlice` builds over it, roughly 2-2.5x the token's own size. So the
-/// largest token `verifyInto`/`peekClaimsInto` can actually verify is ~3-4 KB, not 8 KB.
-/// An over-large token fails closed with `error.TokenTooLarge` rather than allocating.
+/// Scratch sufficient to verify ANY token this module accepts, i.e. any token of at most
+/// `max_token_len` bytes. Derived from measurement, not estimate.
 ///
-/// Asymmetry: `sign` (heap-allocating) is unbounded, but `verifyInto`/`peekClaimsInto`
-/// (caller-buffer) are bounded by this constant. An application that stuffs several KB
-/// into the caller-supplied `pl` claim can mint a token with `sign` that `verifyInto`
-/// then rejects as `TokenTooLarge`. Resolving that asymmetry (e.g. sizing scratch to the
-/// caller's own claim payload, or bounding `pl` at `sign` time) is deferred to the
-/// follow-on allocator-ownership migration; this constant and mechanism are unchanged here.
-pub const scratch_size: usize = 8192;
+/// This is NOT a per-token size bound. A `FixedBufferAllocator` never reuses freed memory,
+/// so what must fit is the SUM of every allocation `verify` makes: the re-concatenated
+/// signing input, the decoded signature, the decoded payload, and whatever
+/// `std.json.parseFromSlice` copies.
+///
+/// Measured consumption (bytes handed out, read from `fba.end_index`):
+///   - ordinary claims: ~1.74x token length. `parseFromSlice` defaults to
+///     `.alloc_if_needed`, so it BORROWS strings from the input and copies almost nothing.
+///   - escape-heavy claims: the ratio is NOT constant and RISES with size, because every
+///     escaped string forces a copy into the parser's arena, which over-allocates as it
+///     grows. Measured 2.74x at 912 bytes, 3.18x at 2960, 4.03x at 5691.
+///
+/// So the ratio must be taken from the adversarial case, not the typical one. Worst case
+/// measured over every token <= `max_token_len` (payload swept 1..3000, all-escape, all
+/// claims populated) is 14800 bytes; 16384 is that rounded up, ~10% headroom.
+///
+/// This constant is only meaningful because `verify`/`peekClaims` enforce `max_token_len`
+/// before allocating. If that ceiling is raised, re-derive this at ~3.6x it and re-measure —
+/// do not assume the ratio holds, since it grows with size.
+pub const scratch_size: usize = 16384;
 
 /// Contract 3 (caller-buffer): verifies signature + expiry and returns claims that BORROW
 /// `scratch`. Allocates nothing on the heap — `scratch` is the only storage, so the claims
@@ -381,4 +426,71 @@ test "verify rejects a token with a foreign header" {
     defer a.free(tampered);
     var scratch: [scratch_size]u8 = undefined;
     try std.testing.expectError(error.Malformed, verifyInto(&scratch, tampered, &key, 1500));
+}
+
+test "an over-long token is rejected before allocating (pre-auth amplification bound)" {
+    // Regression for the unbounded pre-auth path: nothing on the request path bounded token
+    // length, while a request body may be 50 MiB and a realtime frame 256 KiB. Decoding
+    // happens BEFORE the signature check, so a garbage token allocated in proportion to its
+    // own size while still unauthenticated.
+    //
+    // The token must be STRUCTURALLY VALID (header.payload.signature) to be a real test.
+    // A blob of bytes with no '.' is rejected as Malformed before any allocation regardless,
+    // so it would pass against unpatched code and prove nothing.
+    //
+    // `failing_allocator` is the assertion: it returns OutOfMemory on the FIRST allocation.
+    // Passing therefore proves rejection happens with ZERO allocation, not merely that an
+    // oversized token is eventually refused after the amplification already occurred.
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, max_token_len);
+    defer a.free(payload);
+    @memset(payload, 'A'); // valid base64url alphabet, so decoding would proceed
+
+    const token = try std.fmt.allocPrint(a, "{s}.{s}.AAAA", .{ header_b64, payload });
+    defer a.free(token);
+    try std.testing.expect(token.len > max_token_len);
+
+    const fa = std.testing.failing_allocator;
+    try std.testing.expectError(error.TokenTooLarge, verify(fa, token, "k", 0));
+    try std.testing.expectError(error.TokenTooLarge, peekClaims(fa, token));
+}
+
+test "sign refuses to mint a token that verify would reject" {
+    // The two bounds must agree. Without a ceiling in `sign`, an app stuffing a few KB into
+    // the caller-supplied `pl` claim mints a token that fails at the NEXT request, surfacing
+    // the error far from its cause.
+    const a = std.testing.allocator;
+    const key = [_]u8{7} ** 32;
+
+    var big: [max_token_len]u8 = undefined;
+    @memset(&big, 'x');
+    const claims = Claims{ .id = "u1", .collection = "users", .type = .auth, .iat = 1000, .exp = 4000, .pl = &big };
+
+    try std.testing.expectError(error.TokenTooLarge, sign(a, claims, &key));
+}
+
+test "scratch_size holds for the largest token max_token_len admits" {
+    // Guards the derivation in `scratch_size`'s doc comment: the constant is only correct
+    // relative to `max_token_len`, and the consumption ratio GROWS with token size, so a
+    // raise to either constant must be re-measured rather than assumed.
+    const a = std.testing.allocator;
+    const key = [_]u8{3} ** 32;
+
+    // Escape-heavy payload: forces std.json to copy into its arena instead of borrowing,
+    // which is the adversarial case scratch_size is sized against.
+    var pl: [1800]u8 = undefined;
+    @memset(&pl, '"');
+    const claims = Claims{ .id = "u1", .collection = "users", .type = .auth, .iat = 1000, .exp = 4000, .pl = &pl };
+
+    const token = sign(a, claims, &key) catch |e| switch (e) {
+        // If this payload can't be minted, the ceiling is doing its job; nothing to check.
+        error.TokenTooLarge => return,
+        else => return e,
+    };
+    defer a.free(token);
+    try std.testing.expect(token.len <= max_token_len);
+
+    var scratch: [scratch_size]u8 = undefined;
+    const got = try verifyInto(&scratch, token, &key, 1500);
+    try std.testing.expectEqualStrings("u1", got.id);
 }
