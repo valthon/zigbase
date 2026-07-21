@@ -242,84 +242,78 @@ fn roundTrip(a: std.mem.Allocator, field: schema.Field, sql_type: []const u8, in
 }
 
 test "text round-trips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const f = schema.Field{ .id = "f", .name = "title", .options = .{ .text = .{} } };
     const out = try roundTrip(a, f, "TEXT", .{ .string = "hello" });
+    defer a.free(out.string); // readStorage-duped storage string
     try std.testing.expectEqualStrings("hello", out.string);
 }
 
 test "bool round-trips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const f = schema.Field{ .id = "f", .name = "ok", .options = .{ .bool = .{} } };
-    const out = try roundTrip(a, f, "INTEGER", .{ .bool = true });
+    const out = try roundTrip(a, f, "INTEGER", .{ .bool = true }); // .bool result carries no allocation
     try std.testing.expectEqual(true, out.bool);
 }
 
 test "fixed number round-trips as a precise string" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const f = schema.Field{ .id = "f", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } };
     const out = try roundTrip(a, f, "INTEGER", .{ .string = "10.50" });
+    defer a.free(out.string); // scaledIntToDecimal-allocated return value
     try std.testing.expectEqualStrings("10.50", out.string);
 }
 
 test "float round-trips as a number" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const f = schema.Field{ .id = "f", .name = "ratio", .options = .{ .number = .{ .mode = .float } } };
-    const out = try roundTrip(a, f, "REAL", .{ .float = 1.5 });
+    const out = try roundTrip(a, f, "REAL", .{ .float = 1.5 }); // .float result carries no allocation
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), out.float, 0.0001);
 }
 
 test "int number round-trips as a string" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const f = schema.Field{ .id = "f", .name = "n", .options = .{ .number = .{ .mode = .int } } };
     const out = try roundTrip(a, f, "INTEGER", .{ .string = "9007199254740993" });
+    defer a.free(out.string); // scaledIntToDecimal-allocated return value
     try std.testing.expectEqualStrings("9007199254740993", out.string);
 }
 
 test "int number accepts a JSON integer on write (symmetric with reads)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const f = schema.Field{ .id = "f", .name = "n", .options = .{ .number = .{ .mode = .int } } };
     // Passed AS a number, not a string.
     const out = try roundTrip(a, f, "INTEGER", .{ .integer = 42 });
+    defer a.free(out.string); // scaledIntToDecimal-allocated return value
     try std.testing.expectEqualStrings("42", out.string);
     // Back-compat: the string form still works.
     const out_s = try roundTrip(a, f, "INTEGER", .{ .string = "42" });
+    defer a.free(out_s.string);
     try std.testing.expectEqualStrings("42", out_s.string);
 }
 
 test "int number rejects a fractional float on write" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const f = schema.Field{ .id = "f", .name = "n", .options = .{ .number = .{ .mode = .int } } };
+    // Error path: bindValue frees its allocPrint temporary before returning error.TooPrecise.
     try std.testing.expectError(error.TooPrecise, roundTrip(a, f, "INTEGER", .{ .float = 4.2 }));
 }
 
 test "fixed number accepts JSON integer/float and scales identically to the string form" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const f = schema.Field{ .id = "f", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } };
     // `.float = 5.0` scales to 500, then reads back as "5.00" — identical to the string forms.
     const out_f = try roundTrip(a, f, "INTEGER", .{ .float = 5.0 });
+    defer a.free(out_f.string); // scaledIntToDecimal-allocated return value
     try std.testing.expectEqualStrings("5.00", out_f.string);
     const out_i = try roundTrip(a, f, "INTEGER", .{ .integer = 5 });
+    defer a.free(out_i.string);
     try std.testing.expectEqualStrings("5.00", out_i.string);
     const out_s = try roundTrip(a, f, "INTEGER", .{ .string = "5.0" });
+    defer a.free(out_s.string);
     try std.testing.expectEqualStrings("5.00", out_s.string);
     const out_s2 = try roundTrip(a, f, "INTEGER", .{ .string = "5.00" });
+    defer a.free(out_s2.string);
     try std.testing.expectEqualStrings("5.00", out_s2.string);
 }
 
@@ -358,6 +352,12 @@ test "bindValue on the raw GPA path: numeric-as-number writes free their allocPr
 }
 
 test "multi-select round-trips as an array" {
+    // Arena-scoped by contract (NO_SLOP.md 2.2a, contract-4): for a multi-value field
+    // readValue returns `(try std.json.parseFromSlice(...)).value`, DISCARDING the
+    // std.json.Parsed wrapper that owns the parse arena. The returned Value graph
+    // therefore cannot be freed piecewise — the backing arena handle is gone by design
+    // (readValue's doc-comment states it "Requires an arena allocator"). readValue is
+    // only ever driven request-scoped, so the caller's arena reclaims the tree.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -371,11 +371,9 @@ test "multi-select round-trips as an array" {
 }
 
 test "null round-trips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const f = schema.Field{ .id = "f", .name = "title", .options = .{ .text = .{} } };
-    const out = try roundTrip(a, f, "TEXT", .null);
+    const out = try roundTrip(a, f, "TEXT", .null); // .null result carries no allocation
     try std.testing.expect(out == .null);
 }
 
@@ -405,12 +403,20 @@ test "decimalToScaledInt: scale 0 (int)" {
 }
 
 test "scaledIntToDecimal round-trips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("10.50", try scaledIntToDecimal(a, 1050, 2));
-    try std.testing.expectEqualStrings("-0.05", try scaledIntToDecimal(a, -5, 2));
-    try std.testing.expectEqualStrings("0.00", try scaledIntToDecimal(a, 0, 2));
-    try std.testing.expectEqualStrings("42", try scaledIntToDecimal(a, 42, 0));
-    try std.testing.expectEqualStrings("9007199254740993", try scaledIntToDecimal(a, 9007199254740993, 0));
+    const a = std.testing.allocator;
+    const s1 = try scaledIntToDecimal(a, 1050, 2);
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("10.50", s1);
+    const s2 = try scaledIntToDecimal(a, -5, 2);
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("-0.05", s2);
+    const s3 = try scaledIntToDecimal(a, 0, 2);
+    defer a.free(s3);
+    try std.testing.expectEqualStrings("0.00", s3);
+    const s4 = try scaledIntToDecimal(a, 42, 0);
+    defer a.free(s4);
+    try std.testing.expectEqualStrings("42", s4);
+    const s5 = try scaledIntToDecimal(a, 9007199254740993, 0);
+    defer a.free(s5);
+    try std.testing.expectEqualStrings("9007199254740993", s5);
 }

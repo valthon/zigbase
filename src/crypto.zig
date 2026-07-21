@@ -119,10 +119,9 @@ test "timingSafeEql is correct (ported from otp.zig)" {
 }
 
 test "password hash verifies the right password and rejects the wrong one" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const phc = try hashPassword(std.testing.io, a, "correct horse");
+    defer a.free(phc);
     try std.testing.expect(std.mem.startsWith(u8, phc, "$argon2id$"));
     try std.testing.expect(verifyPassword(std.testing.io, a, phc, "correct horse"));
     try std.testing.expect(!verifyPassword(std.testing.io, a, phc, "wrong password"));
@@ -139,27 +138,24 @@ test "deriveKey is deterministic and changes with the token key" {
 }
 
 test "genToken produces a string of the requested length" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const t = try genToken(std.testing.io, arena.allocator(), 32);
+    const a = std.testing.allocator;
+    const t = try genToken(std.testing.io, a, 32);
+    defer a.free(t);
     try std.testing.expectEqual(@as(usize, 32), t.len);
 }
 
 test "genHex produces a lowercase-hex string of the requested length" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     inline for (.{ 0, 1, 7, 32 }) |n| {
         const h = try genHex(std.testing.io, a, n);
+        defer a.free(h);
         try std.testing.expectEqual(@as(usize, n), h.len);
         for (h) |c| try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
     }
 }
 
 test "dummy login-timing hash is a well-formed argon2id PHC string" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try std.testing.expect(std.mem.startsWith(u8, dummy_password_hash, "$argon2id$"));
     // It verifies its own plaintext (proves the constant parses + is real work) ...
     try std.testing.expect(verifyPassword(std.testing.io, a, dummy_password_hash, "zigbase-login-timing-dummy"));
