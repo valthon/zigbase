@@ -265,6 +265,13 @@ pub const testing = @import("testing.zig");
 pub const internal = if (@import("build_options").dev_mode) struct {
     pub const records = @import("records.zig");
     pub const schema = @import("schema.zig");
+    pub const db = @import("db.zig");
+    pub const query = struct {
+        pub const lexer = @import("query/lexer.zig");
+        pub const parser = @import("query/parser.zig");
+        pub const compiler = @import("query/compiler.zig");
+        pub const joiner = @import("query/joiner.zig");
+    };
 } else struct {};
 
 // ---- Auth helper surface (consumer-facing magic-link building blocks) ------
