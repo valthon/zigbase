@@ -89,9 +89,10 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         }
     } // connection released above — SMTP send happens below without parking a connection
 
-    // Deliver the link by email (outside reader lock — SMTP may block)
+    // Deliver the link by email off the request path (enumeration-safe: the send's latency and
+    // any failure happen on the queue worker, so timing/status are identical for an unknown email).
     if (pending) |p| {
-        try ac.deliverMail(p.email, "Your sign-in link", p.mail_body);
+        ac.deliverMail(p.email, "Your sign-in link", p.mail_body);
     }
 
     // ALWAYS return 204 — never reveal whether the email was found

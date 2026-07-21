@@ -99,9 +99,10 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         }
     } // writer released here — SMTP send happens below without holding the writer lock
 
-    // Deliver the code by email (outside writer lock — SMTP may block)
+    // Deliver the code by email off the request path (enumeration-safe: the send's latency and
+    // any failure happen on the queue worker, so timing/status are identical for an unknown email).
     if (pending) |p| {
-        try ac.deliverMail(p.email, "Your sign-in code", p.code);
+        ac.deliverMail(p.email, "Your sign-in code", p.code);
     }
 
     // ALWAYS return 204 — never reveal whether the email was found
@@ -371,6 +372,52 @@ test "OtpMethod: initiate with known email returns 204" {
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
     const am = m.method();
+    const res = try am.vtable.initiate(am.ctx, &ac);
+    try std.testing.expectEqual(@as(u16, 204), res.status);
+}
+
+test "OtpMethod: initiate with a failing mailer still returns 204 (no status oracle)" {
+    const http = @import("../../http.zig");
+    const collections = @import("../../collections.zig");
+    const mailer_mod = @import("../../mail/mailer.zig");
+
+    // A mailer whose send ALWAYS fails. Pre-fix, OTP initiate delivered synchronously with `try`,
+    // so this error propagated to a 500 — but ONLY for an existing account (an unknown email never
+    // reaches the send), an existence oracle. The fix routes delivery through the non-blocking
+    // token-mail queue, which swallows send failures, so initiate returns 204 regardless.
+    const FailMailer = struct {
+        fn sendFn(_: *anyopaque, _: std.Io, _: std.mem.Allocator, _: mailer_mod.Email) anyerror!void {
+            return error.MailerBoom;
+        }
+        const vt = mailer_mod.Mailer.VTable{ .send = sendFn };
+        fn mailer() mailer_mod.Mailer {
+            return .{ .ptr = undefined, .vtable = &vt }; // stateless: sendFn ignores ptr
+        }
+    };
+
+    var env = try api_auth.TestEnv.initAuth("otp_failmail");
+    defer env.deinit();
+    var fail_mailer = FailMailer.mailer();
+    env.app.mailer = &fail_mailer;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try env.createUser(a, "otp_failmail", "u@x.io", "longenough");
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "otp_failmail")).?;
+    };
+
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
+    const am = m.method();
+    // Pre-fix this would error (MailerBoom) → 500 for the existing account; post-fix it is 204.
     const res = try am.vtable.initiate(am.ctx, &ac);
     try std.testing.expectEqual(@as(u16, 204), res.status);
 }

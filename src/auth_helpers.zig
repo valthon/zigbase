@@ -125,16 +125,19 @@ pub fn consumeLinkToken(conn: *db.Db, claims: jwt.Claims) !void {
 
 // ---- Mail delivery -------------------------------------------------------------
 
-/// Deliver an auth-related email (magic link, reset link, etc.) via the app's
-/// configured mailer. Falls back to a log line when no mailer is wired (CI/tests).
+/// Deliver an auth-related email (OTP code, magic link, etc.) NON-BLOCKINGLY via the token-mail
+/// queue seam. This is enumeration-safe by construction: the SMTP send — its latency AND any
+/// failure — happens on the background worker (or, in tests/CLI, inline with errors swallowed),
+/// so an initiate handler returns with identical timing and status whether or not the email
+/// matched a record. A synchronous `try deliverToken` here would re-open the oracle, since only
+/// an existing account ever reaches the send. Best-effort: never fails.
 pub fn deliverAuthMail(
     app: *app_mod.App,
-    alloc: std.mem.Allocator,
     to: []const u8,
     subject: []const u8,
     body: []const u8,
-) !void {
-    return api_auth.deliverToken(app, alloc, to, subject, body);
+) void {
+    api_auth.enqueueTokenMail(app, to, subject, body);
 }
 
 // ---- Rate limiting -------------------------------------------------------------

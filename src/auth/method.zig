@@ -132,8 +132,10 @@ pub const AuthCtx = struct {
         return auth_helpers.consumeLinkToken(conn, claims);
     }
 
-    pub fn deliverMail(ac: *AuthCtx, to: []const u8, subject: []const u8, body: []const u8) !void {
-        return auth_helpers.deliverAuthMail(ac.app, ac.ctx.allocator.a, to, subject, body);
+    /// Deliver an auth email (OTP code, magic link) NON-BLOCKINGLY via the token-mail queue —
+    /// enumeration-safe (identical timing/status regardless of account existence). Never fails.
+    pub fn deliverMail(ac: *AuthCtx, to: []const u8, subject: []const u8, body: []const u8) void {
+        auth_helpers.deliverAuthMail(ac.app, to, subject, body);
     }
 
     pub fn rateLimit(ac: *AuthCtx, scope: []const u8, ident: []const u8) !?http.Response {

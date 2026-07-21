@@ -24,7 +24,7 @@ src/auth/challenge_store.zig	4	PRE-EXISTING: not yet migrated to the ownership c
 src/auth/method.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/magic_link.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/oauth2.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
-src/auth/methods/otp.zig	10	PRE-EXISTING: not yet migrated to the ownership contracts
+src/auth/methods/otp.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/password.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/webauthn.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth_helpers.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
