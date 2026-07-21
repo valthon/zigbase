@@ -51,6 +51,32 @@ pub fn buildCollection(alloc: std.mem.Allocator, row: RawRow) !schema.Collection
     };
 }
 
+/// An acquired collection graph that owns its own memory (contract-2, mirroring
+/// `std.json.Parsed`): every allocation the adapter makes — the `[]Collection`, each
+/// collection's fields/indexes/options graph, the transient id→name map and RawRow dupes —
+/// lives in `arena`, so a single `deinit()` reclaims the whole interlinked graph. This is
+/// why an acquire adapter never hand-frees the graph piecewise (which would mean mirroring
+/// every schema parser); the caller holds the handle for as long as it reads `collections`,
+/// then deinits.
+pub const Acquired = struct {
+    arena: *std.heap.ArenaAllocator,
+    collections: []schema.Collection,
+
+    pub fn deinit(self: Acquired) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+    }
+};
+
+/// Allocate the owning arena for an `Acquired`. The adapter builds its whole graph with
+/// `arena.allocator()`, then returns `.{ .arena = arena, .collections = cols }`.
+pub fn newArena(gpa: std.mem.Allocator) !*std.heap.ArenaAllocator {
+    const arena = try gpa.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(gpa);
+    return arena;
+}
+
 fn lessByName(_: void, a: schema.Collection, b: schema.Collection) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
@@ -87,13 +113,11 @@ pub fn resolveRelationTargets(alloc: std.mem.Allocator, cols: []schema.Collectio
     }
 }
 
-// contract-4 (arena-scoped): buildCollection returns a schema.Collection build-lifetime
-// graph — a duped name plus a schema.fieldsFromJson-allocated []Field whose elements carry
-// their own inner allocations (names, select-value arrays, relation targets), plus indexes
-// and options. schema.zig exposes no deep-free / freeCollection API, so this graph cannot be
-// freed piecewise under std.testing.allocator. (The auth path additionally orphans the
-// filtered-out system fields' inner strings and the all_fields backing array — intermediates
-// the arena reclaims.) Converting requires a schema.freeCollections() deep-free (cross-file).
+// contract-4 (arena-scoped): buildCollection is the internal builder — it returns a single
+// interlinked schema.Collection graph on the CALLER's allocator (fields/indexes/options with
+// inner allocations). The public entry points (acquireFromDb/acquire/parseCollections) wrap
+// this in an `Acquired` contract-2 handle that owns an arena; a direct buildCollection test
+// legitimately owns that graph via a test-local arena.
 test "buildCollection: base collection keeps user fields and parses types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -117,8 +141,7 @@ test "buildCollection: base collection keeps user fields and parses types" {
     try std.testing.expectEqual(schema.FieldType.number, c.fields[1].fieldType());
 }
 
-// contract-4 (arena-scoped): same as above — buildCollection returns a schema.Collection
-// build-lifetime graph with no piecewise/deep free API in schema.zig.
+// contract-4 (arena-scoped): see the note on the first buildCollection test.
 test "buildCollection: auth collection strips injected system fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

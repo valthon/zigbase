@@ -6,7 +6,16 @@ const acquire_core = @import("acquire.zig");
 /// endpoint serializes fields under the "schema" key (collectionToJson shape);
 /// nested arrays/objects are re-stringified to feed acquire.buildCollection,
 /// which uses the same parsers as the data-dir path — so both converge.
-pub fn parseCollections(alloc: std.mem.Allocator, json_bytes: []const u8) ![]schema.Collection {
+pub fn parseCollections(gpa: std.mem.Allocator, json_bytes: []const u8) !acquire_core.Acquired {
+    // Contract-2 (owns its memory, like std.json.Parsed): build the whole graph — collections,
+    // the id→name map, resolved relation targets — in this arena; `Acquired.deinit()` reclaims
+    // it. See acquire.zig's `Acquired`.
+    const arena = try acquire_core.newArena(gpa);
+    errdefer {
+        arena.deinit();
+        gpa.destroy(arena);
+    }
+    const alloc = arena.allocator();
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSchema;
@@ -51,7 +60,7 @@ pub fn parseCollections(alloc: std.mem.Allocator, json_bytes: []const u8) ![]sch
     // Resolve UUID targetCollectionIds → names (same as data-dir path).
     try acquire_core.resolveRelationTargets(alloc, cols, &id_to_name);
     acquire_core.sortByName(cols);
-    return cols;
+    return .{ .arena = arena, .collections = cols };
 }
 
 fn objStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -69,7 +78,14 @@ fn valueToJson(alloc: std.mem.Allocator, v: ?std.json.Value) ![]const u8 {
 
 /// Authenticate as superuser then GET /api/collections. Network round-trip is
 /// validated by SP3b's live e2e; SP3a unit-tests parseCollections.
-pub fn acquire(alloc: std.mem.Allocator, io: std.Io, origin: []const u8, email: []const u8, password: []const u8) ![]schema.Collection {
+pub fn acquire(gpa: std.mem.Allocator, io: std.Io, origin: []const u8, email: []const u8, password: []const u8) !acquire_core.Acquired {
+    // HTTP intermediates (client, URLs, request/response bodies, token) are transient — own
+    // them in a LOCAL arena freed on return. The returned graph is owned separately by the
+    // `Acquired` that `parseCollections` builds, so the response body can die here.
+    var http_arena = std.heap.ArenaAllocator.init(gpa);
+    defer http_arena.deinit();
+    const alloc = http_arena.allocator();
+
     var client = std.http.Client{ .allocator = alloc, .io = io };
     defer client.deinit();
 
@@ -96,7 +112,9 @@ pub fn acquire(alloc: std.mem.Allocator, io: std.Io, origin: []const u8, email: 
         std.log.err("typegen: GET /api/collections failed (HTTP {d})", .{cols_resp.status});
         return error.CollectionsFetchFailed;
     }
-    return parseCollections(alloc, cols_resp.body);
+    // `parseCollections` dupes everything it keeps into its own arena, so the http_arena
+    // (including `cols_resp.body`) is safe to reclaim on return.
+    return parseCollections(gpa, cols_resp.body);
 }
 
 const Resp = struct { status: u16, body: []const u8 };
@@ -126,17 +144,10 @@ fn extractToken(alloc: std.mem.Allocator, body: []const u8) ![]const u8 {
     return alloc.dupe(u8, tv.string);
 }
 
-// contract-4 (arena-scoped): parseCollections returns a []schema.Collection build-lifetime
-// graph (buildCollection dupes names and calls schema.fieldsFromJson, which allocates a []Field
-// with inner allocations) for which schema.zig exposes no deep-free API — it cannot be freed
-// piecewise under std.testing.allocator. The intermediate std.json.Parsed and the id_to_name
-// map ARE freed (defer deinit); the arena additionally reclaims the map's duped key/value
-// entries and the valueToJson re-stringified inputs. Converting requires a
-// schema.freeCollections() deep-free (cross-file).
+// parseCollections is contract-2 (`Acquired` owns its arena), so these run under the leak
+// detector directly — no arena in the test.
 test "parseCollections: parses /api/collections array, strips auth fields, sorts" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // Shape mirrors collectionToJson output: fields under "schema", visible-only.
     const body =
         \\{"items":[
@@ -149,7 +160,9 @@ test "parseCollections: parses /api/collections array, strips auth fields, sorts
         \\  "indexes":[],"options":{}}
         \\]}
     ;
-    const cols = try parseCollections(a, body);
+    var acq = try parseCollections(a, body);
+    defer acq.deinit();
+    const cols = acq.collections;
     try std.testing.expectEqual(@as(usize, 2), cols.len);
     try std.testing.expectEqualStrings("posts", cols[0].name); // name-sorted
     try std.testing.expectEqualStrings("users", cols[1].name);
@@ -158,12 +171,8 @@ test "parseCollections: parses /api/collections array, strips auth fields, sorts
     try std.testing.expectEqualStrings("displayName", cols[1].fields[0].name);
 }
 
-// contract-4 (arena-scoped): same as above — parseCollections returns a []schema.Collection
-// build-lifetime graph with no piecewise/deep free API in schema.zig.
 test "parseCollections: resolves UUID targetCollectionId to collection name" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // The HTTP API serves live UUID ids, not names, in targetCollectionId.
     // The map is built from ALL elements (including system collections) before
     // the system-collection filter runs.
@@ -181,7 +190,9 @@ test "parseCollections: resolves UUID targetCollectionId to collection name" {
         \\  "indexes":[],"options":{}}
         \\]}
     ;
-    const cols = try parseCollections(a, body);
+    var acq = try parseCollections(a, body);
+    defer acq.deinit();
+    const cols = acq.collections;
     try std.testing.expectEqual(@as(usize, 2), cols.len);
     // name-sorted: posts, users
     try std.testing.expectEqualStrings("posts", cols[0].name);

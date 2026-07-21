@@ -64,7 +64,9 @@ test "pg: typed-client codegen from a Postgres-backed instance matches the SQLit
     try migrations.run(&pgconn);
     const pg_specs = demoSpecs();
     try provision.applySpecs(al, io, &pgconn, &pg_specs);
-    const pg_cols = try acquire_datadir.acquireFromDb(al, &pgconn);
+    const pg_acq = try acquire_datadir.acquireFromDb(al, &pgconn);
+    defer pg_acq.deinit();
+    const pg_cols = pg_acq.collections;
     const pg_client = try genFor(al, pg_cols);
 
     // ---- SQLite path: identical schema into in-memory SQLite, same read-back + generate. ----
@@ -73,7 +75,9 @@ test "pg: typed-client codegen from a Postgres-backed instance matches the SQLit
     try migrations.run(&lite);
     const lite_specs = demoSpecs();
     try provision.applySpecs(al, io, &lite, &lite_specs);
-    const lite_cols = try acquire_datadir.acquireFromDb(al, &lite);
+    const lite_acq = try acquire_datadir.acquireFromDb(al, &lite);
+    defer lite_acq.deinit();
+    const lite_cols = lite_acq.collections;
     const lite_client = try genFor(al, lite_cols);
 
     // The generated client is byte-identical across backends → the ts-sdk snapshot is
@@ -112,7 +116,9 @@ test "pg: the data-dir codegen adapter opens a postgres:// source and reads _col
 
     // The adapter routes the postgres:// target to the PG arm (NOT `<target>/data.db`), opens a
     // fresh connection, and reads the user collections back — name-sorted, system rows excluded.
-    const cols = try acquire_datadir.acquire(al, io, url);
+    const acq = try acquire_datadir.acquire(al, io, url);
+    defer acq.deinit();
+    const cols = acq.collections;
     try std.testing.expectEqual(@as(usize, 2), cols.len);
     try std.testing.expectEqualStrings("posts", cols[0].name);
     try std.testing.expectEqualStrings("users", cols[1].name);
