@@ -613,3 +613,22 @@ test "verifyTokenOfTypes accepts a file token only when allowed" {
     const bad = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .file, .iat = 0, .exp = 9999999999 }, &wrong);
     try std.testing.expect(verifyTokenOfTypes(a, &app, &d, bad, &.{ .auth, .file }) == null);
 }
+
+test "verifyTokenOfTypes rejects a full .auth token under .file-only (file ?token= contract)" {
+    // The file-download `?token=` path (api/files.zig fileIdentity) accepts ONLY `.file` tokens,
+    // so a full session (`.auth`) token can never authenticate a download via a URL query param
+    // (which would leak the session token into logs / Referer / history). Pin that type gate.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+    try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk',1);");
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
+    const key = crypto.deriveKey(app.jwt_secret, "tk");
+    const auth_tok = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    try std.testing.expect(verifyTokenOfTypes(a, &app, &d, auth_tok, &.{.file}) == null); // rejected: file-only
+    try std.testing.expect(verifyTokenOfTypes(a, &app, &d, auth_tok, &.{.auth}) != null); // sanity: valid .auth token
+}

@@ -60,6 +60,7 @@ collection (with a prominent startup warning for every one).
 | F14 | Relationship abilities bypassed on realtime (WS/SSE) delivery | Authz / Realtime | **High** | A | Moderate (non-member receives ability-restricted rows over realtime) | **Fixed** |
 | F15 | Over-`maxSelect` relation/select validation runs per-element checks before the count guard | DoS | Low/Med | A | Moderate (authenticated writer; body-bounded array under the writer lock) | **Fixed** |
 | F16 | OTP/magic-link initiate leaks account existence via send timing + status | Info-leak / Auth | Med | A | Moderate (unauthenticated enumeration of the user table) | **Fixed** |
+| F17 | File `?token=` accepted full `.auth` session tokens (session tokens in URLs) | Info-leak / hardening | Low | A | Low (session token exposed via logs/Referer if used in a URL) | **Fixed** |
 
 Items deliberately re-assessed as **not exploitable**: rule **parse errors fail *closed*** (a
 malformed rule yields a 500, the write never runs — see F3 notes); `expand` **does** re-apply the
@@ -712,3 +713,25 @@ path). Magic-link shares the identical `deliverMail` seam.
 **Residual.** Enumeration via other differences (e.g. rate-limit behavior, or a slower initiate
 for existing accounts due to the challenge-store write) is out of scope here; this closes the
 mail-delivery timing and the send-failure status oracles, which were the observable ones.
+
+### F17 — File `?token=` accepted full `.auth` session tokens (FIXED)
+
+**Where.** `src/api/files.zig` — `fileIdentity`.
+
+**Description.** A file download can be authorized either by the normal bearer/cookie auth or by
+a `?token=` query parameter carrying a JWT. That query path accepted `&.{ .auth, .file }` — i.e.
+a full `.auth` **session** token was a valid `?token=` credential, not only the purpose-built,
+scoped `.file` token minted by `POST /api/files/token`. A token in a URL query string travels
+into places a header/cookie does not: web-server access logs, the `Referer` header sent to
+third-party origins when a page embeds the file, and browser history. Encouraging (or merely
+permitting) a long-lived session token there widens its exposure. This is hardening rather than a
+concrete exploit — the token is still the user's own valid credential, so there is no privilege
+escalation — but the loose accept-set invited a real anti-pattern.
+
+**Fix.** `fileIdentity` now accepts only `&.{.file}` on the `?token=` path. Session-authenticated
+downloads use the `Authorization: Bearer` header or the auth cookie (the `authenticate`
+fallthrough), which do not leak into URLs. No first-party client is affected — the SDKs and admin
+UI already fetch protected files with a `.file` token (via `POST /api/files/token`) or the auth
+cookie/header. Regression tests: "fileIdentity rejects a full .auth token supplied via ?token="
+(the handler path) and "verifyTokenOfTypes rejects a full .auth token under .file-only" (the type
+gate). Pre-1.0 behavior change — see the `Breaking` changelog note.
