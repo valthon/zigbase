@@ -27,7 +27,11 @@ pub fn provisionAndGenerate(
     defer d.close();
     try migrations.run(&d);
     try provision.applySpecs(alloc, io, &d, cols);
-    const rt = try acquire_datadir.acquireFromDb(alloc, &d);
+    // acquireFromDb owns its graph (contract-2); hold it until generate has read every
+    // collection, then deinit reclaims it. The returned text is owned by `alloc`, separate.
+    var acq = try acquire_datadir.acquireFromDb(alloc, &d);
+    defer acq.deinit();
+    const rt = acq.collections;
     // Runtime introspection has no comptime feature metadata → empty flags/experiments
     // (the public `zb.flags.resolveAll` surface is emitted only on the comptime path).
     return gen_client.generate(alloc, rt, &.{}, &.{}, &.{}, &.{}, in_repo, authCollectionName(rt), client_name, api_prefix);
@@ -105,10 +109,14 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, opts: Options) !void {
         std.log.err("typegen: pass exactly one of --data-dir or --url", .{});
         return error.BadSource;
     }
-    const cols = if (opts.data_dir) |dir|
+    // The acquired graph is a contract-2 `Acquired` that owns its arena; hold it until
+    // generation has read every collection, then `deinit` reclaims the whole graph.
+    const acquired = if (opts.data_dir) |dir|
         try acquire_datadir.acquire(alloc, io, dir)
     else
-        try acquireHttp(alloc, io, opts); // implemented in Task 4
+        try acquireHttp(alloc, io, opts);
+    defer acquired.deinit();
+    const cols = acquired.collections;
 
     // Runtime introspection has no comptime feature metadata → empty
     // routes/custom_auth/flags/experiments regardless of language.
@@ -121,10 +129,11 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, opts: Options) !void {
         std.log.err("typegen: code generation failed: {s}", .{@errorName(e)});
         return e;
     };
+    defer alloc.free(text); // `generate` returns an owned slice; free it after write/check.
     try checkOrWrite(io, opts.out, text, opts.check);
 }
 
-fn acquireHttp(alloc: std.mem.Allocator, io: std.Io, opts: Options) ![]schema.Collection {
+fn acquireHttp(alloc: std.mem.Allocator, io: std.Io, opts: Options) !acquire.Acquired {
     const email = opts.admin_email orelse {
         std.log.err("typegen: --url requires --admin-email", .{});
         return error.MissingAdminEmail;
@@ -170,7 +179,11 @@ test "equivalence: data-dir runtime path reproduces the comptime collection surf
     defer d.close();
     try migrations.run(&d);
     try provision.applySpecs(a, std.testing.io, &d, &specs);
-    const rt_cols = try acquire_datadir.acquireFromDb(a, &d);
+    // acquireFromDb owns its result (contract-2); run it under the leak detector even though
+    // the surrounding provisioning/generation scaffolding stays on the test arena.
+    var rt_acq = try acquire_datadir.acquireFromDb(std.testing.allocator, &d);
+    defer rt_acq.deinit();
+    const rt_cols = rt_acq.collections;
 
     // Comptime baseline: the same user-field specs, name-sorted.
     const ct_cols = try a.dupe(schema.Collection, &specs);

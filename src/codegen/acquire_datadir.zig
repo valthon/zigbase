@@ -26,9 +26,22 @@ fn buildIdNameMap(alloc: std.mem.Allocator, w: *db.Db) !std.StringHashMap([]cons
 /// `_collections` table, name-sorted. The schema/indexes/options columns are
 /// JSON text the engine wrote via fieldsToJson/indexesToJson/optionsToJson, so
 /// they parse back through acquire_core.buildCollection.
-pub fn acquireFromDb(alloc: std.mem.Allocator, w: *db.Db) ![]schema.Collection {
+pub fn acquireFromDb(gpa: std.mem.Allocator, w: *db.Db) !acquire_core.Acquired {
+    // Contract-2 (owns its memory, like std.json.Parsed): the whole interlinked graph — the
+    // collections, their fields/indexes/options, the transient id→name map, and the per-row
+    // RawRow dupes — is built in this arena, so `Acquired.deinit()` reclaims all of it. No
+    // piecewise free (which would mean mirroring every schema parser).
+    const arena = try acquire_core.newArena(gpa);
+    errdefer {
+        arena.deinit();
+        gpa.destroy(arena);
+    }
+    const alloc = arena.allocator();
+
     // Build id→name map FIRST so we can resolve relation targetCollectionIds.
-    // Provisioning stores UUIDs; the emitter and comptime path use names.
+    // Provisioning stores UUIDs; the emitter and comptime path use names. The map is transient
+    // scratch (its resolved names are duped into the graph), so deinit it here — symmetric with
+    // acquire_http.parseCollections. (A no-op under this arena, but it documents the lifetime.)
     var id_to_name = try buildIdNameMap(alloc, w);
     defer id_to_name.deinit();
 
@@ -54,7 +67,7 @@ pub fn acquireFromDb(alloc: std.mem.Allocator, w: *db.Db) ![]schema.Collection {
     // (which checks by name) works identically to the comptime path.
     try acquire_core.resolveRelationTargets(alloc, cols, &id_to_name);
     acquire_core.sortByName(cols); // ORDER BY name already sorts, but keep adapters symmetric.
-    return cols;
+    return .{ .arena = arena, .collections = cols };
 }
 
 /// Acquire collections from a backend-agnostic data source `target`. Two shapes:
@@ -63,7 +76,7 @@ pub fn acquireFromDb(alloc: std.mem.Allocator, w: *db.Db) ![]schema.Collection {
 ///     identical to the SQLite path).
 ///   - anything else (a data-dir path)          → opens `<target>/data.db` (SQLite).
 /// Errors if the source has no provisioned `_collections` (start the server once first).
-pub fn acquire(alloc: std.mem.Allocator, io: std.Io, target: []const u8) ![]schema.Collection {
+pub fn acquire(alloc: std.mem.Allocator, io: std.Io, target: []const u8) !acquire_core.Acquired {
     if (db.connstrLooksLikePostgres(target)) {
         // The `openPostgres` constructor only exists when Postgres is compiled in; the comptime
         // branch keeps the default (`-Dpostgres=false`) build from referencing the PG subtree.
@@ -144,18 +157,13 @@ test "looksUrlLike: redacts URL/credential targets, allows plain paths" {
     try std.testing.expect(!looksUrlLike(""));
 }
 
-// contract-4 (arena-scoped): acquireFromDb returns a []schema.Collection build-lifetime
-// graph (each Collection carries a schema.fieldsFromJson-allocated []Field with inner
-// allocations) for which schema.zig exposes no deep-free API — it cannot be freed piecewise
-// under std.testing.allocator. It also relies on the arena to reclaim intermediates the
-// function itself does not free: buildIdNameMap's duped id/name entries (map.deinit frees the
-// buckets, not the duped keys/values) and the per-row RawRow JSON dupes (consumed by
-// buildCollection's parsers, then discarded). Converting requires a schema.freeCollections()
-// deep-free (cross-file) plus freeing those intermediates.
 test "acquireFromDb returns user collections (sorted, system excluded, auth stripped)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Provisioning is test SETUP — keep it arena-scoped. `acquireFromDb` returns a contract-2
+    // `Acquired` that OWNS its whole graph, so it runs under the leak detector directly: if it
+    // allocated anything outside its arena, or the test forgot `deinit`, this would leak-fail.
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    const sa = setup.allocator();
 
     var d = try db.Db.openMemory();
     defer d.close();
@@ -170,9 +178,11 @@ test "acquireFromDb returns user collections (sorted, system excluded, auth stri
             .{ .id = "", .name = "views", .options = .{ .number = .{ .mode = .int } } },
         } },
     };
-    try provision.applySpecs(a, std.testing.io, &d, &specs);
+    try provision.applySpecs(sa, std.testing.io, &d, &specs);
 
-    const cols = try acquireFromDb(a, &d);
+    var acq = try acquireFromDb(std.testing.allocator, &d);
+    defer acq.deinit();
+    const cols = acq.collections;
     // _superusers (system) excluded; only the two user collections, name-sorted.
     try std.testing.expectEqual(@as(usize, 2), cols.len);
     try std.testing.expectEqualStrings("articles", cols[0].name);
